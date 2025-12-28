@@ -487,8 +487,8 @@ When updating HTML files, follow this process:
  - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
-   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles.
- - **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
+   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
+- **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
@@ -512,6 +512,36 @@ When updating HTML files, follow this process:
 - This includes the latest HTML results from previous completed tasks in the same conversation
 - Set attach_previous_task_results to false only if you don't want previous results included
 - **Revision Method**: [DEPRECATED: 'create_revision' is deprecated] For image revision, use 'generate_image' with the original image as an input image. For HTML report revision, use 'update_html_file' to update the HTML file content.
+
+## "whitepapers" / "research reports" / "executive summaries"
+
+For whitepapers, research reports, or executive summaries (target: 8-12 pages):
+
+**Step 1 - Deep Research**
+Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages). This returns research_url (S3 URL).
+
+**Step 2 - Generate Charts**: Call 'perform_data_analysis' with:
+      - file_urls: [research_url from Step 1]
+      - analysis_instruction: "Analyze the research data and generate 3-4 chart images using Python matplotlib or plotly. Output actual PNG/image files (not JavaScript or HTML code). Create bar charts, pie charts, line graphs, or diagrams that illustrate key statistics, trends, and comparisons mentioned in the research. Use plt.savefig() to output each chart as an image."
+      Save the chart image URLs from the response (embedded as ![Chart](url) in the analysis output).
+
+**Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
+
+**Step 4 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
+      1. Executive Summary (length="short", ~1 page)
+      2. Introduction/Background (length="short", ~1 page)
+      3. Key Findings (length="medium", ~2 pages)
+      4. Analysis/Discussion (length="long", ~3 pages)
+      5. Conclusion & Recommendations (length="short", ~1 page)
+      6. References (length="short")
+
+      Do NOT create chapters within sections. Do NOT create more than 6 sections.
+ **Step 5 - Generate Content**: For EACH section, call 'generate_book_content' with:
+      - book_id, section_id
+      - research_url: Pass the S3 URL from Step 1 (the function will fetch research content automatically)
+      - content_description: Brief section-specific instructions. **IMPORTANT**: If this section should include charts from Step 2, add to content_description: "Include the following chart image: ![Chart Title](chart_url_from_step_2)" for each relevant chart.
+      - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
+      - imagine: false (stick to research facts, don't invent details)
 
 ## Task Execution
 - When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
@@ -1319,7 +1349,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'generate_book_content',
-          description: 'Generate an entire chapter or section of content for a book. Creates comprehensive markdown content based on the content description and desired length. If existing content exists, it will be used as a base along with the content description to generate new content. Word counts: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words).',
+          description: 'Generate content for a book section/chapter. For BOOKS: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words). For WHITEPAPERS: short (300-600 words, ~1 page), medium (600-1000 words, ~2 pages), long (1000-1500 words, ~3 pages). IMPORTANT for whitepapers: Pass the relevant deep research content in content_description - the AI will reformat it for that section rather than generating new content. If existing content exists, it will be used as a base.',
           parameters: {
             type: 'object',
             properties: {
@@ -1349,6 +1379,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'boolean',
                 description: 'Whether to allow creative imagination and details that do not exist. Defaults to true. When false, the AI will stick strictly to facts and avoid inventing details.',
                 default: true
+              },
+              research_url: {
+                type: 'string',
+                description: 'Optional S3 URL to deep research content (from perform_deep_research). For WHITEPAPERS: pass the research_url here instead of copying full content into content_description. The function will fetch the research and use it as context. When using this, content_description should focus on section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications").'
               }
             },
             required: ['book_id', 'section_id', 'content_description']
@@ -1846,6 +1880,44 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 type: 'boolean',
                 description: 'When true, performs Gemini Deep Research for comprehensive information and includes 3-5 inline images. When false, uses standard content generation with hero image only. Takes several minutes when enabled.',
                 default: false
+              }
+            },
+            required: ['topic']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'perform_deep_research',
+          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Uploads the research content to S3 and returns a URL to the markdown file. Use this for whitepapers, reports, executive summaries, or research documents. NOT for blog articles - use create_blog_article with deep_research=true instead. Takes several minutes to complete. The response includes research_url (S3 URL), title, summary, and word_count.',
+          parameters: {
+            type: 'object',
+            properties: {
+              topic: {
+                type: 'string',
+                description: 'The main topic or subject to research'
+              },
+              prompt: {
+                type: 'string',
+                description: 'Additional instructions for the research (e.g., "Include executive summary", "Focus on competitive analysis", "Structure as a whitepaper")'
+              },
+              tone: {
+                type: 'string',
+                description: 'The tone of the research output',
+                enum: ['professional', 'casual', 'technical', 'executive'],
+                default: 'professional'
+              },
+              depth: {
+                type: 'string',
+                description: 'How thorough the research should be. "overview" for 1-2 pages, "detailed" for 3-5 pages, "comprehensive" for 5-10 pages.',
+                enum: ['overview', 'detailed', 'comprehensive'],
+                default: 'detailed'
+              },
+              focus_areas: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Specific areas to focus on in the research (e.g., ["market trends", "competitor analysis", "implementation strategies"])'
               }
             },
             required: ['topic']
@@ -3000,6 +3072,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
           postsCount: args.posts?.length || 0
         };
 
+      case 'perform_deep_research':
+        const mockMarkdownContent = `# ${args.topic}\n\n## Executive Summary\n\nThis is a comprehensive research report on "${args.topic}".`;
+        const mockS3Url = `https://agentweb-files.s3.us-east-1.amazonaws.com/files/${Date.now()}-research-${args.topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}.md`;
+        return {
+          success: true,
+          message: `Deep research completed successfully. Generated ${mockMarkdownContent.split(/\s+/).length} words of content.`,
+          data: {
+            research_url: mockS3Url,
+            title: args.topic,
+            summary: `Comprehensive research on "${args.topic}" covering market analysis, implementation strategies, and key recommendations.`,
+            key_findings: [
+              `Important insight about ${args.topic}`,
+              'Market trends and analysis',
+              'Implementation considerations',
+              'ROI and business impact',
+              'Future outlook and recommendations'
+            ],
+            word_count: mockMarkdownContent.split(/\s+/).length,
+            research_depth: args.depth || 'detailed',
+            topic: args.topic
+          }
+        };
+
       case 'save_file':
         return {
           success: true,
@@ -3313,7 +3408,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
           args.content_description,
           args.length || 'medium',
           args.imagine !== undefined ? args.imagine : true,
-          userId
+          userId,
+          args.research_url
         );
       case 'create_book':
         return await this.createBook(
@@ -3360,6 +3456,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
         return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
+      case 'perform_deep_research':
+        return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas, userId);
       case 'publish_blog_article':
         return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
       case 'create_social_media_posts':
@@ -7930,6 +8028,98 @@ ${emailDraftFormat === 'text'
     }
   }
 
+  /**
+   * Perform deep research on a topic and upload to S3, returning the S3 URL
+   */
+  private async performDeepResearchTool(
+    topic: string,
+    prompt?: string,
+    tone: string = 'professional',
+    depth: string = 'detailed',
+    focus_areas?: string[],
+    userId?: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
+
+      // Import the deep research service
+      const { deepResearchService } = await import('./deepResearchService');
+
+      // Check if the service is available
+      const isAvailable = await deepResearchService.isAvailable();
+      if (!isAvailable) {
+        return {
+          success: false,
+          message: 'Deep Research service is not available. Please check API key configuration.',
+          error: 'Service unavailable'
+        };
+      }
+
+      // Perform the deep research
+      const researchResult = await deepResearchService.performDeepResearch({
+        topic,
+        prompt,
+        tone,
+        depth,
+        focus_areas
+      });
+
+      if (!researchResult.success || !researchResult.markdownContent) {
+        return {
+          success: false,
+          message: researchResult.error || 'Deep research failed',
+          error: researchResult.error || 'Unknown error'
+        };
+      }
+
+      // Calculate word count for context
+      const wordCount = researchResult.markdownContent.split(/\s+/).length;
+
+      // Upload markdown content to S3
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const sanitizedTopic = topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().substring(0, 50);
+      const filename = `research-${sanitizedTopic}-${Date.now()}.md`;
+      
+      const uploadResult = await uploadFileToS3(
+        researchResult.markdownContent,
+        filename,
+        userId || 'anonymous',
+        'text/markdown'
+      );
+
+      if (!uploadResult.success || !uploadResult.url) {
+        return {
+          success: false,
+          message: 'Failed to upload research content to S3',
+          error: 'S3 upload failed'
+        };
+      }
+
+      console.log('AgentMode: Deep research uploaded to S3:', uploadResult.url);
+
+      return {
+        success: true,
+        message: `Deep research completed successfully. Generated ${wordCount} words of content and saved to S3.`,
+        data: {
+          research_url: uploadResult.url,
+          title: researchResult.title,
+          summary: researchResult.researchSummary,
+          word_count: wordCount,
+          research_depth: depth,
+          topic: topic
+        }
+      };
+
+    } catch (error: any) {
+      console.error('AgentMode: Error performing deep research:', error);
+      return {
+        success: false,
+        message: 'Failed to perform deep research',
+        error: error.message
+      };
+    }
+  }
+
   private async createBlogArticle(
     topic: string,
     keywords: string,
@@ -10393,13 +10583,31 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     contentDescription: string,
     length: string,
     imagine: boolean,
-    userId: string
+    userId: string,
+    researchUrl?: string
   ): Promise<any> {
     try {
-      console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId });
+      console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
       
       const { bookDb } = await import('./bookDb');
       const { bookContentDb } = await import('./bookContentDb');
+      
+      // Fetch research content from S3 URL if provided
+      let researchContent = '';
+      if (researchUrl) {
+        try {
+          console.log('AgentMode: Fetching research content from S3:', researchUrl);
+          const response = await fetch(researchUrl);
+          if (response.ok) {
+            researchContent = await response.text();
+            console.log(`AgentMode: Fetched ${researchContent.length} characters of research content`);
+          } else {
+            console.warn('AgentMode: Failed to fetch research content from S3:', response.status);
+          }
+        } catch (fetchError) {
+          console.error('AgentMode: Error fetching research content:', fetchError);
+        }
+      }
       
       // Verify book exists and belongs to user
       const book = await bookDb.getBookById(bookId, userId);
@@ -10446,13 +10654,21 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         imagineOverridden = true;
       }
 
-      // Map length to word count range
-      const wordCountRanges: Record<string, { min: number; max: number; target: number }> = {
+      // Map length to word count range - different ranges for books vs whitepapers
+      // Whitepapers need smaller word counts to produce concise 8-12 page documents
+      const bookWordCounts: Record<string, { min: number; max: number; target: number }> = {
         short: { min: 1000, max: 2000, target: 1500 },
         medium: { min: 2000, max: 3000, target: 2500 },
         long: { min: 3000, max: 4000, target: 3500 }
       };
 
+      const whitepaperWordCounts: Record<string, { min: number; max: number; target: number }> = {
+        short: { min: 300, max: 600, target: 450 },   // ~1 page (Executive Summary, Conclusion)
+        medium: { min: 600, max: 1000, target: 800 }, // ~2 pages (Introduction, Key Findings)
+        long: { min: 1000, max: 1500, target: 1250 }  // ~3 pages (Analysis sections)
+      };
+
+      const wordCountRanges = book.type === 'whitepaper' ? whitepaperWordCounts : bookWordCounts;
       const wordCount = wordCountRanges[length] || wordCountRanges.medium;
 
       // Get section/chapter title for context
@@ -10494,7 +10710,37 @@ CRITICAL: Do NOT invent or imagine details that do not exist. Stick strictly to 
 ${existingContentText ? `Existing Content (use as base and enhance/expand based on content description):
 ${existingContentText}
 
-Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}`;
+Instructions: Use the existing content above as a foundation, and enhance or expand it based on the content description. Maintain consistency with the existing style and structure while incorporating the new requirements.` : 'Instructions: Create comprehensive, well-structured content from scratch based on the content description.'}${researchContent ? `
+
+=== DEEP RESEARCH CONTENT (SOURCE MATERIAL) ===
+The following is comprehensive research content. Use this as your primary source material for creating this section.
+Extract the relevant information for the "${contentTitle}" section and reformat it appropriately.
+
+${researchContent}
+
+=== END OF RESEARCH CONTENT ===
+` : ''}${book.type === 'whitepaper' ? `
+
+IMPORTANT WHITEPAPER GUIDELINES:
+- This is a whitepaper, not a novel. Be concise and professional.
+${researchContent ? '- You have been provided with DEEP RESEARCH CONTENT above. Your job is to EXTRACT and REFORMAT the relevant portions for this specific section.' : '- The content_description likely contains deep research content - your job is to REFORMAT and CONDENSE it for this section, not to generate entirely new content.'}
+- Focus on key insights, actionable information, and data-driven conclusions.
+- Use bullet points, tables, and clear headings for improved readability and scannability.
+- Target exactly ${wordCount.target} words - do NOT exceed ${wordCount.max} words under any circumstances.
+- Remove verbose language and filler content. Every sentence should add value.
+
+ANTI-REPETITION RULES (CRITICAL):
+- Do NOT repeat concepts, frameworks, or key points that belong in other sections of the whitepaper.
+- Governance/trust topics should ONLY appear in their dedicated section, not repeated in Analysis or Conclusion.
+- If a concept was covered in an earlier section, briefly reference it (e.g., "As noted in the Executive Summary...") instead of re-explaining.
+- Each section should contain UNIQUE insights - check what section you're writing and stay focused on its specific purpose.
+
+CITATION FORMATTING (REQUIRED):
+- Use numbered references in brackets: [1], [2], [3], etc.
+- When citing statistics, research findings, or expert opinions, always include the source.
+- Format example: "AI adoption will reach 80% by 2026 [1]" or "According to Gartner research [2]..."
+- If writing the Conclusion/References section, include a numbered reference list at the end.
+- Prefer specific, verifiable sources over vague attributions like "studies show" or "experts say".` : ''}`;
 
       // Get content model from settings
       let contentModel: string | undefined;

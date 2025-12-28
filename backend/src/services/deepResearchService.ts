@@ -21,6 +21,8 @@ interface DeepResearchParams {
   prompt?: string;
   tone?: string;              // e.g., 'professional', 'casual', 'technical', 'executive'
   style?: string;             // e.g., 'default', 'substack'
+  depth?: string;             // e.g., 'overview', 'detailed', 'comprehensive'
+  focus_areas?: string[];     // Specific areas to focus on
 }
 
 /**
@@ -108,6 +110,29 @@ export class DeepResearchService {
           'Write in first-person perspective where appropriate.',
           'Include engaging section headers that feel conversational.'
         );
+      }
+      
+      // Add depth instructions
+      if (params.depth) {
+        const depthDescriptions: Record<string, string> = {
+          'overview': 'Provide a high-level summary with key points only (approximately 800-1200 words, 1-2 pages). Be concise but cover the main points.',
+          'detailed': 'Provide comprehensive research with examples, analysis, and supporting details (approximately 2000-3500 words, 3-5 pages). Include multiple sections with depth on each topic.',
+          'comprehensive': 'Provide an in-depth deep dive with citations, detailed analysis, case studies, and thorough coverage (approximately 4000-6000 words, 5-10 pages). This should be a complete, publication-ready document with extensive detail in each section.',
+        };
+        const depthDesc = depthDescriptions[params.depth] || params.depth;
+        formatInstructions.push(depthDesc);
+        
+        // Add explicit word count guidance
+        if (params.depth === 'comprehensive') {
+          formatInstructions.push('IMPORTANT: Generate at least 4000 words of content. Do NOT summarize or abbreviate sections. Each major section should be 500-800 words minimum.');
+        } else if (params.depth === 'detailed') {
+          formatInstructions.push('IMPORTANT: Generate at least 2000 words of content. Each section should be substantive with examples and analysis.');
+        }
+      }
+      
+      // Add focus areas if specified
+      if (params.focus_areas && params.focus_areas.length > 0) {
+        formatInstructions.push(`Focus specifically on these areas: ${params.focus_areas.join(', ')}.`);
       }
       
       // Add format instructions to prompt

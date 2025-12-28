@@ -917,8 +917,9 @@ async function renderMarkdownToPdf(
     finalizeLine: boolean = true,
     layout?: { startX?: number; startY?: number; width?: number },
     state?: { first: boolean }
-  ) => {
+  ): boolean => {
     const renderState = state ?? { first: true };
+    let endedLine = false;
     const writeText = (text: string, continued: boolean) => {
       const options: PDFKit.Mixins.TextOptions = { lineGap, continued };
       if (layout?.width !== undefined) {
@@ -932,19 +933,31 @@ async function renderMarkdownToPdf(
       }
       if (text.length > 0) notifyWrite();
       doc.text(text, options);
+      if (!continued) {
+        endedLine = true;
+      }
       renderState.first = false;
     };
 
     inlineTokens.forEach((inlineToken, idx) => {
       const isLast = idx === inlineTokens.length - 1;
-      const continued = !(finalizeLine && isLast);
+      const finalizeCurrent = finalizeLine && isLast;
+      const continued = !finalizeCurrent;
       switch (inlineToken.type) {
         case "strong":
           if (strongFont) {
             doc.font(strongFont);
           }
           if (inlineToken.tokens && Array.isArray(inlineToken.tokens)) {
-            renderInlineTokens(inlineToken.tokens, false, layout, renderState);
+            const innerEnded = renderInlineTokens(
+              inlineToken.tokens,
+              finalizeCurrent,
+              layout,
+              renderState
+            );
+            if (finalizeCurrent && innerEnded) {
+              endedLine = true;
+            }
           } else if (inlineToken.text) {
             writeText(inlineToken.text, continued);
           }
@@ -957,7 +970,15 @@ async function renderMarkdownToPdf(
             doc.font(bodyFont);
           }
           if (inlineToken.tokens && Array.isArray(inlineToken.tokens)) {
-            renderInlineTokens(inlineToken.tokens, false, layout, renderState);
+            const innerEnded = renderInlineTokens(
+              inlineToken.tokens,
+              finalizeCurrent,
+              layout,
+              renderState
+            );
+            if (finalizeCurrent && innerEnded) {
+              endedLine = true;
+            }
           } else if (inlineToken.text) {
             writeText(inlineToken.text, continued);
           }
@@ -990,10 +1011,12 @@ async function renderMarkdownToPdf(
           }
           break;
       }
-      if (finalizeLine && isLast) {
+      if (finalizeLine && isLast && !endedLine) {
         doc.text("", { continued: false });
+        endedLine = true;
       }
     });
+    return endedLine;
   };
 
   const collectInlineTokens = (tokens: any[] = []) => {
