@@ -1025,7 +1025,7 @@ export const agentModeController = {
         undefined, // workflowId
         undefined, // executionId
         undefined, // emailCampaignTaskId
-        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation"
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"
       );
 
       // Set default model for new sessions
@@ -2652,12 +2652,14 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Starting message is required' });
       }
 
-      if (!requiredFunctions || !Array.isArray(requiredFunctions) || requiredFunctions.length === 0) {
-        return res.status(400).json({ error: 'Required functions array is required and must not be empty' });
+      if (requiredFunctions !== undefined && !Array.isArray(requiredFunctions)) {
+        return res.status(400).json({ error: 'Required functions must be an array when provided' });
       }
 
+      const requiredFunctionsArray = Array.isArray(requiredFunctions) ? requiredFunctions : [];
+
       // Validate requiredFunctions format: [{ functionName: string, minCount: number }]
-      for (const reqFunc of requiredFunctions) {
+      for (const reqFunc of requiredFunctionsArray) {
         if (!reqFunc.functionName || typeof reqFunc.functionName !== 'string') {
           return res.status(400).json({ error: 'Each required function must have a functionName (string)' });
         }
@@ -2692,7 +2694,7 @@ export const agentModeController = {
         userId: user.userId,
         startingMessage: startingMessage.trim(),
         keywords: keywords || [],
-        requiredFunctions,
+        requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray
       });

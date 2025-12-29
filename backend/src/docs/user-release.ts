@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-29',
+    changes: [
+      'Added report generation support in Agent Mode',
+      '- All HTML reports generated in Agent Mode are now available in the Reports page',
+      '- Reports can now be created directly from the Customer Portal Reports page using Agent Mode sessions',
+    ],
+  },
+  {
     date: '2025-12-27',
     changes: [
       'Added Event Alerts for CRM lead lists',

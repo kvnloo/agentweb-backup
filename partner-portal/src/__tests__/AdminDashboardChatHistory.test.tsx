@@ -9,6 +9,7 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
     if (sessionType === 'image-generation') return 'Image Generation';
     if (sessionType === 'video-generation') return 'Video Generation';
     if (sessionType === 'book-generation') return 'Book Generation';
+    if (sessionType === 'report_generation') return 'Report Generation';
     return 'Regular';
   };
 
@@ -18,6 +19,7 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
     if (sessionType === 'image-generation') return 'success';
     if (sessionType === 'video-generation') return 'info';
     if (sessionType === 'book-generation') return 'info';
+    if (sessionType === 'report_generation') return 'warning';
     return 'default';
   };
 
@@ -49,6 +51,16 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
   it('should return "Book Generation" for book-generation sessionType', () => {
     expect(getSessionTypeLabel('book-generation')).toBe('Book Generation');
     expect(getSessionTypeColor('book-generation')).toBe('info');
+  });
+
+  it('should return "Report Generation" for report_generation sessionType', () => {
+    expect(getSessionTypeLabel('report_generation')).toBe('Report Generation');
+    expect(getSessionTypeColor('report_generation')).toBe('warning');
+  });
+
+  it('should not treat report_generation as regular', () => {
+    expect(getSessionTypeLabel('report_generation')).not.toBe('Regular');
+    expect(getSessionTypeColor('report_generation')).not.toBe('default');
   });
 
   it('should return "Undefined" for undefined sessionType', () => {

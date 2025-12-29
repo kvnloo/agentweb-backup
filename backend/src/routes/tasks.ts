@@ -2223,6 +2223,137 @@ async function getExecutionsWithAssets(
     }
   }
 
+  // For HTML reports, also search Agent Mode sessions for HTML file tool calls
+  if (assetType === 'html-reports') {
+    try {
+      const chatbotDb = new ChatbotDB();
+      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
+      const agentSessions = agentSessionsResult.sessions || [];
+
+      const addHtmlFile = (sessionKey: string, sessionWithMessages: any, url: string, filename?: string, timestamp?: string) => {
+        const derivedFilename = filename || url.split('/').pop() || 'report.html';
+        const isArchived = sessionWithMessages.archives?.[url] || false;
+        const isFavorited = sessionWithMessages.favorites?.[url] || false;
+
+        if (isArchived) {
+          return;
+        }
+
+        if (!result[sessionKey]) {
+          result[sessionKey] = {
+            taskId: sessionKey,
+            taskName: sessionWithMessages.title || 'Agent Mode Session',
+            createdAt: sessionWithMessages.createdAt,
+            source: 'agent-mode',
+            sessionId: sessionWithMessages.sessionId,
+            executions: []
+          };
+        }
+
+        const executionId = `${sessionWithMessages.sessionId}-html`;
+        let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
+
+        if (!execution) {
+          execution = {
+            executionId,
+            startTime: timestamp,
+            result_files: []
+          };
+          result[sessionKey].executions.push(execution);
+        } else if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
+          execution.startTime = timestamp;
+        }
+
+        const alreadyAdded = execution.result_files.some((file: any) => file.url === url);
+        if (!alreadyAdded) {
+          execution.result_files.push({
+            url,
+            filename: derivedFilename,
+            token: '',
+            source: 'agent-mode',
+            sessionId: sessionWithMessages.sessionId,
+            generatedAt: timestamp,
+            is_html: true,
+            is_favorited: isFavorited,
+            is_archived: false
+          });
+        }
+      };
+
+      const extractHtmlUrls = (toolCall: any): Array<{ url: string; filename?: string }> => {
+        const results: Array<{ url: string; filename?: string }> = [];
+        const toolResult = toolCall?.result || {};
+        const urlCandidates = [
+          toolResult.s3_url,
+          toolResult.file_url,
+          toolResult.htmlUrl,
+          toolResult.blog_html_url
+        ].filter(Boolean);
+
+        urlCandidates.forEach((url: string) => {
+          if (url.toLowerCase().endsWith('.html') || url.toLowerCase().endsWith('.htm')) {
+            results.push({
+              url,
+              filename: toolResult.filename || toolResult.file_name || toolResult.versioned_filename
+            });
+          }
+        });
+
+        return results;
+      };
+
+      const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
+
+      for (const session of agentSessions) {
+        if (session.archived) {
+          continue;
+        }
+
+        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+        if (!sessionWithMessages || !sessionWithMessages.messages) {
+          continue;
+        }
+
+        const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
+
+        sessionWithMessages.messages.forEach((message: any) => {
+          const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
+
+          if (message.metadata?.toolCalls) {
+            message.metadata.toolCalls.forEach((toolCall: any) => {
+              const htmlUrls = extractHtmlUrls(toolCall);
+              htmlUrls.forEach(({ url, filename }) => {
+                addHtmlFile(sessionKey, sessionWithMessages, url, filename, timestamp);
+              });
+            });
+          }
+
+          if (typeof message.content === 'string') {
+            htmlUrlRegex.lastIndex = 0;
+            let match;
+            while ((match = htmlUrlRegex.exec(message.content)) !== null) {
+              addHtmlFile(sessionKey, sessionWithMessages, match[1], undefined, timestamp);
+            }
+          }
+        });
+      }
+
+      Object.keys(result).forEach(key => {
+        if (result[key].source === 'agent-mode') {
+          const task = result[key];
+          const executionTimes = task.executions
+            .map((execution: any) => execution.startTime)
+            .filter((time: string) => time !== null);
+
+          task.latestExecutionTime = executionTimes.length > 0 ? executionTimes.sort().pop() : null;
+          task.latestPendingOrRunningExecution = null;
+        }
+      });
+    } catch (error) {
+      console.error('Error fetching Agent Mode HTML reports:', error);
+    }
+  }
+
   return result;
 }
 
@@ -2292,12 +2423,17 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
+    // Check if this is an agent mode asset (executionId pattern: ${sessionId}-images, -videos, or -html)
     const isAgentModeImage = executionId.endsWith('-images');
     const isAgentModeVideo = executionId.endsWith('-videos');
-    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const isAgentModeHtml = executionId.endsWith('-html');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo || isAgentModeHtml;
     const agentSessionId = isAgentModeAsset 
-      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      ? (isAgentModeImage
+        ? executionId.replace('-images', '')
+        : isAgentModeVideo
+          ? executionId.replace('-videos', '')
+          : executionId.replace('-html', ''))
       : null;
 
     if (agentSessionId) {
@@ -2406,12 +2542,17 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
+    // Check if this is an agent mode asset (executionId pattern: ${sessionId}-images, -videos, or -html)
     const isAgentModeImage = executionId.endsWith('-images');
     const isAgentModeVideo = executionId.endsWith('-videos');
-    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const isAgentModeHtml = executionId.endsWith('-html');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo || isAgentModeHtml;
     const agentSessionId = isAgentModeAsset 
-      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      ? (isAgentModeImage
+        ? executionId.replace('-images', '')
+        : isAgentModeVideo
+          ? executionId.replace('-videos', '')
+          : executionId.replace('-html', ''))
       : null;
 
     if (agentSessionId) {
