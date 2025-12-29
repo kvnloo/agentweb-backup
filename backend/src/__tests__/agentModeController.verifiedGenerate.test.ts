@@ -307,7 +307,7 @@ describe('AgentModeController - Verified Generate', () => {
       );
     });
 
-    it('should validate requiredFunctions array', async () => {
+    it('should allow empty requiredFunctions array', async () => {
       let disconnectCallback: (() => void) | undefined;
       const mockReq = {
         user: { userId: mockUserId },
@@ -331,10 +331,10 @@ describe('AgentModeController - Verified Generate', () => {
 
       await agentModeController.verifiedGenerate(mockReq, mockRes);
 
-      expect(mockRes.status).toHaveBeenCalledWith(400);
+      expect(mockRes.status).toHaveBeenCalledWith(200);
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
-          error: 'Required functions array is required and must not be empty',
+          success: true,
         })
       );
     });
