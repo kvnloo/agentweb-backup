@@ -58,6 +58,11 @@ describe('AdminDashboard - Chat History Session Type Display', () => {
     expect(getSessionTypeColor('report_generation')).toBe('warning');
   });
 
+  it('should not treat report_generation as regular', () => {
+    expect(getSessionTypeLabel('report_generation')).not.toBe('Regular');
+    expect(getSessionTypeColor('report_generation')).not.toBe('default');
+  });
+
   it('should return "Undefined" for undefined sessionType', () => {
     expect(getSessionTypeLabel(undefined)).toBe('Undefined');
     expect(getSessionTypeColor(undefined)).toBe('default');

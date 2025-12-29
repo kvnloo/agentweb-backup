@@ -339,6 +339,40 @@ describe('AgentModeController - Verified Generate', () => {
       );
     });
 
+    it('should allow missing requiredFunctions', async () => {
+      let disconnectCallback: (() => void) | undefined;
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          startingMessage: 'Create a report',
+          keywords: [],
+          attachments: [],
+        },
+        on: jest.fn((event: string, callback: () => void) => {
+          if (event === 'close') {
+            disconnectCallback = callback;
+          }
+        }),
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+        on: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.verifiedGenerate(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(200);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          functionCallMisses: [],
+        })
+      );
+    });
+
     it('should validate requiredFunctions format', async () => {
       let disconnectCallback: (() => void) | undefined;
       const mockReq = {
