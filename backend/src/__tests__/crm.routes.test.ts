@@ -134,7 +134,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined);
+      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined, null);
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockList);
     });
@@ -167,7 +167,8 @@ describe('CRM Routes', () => {
         'test-user-id',
         'Alerts List',
         'Alert description',
-        ['email.received', 'email.clicked']
+        ['email.received', 'email.clicked'],
+        null
       );
       expect(mockResponse.status).toHaveBeenCalledWith(201);
     });
@@ -207,6 +208,66 @@ describe('CRM Routes', () => {
       }
       
       expect(mockResponse.status).toHaveBeenCalledWith(400);
+    });
+
+    it('should return 400 if listSenderId is not configured', async () => {
+      mockRequest.method = 'POST';
+      mockRequest.url = '/lists';
+      mockRequest.body = {
+        name: 'Bad Sender List',
+        listSenderId: 'missing-sender',
+      };
+
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'sender-1', email: 'sender@example.com', fromName: 'Sender' }],
+          defaultSenderId: 'sender-1',
+        }),
+      });
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.createLeadList).not.toHaveBeenCalled();
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listSenderId must reference a configured sender' });
+    });
+
+    it('should allow listSenderId when configured', async () => {
+      const mockList = {
+        listId: 'list3',
+        name: 'PoC List',
+        description: '',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.createLeadList as jest.Mock).mockResolvedValue(mockList);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'sender-1', email: 'sender@example.com', fromName: 'Sender' }],
+          defaultSenderId: 'sender-1',
+        }),
+      });
+
+      mockRequest.method = 'POST';
+      mockRequest.url = '/lists';
+      mockRequest.body = { name: 'PoC List', listSenderId: 'sender-1' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.post);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.createLeadList).toHaveBeenCalledWith(
+        'test-user-id',
+        'PoC List',
+        undefined,
+        undefined,
+        'sender-1'
+      );
+      expect(mockResponse.status).toHaveBeenCalledWith(201);
     });
   });
 
@@ -415,6 +476,74 @@ describe('CRM Routes', () => {
       expect(crmDb.createLead).toHaveBeenCalledWith('list1', mockRequest.body);
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockLead);
+    });
+
+    it('should return 400 if selectedSenderId is not configured', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'sender-1', email: 'sender@example.com', fromName: 'Sender' }],
+          defaultSenderId: 'sender-1',
+        }),
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {
+        email: 'test@example.com',
+        firstName: 'John',
+        selectedSenderId: 'missing-sender',
+      };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.createLead).not.toHaveBeenCalled();
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'selectedSenderId must reference a configured sender' });
+    });
+  });
+
+  describe('PUT /api/crm/lists/:listId/leads/:leadId', () => {
+    it('should return 400 if selectedSenderId is not configured', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify({
+          senders: [{ id: 'sender-1', email: 'sender@example.com', fromName: 'Sender' }],
+          defaultSenderId: 'sender-1',
+        }),
+      });
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = {
+        selectedSenderId: 'missing-sender',
+      };
+
+      const handler = router.stack.find((r: any) => 
+        r.route?.path === '/lists/:listId/leads/:leadId' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLead).not.toHaveBeenCalled();
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'selectedSenderId must reference a configured sender' });
     });
   });
 

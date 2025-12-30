@@ -4044,8 +4044,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  // Get sender information for a lead (from lead record, or default sender)
-  private async getSenderForLead(userId: string, leadSelectedSenderId?: string | null): Promise<{
+  // Get sender information for a lead (from lead record, list default, or account default sender)
+  private async getSenderForLead(
+    userId: string,
+    leadSelectedSenderId?: string | null,
+    listSenderId?: string | null
+  ): Promise<{
     fromName: string;
     notes?: string;
   } | null> {
@@ -4055,10 +4059,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return null;
       }
 
-      // Find the sender saved on the lead record, or default sender, or use the first one
+      // Find the sender saved on the lead record, or list default, or account default, or use the first one
       let sender = null;
       if (leadSelectedSenderId) {
         sender = sendersResult.senders.find((s) => s.id === leadSelectedSenderId);
+      }
+      if (!sender && listSenderId) {
+        sender = sendersResult.senders.find((s) => s.id === listSenderId);
       }
       if (!sender) {
         const defaultSenderId = sendersResult.defaultSenderId;
@@ -4736,7 +4743,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Get sender information (from lead record, or default sender from CRM configuration)
       const leadSelectedSenderId = (lead as any).selectedSenderId;
-      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId);
+      const senderInfo = await this.getSenderForLead(userId, leadSelectedSenderId, list?.listSenderId);
 
       // Get existing draft if it exists
       const existingDraft = (lead as any).emailDraft;
