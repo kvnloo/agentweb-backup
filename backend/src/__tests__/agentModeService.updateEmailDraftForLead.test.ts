@@ -181,7 +181,7 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
       expect(mockReadMarketStrategy).toHaveBeenCalledWith(userId);
-      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined);
+      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined);
       expect(crmDb.updateLead).toHaveBeenCalled();
     });
 
@@ -802,4 +802,3 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
     });
   });
 });
-

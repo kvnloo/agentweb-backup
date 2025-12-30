@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-30',
+    changes: [
+      'CRM lead lists now support a default PoC email sender, with per-lead PoC overrides',
+      '- Leads inherit the list PoC unless a lead-specific sender is selected',
+      '- Engagements popup now always shows the PoC selector',
+    ],
+  },
+  {
     date: '2025-12-29',
     changes: [
       'Added report generation support in Agent Mode',

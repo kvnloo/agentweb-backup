@@ -31,6 +31,32 @@ const normalizeAlertEvents = (alertEvents: any) => {
   return Array.from(new Set(normalized));
 };
 
+const getCrmSenderIds = async (userId: string) => {
+  const settingName = `crm_sender_emails_${userId}`;
+  const setting = await settingsService.getSetting(settingName);
+  if (!setting?.settingValue) {
+    return [];
+  }
+  try {
+    const config = JSON.parse(setting.settingValue);
+    const senders = Array.isArray(config?.senders) ? config.senders : [];
+    return senders.map((sender: any) => sender.id).filter(Boolean);
+  } catch (error) {
+    console.error('Error parsing CRM sender emails:', error);
+    return [];
+  }
+};
+
+const normalizeSenderId = (senderId: any) => {
+  if (senderId === null || senderId === undefined || senderId === '') {
+    return null;
+  }
+  if (typeof senderId !== 'string') {
+    return senderId;
+  }
+  return senderId.trim();
+};
+
 // Lead List Routes
 
 /**
@@ -69,7 +95,7 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, alertEvents } = req.body;
+    const { name, description, alertEvents, listSenderId } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ message: 'List name is required' });
@@ -82,11 +108,23 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
     }
 
+    const normalizedListSenderId = normalizeSenderId(listSenderId);
+    if (normalizedListSenderId !== null && typeof normalizedListSenderId !== 'string') {
+      return res.status(400).json({ message: 'listSenderId must be a string or null' });
+    }
+    if (normalizedListSenderId) {
+      const senderIds = await getCrmSenderIds(userId);
+      if (!senderIds.includes(normalizedListSenderId)) {
+        return res.status(400).json({ message: 'listSenderId must reference a configured sender' });
+      }
+    }
+
     const list = await crmDb.createLeadList(
       userId,
       name.trim(),
       description?.trim(),
-      normalizedAlertEvents
+      normalizedAlertEvents,
+      normalizedListSenderId
     );
     res.status(201).json(list);
   } catch (error: any) {
@@ -138,7 +176,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -160,6 +198,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       displayFields?: string[];
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
+      listSenderId?: string | null;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -204,6 +243,20 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       } catch (error: any) {
         return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
       }
+    }
+
+    if (listSenderId !== undefined) {
+      const normalizedListSenderId = normalizeSenderId(listSenderId);
+      if (normalizedListSenderId !== null && typeof normalizedListSenderId !== 'string') {
+        return res.status(400).json({ message: 'listSenderId must be a string or null' });
+      }
+      if (normalizedListSenderId) {
+        const senderIds = await getCrmSenderIds(userId);
+        if (!senderIds.includes(normalizedListSenderId)) {
+          return res.status(400).json({ message: 'listSenderId must reference a configured sender' });
+        }
+      }
+      updates.listSenderId = normalizedListSenderId;
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);
@@ -345,6 +398,19 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const userId = authReq.user?.userId;
     const { listId } = req.params;
     const leadData = req.body;
+    if (leadData?.selectedSenderId !== undefined) {
+      const normalizedSenderId = normalizeSenderId(leadData.selectedSenderId);
+      if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
+        return res.status(400).json({ message: 'selectedSenderId must be a string or null' });
+      }
+      if (normalizedSenderId) {
+        const senderIds = await getCrmSenderIds(userId);
+        if (!senderIds.includes(normalizedSenderId)) {
+          return res.status(400).json({ message: 'selectedSenderId must reference a configured sender' });
+        }
+      }
+      leadData.selectedSenderId = normalizedSenderId;
+    }
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -429,6 +495,20 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     if (list.userId !== userId) {
       return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (updates?.selectedSenderId !== undefined) {
+      const normalizedSenderId = normalizeSenderId(updates.selectedSenderId);
+      if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
+        return res.status(400).json({ message: 'selectedSenderId must be a string or null' });
+      }
+      if (normalizedSenderId) {
+        const senderIds = await getCrmSenderIds(userId);
+        if (!senderIds.includes(normalizedSenderId)) {
+          return res.status(400).json({ message: 'selectedSenderId must reference a configured sender' });
+        }
+      }
+      updates.selectedSenderId = normalizedSenderId;
     }
 
     const updateData = updates;

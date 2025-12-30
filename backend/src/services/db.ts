@@ -2600,7 +2600,13 @@ export const benchmarkTestDb = new BenchmarkTestDB();
 // CRM Database Service
 export const crmDb = {
   // Lead List operations
-  async createLeadList(userId: string, name: string, description?: string, alertEvents?: string[]) {
+  async createLeadList(
+    userId: string,
+    name: string,
+    description?: string,
+    alertEvents?: string[],
+    listSenderId?: string | null
+  ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const normalizedAlertEvents = Array.isArray(alertEvents)
@@ -2621,6 +2627,7 @@ export const crmDb = {
           displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
           sortConfig: null,
           alertEvents: normalizedAlertEvents,
+          listSenderId: listSenderId ?? null,
         },
       };
 
@@ -2706,6 +2713,7 @@ export const crmDb = {
       displayFields?: string[];
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
+      listSenderId?: string | null;
     }
   ) {
     try {
@@ -2741,6 +2749,12 @@ export const crmDb = {
         expressionAttributeNames['#alertEvents'] = 'alertEvents';
         updateExpressions.push('#alertEvents = :alertEvents');
         expressionAttributeValues[':alertEvents'] = updates.alertEvents;
+      }
+
+      if (updates.listSenderId !== undefined) {
+        expressionAttributeNames['#listSenderId'] = 'listSenderId';
+        updateExpressions.push('#listSenderId = :listSenderId');
+        expressionAttributeValues[':listSenderId'] = updates.listSenderId;
       }
 
       if (updateExpressions.length === 0) {
@@ -2882,6 +2896,7 @@ export const crmDb = {
     notes?: string;
     linkedin?: string;
     customFields?: Record<string, any>;
+    selectedSenderId?: string | null;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2914,6 +2929,9 @@ export const crmDb = {
       // Only include email if it's provided (GSI key cannot be empty string)
       if (emailValue) {
         item.email = emailValue;
+      }
+      if (leadData.selectedSenderId) {
+        item.selectedSenderId = leadData.selectedSenderId;
       }
 
       const params = {
