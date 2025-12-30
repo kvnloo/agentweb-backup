@@ -409,3 +409,6 @@ to support pdf file uploads for Knowledge Base, add OCR Parser for PDF file form
 
 ## Dec 23, 2025
 After resolving conflicts, we need to use force push to remote. On Github Desktop, instead of clicking on the pull and push button, we should select force push from it because otherwise a pull will happen again which will get the conflicts happen again.
+
+## Dev 30, 2025
+If tests fail in PR, we could rerun the step in the PR to see whether it is a random issue. This worked for customer-portal.
