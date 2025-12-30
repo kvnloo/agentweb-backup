@@ -1,6 +1,31 @@
 import { userDb, User } from './db';
 
 /**
+ * Helper function to normalize connected_accounts from old object format to new array format
+ * This provides backward compatibility with existing database records
+ */
+const normalizeAccounts = (connectedAccounts: any): ConnectedAccountConfig[] => {
+  if (!connectedAccounts) {
+    return [];
+  }
+  
+  // Already an array - return as is
+  if (Array.isArray(connectedAccounts)) {
+    return connectedAccounts;
+  }
+  
+  // Old object format - convert to array
+  if (typeof connectedAccounts === 'object') {
+    return Object.entries(connectedAccounts).map(([platform, config]) => ({
+      platform,
+      ...(config as object),
+    })) as ConnectedAccountConfig[];
+  }
+  
+  return [];
+};
+
+/**
  * Connected Account configuration stored in the User record
  */
 export interface ConnectedAccountConfig {
@@ -37,10 +62,12 @@ export const createAccount = async (
   }
 
   const now = new Date().toISOString();
-  const existingAccounts = (user as User).connected_accounts || [];
+  const existingAccounts = normalizeAccounts((user as User).connected_accounts);
   
-  // Find existing account for this platform
-  const existingIndex = existingAccounts.findIndex(acc => acc.platform === platform);
+  // Find existing account for this platform AND account_id (to support multiple accounts per platform)
+  const existingIndex = existingAccounts.findIndex(
+    acc => acc.platform === platform && acc.account_id === config.account_id
+  );
   const existingAccount = existingIndex >= 0 ? existingAccounts[existingIndex] : null;
 
   const accountConfig: ConnectedAccountConfig = {
@@ -80,7 +107,7 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
     return [];
   }
 
-  const accounts = (user as User).connected_accounts || [];
+  const accounts = normalizeAccounts((user as User).connected_accounts);
   return accounts.map(({ platform, ...config }) => ({
     platform,
     config,
@@ -99,7 +126,7 @@ export const getAccountByPlatform = async (
     return null;
   }
 
-  const accounts = (user as User).connected_accounts || [];
+  const accounts = normalizeAccounts((user as User).connected_accounts);
   const account = accounts.find(acc => acc.platform === platform);
   
   if (!account) {
@@ -130,7 +157,7 @@ export const updateAccountTokens = async (
     throw new Error('User not found');
   }
 
-  const accounts = (user as User).connected_accounts || [];
+  const accounts = normalizeAccounts((user as User).connected_accounts);
   const accountIndex = accounts.findIndex(acc => acc.platform === platform);
   
   if (accountIndex < 0) {
@@ -166,7 +193,7 @@ export const deleteAccount = async (
     throw new Error('User not found');
   }
 
-  const accounts = (user as User).connected_accounts || [];
+  const accounts = normalizeAccounts((user as User).connected_accounts);
   const filteredAccounts = accounts.filter(acc => acc.platform !== platform);
 
   // If no accounts were removed, just return

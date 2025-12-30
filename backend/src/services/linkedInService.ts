@@ -62,15 +62,43 @@ export class LinkedInService {
   }
 
   /**
-   * Get current user profile
+   * Get current user profile (OpenID Connect userinfo endpoint)
+   * Note: This endpoint does NOT use the versioned REST API headers
    */
   async getProfile(accessToken: string): Promise<LinkedInProfile> {
-    return this.safeRequest(async () => {
-      const response = await this.client.get<LinkedInProfile>('/v2/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` },
+    try {
+      console.log('[LinkedIn getProfile] Fetching profile with token:', accessToken?.substring(0, 20) + '...');
+      
+      // Use direct axios call without versioned API headers for OIDC userinfo
+      const response = await axios.get<LinkedInProfile>('https://api.linkedin.com/v2/userinfo', {
+        headers: { 
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000, // 10 second timeout
       });
+      
+      console.log('[LinkedIn getProfile] Success:', response.data);
       return response.data;
-    });
+    } catch (error: any) {
+      console.error('[LinkedIn getProfile] Full raw error:', error);
+      console.error('[LinkedIn getProfile] Error name:', error.name);
+      console.error('[LinkedIn getProfile] Error code:', error.code);
+      console.error('[LinkedIn getProfile] Error message:', error.message);
+      console.error('[LinkedIn getProfile] Is Axios error:', axios.isAxiosError(error));
+      
+      if (axios.isAxiosError(error)) {
+        console.error('[LinkedIn getProfile] Axios error details:', {
+          status: error.response?.status,
+          statusText: error.response?.statusText,
+          data: error.response?.data,
+          config: error.config?.url,
+        });
+      }
+      
+      this.handleError(error);
+      throw error;
+    }
   }
 
   /**

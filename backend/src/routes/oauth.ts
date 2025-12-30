@@ -39,12 +39,12 @@ router.get('/linkedin/callback', async (req, res) => {
 
   if (error) {
     const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-    return res.redirect(`${frontendUrl}/settings?error=linkedin_access_denied&details=${error}`);
+    return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=linkedin_access_denied&details=${error}`);
   }
 
   if (!code) {
     const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-    return res.redirect(`${frontendUrl}/settings?error=no_code_provided`);
+    return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
   }
 
   // NOTE: In production, verify 'state' against user's session to prevent CSRF attacks.
@@ -52,7 +52,7 @@ router.get('/linkedin/callback', async (req, res) => {
   // The frontend will call POST /linkedin/connect with the code and the user's auth token.
   
   const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-  res.redirect(`${frontendUrl}/settings?linkedin_code=${code}`);
+  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_code=${code}`);
 });
 
 // Finalize LinkedIn Connection (Authenticated)
@@ -80,28 +80,43 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
       }
     });
 
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
-    console.log('[LinkedIn Connect] Token exchange successful, fetching profile...');
+    const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data;
+    console.log('[LinkedIn Connect] Token exchange successful. Has id_token:', !!id_token);
     
-    // Try to fetch profile, but fall back to token data if it fails (network issues)
-    let profile: { sub: string; name: string } = { sub: 'unknown', name: 'LinkedIn User' };
     
-    try {
-      profile = await linkedInService.getProfile(access_token);
-      console.log('[LinkedIn Connect] Profile fetched:', profile.name);
-    } catch (profileError: any) {
-      console.warn('[LinkedIn Connect] Profile fetch failed, using fallback:', profileError.message);
-      
-      // Try to decode the JWT access token to get user info
+    // Try to extract profile from id_token first (most reliable - no network call needed)
+    let profile: { sub: string; name: string; email?: string } = { 
+      sub: `linkedin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      name: 'LinkedIn User' 
+    };
+    
+    // Method 1: Extract from id_token JWT (preferred - no additional API call)
+    if (id_token) {
       try {
-        const tokenParts = access_token.split('.');
+        const tokenParts = id_token.split('.');
         if (tokenParts.length === 3) {
           const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
+          console.log('[LinkedIn Connect] Decoded id_token payload:', { sub: payload.sub, name: payload.name });
           if (payload.sub) profile.sub = payload.sub;
           if (payload.name) profile.name = payload.name;
+          if (payload.email) profile.email = payload.email;
+          console.log('[LinkedIn Connect] Profile from id_token:', profile.name, profile.sub);
         }
-      } catch {
-        // LinkedIn access tokens aren't always JWTs, use default
+      } catch (jwtError) {
+        console.warn('[LinkedIn Connect] Failed to decode id_token:', jwtError);
+      }
+    }
+    
+    // Method 2: If id_token didn't have info, try the API call
+    if (profile.sub.startsWith('linkedin_')) {
+      try {
+        const apiProfile = await linkedInService.getProfile(access_token);
+        console.log('[LinkedIn Connect] Profile from API:', apiProfile.name);
+        profile.sub = apiProfile.sub;
+        profile.name = apiProfile.name;
+        if (apiProfile.email) profile.email = apiProfile.email;
+      } catch (profileError: any) {
+        console.warn('[LinkedIn Connect] Profile API failed, using fallback. Error:', profileError.code || profileError.message);
       }
     }
 
