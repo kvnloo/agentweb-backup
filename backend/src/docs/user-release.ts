@@ -12,6 +12,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'CRM lead lists now support a default PoC email sender, with per-lead PoC overrides',
       '- Leads inherit the list PoC unless a lead-specific sender is selected',
       '- Engagements popup now always shows the PoC selector',
+      'Fixed the bug SEO/GEO page redirects to Agent Mode',
+      '-  The page now shows a "Contact Admin" setup message when not configured',
     ],
   },
   {
