@@ -127,6 +127,20 @@ export interface User {
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  connected_accounts?: Array<{
+    platform: string;
+    account_id: string;
+    account_name: string;
+    account_type: 'personal' | 'company_page';
+    page_id?: string;
+    profile_id?: string;
+    access_token: string;
+    refresh_token?: string;
+    token_expires_at: number;
+    scopes: string[];
+    connected_at: string;
+    updated_at: string;
+  }>;
 }
 
 interface UserInteraction {

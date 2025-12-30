@@ -95,3 +95,45 @@ export async function getGCSPPrivateKey(): Promise<string> {
     throw new Error('Failed to fetch GCS private key from Secrets Manager');
   }
 }
+
+/**
+ * Interface for LinkedIn credentials returned from Secrets Manager
+ */
+export interface LinkedInCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get LinkedIn OAuth credentials from AWS Secrets Manager
+ * @returns The LinkedIn client credentials (clientId and clientSecret)
+ */
+export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
+  return {
+    clientId: '8686e2cjsw55we',
+    clientSecret: 'WPL_AP1.IrKaY2k9bVyH0pXc.Fs/xUA==',
+  };
+  // try {
+  //   const environment = process.env.NODE_ENV || 'development';
+  //   const secretName = environment === 'production'
+  //     ? 'prod/AgentWeb/LinkedIn/Company'
+  //     : 'dev/AgentWeb/LinkedIn/Company';
+    
+  //   const secretString = await getSecret(secretName);
+    
+  //   if (!secretString || secretString.trim() === '') {
+  //     throw new Error('LinkedIn credentials secret is empty');
+  //   }
+    
+  //   const credentials = JSON.parse(secretString) as LinkedInCredentials;
+    
+  //   if (!credentials.clientId || !credentials.clientSecret) {
+  //     throw new Error('LinkedIn credentials missing clientId or clientSecret');
+  //   }
+    
+  //   return credentials;
+  // } catch (error) {
+  //   console.error('Error fetching LinkedIn credentials from Secrets Manager:', error);
+  //   throw new Error('Failed to fetch LinkedIn credentials from Secrets Manager');
+  // }
+}
