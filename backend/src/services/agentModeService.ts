@@ -1212,7 +1212,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'list_knowledge_base_files',
-          description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, types (public/private), and last updated timestamps.',
+          description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, URLs, types (public/private), and last updated timestamps.',
           parameters: {
             type: 'object',
             properties: {},
@@ -2037,7 +2037,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             properties: {
               image_url: {
                 type: 'string',
-                description: 'Image URL to analyze and describe'
+                description: 'Image URL to analyze and describe. Include the complete file URL in request.'
               },
               prompt: {
                 type: 'string',
@@ -2621,8 +2621,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
               type: 'private',
               updatedAt: new Date().toISOString(),
               files: [
-                { fileName: 'knowledge-base.txt', fileSize: 1024 },
-                { fileName: 'uploaded-guide.pdf', fileSize: 2048 }
+                { fileName: 'knowledge-base.txt', fileSize: 1024, url: 'https://example.com/knowledge-base.txt' },
+                { fileName: 'uploaded-guide.pdf', fileSize: 2048, url: 'https://example.com/uploaded-guide.pdf' }
               ]
             }
           ],
@@ -6858,11 +6858,13 @@ ${emailDraftFormat === 'text'
       const files = [
         {
           fileName: 'knowledge-base.txt',
-          fileSize: task.knowledgeBaseSize || 0
+          fileSize: task.knowledgeBaseSize || 0,
+          url: task.knowledgeBase || null
         },
         ...(task.knowledgeBaseFiles || []).map((f: any) => ({
           fileName: f.filename,
-          fileSize: f.size || 0
+          fileSize: f.size || 0,
+          url: f.url || null
         }))
       ];
 
@@ -6882,7 +6884,7 @@ ${emailDraftFormat === 'text'
 
     return {
       success: true,
-      message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)`,
+      message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). Ensure to use the complete file URL to access the file.`,
       knowledge_bases: knowledgeBases,
       totalKnowledgeBases: knowledgeBases.length,
       totalFiles

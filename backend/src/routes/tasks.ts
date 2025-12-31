@@ -1365,7 +1365,7 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       // Validate file type
       if (!isSupportedFileType(file.originalname, file.mimetype)) {
         return res.status(400).json({ 
-          message: `Unsupported file type: ${file.originalname}. Supported types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM` 
+          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.` 
         });
       }
 
@@ -1400,6 +1400,13 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
           expires: '03-01-2500' // Far future expiration
         });
 
+        console.log('KB upload: generated signed URL', {
+          taskId,
+          filePath,
+          filename: file.originalname,
+          url
+        });
+
         uploadedFiles.push({
           filename: file.originalname,
           size: file.size,
@@ -1426,6 +1433,15 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       filesArray: JSON.stringify(updatedKnowledgeBaseFiles)
     });
     
+    console.log('KB upload: updating task with files', {
+      taskId,
+      files: updatedKnowledgeBaseFiles.map((f: any) => ({
+        filename: f.filename,
+        url: f.url,
+        key: f.key
+      }))
+    });
+
     await taskDb.updateTask(taskId, {
       knowledgeBaseFiles: updatedKnowledgeBaseFiles,
       knowledgeBaseUpdatedAt: new Date().toISOString()

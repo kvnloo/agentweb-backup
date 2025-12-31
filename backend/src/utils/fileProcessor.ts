@@ -9,7 +9,20 @@ export const SUPPORTED_FILE_TYPES = [
   'docx',
   'pptx',
   'xlsx',
-  'xlsm'
+  'xlsm',
+  'jpg',
+  'jpeg',
+  'png',
+  'gif',
+  'webp',
+  'bmp',
+  'svg',
+  'mp4',
+  'mov',
+  'webm',
+  'ogg',
+  'm4v',
+  'avi'
 ] as const;
 
 export type SupportedFileType = typeof SUPPORTED_FILE_TYPES[number];
@@ -27,7 +40,19 @@ function getFileTypeFromMime(mimeType?: string): string {
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
     'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-    'application/vnd.ms-excel.sheet.macroEnabled.12': 'xlsm'
+    'application/vnd.ms-excel.sheet.macroEnabled.12': 'xlsm',
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'image/bmp': 'bmp',
+    'image/svg+xml': 'svg',
+    'video/mp4': 'mp4',
+    'video/quicktime': 'mov',
+    'video/webm': 'webm',
+    'video/ogg': 'ogg',
+    'video/x-m4v': 'm4v',
+    'video/x-msvideo': 'avi'
   };
 
   return mimeMap[mimeType] || 'unknown';
@@ -44,6 +69,9 @@ export function isSupportedFileType(filename: string, mimeType?: string): boolea
   }
 
   if (mimeType) {
+    if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
+      return true;
+    }
     const fileType = getFileTypeFromMime(mimeType);
     return SUPPORTED_FILE_TYPES.includes(fileType as SupportedFileType);
   }
@@ -66,7 +94,20 @@ export function getContentType(filename: string, mimeType?: string): string {
     'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    'xlsm': 'application/vnd.ms-excel.sheet.macroEnabled.12'
+    'xlsm': 'application/vnd.ms-excel.sheet.macroEnabled.12',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif',
+    'webp': 'image/webp',
+    'bmp': 'image/bmp',
+    'svg': 'image/svg+xml',
+    'mp4': 'video/mp4',
+    'mov': 'video/quicktime',
+    'webm': 'video/webm',
+    'ogg': 'video/ogg',
+    'm4v': 'video/x-m4v',
+    'avi': 'video/x-msvideo'
   };
 
   return mimeMap[extension] || 'application/octet-stream';

@@ -89,7 +89,8 @@ describe('AgentModeService - Knowledge Base Files', () => {
             knowledgeBaseSize: 1024,
             knowledgeBaseType: 'private',
             knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z',
-            knowledgeBaseFiles: [{ filename: 'file1.pdf', size: 256 }]
+            knowledgeBase: 'https://example.com/knowledge-base.txt',
+            knowledgeBaseFiles: [{ filename: 'file1.pdf', size: 256, url: 'https://example.com/file1.pdf' }]
           },
           {
             taskId: 'task-2',
@@ -97,6 +98,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
             knowledgeBaseSize: 2048,
             knowledgeBaseType: 'public',
             knowledgeBaseUpdatedAt: '2024-01-02T00:00:00Z',
+            knowledgeBase: 'https://example.com/task-2/knowledge-base.txt',
             knowledgeBaseFiles: []
           }
         ];
@@ -114,11 +116,11 @@ describe('AgentModeService - Knowledge Base Files', () => {
           updatedAt: '2024-01-01T00:00:00Z'
         });
         expect(result.knowledge_bases[0].files).toEqual([
-          { fileName: 'knowledge-base.txt', fileSize: 1024 },
-          { fileName: 'file1.pdf', fileSize: 256 }
+          { fileName: 'knowledge-base.txt', fileSize: 1024, url: 'https://example.com/knowledge-base.txt' },
+          { fileName: 'file1.pdf', fileSize: 256, url: 'https://example.com/file1.pdf' }
         ]);
         expect(result.knowledge_bases[1].files).toEqual([
-          { fileName: 'knowledge-base.txt', fileSize: 2048 }
+          { fileName: 'knowledge-base.txt', fileSize: 2048, url: 'https://example.com/task-2/knowledge-base.txt' }
         ]);
         expect(result.totalFiles).toBe(3);
         expect(result.totalKnowledgeBases).toBe(2);
@@ -334,4 +336,3 @@ describe('AgentModeService - Knowledge Base Files', () => {
     });
   });
 });
-
