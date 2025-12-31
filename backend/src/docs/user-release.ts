@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-12-31',
+    changes: [
+      'Knowledge Base now supports image and video uploads',
+      '- Upload images (JPG, PNG, GIF, WebP, BMP, SVG) and videos (MP4, MOV, WebM, OGG, M4V, AVI) alongside document files',
+      '- Images follow the 18MB file limit; videos allow up to 100MB per file',
+      'Agent Mode now supports describe_video function calls for video understanding',
+    ],
+  },
+  {
     date: '2025-12-30',
     changes: [
       'CRM lead lists now support a default PoC email sender, with per-lead PoC overrides',
