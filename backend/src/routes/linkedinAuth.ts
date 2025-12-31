@@ -1,23 +1,55 @@
-
 import express from 'express';
 import axios from 'axios';
+import jwt from 'jsonwebtoken';
 import { getLinkedInConfig, getLinkedInOrgConfig } from '../config/integrations';
-import { createAccount, getAccountsByUserId, deleteAccount, deleteAccountById } from '../services/connectedAccountsDb';
+import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
-import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 
 const router = express.Router();
+
+// JWT Secret for signing the state parameter
+// Use a dedicated secret or fall back to the main JWT secret
+const STATE_SECRET = process.env.JWT_SECRET || 'default-secret-change-me';
+
+interface StatePayload {
+  userId: string;
+  nonce: string;
+  type: 'personal' | 'organization';
+}
+
+// Helper to generate signed state
+const generateState = (userId: string, type: 'personal' | 'organization'): string => {
+  const nonce = Math.random().toString(36).substring(7);
+  const payload: StatePayload = { userId, nonce, type };
+  // Short expiration (e.g., 15 minutes) to prevent replay
+  return jwt.sign(payload, STATE_SECRET, { expiresIn: '15m' });
+};
+
+// Helper to verify state
+const verifyState = (state: string, userId: string): boolean => {
+  try {
+    const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
+    return decoded.userId === userId;
+  } catch (error) {
+    console.error('[OAuth] State verification failed:', error);
+    return false;
+  }
+};
 
 // ============================================
 // LinkedIn Personal Profile OAuth
 // ============================================
 
 // LinkedIn Personal OAuth Init
-router.get('/linkedin/init', async (req, res) => {
+// Returns the authorization URL to the frontend
+router.get('/init', authenticateToken, async (req: any, res) => {
   try {
+    const userId = req.user.userId;
     const config = await getLinkedInConfig();
-    const state = Math.random().toString(36).substring(7); // Simple state for demo. in prod use signed JWT or session
+    
+    // Generate signed state
+    const state = generateState(userId, 'personal');
     
     // Construct URL
     const params = new URLSearchParams({
@@ -28,7 +60,9 @@ router.get('/linkedin/init', async (req, res) => {
       scope: config.scopes.join(' ')
     });
 
-    res.redirect(`${config.authorizationUrl}?${params.toString()}`);
+    const url = `${config.authorizationUrl}?${params.toString()}`;
+    res.json({ success: true, url });
+    
   } catch (error) {
     console.error('Error initializing LinkedIn OAuth:', error);
     res.status(500).json({ error: 'Failed to initialize LinkedIn OAuth' });
@@ -36,27 +70,32 @@ router.get('/linkedin/init', async (req, res) => {
 });
 
 // LinkedIn Personal OAuth Callback
-router.get('/linkedin/callback', async (req, res) => {
+// This route is hit by LinkedIn. It renders the popup closer or redirects to frontend.
+router.get('/callback', async (req, res) => {
   const { code, state, error } = req.query;
+  const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
   if (error) {
-    const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=linkedin_access_denied&details=${error}`);
   }
 
   if (!code) {
-    const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
   }
 
-  const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_code=${code}`);
+  // Pass the state back to the frontend so it can be sent to /connect
+  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_code=${code}&state=${state}`);
 });
 
 // Finalize LinkedIn Personal Connection
-router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
-  const { code } = req.body;
+router.post('/connect', authenticateToken, async (req: any, res) => {
+  const { code, state } = req.body;
   const userId = req.user.userId;
+
+  // Security Check: Verify State
+  if (!state || !verifyState(state, userId)) {
+    return res.status(403).json({ error: 'Invalid or expired state parameter. CSRF protection.' });
+  }
 
   try {
     const config = await getLinkedInConfig();
@@ -78,26 +117,23 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
     });
 
     const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data;
-    console.log('[LinkedIn Connect] Token exchange successful. Has id_token:', !!id_token);
     
-    // Try to extract profile from id_token first (most reliable - no network call needed)
+    // Try to extract profile from id_token first
     let profile: { sub: string; name: string; email?: string; picture?: string } = { 
       sub: `linkedin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       name: 'LinkedIn User' 
     };
     
-    // Method 1: Extract from id_token JWT (preferred - no additional API call)
+    // Method 1: Extract from id_token JWT
     if (id_token) {
       try {
         const tokenParts = id_token.split('.');
         if (tokenParts.length === 3) {
           const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
-          console.log('[LinkedIn Connect] Decoded id_token payload:', { sub: payload.sub, name: payload.name });
           if (payload.sub) profile.sub = payload.sub;
           if (payload.name) profile.name = payload.name;
           if (payload.email) profile.email = payload.email;
           if (payload.picture) profile.picture = payload.picture;
-          console.log('[LinkedIn Connect] Profile from id_token:', profile.name, profile.sub);
         }
       } catch (jwtError) {
         console.warn('[LinkedIn Connect] Failed to decode id_token:', jwtError);
@@ -108,13 +144,12 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
     if (profile.sub.startsWith('linkedin_')) {
       try {
         const apiProfile = await linkedInService.getProfile(access_token);
-        console.log('[LinkedIn Connect] Profile from API:', apiProfile.name);
         profile.sub = apiProfile.sub;
         profile.name = apiProfile.name;
         if (apiProfile.email) profile.email = apiProfile.email;
         if (apiProfile.picture) profile.picture = apiProfile.picture;
       } catch (profileError: any) {
-        console.warn('[LinkedIn Connect] Profile API failed, using fallback. Error:', profileError.code || profileError.message);
+        console.warn('[LinkedIn Connect] Profile API failed, using fallback.', profileError.message);
       }
     }
 
@@ -124,7 +159,7 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
       accountId = `urn:li:person:${accountId}`;
     }
 
-    // Save to DB (profile_id from sub)
+    // Save to DB
     const accountInput = {
       account_id: accountId,
       account_name: profile.name,
@@ -145,11 +180,6 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
 
   } catch (error: any) {
     console.error('Connect Error:', error);
-    console.error('Error details:', {
-      message: error.message,
-      response: error.response?.data,
-      status: error.response?.status
-    });
     res.status(500).json({ error: 'Failed to connect account', details: error.message });
   }
 });
@@ -159,10 +189,12 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
 // ============================================
 
 // LinkedIn Organization OAuth Init
-router.get('/linkedin/org/init', async (req, res) => {
+router.get('/org/init', authenticateToken, async (req: any, res) => {
   try {
+    const userId = req.user.userId;
     const config = await getLinkedInOrgConfig();
-    const state = 'org_' + Math.random().toString(36).substring(7);
+    
+    const state = generateState(userId, 'organization');
     
     const params = new URLSearchParams({
       response_type: 'code',
@@ -172,7 +204,8 @@ router.get('/linkedin/org/init', async (req, res) => {
       scope: config.scopes.join(' ')
     });
 
-    res.redirect(`${config.authorizationUrl}?${params.toString()}`);
+    const url = `${config.authorizationUrl}?${params.toString()}`;
+    res.json({ success: true, url });
   } catch (error) {
     console.error('Error initializing LinkedIn Org OAuth:', error);
     res.status(500).json({ error: 'Failed to initialize LinkedIn Organization OAuth' });
@@ -180,8 +213,8 @@ router.get('/linkedin/org/init', async (req, res) => {
 });
 
 // LinkedIn Organization OAuth Callback
-router.get('/linkedin/org/callback', async (req, res) => {
-  const { code, error } = req.query;
+router.get('/org/callback', async (req, res) => {
+  const { code, state, error } = req.query;
   const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
   if (error) {
@@ -192,14 +225,19 @@ router.get('/linkedin/org/callback', async (req, res) => {
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
   }
 
-  // Redirect with org-specific code parameter
-  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_org_code=${code}`);
+  // Redirect with org-specific code parameter AND state
+  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_org_code=${code}&state=${state}`);
 });
 
 // Get user's admin organizations (after org OAuth)
-router.post('/linkedin/organizations', authenticateToken, async (req: any, res) => {
-  const { code } = req.body;
+router.post('/organizations', authenticateToken, async (req: any, res) => {
+  const { code, state } = req.body;
   const userId = req.user.userId;
+
+  // Security Check: Verify State
+  if (!state || !verifyState(state, userId)) {
+    return res.status(403).json({ error: 'Invalid or expired state parameter. CSRF protection.' });
+  }
 
   try {
     const config = await getLinkedInOrgConfig();
@@ -220,7 +258,7 @@ router.post('/linkedin/organizations', authenticateToken, async (req: any, res) 
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     
-    // Get organizations where user is admin (returns LinkedInAclResponse)
+    // Get organizations where user is admin
     const aclResponse = await linkedInService.getAdminOrganizations(access_token);
     const orgUrns = aclResponse.elements.map(acl => acl.organizationTarget);
     
@@ -250,11 +288,9 @@ router.post('/linkedin/organizations', authenticateToken, async (req: any, res) 
       })
     );
 
-    // Return organizations and tokens for later use
     res.json({
       success: true,
       organizations,
-      // Return tokens encrypted or store in session - for now just return for client to use
       _tokens: {
         access_token,
         refresh_token,
@@ -270,7 +306,10 @@ router.post('/linkedin/organizations', authenticateToken, async (req: any, res) 
 });
 
 // Connect selected company pages
-router.post('/linkedin/connect-pages', authenticateToken, async (req: any, res) => {
+// State validation not strictly needed here if we trust the tokens? 
+// Actually this is a separate step post-OAuth. The tokens are passed in.
+// We verify the user logic normally via authenticateToken.
+router.post('/connect-pages', authenticateToken, async (req: any, res) => {
   const { organizations, tokens } = req.body;
   const userId = req.user.userId;
 
@@ -288,7 +327,7 @@ router.post('/linkedin/connect-pages', authenticateToken, async (req: any, res) 
 
     for (const org of organizations) {
       const accountInput = {
-        account_id: org.urn, // Store full URN (e.g., urn:li:organization:123)
+        account_id: org.urn,
         account_name: org.name,
         config: {
           account_type: 'company_page' as const,
@@ -316,73 +355,4 @@ router.post('/linkedin/connect-pages', authenticateToken, async (req: any, res) 
   }
 });
 
-// ============================================
-// Connected Accounts Management
-// ============================================
-
-// List Connected Accounts (with status)
-router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
-  const userId = req.user.userId;
-
-  try {
-    const accounts = await getAccountsByUserId(userId);
-
-    const accountsWithStatus = accounts.map(acc => {
-      const status = getTokenStatus(acc.config.token_expires_at);
-      const expiryMessage = formatExpiryMessage(acc.config.token_expires_at);
-
-      return {
-        platform: acc.platform,
-        account_id: acc.account_id,
-        account_name: acc.account_name,
-        account_type: acc.config.account_type,
-        profile_id: acc.config.profile_id,
-        page_id: acc.config.page_id,
-        profile_image_url: (acc.config as any).profile_image_url,
-        account_handle: (acc.config as any).account_handle,
-        follower_count: (acc.config as any).follower_count,
-        created_at: acc.created_at,
-        // Status fields
-        status,
-        expires_at: acc.config.token_expires_at,
-        expiry_message: expiryMessage,
-      };
-    });
-
-    res.json({ success: true, accounts: accountsWithStatus });
-  } catch (error) {
-    console.error('List Accounts Error:', error);
-    res.status(500).json({ error: 'Failed to list connected accounts' });
-  }
-});
-
-// Delete Connected Account by platform (all accounts for that platform)
-router.delete('/connected-accounts/:platform', authenticateToken, async (req: any, res) => {
-  const userId = req.user.userId;
-  const { platform } = req.params;
-
-  try {
-    await deleteAccount(userId, platform);
-    res.json({ success: true, message: `${platform} account(s) disconnected` });
-  } catch (error) {
-    console.error('Delete Account Error:', error);
-    res.status(500).json({ error: 'Failed to delete connected account' });
-  }
-});
-
-// Delete specific Connected Account by platform and account_id
-router.delete('/connected-accounts/:platform/:accountId', authenticateToken, async (req: any, res) => {
-  const userId = req.user.userId;
-  const { platform, accountId } = req.params;
-
-  try {
-    await deleteAccountById(userId, platform, accountId);
-    res.json({ success: true, message: `${platform} account ${accountId} disconnected` });
-  } catch (error) {
-    console.error('Delete Account By ID Error:', error);
-    res.status(500).json({ error: 'Failed to delete connected account' });
-  }
-});
-
 export default router;
-

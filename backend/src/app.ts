@@ -28,7 +28,7 @@ import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
 import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
-import oauthRoutes from "./routes/oauth";
+
 
 // Import the new controller
 import {
@@ -152,7 +152,13 @@ app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
-app.use("/api/oauth", oauthRoutes);
+import linkedinAuthRoutes from "./routes/linkedinAuth";
+import connectedAccountsRoutes from "./routes/connectedAccounts";
+
+// ... existing imports ...
+
+app.use("/api/oauth/linkedin", linkedinAuthRoutes);
+app.use("/api/oauth", connectedAccountsRoutes);
 
 
 // Health check endpoint
