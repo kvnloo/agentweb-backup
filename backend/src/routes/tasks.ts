@@ -17,6 +17,7 @@ import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB } from '../services/chatbotService';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
+import { uploadFileToS3 } from '../utils/s3Utils';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -69,6 +70,13 @@ const openai = new OpenAI({
 // Ensure bucket exists
 const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
 const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
+const s3 = new AWS.S3({
+  region: process.env.AWS_REGION || 'us-west-2',
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+});
+
+const S3_KEY_PREFIX = 's3:';
 
 type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
@@ -1050,13 +1058,6 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     // Include knowledgeBaseFiles in the response
     const knowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
     
-    console.log('GET knowledge-base - Retrieved task:', {
-      taskId,
-      hasKnowledgeBaseFiles: !!(task as any).knowledgeBaseFiles,
-      knowledgeBaseFilesCount: knowledgeBaseFiles.length,
-      knowledgeBaseFiles: JSON.stringify(knowledgeBaseFiles)
-    });
-
     // If knowledgeBaseType is not set, determine it based on file content
     if (!task.knowledgeBaseType) {
       const storageInstance = await initializeStorage();
@@ -1362,10 +1363,14 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
     const uploadedFiles: Array<{ filename: string; size: number; url: string; key: string; uploadedAt: string }> = [];
 
     for (const file of files) {
+      const isMediaFile =
+        file.mimetype?.startsWith('image/') ||
+        file.mimetype?.startsWith('video/');
+
       // Validate file type
       if (!isSupportedFileType(file.originalname, file.mimetype)) {
         return res.status(400).json({ 
-          message: `Unsupported file type: ${file.originalname}. Supported types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM` 
+          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.` 
         });
       }
 
@@ -1377,6 +1382,30 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       }
 
       try {
+        if (isMediaFile) {
+          const uploadResult = await uploadFileToS3(
+            file.buffer,
+            file.originalname,
+            userId,
+            file.mimetype || getContentType(file.originalname, file.mimetype)
+          );
+
+          if (!uploadResult.success || !uploadResult.url || !uploadResult.key) {
+            return res.status(400).json({ 
+              message: `Failed to upload file ${file.originalname}: ${uploadResult.error || 'Unknown error'}` 
+            });
+          }
+
+          uploadedFiles.push({
+            filename: file.originalname,
+            size: file.size,
+            url: uploadResult.url,
+            key: `${S3_KEY_PREFIX}${uploadResult.key}`,
+            uploadedAt: new Date().toISOString()
+          });
+          continue;
+        }
+
         // Store the file in GCS
         const timestamp = Date.now();
         const sanitizedFilename = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -1477,6 +1506,31 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
 
     // Decode the file key (it's URL encoded)
     const decodedKey = decodeURIComponent(fileKey);
+    if (decodedKey.startsWith(S3_KEY_PREFIX)) {
+      try {
+        await s3
+          .deleteObject({
+            Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+            Key: decodedKey.slice(S3_KEY_PREFIX.length),
+          })
+          .promise();
+      } catch (s3Error) {
+        console.warn('Failed to delete from S3:', s3Error);
+      }
+
+      const currentFiles = (task as any).knowledgeBaseFiles || [];
+      const updatedFiles = currentFiles.filter((f: any) => f.key !== decodedKey);
+
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseFiles: updatedFiles,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
+
+      return res.json({ 
+        message: 'File deleted successfully',
+        knowledgeBaseFiles: updatedFiles
+      });
+    }
 
     // Delete file from GCS
     const storageInstance = await initializeStorage();
@@ -1602,6 +1656,10 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
       for (const fileInfo of knowledgeBaseFiles) {
         try {
           const oldFileKey = fileInfo.key;
+          if (typeof oldFileKey !== 'string' || oldFileKey.startsWith(S3_KEY_PREFIX)) {
+            updatedFiles.push(fileInfo);
+            continue;
+          }
           const oldFile = currentBucket.file(oldFileKey);
           const [fileExists] = await oldFile.exists();
           

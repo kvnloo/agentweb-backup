@@ -9,6 +9,10 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
+import { createWriteStream, promises as fs } from 'fs';
+import os from 'os';
+import path from 'path';
+import { Readable } from 'stream';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
 // Used for updateEmailDraftForLead to match generateBlogContent pattern
@@ -1212,7 +1216,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'list_knowledge_base_files',
-          description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, types (public/private), and last updated timestamps.',
+          description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, URLs, types (public/private), and last updated timestamps.',
           parameters: {
             type: 'object',
             properties: {},
@@ -2037,7 +2041,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             properties: {
               image_url: {
                 type: 'string',
-                description: 'Image URL to analyze and describe'
+                description: 'Image URL to analyze and describe. Include the complete file URL in request.'
               },
               prompt: {
                 type: 'string',
@@ -2046,6 +2050,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             },
             required: ['image_url']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'describe_video',
+          description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video or when you need to understand video content.',
+          parameters: {
+            type: 'object',
+            properties: {
+              video_file_url: {
+                type: 'string',
+                description: 'Video URL to analyze and describe. Include the complete file URL in request.'
+              },
+              prompt: {
+                type: 'string',
+                description: 'Custom prompt/instructions for analyzing the video. Specify what aspects to focus on (e.g., key events, narration, visual details, or timing).',
+                default: 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.'
+              }
+            },
+            required: ['video_file_url']
           }
         }
       },
@@ -2311,6 +2337,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
         message: result.message,
         videoUrl: result.videoUrl,
         filename: result.filename
+      };
+    }
+
+    if (toolName === 'describe_video') {
+      return {
+        success: result.success,
+        description: result.description,
+        videoUrl: result.videoUrl
       };
     }
 
@@ -2621,8 +2655,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
               type: 'private',
               updatedAt: new Date().toISOString(),
               files: [
-                { fileName: 'knowledge-base.txt', fileSize: 1024 },
-                { fileName: 'uploaded-guide.pdf', fileSize: 2048 }
+                { fileName: 'knowledge-base.txt', fileSize: 1024, url: 'https://example.com/knowledge-base.txt' },
+                { fileName: 'uploaded-guide.pdf', fileSize: 2048, url: 'https://example.com/uploaded-guide.pdf' }
               ]
             }
           ],
@@ -3126,6 +3160,13 @@ Use the available tools to create tasks in the agent-engine when complex work is
           imageUrl: args.image_url
         };
 
+      case 'describe_video':
+        return {
+          success: true,
+          description: `Mock video analysis for ${args.video_file_url}${args.prompt ? ` with custom prompt: "${args.prompt}"` : ''}. This would contain a detailed summary of the video content in a real scenario.`,
+          videoUrl: args.video_file_url
+        };
+
       case 'perform_data_analysis':
         return {
           success: true,
@@ -3468,6 +3509,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
       case 'describe_image':
         return await this.describeImage(llmModel, args.image_url, args.prompt);
+      case 'describe_video':
+        return await this.describeVideo(args.video_file_url, args.prompt);
       case 'perform_data_analysis':
         return await this.performDataAnalysis(args.file_urls, args.analysis_instruction, userId);
       case 'list_html_templates':
@@ -3622,6 +3665,232 @@ Use the available tools to create tasks in the agent-engine when complex work is
         message: 'Failed to analyze image. Please check that the URL is accessible and contains a valid image.',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  private async describeVideo(videoFileUrl: string, prompt?: string): Promise<any> {
+    let tempDirPath: string | null = null;
+    let uploadedFileName: string | null = null;
+    let aiClient: any = null;
+
+    try {
+      if (!videoFileUrl) {
+        return {
+          success: false,
+          message: 'No video URL provided'
+        };
+      }
+
+      const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
+      const geminiApiKey = await getSecret(geminiSecretName);
+
+      if (!geminiApiKey || !geminiApiKey.trim()) {
+        return {
+          success: false,
+          message: 'Gemini API key is empty'
+        };
+      }
+
+      const { GoogleGenAI } = await import('@google/genai');
+      aiClient = new GoogleGenAI({ apiKey: geminiApiKey.trim() });
+
+      const modelName = 'gemini-3-flash-preview';
+      const analysisPrompt = prompt || 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.';
+      const url = new URL(videoFileUrl);
+      const hostname = (url.hostname || '').toLowerCase();
+      const isYoutube = hostname.includes('youtube.com') || hostname.includes('youtu.be');
+
+      let contents: any;
+
+      if (isYoutube) {
+        contents = [
+          {
+            role: 'user',
+            parts: [
+              {
+                fileData: {
+                  fileUri: videoFileUrl
+                }
+              },
+              { text: analysisPrompt }
+            ]
+          }
+        ];
+      } else {
+        const maxSizeMb = parseInt(process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB || '100', 10);
+        const maxSizeBytes = maxSizeMb * 1024 * 1024;
+
+        const response = await axios.get(videoFileUrl, { responseType: 'stream' });
+        const responseStream = response.data as Readable;
+        const contentLengthHeader = response.headers['content-length'];
+        const declaredSize = contentLengthHeader ? parseInt(contentLengthHeader.toString(), 10) : 0;
+        if (declaredSize && declaredSize > maxSizeBytes) {
+          return {
+            success: false,
+            message: `Video file too large for analysis: ${Math.round(declaredSize / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
+          };
+        }
+
+        const contentTypeHeader = (response.headers['content-type'] || '').toString();
+        const urlExtension = path.extname(url.pathname).toLowerCase();
+        const mimeTypeMap: Record<string, string> = {
+          '.mp4': 'video/mp4',
+          '.mov': 'video/quicktime',
+          '.webm': 'video/webm',
+          '.ogg': 'video/ogg',
+          '.m4v': 'video/x-m4v',
+          '.avi': 'video/x-msvideo'
+        };
+        const fallbackMimeType = mimeTypeMap[urlExtension] || 'video/mp4';
+        const mimeType = contentTypeHeader.startsWith('video/') ? contentTypeHeader : fallbackMimeType;
+
+        tempDirPath = await fs.mkdtemp(path.join(os.tmpdir(), 'agentweb-video-'));
+        const fileExtension = urlExtension || '.mp4';
+        const tempFilePath = path.join(tempDirPath, `video${fileExtension}`);
+
+        const writer = createWriteStream(tempFilePath);
+        let downloadedBytes = 0;
+        await new Promise<void>((resolve, reject) => {
+          responseStream.on('data', (chunk: Buffer) => {
+            downloadedBytes += chunk.length;
+            if (downloadedBytes > maxSizeBytes) {
+              responseStream.destroy(new Error('Video file too large'));
+            }
+          });
+          responseStream.on('error', reject);
+          writer.on('error', reject);
+          writer.on('finish', resolve);
+          responseStream.pipe(writer);
+        });
+
+        if (downloadedBytes === 0) {
+          return {
+            success: false,
+            message: 'Downloaded video file is empty'
+          };
+        }
+
+        if (downloadedBytes > maxSizeBytes) {
+          return {
+            success: false,
+            message: `Video file too large for analysis: ${Math.round(downloadedBytes / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
+          };
+        }
+
+        const uploadResponse = await aiClient.files.upload({
+          file: tempFilePath,
+          config: { mimeType }
+        });
+
+        const fileUri = uploadResponse.uri || uploadResponse.file?.uri;
+        const uploadedMime = uploadResponse.mimeType || uploadResponse.file?.mimeType || mimeType;
+        uploadedFileName = uploadResponse.name || uploadResponse.file?.name || fileUri || null;
+
+        if (!fileUri) {
+          return {
+            success: false,
+            message: 'Failed to upload video to Gemini Files API'
+          };
+        }
+
+        if (uploadedFileName) {
+          await this.waitForGeminiFileActive(aiClient, uploadedFileName);
+        }
+
+        contents = [
+          {
+            role: 'user',
+            parts: [
+              {
+                fileData: {
+                  fileUri,
+                  mimeType: uploadedMime
+                }
+              },
+              { text: analysisPrompt }
+            ]
+          }
+        ];
+      }
+
+      const response = await aiClient.models.generateContent({
+        model: modelName,
+        contents
+      });
+
+      const description = response.text;
+
+      if (!description) {
+        return {
+          success: false,
+          message: 'No description returned from Gemini'
+        };
+      }
+
+      return {
+        success: true,
+        description,
+        videoUrl: videoFileUrl
+      };
+    } catch (error) {
+      console.error('AgentMode: Error describing video:', error);
+      return {
+        success: false,
+        message: 'Failed to analyze video. Please check that the URL is accessible and contains a valid video.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    } finally {
+      if (aiClient && uploadedFileName) {
+        try {
+          await aiClient.files.delete({ name: uploadedFileName });
+        } catch (cleanupError) {
+          try {
+            await (aiClient.files as any).delete(uploadedFileName);
+          } catch (fallbackError) {
+            console.warn('AgentMode: Failed to delete uploaded Gemini file:', fallbackError);
+          }
+        }
+      }
+
+      if (tempDirPath) {
+        try {
+          await fs.rm(tempDirPath, { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.warn('AgentMode: Failed to clean up temp video file:', cleanupError);
+        }
+      }
+    }
+  }
+
+  private async waitForGeminiFileActive(aiClient: any, fileName: string): Promise<void> {
+    const maxAttempts = 30;
+    const delayMs = 2000;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        let fileInfo: any;
+        try {
+          fileInfo = await aiClient.files.get({ name: fileName });
+        } catch {
+          fileInfo = await aiClient.files.get(fileName);
+        }
+
+        const state = fileInfo?.state || fileInfo?.file?.state;
+        if (state === 'ACTIVE') {
+          return;
+        }
+
+        if (state === 'FAILED') {
+          throw new Error('Gemini file processing failed');
+        }
+      } catch (error) {
+        if (attempt === maxAttempts) {
+          throw error;
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
 
@@ -6858,11 +7127,13 @@ ${emailDraftFormat === 'text'
       const files = [
         {
           fileName: 'knowledge-base.txt',
-          fileSize: task.knowledgeBaseSize || 0
+          fileSize: task.knowledgeBaseSize || 0,
+          url: task.knowledgeBase || null
         },
         ...(task.knowledgeBaseFiles || []).map((f: any) => ({
           fileName: f.filename,
-          fileSize: f.size || 0
+          fileSize: f.size || 0,
+          url: f.url || null
         }))
       ];
 
@@ -6882,7 +7153,7 @@ ${emailDraftFormat === 'text'
 
     return {
       success: true,
-      message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s)`,
+      message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). Ensure to use the complete file URL to access the file.`,
       knowledge_bases: knowledgeBases,
       totalKnowledgeBases: knowledgeBases.length,
       totalFiles

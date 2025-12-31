@@ -129,6 +129,16 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(toolNames).toContain('create_task_from_template');
       expect(toolNames).toContain('create_task_from_prompt');
     });
+
+    it('should include describe_video in available tools', () => {
+      const tools = agentModeService.getAvailableTools();
+      const describeVideo = tools.find(
+        (tool: any) => tool.function?.name === 'describe_video'
+      );
+
+      expect(describeVideo).toBeDefined();
+      expect(describeVideo?.function?.parameters?.required).toContain('video_file_url');
+    });
   });
 
   describe('System Prompt - Web Automation Clarification', () => {
@@ -217,4 +227,3 @@ describe('AgentModeService - Tool Descriptions', () => {
     });
   });
 });
-
