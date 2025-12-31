@@ -885,16 +885,6 @@ export const taskDb = {
 
       const result = await dynamodb.update(params).promise();
       
-      // Log if knowledgeBaseFiles was updated
-      if (updates.knowledgeBaseFiles !== undefined) {
-        console.log('updateTask result:', {
-          taskId,
-          hasAttributes: !!result.Attributes,
-          knowledgeBaseFilesInResult: !!(result.Attributes as any)?.knowledgeBaseFiles,
-          knowledgeBaseFilesCount: (result.Attributes as any)?.knowledgeBaseFiles?.length || 0
-        });
-      }
-      
       return result.Attributes;
     } catch (error) {
       console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);

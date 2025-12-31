@@ -1058,13 +1058,6 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     // Include knowledgeBaseFiles in the response
     const knowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
     
-    console.log('GET knowledge-base - Retrieved task:', {
-      taskId,
-      hasKnowledgeBaseFiles: !!(task as any).knowledgeBaseFiles,
-      knowledgeBaseFilesCount: knowledgeBaseFiles.length,
-      knowledgeBaseFiles: JSON.stringify(knowledgeBaseFiles)
-    });
-
     // If knowledgeBaseType is not set, determine it based on file content
     if (!task.knowledgeBaseType) {
       const storageInstance = await initializeStorage();
