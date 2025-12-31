@@ -1,51 +1,83 @@
 import { userDb, User } from './db';
 
 /**
- * Helper function to normalize connected_accounts from old object format to new array format
- * This provides backward compatibility with existing database records
+ * Helper function to normalize connected_accounts to array format
  */
 const normalizeAccounts = (connectedAccounts: any): ConnectedAccountConfig[] => {
   if (!connectedAccounts) {
     return [];
   }
   
-  // Already an array - return as is
   if (Array.isArray(connectedAccounts)) {
-    return connectedAccounts;
-  }
-  
-  // Old object format - convert to array
-  if (typeof connectedAccounts === 'object') {
-    return Object.entries(connectedAccounts).map(([platform, config]) => ({
-      platform,
-      ...(config as object),
-    })) as ConnectedAccountConfig[];
+    return connectedAccounts as ConnectedAccountConfig[];
   }
   
   return [];
 };
 
+// ============================================
+// Platform Type Definitions
+// ============================================
+
+export type PlatformType = 'linkedin' | 'facebook' | 'twitter' | 'instagram';
+
 /**
- * Connected Account configuration stored in the User record
+ * Base OAuth configuration shared across all platforms
  */
-export interface ConnectedAccountConfig {
-  platform: string;
-  account_id: string;
-  account_name: string;
-  account_type: 'personal' | 'company_page';
-  page_id?: string;
-  profile_id?: string;
+export interface BaseOAuthConfig {
   access_token: string;
   refresh_token?: string;
   token_expires_at: number;
   scopes: string[];
-  connected_at: string;
+}
+
+/**
+ * LinkedIn-specific configuration
+ */
+export interface LinkedInConfig extends BaseOAuthConfig {
+  account_type: 'personal' | 'company_page';
+  profile_id?: string;
+  page_id?: string;
+  organization_id?: string;
+}
+
+/**
+ * Union type for all platform-specific configurations.
+ * Add new platform configs here as they are implemented.
+ */
+export type PlatformConfig = LinkedInConfig; // | FacebookConfig | TwitterConfig
+
+/**
+ * Connected Account configuration stored in the User record
+ */
+export interface ConnectedAccountConfig {
+  platform: PlatformType;
+  account_id: string;
+  account_name: string;
+  config: PlatformConfig;
+  created_at: string;
   updated_at: string;
 }
 
+/**
+ * Connected Account return type for API responses
+ */
 export interface ConnectedAccount {
-  platform: string;
-  config: Omit<ConnectedAccountConfig, 'platform'>;
+  platform: PlatformType;
+  account_id: string;
+  account_name: string;
+  config: PlatformConfig;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Input type for creating a connected account
+ */
+export interface CreateAccountInput {
+  account_id: string;
+  account_name: string;
+  config: PlatformConfig;
 }
 
 /**
@@ -53,8 +85,8 @@ export interface ConnectedAccount {
  */
 export const createAccount = async (
   userId: string,
-  platform: string,
-  config: Omit<ConnectedAccountConfig, 'platform' | 'connected_at' | 'updated_at'>
+  platform: PlatformType,
+  input: CreateAccountInput
 ): Promise<ConnectedAccount> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -66,14 +98,16 @@ export const createAccount = async (
   
   // Find existing account for this platform AND account_id (to support multiple accounts per platform)
   const existingIndex = existingAccounts.findIndex(
-    acc => acc.platform === platform && acc.account_id === config.account_id
+    acc => acc.platform === platform && acc.account_id === input.account_id
   );
   const existingAccount = existingIndex >= 0 ? existingAccounts[existingIndex] : null;
 
   const accountConfig: ConnectedAccountConfig = {
     platform,
-    ...config,
-    connected_at: existingAccount?.connected_at || now,
+    account_id: input.account_id,
+    account_name: input.account_name,
+    config: input.config,
+    created_at: existingAccount?.created_at || now,
     updated_at: now,
   };
 
@@ -91,11 +125,7 @@ export const createAccount = async (
     connected_accounts: updatedAccounts,
   } as Partial<User>);
 
-  const { platform: _, ...configWithoutPlatform } = accountConfig;
-  return {
-    platform,
-    config: configWithoutPlatform,
-  };
+  return accountConfig;
 };
 
 /**
@@ -108,10 +138,7 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
   }
 
   const accounts = normalizeAccounts((user as User).connected_accounts);
-  return accounts.map(({ platform, ...config }) => ({
-    platform,
-    config,
-  }));
+  return accounts;
 };
 
 /**
@@ -119,7 +146,7 @@ export const getAccountsByUserId = async (userId: string): Promise<ConnectedAcco
  */
 export const getAccountByPlatform = async (
   userId: string,
-  platform: string
+  platform: PlatformType
 ): Promise<ConnectedAccount | null> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -133,11 +160,7 @@ export const getAccountByPlatform = async (
     return null;
   }
 
-  const { platform: _, ...config } = account;
-  return {
-    platform,
-    config,
-  };
+  return account;
 };
 
 /**
@@ -145,7 +168,7 @@ export const getAccountByPlatform = async (
  */
 export const updateAccountTokens = async (
   userId: string,
-  platform: string,
+  platform: PlatformType,
   tokens: {
     access_token: string;
     refresh_token?: string;
@@ -167,9 +190,12 @@ export const updateAccountTokens = async (
   const existingAccount = accounts[accountIndex];
   const updatedAccount: ConnectedAccountConfig = {
     ...existingAccount,
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token ?? existingAccount.refresh_token,
-    token_expires_at: tokens.token_expires_at,
+    config: {
+      ...existingAccount.config,
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token ?? existingAccount.config.refresh_token,
+      token_expires_at: tokens.token_expires_at,
+    },
     updated_at: new Date().toISOString(),
   };
 
@@ -182,11 +208,11 @@ export const updateAccountTokens = async (
 };
 
 /**
- * Remove a connected account
+ * Remove a connected account (all accounts for a platform)
  */
 export const deleteAccount = async (
   userId: string,
-  platform: string
+  platform: PlatformType
 ): Promise<void> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -205,3 +231,33 @@ export const deleteAccount = async (
     connected_accounts: filteredAccounts,
   } as Partial<User>);
 };
+
+/**
+ * Remove a specific connected account by platform and account_id
+ * This allows deleting individual accounts when multiple accounts exist per platform
+ */
+export const deleteAccountById = async (
+  userId: string,
+  platform: PlatformType,
+  accountId: string
+): Promise<void> => {
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const accounts = normalizeAccounts((user as User).connected_accounts);
+  const filteredAccounts = accounts.filter(
+    acc => !(acc.platform === platform && acc.account_id === accountId)
+  );
+
+  // If no accounts were removed, just return
+  if (filteredAccounts.length === accounts.length) {
+    return;
+  }
+
+  await userDb.updateUser(userId, {
+    connected_accounts: filteredAccounts,
+  } as Partial<User>);
+};
+

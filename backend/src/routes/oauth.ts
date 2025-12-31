@@ -1,14 +1,19 @@
 
 import express from 'express';
 import axios from 'axios';
-import { getLinkedInConfig } from '../config/integrations';
-import { createAccount, getAccountsByUserId } from '../services/connectedAccountsDb';
+import { getLinkedInConfig, getLinkedInOrgConfig } from '../config/integrations';
+import { createAccount, getAccountsByUserId, deleteAccount, deleteAccountById } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
+import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 
 const router = express.Router();
 
-// LinkedIn OAuth Init
+// ============================================
+// LinkedIn Personal Profile OAuth
+// ============================================
+
+// LinkedIn Personal OAuth Init
 router.get('/linkedin/init', async (req, res) => {
   try {
     const config = await getLinkedInConfig();
@@ -30,10 +35,7 @@ router.get('/linkedin/init', async (req, res) => {
   }
 });
 
-// LinkedIn OAuth Callback
-// This endpoint receives the authorization code from LinkedIn and redirects to the frontend.
-// The frontend then calls /linkedin/connect with the code to complete the OAuth flow.
-// NOTE: Authorization codes are single-use, so we DON'T exchange them here.
+// LinkedIn Personal OAuth Callback
 router.get('/linkedin/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
@@ -47,19 +49,14 @@ router.get('/linkedin/callback', async (req, res) => {
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
   }
 
-  // NOTE: In production, verify 'state' against user's session to prevent CSRF attacks.
-  // For now, we simply redirect to the frontend with the code.
-  // The frontend will call POST /linkedin/connect with the code and the user's auth token.
-  
   const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
   res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_code=${code}`);
 });
 
-// Finalize LinkedIn Connection (Authenticated)
-// Frontend calls this after getting 'code' or if we handle it fully on backend
+// Finalize LinkedIn Personal Connection
 router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
   const { code } = req.body;
-  const userId = req.user.userId; // user is guaranteed by middleware
+  const userId = req.user.userId;
 
   try {
     const config = await getLinkedInConfig();
@@ -83,9 +80,8 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
     const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data;
     console.log('[LinkedIn Connect] Token exchange successful. Has id_token:', !!id_token);
     
-    
     // Try to extract profile from id_token first (most reliable - no network call needed)
-    let profile: { sub: string; name: string; email?: string } = { 
+    let profile: { sub: string; name: string; email?: string; picture?: string } = { 
       sub: `linkedin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       name: 'LinkedIn User' 
     };
@@ -100,6 +96,7 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
           if (payload.sub) profile.sub = payload.sub;
           if (payload.name) profile.name = payload.name;
           if (payload.email) profile.email = payload.email;
+          if (payload.picture) profile.picture = payload.picture;
           console.log('[LinkedIn Connect] Profile from id_token:', profile.name, profile.sub);
         }
       } catch (jwtError) {
@@ -115,24 +112,28 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
         profile.sub = apiProfile.sub;
         profile.name = apiProfile.name;
         if (apiProfile.email) profile.email = apiProfile.email;
+        if (apiProfile.picture) profile.picture = apiProfile.picture;
       } catch (profileError: any) {
         console.warn('[LinkedIn Connect] Profile API failed, using fallback. Error:', profileError.code || profileError.message);
       }
     }
 
     // Save to DB (profile_id from sub)
-    const accountConfig = {
+    const accountInput = {
       account_id: profile.sub,
       account_name: profile.name,
-      account_type: 'personal' as const,
-      profile_id: profile.sub,
-      access_token,
-      refresh_token,
-      token_expires_at: Date.now() + (expires_in * 1000),
-      scopes: config.scopes
+      config: {
+        account_type: 'personal' as const,
+        profile_id: profile.sub,
+        profile_image_url: profile.picture,
+        access_token,
+        refresh_token,
+        token_expires_at: Date.now() + (expires_in * 1000),
+        scopes: config.scopes
+      }
     };
 
-    const account = await createAccount(userId, 'linkedin', accountConfig);
+    const account = await createAccount(userId, 'linkedin', accountInput);
 
     res.json({ success: true, account });
 
@@ -147,27 +148,234 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
   }
 });
 
-// List Connected Accounts
+// ============================================
+// LinkedIn Organization/Company Pages OAuth
+// ============================================
+
+// LinkedIn Organization OAuth Init
+router.get('/linkedin/org/init', async (req, res) => {
+  try {
+    const config = await getLinkedInOrgConfig();
+    const state = 'org_' + Math.random().toString(36).substring(7);
+    
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: config.clientId || '',
+      redirect_uri: config.redirectUri,
+      state: state,
+      scope: config.scopes.join(' ')
+    });
+
+    res.redirect(`${config.authorizationUrl}?${params.toString()}`);
+  } catch (error) {
+    console.error('Error initializing LinkedIn Org OAuth:', error);
+    res.status(500).json({ error: 'Failed to initialize LinkedIn Organization OAuth' });
+  }
+});
+
+// LinkedIn Organization OAuth Callback
+router.get('/linkedin/org/callback', async (req, res) => {
+  const { code, error } = req.query;
+  const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+
+  if (error) {
+    return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=linkedin_org_access_denied&details=${error}`);
+  }
+
+  if (!code) {
+    return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
+  }
+
+  // Redirect with org-specific code parameter
+  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_org_code=${code}`);
+});
+
+// Get user's admin organizations (after org OAuth)
+router.post('/linkedin/organizations', authenticateToken, async (req: any, res) => {
+  const { code } = req.body;
+  const userId = req.user.userId;
+
+  try {
+    const config = await getLinkedInOrgConfig();
+    
+    // Exchange code for access token
+    const tokenResponse = await axios.post(config.tokenUrl, null, {
+      params: {
+        grant_type: 'authorization_code',
+        code: code,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        redirect_uri: config.redirectUri
+      },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+    // Get organizations where user is admin
+    const orgUrns = await linkedInService.getAdminOrganizations(access_token);
+    
+    // Get details for each organization
+    const organizations = await Promise.all(
+      orgUrns.map(async (orgUrn: string) => {
+        try {
+          const orgDetails = await linkedInService.getOrganization(access_token, orgUrn);
+          const followerCount = await linkedInService.getOrganizationFollowerCount(access_token, orgUrn);
+          return {
+            urn: orgUrn,
+            id: orgDetails.id,
+            name: orgDetails.name,
+            vanityName: orgDetails.vanityName,
+            logoUrl: orgDetails.logoUrl,
+            followerCount,
+          };
+        } catch (err) {
+          console.warn(`Failed to get details for org ${orgUrn}:`, err);
+          return {
+            urn: orgUrn,
+            id: orgUrn.replace('urn:li:organization:', ''),
+            name: `Organization ${orgUrn.replace('urn:li:organization:', '')}`,
+            followerCount: 0,
+          };
+        }
+      })
+    );
+
+    // Return organizations and tokens for later use
+    res.json({
+      success: true,
+      organizations,
+      // Return tokens encrypted or store in session - for now just return for client to use
+      _tokens: {
+        access_token,
+        refresh_token,
+        expires_in,
+        scopes: config.scopes
+      }
+    });
+
+  } catch (error: any) {
+    console.error('Get Organizations Error:', error);
+    res.status(500).json({ error: 'Failed to get organizations', details: error.message });
+  }
+});
+
+// Connect selected company pages
+router.post('/linkedin/connect-pages', authenticateToken, async (req: any, res) => {
+  const { organizations, tokens } = req.body;
+  const userId = req.user.userId;
+
+  if (!organizations || !Array.isArray(organizations) || organizations.length === 0) {
+    return res.status(400).json({ error: 'No organizations selected' });
+  }
+
+  if (!tokens || !tokens.access_token) {
+    return res.status(400).json({ error: 'Missing access tokens' });
+  }
+
+  try {
+    const config = await getLinkedInOrgConfig();
+    const connectedAccounts = [];
+
+    for (const org of organizations) {
+      const accountInput = {
+        account_id: org.id || org.urn.replace('urn:li:organization:', ''),
+        account_name: org.name,
+        config: {
+          account_type: 'company_page' as const,
+          page_id: org.id,
+          organization_id: org.urn,
+          profile_image_url: org.logoUrl,
+          follower_count: org.followerCount,
+          account_handle: org.vanityName,
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token,
+          token_expires_at: Date.now() + (tokens.expires_in * 1000),
+          scopes: config.scopes
+        }
+      };
+
+      const account = await createAccount(userId, 'linkedin', accountInput);
+      connectedAccounts.push(account);
+    }
+
+    res.json({ success: true, accounts: connectedAccounts });
+
+  } catch (error: any) {
+    console.error('Connect Pages Error:', error);
+    res.status(500).json({ error: 'Failed to connect pages', details: error.message });
+  }
+});
+
+// ============================================
+// Connected Accounts Management
+// ============================================
+
+// List Connected Accounts (with status)
 router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
     const accounts = await getAccountsByUserId(userId);
 
-    const safeAccounts = accounts.map(acc => ({
-      platform: acc.platform,
-      account_name: acc.config.account_name,
-      account_type: acc.config.account_type,
-      profile_id: acc.config.profile_id,
-      page_id: acc.config.page_id,
-      connected_at: acc.config.connected_at
-    }));
+    const accountsWithStatus = accounts.map(acc => {
+      const status = getTokenStatus(acc.config.token_expires_at);
+      const expiryMessage = formatExpiryMessage(acc.config.token_expires_at);
 
-    res.json({ success: true, accounts: safeAccounts });
+      return {
+        platform: acc.platform,
+        account_id: acc.account_id,
+        account_name: acc.account_name,
+        account_type: acc.config.account_type,
+        profile_id: acc.config.profile_id,
+        page_id: acc.config.page_id,
+        profile_image_url: (acc.config as any).profile_image_url,
+        account_handle: (acc.config as any).account_handle,
+        follower_count: (acc.config as any).follower_count,
+        created_at: acc.created_at,
+        // Status fields
+        status,
+        expires_at: acc.config.token_expires_at,
+        expiry_message: expiryMessage,
+      };
+    });
+
+    res.json({ success: true, accounts: accountsWithStatus });
   } catch (error) {
     console.error('List Accounts Error:', error);
     res.status(500).json({ error: 'Failed to list connected accounts' });
   }
 });
 
+// Delete Connected Account by platform (all accounts for that platform)
+router.delete('/connected-accounts/:platform', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { platform } = req.params;
+
+  try {
+    await deleteAccount(userId, platform);
+    res.json({ success: true, message: `${platform} account(s) disconnected` });
+  } catch (error) {
+    console.error('Delete Account Error:', error);
+    res.status(500).json({ error: 'Failed to delete connected account' });
+  }
+});
+
+// Delete specific Connected Account by platform and account_id
+router.delete('/connected-accounts/:platform/:accountId', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { platform, accountId } = req.params;
+
+  try {
+    await deleteAccountById(userId, platform, accountId);
+    res.json({ success: true, message: `${platform} account ${accountId} disconnected` });
+  } catch (error) {
+    console.error('Delete Account By ID Error:', error);
+    res.status(500).json({ error: 'Failed to delete connected account' });
+  }
+});
+
 export default router;
+

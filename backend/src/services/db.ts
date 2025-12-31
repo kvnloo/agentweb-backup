@@ -128,17 +128,20 @@ export interface User {
   resetPasswordExpires?: string;
   subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
   connected_accounts?: Array<{
-    platform: string;
+    platform: 'linkedin' | 'facebook' | 'twitter' | 'instagram';
     account_id: string;
     account_name: string;
-    account_type: 'personal' | 'company_page';
-    page_id?: string;
-    profile_id?: string;
-    access_token: string;
-    refresh_token?: string;
-    token_expires_at: number;
-    scopes: string[];
-    connected_at: string;
+    config: {
+      account_type: 'personal' | 'company_page';
+      profile_id?: string;
+      page_id?: string;
+      organization_id?: string;
+      access_token: string;
+      refresh_token?: string;
+      token_expires_at: number;
+      scopes: string[];
+    };
+    created_at: string;
     updated_at: string;
   }>;
 }

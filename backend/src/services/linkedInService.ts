@@ -190,6 +190,82 @@ export class LinkedInService {
       return response.headers['x-restli-id'] || (response.data as any).id;
     });
   }
+
+  /**
+   * Verify if an access token is still valid
+   * Uses the lightweight userinfo endpoint for personal tokens
+   * @returns Object with valid status and optional error message
+   */
+  async verifyToken(accessToken: string): Promise<{ valid: boolean; error?: string }> {
+    try {
+      await axios.get('https://api.linkedin.com/v2/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: 5000,
+      });
+      return { valid: true };
+    } catch (error: any) {
+      if (error.response?.status === 401) {
+        return { valid: false, error: 'Token expired or revoked' };
+      }
+      if (error.response?.status === 403) {
+        return { valid: false, error: 'Token permissions revoked' };
+      }
+      // Network error - assume valid (might be temporary issue)
+      console.warn('[LinkedIn verifyToken] Network error, assuming valid:', error.code || error.message);
+      return { valid: true };
+    }
+  }
+
+  /**
+   * Get organization details by URN
+   * @param accessToken - OAuth token with organization scopes
+   * @param orgUrn - Organization URN (e.g., "urn:li:organization:123456")
+   */
+  async getOrganization(accessToken: string, orgUrn: string): Promise<{
+    id: string;
+    name: string;
+    vanityName?: string;
+    logoUrl?: string;
+  }> {
+    return this.safeRequest(async () => {
+      // Extract numeric ID from URN
+      const orgId = orgUrn.replace('urn:li:organization:', '');
+      
+      const response = await this.client.get(`/rest/organizations/${orgId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: {
+          projection: '(id,name,vanityName,logoV2)'
+        }
+      });
+
+      const data = response.data;
+      return {
+        id: data.id || orgId,
+        name: data.name?.localized?.en_US || data.localizedName || `Organization ${orgId}`,
+        vanityName: data.vanityName,
+        logoUrl: data.logoV2?.original || data.logoV2?.['cropped-mini'] || undefined,
+      };
+    });
+  }
+
+  /**
+   * Get follower count for an organization
+   * @param accessToken - OAuth token with organization scopes
+   * @param orgUrn - Organization URN
+   */
+  async getOrganizationFollowerCount(accessToken: string, orgUrn: string): Promise<number> {
+    try {
+      const response = await this.client.get('/rest/networkSizes/' + orgUrn, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: { edgeType: 'CompanyFollowedByMember' }
+      });
+      return response.data.firstDegreeSize || 0;
+    } catch (error) {
+      console.warn('[LinkedIn] Failed to get follower count:', error);
+      return 0;
+    }
+  }
 }
 
 export const linkedInService = new LinkedInService();
+

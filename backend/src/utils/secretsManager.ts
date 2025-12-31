@@ -137,3 +137,44 @@ export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
   //   throw new Error('Failed to fetch LinkedIn credentials from Secrets Manager');
   // }
 }
+
+/**
+ * Interface for LinkedIn Organization App credentials
+ * (Different app with organization scopes)
+ */
+export interface LinkedInOrgCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get LinkedIn Organization App OAuth credentials from AWS Secrets Manager
+ * This is a separate app with r_organization_admin, w_organization_social scopes
+ * @returns The LinkedIn Organization App credentials (clientId and clientSecret)
+ */
+export async function getLinkedInOrgCredentials(): Promise<LinkedInOrgCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/LinkedIn/OrganizationApp'
+      : 'dev/AgentWeb/LinkedIn/OrganizationApp';
+    
+    const secretString = await getSecret(secretName);
+    
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('LinkedIn Organization App credentials secret is empty');
+    }
+    
+    const credentials = JSON.parse(secretString) as LinkedInOrgCredentials;
+    
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('LinkedIn Organization App credentials missing clientId or clientSecret');
+    }
+    
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching LinkedIn Organization App credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch LinkedIn Organization App credentials from Secrets Manager');
+  }
+}
+
