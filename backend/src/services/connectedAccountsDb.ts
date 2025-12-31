@@ -261,3 +261,77 @@ export const deleteAccountById = async (
   } as Partial<User>);
 };
 
+/**
+ * Extended Connected Account type that includes userId for owner verification
+ */
+export interface ConnectedAccountWithUser extends ConnectedAccount {
+  userId: string;
+}
+
+/**
+ * Get a specific connected account by account_id and userId
+ * Directly looks up the user to find the account, avoiding full table scan
+ */
+export const getAccountById = async (
+  accountId: string,
+  userId: string
+): Promise<ConnectedAccountWithUser | null> => {
+  try {
+    const user = await userDb.getUserById(userId);
+    
+    if (user) {
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      const account = accounts.find(acc => acc.account_id === accountId);
+      
+      if (account) {
+        return {
+          ...account,
+          userId: (user as User).userId,
+        };
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error in getAccountById:', error);
+    return null;
+  }
+};
+
+/**
+ * Check if an account token is still valid
+ * First checks expiry timestamp, then verifies via API if not expired
+ */
+export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> => {
+  const now = Date.now();
+  
+  // First check: is the token expired based on timestamp?
+  if (account.config.token_expires_at <= now) {
+    return false;
+  }
+  
+  // Second check: verify via API (only for LinkedIn for now)
+  if (account.platform === 'linkedin') {
+    try {
+      // Use real LinkedIn service for API verification
+      const { linkedInService } = await import('./linkedInService');
+      const result = await linkedInService.verifyToken(account.config.access_token);
+      return result.valid;
+    } catch (error) {
+      console.warn('[isTokenValid] Failed to verify token via API, assuming valid:', error);
+      return true; // Assume valid if API check fails
+    }
+  }
+  
+  // For other platforms, just use timestamp check
+  return true;
+};
+
+/**
+ * Quick synchronous check for token expiry (timestamp only, no API call)
+ * Use this when you don't need the full API verification
+ */
+export const isTokenNotExpired = (account: ConnectedAccount): boolean => {
+  const now = Date.now();
+  return account.config.token_expires_at > now;
+};

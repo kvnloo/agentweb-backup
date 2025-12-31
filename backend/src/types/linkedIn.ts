@@ -1,4 +1,3 @@
-
 export interface LinkedInProfile {
   sub: string;
   name: string;
@@ -19,11 +18,14 @@ export interface LinkedInErrorResponse {
 }
 
 export interface LinkedInPost {
+  id?: string;
   author: string;
   commentary: string;
   visibility: 'PUBLIC' | 'CONNECTIONS';
   lifecycleState: 'PUBLISHED' | 'DRAFT';
   isReshareDisabledByAuthor?: boolean;
+  createdAt?: number;
+  lastModifiedAt?: number;
   distribution?: {
     feedDistribution: 'MAIN_FEED' | 'NONE';
     targetEntities?: any[];
@@ -40,41 +42,136 @@ export interface LinkedInPost {
       id: string;
       altText?: string;
     };
+    image?: {
+      id: string;
+      altText?: string;
+    };
+    video?: {
+      id: string;
+      altText?: string;
+    };
   };
 }
 
 export interface LinkedInOrganizationAcl {
   role: 'ADMINISTRATOR' | 'DIRECT_SPONSORED_CONTENT_POSTER' | 'ANALYST';
-  roleContext: string;
+  roleContext?: string;
+  roleAssignee?: string;
   state: 'APPROVED' | 'REQUESTED';
-  organization: string;
+  organizationTarget: string;
 }
 
-export interface LinkedInAclResponse {
-  elements: LinkedInOrganizationAcl[];
+export interface LinkedInPaginatedResponse<T> {
+  paging?: {
+    start: number;
+    count: number;
+    links?: {
+      rel: string;
+      href: string;
+    }[];
+  };
+  elements: T[];
+}
+
+export interface LinkedInAclResponse extends LinkedInPaginatedResponse<LinkedInOrganizationAcl> {}
+
+export interface FollowerCount {
+  organicFollowerCount: number;
+  paidFollowerCount: number;
 }
 
 export interface LinkedInFollowerStatistics {
   organizationalEntity: string;
-  followerCountsByCountry?: any[];
-  followerCountsBySeniority?: any[];
-  followerCountsByIndustry?: any[];
+  followerCountsByStaffCountRange?: Array<{
+    followerCounts: FollowerCount;
+    staffCountRange: string;
+  }>;
+  followerCountsByFunction?: Array<{
+    followerCounts: FollowerCount;
+    function: string;
+  }>;
+  followerCountsByAssociationType?: Array<{
+    followerCounts: FollowerCount;
+    associationType: string;
+  }>;
+  followerCountsBySeniority?: Array<{
+    followerCounts: FollowerCount;
+    seniority: string;
+  }>;
+  followerCountsByGeoCountry?: Array<{
+    followerCounts: FollowerCount;
+    geo: string;
+  }>;
+  followerCountsByGeo?: Array<{
+    followerCounts: FollowerCount;
+    geo: string;
+  }>;
+  followerCountsByIndustry?: Array<{
+    followerCounts: FollowerCount;
+    industry: string;
+  }>;
+}
+
+export interface PageViewMetric {
+  pageViews: number;
+  uniquePageViews?: number;
+}
+
+export interface PageStatisticsViews {
+  allDesktopPageViews?: PageViewMetric;
+  allMobilePageViews?: PageViewMetric;
+  allPageViews: PageViewMetric;
+  careersPageViews?: PageViewMetric;
+  desktopCareersPageViews?: PageViewMetric;
+  desktopJobsPageViews?: PageViewMetric;
+  desktopLifeAtPageViews?: PageViewMetric;
+  desktopOverviewPageViews?: PageViewMetric;
+  jobsPageViews?: PageViewMetric;
+  lifeAtPageViews?: PageViewMetric;
+  mobileCareersPageViews?: PageViewMetric;
+  mobileJobsPageViews?: PageViewMetric;
+  mobileLifeAtPageViews?: PageViewMetric;
+  mobileOverviewPageViews?: PageViewMetric;
+  overviewPageViews?: PageViewMetric;
 }
 
 export interface LinkedInPageStatistics {
   organization: string;
+  pageStatisticsByGeoCountry?: Array<{
+    geo: string;
+    pageStatistics: { views: PageStatisticsViews };
+  }>;
+  pageStatisticsByFunction?: Array<{
+    function: string;
+    pageStatistics: { views: PageStatisticsViews };
+  }>;
+  pageStatisticsByIndustryV2?: Array<{
+    industryV2: string;
+    pageStatistics: { views: PageStatisticsViews };
+  }>;
+  pageStatisticsByGeo?: Array<{
+    geo: string;
+    pageStatistics: { views: PageStatisticsViews };
+  }>;
+  pageStatisticsBySeniority?: Array<{
+    seniority: string;
+    pageStatistics: { views: PageStatisticsViews };
+  }>;
+  pageStatisticsByStaffCountRange?: Array<{
+    staffCountRange: string;
+    pageStatistics: { views: PageStatisticsViews };
+  }>;
   totalPageStatistics: {
-    views: {
-      allPageViews: {
-        pageViews: number;
-        uniquePageViews: number;
-      };
+    clicks?: {
+      desktopCustomButtonClickCounts: any[];
+      mobileCustomButtonClickCounts: any[];
     };
+    views: PageStatisticsViews;
   };
 }
-
 export interface LinkedInShareStatistics {
   organizationalEntity: string;
+  share?: string;
   totalShareStatistics: {
     uniqueImpressionsCount: number;
     shareCount: number;
@@ -82,6 +179,6 @@ export interface LinkedInShareStatistics {
     clickCount: number;
     likeCount: number;
     commentCount: number;
+    impressionCount: number;
   };
 }
-

@@ -1,15 +1,15 @@
-
 import axios from 'axios';
 import type { AxiosInstance, AxiosError } from 'axios';
-import { 
-  LinkedInProfile, 
-  LinkedInPost, 
-  LinkedInErrorResponse, 
+import {
+  LinkedInProfile,
+  LinkedInPost,
+  LinkedInErrorResponse,
   LinkedInAclResponse,
   LinkedInOrganizationAcl,
   LinkedInFollowerStatistics,
   LinkedInPageStatistics,
-  LinkedInShareStatistics
+  LinkedInShareStatistics,
+  LinkedInPaginatedResponse
 } from '../types/linkedIn';
 
 export class LinkedInService {
@@ -62,55 +62,27 @@ export class LinkedInService {
   }
 
   /**
-   * Get current user profile (OpenID Connect userinfo endpoint)
-   * Note: This endpoint does NOT use the versioned REST API headers
+   * Get current user profile
    */
   async getProfile(accessToken: string): Promise<LinkedInProfile> {
-    try {
-      console.log('[LinkedIn getProfile] Fetching profile with token:', accessToken?.substring(0, 20) + '...');
-      
-      // Use direct axios call without versioned API headers for OIDC userinfo
-      const response = await axios.get<LinkedInProfile>('https://api.linkedin.com/v2/userinfo', {
-        headers: { 
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 10000, // 10 second timeout
+    return this.safeRequest(async () => {
+      const response = await this.client.get<LinkedInProfile>('/v2/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` },
       });
-      
-      console.log('[LinkedIn getProfile] Success:', response.data);
       return response.data;
-    } catch (error: any) {
-      console.error('[LinkedIn getProfile] Full raw error:', error);
-      console.error('[LinkedIn getProfile] Error name:', error.name);
-      console.error('[LinkedIn getProfile] Error code:', error.code);
-      console.error('[LinkedIn getProfile] Error message:', error.message);
-      console.error('[LinkedIn getProfile] Is Axios error:', axios.isAxiosError(error));
-      
-      if (axios.isAxiosError(error)) {
-        console.error('[LinkedIn getProfile] Axios error details:', {
-          status: error.response?.status,
-          statusText: error.response?.statusText,
-          data: error.response?.data,
-          config: error.config?.url,
-        });
-      }
-      
-      this.handleError(error);
-      throw error;
-    }
+    });
   }
 
   /**
    * Discovery: Get organizations where the user has an admin role
    */
-  async getAdminOrganizations(accessToken: string): Promise<string[]> {
+  async getAdminOrganizations(accessToken: string): Promise<LinkedInAclResponse> {
     return this.safeRequest(async () => {
       const response = await this.client.get<LinkedInAclResponse>('/rest/organizationAcls', {
-        params: { q: 'role', role: 'ADMINISTRATOR', state: 'APPROVED' },
+        params: { q: 'roleAssignee', role: 'ADMINISTRATOR', state: 'APPROVED' },
         headers: { Authorization: `Bearer ${accessToken}` },
       });
-      return response.data.elements.map((acl: LinkedInOrganizationAcl) => acl.organization);
+      return response.data;
     });
   }
 
@@ -120,7 +92,7 @@ export class LinkedInService {
   async getFollowerStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInFollowerStatistics[]> {
     return this.safeRequest(async () => {
       const response = await this.client.get<{ elements: LinkedInFollowerStatistics[] }>('/rest/organizationalEntityFollowerStatistics', {
-        params: { organizationalEntity: organizationUrn },
+        params: { q: 'organizationalEntity', organizationalEntity: organizationUrn },
         headers: { Authorization: `Bearer ${accessToken}` },
       });
       return response.data.elements;
@@ -128,7 +100,7 @@ export class LinkedInService {
   }
 
   /**
-   * Analytics: Get page statistics for an organization
+   * Analytics: Get page statistics for an organization urn:li:organization:{PAGE_URN_ID}
    */
   async getPageStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInPageStatistics[]> {
     return this.safeRequest(async () => {
@@ -141,28 +113,37 @@ export class LinkedInService {
   }
 
   /**
-   * Post Metrics: Get share statistics for an organization's entity
+   * Post Metrics: Get share statistics for an organization's entity or specific shares
    */
-  async getShareStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInShareStatistics[]> {
+  async getShareStatistics(
+    accessToken: string,
+    organizationUrn: string,
+    shareUrns?: string[]
+  ): Promise<LinkedInShareStatistics[]> {
     return this.safeRequest(async () => {
-      const response = await this.client.get<{ elements: LinkedInShareStatistics[] }>('/rest/organizationalEntityShareStatistics', {
-        params: { organizationalEntity: organizationUrn },
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
+      const params: any = { q: 'organizationalEntity', organizationalEntity: organizationUrn };
+      if (shareUrns && shareUrns.length > 0) {
+        params.shares = `List(${shareUrns.join(',')})`;
+      }
+
+      const response = await this.client.get<{ elements: LinkedInShareStatistics[] }>(
+        '/rest/organizationalEntityShareStatistics',
+        { params, headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+
       return response.data.elements;
     });
   }
-
   /**
    * List posts for a specific author (person or organization)
    */
-  async listPosts(accessToken: string, authorUrn: string): Promise<LinkedInPost[]> {
+  async listPosts(accessToken: string, authorUrn: string, start: number = 0, count: number = 50): Promise<LinkedInPaginatedResponse<LinkedInPost>> {
     return this.safeRequest(async () => {
-      const response = await this.client.get<{ elements: LinkedInPost[] }>('/rest/posts', {
-        params: { q: 'author', author: authorUrn },
+      const response = await this.client.get<LinkedInPaginatedResponse<LinkedInPost>>('/rest/posts', {
+        params: { q: 'author', author: authorUrn, start, count },
         headers: { Authorization: `Bearer ${accessToken}` },
       });
-      return response.data.elements;
+      return response.data;
     });
   }
 
@@ -191,8 +172,69 @@ export class LinkedInService {
     });
   }
 
+
   /**
-   * Verify if an access token is still valid
+   * Aggregated Analytics: Get follower, page, and share statistics for an organization
+   */
+  async getAggregatedMetrics(accessToken: string, organizationUrn: string): Promise<any> {
+    const [followerStats, pageStats] = await Promise.all([
+      this.getFollowerStatistics(accessToken, organizationUrn),
+      this.getPageStatistics(accessToken, organizationUrn)
+    ]);
+
+    return {
+      followerStatistics: followerStats,
+      pageStatistics: pageStats
+    };
+  }
+
+  /**
+   * Get organization details by URN (for Connected Accounts)
+   * @param accessToken - OAuth token with organization scopes
+   * @param orgUrn - Organization URN (e.g., "urn:li:organization:123456")
+   */
+  async getOrganization(accessToken: string, orgUrn: string): Promise<{
+    id: string;
+    name: string;
+    vanityName?: string;
+    logoUrl?: string;
+  }> {
+    return this.safeRequest(async () => {
+      const orgId = orgUrn.replace('urn:li:organization:', '');
+      
+      const response = await this.client.get(`/rest/organizations/${orgId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+
+      const data = response.data;
+      return {
+        id: data.id?.toString() || orgId,
+        name: data.localizedName || data.name?.localized?.en_US || `Organization ${orgId}`,
+        vanityName: data.vanityName,
+        logoUrl: data.logoV2?.original || data.logoV2?.['cropped-mini'] || undefined,
+      };
+    });
+  }
+
+  /**
+   * Get follower count for an organization (for Connected Accounts)
+   * Uses the networkSizes endpoint
+   */
+  async getOrganizationFollowerCount(accessToken: string, orgUrn: string): Promise<number> {
+    try {
+      const response = await this.client.get(`/rest/networkSizes/${orgUrn}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+        params: { edgeType: 'CompanyFollowedByMember' }
+      });
+      return response.data.firstDegreeSize || 0;
+    } catch (error) {
+      console.warn('[LinkedIn] Failed to get follower count:', error);
+      return 0;
+    }
+  }
+
+  /**
+   * Verify if an access token is still valid by making an API call
    * Uses the lightweight userinfo endpoint for personal tokens
    * @returns Object with valid status and optional error message
    */
@@ -215,57 +257,6 @@ export class LinkedInService {
       return { valid: true };
     }
   }
-
-  /**
-   * Get organization details by URN
-   * @param accessToken - OAuth token with organization scopes
-   * @param orgUrn - Organization URN (e.g., "urn:li:organization:123456")
-   */
-  async getOrganization(accessToken: string, orgUrn: string): Promise<{
-    id: string;
-    name: string;
-    vanityName?: string;
-    logoUrl?: string;
-  }> {
-    return this.safeRequest(async () => {
-      // Extract numeric ID from URN
-      const orgId = orgUrn.replace('urn:li:organization:', '');
-      
-      const response = await this.client.get(`/rest/organizations/${orgId}`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-        params: {
-          projection: '(id,name,vanityName,logoV2)'
-        }
-      });
-
-      const data = response.data;
-      return {
-        id: data.id || orgId,
-        name: data.name?.localized?.en_US || data.localizedName || `Organization ${orgId}`,
-        vanityName: data.vanityName,
-        logoUrl: data.logoV2?.original || data.logoV2?.['cropped-mini'] || undefined,
-      };
-    });
-  }
-
-  /**
-   * Get follower count for an organization
-   * @param accessToken - OAuth token with organization scopes
-   * @param orgUrn - Organization URN
-   */
-  async getOrganizationFollowerCount(accessToken: string, orgUrn: string): Promise<number> {
-    try {
-      const response = await this.client.get('/rest/networkSizes/' + orgUrn, {
-        headers: { Authorization: `Bearer ${accessToken}` },
-        params: { edgeType: 'CompanyFollowedByMember' }
-      });
-      return response.data.firstDegreeSize || 0;
-    } catch (error) {
-      console.warn('[LinkedIn] Failed to get follower count:', error);
-      return 0;
-    }
-  }
 }
 
 export const linkedInService = new LinkedInService();
-

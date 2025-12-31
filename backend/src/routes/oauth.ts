@@ -118,13 +118,19 @@ router.post('/linkedin/connect', authenticateToken, async (req: any, res) => {
       }
     }
 
+    // Ensure URN format for account_id
+    let accountId = profile.sub;
+    if (!accountId.startsWith('urn:')) {
+      accountId = `urn:li:person:${accountId}`;
+    }
+
     // Save to DB (profile_id from sub)
     const accountInput = {
-      account_id: profile.sub,
+      account_id: accountId,
       account_name: profile.name,
       config: {
         account_type: 'personal' as const,
-        profile_id: profile.sub,
+        profile_id: accountId,
         profile_image_url: profile.picture,
         access_token,
         refresh_token,
@@ -214,8 +220,9 @@ router.post('/linkedin/organizations', authenticateToken, async (req: any, res) 
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     
-    // Get organizations where user is admin
-    const orgUrns = await linkedInService.getAdminOrganizations(access_token);
+    // Get organizations where user is admin (returns LinkedInAclResponse)
+    const aclResponse = await linkedInService.getAdminOrganizations(access_token);
+    const orgUrns = aclResponse.elements.map(acl => acl.organizationTarget);
     
     // Get details for each organization
     const organizations = await Promise.all(
@@ -281,7 +288,7 @@ router.post('/linkedin/connect-pages', authenticateToken, async (req: any, res) 
 
     for (const org of organizations) {
       const accountInput = {
-        account_id: org.id || org.urn.replace('urn:li:organization:', ''),
+        account_id: org.urn, // Store full URN (e.g., urn:li:organization:123)
         account_name: org.name,
         config: {
           account_type: 'company_page' as const,
