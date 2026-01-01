@@ -16,7 +16,12 @@ from aws_utils import get_dynamodb_resource, get_s3_client
 import yaml
 import random
 from typing import Dict, Any, List, Optional
-from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
+try:
+    from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
+    _deep_research_import_error = None
+except Exception as e:
+    DeepResearchAgentWrapper = None
+    _deep_research_import_error = str(e)
 from task_utils import get_downloads_path, upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
 import subprocess
 import tempfile
@@ -1304,6 +1309,16 @@ Context - Original Task: {base_prompt}"""
                 
                 # Run appropriate agent based on task type
                 if is_deep_research:
+                    if DeepResearchAgentWrapper is None:
+                        error_message = "Deep research is disabled."
+                        logger.warning(error_message)
+                        result = {
+                            "success": False,
+                            "error": error_message,
+                            "llm_name": llm_name
+                        }
+                        last_error = error_message
+                        break
                     # Use DeepResearchAgentWrapper directly instead of CLI
                     try:
                         logger.info(f"Running deep research directly with LLM: {llm_name}")
