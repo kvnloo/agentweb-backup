@@ -17,7 +17,6 @@ from aws_utils import get_dynamodb_resource, get_s3_client
 import yaml
 import random
 from typing import Dict, Any, List, Optional
-from deep_research_agent import DeepResearchAgentWrapper  # Import the wrapper class
 from task_utils import get_downloads_path, upload_activity_log, upload_gif, check_new_information, LogSyncManager, start_log_sync  # Import utility functions
 import subprocess
 import tempfile
@@ -1305,94 +1304,7 @@ Context - Original Task: {base_prompt}"""
                 
                 # Run appropriate agent based on task type
                 if is_deep_research:
-                    # Use DeepResearchAgentWrapper directly instead of CLI
-                    try:
-                        logger.info(f"Running deep research directly with LLM: {llm_name}")
-                        
-                        # Initialize the deep research agent with user_id and execution_id
-                        agent = DeepResearchAgentWrapper(
-                            user_id=user_id,
-                            execution_id=execution_id,
-                            full_llm_name=llm_name
-                        )
-                        
-                        # Set up log file path for deep research logs
-                        filtered_activity_log = f"logs/execution_{execution_id}_deep_activities.log"
-                        
-                        # Start real-time log syncing for deep research logs
-                        log_sync_manager = start_log_sync(filtered_activity_log, user_id, execution_id)
-                        
-                        # Define a function to run the research in a separate thread
-                        def run_research_in_thread(agent, prompt, max_turns):
-                            try:
-                                return agent.run_research(
-                                    query=prompt,
-                                    max_turns=max_turns,
-                                    user_input=False
-                                )
-                            except Exception as e:
-                                logger.error(f"Error in research thread: {str(e)}")
-                                return {
-                                    "success": False,
-                                    "error": f"Research thread error: {str(e)}",
-                                    "llm_name": llm_name
-                                }
-                        
-                        # Set timeout from environment or default to 15 minutes
-                        timeout_seconds = int(os.getenv('DEEP_RESEARCH_TIMEOUT_SECONDS', '900'))
-                        logger.info(f"Running deep research with timeout of {timeout_seconds} seconds")
-                        
-                        # Use asyncio.to_thread to run the research in a separate thread without blocking
-                        try:
-                            # Create a task that will run the research in a separate thread
-                            research_task = asyncio.create_task(
-                                asyncio.to_thread(
-                                    run_research_in_thread,
-                                    agent,
-                                    prompt_with_context,
-                                    int(os.getenv('DEEP_RESEARCH_MAX_TURNS', '2'))
-                                )
-                            )
-                            
-                            # Wait for the research to complete with a timeout
-                            result = await asyncio.wait_for(research_task, timeout=timeout_seconds)
-                            logger.info(f"Successfully completed deep research with {llm_name}")
-                            
-                        except asyncio.TimeoutError:
-                            # Research timed out
-                            logger.error(f"Deep research timed out after {timeout_seconds} seconds")
-                            result = {
-                                "success": False,
-                                "error": f"Deep research timed out after {timeout_seconds} seconds",
-                                "llm_name": llm_name
-                            }
-                            # Cancel the task to prevent it from continuing to run in the background
-                            research_task.cancel()
-                            
-                        except Exception as e:
-                            # Other errors
-                            logger.error(f"Error waiting for deep research: {str(e)}")
-                            result = {
-                                "success": False,
-                                "error": f"Error waiting for deep research: {str(e)}",
-                                "llm_name": llm_name
-                            }
-                            # Cancel the task if it's still running
-                            if 'research_task' in locals() and not research_task.done():
-                                research_task.cancel()
-                        
-                        # Get the output file path from the result
-                        output_file = result.get('output_file', None)
-                        if filtered_activity_log != output_file:
-                            logger.error(f"Log file {output_file} is different from expected path {filtered_activity_log}. Log sync will not work.")
-                            
-                    except Exception as e:
-                        logger.error(f"Error running deep research directly: {str(e)}")
-                        result = {
-                            "success": False,
-                            "error": f"Deep research error: {str(e)}",
-                            "llm_name": llm_name
-                        }
+                    raise RuntimeError("Deep research is deprecated and no longer supported.")
                 else:
                     # Run WebAgent via CLI for non-deep-research tasks
                     try:
