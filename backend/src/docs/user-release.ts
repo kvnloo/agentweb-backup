@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-01',
+    changes: [
+      'Added "Require Login" configuration for predefined work plans',
+      '- Admins can require login before a work plan can be started',
+      '- Users are redirected to log in when accessing required-login work plan sessions',
+    ],
+  },
+  {
     date: '2025-12-31',
     changes: [
       'Knowledge Base now supports image and video uploads',
