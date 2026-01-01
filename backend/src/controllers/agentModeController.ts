@@ -2429,7 +2429,8 @@ export const agentModeController = {
 
       res.json({
         ...workPlan,
-        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed'
+        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+        requireLogin: workPlan.requireLogin || false
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
@@ -2503,7 +2504,8 @@ export const agentModeController = {
         ...workPlan,
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
         autocomplete: predefinedPlan.autocomplete || false,
-        showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed'
+        showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
+        requireLogin: predefinedPlan.requireLogin || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
 
