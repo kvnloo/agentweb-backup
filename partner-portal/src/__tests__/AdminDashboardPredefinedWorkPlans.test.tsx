@@ -25,12 +25,14 @@ interface WorkPlanStep {
 interface PredefinedWorkPlan {
   title: string;
   steps: WorkPlanStep[];
+  requireLogin?: boolean;
   showLoginSignup?: 'after_plan_completed' | 'always';
 }
 
 // Helper function to get default onboarding plan
 const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
   title: 'Onboarding',
+  requireLogin: false,
   showLoginSignup: 'after_plan_completed',
   steps: [
     {
@@ -144,6 +146,7 @@ const savePredefinedWorkPlans = async (
   // Validate work plans
   const validatedWorkPlans = workPlans.map(workPlan => ({
     title: workPlan.title.trim(),
+    requireLogin: workPlan.requireLogin || false,
     showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
     steps: workPlan.steps
       .filter(step => step.title.trim().length > 0)

@@ -5010,6 +5010,7 @@ interface PredefinedWorkPlan {
   steps: WorkPlanStep[];
   welcomeMessage?: string;
   autocomplete?: boolean;
+  requireLogin?: boolean;
   showLoginSignup?: 'after_plan_completed' | 'always';
 }
 
@@ -5241,6 +5242,7 @@ const AgentModeSettings = () => {
 
   const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
     autocomplete: false,
+    requireLogin: false,
     showLoginSignup: 'after_plan_completed',
     title: 'Onboarding',
     welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
@@ -5501,6 +5503,7 @@ const AgentModeSettings = () => {
         title: workPlan.title.trim(),
         welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
         autocomplete: workPlan.autocomplete || false,
+        requireLogin: workPlan.requireLogin || false,
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
@@ -5536,6 +5539,7 @@ const AgentModeSettings = () => {
         title: '',
         steps: [{ stepCount: 1, title: '' }],
         autocomplete: false,
+        requireLogin: false,
         showLoginSignup: 'after_plan_completed'
       }
     ]);
@@ -5974,19 +5978,36 @@ const AgentModeSettings = () => {
                     />
 
                     <Box sx={{ mb: 2 }}>
-                      <FormControlLabel
-                        control={
-                          <Checkbox
-                            checked={workPlan.autocomplete || false}
-                            onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
-                            disabled={savingWorkPlans}
-                          />
-                        }
-                        label="Autocomplete Steps"
-                      />
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5, ml: 4 }}>
-                        When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
-                      </Typography>
+                      <Box display="flex" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={2}>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={workPlan.autocomplete || false}
+                              onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
+                              disabled={savingWorkPlans}
+                            />
+                          }
+                          label="Autocomplete Steps"
+                        />
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={workPlan.requireLogin || false}
+                              onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
+                              disabled={savingWorkPlans}
+                            />
+                          }
+                          label="Require Login"
+                        />
+                      </Box>
+                      <Box display="flex" justifyContent="space-between" flexWrap="wrap" gap={2} sx={{ mt: 0.5 }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ ml: 4, maxWidth: 520 }}>
+                          When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ mr: 2 }}>
+                          Users must log in before starting this plan.
+                        </Typography>
+                      </Box>
                     </Box>
 
                     <FormControl fullWidth size="small" sx={{ mb: 2 }}>
