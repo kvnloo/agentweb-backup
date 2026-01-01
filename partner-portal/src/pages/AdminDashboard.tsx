@@ -47,6 +47,7 @@ import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
+import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -129,7 +130,7 @@ interface AdminChatSession {
   pageContent?: string;
   contextChunks?: any[];
   portalType?: "customer" | "partner";
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation";
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation";
   shareMetadata?: {
     isShared: boolean;
     sharedAt?: string;
@@ -171,7 +172,9 @@ interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
+  googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
+  subscriptionType?: string; // Subscription type for customer portal users
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -212,17 +215,38 @@ interface KnowledgeBaseMetrics {
   tasksWithKnowledgeBase: number;
   totalKnowledgeBaseSize: number;
   averageKnowledgeBaseSize: number;
+  uploadedFiles: {
+    totalFiles: number;
+    totalSize: number;
+    tasksWithUploadedFiles: number;
+    averageFilesPerTask: number;
+    averageSizePerTask: number;
+  };
   public: {
     tasks: number;
     tasksWithKnowledgeBase: number;
     totalSize: number;
     averageSize: number;
+    uploadedFiles: {
+      totalFiles: number;
+      totalSize: number;
+      tasksWithUploadedFiles: number;
+      averageFilesPerTask: number;
+      averageSizePerTask: number;
+    };
   };
   private: {
     tasks: number;
     tasksWithKnowledgeBase: number;
     totalSize: number;
     averageSize: number;
+    uploadedFiles: {
+      totalFiles: number;
+      totalSize: number;
+      tasksWithUploadedFiles: number;
+      averageFilesPerTask: number;
+      averageSizePerTask: number;
+    };
   };
   tasks: {
     taskId: string;
@@ -230,6 +254,8 @@ interface KnowledgeBaseMetrics {
     knowledgeBaseSize: number;
     owner: string;
     type: "public" | "private";
+    uploadedFilesCount?: number;
+    uploadedFilesSize?: number;
   }[];
 }
 
@@ -501,6 +527,7 @@ export default function AdminDashboard() {
     'default-prompts': 10,
     'benchmarks': 11,
     'gtm-plans': 12,
+    'subscriptions': 13,
   };
   
   // Get initial tab value from URL or default to 0
@@ -527,6 +554,10 @@ export default function AdminDashboard() {
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
   const [chatSessions, setChatSessions] = useState<AdminChatSession[]>([]);
+  const [chatSessionsLoading, setChatSessionsLoading] = useState(false);
+  const [chatSessionsCursor, setChatSessionsCursor] = useState<string | null>(null);
+  const [chatSessionsHasMore, setChatSessionsHasMore] = useState(true);
+  const [chatSessionsInitialized, setChatSessionsInitialized] = useState(false);
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
@@ -556,10 +587,15 @@ export default function AdminDashboard() {
   const [seoDomainsDialogOpen, setSeoDomainsDialogOpen] = useState(false);
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
+  const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
   const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
   const [cmsTypeEditLoading, setCmsTypeEditLoading] = useState(false);
+  const [editingSubscriptionTypeUserId, setEditingSubscriptionTypeUserId] = useState<string | null>(null);
+  const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
+  const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
+  const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -574,6 +610,12 @@ export default function AdminDashboard() {
   const [createUserLoading, setCreateUserLoading] = useState(false);
   const [gtmPlans, setGtmPlans] = useState<any[]>([]);
   const [gtmPlansLoading, setGtmPlansLoading] = useState(false);
+
+  // Edit Waitlist Dialog state
+  const [editWaitlistDialogOpen, setEditWaitlistDialogOpen] = useState(false);
+  const [editWaitlistData, setEditWaitlistData] = useState<WaitlistEntry | null>(null);
+  const [editWaitlistLoading, setEditWaitlistLoading] = useState(false);
+
   const { token } = useAuth();
 
   const {
@@ -631,8 +673,28 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 2) {
       loadUsers();
+      loadSubscriptionTypes();
     }
   }, [tabValue]);
+
+  // Load subscription types
+  const loadSubscriptionTypes = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/admin/subscription-types'), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const types = response.data;
+      // Extract type names, including "Basic" as default
+      const typeNames = types.length > 0 
+        ? types.map((t: any) => t.name)
+        : ['Basic'];
+      setAvailableSubscriptionTypes(typeNames);
+    } catch (error) {
+      console.error('Error loading subscription types:', error);
+      // Default to Basic if loading fails
+      setAvailableSubscriptionTypes(['Basic']);
+    }
+  };
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -652,6 +714,7 @@ export default function AdminDashboard() {
 
   // Track last loaded dates to prevent unnecessary reloads
   const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
+  const chatSessionsLoadMoreRef = React.useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (startDate && endDate && tabValue === 0 && !adminLoading) {
@@ -711,28 +774,92 @@ export default function AdminDashboard() {
     }
   }, [tabValue, token]);
 
-  useEffect(() => {
-    const loadChatSessions = async () => {
+  const loadChatSessions = React.useCallback(
+    async (options?: { reset?: boolean }) => {
+      if (!token || chatSessionsLoading) {
+        return;
+      }
+
+      const shouldReset = options?.reset ?? false;
+      const cursor = shouldReset ? null : chatSessionsCursor;
+
       try {
+        setChatSessionsLoading(true);
+        const params = new URLSearchParams();
+        params.set("limit", "30");
+        if (cursor) {
+          params.set("cursor", cursor);
+        }
+
         const response = await axios.get(
-          buildApiUrl("/api/admin/chat-sessions"),
+          buildApiUrl(`/api/admin/chat-sessions?${params.toString()}`),
           {
             headers: {
               Authorization: `Bearer ${token}`,
             },
           }
         );
-        setChatSessions(response.data);
+
+        const { sessions, nextCursor } = response.data as {
+          sessions: AdminChatSession[];
+          nextCursor: string | null;
+        };
+
+        setChatSessions((prev) => {
+          if (shouldReset) {
+            return sessions;
+          }
+          const seen = new Set(prev.map((session) => session.sessionId));
+          const merged = [...prev];
+          sessions.forEach((session) => {
+            if (!seen.has(session.sessionId)) {
+              merged.push(session);
+              seen.add(session.sessionId);
+            }
+          });
+          return merged;
+        });
+        setChatSessionsCursor(nextCursor);
+        setChatSessionsHasMore(Boolean(nextCursor));
+        setChatSessionsInitialized(true);
       } catch (error) {
         console.error("Error loading chat sessions:", error);
+      } finally {
+        setChatSessionsLoading(false);
       }
-    };
+    },
+    [token, chatSessionsCursor, chatSessionsLoading]
+  );
 
-    // Only load chat sessions when Chat History tab (6) is selected and we haven't loaded them yet
-    if (tabValue === 6 && chatSessions.length === 0) {
-      loadChatSessions();
+  useEffect(() => {
+    if (tabValue === 6 && !chatSessionsInitialized) {
+      loadChatSessions({ reset: true });
     }
-  }, [tabValue, token]);
+  }, [tabValue, chatSessionsInitialized, loadChatSessions]);
+
+  useEffect(() => {
+    if (tabValue !== 6 || !chatSessionsHasMore) {
+      return;
+    }
+
+    const target = chatSessionsLoadMoreRef.current;
+    if (!target) {
+      return;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const [entry] = entries;
+        if (entry.isIntersecting && !chatSessionsLoading && chatSessionsHasMore) {
+          loadChatSessions();
+        }
+      },
+      { root: null, rootMargin: "200px", threshold: 0.1 }
+    );
+
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [tabValue, chatSessionsHasMore, chatSessionsLoading, loadChatSessions]);
 
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
@@ -1347,9 +1474,20 @@ export default function AdminDashboard() {
         }
       }
       
+      // Validate Google Analytics Property ID format if provided
+      // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
+      const gaId = googleAnalyticsPropertyId.trim();
+      if (gaId && !/^\d+$/.test(gaId)) {
+        setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
+        return;
+      }
+      
       const response = await axios.put(
-        buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-domains`),
-        { seoDomains: domains },
+        buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
+        { 
+          seoDomains: domains,
+          googleAnalyticsPropertyId: gaId || null
+        },
         {
           headers: { Authorization: `Bearer ${token}` }
         }
@@ -1362,19 +1500,21 @@ export default function AdminDashboard() {
             user.userId === editingSeoDomainsUserId 
               ? { 
                   ...user, 
-                  seoDomains: response.data.seoDomains || []
+                  seoDomains: response.data.seoDomains || [],
+                  googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined
                 }
               : user
           )
         );
-        setSuccess("SEO domains updated successfully!");
+        setSuccess("SEO/AEO configuration updated successfully!");
         setSeoDomainsDialogOpen(false);
         setEditingSeoDomainsUserId(null);
         setSeoDomainsText("");
+        setGoogleAnalyticsPropertyId("");
       }
     } catch (error: any) {
-      console.error("Error updating SEO domains:", error);
-      setError(error.response?.data?.message || "Failed to update SEO domains");
+      console.error("Error updating SEO/AEO configuration:", error);
+      setError(error.response?.data?.message || "Failed to update SEO/AEO configuration");
     } finally {
       setSeoDomainsEditLoading(false);
     }
@@ -1411,10 +1551,46 @@ export default function AdminDashboard() {
         setCurrentCmsType("");
       }
     } catch (error: any) {
-      console.error("Error updating CMS Type:", error);
       setError(error.response?.data?.message || "Failed to update CMS Type");
     } finally {
       setCmsTypeEditLoading(false);
+    }
+  };
+
+  const handleSaveSubscriptionType = async () => {
+    if (!editingSubscriptionTypeUserId) return;
+    
+    try {
+      setSubscriptionTypeEditLoading(true);
+      
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingSubscriptionTypeUserId}/subscription-type`),
+        { subscriptionType: currentSubscriptionType || 'Basic' },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        // Update the user in the local state without reloading
+        setUsers((prevUsers: User[]) => 
+          prevUsers.map((user: User) => 
+            user.userId === editingSubscriptionTypeUserId 
+              ? { 
+                  ...user, 
+                  subscriptionType: response.data.subscriptionType || 'Basic'
+                }
+              : user
+          )
+        );
+        setSuccess("Subscription Type updated successfully!");
+        setEditingSubscriptionTypeUserId(null);
+        setCurrentSubscriptionType("");
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to update Subscription Type");
+    } finally {
+      setSubscriptionTypeEditLoading(false);
     }
   };
 
@@ -1482,6 +1658,44 @@ export default function AdminDashboard() {
     }
   };
 
+  // Edit Waitlist Dialog handlers
+  const handleEditWaitlistOpen = (entry: WaitlistEntry) => {
+    setEditWaitlistData({ ...entry });
+    setEditWaitlistDialogOpen(true);
+  };
+
+  const handleEditWaitlistClose = () => {
+    setEditWaitlistDialogOpen(false);
+    setEditWaitlistData(null);
+  };
+
+  const handleEditWaitlistSave = async () => {
+    if (!editWaitlistData) return;
+
+    try {
+      setEditWaitlistLoading(true);
+      setError("");
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/waitlist/${encodeURIComponent(editWaitlistData.email)}`),
+        editWaitlistData,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        // Reload waitlist to get updated data
+        await loadWaitlist();
+        setSuccess("Waitlist entry updated successfully!");
+        handleEditWaitlistClose();
+      }
+    } catch (error: any) {
+      console.error("Error updating waitlist entry:", error);
+      setError(error.response?.data?.message || "Failed to update waitlist entry");
+    } finally {
+      setEditWaitlistLoading(false);
+    }
+  };
+
   const useCaseOptions = [
     "Content Marketing",
     "SEO",
@@ -1537,6 +1751,7 @@ export default function AdminDashboard() {
             <Tab label="Default Prompts" {...a11yProps(10)} />
             <Tab label="Benchmarks" {...a11yProps(11)} />
             <Tab label="GTM Plans" {...a11yProps(12)} />
+            <Tab label="Subscriptions" {...a11yProps(13)} />
           </Tabs>
         </Box>
 
@@ -2083,7 +2298,7 @@ export default function AdminDashboard() {
                   <TableCell>Ad Account</TableCell>
                   <TableCell>Email Sender</TableCell>
                   <TableCell>Slack Channel</TableCell>
-                  <TableCell>SEO Domains</TableCell>
+                  <TableCell>SEO/AEO</TableCell>
                   <TableCell>CMS Type</TableCell>
                   <TableCell>Created</TableCell>
                   <TableCell>Last Login</TableCell>
@@ -2094,6 +2309,7 @@ export default function AdminDashboard() {
                   <TableCell>OAuth User</TableCell>
                   <TableCell>Admin</TableCell>
                   <TableCell>Status</TableCell>
+                  <TableCell>Subscription Type</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
@@ -2216,27 +2432,39 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            {user.seoDomains && user.seoDomains.length > 0 ? (
-                              <Box>
-                                {user.seoDomains.map((domain: string, idx: number) => (
-                                  <Chip
-                                    key={idx}
-                                    label={domain}
-                                    size="small"
-                                    sx={{ mr: 0.5, mb: 0.5 }}
-                                  />
-                                ))}
-                              </Box>
-                            ) : (
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                -
-                              </Typography>
-                            )}
+                            <Box sx={{ flex: 1, minWidth: 200 }}>
+                              {user.seoDomains && user.seoDomains.length > 0 ? (
+                                <Box sx={{ mb: 1 }}>
+                                  {user.seoDomains.map((domain: string, idx: number) => (
+                                    <Chip
+                                      key={idx}
+                                      label={domain}
+                                      size="small"
+                                      sx={{ mr: 0.5, mb: 0.5 }}
+                                    />
+                                  ))}
+                                </Box>
+                              ) : (
+                                <Typography variant="body2" sx={{ mb: 1 }}>
+                                  No domains
+                                </Typography>
+                              )}
+                              {user.googleAnalyticsPropertyId ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  GA: {user.googleAnalyticsPropertyId}
+                                </Typography>
+                              ) : (
+                                <Typography variant="body2" color="text.secondary">
+                                  No GA ID
+                                </Typography>
+                              )}
+                            </Box>
                             <IconButton
                               size="small"
                               onClick={() => {
                                 setEditingSeoDomainsUserId(user.userId);
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
+                                setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
                                 setSeoDomainsDialogOpen(true);
                               }}
                               disabled={seoDomainsEditLoading}
@@ -2429,6 +2657,67 @@ export default function AdminDashboard() {
                           />
                         </TableCell>
                         <TableCell>
+                          {user.roles && user.roles.includes("customer") ? (
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                              {editingSubscriptionTypeUserId === user.userId ? (
+                                <>
+                                  <FormControl size="small" sx={{ minWidth: 120 }}>
+                                    <Select
+                                      value={currentSubscriptionType}
+                                      onChange={(e) => setCurrentSubscriptionType(e.target.value)}
+                                      disabled={subscriptionTypeEditLoading}
+                                    >
+                                      {availableSubscriptionTypes.map((type) => (
+                                        <MenuItem key={type} value={type}>
+                                          {type}
+                                        </MenuItem>
+                                      ))}
+                                    </Select>
+                                  </FormControl>
+                                  <IconButton
+                                    size="small"
+                                    onClick={handleSaveSubscriptionType}
+                                    disabled={subscriptionTypeEditLoading}
+                                    color="primary"
+                                  >
+                                    <CheckIcon />
+                                  </IconButton>
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => {
+                                      setEditingSubscriptionTypeUserId(null);
+                                      setCurrentSubscriptionType("");
+                                    }}
+                                    disabled={subscriptionTypeEditLoading}
+                                  >
+                                    <CloseIcon />
+                                  </IconButton>
+                                </>
+                              ) : (
+                                <>
+                                  <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                    {user.subscriptionType || "Basic"}
+                                  </Typography>
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => {
+                                      setEditingSubscriptionTypeUserId(user.userId);
+                                      setCurrentSubscriptionType(user.subscriptionType || "Basic");
+                                    }}
+                                    disabled={subscriptionTypeEditLoading}
+                                  >
+                                    <EditIcon />
+                                  </IconButton>
+                                </>
+                              )}
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              -
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
                           <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
                             {user.roles && user.roles.includes("customer") && (
                               <Tooltip title="Access Customer Portal">
@@ -2437,7 +2726,7 @@ export default function AdminDashboard() {
                                   onClick={() => handleAccessCustomerPortal(user.userId)}
                                   disabled={delegateAccessLoading === user.userId}
                                   color="primary"
-                                  sx={{ 
+                                  sx={{
                                     border: '1px solid',
                                     borderColor: 'primary.main',
                                     '&:hover': { bgcolor: 'primary.50' }
@@ -2451,7 +2740,7 @@ export default function AdminDashboard() {
                                 </IconButton>
                               </Tooltip>
                             )}
-                            
+
                             <Tooltip title="Manage Roles">
                               <IconButton
                                 size="small"
@@ -2818,6 +3107,20 @@ export default function AdminDashboard() {
                               gap: 0.5,
                             }}
                           >
+                            <Tooltip title="Edit All Fields">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleEditWaitlistOpen(entry)}
+                                color="info"
+                                sx={{
+                                  border: '1px solid',
+                                  borderColor: 'info.main',
+                                  '&:hover': { bgcolor: 'info.50' }
+                                }}
+                              >
+                                <EditIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
                             {(!userExists || isFreeUserOnly) && entry.status !== "invited" && !isRegisteredUser && (
                               <Button
                                 variant="outlined"
@@ -3167,144 +3470,162 @@ export default function AdminDashboard() {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {loading ? (
+                {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={8} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
                 ) : (
-                  chatSessions.map((session) => (
-                    <TableRow key={session.sessionId}>
-                      <TableCell component="th" scope="row">
-                        <Tooltip title={session.sessionId}>
-                          <span>{`${session.sessionId.substring(
-                            0,
-                            8
-                          )}...`}</span>
-                        </Tooltip>
-                      </TableCell>
-                      <TableCell>
-                        <Link
-                          component={RouterLink}
-                          to={`/profile/${session.userId}`}
-                          color="primary"
-                          underline="hover"
-                        >
-                          {session.userId}
-                        </Link>
-                      </TableCell>
-                      <TableCell>
-                        {session.portalType ? (
-                          <Chip
-                            label={
-                              session.portalType.charAt(0).toUpperCase() +
-                              session.portalType.slice(1)
-                            }
-                            color={
-                              session.portalType === "customer"
-                                ? "secondary"
-                                : "primary"
-                            }
-                            size="small"
-                          />
-                        ) : (
-                          <Chip label="Partner" color="primary" size="small" />
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {session.sessionType ? (
-                          <Chip
-                            label={
-                              session.sessionType === "predefined-work-plan"
-                                ? "Predefined Work Plan"
-                                : session.sessionType === "scheduled"
-                                ? "Scheduled"
-                                : session.sessionType === "image-generation"
-                                ? "Image Generation"
-                                : session.sessionType === "video-generation"
-                                ? "Video Generation"
-                                : "Regular"
-                            }
-                            color={
-                              session.sessionType === "predefined-work-plan"
-                                ? "primary"
-                                : session.sessionType === "scheduled"
-                                ? "secondary"
-                                : session.sessionType === "image-generation"
-                                ? "success"
-                                : session.sessionType === "video-generation"
-                                ? "info"
-                                : "default"
-                            }
-                            size="small"
-                          />
-                        ) : (
-                          <Chip label="Undefined" color="default" size="small" />
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        {format(new Date(session.createdAt), "Pp")}
-                      </TableCell>
-                      <TableCell>
-                        {format(new Date(session.updatedAt), "Pp")}
-                      </TableCell>
-                      <TableCell>
-                        <Chip
-                          label={session.messages?.length || 0}
-                          color="primary"
-                          size="small"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-                          <Button
-                            variant="outlined"
-                            size="small"
-                            onClick={() => handleViewChat(session)}
+                  <>
+                    {chatSessions.map((session) => (
+                      <TableRow key={session.sessionId}>
+                        <TableCell component="th" scope="row">
+                          <Tooltip title={session.sessionId}>
+                            <span>{`${session.sessionId.substring(
+                              0,
+                              8
+                            )}...`}</span>
+                          </Tooltip>
+                        </TableCell>
+                        <TableCell>
+                          <Link
+                            component={RouterLink}
+                            to={`/profile/${session.userId}`}
+                            color="primary"
+                            underline="hover"
                           >
-                            Debug Chat
-                          </Button>
-                          {session.shareMetadata?.isShared && !(session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) && (
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              color="error"
-                              component="a"
-                              href={`${CUSTOMER_FRONTEND_URL}/share/${session.sessionId}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              sx={{ textAlign: 'center' }}
-                            >
-                              Shared Chat
-                            </Button>
-                          )}
-                          {session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && (
-                            <Button
-                              variant="outlined"
-                              size="small"
-                              color="error"
-                              component="a"
-                              href={
-                                session.sessionType === "predefined-work-plan" && session.workPlan?.title
-                                  ? `${CUSTOMER_FRONTEND_URL}/plan/${encodeURIComponent(session.workPlan.title)}/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
-                                  : `${CUSTOMER_FRONTEND_URL}/ishare/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                            {session.userId}
+                          </Link>
+                        </TableCell>
+                        <TableCell>
+                          {session.portalType ? (
+                            <Chip
+                              label={
+                                session.portalType.charAt(0).toUpperCase() +
+                                session.portalType.slice(1)
                               }
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              sx={{ textAlign: 'center' }}
-                            >
-                              Shared Chat
-                            </Button>
+                              color={
+                                session.portalType === "customer"
+                                  ? "secondary"
+                                  : "primary"
+                              }
+                              size="small"
+                            />
+                          ) : (
+                            <Chip label="Partner" color="primary" size="small" />
                           )}
-                        </Box>
-                      </TableCell>
-                    </TableRow>
-                  ))
+                        </TableCell>
+                        <TableCell>
+                          {session.sessionType ? (
+                            <Chip
+                              label={
+                                session.sessionType === "predefined-work-plan"
+                                  ? "Predefined Work Plan"
+                                  : session.sessionType === "scheduled"
+                                  ? "Scheduled"
+                                  : session.sessionType === "image-generation"
+                                  ? "Image Generation"
+                                  : session.sessionType === "video-generation"
+                                  ? "Video Generation"
+                                  : session.sessionType === "book-generation"
+                                  ? "Book Generation"
+                                  : session.sessionType === "report_generation"
+                                  ? "Report Generation"
+                                  : "Regular"
+                              }
+                              color={
+                                session.sessionType === "predefined-work-plan"
+                                  ? "primary"
+                                  : session.sessionType === "scheduled"
+                                  ? "secondary"
+                                  : session.sessionType === "image-generation"
+                                  ? "success"
+                                  : session.sessionType === "video-generation"
+                                  ? "info"
+                                  : session.sessionType === "book-generation"
+                                  ? "info"
+                                  : session.sessionType === "report_generation"
+                                  ? "warning"
+                                  : "default"
+                              }
+                              size="small"
+                            />
+                          ) : (
+                            <Chip label="Undefined" color="default" size="small" />
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {format(new Date(session.createdAt), "Pp")}
+                        </TableCell>
+                        <TableCell>
+                          {format(new Date(session.updatedAt), "Pp")}
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            label={session.messages?.length || 0}
+                            color="primary"
+                            size="small"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+                            <Button
+                              variant="outlined"
+                              size="small"
+                              onClick={() => handleViewChat(session)}
+                            >
+                              Debug Chat
+                            </Button>
+                            {session.shareMetadata?.isShared && !(session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token) && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                component="a"
+                                href={`${CUSTOMER_FRONTEND_URL}/share/${session.sessionId}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                sx={{ textAlign: 'center' }}
+                              >
+                                Shared Chat
+                              </Button>
+                            )}
+                            {session.interactiveShareMetadata?.isActive && session.interactiveShareMetadata?.token && (
+                              <Button
+                                variant="outlined"
+                                size="small"
+                                color="error"
+                                component="a"
+                                href={
+                                  session.sessionType === "predefined-work-plan" && session.workPlan?.title
+                                    ? `${CUSTOMER_FRONTEND_URL}/plan/${encodeURIComponent(session.workPlan.title)}/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                                    : `${CUSTOMER_FRONTEND_URL}/ishare/${session.sessionId}?conversable=${session.interactiveShareMetadata.token}`
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                sx={{ textAlign: 'center' }}
+                              >
+                                Shared Chat
+                              </Button>
+                            )}
+                          </Box>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    {chatSessionsLoading && (
+                      <TableRow>
+                        <TableCell colSpan={8} align="center">
+                          <CircularProgress size={24} />
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </>
                 )}
               </TableBody>
             </Table>
           </TableContainer>
+          <Box ref={chatSessionsLoadMoreRef} sx={{ height: 1 }} />
         </TabPanel>
 
         <TabPanel value={tabValue} index={7}>
@@ -3334,6 +3655,8 @@ export default function AdminDashboard() {
                           <TableCell>Tasks with Knowledge Base</TableCell>
                           <TableCell>Total Size</TableCell>
                           <TableCell>Average Size</TableCell>
+                          <TableCell>Uploaded Files</TableCell>
+                          <TableCell>Uploaded Size</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
@@ -3358,6 +3681,13 @@ export default function AdminDashboard() {
                                 ).toFixed(2)}{" "}
                                 KB
                               </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.uploadedFiles.totalFiles} files (
+                                {knowledgeBaseMetrics.uploadedFiles.tasksWithUploadedFiles} tasks)
+                              </TableCell>
+                              <TableCell>
+                                {(knowledgeBaseMetrics.uploadedFiles.totalSize / 1024).toFixed(2)} KB
+                              </TableCell>
                             </TableRow>
                             <TableRow>
                               <TableCell>Public</TableCell>
@@ -3378,6 +3708,13 @@ export default function AdminDashboard() {
                                   knowledgeBaseMetrics.public.averageSize / 1024
                                 ).toFixed(2)}{" "}
                                 KB
+                              </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.public.uploadedFiles.totalFiles} files (
+                                {knowledgeBaseMetrics.public.uploadedFiles.tasksWithUploadedFiles} tasks)
+                              </TableCell>
+                              <TableCell>
+                                {(knowledgeBaseMetrics.public.uploadedFiles.totalSize / 1024).toFixed(2)} KB
                               </TableCell>
                             </TableRow>
                             <TableRow>
@@ -3401,11 +3738,18 @@ export default function AdminDashboard() {
                                 ).toFixed(2)}{" "}
                                 KB
                               </TableCell>
+                              <TableCell>
+                                {knowledgeBaseMetrics.private.uploadedFiles.totalFiles} files (
+                                {knowledgeBaseMetrics.private.uploadedFiles.tasksWithUploadedFiles} tasks)
+                              </TableCell>
+                              <TableCell>
+                                {(knowledgeBaseMetrics.private.uploadedFiles.totalSize / 1024).toFixed(2)} KB
+                              </TableCell>
                             </TableRow>
                           </>
                         ) : (
                           <TableRow>
-                            <TableCell colSpan={5} align="center">
+                            <TableCell colSpan={7} align="center">
                               <Typography
                                 variant="body2"
                                 color="text.secondary"
@@ -3437,6 +3781,8 @@ export default function AdminDashboard() {
                           <TableCell>Owner</TableCell>
                           <TableCell>Type</TableCell>
                           <TableCell>Knowledge Base Size</TableCell>
+                          <TableCell>Uploaded Files</TableCell>
+                          <TableCell>Uploaded Size</TableCell>
                           <TableCell>Actions</TableCell>
                         </TableRow>
                       </TableHead>
@@ -3466,6 +3812,12 @@ export default function AdminDashboard() {
                                 {(task.knowledgeBaseSize / 1024).toFixed(2)} KB
                               </TableCell>
                               <TableCell>
+                                {task.uploadedFilesCount ?? 0}
+                              </TableCell>
+                              <TableCell>
+                                {((task.uploadedFilesSize || 0) / 1024).toFixed(2)} KB
+                              </TableCell>
+                              <TableCell>
                                 <Button
                                   size="small"
                                   component={RouterLink}
@@ -3479,7 +3831,7 @@ export default function AdminDashboard() {
                           ))
                         ) : (
                           <TableRow>
-                            <TableCell colSpan={6} align="center">
+                            <TableCell colSpan={8} align="center">
                               <Typography
                                 variant="body2"
                                 color="text.secondary"
@@ -3657,6 +4009,10 @@ export default function AdminDashboard() {
               </TableContainer>
             )}
           </Box>
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={13}>
+          <SubscriptionTypesTab />
         </TabPanel>
       </Paper>
 
@@ -4272,25 +4628,27 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
-      {/* SEO Domains Configuration Dialog */}
+      {/* SEO/AEO Configuration Dialog */}
       <Dialog
         open={seoDomainsDialogOpen}
         onClose={() => {
           setSeoDomainsDialogOpen(false);
           setEditingSeoDomainsUserId(null);
           setSeoDomainsText("");
+          setGoogleAnalyticsPropertyId("");
         }}
         maxWidth="sm"
         fullWidth
       >
         <DialogTitle>
-          Configure SEO Domains
+          Configure SEO/AEO
           <IconButton
             aria-label="close"
             onClick={() => {
               setSeoDomainsDialogOpen(false);
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
+              setGoogleAnalyticsPropertyId("");
             }}
             sx={{
               position: 'absolute',
@@ -4302,18 +4660,33 @@ export default function AdminDashboard() {
           </IconButton>
         </DialogTitle>
         <DialogContent dividers>
-          <TextField
-            autoFocus
-            fullWidth
-            multiline
-            rows={6}
-            label="SEO Domains"
-            value={seoDomainsText}
-            onChange={(e) => setSeoDomainsText(e.target.value)}
-            placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
-            helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
-            disabled={seoDomainsEditLoading}
-          />
+          <Grid container spacing={2}>
+            <Grid item xs={12}>
+              <TextField
+                autoFocus
+                fullWidth
+                multiline
+                rows={6}
+                label="SEO Domains"
+                value={seoDomainsText}
+                onChange={(e) => setSeoDomainsText(e.target.value)}
+                placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
+                helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Google Analytics Property ID"
+                value={googleAnalyticsPropertyId}
+                onChange={(e) => setGoogleAnalyticsPropertyId(e.target.value)}
+                placeholder="123456789"
+                helperText="Enter your Google Analytics 4 Property ID (numeric, e.g., 123456789). You can find this in GA4 Admin > Property Settings. This will enable Google Analytics metrics on the SEO/AEO page."
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
+          </Grid>
         </DialogContent>
         <DialogActions>
           <Button
@@ -4321,6 +4694,7 @@ export default function AdminDashboard() {
               setSeoDomainsDialogOpen(false);
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
+              setGoogleAnalyticsPropertyId("");
             }}
             disabled={seoDomainsEditLoading}
           >
@@ -4474,13 +4848,148 @@ export default function AdminDashboard() {
           >
             Cancel
           </Button>
-          <Button 
+          <Button
             onClick={handleCreateUser}
             variant="contained"
             disabled={createUserLoading}
             startIcon={createUserLoading ? <CircularProgress size={20} /> : <AddIcon />}
           >
             {createUserLoading ? 'Creating...' : 'Create User'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Edit Waitlist Entry Dialog */}
+      <Dialog
+        open={editWaitlistDialogOpen}
+        onClose={handleEditWaitlistClose}
+        maxWidth="md"
+        fullWidth
+      >
+        <DialogTitle>Edit Waitlist Entry</DialogTitle>
+        <DialogContent>
+          {editWaitlistData && (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, mt: 1 }}>
+              <TextField
+                fullWidth
+                label="Email"
+                value={editWaitlistData.email || ''}
+                disabled
+                helperText="Email cannot be changed (primary key)"
+              />
+              <TextField
+                fullWidth
+                label="Full Name"
+                value={editWaitlistData.fullName || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, fullName: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Company Name"
+                value={editWaitlistData.companyName || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, companyName: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Phone Number"
+                value={editWaitlistData.phoneNumber || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, phoneNumber: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Stripe Customer ID"
+                value={editWaitlistData.stripe_customer_id || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, stripe_customer_id: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Monthly Marketing Spend"
+                value={editWaitlistData.monthlyMarketingSpend || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, monthlyMarketingSpend: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <TextField
+                fullWidth
+                label="Business Area"
+                value={editWaitlistData.businessArea || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, businessArea: e.target.value })}
+                disabled={editWaitlistLoading}
+              />
+              <FormControl fullWidth>
+                <InputLabel>Marketing Channels</InputLabel>
+                <Select
+                  multiple
+                  value={editWaitlistData.marketingChannels || []}
+                  onChange={(e) => setEditWaitlistData({ ...editWaitlistData, marketingChannels: e.target.value as string[] })}
+                  renderValue={(selected) => (selected as string[]).join(', ')}
+                  label="Marketing Channels"
+                  disabled={editWaitlistLoading}
+                >
+                  {marketingChannelOptions.map((channel) => (
+                    <MenuItem key={channel} value={channel}>{channel}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl fullWidth>
+                <InputLabel>Use Case Categories</InputLabel>
+                <Select
+                  multiple
+                  value={editWaitlistData.useCaseCategories || []}
+                  onChange={(e) => setEditWaitlistData({ ...editWaitlistData, useCaseCategories: e.target.value as string[] })}
+                  renderValue={(selected) => (selected as string[]).join(', ')}
+                  label="Use Case Categories"
+                  disabled={editWaitlistLoading}
+                >
+                  {useCaseOptions.map((category) => (
+                    <MenuItem key={category} value={category}>{category}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <TextField
+                fullWidth
+                label="Use Case Description"
+                value={editWaitlistData.useCaseDescription || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, useCaseDescription: e.target.value })}
+                multiline
+                rows={3}
+                disabled={editWaitlistLoading}
+              />
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={editWaitlistData.requestReport || false}
+                    onChange={(e) => setEditWaitlistData({ ...editWaitlistData, requestReport: e.target.checked })}
+                    disabled={editWaitlistLoading}
+                  />
+                }
+                label="Request Report"
+              />
+              <TextField
+                fullWidth
+                label="Support Note"
+                value={editWaitlistData.supportNote || ''}
+                onChange={(e) => setEditWaitlistData({ ...editWaitlistData, supportNote: e.target.value })}
+                multiline
+                rows={3}
+                disabled={editWaitlistLoading}
+              />
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleEditWaitlistClose} disabled={editWaitlistLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleEditWaitlistSave}
+            variant="contained"
+            disabled={editWaitlistLoading}
+          >
+            {editWaitlistLoading ? <CircularProgress size={24} /> : 'Save'}
           </Button>
         </DialogActions>
       </Dialog>
@@ -4501,6 +5010,8 @@ interface PredefinedWorkPlan {
   steps: WorkPlanStep[];
   welcomeMessage?: string;
   autocomplete?: boolean;
+  requireLogin?: boolean;
+  showLoginSignup?: 'after_plan_completed' | 'always';
 }
 
 interface AvailableFunctionCall {
@@ -4516,14 +5027,20 @@ const AgentModeSettings = () => {
   const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
   const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
   const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
+  const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
+  const [supportedModels, setSupportedModels] = useState<string[]>([]);
+  const [contentModel, setContentModel] = useState('');
   const [loading, setLoading] = useState(true);
+  const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [savingWorkPlans, setSavingWorkPlans] = useState(false);
+  const [savingContentModel, setSavingContentModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const { token } = useAuth();
+  const fallbackDefaultModel = 'gpt-5-chat-2';
 
   useEffect(() => {
     loadAllSettings();
@@ -4534,6 +5051,9 @@ const AgentModeSettings = () => {
       setLoading(true);
       setError('');
       
+      const models = await loadSupportedModels();
+      await loadDefaultModel(models);
+
       // Load system prompt
       await loadSystemPrompt();
       
@@ -4548,11 +5068,61 @@ const AgentModeSettings = () => {
       
       // Load predefined work plans
       await loadPredefinedWorkPlans();
+      
+      // Load content model
+      await loadContentModel();
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadSupportedModels = async (): Promise<string[]> => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/agent-mode/public/llm-models'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (Array.isArray(response.data) && response.data.length > 0) {
+        setSupportedModels(response.data);
+        return response.data;
+      }
+    } catch (error) {
+      console.error('Error loading supported models:', error);
+    }
+    const fallbackModels = [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    setSupportedModels(fallbackModels);
+    return fallbackModels;
+  };
+
+  const loadDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      try {
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          const modelValue = response.data.settingValue.trim();
+          if (modelValue && availableModels.includes(modelValue)) {
+            setDefaultModel(modelValue);
+          } else {
+            setDefaultModel(fallbackDefaultModel);
+          }
+          return;
+        }
+      } catch (settingsError: any) {
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading default model setting:', settingsError);
+        }
+      }
+      
+      setDefaultModel(fallbackDefaultModel);
+    } catch (error) {
+      console.error('Error loading default model:', error);
+      setDefaultModel(fallbackDefaultModel);
     }
   };
 
@@ -4672,6 +5242,8 @@ const AgentModeSettings = () => {
 
   const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
     autocomplete: false,
+    requireLogin: false,
+    showLoginSignup: 'after_plan_completed',
     title: 'Onboarding',
     welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
     steps: [
@@ -4776,6 +5348,55 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadContentModel = async () => {
+    try {
+      try {
+        // Try to get content model from settings
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_content_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        
+        if (response.data && response.data.settingValue) {
+          setContentModel(response.data.settingValue);
+          return;
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404), use default
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading content model:', settingsError);
+        }
+      }
+      
+      // Default to gpt-5-chat-2 if no setting exists
+      setContentModel('gpt-5-chat-2');
+    } catch (error) {
+      console.error('Error loading content model:', error);
+      setContentModel('gpt-4');
+    }
+  };
+
+  const saveContentModel = async () => {
+    try {
+      setSavingContentModel(true);
+      setError('');
+      setSuccess('');
+      
+      await axios.put(buildApiUrl('/api/settings/agent_mode_content_model'), {
+        settingValue: contentModel,
+        description: 'Content model for blog article and book content generation (e.g., gpt-4, claude-sonnet-4-5 via AWS Bedrock). Note: This does not affect Agent Mode chat conversations.'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      setSuccess('Content model updated successfully!');
+    } catch (error) {
+      console.error('Error saving content model:', error);
+      setError('Failed to save content model');
+    } finally {
+      setSavingContentModel(false);
+    }
+  };
+
   const saveSystemPrompt = async () => {
     try {
       setSavingSystemPrompt(true);
@@ -4795,6 +5416,28 @@ const AgentModeSettings = () => {
       setError('Failed to save system prompt');
     } finally {
       setSavingSystemPrompt(false);
+    }
+  };
+
+  const saveDefaultModel = async () => {
+    try {
+      setSavingDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      await axios.put(buildApiUrl('/api/settings/agent_mode_default_model'), {
+        settingValue: defaultModel,
+        description: 'Agent Mode default model for new sessions'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      setSuccess('Default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving default model:', error);
+      setError('Failed to save default model');
+    } finally {
+      setSavingDefaultModel(false);
     }
   };
 
@@ -4860,6 +5503,8 @@ const AgentModeSettings = () => {
         title: workPlan.title.trim(),
         welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
         autocomplete: workPlan.autocomplete || false,
+        requireLogin: workPlan.requireLogin || false,
+        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
           .map((step, index) => ({
@@ -4893,7 +5538,9 @@ const AgentModeSettings = () => {
       {
         title: '',
         steps: [{ stepCount: 1, title: '' }],
-        autocomplete: false
+        autocomplete: false,
+        requireLogin: false,
+        showLoginSignup: 'after_plan_completed'
       }
     ]);
   };
@@ -4931,7 +5578,7 @@ const AgentModeSettings = () => {
     setPredefinedWorkPlans(updated);
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -4979,6 +5626,14 @@ const AgentModeSettings = () => {
         setConversationStarters(response.data);
         setConversationStartersText(response.data.join('\n'));
         setSuccess('Reset to default conversation starters successfully!');
+      } else if (type === 'defaultModel') {
+        setSavingDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setDefaultModel(fallbackDefaultModel);
+        setSuccess('Reset to default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -4990,6 +5645,8 @@ const AgentModeSettings = () => {
         setSavingWelcomeMessage(false);
       } else if (type === 'conversationStarters') {
         setSavingConversationStarters(false);
+      } else if (type === 'defaultModel') {
+        setSavingDefaultModel(false);
       }
     }
   };
@@ -5023,6 +5680,89 @@ const AgentModeSettings = () => {
           {success}
         </Alert>
       )}
+
+      {/* Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('defaultModel')}
+                disabled={savingDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveDefaultModel}
+                disabled={savingDefaultModel || !defaultModel}
+              >
+                {savingDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-default-model-label">Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-default-model-label"
+              value={defaultModel}
+              label="Default Model"
+              onChange={(e) => setDefaultModel(e.target.value as string)}
+            >
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for newly created Agent Mode sessions. Existing sessions keep their current model.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Content Model for Blog/Book Generation */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Content Model (Blog & Book Generation)</Typography>
+            <Button
+              variant="contained"
+              onClick={saveContentModel}
+              disabled={savingContentModel}
+            >
+              {savingContentModel ? <CircularProgress size={20} /> : 'Save Changes'}
+            </Button>
+          </Box>
+
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel>Content Model</InputLabel>
+            <Select
+              value={contentModel}
+              onChange={(e) => setContentModel(e.target.value)}
+              label="Content Model"
+            >
+              <MenuItem value="gpt-5-chat-2">GPT-5 Chat 2 (Azure)</MenuItem>
+              <MenuItem value="anthropic.claude-sonnet-4-5-20250929-v1:0">
+                Claude Sonnet 4.5 (AWS Bedrock)
+              </MenuItem>
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Select the LLM model to use for blog article and book content generation. This setting does NOT affect Agent Mode chat conversations, which use their own model configuration.
+          </Typography>
+        </CardContent>
+      </Card>
 
       {/* System Prompt */}
       <Card sx={{ mb: 3 }}>
@@ -5238,20 +5978,58 @@ const AgentModeSettings = () => {
                     />
 
                     <Box sx={{ mb: 2 }}>
-                      <FormControlLabel
-                        control={
-                          <Checkbox
-                            checked={workPlan.autocomplete || false}
-                            onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
-                            disabled={savingWorkPlans}
-                          />
-                        }
-                        label="Autocomplete Steps"
-                      />
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5, ml: 4 }}>
-                        When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
-                      </Typography>
+                      <Box display="flex" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={2}>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={workPlan.autocomplete || false}
+                              onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
+                              disabled={savingWorkPlans}
+                            />
+                          }
+                          label="Autocomplete Steps"
+                        />
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={workPlan.requireLogin || false}
+                              onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
+                              disabled={savingWorkPlans}
+                            />
+                          }
+                          label="Require Login"
+                        />
+                      </Box>
+                      <Box display="flex" justifyContent="space-between" flexWrap="wrap" gap={2} sx={{ mt: 0.5 }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ ml: 4, maxWidth: 520 }}>
+                          When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ mr: 2 }}>
+                          Users must log in before starting this plan.
+                        </Typography>
+                      </Box>
                     </Box>
+
+                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+                      <InputLabel>Show Login/Signup</InputLabel>
+                      <Select
+                        value={workPlan.showLoginSignup || 'after_plan_completed'}
+                        label="Show Login/Signup"
+                        onChange={(e) =>
+                          updateWorkPlan(workPlanIndex, {
+                            ...workPlan,
+                            showLoginSignup: e.target.value as 'after_plan_completed' | 'always'
+                          })
+                        }
+                        disabled={savingWorkPlans}
+                      >
+                        <MenuItem value="after_plan_completed">After plan completed</MenuItem>
+                        <MenuItem value="always">Always</MenuItem>
+                      </Select>
+                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                        Controls when the login/signup prompt is displayed during a plan session.
+                      </Typography>
+                    </FormControl>
 
                     <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
                       Steps:

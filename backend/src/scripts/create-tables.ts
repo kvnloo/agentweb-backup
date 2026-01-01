@@ -595,7 +595,8 @@ const createChatSessionsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'sessionId', AttributeType: 'S' },
       { AttributeName: 'userId', AttributeType: 'S' },
-      { AttributeName: 'updatedAt', AttributeType: 'S' }
+      { AttributeName: 'updatedAt', AttributeType: 'S' },
+      { AttributeName: 'adminListPartition', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'sessionId', KeyType: 'HASH' }
@@ -614,7 +615,51 @@ const createChatSessionsTable = async () => {
           ReadCapacityUnits: 5,
           WriteCapacityUnits: 5
         }
+      },
+      {
+        IndexName: 'AdminUpdatedAtIndex',
+        KeySchema: [
+          { AttributeName: 'adminListPartition', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
       }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Chat Messages table
+const createChatMessagesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-ChatMessages`,
+    AttributeDefinitions: [
+      { AttributeName: 'sessionId', AttributeType: 'S' },
+      { AttributeName: 'messageIndex', AttributeType: 'N' }
+    ],
+    KeySchema: [
+      { AttributeName: 'sessionId', KeyType: 'HASH' },
+      { AttributeName: 'messageIndex', KeyType: 'RANGE' }
     ],
     ProvisionedThroughput: {
       ReadCapacityUnits: 5,
@@ -941,6 +986,46 @@ const createGTMPlansTable = async () => {
   }
 };
 
+// Create Books table
+const createBooksTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-Books`,
+    AttributeDefinitions: [
+      { AttributeName: 'bookId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'updatedAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'bookId', KeyType: 'HASH' },
+      { AttributeName: 'userId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'updatedAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Lead Lists table
 const createLeadListsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1032,6 +1117,54 @@ const createLeadsTable = async () => {
   }
 };
 
+// Create Book Contents table
+const createBookContentsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-BookContents`,
+    AttributeDefinitions: [
+      { AttributeName: 'contentId', AttributeType: 'S' },
+      { AttributeName: 'bookId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'contentId', KeyType: 'HASH' },
+      { AttributeName: 'bookId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'BookIdIndex',
+        KeySchema: [
+          { AttributeName: 'bookId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1046,6 +1179,7 @@ const main = async () => {
     await createWorkflowExecutionsTable();
     await createTaskTemplatesTable();
     await createChatSessionsTable();
+    await createChatMessagesTable();
     await createTaskLeadListTable();
     await createAssetApprovalsTable();
     await createSettingsTable();
@@ -1054,6 +1188,8 @@ const main = async () => {
     await createGTMPlansTable();
     await createLeadListsTable();
     await createLeadsTable();
+    await createBooksTable();
+    await createBookContentsTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

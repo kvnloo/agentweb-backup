@@ -640,6 +640,82 @@ Store your Google Search Console API credentials in AWS Secrets Manager:
 - Secret Name: `prod/AgentWeb/Google/SearchConsole`
 - Secret Value: Paste the entire contents of the service account JSON key file you downloaded
 
+### Google Analytics Data API (GA4) Configuration for SEO/AEO
+
+**AEO (Answer Engine Optimization)** tracks traffic from answer engines like ChatGPT, Perplexity, LinkedIn, and other AI-powered search platforms. The SEO/AEO page displays both traditional SEO metrics (from Google Search Console) and AEO metrics (from Google Analytics) to help you understand how users discover your content through both search engines and answer engines.
+
+If you see `PERMISSION_DENIED: Google Analytics Data API has not been used...` on the SEO/AEO page, do the following:
+
+1. **Enable Google Analytics Data API in the correct project**
+   - Open [Google Cloud Console](https://console.cloud.google.com/apis/library/analyticsdata.googleapis.com)
+   - Switch to the project used for AgentWeb (e.g., `606140610214` or your chosen project)
+   - Click **Enable**
+   - Wait a few minutes for the change to propagate
+
+2. **Grant the service account access to the GA4 property**
+   - Find the service account email stored in `dev/AgentWeb/Google/SearchConsole` or `prod/AgentWeb/Google/SearchConsole` (the `client_email` field)
+   - In GA4 Admin, under **Property** > **Property Access Management**, click **Add** and grant this service account **Viewer** (read-only) access to the GA4 property you want to use
+
+3. **Configure GA4 Property ID in Admin Dashboard**
+   - In the partner portal Admin > Users tab, click the edit icon under the "SEO/AEO" column
+   - In the "Google Analytics Property ID" field, enter the **numeric Property ID** (e.g., `123456789`)
+   - **Important**: Enter the **Property ID** (numeric), NOT the Measurement ID (`G-XXXXXXXXXX`)
+   - To find your Property ID: Go to GA4 Admin > Property Settings. The Property ID is the numeric value (e.g., `123456789`), not the Measurement ID which starts with `G-`
+   - After enabling the API and granting access, retry the SEO/AEO page
+
+**What is AEO (Answer Engine Optimization)?**
+
+AEO tracks how users discover your content through answer engines - AI-powered platforms like ChatGPT, Perplexity, Google Bard/Gemini, Bing Chat, LinkedIn, and other conversational search platforms. The SEO/AEO page shows:
+
+- **SEO Metrics**: Traditional search engine performance from Google Search Console (clicks, impressions, CTR, position)
+- **AEO Metrics**: Traffic from answer engines including:
+  - Answer engine traffic volume and percentage of total traffic
+  - Traffic sources breakdown (identifying which answer engines drive traffic)
+  - Top pages that receive traffic from answer engines
+  - User engagement metrics from answer engine traffic
+
+This helps you understand both traditional search visibility and emerging answer engine visibility for your content.
+
+#### Testing Google Analytics API Connection
+
+If you're seeing 0 traffic or errors, you can test the API connection using the test script:
+
+**Prerequisites:**
+- The script uses the same AWS credential configuration as the backend (from `.env` file)
+- AWS credentials must have `secretsmanager:GetSecretValue` permission
+- Set `AWS_REGION` environment variable if not using default `us-west-2`
+- Ensure `NODE_ENV` is set to `development` or `production` (defaults to `development`)
+- **Note**: If you get `AccessDeniedException`, your local AWS credentials don't have Secrets Manager access. The script will work when run on the server where the backend normally runs.
+
+**Run the test:**
+
+```bash
+cd backend
+ts-node scripts/test-ga-api.ts <property-id>
+```
+
+Example:
+```bash
+ts-node scripts/test-ga-api.ts 123456789
+```
+
+The script will:
+- Test the service account credentials from AWS Secrets Manager
+- Fetch overall metrics (sessions, users, page views, bounce rate, session duration)
+- Fetch daily data for the last 30 days
+- Fetch traffic sources (including answer engine detection)
+- Fetch top pages by traffic
+
+**What to look for:**
+- ✅ If you see data: The API is working correctly, check if the Property ID in admin matches
+- ⚠️  If you see 0s: The Property ID might be correct but there's no traffic in the date range
+- ❌ If you see errors: Check API enablement, service account permissions, or Property ID
+
+**Common issues:**
+- `PERMISSION_DENIED`: API not enabled or service account lacks access
+- `not found`: Wrong Property ID or service account can't access this property
+- `0 traffic`: Property ID is correct but no data in the selected date range
+
 ### CMS Configuration (BaseHub and Webflow)
 
 The blog publishing feature supports publishing to both BaseHub and Webflow CMS. Users can be configured with a CMS Type in the admin dashboard, and the system will automatically route blog posts to the appropriate CMS.
@@ -1147,6 +1223,137 @@ When you need to update your staging environment:
 4. Choose the same zip file used for production
 5. Enter a version label (e.g., "v0.22-stage")
 6. Click "Deploy"
+
+#### 6. Creating IAM User for Vendor Access to Staging Backend Load Logs
+
+Create an AWS IAM user for vendor Argusoft to access CloudWatch logs via AWS Console UI:
+
+1. **Create IAM Policy**:
+   - Go to AWS IAM Console > Policies > Create policy > JSON tab
+   - Paste this policy:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "elasticbeanstalk:DescribeEnvironments",
+           "elasticbeanstalk:DescribeEnvironmentHealth",
+           "elasticbeanstalk:DescribeEnvironmentResources",
+           "elasticbeanstalk:DescribeInstancesHealth",
+           "elasticbeanstalk:DescribeConfigurationSettings",
+           "elasticbeanstalk:DescribeApplicationVersions",
+           "elasticbeanstalk:DescribeApplications",
+           "elasticbeanstalk:ListAvailableSolutionStacks",
+           "elasticbeanstalk:DescribeEvents",
+           "elasticbeanstalk:RetrieveEnvironmentInfo",
+           "elasticbeanstalk:RequestEnvironmentInfo"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Deny",
+         "Action": [
+           "elasticbeanstalk:UpdateEnvironment",
+           "elasticbeanstalk:UpdateApplicationVersion",
+           "elasticbeanstalk:UpdateConfigurationTemplate",
+           "elasticbeanstalk:CreateConfigurationTemplate",
+           "elasticbeanstalk:DeleteConfigurationTemplate",
+           "elasticbeanstalk:ValidateConfigurationSettings",
+           "elasticbeanstalk:ApplyEnvironmentManagedAction",
+           "elasticbeanstalk:RestartAppServer",
+           "elasticbeanstalk:RebuildEnvironment",
+           "elasticbeanstalk:SwapEnvironmentCNAMEs",
+           "elasticbeanstalk:TerminateEnvironment"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:DescribeLogGroups",
+           "logs:DescribeLogStreams",
+           "logs:GetLogEvents",
+           "logs:FilterLogEvents"
+         ],
+         "Resource": [
+           "arn:aws:logs:*:*:log-group:/aws/elasticbeanstalk/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "logs:DescribeLogGroups"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "cloudtrail:LookupEvents",
+           "cloudtrail:GetTrail",
+           "cloudtrail:ListTrails",
+           "cloudtrail:DescribeTrails"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "s3:ListBucket",
+           "s3:GetObject",
+           "s3:GetObjectAcl",
+           "s3:PutObjectAcl"
+         ],
+         "Resource": [
+           "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572",
+           "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/*"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "cloudformation:DescribeStacks",
+           "cloudformation:DescribeStackResources",
+           "cloudformation:DescribeStackResource",
+           "cloudformation:ListStacks",
+           "cloudformation:GetTemplate"
+         ],
+         "Resource": "*"
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "autoscaling:DescribeAutoScalingGroups",
+           "autoscaling:DescribeAutoScalingInstances",
+           "autoscaling:DescribeLaunchConfigurations",
+           "autoscaling:DescribeScalingActivities"
+         ],
+         "Resource": "*"
+       }
+     ]
+   }
+   ```
+
+   **Note**: Elastic Beanstalk read actions require `"Resource": "*"` as they don't support fine-grained resource restrictions. However, all write/modify actions are explicitly denied, so Argusoft can only view information and cannot make any changes to any environment.
+
+   - Name: `VendorStagingLogsAccess` > Create policy
+
+2. **Create IAM User**:
+   - Go to AWS IAM Console > Users > Add User
+   - Username: `vendor-argusoft-access`
+   - Select "AWS Management Console access"
+   - Attach the `VendorStagingLogsAccess` policy
+   - Create user and set password
+
+3. **Share Access**:
+   - Share the AWS Console sign-in URL (found in IAM > Dashboard > "IAM users sign-in link")
+   - Share the username and password securely
+   - Argusoft can:
+     - View the staging environment page: Elastic Beanstalk > Environments > `Agentweb-backend-env-1` (read-only, no Configuration access)
+     - Access logs via CloudWatch > Logs > Log groups (filter by `/aws/elasticbeanstalk/`)
 
 ### Setting Up Oncall Alerts for Elastic Beanstalk Services
 

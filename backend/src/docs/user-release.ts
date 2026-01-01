@@ -7,6 +7,204 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-01',
+    changes: [
+      'Added "Require Login" configuration for predefined work plans',
+      '- Admins can require login before a work plan can be started',
+      '- Users are redirected to log in when accessing required-login work plan sessions',
+    ],
+  },
+  {
+    date: '2025-12-31',
+    changes: [
+      'Knowledge Base now supports image and video uploads',
+      '- Upload images (JPG, PNG, GIF, WebP, BMP, SVG) and videos (MP4, MOV, WebM, OGG, M4V, AVI) alongside document files',
+      '- Images follow the 18MB file limit; videos allow up to 100MB per file',
+      'Agent Mode now supports describe_video function calls for video understanding',
+    ],
+  },
+  {
+    date: '2025-12-30',
+    changes: [
+      'CRM lead lists now support a default PoC email sender, with per-lead PoC overrides',
+      '- Leads inherit the list PoC unless a lead-specific sender is selected',
+      '- Engagements popup now always shows the PoC selector',
+      'Fixed the bug SEO/GEO page redirects to Agent Mode',
+      '-  The page now shows a "Contact Admin" setup message when not configured',
+    ],
+  },
+  {
+    date: '2025-12-29',
+    changes: [
+      'Added report generation support in Agent Mode',
+      '- All HTML reports generated in Agent Mode are now available in the Reports page',
+      '- Reports can now be created directly from the Customer Portal Reports page using Agent Mode sessions',
+      'Added column sorting to SEO/GEO tables in the Customer Portal',
+      '- Click column sorting is default for Top Queries and Top Pages',
+      '- Sessions column sorting is default for Top Pages by Engagement and Traffic Sources',
+    ],
+  },
+  {
+    date: '2025-12-27',
+    changes: [
+      'Added Event Alerts for CRM lead lists',
+      '- Configure alert events (email.received, email.clicked, email.opened, email.delivered, email.bounced, email.complained)',
+      '- Support custom event types (e.g., custom.linkedin) and select them from the same list',
+      '- Alert emails include a direct link to the CRM lead management page',
+    ],
+  },
+  {
+    date: '2025-12-24',
+    changes: [
+      'Admins can now edit waitlist entries from the admin dashboard',
+      '- Waitlist entries can be edited to update company name, use cases, stripe customer id, and other details',
+      'Added Books page to Creative Hub',
+      '- Users can create books and white papers',
+      '- Added function calls to list books, create books, create characters, create outlines, and generate or update book content',
+      '- Books can be exported as PDF or TXT',
+    ],
+  },
+  {
+    date: '2025-12-23',
+    changes: [
+      'Improved Knowledge Base creation and editing',
+      '- File uploads now auto-upload on select during edit, and after save during creation',
+      '- Save is enabled when the knowledge base name changes, even if content stays the same',
+      'Agent Mode now restores in-progress status after navigation and refreshes the session on completion',
+    ],
+  },
+  {
+    date: '2025-12-22',
+    changes: [
+      'Added post-login redirect to return users to their intended destination',
+      'Fixed upload image file name overflow in the Customer Portal UI',
+      'Removed the extra line at the top of the main page',
+      'Fixed URL wrapping issues in the Customer Portal UI',
+      'Improved GTM Plan page responsiveness',
+      'CRM lead list sorting now persists per list across browsers',
+    ],
+  },
+  {
+    date: '2025-12-21',
+    changes: [
+      'Supported deep research for create_blog_article function call in Agent Mode',
+      '- When deep_research is true, Agent Mode routes the task to the Gemini deep research agent for extended research and synthesis before drafting the article',
+      'Added configurable default model for Agent Mode sessions in partner portal admin',
+      '- Admins can choose gpt-5-chat-2, gpt-5.2-chat, gemini-3-pro-preview, or gemini-3-flash-preview as the default for new Agent Mode sessions',
+    ],
+  },
+  {
+    date: '2025-12-20',
+    changes: [
+      'Added Growth Hub to Customer Portal sidebar',
+      '- CRM and GTM Plan pages now live under the new Growth Hub section',
+    ],
+  },
+  {
+    date: '2025-12-19',
+    changes: [
+      'Added New Plan Page Endpoint with Query Parameter Support',
+      '- Introduced new `/plan/:planTitle/new` endpoint that accepts query parameters',
+      '- Query parameters are automatically formatted into a starting message and sent to begin the conversation',
+      '- System parameters (leadId, sessionId, conversable) are automatically filtered out from the starting message',
+      'Added login/signup display setting for predefined work plans',
+      '- Admins can choose to show the login/signup prompt only after plan completion or always during plan sessions',
+      '- Default behavior remains showing the prompt after all plan steps are completed',
+      'Fixed Partner Portal Admin Chat History message loading',
+      '- Message counts and chat contents now load from the messages table instead of session records',
+    ],
+  },
+  {
+    date: '2025-12-18',
+    changes: [
+      'Reorganized Customer Portal Sidebar into 3 Hubs',
+      '- Restructured sidebar navigation into three main hubs: Brand Hub, Creative Hub, and Performance Hub',
+      '- Brand Hub: Brand Guidelines, Market Strategy, Knowledge Base, Email Templates',
+      '- Creative Hub: Reports (renamed from Research Reports), Images, Videos',
+      '- Performance Hub: Paid Social, Newsletter, SEO/GEO (expanded by default)',
+      '- Split Campaign Performance page into separate Paid Social and Newsletter pages for better organization',
+      'Fixed Agent Mode Session Message Count Display',
+      '- Fixed bug where session message count was not displaying correctly in the chat history panel',
+      'Fixed SEO/GEO Page Visibility Issue',
+      '- Fixed bug where SEO/GEO page was not showing in the sidebar even when selected for the user\'s subscription type',
+    ],
+  },
+  {
+    date: '2025-12-17',
+    changes: [
+      'Increased Video File Upload Limit to 100MB',
+      '- Video file uploads on the Ad Videos page now support files up to 100MB (previously 18MB)',
+      '- Other file types (images, documents, etc.) continue to use the 18MB limit',
+      'Major UI/UX overhaul implementing a centralized design system, improved Agent Mode scheduling, and enhanced responsive behavior across the application',
+      '- Implemented centralized CSS variable system with full light/dark mode support and new button variants',
+      '- Refactored Agent Mode scheduling system with modular components (ScheduleFormPanel, ScheduleList, TestHistoryPanel)',
+      '- Added copy-to-clipboard functionality for assistant messages and responsive chat history panel',
+      '- Updated sidebar with iconsax icons, restructured navigation categories, and improved active state logic',
+      '- Redesigned auth pages (Login, ForgotPassword, Register) with updated components and animations',
+    ],
+  },
+  {
+    date: '2025-12-16',
+    changes: [
+      'Added uploaded file support for Knowledge Base',
+      '- Knowledge bases now store uploaded files (PDF, DOCX, PPTX, XLSX, etc.) alongside the default knowledge-base.txt',
+      '- Customer Portal edit dialog shows uploaded files with size, date, and delete support; uploads respect the 18MB limit',
+      '- Partner Portal admin Knowledge Base tab now reports uploaded file counts and sizes for overall/public/private and per task',
+      '- Agent Mode can read the uploaded files using read_knowledge_base_files function',
+      'Fixed Agent Mode Images Not Showing in Ad Images Page',
+      '- Fixed bug where recently created Agent Mode images were not appearing in the Ad Images page',
+    ],
+  },
+  {
+    date: '2025-12-15',
+    changes: [
+      'Added Subscription Types and Access Controls for Customer Portal',
+      '- Admins can now configure subscription types in the partner portal, defining which customer-portal pages and Agent Mode function calls are available for each type',
+      '- Users receive their subscription type and explicit lists of allowed pages and function calls as part of their account metadata and can view them in the Customer Portal Settings page',
+      '- Scheduled chats now validate required function calls against the user\'s subscription and send error emails instead of running when permissions are insufficient',
+      '- A default \"Basic\" subscription type is provided which grants full access to all customer-portal pages and Agent Mode function calls, and is automatically used when no subscription types are configured',
+      'Fixed Brand Guidelines Key Messages and Brand Values Overwrite Bug',
+      '- Fixed critical bug where updating key messages would remove brand values, and updating brand values would remove key messages',
+    ],
+  },
+  {
+    date: '2025-12-12',
+    changes: [
+      'Improved Chat Session Storage and Scalability',
+      '- Chat messages are now stored in a separate database table for better performance and scalability',
+      '- Automatic migration of existing chat messages from session records to the new messages table',
+      '- Long chat sessions now perform better without hitting database size limits',
+    ],
+  },
+  {
+    date: '2025-12-10',
+    changes: [
+      'Added Google Analytics Metrics Support to SEO/GEO Page',
+      '- SEO/GEO page now displays Google Analytics metrics alongside traditional SEO metrics',
+      '- Configure Google Analytics Property ID in the admin panel under Users tab > SEO/AEO settings',
+      '- Traffic Sources table displaying all traffic sources with sessions, users, page views, and average session duration',
+      '- Top Pages by Engagement table showing pages ranked by engagement rate with sessions, engagement time, and event counts',
+      'Added Microsoft Clarity User Activity Tracking Support',
+      '- Customer Portal now includes Microsoft Clarity integration for comprehensive user activity tracking',
+      '- Automatically tracks user interactions, page views, and navigation patterns',
+      '- Provides heatmaps and session recordings to understand user behavior',
+      '- Helps identify usability issues and optimize user experience',
+      'Supported Sync to CRM for Task Subscribers',
+      '- New "Sync to CRM" button in the Subscribers section on Task Details page',
+      '- Syncs all task subscribers to a CRM lead list named "<task_name> Subscribers"',
+      '- Automatically creates the lead list if it doesn\'t exist, or merges with existing list',
+    ],
+  },
+  {
+    date: '2025-12-09',
+    changes: [
+      'Added Text Email Content Support in CRM',
+      '- Email drafts in CRM now default to plain text format for better deliverability and compatibility',
+      '- Users can choose between text or HTML format when creating or updating email drafts',
+      '- Batch email drafting supports format selection with text as the default',
+    ],
+  },
+  {
     date: '2025-12-08',
     changes: [
       'Fixed Brand Guidelines Gradient Checkbox Bug',

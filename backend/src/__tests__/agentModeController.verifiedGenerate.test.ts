@@ -13,6 +13,8 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -43,10 +45,12 @@ jest.mock('../services/db', () => ({
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { agentModeService } from '../services/agentModeService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
+const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 
 describe('AgentModeController - Verified Generate', () => {
   const mockUserId = 'test-user-123';
@@ -78,6 +82,7 @@ describe('AgentModeController - Verified Generate', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
   });
 
   describe('verifiedGenerate endpoint', () => {
@@ -302,7 +307,7 @@ describe('AgentModeController - Verified Generate', () => {
       );
     });
 
-    it('should validate requiredFunctions array', async () => {
+    it('should allow empty requiredFunctions array', async () => {
       let disconnectCallback: (() => void) | undefined;
       const mockReq = {
         user: { userId: mockUserId },
@@ -326,10 +331,44 @@ describe('AgentModeController - Verified Generate', () => {
 
       await agentModeController.verifiedGenerate(mockReq, mockRes);
 
-      expect(mockRes.status).toHaveBeenCalledWith(400);
+      expect(mockRes.status).toHaveBeenCalledWith(200);
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
-          error: 'Required functions array is required and must not be empty',
+          success: true,
+        })
+      );
+    });
+
+    it('should allow missing requiredFunctions', async () => {
+      let disconnectCallback: (() => void) | undefined;
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          startingMessage: 'Create a report',
+          keywords: [],
+          attachments: [],
+        },
+        on: jest.fn((event: string, callback: () => void) => {
+          if (event === 'close') {
+            disconnectCallback = callback;
+          }
+        }),
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+        on: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.verifiedGenerate(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(200);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          functionCallMisses: [],
         })
       );
     });
@@ -681,4 +720,3 @@ describe('AgentModeController - Verified Generate', () => {
     });
   });
 });
-

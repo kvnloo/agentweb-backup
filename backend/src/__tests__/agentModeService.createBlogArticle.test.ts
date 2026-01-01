@@ -117,7 +117,7 @@ describe('AgentModeService - create_blog_article function', () => {
       expect(result.success).toBe(true);
       expect(result.data.title).toBe('Test Blog Title');
       expect(result.data.description).toBe('Test description');
-      expect(result.data.imageUrl).toBe('https://example.com/image.png');
+      expect(result.data.heroImageUrl).toBe('https://example.com/image.png');
       expect(result.data.htmlUrl).toBe(mockS3Url);
     });
 
@@ -426,7 +426,7 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toBe('Image generation failed');
+      expect(result.error).toBe('Hero image generation failed');
     });
 
     it('should handle S3 upload failure', async () => {
@@ -580,6 +580,139 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('Deep Research Integration', () => {
+    let mockDeepResearchService: { performDeepResearch: jest.Mock };
+
+    beforeEach(() => {
+      // Mock the deep research service
+      jest.mock('../services/deepResearchService', () => ({
+        deepResearchService: {
+          performDeepResearch: jest.fn()
+        }
+      }));
+
+      const deepResearchModule = require('../services/deepResearchService');
+      mockDeepResearchService = deepResearchModule.deepResearchService;
+    });
+
+    it('should NOT call deep research when deep_research is false', async () => {
+      const mockBlogData = {
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
+      };
+
+      mockGenerateBlogContent.mockResolvedValue(mockBlogData);
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Test</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/blog.html'
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Topic',
+        '',
+        'professional',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        false // deep_research = false
+      );
+
+      expect(result.success).toBe(true);
+      // deepResearchService should NOT be called
+      expect(mockDeepResearchService?.performDeepResearch).not.toHaveBeenCalled?.();
+    });
+
+    it('should use original researchContext when deep_research is not provided', async () => {
+      const mockBlogData = {
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
+      };
+
+      mockGenerateBlogContent.mockResolvedValue(mockBlogData);
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Test</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/blog.html'
+      });
+
+      await (agentModeService as any).createBlogArticle(
+        'Test Topic',
+        '',
+        'professional',
+        'medium',
+        'Original research context',
+        '',
+        'user123',
+        'session123',
+        'default'
+        // deep_research not provided, defaults to false
+      );
+
+      // Should use original research context
+      expect(mockGenerateBlogContent).toHaveBeenCalledWith(
+        'Test Topic',
+        '',
+        'professional',
+        'medium',
+        'Original research context',
+        '',
+        'default'
+      );
+    });
+
+    it('should include deepResearchUsed in result', async () => {
+      const mockBlogData = {
+        title: 'Test Title',
+        description: 'Test description',
+        content: 'Test content',
+        imagePrompt: 'Test prompt'
+      };
+
+      mockGenerateBlogContent.mockResolvedValue(mockBlogData);
+      mockGenerateBlogImage.mockResolvedValue({
+        imageUrl: 'https://example.com/image.png',
+        filename: 'image.png'
+      });
+      mockGenerateBlogHtml.mockReturnValue('<html>Test</html>');
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/blog.html'
+      });
+
+      const result = await (agentModeService as any).createBlogArticle(
+        'Test Topic',
+        '',
+        'professional',
+        'medium',
+        '',
+        '',
+        'user123',
+        'session123',
+        'default',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.deepResearchUsed).toBe(false);
     });
   });
 });

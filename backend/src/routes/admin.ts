@@ -9,6 +9,7 @@ import { emailService } from "../services/emailService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
+import { settingsService } from "../services/settingsService";
 
 const router = express.Router();
 
@@ -161,7 +162,7 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   }
 });
 
-// Update user SEO domains
+// Update user SEO domains (kept for backward compatibility)
 router.put("/users/:userId/seo-domains", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -198,6 +199,66 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
   } catch (error) {
     console.error("Error updating user SEO domains:", error);
     res.status(500).json({ message: "Error updating SEO domains" });
+  }
+});
+
+// Update user SEO/AEO configuration (SEO domains and Google Analytics Measurement ID)
+router.put("/users/:userId/seo-aeo", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { seoDomains, googleAnalyticsPropertyId } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Validate seoDomains is an array if provided
+    if (seoDomains !== undefined) {
+      if (!Array.isArray(seoDomains)) {
+        return res.status(400).json({ message: "seoDomains must be an array" });
+      }
+
+      // Validate each domain format
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      for (const domain of seoDomains) {
+        if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
+          return res.status(400).json({ 
+            message: `Invalid domain format: ${domain}. Please use format like example.com` 
+          });
+        }
+      }
+    }
+
+    // Validate Google Analytics Property ID format if provided
+    // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
+    if (googleAnalyticsPropertyId !== undefined && googleAnalyticsPropertyId !== null && googleAnalyticsPropertyId !== "") {
+      // GA4 Property ID is numeric (e.g., 123456789)
+      const gaIdRegex = /^\d+$/;
+      const trimmedId = googleAnalyticsPropertyId.trim();
+      if (typeof googleAnalyticsPropertyId !== 'string' || !gaIdRegex.test(trimmedId)) {
+        return res.status(400).json({ 
+          message: `Invalid Google Analytics Property ID format: ${googleAnalyticsPropertyId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.` 
+        });
+      }
+    }
+
+    // Build update object with only provided fields
+    const updateData: any = {};
+    if (seoDomains !== undefined) {
+      updateData.seoDomains = seoDomains;
+    }
+    if (googleAnalyticsPropertyId !== undefined) {
+      updateData.googleAnalyticsPropertyId = googleAnalyticsPropertyId?.trim() || null;
+    }
+
+    // Update the user's SEO/AEO configuration
+    const updatedUser = await userDb.updateUser(userId, updateData);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user SEO/AEO configuration:", error);
+    res.status(500).json({ message: "Error updating SEO/AEO configuration" });
   }
 });
 
@@ -474,6 +535,31 @@ router.put("/waitlist/:email/status", async (req, res) => {
   } catch (error) {
     console.error("Error updating waitlist status:", error);
     res.status(500).json({ message: "Error updating waitlist status" });
+  }
+});
+
+// Update waitlist entry - general endpoint for updating any waitlist fields
+router.put("/waitlist/:email", async (req, res) => {
+  try {
+    const { email } = req.params;
+    const updates = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    // Check if waitlist entry exists
+    const entry = await waitlistDb.getByEmail(email);
+    if (!entry) {
+      return res.status(404).json({ message: "Waitlist entry not found" });
+    }
+
+    // Use the updateDetails method which handles partial updates
+    const updatedEntry = await waitlistDb.updateDetails(email, updates);
+    res.json(updatedEntry);
+  } catch (error) {
+    console.error("Error updating waitlist entry:", error);
+    res.status(500).json({ message: "Error updating waitlist entry" });
   }
 });
 
@@ -1302,15 +1388,42 @@ router.post("/announcements/send", async (req, res) => {
 // Add the chat sessions route
 router.get("/chat-sessions", async (req, res) => {
   try {
-    // Get all chat sessions from DynamoDB
-    const sessions = await chatbotDb.getAllSessions();
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 30;
+    const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+    let lastEvaluatedKey: DynamoDB.DocumentClient.Key | undefined;
 
-    // Sort sessions by updatedAt in descending order
-    sessions.sort((a: ChatSession, b: ChatSession) => {
-      return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-    });
+    if (cursor) {
+      try {
+        lastEvaluatedKey = JSON.parse(Buffer.from(cursor, "base64").toString("utf8"));
+      } catch (error) {
+        return res.status(400).json({ message: "Invalid cursor" });
+      }
+    }
 
-    res.json(sessions);
+    const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
+      limit,
+      lastEvaluatedKey
+    );
+
+    // Load messages from the messages table for each session
+    const sessionsWithMessages = await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+          return sessionWithMessages ?? session;
+        } catch (error) {
+          console.error(`Error loading messages for session ${session.sessionId}:`, error);
+          return session;
+        }
+      })
+    );
+
+    const nextCursor = nextKey
+      ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
+      : null;
+
+    res.json({ sessions: sessionsWithMessages, nextCursor });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
@@ -1532,6 +1645,22 @@ router.get("/knowledge-base-metrics", async (req, res) => {
     }, 0);
     
     const averageKnowledgeBaseSize = tasksWithKnowledgeBase > 0 ? totalKnowledgeBaseSize / tasksWithKnowledgeBase : 0;
+
+    // Uploaded files metrics (from knowledgeBaseFiles array)
+    const getUploadedFileStats = (task: any) => {
+      const files = (task as any).knowledgeBaseFiles || [];
+      const count = Array.isArray(files) ? files.length : 0;
+      const size = Array.isArray(files)
+        ? files.reduce((sum: number, f: any) => sum + (typeof f?.size === 'number' ? f.size : 0), 0)
+        : 0;
+      return { count, size };
+    };
+
+    const totalUploadedFiles = tasks.reduce((sum, task) => sum + getUploadedFileStats(task).count, 0);
+    const totalUploadedFilesSize = tasks.reduce((sum, task) => sum + getUploadedFileStats(task).size, 0);
+    const tasksWithUploadedFiles = tasks.filter(task => getUploadedFileStats(task).count > 0).length;
+    const averageUploadedFilesPerTask = tasksWithUploadedFiles > 0 ? totalUploadedFiles / tasksWithUploadedFiles : 0;
+    const averageUploadedFileSizePerTask = tasksWithUploadedFiles > 0 ? totalUploadedFilesSize / tasksWithUploadedFiles : 0;
     
     // Calculate public knowledge base metrics
     const publicTasks = tasks.filter(task => task.knowledgeBaseType === 'public');
@@ -1544,6 +1673,21 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       return sum + size;
     }, 0);
     const averagePublicKnowledgeBaseSize = publicTasksWithKnowledgeBase > 0 ? totalPublicKnowledgeBaseSize / publicTasksWithKnowledgeBase : 0;
+
+    const publicUploaded = publicTasks.reduce(
+      (acc, task) => {
+        const { count, size } = getUploadedFileStats(task);
+        acc.count += count;
+        acc.size += size;
+        if (count > 0) acc.tasksWithFiles += 1;
+        return acc;
+      },
+      { count: 0, size: 0, tasksWithFiles: 0 }
+    );
+    const averagePublicUploadedFilesPerTask =
+      publicUploaded.tasksWithFiles > 0 ? publicUploaded.count / publicUploaded.tasksWithFiles : 0;
+    const averagePublicUploadedSizePerTask =
+      publicUploaded.tasksWithFiles > 0 ? publicUploaded.size / publicUploaded.tasksWithFiles : 0;
     
     // Calculate private knowledge base metrics
     const privateTasks = tasks.filter(task => task.knowledgeBaseType === 'private');
@@ -1556,6 +1700,21 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       return sum + size;
     }, 0);
     const averagePrivateKnowledgeBaseSize = privateTasksWithKnowledgeBase > 0 ? totalPrivateKnowledgeBaseSize / privateTasksWithKnowledgeBase : 0;
+
+    const privateUploaded = privateTasks.reduce(
+      (acc, task) => {
+        const { count, size } = getUploadedFileStats(task);
+        acc.count += count;
+        acc.size += size;
+        if (count > 0) acc.tasksWithFiles += 1;
+        return acc;
+      },
+      { count: 0, size: 0, tasksWithFiles: 0 }
+    );
+    const averagePrivateUploadedFilesPerTask =
+      privateUploaded.tasksWithFiles > 0 ? privateUploaded.count / privateUploaded.tasksWithFiles : 0;
+    const averagePrivateUploadedSizePerTask =
+      privateUploaded.tasksWithFiles > 0 ? privateUploaded.size / privateUploaded.tasksWithFiles : 0;
     
     // Get tasks with knowledge base details (only those with size > 0)
     const tasksWithDetails = tasks
@@ -1565,12 +1724,15 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       })
       .map(task => {
         const size = typeof task.knowledgeBaseSize === 'string' ? parseInt(task.knowledgeBaseSize) : (task.knowledgeBaseSize || 0);
+        const { count: uploadedFilesCount, size: uploadedFilesSize } = getUploadedFileStats(task);
         return {
           taskId: task.taskId,
           name: task.name,
           knowledgeBaseSize: size,
           owner: task.userId,
-          type: task.knowledgeBaseType || 'private'
+          type: task.knowledgeBaseType || 'private',
+          uploadedFilesCount,
+          uploadedFilesSize,
         };
       });
 
@@ -1579,17 +1741,38 @@ router.get("/knowledge-base-metrics", async (req, res) => {
       tasksWithKnowledgeBase,
       totalKnowledgeBaseSize,
       averageKnowledgeBaseSize,
+      uploadedFiles: {
+        totalFiles: totalUploadedFiles,
+        totalSize: totalUploadedFilesSize,
+        tasksWithUploadedFiles,
+        averageFilesPerTask: averageUploadedFilesPerTask,
+        averageSizePerTask: averageUploadedFileSizePerTask,
+      },
       public: {
         tasks: publicTasks.length,
         tasksWithKnowledgeBase: publicTasksWithKnowledgeBase,
         totalSize: totalPublicKnowledgeBaseSize,
-        averageSize: averagePublicKnowledgeBaseSize
+        averageSize: averagePublicKnowledgeBaseSize,
+        uploadedFiles: {
+          totalFiles: publicUploaded.count,
+          totalSize: publicUploaded.size,
+          tasksWithUploadedFiles: publicUploaded.tasksWithFiles,
+          averageFilesPerTask: averagePublicUploadedFilesPerTask,
+          averageSizePerTask: averagePublicUploadedSizePerTask,
+        },
       },
       private: {
         tasks: privateTasks.length,
         tasksWithKnowledgeBase: privateTasksWithKnowledgeBase,
         totalSize: totalPrivateKnowledgeBaseSize,
-        averageSize: averagePrivateKnowledgeBaseSize
+        averageSize: averagePrivateKnowledgeBaseSize,
+        uploadedFiles: {
+          totalFiles: privateUploaded.count,
+          totalSize: privateUploaded.size,
+          tasksWithUploadedFiles: privateUploaded.tasksWithFiles,
+          averageFilesPerTask: averagePrivateUploadedFilesPerTask,
+          averageSizePerTask: averagePrivateUploadedSizePerTask,
+        },
       },
       tasks: tasksWithDetails
     });
@@ -1653,6 +1836,190 @@ router.get("/gtm-plans", async (req, res) => {
       message: "Error fetching GTM plans",
       error: error?.message || "Internal server error",
     });
+  }
+});
+
+// Subscription Types endpoints
+
+// Get all subscription types
+router.get("/subscription-types", async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting("subscription_types");
+    let subscriptionTypes = [];
+    
+    if (setting) {
+      try {
+        subscriptionTypes = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error("Error parsing subscription types:", error);
+        subscriptionTypes = [];
+      }
+    }
+    
+    // Import helper functions to expand "*" to actual lists if needed
+    const subscriptionService = await import('../services/subscriptionService');
+    const allAvailablePages = subscriptionService.getAllAvailablePages();
+    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
+    
+    // If no subscription types exist, return default Basic type with actual lists
+    if (subscriptionTypes.length === 0) {
+      subscriptionTypes = [{
+        name: "Basic",
+        allowedPages: allAvailablePages, // All available pages (expanded)
+        allowedFunctionCalls: allAvailableFunctionCalls // All available function calls (expanded)
+      }];
+    }
+    
+    // Normalize paths: remove "/marketing" prefix from allowedPages (for backward compatibility)
+    // Also expand "*" to actual lists if present (for backward compatibility with old data)
+    subscriptionTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
+      // Normalize pages
+      let normalizedPages = type.allowedPages.map((page: string) => {
+        if (page.startsWith('/marketing/')) {
+          return page.replace('/marketing', '');
+        }
+        return page;
+      });
+      
+      // Expand "*" to actual list if present (for backward compatibility)
+      if (normalizedPages.includes('*')) {
+        normalizedPages = allAvailablePages;
+      }
+      
+      // Expand "*" to actual list if present (for backward compatibility)
+      let normalizedFunctionCalls = type.allowedFunctionCalls;
+      if (normalizedFunctionCalls.includes('*')) {
+        normalizedFunctionCalls = allAvailableFunctionCalls;
+      }
+      
+      return {
+        ...type,
+        allowedPages: normalizedPages,
+        allowedFunctionCalls: normalizedFunctionCalls
+      };
+    }));
+    
+    res.json(subscriptionTypes);
+  } catch (error) {
+    console.error("Error getting subscription types:", error);
+    res.status(500).json({ message: "Error fetching subscription types" });
+  }
+});
+
+// Create or update subscription types
+router.post("/subscription-types", async (req, res) => {
+  try {
+    const { subscriptionTypes } = req.body;
+    
+    if (!Array.isArray(subscriptionTypes)) {
+      return res.status(400).json({ message: "subscriptionTypes must be an array" });
+    }
+    
+    // Import helper functions to expand "*" to actual lists
+    const subscriptionService = await import('../services/subscriptionService');
+    const allAvailablePages = subscriptionService.getAllAvailablePages();
+    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
+    
+    // Validate subscription types structure, normalize paths, and expand "*" to actual lists
+    const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
+      if (!type.name || typeof type.name !== "string") {
+        throw new Error("Each subscription type must have a name");
+      }
+      if (!Array.isArray(type.allowedPages)) {
+        throw new Error("Each subscription type must have allowedPages array");
+      }
+      if (!Array.isArray(type.allowedFunctionCalls)) {
+        throw new Error("Each subscription type must have allowedFunctionCalls array");
+      }
+      
+      // Remove "/marketing" prefix from allowedPages if present
+      let normalizedPages = type.allowedPages.map((page: string) => {
+        if (page.startsWith('/marketing/')) {
+          return page.replace('/marketing', '');
+        }
+        return page;
+      });
+      
+      // Expand "*" to actual list of pages
+      if (normalizedPages.includes('*')) {
+        normalizedPages = allAvailablePages;
+      }
+      
+      // Expand "*" to actual list of function calls
+      let normalizedFunctionCalls = type.allowedFunctionCalls;
+      if (normalizedFunctionCalls.includes('*')) {
+        normalizedFunctionCalls = allAvailableFunctionCalls;
+      }
+      
+      return {
+        ...type,
+        allowedPages: normalizedPages,
+        allowedFunctionCalls: normalizedFunctionCalls
+      };
+    }));
+    
+    const updatedBy = (req as any).user?.email || "unknown";
+    await settingsService.setSetting(
+      "subscription_types",
+      JSON.stringify(normalizedTypes),
+      "Customer portal subscription types configuration",
+      updatedBy
+    );
+    
+    res.json({ success: true, subscriptionTypes: normalizedTypes });
+  } catch (error: any) {
+    console.error("Error saving subscription types:", error);
+    res.status(400).json({ message: error.message || "Error saving subscription types" });
+  }
+});
+
+// Update user subscription type
+router.put("/users/:userId/subscription-type", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { subscriptionType } = req.body;
+    
+    if (!subscriptionType || typeof subscriptionType !== "string") {
+      return res.status(400).json({ message: "subscriptionType is required and must be a string" });
+    }
+    
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    
+    // Verify subscription type exists
+    const setting = await settingsService.getSetting("subscription_types");
+    let subscriptionTypes = [];
+    
+    if (setting) {
+      try {
+        subscriptionTypes = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error("Error parsing subscription types:", error);
+      }
+    }
+    
+    // If no subscription types defined, allow "Basic" as default
+    if (subscriptionTypes.length === 0 && subscriptionType !== "Basic") {
+      return res.status(400).json({ message: "Subscription type not found. Only 'Basic' is available." });
+    }
+    
+    // Check if subscription type exists (unless it's Basic and no types are defined)
+    if (subscriptionTypes.length > 0) {
+      const typeExists = subscriptionTypes.some((type: any) => type.name === subscriptionType);
+      if (!typeExists) {
+        return res.status(400).json({ message: "Subscription type not found" });
+      }
+    }
+    
+    // Update the user's subscription type
+    const updatedUser = await userDb.updateUser(userId, { subscriptionType });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user subscription type:", error);
+    res.status(500).json({ message: "Error updating subscription type" });
   }
 });
 

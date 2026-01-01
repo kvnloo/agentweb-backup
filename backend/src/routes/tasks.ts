@@ -15,6 +15,9 @@ import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB } from '../services/chatbotService';
+import { MAX_FILE_SIZE } from '../config';
+import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
+import { uploadFileToS3 } from '../utils/s3Utils';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -24,7 +27,7 @@ const router = express.Router();
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 18 * 1024 * 1024, // 18MB limit (to support video uploads, images are validated to 10MB in frontend)
+    fileSize: MAX_FILE_SIZE, // 100MB limit to support larger video uploads
   },
 });
 
@@ -67,6 +70,13 @@ const openai = new OpenAI({
 // Ensure bucket exists
 const BUCKET_NAME = process.env.GCS_BUCKET_NAME || 'agentweb-knowledge-base-dev';
 const PRIVATE_BUCKET_NAME = process.env.GCS_BUCKET_NAME_PRIVATE || 'agentweb-knowledge-base-private-dev';
+const s3 = new AWS.S3({
+  region: process.env.AWS_REGION || 'us-west-2',
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+});
+
+const S3_KEY_PREFIX = 's3:';
 
 type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
@@ -1016,6 +1026,7 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
       name: task.name,
       knowledgeBaseSize: task.knowledgeBaseSize,
       knowledgeBaseType: task.knowledgeBaseType,
+      knowledgeBaseFiles: task.knowledgeBaseFiles || [],
       knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt,
     }));
 
@@ -1044,6 +1055,9 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(403).json({ message: 'Not authorized to access this task' });
     }
 
+    // Include knowledgeBaseFiles in the response
+    const knowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
+    
     // If knowledgeBaseType is not set, determine it based on file content
     if (!task.knowledgeBaseType) {
       const storageInstance = await initializeStorage();
@@ -1074,7 +1088,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     // Check if file exists
     const [exists] = await file.exists();
     let contentStr = '';
-    let url = '';
+    let signedUrl = '';
     let size = 0;
     if (exists) {
       // If file exists, get its content and size
@@ -1087,6 +1101,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
         action: 'read',
         expires: '03-01-2500' // Far future expiration
       });
+      signedUrl = url;
     }
     // Update size if it doesn't match
     if (size !== task.knowledgeBaseSize) {
@@ -1098,7 +1113,8 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
     
     res.json({ 
       content: contentStr, 
-      url: task.knowledgeBase || url,
+      url: task.knowledgeBase || signedUrl,
+      knowledgeBaseFiles: knowledgeBaseFiles,
       knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt
     });
   } catch (error) {
@@ -1304,6 +1320,247 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
   }
 });
 
+// Upload files to knowledge base endpoint
+router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('files', 100), async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const files = (req as FileRequest & { files?: Express.Multer.File[] }).files || [];
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({ message: 'No files uploaded' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // File processor functions are imported at the top
+
+    // Set knowledgeBaseType to 'private' if not defined
+    const knowledgeBaseType = task.knowledgeBaseType || 'private';
+    if (!task.knowledgeBaseType) {
+      await taskDb.updateTask(taskId, { knowledgeBaseType: 'private' });
+    }
+
+    // Use the appropriate bucket based on knowledgeBaseType
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+
+    // Get existing knowledge base files
+    const currentKnowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
+
+    // Process each uploaded file
+    const uploadedFiles: Array<{ filename: string; size: number; url: string; key: string; uploadedAt: string }> = [];
+
+    for (const file of files) {
+      const isMediaFile =
+        file.mimetype?.startsWith('image/') ||
+        file.mimetype?.startsWith('video/');
+
+      // Validate file type
+      if (!isSupportedFileType(file.originalname, file.mimetype)) {
+        return res.status(400).json({ 
+          message: `Unsupported file type: ${file.originalname}. Supported document types: TXT, PDF, HTML, DOCX, PPTX, XLSX, XLSM. Image types: JPG, JPEG, PNG, GIF, WEBP, BMP, SVG. Video types: MP4, MOV, WEBM, OGG, M4V, AVI.` 
+        });
+      }
+
+      // Validate file size (matches multer limit and frontend MAX_FILE_SIZE)
+      if (file.size > MAX_FILE_SIZE) {
+        return res.status(400).json({ 
+          message: `File ${file.originalname} exceeds maximum size of ${MAX_FILE_SIZE / (1024 * 1024)}MB` 
+        });
+      }
+
+      try {
+        if (isMediaFile) {
+          const uploadResult = await uploadFileToS3(
+            file.buffer,
+            file.originalname,
+            userId,
+            file.mimetype || getContentType(file.originalname, file.mimetype)
+          );
+
+          if (!uploadResult.success || !uploadResult.url || !uploadResult.key) {
+            return res.status(400).json({ 
+              message: `Failed to upload file ${file.originalname}: ${uploadResult.error || 'Unknown error'}` 
+            });
+          }
+
+          uploadedFiles.push({
+            filename: file.originalname,
+            size: file.size,
+            url: uploadResult.url,
+            key: `${S3_KEY_PREFIX}${uploadResult.key}`,
+            uploadedAt: new Date().toISOString()
+          });
+          continue;
+        }
+
+        // Store the file in GCS
+        const timestamp = Date.now();
+        const sanitizedFilename = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filePath = `tasks/${taskId}/knowledge-base-files/${timestamp}_${sanitizedFilename}`;
+        const gcsFile = bucket.file(filePath);
+        
+        const buffer = Buffer.from(file.buffer);
+        await gcsFile.save(buffer, {
+          contentType: getContentType(file.originalname, file.mimetype),
+          metadata: {
+            taskId,
+            userId,
+            originalName: file.originalname,
+            uploadedAt: new Date().toISOString()
+          }
+        });
+
+        // Get signed URL for the file
+        const [url] = await gcsFile.getSignedUrl({
+          action: 'read',
+          expires: '03-01-2500' // Far future expiration
+        });
+
+        uploadedFiles.push({
+          filename: file.originalname,
+          size: file.size,
+          url,
+          key: filePath,
+          uploadedAt: new Date().toISOString()
+        });
+      } catch (error: any) {
+        console.error(`Error uploading file ${file.originalname}:`, error);
+        return res.status(400).json({ 
+          message: `Failed to upload file ${file.originalname}: ${error.message}` 
+        });
+      }
+    }
+
+    // Update task with new knowledge base files
+    const updatedKnowledgeBaseFiles = [...currentKnowledgeBaseFiles, ...uploadedFiles];
+    
+    console.log('Uploading files:', {
+      taskId,
+      currentFiles: currentKnowledgeBaseFiles.length,
+      newFiles: uploadedFiles.length,
+      totalFiles: updatedKnowledgeBaseFiles.length,
+      filesArray: JSON.stringify(updatedKnowledgeBaseFiles)
+    });
+    
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseFiles: updatedKnowledgeBaseFiles,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+
+    // Verify the update by fetching the task again
+    const updatedTask = await taskDb.getTaskById(taskId);
+    const savedFiles = (updatedTask as any)?.knowledgeBaseFiles || [];
+    
+    console.log('After update, retrieved task:', {
+      taskId,
+      savedFilesCount: savedFiles.length,
+      savedFiles: JSON.stringify(savedFiles)
+    });
+
+    res.json({
+      message: `Successfully uploaded ${uploadedFiles.length} file(s)`,
+      files: uploadedFiles,
+      knowledgeBaseFiles: savedFiles.length > 0 ? savedFiles : updatedKnowledgeBaseFiles,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+  } catch (error: any) {
+    console.error('Error uploading files to knowledge base:', error);
+    res.status(500).json({ 
+      message: 'Internal server error',
+      error: error.message 
+    });
+  }
+});
+
+// Delete knowledge base file endpoint
+router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { taskId, fileKey } = req.params;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this task' });
+    }
+
+    // Decode the file key (it's URL encoded)
+    const decodedKey = decodeURIComponent(fileKey);
+    if (decodedKey.startsWith(S3_KEY_PREFIX)) {
+      try {
+        await s3
+          .deleteObject({
+            Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+            Key: decodedKey.slice(S3_KEY_PREFIX.length),
+          })
+          .promise();
+      } catch (s3Error) {
+        console.warn('Failed to delete from S3:', s3Error);
+      }
+
+      const currentFiles = (task as any).knowledgeBaseFiles || [];
+      const updatedFiles = currentFiles.filter((f: any) => f.key !== decodedKey);
+
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseFiles: updatedFiles,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
+
+      return res.json({ 
+        message: 'File deleted successfully',
+        knowledgeBaseFiles: updatedFiles
+      });
+    }
+
+    // Delete file from GCS
+    const storageInstance = await initializeStorage();
+    const bucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+    const file = bucket.file(decodedKey);
+    
+    const [exists] = await file.exists();
+    if (exists) {
+      await file.delete();
+    }
+
+    // Update task to remove the file from knowledgeBaseFiles
+    const currentFiles = (task as any).knowledgeBaseFiles || [];
+    const updatedFiles = currentFiles.filter((f: any) => f.key !== decodedKey);
+    
+    await taskDb.updateTask(taskId, {
+      knowledgeBaseFiles: updatedFiles,
+      knowledgeBaseUpdatedAt: new Date().toISOString()
+    });
+
+    res.json({ 
+      message: 'File deleted successfully',
+      knowledgeBaseFiles: updatedFiles
+    });
+  } catch (error) {
+    console.error('Error deleting knowledge base file:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 // Delete knowledge base endpoint
 router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -1380,15 +1637,79 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
-    // Only move file if type is actually changing
+    // Only move files if type is actually changing
     if (task.knowledgeBaseType !== knowledgeBaseType) {
-      const filePath = `tasks/${taskId}/knowledge-base.txt`;
       const storageInstance = await initializeStorage();
       const currentBucket = storageInstance.bucket(task.knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
       const newBucket = storageInstance.bucket(knowledgeBaseType === 'public' ? BUCKET_NAME : PRIVATE_BUCKET_NAME);
+      
+      // Move knowledge base text file
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
       const currentFile = currentBucket.file(filePath);
       const newFile = newBucket.file(filePath);
-      // Check if current file exists
+      
+      // Get existing knowledge base files
+      const knowledgeBaseFiles = (task as any).knowledgeBaseFiles || [];
+      const updatedFiles: Array<{ filename: string; size: number; url: string; key: string; uploadedAt: string }> = [];
+      
+      // Move all knowledge base files to the new bucket
+      for (const fileInfo of knowledgeBaseFiles) {
+        try {
+          const oldFileKey = fileInfo.key;
+          if (typeof oldFileKey !== 'string' || oldFileKey.startsWith(S3_KEY_PREFIX)) {
+            updatedFiles.push(fileInfo);
+            continue;
+          }
+          const oldFile = currentBucket.file(oldFileKey);
+          const [fileExists] = await oldFile.exists();
+          
+          if (fileExists) {
+            // Download file from old bucket
+            const [fileContent] = await oldFile.download();
+            
+            // Get file metadata to preserve content type
+            const [metadata] = await oldFile.getMetadata();
+            const contentType = metadata.contentType || 'application/octet-stream';
+            
+            // Upload to new bucket (same path)
+            const newFileObj = newBucket.file(oldFileKey);
+            await newFileObj.save(fileContent, {
+              contentType: contentType,
+              metadata: {
+                ...metadata.metadata,
+                taskId,
+                userId,
+                movedAt: new Date().toISOString(),
+                sourceBucket: task.knowledgeBaseType
+              }
+            });
+            
+            // Get new signed URL
+            const [newUrl] = await newFileObj.getSignedUrl({
+              action: 'read',
+              expires: '03-01-2500'
+            });
+            
+            // Delete old file
+            await oldFile.delete();
+            
+            // Update file info with new URL
+            updatedFiles.push({
+              ...fileInfo,
+              url: newUrl
+            });
+          } else {
+            // File doesn't exist in old bucket, keep as is (might have been deleted)
+            updatedFiles.push(fileInfo);
+          }
+        } catch (error: any) {
+          console.error(`Error moving file ${fileInfo.filename}:`, error);
+          // Keep the old file info if move fails
+          updatedFiles.push(fileInfo);
+        }
+      }
+      
+      // Check if knowledge base text file exists
       const [exists] = await currentFile.exists();
       if (exists) {
         // Download current content
@@ -1408,22 +1729,33 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
           action: 'read',
           expires: '03-01-2500'
         });
-        // Update task with new bucket type and URL
+        // Update task with new bucket type, URL, and moved files
         await taskDb.updateTask(taskId, {
           knowledgeBaseType,
           knowledgeBase: url,
+          knowledgeBaseFiles: updatedFiles,
           knowledgeBaseUpdatedAt: new Date().toISOString()
         });
         // Delete the old file
         await currentFile.delete();
-        return res.json({ message: 'Knowledge base type and file moved successfully', knowledgeBaseType, url });
+        return res.json({ 
+          message: 'Knowledge base type and files moved successfully', 
+          knowledgeBaseType, 
+          url,
+          filesMoved: updatedFiles.length
+        });
       } else {
-        // If no file exists, just update the type
+        // If no text file exists, just update the type and files
         await taskDb.updateTask(taskId, { 
           knowledgeBaseType,
+          knowledgeBaseFiles: updatedFiles,
           knowledgeBaseUpdatedAt: new Date().toISOString()
         });
-        return res.json({ message: 'Knowledge base type updated (no file to move)', knowledgeBaseType });
+        return res.json({ 
+          message: 'Knowledge base type updated', 
+          knowledgeBaseType,
+          filesMoved: updatedFiles.length
+        });
       }
     } else {
       // If type is not changing, just return success
@@ -1712,13 +2044,20 @@ async function getExecutionsWithAssets(
       const agentSessions = agentSessionsResult.sessions || [];
       
       // Process each session to find generate_image tool calls
-      agentSessions.forEach((session: any) => {
-        if (!session.messages || session.archived) {
-          return;
+      // Note: getUserSessions now loads messages, but we still call getChatSession to ensure we have the full session data
+      for (const session of agentSessions) {
+        if (session.archived) {
+          continue;
+        }
+        
+        // Load full session data (messages are stored in AW-ChatMessages table)
+        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+        if (!sessionWithMessages || !sessionWithMessages.messages) {
+          continue;
         }
         
         // Search through messages for generate_image and upload_image tool calls
-        session.messages.forEach((message: any) => {
+        sessionWithMessages.messages.forEach((message: any) => {
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
               if ((toolCall.name === 'generate_image' || toolCall.name === 'upload_image') && toolCall.result?.success && toolCall.result?.imageUrl) {
@@ -1726,18 +2065,18 @@ async function getExecutionsWithAssets(
                 const filename = toolCall.result.filename || 'generated-image.png';
                 
                 // Extract timestamp from message or use session updatedAt
-                const timestamp = message.timestamp || message.metadata?.timestamp || session.updatedAt || session.createdAt;
+                const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
                 
                 // Create a unique key for this session (using sessionId)
-                const sessionKey = `agent-mode-${session.sessionId}`;
+                const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
                 
                 if (!result[sessionKey]) {
                   result[sessionKey] = {
                     taskId: sessionKey,
-                    taskName: session.title || 'Agent Mode Session',
-                    createdAt: session.createdAt,
+                    taskName: sessionWithMessages.title || 'Agent Mode Session',
+                    createdAt: sessionWithMessages.createdAt,
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     executions: []
                   };
                 }
@@ -1749,14 +2088,14 @@ async function getExecutionsWithAssets(
                 
                 if (!existingImage) {
                   // Use a single execution per session to group all images
-                  const executionId = `${session.sessionId}-images`;
+                  const executionId = `${sessionWithMessages.sessionId}-images`;
                   
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
                   // Check favorites and archives from session fields
-                  const isFavorited = session.favorites?.[imageUrl] || false;
-                  const isArchived = session.archives?.[imageUrl] || false;
+                  const isFavorited = sessionWithMessages.favorites?.[imageUrl] || false;
+                  const isArchived = sessionWithMessages.archives?.[imageUrl] || false;
                   
                   // Skip archived images (they will be filtered out, similar to task executions)
                   if (isArchived) {
@@ -1783,7 +2122,7 @@ async function getExecutionsWithAssets(
                     filename: filename,
                     token: '', // Not applicable for agent mode images
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     generatedAt: timestamp, // Store when this specific image was generated
                     is_favorited: isFavorited,
                     is_archived: false // Always false since we filter out archived images
@@ -1793,7 +2132,7 @@ async function getExecutionsWithAssets(
             });
           }
         });
-      });
+      }
       
       // Calculate latest execution time for agent mode sessions
       Object.keys(result).forEach(key => {
@@ -1828,13 +2167,20 @@ async function getExecutionsWithAssets(
       const agentSessions = agentSessionsResult.sessions || [];
       
       // Process each session to find generate_video tool calls
-      agentSessions.forEach((session: any) => {
-        if (!session.messages || session.archived) {
-          return;
+      // Note: getUserSessions now loads messages, but we still call getChatSession to ensure we have the full session data
+      for (const session of agentSessions) {
+        if (session.archived) {
+          continue;
+        }
+        
+        // Load full session data (messages are stored in AW-ChatMessages table)
+        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+        if (!sessionWithMessages || !sessionWithMessages.messages) {
+          continue;
         }
         
         // Search through messages for generate_video and upload_video tool calls
-        session.messages.forEach((message: any) => {
+        sessionWithMessages.messages.forEach((message: any) => {
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
               if ((toolCall.name === 'generate_video' || toolCall.name === 'upload_video') && toolCall.result?.success && toolCall.result?.videoUrl) {
@@ -1842,18 +2188,18 @@ async function getExecutionsWithAssets(
                 const filename = toolCall.result.filename || 'generated-video.mp4';
                 
                 // Extract timestamp from message or use session updatedAt
-                const timestamp = message.timestamp || message.metadata?.timestamp || session.updatedAt || session.createdAt;
+                const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
                 
                 // Create a unique key for this session (using sessionId)
-                const sessionKey = `agent-mode-${session.sessionId}`;
+                const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
                 
                 if (!result[sessionKey]) {
                   result[sessionKey] = {
                     taskId: sessionKey,
-                    taskName: session.title || 'Agent Mode Session',
-                    createdAt: session.createdAt,
+                    taskName: sessionWithMessages.title || 'Agent Mode Session',
+                    createdAt: sessionWithMessages.createdAt,
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     executions: []
                   };
                 }
@@ -1865,14 +2211,14 @@ async function getExecutionsWithAssets(
                 
                 if (!existingVideo) {
                   // Use a single execution per session to group all videos
-                  const executionId = `${session.sessionId}-videos`;
+                  const executionId = `${sessionWithMessages.sessionId}-videos`;
                   
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
                   // Check favorites and archives from session fields
-                  const isFavorited = session.favorites?.[videoUrl] || false;
-                  const isArchived = session.archives?.[videoUrl] || false;
+                  const isFavorited = sessionWithMessages.favorites?.[videoUrl] || false;
+                  const isArchived = sessionWithMessages.archives?.[videoUrl] || false;
                   
                   // Skip archived videos (they will be filtered out, similar to task executions)
                   if (isArchived) {
@@ -1899,7 +2245,7 @@ async function getExecutionsWithAssets(
                     filename: filename,
                     token: '', // Not applicable for agent mode videos
                     source: 'agent-mode',
-                    sessionId: session.sessionId,
+                    sessionId: sessionWithMessages.sessionId,
                     generatedAt: timestamp, // Store when this specific video was generated
                     is_favorited: isFavorited,
                     is_archived: false // Always false since we filter out archived videos
@@ -1909,7 +2255,7 @@ async function getExecutionsWithAssets(
             });
           }
         });
-      });
+      }
       
       // Calculate latest execution time for agent mode sessions
       Object.keys(result).forEach(key => {
@@ -1932,6 +2278,137 @@ async function getExecutionsWithAssets(
     } catch (error) {
       console.error('Error fetching Agent Mode videos:', error);
       // Don't fail the whole request if agent mode video fetching fails
+    }
+  }
+
+  // For HTML reports, also search Agent Mode sessions for HTML file tool calls
+  if (assetType === 'html-reports') {
+    try {
+      const chatbotDb = new ChatbotDB();
+      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
+      const agentSessions = agentSessionsResult.sessions || [];
+
+      const addHtmlFile = (sessionKey: string, sessionWithMessages: any, url: string, filename?: string, timestamp?: string) => {
+        const derivedFilename = filename || url.split('/').pop() || 'report.html';
+        const isArchived = sessionWithMessages.archives?.[url] || false;
+        const isFavorited = sessionWithMessages.favorites?.[url] || false;
+
+        if (isArchived) {
+          return;
+        }
+
+        if (!result[sessionKey]) {
+          result[sessionKey] = {
+            taskId: sessionKey,
+            taskName: sessionWithMessages.title || 'Agent Mode Session',
+            createdAt: sessionWithMessages.createdAt,
+            source: 'agent-mode',
+            sessionId: sessionWithMessages.sessionId,
+            executions: []
+          };
+        }
+
+        const executionId = `${sessionWithMessages.sessionId}-html`;
+        let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
+
+        if (!execution) {
+          execution = {
+            executionId,
+            startTime: timestamp,
+            result_files: []
+          };
+          result[sessionKey].executions.push(execution);
+        } else if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
+          execution.startTime = timestamp;
+        }
+
+        const alreadyAdded = execution.result_files.some((file: any) => file.url === url);
+        if (!alreadyAdded) {
+          execution.result_files.push({
+            url,
+            filename: derivedFilename,
+            token: '',
+            source: 'agent-mode',
+            sessionId: sessionWithMessages.sessionId,
+            generatedAt: timestamp,
+            is_html: true,
+            is_favorited: isFavorited,
+            is_archived: false
+          });
+        }
+      };
+
+      const extractHtmlUrls = (toolCall: any): Array<{ url: string; filename?: string }> => {
+        const results: Array<{ url: string; filename?: string }> = [];
+        const toolResult = toolCall?.result || {};
+        const urlCandidates = [
+          toolResult.s3_url,
+          toolResult.file_url,
+          toolResult.htmlUrl,
+          toolResult.blog_html_url
+        ].filter(Boolean);
+
+        urlCandidates.forEach((url: string) => {
+          if (url.toLowerCase().endsWith('.html') || url.toLowerCase().endsWith('.htm')) {
+            results.push({
+              url,
+              filename: toolResult.filename || toolResult.file_name || toolResult.versioned_filename
+            });
+          }
+        });
+
+        return results;
+      };
+
+      const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
+
+      for (const session of agentSessions) {
+        if (session.archived) {
+          continue;
+        }
+
+        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
+        if (!sessionWithMessages || !sessionWithMessages.messages) {
+          continue;
+        }
+
+        const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
+
+        sessionWithMessages.messages.forEach((message: any) => {
+          const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
+
+          if (message.metadata?.toolCalls) {
+            message.metadata.toolCalls.forEach((toolCall: any) => {
+              const htmlUrls = extractHtmlUrls(toolCall);
+              htmlUrls.forEach(({ url, filename }) => {
+                addHtmlFile(sessionKey, sessionWithMessages, url, filename, timestamp);
+              });
+            });
+          }
+
+          if (typeof message.content === 'string') {
+            htmlUrlRegex.lastIndex = 0;
+            let match;
+            while ((match = htmlUrlRegex.exec(message.content)) !== null) {
+              addHtmlFile(sessionKey, sessionWithMessages, match[1], undefined, timestamp);
+            }
+          }
+        });
+      }
+
+      Object.keys(result).forEach(key => {
+        if (result[key].source === 'agent-mode') {
+          const task = result[key];
+          const executionTimes = task.executions
+            .map((execution: any) => execution.startTime)
+            .filter((time: string) => time !== null);
+
+          task.latestExecutionTime = executionTimes.length > 0 ? executionTimes.sort().pop() : null;
+          task.latestPendingOrRunningExecution = null;
+        }
+      });
+    } catch (error) {
+      console.error('Error fetching Agent Mode HTML reports:', error);
     }
   }
 
@@ -2004,12 +2481,17 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
+    // Check if this is an agent mode asset (executionId pattern: ${sessionId}-images, -videos, or -html)
     const isAgentModeImage = executionId.endsWith('-images');
     const isAgentModeVideo = executionId.endsWith('-videos');
-    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const isAgentModeHtml = executionId.endsWith('-html');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo || isAgentModeHtml;
     const agentSessionId = isAgentModeAsset 
-      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      ? (isAgentModeImage
+        ? executionId.replace('-images', '')
+        : isAgentModeVideo
+          ? executionId.replace('-videos', '')
+          : executionId.replace('-html', ''))
       : null;
 
     if (agentSessionId) {
@@ -2118,12 +2600,17 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
       return res.status(400).json({ message: 'Execution ID and image URL are required' });
     }
 
-    // Check if this is an agent mode image or video (executionId pattern: ${sessionId}-images or ${sessionId}-videos)
+    // Check if this is an agent mode asset (executionId pattern: ${sessionId}-images, -videos, or -html)
     const isAgentModeImage = executionId.endsWith('-images');
     const isAgentModeVideo = executionId.endsWith('-videos');
-    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo;
+    const isAgentModeHtml = executionId.endsWith('-html');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo || isAgentModeHtml;
     const agentSessionId = isAgentModeAsset 
-      ? (isAgentModeImage ? executionId.replace('-images', '') : executionId.replace('-videos', ''))
+      ? (isAgentModeImage
+        ? executionId.replace('-images', '')
+        : isAgentModeVideo
+          ? executionId.replace('-videos', '')
+          : executionId.replace('-html', ''))
       : null;
 
     if (agentSessionId) {

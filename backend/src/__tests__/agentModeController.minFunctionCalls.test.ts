@@ -1,6 +1,17 @@
 import { Request, Response } from 'express';
 
 // Mock all dependencies before importing the controller
+// Mock subscriptionService so subscription checks always pass in tests
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedFunctionCalls: jest.fn(async () => [
+    'get_marketing_tips',
+    'analyze_competitors',
+    'create_work_plan',
+    'modify_work_plan',
+    'set_work_plan_status',
+  ]),
+}));
+
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(),
@@ -14,6 +25,8 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -86,6 +99,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Generated Title');
     // Use worker service instead of direct generateMarketingResponse

@@ -55,6 +55,7 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
 
     // Create the benchmark test
     const testId = uuidv4();
+    const defaultModel = await agentModeService.getDefaultModel();
     const benchmarkTest: BenchmarkTest = {
       testId,
       createdBy: adminUserId,
@@ -65,7 +66,7 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
       conversationHistory,
       expectedOutput,
       status: 'draft',
-      llmModel: llmModel || agentModeService.default_model, // Use provided model or default
+      llmModel: llmModel || defaultModel, // Use provided model or default
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       runCount: 0,
@@ -314,6 +315,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
 
     const runId = uuidv4();
     const startTime = Date.now();
+    const defaultModel = await agentModeService.getDefaultModel();
 
     try {
       // Prepare input for benchmark execution
@@ -330,7 +332,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       const sessionHistory = messages.slice(0, -1);
 
       // Determine which model to use: override > saved model > default
-      const modelToUse = llmName || test.llmModel || agentModeService.default_model;
+      const modelToUse = llmName || test.llmModel || defaultModel;
 
       // Call the agent to generate response with mock mode enabled using worker process
       // This prevents blocking the main event loop during benchmark testing
@@ -395,7 +397,7 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
       
       const executionTime = Date.now() - startTime;
       // Determine which model was attempted (use same logic as success case)
-      const modelToUse = llmName || test.llmModel || agentModeService.default_model;
+      const modelToUse = llmName || test.llmModel || defaultModel;
       
       const errorResult = {
         testId,

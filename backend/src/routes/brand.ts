@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import { S3 } from "aws-sdk";
 import crypto from "crypto";
+import { MAX_FILE_SIZE } from "../config";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -18,7 +19,7 @@ const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 18 * 1024 * 1024, // 18MB limit
+    fileSize: MAX_FILE_SIZE, // 100MB limit to match global upload cap
   },
 });
 
@@ -225,9 +226,9 @@ router.post(
       const user = userResult.Items[0];
       const existingBrandGuidelines = user.brandGuidelines;
 
-      // Parse keyMessages if it's a string
-      let parsedKeyMessages = [];
-      if (keyMessages) {
+      // Parse keyMessages if it's a string; preserve existing if not provided
+      let parsedKeyMessages = existingBrandGuidelines?.brandData?.keyMessages || [];
+      if (keyMessages !== undefined) {
         try {
           parsedKeyMessages =
             typeof keyMessages === "string"
@@ -239,9 +240,9 @@ router.post(
         }
       }
 
-      // Parse brandValues if it's a string
-      let parsedBrandValues = [];
-      if (brandValues) {
+      // Parse brandValues if it's a string; preserve existing if not provided
+      let parsedBrandValues = existingBrandGuidelines?.brandData?.brandValues || [];
+      if (brandValues !== undefined) {
         try {
           parsedBrandValues =
             typeof brandValues === "string"

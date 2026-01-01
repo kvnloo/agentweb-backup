@@ -1,8 +1,9 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { crmDb } from '../services/db';
+import { crmDb, taskDb, subscriberDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
+import { leadListAlertService } from '../services/leadListAlertService';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 
@@ -16,6 +17,45 @@ const upload = multer({
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
+
+const normalizeAlertEvents = (alertEvents: any) => {
+  if (alertEvents === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(alertEvents)) {
+    throw new Error('alertEvents must be an array');
+  }
+  const normalized = alertEvents
+    .map((event) => (typeof event === 'string' ? event.trim().toLowerCase() : ''))
+    .filter(Boolean);
+  return Array.from(new Set(normalized));
+};
+
+const getCrmSenderIds = async (userId: string) => {
+  const settingName = `crm_sender_emails_${userId}`;
+  const setting = await settingsService.getSetting(settingName);
+  if (!setting?.settingValue) {
+    return [];
+  }
+  try {
+    const config = JSON.parse(setting.settingValue);
+    const senders = Array.isArray(config?.senders) ? config.senders : [];
+    return senders.map((sender: any) => sender.id).filter(Boolean);
+  } catch (error) {
+    console.error('Error parsing CRM sender emails:', error);
+    return [];
+  }
+};
+
+const normalizeSenderId = (senderId: any) => {
+  if (senderId === null || senderId === undefined || senderId === '') {
+    return null;
+  }
+  if (typeof senderId !== 'string') {
+    return senderId;
+  }
+  return senderId.trim();
+};
 
 // Lead List Routes
 
@@ -55,13 +95,37 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description } = req.body;
+    const { name, description, alertEvents, listSenderId } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ message: 'List name is required' });
     }
 
-    const list = await crmDb.createLeadList(userId, name.trim(), description?.trim());
+    let normalizedAlertEvents: string[] | undefined;
+    try {
+      normalizedAlertEvents = normalizeAlertEvents(alertEvents);
+    } catch (error: any) {
+      return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
+    }
+
+    const normalizedListSenderId = normalizeSenderId(listSenderId);
+    if (normalizedListSenderId !== null && typeof normalizedListSenderId !== 'string') {
+      return res.status(400).json({ message: 'listSenderId must be a string or null' });
+    }
+    if (normalizedListSenderId) {
+      const senderIds = await getCrmSenderIds(userId);
+      if (!senderIds.includes(normalizedListSenderId)) {
+        return res.status(400).json({ message: 'listSenderId must reference a configured sender' });
+      }
+    }
+
+    const list = await crmDb.createLeadList(
+      userId,
+      name.trim(),
+      description?.trim(),
+      normalizedAlertEvents,
+      normalizedListSenderId
+    );
     res.status(201).json(list);
   } catch (error: any) {
     console.error('Error creating lead list:', error);
@@ -112,7 +176,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -128,7 +192,14 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    const updates: { name?: string; description?: string; displayFields?: string[] } = {};
+    const updates: {
+      name?: string;
+      description?: string;
+      displayFields?: string[];
+      sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
+      alertEvents?: string[];
+      listSenderId?: string | null;
+    } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
         return res.status(400).json({ message: 'List name cannot be empty' });
@@ -146,6 +217,46 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       } else {
         return res.status(400).json({ message: 'displayFields must be an array' });
       }
+    }
+
+    if (sortConfig !== undefined) {
+      if (sortConfig === null) {
+        updates.sortConfig = null;
+      } else if (typeof sortConfig === 'object' && !Array.isArray(sortConfig)) {
+        const column = typeof sortConfig.column === 'string' ? sortConfig.column.trim() : '';
+        const direction = typeof sortConfig.direction === 'string' ? sortConfig.direction.toLowerCase() : '';
+        if (!column) {
+          return res.status(400).json({ message: 'sortConfig.column is required' });
+        }
+        if (direction !== 'asc' && direction !== 'desc') {
+          return res.status(400).json({ message: 'sortConfig.direction must be "asc" or "desc"' });
+        }
+        updates.sortConfig = { column, direction: direction as 'asc' | 'desc' };
+      } else {
+        return res.status(400).json({ message: 'sortConfig must be an object or null' });
+      }
+    }
+
+    if (alertEvents !== undefined) {
+      try {
+        updates.alertEvents = normalizeAlertEvents(alertEvents) || [];
+      } catch (error: any) {
+        return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
+      }
+    }
+
+    if (listSenderId !== undefined) {
+      const normalizedListSenderId = normalizeSenderId(listSenderId);
+      if (normalizedListSenderId !== null && typeof normalizedListSenderId !== 'string') {
+        return res.status(400).json({ message: 'listSenderId must be a string or null' });
+      }
+      if (normalizedListSenderId) {
+        const senderIds = await getCrmSenderIds(userId);
+        if (!senderIds.includes(normalizedListSenderId)) {
+          return res.status(400).json({ message: 'listSenderId must reference a configured sender' });
+        }
+      }
+      updates.listSenderId = normalizedListSenderId;
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);
@@ -287,6 +398,19 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     const userId = authReq.user?.userId;
     const { listId } = req.params;
     const leadData = req.body;
+    if (leadData?.selectedSenderId !== undefined) {
+      const normalizedSenderId = normalizeSenderId(leadData.selectedSenderId);
+      if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
+        return res.status(400).json({ message: 'selectedSenderId must be a string or null' });
+      }
+      if (normalizedSenderId) {
+        const senderIds = await getCrmSenderIds(userId);
+        if (!senderIds.includes(normalizedSenderId)) {
+          return res.status(400).json({ message: 'selectedSenderId must reference a configured sender' });
+        }
+      }
+      leadData.selectedSenderId = normalizedSenderId;
+    }
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -371,6 +495,20 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
 
     if (list.userId !== userId) {
       return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (updates?.selectedSenderId !== undefined) {
+      const normalizedSenderId = normalizeSenderId(updates.selectedSenderId);
+      if (normalizedSenderId !== null && typeof normalizedSenderId !== 'string') {
+        return res.status(400).json({ message: 'selectedSenderId must be a string or null' });
+      }
+      if (normalizedSenderId) {
+        const senderIds = await getCrmSenderIds(userId);
+        if (!senderIds.includes(normalizedSenderId)) {
+          return res.status(400).json({ message: 'selectedSenderId must reference a configured sender' });
+        }
+      }
+      updates.selectedSenderId = normalizedSenderId;
     }
 
     const updateData = updates;
@@ -608,6 +746,17 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
     };
 
     const updatedLead = await crmDb.addLeadEngagement(listId, leadId, engagement);
+    try {
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        list,
+        updatedLead,
+        eventType,
+        eventData,
+        createdAt
+      );
+    } catch (alertError) {
+      console.error('Failed to send lead list alert email:', alertError);
+    }
     res.json({ success: true, lead: updatedLead });
   } catch (error: any) {
     console.error('Error adding lead engagement:', error);
@@ -816,15 +965,15 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId, leadId } = req.params;
-    const { senderEmail, senderName, subject, htmlContent } = req.body;
+    const { senderEmail, senderName, subject, htmlContent, textContent } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    // Validate required fields
-    if (!senderEmail || !senderName || !subject || !htmlContent) {
-      return res.status(400).json({ message: 'Missing required fields: senderEmail, senderName, subject, htmlContent' });
+    // Validate required fields - need either htmlContent or textContent
+    if (!senderEmail || !senderName || !subject || (!htmlContent && !textContent)) {
+      return res.status(400).json({ message: 'Missing required fields: senderEmail, senderName, subject, and either htmlContent or textContent' });
     }
 
     // Get the lead to get the recipient email
@@ -849,7 +998,8 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
       from,
       to: lead.email,
       subject,
-      html: htmlContent
+      html: htmlContent,
+      text: textContent
     });
 
     if (!result) {
@@ -932,5 +1082,107 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
   }
 });
 
-export default router;
+/**
+ * @route POST /api/crm/sync-subscribers
+ * @desc Sync task subscribers to a CRM lead list
+ * @access Private
+ */
+router.post('/sync-subscribers', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { taskId } = req.body;
 
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!taskId) {
+      return res.status(400).json({ message: 'taskId is required' });
+    }
+
+    // Get the task to get the task name
+    const task = await taskDb.getTaskById(taskId);
+    if (!task) {
+      return res.status(404).json({ message: 'Task not found' });
+    }
+
+    // Verify task ownership
+    if (task.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get all subscribers for the task (including unsubscribed) so we can update the subscribed field
+    const subscribers = await subscriberDb.getAllTaskSubscribers(taskId);
+    
+    if (!subscribers || subscribers.length === 0) {
+      return res.status(400).json({ message: 'No subscribers to sync' });
+    }
+
+    // Find or create lead list named "<task_name> Subscribers"
+    const listName = `${task.name} Subscribers`;
+    let leadList = null;
+
+    // Get all lead lists for the user
+    const allLists = await crmDb.getLeadListsByUserId(userId);
+    leadList = allLists.find((list: any) => list.name === listName);
+
+    // Create the list if it doesn't exist
+    if (!leadList) {
+      leadList = await crmDb.createLeadList(
+        userId,
+        listName,
+        `Subscribers synced from task: ${task.name}`
+      );
+    }
+
+    // Convert subscribers to leads format (subscribers is guaranteed to be defined and non-empty here)
+    const leads = (subscribers || []).map((subscriber: any) => {
+      const lead: any = {
+        email: subscriber.email || '',
+        firstName: subscriber.firstName || '',
+        lastName: subscriber.lastName || '',
+        phone: subscriber.phone || '',
+        company: subscriber.company || '',
+        title: subscriber.title || '',
+        notes: subscriber.notes || '',
+        linkedin: subscriber.linkedin || '',
+      };
+
+      // Add custom fields - treat all customFields as custom fields
+      const customFields: Record<string, any> = {};
+      
+      // Add subscribed field (yes/no) based on unsubscribed status
+      customFields.subscribed = subscriber.unsubscribed ? 'no' : 'yes';
+      
+      if (subscriber.customFields && typeof subscriber.customFields === 'object') {
+        Object.assign(customFields, subscriber.customFields);
+      }
+      if (Object.keys(customFields).length > 0) {
+        lead.customFields = customFields;
+      }
+
+      return lead;
+    });
+
+    // Batch create/merge leads (always force update)
+    const results = await crmDb.batchCreateLeads(leadList.listId, leads);
+
+    res.json({
+      success: true,
+      listId: leadList.listId,
+      listName: leadList.name,
+      successCount: results.successCount,
+      newCount: results.newCount,
+      mergedCount: results.mergedCount,
+      errorCount: results.errorCount,
+      errors: results.errors,
+      message: `Synced ${results.successCount} subscriber(s) to lead list "${listName}"${results.errorCount > 0 ? `, ${results.errorCount} error(s)` : ''}`,
+    });
+  } catch (error: any) {
+    console.error('Error syncing subscribers to CRM:', error);
+    res.status(500).json({ message: error.message || 'Failed to sync subscribers to CRM' });
+  }
+});
+
+export default router;

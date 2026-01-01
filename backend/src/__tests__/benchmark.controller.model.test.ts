@@ -53,6 +53,7 @@ describe('Benchmark Controller - Model Selection', () => {
 
     // Set default model
     mockAgentModeService.default_model = 'gpt-5-chat-2';
+    mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
   });
 
   describe('createBenchmarkTest', () => {
@@ -444,4 +445,3 @@ describe('Benchmark Controller - Model Selection', () => {
     });
   });
 });
-

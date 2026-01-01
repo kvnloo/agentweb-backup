@@ -1,0 +1,11 @@
+// Configuration constants
+
+// Maximum number of messages allowed per chat session
+export const MAX_MESSAGE_SIZE_PER_SESSION = 150;
+
+// Maximum file size for uploads (100MB in bytes)
+export const MAX_FILE_SIZE = 100 * 1024 * 1024;
+
+// AI Model Configuration
+export const DEEP_RESEARCH_AGENT = 'deep-research-pro-preview-12-2025';
+export const CONTENT_RESTYLE_MODEL = 'gemini-3-flash-preview';

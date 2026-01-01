@@ -17,6 +17,8 @@ jest.mock('../../services/chatbotService', () => ({
 // Mock the agentModeService.generateMarketingResponse used inside generateSessionResponse
 jest.mock('../../services/agentModeService', () => ({
   agentModeService: {
+    default_model: 'gpt-5-chat-2',
+    getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat-2'),
     getMarketingSystemPrompt: jest.fn().mockResolvedValue('System prompt'),
     generateSessionTitle: jest.fn().mockResolvedValue('Title'),
     generateMarketingResponse: jest.fn().mockResolvedValue({
@@ -453,16 +455,20 @@ describe('AgentMode Sharing Controller', () => {
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(shareId);
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith({
-        session: {
+        session: expect.objectContaining({
           sessionId: shareId,
           title: 'Test Session',
-          messages: expect.any(Array),
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi there!' }
+          ],
           createdAt: '2024-01-01T00:00:00Z',
           updatedAt: '2024-01-01T00:00:00Z',
           shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
           interactiveShareMetadata: { isActive: false },
-          isConversable: false
-        }
+          isConversable: false,
+          llmModel: 'gpt-5-chat-2'
+        })
       });
     });
 
@@ -502,10 +508,13 @@ describe('AgentMode Sharing Controller', () => {
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(shareId);
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith({
-        session: {
+        session: expect.objectContaining({
           sessionId: shareId,
           title: 'Test Session',
-          messages: expect.any(Array),
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi there!' }
+          ],
           createdAt: '2024-01-01T00:00:00Z',
           updatedAt: '2024-01-01T00:00:00Z',
           shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
@@ -514,8 +523,9 @@ describe('AgentMode Sharing Controller', () => {
             token: conversableToken, 
             sharedAt: '2024-01-01T00:00:00Z' 
           },
-          isConversable: true
-        }
+          isConversable: true,
+          llmModel: 'gpt-5-chat-2'
+        })
       });
     });
 

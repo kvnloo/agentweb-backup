@@ -64,6 +64,7 @@ export interface User {
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
+  googleAnalyticsPropertyId?: string; // Google Analytics Property ID (numeric, e.g., 123456789)
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   companyName?: string;
   useCaseCategories?: string[];
@@ -125,6 +126,7 @@ export interface User {
   }>;
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
+  subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
 }
 
 interface UserInteraction {
@@ -289,6 +291,34 @@ class UserDB {
       return result.Items?.[0];
     } catch (error) {
       console.error("Error in getUserById:", error);
+      throw error;
+    }
+  }
+
+  async getUsersByEmailDomain(emailDomain: string): Promise<User[]> {
+    try {
+      const normalizedDomain = emailDomain.trim().toLowerCase();
+      const results: User[] = [];
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+      do {
+        const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+          TableName: this.tableName,
+          FilterExpression: 'emailDomain = :emailDomain',
+          ExpressionAttributeValues: {
+            ':emailDomain': normalizedDomain,
+          },
+          ExclusiveStartKey: lastEvaluatedKey,
+        };
+
+        const result = await this.docClient.scan(params).promise();
+        results.push(...((result.Items || []) as User[]));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return results;
+    } catch (error) {
+      console.error("Error in getUsersByEmailDomain:", error);
       throw error;
     }
   }
@@ -587,7 +617,7 @@ export const taskDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-Tasks`,
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseFiles, knowledgeBaseUpdatedAt, createVideo, videoModel, imageModel, requireApproval, slackChannel, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -658,7 +688,7 @@ export const taskDb = {
           ":userId": userId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, #adm, category, description, templateId, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, knowledgeBaseFiles, createVideo, videoModel, imageModel, requireApproval, slackChannel, sendHtmlReportOnly",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -713,7 +743,7 @@ export const taskDb = {
           taskId,
         },
         ProjectionExpression:
-          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, htmlFormatInstructions, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly, emailSender, fromName",
+          "taskId, userId, #n, prompt, #s, createdAt, updatedAt, #e, #sum, #en, #i, #dr, attachments, #llm, #ct, #epc, #vo, #oaj, #oah, emailFriendlyHtml, repairImageEmbedding, htmlFormatInstructions, #adm, category, description, templateId, selectedLLMs, useSharedBrowser, turnOffHeadless, useKnowledgeBase, updateKnowledgeBase, updateLeadList, createVideo, videoModel, imageModel, leadListIdentifier, knowledgeBase, knowledgeBaseSize, knowledgeBaseType, knowledgeBaseFiles, knowledgeBaseUpdatedAt, requireApproval, slackChannel, sendHtmlReportOnly, emailSender, fromName",
         ExpressionAttributeNames: {
           "#n": "name",
           "#s": "status",
@@ -764,6 +794,13 @@ export const taskDb = {
       knowledgeBase?: string;
       knowledgeBaseSize?: number;
       knowledgeBaseType?: "public" | "private";
+      knowledgeBaseFiles?: Array<{
+        filename: string;
+        size: number;
+        url: string;
+        key: string;
+        uploadedAt: string;
+      }>;
       useKnowledgeBase?: boolean;
       updateKnowledgeBase?: boolean;
       updateLeadList?: boolean;
@@ -795,7 +832,17 @@ export const taskDb = {
           // Attribute to be set/updated
           setClauses.push(`#${key} = :${key}`);
           expressionAttributeNames[`#${key}`] = key;
+          // DynamoDB handles arrays and objects automatically, but ensure proper serialization
           expressionAttributeValues[`:${key}`] = value;
+          
+          // Log knowledgeBaseFiles updates for debugging
+          if (key === 'knowledgeBaseFiles') {
+            console.log('Updating knowledgeBaseFiles:', {
+              taskId,
+              filesCount: Array.isArray(value) ? value.length : 0,
+              value: JSON.stringify(value)
+            });
+          }
         }
       });
 
@@ -837,6 +884,7 @@ export const taskDb = {
       }
 
       const result = await dynamodb.update(params).promise();
+      
       return result.Attributes;
     } catch (error) {
       console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);
@@ -1361,6 +1409,7 @@ export const taskDb = {
           name: task.name,
           knowledgeBaseSize: size,
           knowledgeBaseType: task.knowledgeBaseType || 'private',
+          knowledgeBaseFiles: task.knowledgeBaseFiles || [],
           knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
           // Include additional fields that might be useful
           updatedAt: task.updatedAt || task.createdAt,
@@ -2479,7 +2528,7 @@ class BenchmarkTestDB {
     } catch (error: any) {
       // Handle DynamoDB item size limit error
       if (error.code === 'ValidationException' && error.message?.includes('exceeded the maximum allowed size')) {
-        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 10 test history records.`);
+        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 5 test history records.`);
         
         try {
           // Get the current test to access testHistory
@@ -2495,8 +2544,8 @@ class BenchmarkTestDB {
             throw new Error('Item size limit exceeded but no test history to remove');
           }
           
-          // Keep only the last 10 records (most recent)
-          const updatedHistory = testHistory.slice(-10);
+          // Keep only the last 5 records (most recent)
+          const updatedHistory = testHistory.slice(-5);
           
           console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records.`);
           
@@ -2541,9 +2590,18 @@ export const benchmarkTestDb = new BenchmarkTestDB();
 // CRM Database Service
 export const crmDb = {
   // Lead List operations
-  async createLeadList(userId: string, name: string, description?: string) {
+  async createLeadList(
+    userId: string,
+    name: string,
+    description?: string,
+    alertEvents?: string[],
+    listSenderId?: string | null
+  ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const normalizedAlertEvents = Array.isArray(alertEvents)
+        ? alertEvents
+        : ['email.received'];
       
       const params = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
@@ -2557,6 +2615,9 @@ export const crmDb = {
           leadCount: 0,
           fieldNames: [], // Initialize with empty array
           displayFields: ['email', 'firstName', 'lastName', 'company', 'phone', 'title', 'linkedin', 'notes'], // Default visible fields
+          sortConfig: null,
+          alertEvents: normalizedAlertEvents,
+          listSenderId: listSenderId ?? null,
         },
       };
 
@@ -2570,29 +2631,47 @@ export const crmDb = {
 
   async getLeadListsByUserId(userId: string) {
     try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-LeadLists`,
-        IndexName: 'userId-index', // Assuming GSI on userId
-        KeyConditionExpression: 'userId = :userId',
-        ExpressionAttributeValues: {
-          ':userId': userId,
-        },
-      };
+      const items: any[] = [];
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
-    } catch (error: any) {
-      // If index doesn't exist, use scan with filter
-      if (error.code === 'ResourceNotFoundException' || error.message?.includes('index')) {
-        const params = {
+      do {
+        const params: AWS.DynamoDB.DocumentClient.QueryInput = {
           TableName: `${TABLE_PREFIX}AW-LeadLists`,
-          FilterExpression: 'userId = :userId',
+          IndexName: 'userId-index', // Assuming GSI on userId
+          KeyConditionExpression: 'userId = :userId',
           ExpressionAttributeValues: {
             ':userId': userId,
           },
+          ExclusiveStartKey: lastEvaluatedKey,
         };
-        const result = await dynamodb.scan(params).promise();
-        return result.Items || [];
+
+        const result = await dynamodb.query(params).promise();
+        items.push(...(result.Items || []));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return items;
+    } catch (error: any) {
+      // If index doesn't exist, use scan with filter
+      if (error.code === 'ResourceNotFoundException' || error.message?.includes('index')) {
+        const items: any[] = [];
+        let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+
+        do {
+          const params: AWS.DynamoDB.DocumentClient.ScanInput = {
+            TableName: `${TABLE_PREFIX}AW-LeadLists`,
+            FilterExpression: 'userId = :userId',
+            ExpressionAttributeValues: {
+              ':userId': userId,
+            },
+            ExclusiveStartKey: lastEvaluatedKey,
+          };
+          const result = await dynamodb.scan(params).promise();
+          items.push(...(result.Items || []));
+          lastEvaluatedKey = result.LastEvaluatedKey;
+        } while (lastEvaluatedKey);
+
+        return items;
       }
       handleDynamoDbError(error, "getLeadListsByUserId");
       throw error;
@@ -2616,31 +2695,64 @@ export const crmDb = {
     }
   },
 
-  async updateLeadList(listId: string, updates: { name?: string; description?: string; displayFields?: string[] }) {
+  async updateLeadList(
+    listId: string,
+    updates: {
+      name?: string;
+      description?: string;
+      displayFields?: string[];
+      sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
+      alertEvents?: string[];
+      listSenderId?: string | null;
+    }
+  ) {
     try {
       const updateExpressions: string[] = [];
       const expressionAttributeValues: any = {};
+      const expressionAttributeNames: Record<string, string> = {};
 
       if (updates.name !== undefined) {
-        updateExpressions.push('name = :name');
+        expressionAttributeNames['#name'] = 'name';
+        updateExpressions.push('#name = :name');
         expressionAttributeValues[':name'] = updates.name;
       }
 
       if (updates.description !== undefined) {
-        updateExpressions.push('description = :description');
+        expressionAttributeNames['#description'] = 'description';
+        updateExpressions.push('#description = :description');
         expressionAttributeValues[':description'] = updates.description;
       }
 
       if (updates.displayFields !== undefined) {
-        updateExpressions.push('displayFields = :displayFields');
+        expressionAttributeNames['#displayFields'] = 'displayFields';
+        updateExpressions.push('#displayFields = :displayFields');
         expressionAttributeValues[':displayFields'] = updates.displayFields;
+      }
+
+      if (updates.sortConfig !== undefined) {
+        expressionAttributeNames['#sortConfig'] = 'sortConfig';
+        updateExpressions.push('#sortConfig = :sortConfig');
+        expressionAttributeValues[':sortConfig'] = updates.sortConfig;
+      }
+
+      if (updates.alertEvents !== undefined) {
+        expressionAttributeNames['#alertEvents'] = 'alertEvents';
+        updateExpressions.push('#alertEvents = :alertEvents');
+        expressionAttributeValues[':alertEvents'] = updates.alertEvents;
+      }
+
+      if (updates.listSenderId !== undefined) {
+        expressionAttributeNames['#listSenderId'] = 'listSenderId';
+        updateExpressions.push('#listSenderId = :listSenderId');
+        expressionAttributeValues[':listSenderId'] = updates.listSenderId;
       }
 
       if (updateExpressions.length === 0) {
         return await this.getLeadListById(listId);
       }
 
-      updateExpressions.push('updatedAt = :updatedAt');
+      expressionAttributeNames['#updatedAt'] = 'updatedAt';
+      updateExpressions.push('#updatedAt = :updatedAt');
       expressionAttributeValues[':updatedAt'] = new Date().toISOString();
 
       const params = {
@@ -2649,6 +2761,7 @@ export const crmDb = {
           listId,
         },
         UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: 'ALL_NEW',
       };
@@ -2660,6 +2773,7 @@ export const crmDb = {
       throw error;
     }
   },
+
 
   async deleteLeadList(listId: string) {
     try {
@@ -2772,6 +2886,7 @@ export const crmDb = {
     notes?: string;
     linkedin?: string;
     customFields?: Record<string, any>;
+    selectedSenderId?: string | null;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2804,6 +2919,9 @@ export const crmDb = {
       // Only include email if it's provided (GSI key cannot be empty string)
       if (emailValue) {
         item.email = emailValue;
+      }
+      if (leadData.selectedSenderId) {
+        item.selectedSenderId = leadData.selectedSenderId;
       }
 
       const params = {
@@ -2927,9 +3045,11 @@ export const crmDb = {
     linkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
+    emailDraftFormat?: 'text' | 'html';
     emailDraft?: {
       subject: string;
-      htmlContent: string;
+      htmlContent?: string;
+      textContent?: string;
       createdAt: string;
       updatedAt: string;
       sessionId?: string;
@@ -3000,6 +3120,11 @@ export const crmDb = {
           setExpressions.push('selectedSenderId = :selectedSenderId');
           expressionAttributeValues[':selectedSenderId'] = updates.selectedSenderId;
         }
+      }
+
+      if (updates.emailDraftFormat !== undefined) {
+        setExpressions.push('emailDraftFormat = :emailDraftFormat');
+        expressionAttributeValues[':emailDraftFormat'] = updates.emailDraftFormat;
       }
 
       if (updates.emailDraft !== undefined) {
@@ -3268,44 +3393,127 @@ export const crmDb = {
       // Process leads to update (merge existing leads with new data)
       for (const { existingLead, newData } of leadsToUpdate) {
         try {
+          // Helper to normalize values for comparison
+          const normalize = (value: any): string => {
+            if (value === null || value === undefined) return '';
+            return String(value).trim();
+          };
+
           // Build update object - only include fields that have values in newData
           const updates: any = {};
+          let changed = false;
           
+          // Check and update standard fields - only if newData has a value and it's different
           if (newData.firstName !== undefined && newData.firstName.trim()) {
-            updates.firstName = newData.firstName;
+            const newValue = newData.firstName.trim();
+            const existingValue = normalize(existingLead.firstName);
+            if (existingValue !== newValue) {
+              updates.firstName = newValue;
+              changed = true;
+            }
           }
           if (newData.lastName !== undefined && newData.lastName.trim()) {
-            updates.lastName = newData.lastName;
+            const newValue = newData.lastName.trim();
+            const existingValue = normalize(existingLead.lastName);
+            if (existingValue !== newValue) {
+              updates.lastName = newValue;
+              changed = true;
+            }
           }
           if (newData.phone !== undefined && newData.phone.trim()) {
-            updates.phone = newData.phone;
+            const newValue = newData.phone.trim();
+            const existingValue = normalize(existingLead.phone);
+            if (existingValue !== newValue) {
+              updates.phone = newValue;
+              changed = true;
+            }
           }
           if (newData.company !== undefined && newData.company.trim()) {
-            updates.company = newData.company;
+            const newValue = newData.company.trim();
+            const existingValue = normalize(existingLead.company);
+            if (existingValue !== newValue) {
+              updates.company = newValue;
+              changed = true;
+            }
           }
           if (newData.title !== undefined && newData.title.trim()) {
-            updates.title = newData.title;
+            const newValue = newData.title.trim();
+            const existingValue = normalize(existingLead.title);
+            if (existingValue !== newValue) {
+              updates.title = newValue;
+              changed = true;
+            }
           }
           if (newData.notes !== undefined && newData.notes.trim()) {
-            updates.notes = newData.notes;
+            const newValue = newData.notes.trim();
+            const existingValue = normalize(existingLead.notes);
+            if (existingValue !== newValue) {
+              updates.notes = newValue;
+              changed = true;
+            }
           }
           if (newData.linkedin !== undefined && newData.linkedin.trim()) {
-            updates.linkedin = newData.linkedin.trim();
+            const newValue = newData.linkedin.trim();
+            const existingValue = normalize(existingLead.linkedin);
+            if (existingValue !== newValue) {
+              updates.linkedin = newValue;
+              changed = true;
+            }
           }
           
-          // Merge customFields - combine existing and new, with new values overriding
-          if (newData.customFields && Object.keys(newData.customFields).length > 0) {
+          // Check customFields - only if newData has customFields
+          if (newData.customFields !== undefined) {
             const existingCustomFields = existingLead.customFields || {};
-            updates.customFields = {
-              ...existingCustomFields,
-              ...newData.customFields,
+            const newCustomFields = newData.customFields || {};
+            
+            // Normalize function for consistent comparison (sort keys, trim strings, handle null/undefined/empty consistently)
+            const normalizeCustomFields = (fields: Record<string, any>): Record<string, any> => {
+              if (!fields || typeof fields !== 'object') return {};
+              const normalized: Record<string, any> = {};
+              Object.keys(fields).sort().forEach(key => {
+                const value = fields[key];
+                // Only include non-null, non-undefined values
+                if (value !== null && value !== undefined) {
+                  // Convert to string and trim, or keep as-is if not a string
+                  normalized[key] = typeof value === 'string' ? value.trim() : value;
+                }
+              });
+              return normalized;
             };
+            
+            // Normalize existing and new separately
+            const existingNormalized = normalizeCustomFields(existingCustomFields);
+            const newNormalized = normalizeCustomFields(newCustomFields);
+            
+            // Merge normalized versions
+            const mergedNormalized = {
+              ...existingNormalized,
+              ...newNormalized,
+            };
+            
+            // Compare normalized existing with normalized merged result
+            const existingStr = JSON.stringify(existingNormalized);
+            const mergedStr = JSON.stringify(mergedNormalized);
+            
+            // Only update if the merged result is different from existing
+            if (existingStr !== mergedStr) {
+              // Use the actual merged customFields (not normalized) for the update
+              const mergedCustomFields = {
+                ...existingCustomFields,
+                ...newCustomFields,
+              };
+              updates.customFields = mergedCustomFields;
+              changed = true;
+            }
           }
           
-          // Update the lead
-          await this.updateLead(listId, existingLead.leadId, updates);
-          results.successCount++;
-          results.mergedCount++;
+          // Only update if there are changes
+          if (changed) {
+            await this.updateLead(listId, existingLead.leadId, updates);
+            results.successCount++;
+            results.mergedCount++;
+          }
+          // If no changes, skip the update (don't count as merged)
         } catch (updateError: any) {
           results.errorCount++;
           results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);
@@ -3646,5 +3854,3 @@ export const crmDb = {
     }
   },
 };
-
-

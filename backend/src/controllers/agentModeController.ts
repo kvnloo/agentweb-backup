@@ -294,6 +294,7 @@ async function runVerifiedChat(
   let attempt = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
+  const defaultModel = params.llmModel || await agentModeService.getDefaultModel();
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -355,7 +356,7 @@ async function runVerifiedChat(
         sessionId,
         userMessage,
         userId,
-        params.llmModel || agentModeService.default_model,
+        defaultModel,
         attachmentsForThisAttempt
       );
 
@@ -531,6 +532,109 @@ async function runScheduledChat(
   const now = new Date();
 
   try {
+    // Check if required function calls are allowed for the user's subscription
+    const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
+    if (expectedFunctionCalls.length > 0) {
+      const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
+      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+      
+      // Check if all required function calls are allowed
+      // getAllowedFunctionCalls now always returns an array (never null or "*")
+      // If the array is empty, it means no functions are allowed (shouldn't happen, but handle it)
+      if (allowedFunctionCalls.length === 0) {
+        // This shouldn't happen, but if it does, block all function calls
+        const disallowedFunctions = expectedFunctionCalls;
+        
+        // Get user info for email
+        const { userDb } = await import('../services/db');
+        const user = await userDb.getUserById(userId);
+        const emailNotifications = schedule.emailNotifications || [];
+        
+        // Send error email instead of running
+        const { emailService } = await import('../services/emailService');
+        await emailService.sendScheduledChatErrorEmail(
+          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
+          schedule.scheduleName,
+          disallowedFunctions,
+          schedule.scheduleId
+        );
+        
+        // Create failure result
+        const errorResult = {
+          scheduleId: schedule.scheduleId,
+          runId: require('uuid').v4(),
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: `Scheduled chat cannot run: No function calls are allowed by your subscription.`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: [],
+          functionCallMatches: [],
+          functionCallMisses: disallowedFunctions,
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString()
+        };
+        
+        // Save the error result to database
+        try {
+          await scheduleDb.addRunResult(schedule.scheduleId, errorResult);
+        } catch (error) {
+          console.error('Error saving error run result:', error);
+        }
+        
+        return errorResult;
+      }
+      
+      const disallowedFunctions = expectedFunctionCalls.filter((funcName: string) => 
+        !allowedFunctionCalls.includes(funcName)
+      );
+        
+      if (disallowedFunctions.length > 0) {
+        // Get user info for email
+        const { userDb } = await import('../services/db');
+        const user = await userDb.getUserById(userId);
+        const emailNotifications = schedule.emailNotifications || [];
+        
+        // Send error email instead of running
+        const { emailService } = await import('../services/emailService');
+        await emailService.sendScheduledChatErrorEmail(
+          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
+          schedule.scheduleName,
+          disallowedFunctions,
+          schedule.scheduleId
+        );
+        
+        // Create failure result
+        const errorResult = {
+          scheduleId: schedule.scheduleId,
+          runId: require('uuid').v4(),
+          status: 'failure' as const,
+          passed: false,
+          actualResponse: `Scheduled chat cannot run: Required function calls are not allowed by your subscription: ${disallowedFunctions.join(', ')}`,
+          actualFunctionCalls: [],
+          keywordMatches: [],
+          keywordMisses: [],
+          functionCallMatches: [],
+          functionCallMisses: disallowedFunctions,
+          executionTime: 0,
+          sessionId: '',
+          attempt: 0,
+          createdAt: new Date().toISOString()
+        };
+        
+        // Save the error result to database
+        try {
+          await scheduleDb.addRunResult(schedule.scheduleId, errorResult);
+        } catch (error) {
+          console.error('Error saving error run result:', error);
+        }
+        
+        return errorResult;
+      }
+    }
+
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
     const testSession = await chatbotDb.createChatSession(
@@ -547,12 +651,12 @@ async function runScheduledChat(
     const sessionId = testSession.sessionId;
 
     // Update the session with the selected model from the schedule
-    const modelToUse = schedule.llmModel || agentModeService.default_model;
+    const defaultModel = await agentModeService.getDefaultModel();
+    const modelToUse = schedule.llmModel || defaultModel;
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
     // Convert schedule format to runVerifiedChat format
     const expectedKeywords = schedule.keywords || [];
-    const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
     const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
@@ -569,7 +673,7 @@ async function runScheduledChat(
       requiredFunctions,
       maxAttempts: 20,
       attachments: [],
-      llmModel: schedule.llmModel || agentModeService.default_model
+      llmModel: schedule.llmModel || defaultModel
     });
 
     // Convert result to scheduled chat format
@@ -619,7 +723,7 @@ async function runScheduledChat(
 
     // Also sync Research Reports execution for email campaigns
     try {
-      if (schedule.emailCampaignTaskId) {
+      if (schedule.emailCampaignTaskId && finalResult.sessionId) {
         await syncEmailCampaignExecution(userId, finalResult.sessionId, schedule.emailCampaignTaskId);
       }
     } catch (err) {
@@ -660,7 +764,6 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
     // Register callback for progress updates
     const cleanup = registerProgressCallback(sessionId, (progress) => {
       try {
-        console.log(`[SSE] Writing progress for session ${sessionId}:`, progress);
         res.write(`data: ${JSON.stringify(progress)}\n\n`);
         // Flush the response to ensure it's sent immediately
         if (typeof (res as any).flush === 'function') {
@@ -671,8 +774,6 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
         cleanup();
       }
     });
-
-    console.log(`[SSE] Progress callback registered for session ${sessionId}`);
 
     // Handle client disconnect
     req.on('close', () => {
@@ -705,6 +806,12 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
       res.status(500).json({ error: 'Failed to establish progress stream' });
     }
   }
+}
+
+function hasActiveProgress(sessionId: string): boolean {
+  const latestProgress = getLatestProgress(sessionId);
+  if (!latestProgress) return false;
+  return latestProgress.status !== 'complete';
 }
 
 // Common function to generate AI response for a session
@@ -918,11 +1025,11 @@ export const agentModeController = {
         undefined, // workflowId
         undefined, // executionId
         undefined, // emailCampaignTaskId
-        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation"
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"
       );
 
       // Set default model for new sessions
-      const defaultModel = agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
 
       res.status(201).json(sessionWithModel);
@@ -942,10 +1049,11 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      const progressActive = hasActiveProgress(session.sessionId);
 
       // Allow admin users to access any session for benchmark creation
       if (user && user.isAdmin) {
-        return res.json(session);
+        return res.json({ ...session, hasActiveProgress: progressActive });
       }
 
       // For non-admin users, check if they own the session
@@ -958,7 +1066,8 @@ export const agentModeController = {
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSession = {
         ...session,
-        messages: filterMessagesForClient(session.messages)
+        messages: filterMessagesForClient(session.messages),
+        hasActiveProgress: progressActive
       };
 
       res.json(filteredSession);
@@ -971,14 +1080,27 @@ export const agentModeController = {
   // Get available function calls for benchmark tests
   async getAvailableFunctionCalls(req: Request, res: Response) {
     try {
+      const user = req.user as User;
       const agentModeService = new AgentModeService();
-      const tools = agentModeService.getAvailableTools();
+      const allTools = agentModeService.getAvailableTools();
+      
+      // For admin users, return all function calls without filtering
+      // For regular users, filter tools based on subscription
+      let toolsToReturn = allTools;
+      if (!user.isAdmin) {
+        const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
+        const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
+        // getAllowedFunctionCalls now always returns an array (never null)
+        toolsToReturn = filterFunctionCalls(allTools, allowedFunctionCalls);
+      }
 
       // Extract function names and descriptions
-      const functionCalls = tools.map((tool: any) => ({
-        name: tool.function.name,
-        description: tool.function.description
-      }));
+      const functionCalls = toolsToReturn
+        .filter((tool: any) => tool.type === 'function')
+        .map((tool: any) => ({
+          name: tool.function.name,
+          description: tool.function.description
+        }));
 
       res.json({ functionCalls });
     } catch (error) {
@@ -1007,12 +1129,15 @@ export const agentModeController = {
       // Don't call cleanupProgress here as it removes active SSE connections
       progressStore.delete(sessionId);
 
+      // Use llmModel from request, session, or default
+      const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
+
       // Generate AI response using common function
       const response = await generateSessionResponse(
         sessionId,
         userMessage,
         user.userId,
-        llmModel,
+        modelToUse,
         attachments
       );
 
@@ -1322,7 +1447,8 @@ export const agentModeController = {
       }
 
       // Use session's llmModel if available, otherwise use default
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       res.status(200).json({
         session: {
@@ -1335,7 +1461,8 @@ export const agentModeController = {
           interactiveShareMetadata: session.interactiveShareMetadata,
           workPlan: session.workPlan,
           llmModel: modelToUse,
-          isConversable: !!conversable
+          isConversable: !!conversable,
+          hasActiveProgress: hasActiveProgress(session.sessionId)
         }
       });
     } catch (error) {
@@ -1376,7 +1503,8 @@ export const agentModeController = {
 
       // Always use session's llmModel for ishare endpoints (ignore request body's llmModel)
       // This ensures anonymous users get the correct model from the session
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       // Use the same generateSessionResponse logic as the regular generateResponse
       const response = await generateSessionResponse(
@@ -1727,7 +1855,7 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || agentModeService.default_model // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
       };
 
       await scheduleDb.createSchedule(scheduledChat);
@@ -1807,7 +1935,7 @@ export const agentModeController = {
         dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || agentModeService.default_model // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
       };
 
       await scheduleDb.updateSchedule(scheduleId, updates);
@@ -2076,40 +2204,44 @@ export const agentModeController = {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
 
-            // Send email notification with the result
-            try {
-              // Only send emails if email notifications are specified
-              const emailNotifications = schedule.emailNotifications || [];
-              if (emailNotifications.length > 0) {
-                // Check if this is an hourly schedule with daily digest enabled
-                if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
-                  // Check if this is the last run of the day
-                  const now = new Date();
-                  const nextRunTime = calculateNextRunTime('hourly', now);
-                  const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
+            // Send email notification with the result (only if it actually ran, not if it was blocked)
+            // If result.sessionId is empty, it means the run was blocked due to subscription restrictions
+            if (result.sessionId) {
+              try {
+                // Only send emails if email notifications are specified
+                const emailNotifications = schedule.emailNotifications || [];
+                if (emailNotifications.length > 0) {
+                  // Check if this is an hourly schedule with daily digest enabled
+                  if (schedule.frequency === 'hourly' && schedule.dailyDigest) {
+                    // Check if this is the last run of the day
+                    const now = new Date();
+                    const nextRunTime = calculateNextRunTime('hourly', now);
+                    const isLastRunOfDay = isLastRunOfDayForHourlySchedule(now, nextRunTime);
 
-                  if (isLastRunOfDay) {
-                    // Send daily digest instead of individual email
-                    await sendDailyDigestEmail(schedule, emailNotifications);
+                    if (isLastRunOfDay) {
+                      // Send daily digest instead of individual email
+                      await sendDailyDigestEmail(schedule, emailNotifications);
+                    }
+                    // For hourly schedules with daily digest, don't send individual emails
+                    // Only send the daily digest on the last run of the day
+                  } else {
+                    // Send individual email as usual for non-hourly schedules or hourly without daily digest
+                    await emailService.sendScheduledChatResultEmail(
+                      emailNotifications,
+                      schedule.scheduleName,
+                      result,
+                      schedule.scheduleId
+                    );
                   }
-                  // For hourly schedules with daily digest, don't send individual emails
-                  // Only send the daily digest on the last run of the day
                 } else {
-                  // Send individual email as usual for non-hourly schedules or hourly without daily digest
-                  await emailService.sendScheduledChatResultEmail(
-                    emailNotifications,
-                    schedule.scheduleName,
-                    result,
-                    schedule.scheduleId
-                  );
+                  console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
                 }
-              } else {
-                console.log(`No email notifications configured for schedule ${schedule.scheduleName}, skipping email send`);
+              } catch (error) {
+                console.error('Error sending scheduled chat result email:', error);
+                // Don't throw error - email failure shouldn't break the scheduled chat execution
               }
-            } catch (error) {
-              console.error('Error sending scheduled chat result email:', error);
-              // Don't throw error - email failure shouldn't break the scheduled chat execution
             }
+            // If result.sessionId is empty, the error email was already sent in runScheduledChat
           }).catch((error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
@@ -2165,7 +2297,8 @@ export const agentModeController = {
       }
 
       // Use session's llmModel if available, otherwise use default
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       res.json({
         sessionId: session.sessionId,
@@ -2198,7 +2331,8 @@ export const agentModeController = {
       }
 
       // Use session's llmModel if available, otherwise use default
-      const modelToUse = session.llmModel || agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
+      const modelToUse = session.llmModel || defaultModel;
 
       // Generate AI response using the same function as regular users
       const response = await generateSessionResponse(
@@ -2293,7 +2427,11 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      res.json(workPlan);
+      res.json({
+        ...workPlan,
+        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+        requireLogin: workPlan.requireLogin || false
+      });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
       res.status(500).json({ error: 'Failed to get predefined work plan' });
@@ -2365,12 +2503,14 @@ export const agentModeController = {
       const workPlanWithWelcome = {
         ...workPlan,
         welcomeMessage: predefinedPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: predefinedPlan.autocomplete || false
+        autocomplete: predefinedPlan.autocomplete || false,
+        showLoginSignup: predefinedPlan.showLoginSignup || 'after_plan_completed',
+        requireLogin: predefinedPlan.requireLogin || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
 
       // Set default model for new sessions
-      const defaultModel = agentModeService.default_model;
+      const defaultModel = await agentModeService.getDefaultModel();
       await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
 
       // Enable interactive sharing for the session
@@ -2514,12 +2654,14 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Starting message is required' });
       }
 
-      if (!requiredFunctions || !Array.isArray(requiredFunctions) || requiredFunctions.length === 0) {
-        return res.status(400).json({ error: 'Required functions array is required and must not be empty' });
+      if (requiredFunctions !== undefined && !Array.isArray(requiredFunctions)) {
+        return res.status(400).json({ error: 'Required functions must be an array when provided' });
       }
 
+      const requiredFunctionsArray = Array.isArray(requiredFunctions) ? requiredFunctions : [];
+
       // Validate requiredFunctions format: [{ functionName: string, minCount: number }]
-      for (const reqFunc of requiredFunctions) {
+      for (const reqFunc of requiredFunctionsArray) {
         if (!reqFunc.functionName || typeof reqFunc.functionName !== 'string') {
           return res.status(400).json({ error: 'Each required function must have a functionName (string)' });
         }
@@ -2554,7 +2696,7 @@ export const agentModeController = {
         userId: user.userId,
         startingMessage: startingMessage.trim(),
         keywords: keywords || [],
-        requiredFunctions,
+        requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray
       });

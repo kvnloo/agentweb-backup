@@ -407,12 +407,14 @@ export class ImageService {
       }
     });
     
-    let imageBuffer: Buffer = Buffer.from(imageResponse.data as ArrayBuffer);
+    // Convert ArrayBufferLike to Buffer
+    const data = imageResponse.data as ArrayBuffer;
+    let imageBuffer: Buffer = Buffer.from(data);
     let mimeType = this.getImageMimeType(imageUrl, imageResponse.headers['content-type'] as string);
     
     // Check if it's an SVG and convert to PNG
     if (mimeType === 'image/svg+xml') {
-      imageBuffer = await this.convertSvgToPng(imageBuffer);
+      imageBuffer = await this.convertSvgToPng(imageBuffer) as Buffer;
       mimeType = 'image/png'; // After conversion, it's PNG
     }
     
@@ -749,7 +751,6 @@ export class ImageService {
   private async generateWithGoogleGemini3Pro(params: ImageGenerationParams): Promise<ImageGenerationResult> {
     try {
       const { GoogleGenAI } = require('@google/genai');
-      const mime = require('mime');
       
       const apiKey = await this.getApiKey("gemini-3-pro-image-preview");
       const ai = new GoogleGenAI({

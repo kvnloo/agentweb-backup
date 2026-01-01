@@ -25,6 +25,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
     mockFile = {
       exists: jest.fn(),
       download: jest.fn(),
+      getMetadata: jest.fn().mockResolvedValue([{ contentType: 'text/plain' }])
     };
 
     mockBucket = {
@@ -48,62 +49,57 @@ describe('AgentModeService - Knowledge Base Files', () => {
     describe('Tool Definition', () => {
       it('should include list_knowledge_base_files in available tools', () => {
         const tools = agentModeService.getAvailableTools();
-        const tool = tools.find(
-          (t: any) => t.function?.name === 'list_knowledge_base_files'
-        );
-
+        const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
         expect(tool).toBeDefined();
         expect(tool?.function?.name).toBe('list_knowledge_base_files');
       });
 
       it('should have correct tool description', () => {
         const tools = agentModeService.getAvailableTools();
-        const tool = tools.find(
-          (t: any) => t.function?.name === 'list_knowledge_base_files'
-        );
-
+        const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
         expect(tool?.function?.description).toContain('List all available knowledge base files');
-        expect(tool?.function?.description).toContain('unique identifiers');
       });
 
       it('should have no required parameters', () => {
         const tools = agentModeService.getAvailableTools();
-        const tool = tools.find(
-          (t: any) => t.function?.name === 'list_knowledge_base_files'
-        );
-
+        const tool = tools.find((t: any) => t.function?.name === 'list_knowledge_base_files');
         expect(tool?.function?.parameters?.required).toEqual([]);
       });
     });
 
     describe('listKnowledgeBaseFiles method', () => {
-      it('should return empty list when user has no knowledge base files', async () => {
+      it('should return empty list when user has no knowledge bases', async () => {
         mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
 
         const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
 
         expect(result.success).toBe(true);
-        expect(result.message).toBe('No knowledge base files found');
-        expect(result.files).toEqual([]);
+        expect(result.message).toBe('No knowledge bases found');
+        expect(result.knowledge_bases).toEqual([]);
         expect(result.totalFiles).toBe(0);
+        expect(result.totalKnowledgeBases).toBe(0);
         expect(mockedTaskDb.getTasksWithKnowledgeBase).toHaveBeenCalledWith('user-123');
       });
 
-      it('should return list of knowledge base files', async () => {
+      it('should return list of knowledge bases with files', async () => {
         const mockTasks = [
           {
             taskId: 'task-1',
             name: 'Task 1',
             knowledgeBaseSize: 1024,
             knowledgeBaseType: 'private',
-            knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
+            knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z',
+            knowledgeBase: 'https://example.com/knowledge-base.txt',
+            knowledgeBaseFiles: [{ filename: 'file1.pdf', size: 256, url: 'https://example.com/file1.pdf' }]
           },
           {
             taskId: 'task-2',
             name: 'Task 2',
             knowledgeBaseSize: 2048,
             knowledgeBaseType: 'public',
-            knowledgeBaseUpdatedAt: '2024-01-02T00:00:00Z'
+            knowledgeBaseUpdatedAt: '2024-01-02T00:00:00Z',
+            knowledgeBase: 'https://example.com/task-2/knowledge-base.txt',
+            knowledgeBaseFiles: []
           }
         ];
 
@@ -112,22 +108,22 @@ describe('AgentModeService - Knowledge Base Files', () => {
         const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
 
         expect(result.success).toBe(true);
-        expect(result.files).toHaveLength(2);
-        expect(result.files[0]).toEqual({
-          file_identifier: 'task-1',
+        expect(result.knowledge_bases).toHaveLength(2);
+        expect(result.knowledge_bases[0]).toMatchObject({
+          identifier: 'task-1',
           name: 'Task 1',
-          size: 1024,
           type: 'private',
           updatedAt: '2024-01-01T00:00:00Z'
         });
-        expect(result.files[1]).toEqual({
-          file_identifier: 'task-2',
-          name: 'Task 2',
-          size: 2048,
-          type: 'public',
-          updatedAt: '2024-01-02T00:00:00Z'
-        });
-        expect(result.totalFiles).toBe(2);
+        expect(result.knowledge_bases[0].files).toEqual([
+          { fileName: 'knowledge-base.txt', fileSize: 1024, url: 'https://example.com/knowledge-base.txt' },
+          { fileName: 'file1.pdf', fileSize: 256, url: 'https://example.com/file1.pdf' }
+        ]);
+        expect(result.knowledge_bases[1].files).toEqual([
+          { fileName: 'knowledge-base.txt', fileSize: 2048, url: 'https://example.com/task-2/knowledge-base.txt' }
+        ]);
+        expect(result.totalFiles).toBe(3);
+        expect(result.totalKnowledgeBases).toBe(2);
       });
 
       it('should handle errors gracefully', async () => {
@@ -142,88 +138,79 @@ describe('AgentModeService - Knowledge Base Files', () => {
     });
   });
 
-  describe('read_knowledge_base_file', () => {
+  describe('read_knowledge_base_files', () => {
     describe('Tool Definition', () => {
-      it('should include read_knowledge_base_file in available tools', () => {
+      it('should include read_knowledge_base_files in available tools', () => {
         const tools = agentModeService.getAvailableTools();
         const tool = tools.find(
-          (t: any) => t.function?.name === 'read_knowledge_base_file'
+          (t: any) => t.function?.name === 'read_knowledge_base_files'
         );
 
         expect(tool).toBeDefined();
-        expect(tool?.function?.name).toBe('read_knowledge_base_file');
+        expect(tool?.function?.name).toBe('read_knowledge_base_files');
       });
 
       it('should have correct tool description', () => {
         const tools = agentModeService.getAvailableTools();
         const tool = tools.find(
-          (t: any) => t.function?.name === 'read_knowledge_base_file'
+          (t: any) => t.function?.name === 'read_knowledge_base_files'
         );
 
-        expect(tool?.function?.description).toContain('Read a knowledge base file');
-        expect(tool?.function?.description).toContain('unique identifier');
+        expect(tool?.function?.description).toContain('Read one or more knowledge base files');
       });
 
-      it('should have file_identifier as required parameter', () => {
+      it('should require files array parameter', () => {
         const tools = agentModeService.getAvailableTools();
         const tool = tools.find(
-          (t: any) => t.function?.name === 'read_knowledge_base_file'
+          (t: any) => t.function?.name === 'read_knowledge_base_files'
         );
 
-        expect(tool?.function?.parameters?.required).toContain('file_identifier');
-        expect(tool?.function?.parameters?.properties?.file_identifier?.type).toBe('string');
-        expect(tool?.function?.parameters?.properties?.file_identifier?.description).toContain('unique identifier');
+        expect(tool?.function?.parameters?.required).toContain('files');
+        expect(tool?.function?.parameters?.properties?.files?.type).toBe('array');
       });
     });
 
-    describe('readKnowledgeBaseFile method', () => {
-      it('should return error when file_identifier is missing', async () => {
-        const result = await (agentModeService as any).readKnowledgeBaseFile('', 'user-123');
-
+    describe('readKnowledgeBaseFiles method', () => {
+      it('should return error when files array missing', async () => {
+        const result = await (agentModeService as any).readKnowledgeBaseFiles([], 'user-123');
         expect(result.success).toBe(false);
-        expect(result.message).toBe('File identifier is required');
+        expect(result.message).toBe('files array is required');
       });
 
       it('should return error when task not found', async () => {
         mockedTaskDb.getTaskById.mockResolvedValue(undefined);
-
-        const result = await (agentModeService as any).readKnowledgeBaseFile('invalid-id', 'user-123');
-
-        expect(result.success).toBe(false);
-        expect(result.message).toContain('not found');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'invalid-id', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
+        expect(result.success).toBe(true);
+        expect(result.files[0].success).toBe(false);
+        expect(result.files[0].message).toContain('not found');
         expect(mockedTaskDb.getTaskById).toHaveBeenCalledWith('invalid-id');
       });
 
       it('should return error when user is not authorized', async () => {
-        const mockTask = {
-          taskId: 'task-1',
-          userId: 'other-user',
-          name: 'Task 1',
-          knowledgeBaseSize: 1024
-        };
-
+        const mockTask = { taskId: 'task-1', userId: 'other-user', name: 'Task 1', knowledgeBaseSize: 1024 };
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
 
-        const result = await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
-
-        expect(result.success).toBe(false);
-        expect(result.message).toBe('Not authorized to access this knowledge base file');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
+        expect(result.files[0].success).toBe(false);
+        expect(result.files[0].message).toBe('Not authorized to access this knowledge base file');
       });
 
       it('should return error when knowledge base is empty', async () => {
-        const mockTask = {
-          taskId: 'task-1',
-          userId: 'user-123',
-          name: 'Task 1',
-          knowledgeBaseSize: 0
-        };
-
+        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 0 };
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
 
-        const result = await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
-
-        expect(result.success).toBe(false);
-        expect(result.message).toContain('empty or does not exist');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
+        expect(result.files[0].success).toBe(false);
+        expect(result.files[0].message).toContain('empty or does not exist');
       });
 
       it('should return error when file does not exist in storage', async () => {
@@ -234,14 +221,15 @@ describe('AgentModeService - Knowledge Base Files', () => {
           knowledgeBaseSize: 1024,
           knowledgeBaseType: 'private'
         };
-
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
         mockFile.exists.mockResolvedValue([false]);
 
-        const result = await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
-
-        expect(result.success).toBe(false);
-        expect(result.message).toContain('not found in storage');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
+        expect(result.files[0].success).toBe(false);
+        expect(result.files[0].message).toContain('not found in storage');
       });
 
       it('should successfully read knowledge base file', async () => {
@@ -253,87 +241,75 @@ describe('AgentModeService - Knowledge Base Files', () => {
           knowledgeBaseType: 'private',
           knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
         };
-
         const mockContent = Buffer.from('Test knowledge base content');
-
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
         mockFile.exists.mockResolvedValue([true]);
         mockFile.download.mockResolvedValue([mockContent]);
+        mockFile.getMetadata = jest.fn().mockResolvedValue([{ contentType: 'text/plain' }]);
 
-        const result = await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
 
         expect(result.success).toBe(true);
-        expect(result.message).toContain('Successfully read');
-        expect(result.file_identifier).toBe('task-1');
-        expect(result.name).toBe('Task 1');
-        expect(result.content).toBe('Test knowledge base content');
-        expect(result.size).toBe(1024);
-        expect(result.type).toBe('private');
+        expect(result.files[0].success).toBe(true);
+        expect(result.files[0].kb_identifier).toBe('task-1');
+        expect(result.files[0].file_name).toBe('knowledge-base.txt');
+        expect(result.files[0].content).toBe('Test knowledge base content');
         expect(mockBucket.file).toHaveBeenCalledWith('tasks/task-1/knowledge-base.txt');
       });
 
       it('should use public bucket when knowledgeBaseType is public', async () => {
-        const mockTask = {
-          taskId: 'task-1',
-          userId: 'user-123',
-          name: 'Task 1',
-          knowledgeBaseSize: 1024,
-          knowledgeBaseType: 'public'
-        };
-
+        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 1024, knowledgeBaseType: 'public' };
         const mockContent = Buffer.from('Test content');
-
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
         mockFile.exists.mockResolvedValue([true]);
         mockFile.download.mockResolvedValue([mockContent]);
+        mockFile.getMetadata = jest.fn().mockResolvedValue([{ contentType: 'text/plain' }]);
 
-        await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
+        await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
 
         const storageInstance = mockedStorage.mock.results[0].value;
         expect(storageInstance.bucket).toHaveBeenCalledWith('test-bucket');
       });
 
       it('should truncate content when it exceeds 50KB limit', async () => {
-        const mockTask = {
-          taskId: 'task-1',
-          userId: 'user-123',
-          name: 'Task 1',
-          knowledgeBaseSize: 60000,
-          knowledgeBaseType: 'private'
-        };
-
-        // Create content larger than 50KB
+        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 60000, knowledgeBaseType: 'private' };
         const largeContent = 'x'.repeat(60000);
         const mockContent = Buffer.from(largeContent);
-
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
         mockFile.exists.mockResolvedValue([true]);
         mockFile.download.mockResolvedValue([mockContent]);
+        mockFile.getMetadata = jest.fn().mockResolvedValue([{ contentType: 'text/plain' }]);
 
-        const result = await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
 
         expect(result.success).toBe(true);
-        expect(result.content.length).toBe(50000 + '\n\n[Content truncated due to size limit]'.length);
-        expect(result.content).toContain('[Content truncated due to size limit]');
+        expect(result.files[0].content.length).toBe(50000 + '\n\n[Content truncated due to size limit]'.length);
+        expect(result.files[0].content).toContain('[Content truncated due to size limit]');
       });
 
       it('should handle errors gracefully', async () => {
-        const mockTask = {
-          taskId: 'task-1',
-          userId: 'user-123',
-          name: 'Task 1',
-          knowledgeBaseSize: 1024,
-          knowledgeBaseType: 'private'
-        };
-
+        const mockTask = { taskId: 'task-1', userId: 'user-123', name: 'Task 1', knowledgeBaseSize: 1024, knowledgeBaseType: 'private' };
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
         mockFile.exists.mockRejectedValue(new Error('Storage error'));
+        mockFile.getMetadata = jest.fn().mockResolvedValue([{ contentType: 'text/plain' }]);
 
-        const result = await (agentModeService as any).readKnowledgeBaseFile('task-1', 'user-123');
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
 
-        expect(result.success).toBe(false);
-        expect(result.message).toContain('Failed to read knowledge base file');
-        expect(result.error).toBe('Storage error');
+        expect(result.success).toBe(true);
+        expect(result.files[0].success).toBe(false);
+        expect(result.files[0].message).toContain('Failed to read knowledge base file');
       });
     });
   });
@@ -343,27 +319,20 @@ describe('AgentModeService - Knowledge Base Files', () => {
       const mockResponse = (agentModeService as any).getMockToolResult('list_knowledge_base_files', {});
 
       expect(mockResponse.success).toBe(true);
-      expect(mockResponse.files).toHaveLength(2);
-      expect(mockResponse.files[0]).toHaveProperty('file_identifier');
-      expect(mockResponse.files[0]).toHaveProperty('name');
-      expect(mockResponse.files[0]).toHaveProperty('size');
-      expect(mockResponse.files[0]).toHaveProperty('type');
-      expect(mockResponse.files[0]).toHaveProperty('updatedAt');
-      expect(mockResponse.totalFiles).toBe(2);
+      expect(mockResponse.knowledge_bases).toBeDefined();
+      expect(mockResponse.totalFiles).toBeDefined();
     });
 
-    it('should return correct mock response for read_knowledge_base_file', () => {
-      const mockResponse = (agentModeService as any).getMockToolResult('read_knowledge_base_file', {
-        file_identifier: 'test-id'
+    it('should return correct mock response for read_knowledge_base_files', () => {
+      const mockResponse = (agentModeService as any).getMockToolResult('read_knowledge_base_files', {
+        files: [{ kb_identifier: 'test-id', file_name: 'knowledge-base.txt' }]
       });
 
       expect(mockResponse.success).toBe(true);
-      expect(mockResponse.file_identifier).toBe('test-id');
-      expect(mockResponse.name).toBe('Mock Product Specifications');
-      expect(mockResponse.content).toContain('mock knowledge base content');
-      expect(mockResponse.size).toBe(1024);
-      expect(mockResponse.type).toBe('private');
+      expect(mockResponse.files).toHaveLength(1);
+      expect(mockResponse.files[0]).toHaveProperty('kb_identifier');
+      expect(mockResponse.files[0]).toHaveProperty('file_name');
+      expect(mockResponse.files[0]).toHaveProperty('content');
     });
   });
 });
-

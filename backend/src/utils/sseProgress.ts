@@ -32,7 +32,6 @@ export function registerProgressCallback(
       callbacks.delete(callback);
       if (callbacks.size === 0) {
         activeConnections.delete(sessionId);
-        progressStore.delete(sessionId);
       }
     }
   };
@@ -72,4 +71,3 @@ export function cleanupProgress(sessionId: string) {
   activeConnections.delete(sessionId);
   progressStore.delete(sessionId);
 }
-

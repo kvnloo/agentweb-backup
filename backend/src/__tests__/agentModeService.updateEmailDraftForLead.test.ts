@@ -173,14 +173,15 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
         leadId,
         instruction,
         sessionId,
-        userId
+        userId,
+        'html' // Specify HTML format since mock returns htmlContent
       );
 
       expect(result.success).toBe(true);
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
       expect(mockReadMarketStrategy).toHaveBeenCalledWith(userId);
-      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined);
+      expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined);
       expect(crmDb.updateLead).toHaveBeenCalled();
     });
 
@@ -235,7 +236,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
         leadId,
         instruction,
         sessionId,
-        userId
+        userId,
+        'html' // Specify HTML format since mock returns htmlContent
       );
 
       // Verify that the prompt includes email content (first 1k chars)
@@ -298,7 +300,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
         leadId,
         instruction,
         sessionId,
-        userId
+        userId,
+        'html' // Specify HTML format since mock returns htmlContent
       );
 
       expect(mockCreate).toHaveBeenCalled();
@@ -368,7 +371,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
         leadId,
         instruction,
         sessionId,
-        userId
+        userId,
+        'html' // Specify HTML format since mock returns htmlContent
       );
 
       expect(result.success).toBe(true);
@@ -496,5 +500,305 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(result.message).toContain('Failed');
     });
   });
-});
 
+  describe('Email format support', () => {
+    it('should generate text content when emailFormat is "text"', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+      const emailFormat = 'text';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { leadId, listId, email: 'lead@example.com', firstName: 'John', lastName: 'Doe' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      // Mock OpenAI to return text content
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Welcome',
+              textContent: 'This is plain text content without HTML tags.',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId,
+        emailFormat
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.textContent).toBe('This is plain text content without HTML tags.');
+      expect(result.data.htmlContent).toBeUndefined();
+
+      // Verify updateLead was called with textContent and format
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        listId,
+        leadId,
+        expect.objectContaining({
+          emailDraft: expect.objectContaining({
+            textContent: 'This is plain text content without HTML tags.',
+            subject: 'Welcome',
+          }),
+          emailDraftFormat: 'text',
+        })
+      );
+
+      // Verify the prompt instructs for text format
+      const callArgs = mockCreate.mock.calls[0];
+      const prompt = callArgs[0].messages[1].content;
+      expect(prompt).toContain('plain text');
+      expect(prompt).toContain('textContent');
+      expect(prompt).not.toContain('htmlContent');
+    });
+
+    it('should generate HTML content when emailFormat is "html"', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+      const emailFormat = 'html';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { leadId, listId, email: 'lead@example.com', firstName: 'John', lastName: 'Doe' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      // Mock OpenAI to return HTML content
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Welcome',
+              htmlContent: '<p>This is HTML content with <strong>formatting</strong>.</p>',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId,
+        emailFormat
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data.htmlContent).toBe('<p>This is HTML content with <strong>formatting</strong>.</p>');
+      expect(result.data.textContent).toBeUndefined();
+
+      // Verify updateLead was called with htmlContent and format
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        listId,
+        leadId,
+        expect.objectContaining({
+          emailDraft: expect.objectContaining({
+            htmlContent: '<p>This is HTML content with <strong>formatting</strong>.</p>',
+            subject: 'Welcome',
+          }),
+          emailDraftFormat: 'html',
+        })
+      );
+
+      // Verify the prompt instructs for HTML format
+      const callArgs = mockCreate.mock.calls[0];
+      const prompt = callArgs[0].messages[1].content;
+      expect(prompt).toContain('HTML');
+      expect(prompt).toContain('htmlContent');
+    });
+
+    it('should default to text format when emailFormat is not provided and lead has no format preference', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { leadId, listId, email: 'lead@example.com', firstName: 'John', lastName: 'Doe' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Welcome',
+              textContent: 'Plain text content',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        listId,
+        leadId,
+        expect.objectContaining({
+          emailDraftFormat: 'text',
+        })
+      );
+    });
+
+    it('should use lead\'s saved format preference when emailFormat is not provided', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { 
+        leadId, 
+        listId, 
+        email: 'lead@example.com', 
+        firstName: 'John', 
+        lastName: 'Doe',
+        emailDraftFormat: 'html' // Lead has saved preference
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Welcome',
+              htmlContent: '<p>HTML content</p>',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      // Should use lead's saved format preference
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        listId,
+        leadId,
+        expect.objectContaining({
+          emailDraftFormat: 'html',
+          emailDraft: expect.objectContaining({
+            htmlContent: '<p>HTML content</p>',
+          }),
+        })
+      );
+    });
+
+    it('should prioritize provided emailFormat over lead\'s saved preference', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create a welcome email';
+      const emailFormat = 'text'; // Explicitly provided
+
+      const mockList = { listId, name: 'Test List', userId };
+      const mockLead = { 
+        leadId, 
+        listId, 
+        email: 'lead@example.com', 
+        firstName: 'John', 
+        lastName: 'Doe',
+        emailDraftFormat: 'html' // Lead has saved preference, but should be overridden
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({ engagements: [] });
+      mockReadBrandGuidelines.mockResolvedValue({ exists: false });
+      mockReadMarketStrategy.mockResolvedValue({ exists: false });
+      mockGetSenderForLead.mockResolvedValue({ fromName: 'Sender' });
+
+      mockCreate.mockResolvedValue({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              subject: 'Welcome',
+              textContent: 'Plain text content',
+            }),
+          },
+        }],
+      });
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(mockLead);
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId,
+        emailFormat
+      );
+
+      expect(result.success).toBe(true);
+      // Should use provided format, not lead's preference
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        listId,
+        leadId,
+        expect.objectContaining({
+          emailDraftFormat: 'text', // Should use provided format
+          emailDraft: expect.objectContaining({
+            textContent: 'Plain text content',
+          }),
+        })
+      );
+    });
+  });
+});

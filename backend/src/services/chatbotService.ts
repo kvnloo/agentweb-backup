@@ -14,6 +14,7 @@ import { Storage } from '@google-cloud/storage';
 import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
 import { getGCSPPrivateKey } from '../utils/secretsManager';
+import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -102,6 +103,7 @@ export interface ChatMessage {
 export interface ChatSession {
   sessionId: string;
   userId: string;
+  adminListPartition?: string;
   title?: string; // Session title for display
   messages: ChatMessage[];
   createdAt: string;
@@ -144,7 +146,7 @@ export interface ChatSession {
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation"; // Type of session based on how it was created
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"; // Type of session based on how it was created
   llmModel?: string; // Selected LLM model for this session
 }
 
@@ -357,112 +359,12 @@ function keywordBasedChunkRetrieval(
 
 export class ChatbotDB {
   private tableName: string;
+  private messagesTableName: string;
 
   constructor() {
     this.tableName = `${TABLE_PREFIX}AW-ChatSessions`;
+    this.messagesTableName = `${TABLE_PREFIX}AW-ChatMessages`;
   }
-
-  // Utility function to calculate DynamoDB item size more accurately
-  private calculateItemSize(item: any): number {
-    // DynamoDB calculates size based on UTF-8 encoding
-    return Buffer.byteLength(JSON.stringify(item), 'utf8');
-  }
-
-  // Common function to validate and truncate messages with total size calculation
-  private async validateAndTruncateMessages(
-    sessionId: string, 
-    messages: ChatMessage[], 
-    maxContentSize: number = 150000, 
-    maxSessionSize: number = 350000
-  ): Promise<ChatMessage[]> {
-    // First, truncate all messages
-    const truncatedMessages = messages.map((message, index) => {
-      // Truncate message content if too large
-      if (message.content && message.content.length > maxContentSize) {
-        message.content = message.content.substring(0, maxContentSize) + '\n\n[Message content truncated due to size limit]';
-      }
-      
-      const messageSize = this.calculateItemSize(message);
-      console.log(`Message ${index}: size ${messageSize} bytes, content length: ${message.content?.length || 0} chars, role: ${message.role}`);
-      
-      // Debug: Break down the message size by component
-      if (messageSize > 50000) { // Only debug large messages
-        console.log(`  Debug - Message ${index} breakdown:`);
-        console.log(`    Content: ${this.calculateItemSize({ content: message.content })} bytes`);
-        console.log(`    Metadata: ${this.calculateItemSize({ metadata: message.metadata })} bytes`);
-        if (message.metadata?.toolCalls) {
-          console.log(`    ToolCalls: ${this.calculateItemSize({ toolCalls: message.metadata.toolCalls })} bytes`);
-          message.metadata.toolCalls.forEach((toolCall: any, i: number) => {
-            console.log(`      ToolCall ${i}: ${this.calculateItemSize(toolCall)} bytes (${toolCall.name})`);
-            if (toolCall.result) {
-              console.log(`        Result: ${this.calculateItemSize(toolCall.result)} bytes`);
-            }
-          });
-        }
-        if ((message.metadata as any)?.knowledgeBaseQueries) {
-          console.log(`    KnowledgeBaseQueries: ${this.calculateItemSize({ knowledgeBaseQueries: (message.metadata as any).knowledgeBaseQueries })} bytes`);
-        }
-        if ((message.metadata as any)?.sources) {
-          console.log(`    Sources: ${this.calculateItemSize({ sources: (message.metadata as any).sources })} bytes`);
-        }
-      }
-      
-      return message;
-    });
-
-    if (truncatedMessages.length === 0) {
-      return [];
-    }
-
-    // Get current session to calculate total size
-    try {
-      const currentSession = await this.getChatSession(sessionId);
-      if (!currentSession) {
-        return truncatedMessages;
-      }
-
-      const currentMessages = currentSession.messages || [];
-      const totalMessages = [...currentMessages, ...truncatedMessages];
-      const totalSessionSize = this.calculateItemSize({ ...currentSession, messages: totalMessages });
-      
-      console.log(`ChatbotDB: Current session has ${currentMessages.length} messages, adding ${truncatedMessages.length} new message(s)`);
-      console.log(`ChatbotDB: Total session size would be ${totalSessionSize} bytes`);
-      
-      if (totalSessionSize <= maxSessionSize) {
-        return truncatedMessages;
-      }
-
-      console.warn(`Total session size (${totalSessionSize} bytes) would exceed limit (${maxSessionSize} bytes). Checking if last message alone would fit.`);
-      
-      // Check if even the last message alone would exceed the limit
-      const lastMessage = truncatedMessages[truncatedMessages.length - 1];
-      if (lastMessage) {
-        const sessionWithOnlyLastMessage = { ...currentSession, messages: [lastMessage] };
-        const lastMessageSessionSize = this.calculateItemSize(sessionWithOnlyLastMessage);
-        console.log(`ChatbotDB: Last message session size: ${lastMessageSessionSize} bytes`);
-        
-        if (lastMessageSessionSize <= maxSessionSize) {
-          console.log(`ChatbotDB: Appending only the last message (${lastMessage.role}) - fits within limit`);
-          return [lastMessage];
-        } else {
-          console.error(`ChatbotDB: Even the last message alone (${lastMessageSessionSize} bytes) exceeds limit (${maxSessionSize} bytes). Returning empty array.`);
-          return [];
-        }
-      }
-      
-      // If no messages to keep, return empty array
-      return [];
-      
-    } catch (sessionError) {
-      // Only catch errors from getChatSession, not our intentional SESSION_SIZE_LIMIT_EXCEEDED
-      if (sessionError instanceof Error && sessionError.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
-        throw sessionError; // Re-throw our intentional error
-      }
-      console.warn('Could not check current session size, proceeding with truncated messages:', sessionError);
-      return truncatedMessages;
-    }
-  }
-
 
   async createChatSession(
     userId: string,
@@ -473,7 +375,7 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation"
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -502,6 +404,7 @@ export class ChatbotDB {
       ] : [],
       createdAt: timestamp,
       updatedAt: timestamp,
+      adminListPartition: "all",
       portalType,
       pageIdentifier,
       selectedStartupId,
@@ -557,14 +460,83 @@ export class ChatbotDB {
     }
   }
 
+  // Add messages to AW-ChatMessages table
+  private async addMessagesToMessagesTable(sessionId: string, messages: ChatMessage[], startIndex: number): Promise<void> {
+    if (messages.length === 0) {
+      return;
+    }
+
+    try {
+      // Write messages in batches (DynamoDB batch write limit is 25 items)
+      const batchSize = 25;
+      for (let i = 0; i < messages.length; i += batchSize) {
+        const batch = messages.slice(i, i + batchSize);
+        const writeRequests = batch.map((message, index) => ({
+          PutRequest: {
+            Item: {
+              sessionId,
+              messageIndex: startIndex + i + index,
+              message,
+            },
+          },
+        }));
+
+        const params = {
+          RequestItems: {
+            [this.messagesTableName]: writeRequests,
+          },
+        };
+
+        await dynamodb.batchWrite(params).promise();
+      }
+    } catch (error) {
+      // If table doesn't exist yet, log and continue (table will be created later)
+      if ((error as any).code === 'ResourceNotFoundException') {
+        console.log(`ChatMessages table not found, skipping write for session ${sessionId}`);
+        return;
+      }
+      console.error(`Error adding messages to messages table for session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
   ): Promise<ChatSession> {
-    // Validate and truncate the message (wrap single message in array)
-    const validatedMessages = await this.validateAndTruncateMessages(sessionId, [message]);
-    if (validatedMessages.length === 0) {
-      throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
+    // Check if session exists
+    const currentSession = await this.getChatSession(sessionId);
+    if (!currentSession) {
+      throw new Error('Session not found');
+    }
+
+    // Get current message count from AW-ChatMessages
+    const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
+    const currentMessageCount = currentMessages.length;
+
+    // Check if adding this message would exceed the limit
+    if (currentMessageCount >= MAX_MESSAGE_SIZE_PER_SESSION) {
+      throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`);
+    }
+
+    const messageIndex = currentMessageCount;
+
+    // Add message to AW-ChatMessages table
+    await this.addMessagesToMessagesTable(sessionId, [message], messageIndex);
+
+    // Return session with updated messages (no need to update session table)
+    return {
+      ...currentSession,
+      messages: [...currentMessages, message],
+    };
+  }
+
+  async addMessagesToSession(
+    sessionId: string,
+    messages: ChatMessage[]
+  ): Promise<ChatSession> {
+    if (messages.length === 0) {
+      return (await this.getChatSession(sessionId))!;
     }
 
     // Check if session exists
@@ -573,71 +545,122 @@ export class ChatbotDB {
       throw new Error('Session not found');
     }
 
-    const currentMessages = currentSession.messages || [];
-    const allMessages = [...currentMessages, ...validatedMessages];
+    // Get current message count from AW-ChatMessages
+    const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
+    const currentMessageCount = currentMessages.length;
 
+    // Check if adding these messages would exceed the limit
+    const totalMessageCount = currentMessageCount + messages.length;
+    if (totalMessageCount > MAX_MESSAGE_SIZE_PER_SESSION) {
+      throw new Error(`SESSION_MESSAGE_LIMIT_EXCEEDED: Adding ${messages.length} message(s) would exceed the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages per session (current: ${currentMessageCount}). Please start a new session to continue the conversation.`);
+    }
+
+    const messageIndex = currentMessageCount;
+
+    // Add messages to AW-ChatMessages table
+    await this.addMessagesToMessagesTable(sessionId, messages, messageIndex);
+
+    // Return session with updated messages (no need to update session table)
+    return {
+      ...currentSession,
+      messages: [...currentMessages, ...messages],
+    };
+  }
+
+  // Get message count from AW-ChatMessages table (optimized for list views)
+  private async getMessageCountFromMessagesTable(sessionId: string): Promise<number> {
     const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
+      TableName: this.messagesTableName,
+      KeyConditionExpression: "sessionId = :sessionId",
       ExpressionAttributeValues: {
-        ":messages": allMessages,
-        ":updatedAt": new Date().toISOString(),
+        ":sessionId": sessionId,
       },
-      ReturnValues: "ALL_NEW",
+      Select: "COUNT",
     };
 
     try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
+      const result = await dynamodb.query(params).promise();
+      return result.Count || 0;
     } catch (error) {
-      console.error("Error adding message to session:", error);
+      // If table doesn't exist yet, return 0
+      if ((error as any).code === 'ResourceNotFoundException') {
+        console.log(`ChatMessages table not found, returning 0 message count`);
+        return 0;
+      }
+      console.error("Error getting message count from messages table:", error);
       throw error;
     }
   }
 
-  async addMessagesToSession(
-    sessionId: string,
-    messages: ChatMessage[]
-  ): Promise<ChatSession> {
-    // Validate and truncate all messages
-    const validatedMessages = await this.validateAndTruncateMessages(sessionId, messages);
-    
-    console.log(`ChatbotDB: Validated messages: ${validatedMessages.length} out of ${messages.length} messages will be added`);
-
-    if (validatedMessages.length === 0) {
-      throw new Error('SESSION_SIZE_LIMIT_EXCEEDED: Please start a new session to continue the conversation.');
-    }
-
-    // Check if session exists and has messages
-    const currentSession = await this.getChatSession(sessionId);
-    if (!currentSession) {
-      throw new Error('Session not found');
-    }
-
-    const currentMessages = currentSession.messages || [];
-    const allMessages = [...currentMessages, ...validatedMessages];
-
+  // Get messages from AW-ChatMessages table
+  private async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
     const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
+      TableName: this.messagesTableName,
+      KeyConditionExpression: "sessionId = :sessionId",
       ExpressionAttributeValues: {
-        ":messages": allMessages,
-        ":updatedAt": new Date().toISOString(),
+        ":sessionId": sessionId,
       },
-      ReturnValues: "ALL_NEW",
+      ScanIndexForward: true, // Sort by messageIndex ascending
     };
 
     try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
+      const result = await dynamodb.query(params).promise();
+      if (!result.Items || result.Items.length === 0) {
+        return [];
+      }
+      // Sort by messageIndex and extract messages
+      const messages = result.Items
+        .sort((a, b) => a.messageIndex - b.messageIndex)
+        .map((item) => item.message as ChatMessage);
+      return messages;
     } catch (error) {
-      console.error("Error adding messages to session:", error);
+      // If table doesn't exist yet, return empty array
+      if ((error as any).code === 'ResourceNotFoundException') {
+        console.log(`ChatMessages table not found, returning empty messages`);
+        return [];
+      }
+      console.error("Error getting messages from messages table:", error);
+      throw error;
+    }
+  }
+
+  // Migrate messages from session record to AW-ChatMessages table
+  private async migrateMessagesToMessagesTable(sessionId: string, messages: ChatMessage[]): Promise<void> {
+    if (!messages || messages.length === 0) {
+      return;
+    }
+
+    try {
+      // Write messages in batches (DynamoDB batch write limit is 25 items)
+      const batchSize = 25;
+      for (let i = 0; i < messages.length; i += batchSize) {
+        const batch = messages.slice(i, i + batchSize);
+        const writeRequests = batch.map((message, index) => ({
+          PutRequest: {
+            Item: {
+              sessionId,
+              messageIndex: i + index,
+              message,
+            },
+          },
+        }));
+
+        const params = {
+          RequestItems: {
+            [this.messagesTableName]: writeRequests,
+          },
+        };
+
+        await dynamodb.batchWrite(params).promise();
+      }
+      console.log(`Migrated ${messages.length} messages from session ${sessionId} to AW-ChatMessages`);
+    } catch (error) {
+      // If table doesn't exist yet, log and continue (table will be created later)
+      if ((error as any).code === 'ResourceNotFoundException') {
+        console.log(`ChatMessages table not found, skipping migration for session ${sessionId}`);
+        return;
+      }
+      console.error(`Error migrating messages for session ${sessionId}:`, error);
       throw error;
     }
   }
@@ -652,7 +675,32 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.get(params).promise();
-      return (result.Item as ChatSession) || null;
+      const session = (result.Item as ChatSession) || null;
+      
+      if (!session) {
+        return null;
+      }
+
+      // Check if messages exist in AW-ChatMessages
+      let messages = await this.getMessagesFromMessagesTable(sessionId);
+
+      // If no messages in AW-ChatMessages but messages exist in session record, migrate them
+      if (messages.length === 0 && session.messages && session.messages.length > 0) {
+        console.log(`Migrating ${session.messages.length} messages from session record to AW-ChatMessages for session ${sessionId}`);
+        await this.migrateMessagesToMessagesTable(sessionId, session.messages);
+        messages = session.messages; // Use the migrated messages
+      } else if (messages.length > 0) {
+        // Messages exist in AW-ChatMessages, use those instead
+        console.log(`Using ${messages.length} messages from AW-ChatMessages for session ${sessionId}`);
+      }
+
+      // Remove messages from session object and replace with messages from messages table
+      // This ensures we always return the correct format from the messages table
+      const { messages: _, ...sessionWithoutMessages } = session;
+      return {
+        ...sessionWithoutMessages,
+        messages,
+      };
     } catch (error) {
       console.error("Error getting chat session:", error);
       throw error;
@@ -730,12 +778,45 @@ export class ChatbotDB {
         );
       }
 
+      // Fetch messages from messages table for each session
+      // This ensures message counts are accurate since messages are now stored separately
+      const sessionsWithMessages = await Promise.all(
+        sessions.map(async (session) => {
+          try {
+            // Get messages from AW-ChatMessages table
+            let messages = await this.getMessagesFromMessagesTable(session.sessionId);
+
+            // If no messages in AW-ChatMessages but messages exist in session record, migrate them
+            if (messages.length === 0 && session.messages && session.messages.length > 0) {
+              console.log(`Migrating ${session.messages.length} messages from session record to AW-ChatMessages for session ${session.sessionId}`);
+              await this.migrateMessagesToMessagesTable(session.sessionId, session.messages);
+              messages = session.messages; // Use the migrated messages
+            }
+
+            // Remove messages from session object and replace with messages from messages table
+            const { messages: _, ...sessionWithoutMessages } = session;
+            return {
+              ...sessionWithoutMessages,
+              messages,
+            };
+          } catch (error) {
+            console.error(`Error fetching messages for session ${session.sessionId}:`, error);
+            // If there's an error, return session with empty messages array
+            const { messages: _, ...sessionWithoutMessages } = session;
+            return {
+              ...sessionWithoutMessages,
+              messages: [],
+            };
+          }
+        })
+      );
+
       console.log(
-        `Returning ${sessions.length} sorted chat sessions for user: ${userId}`
+        `Returning ${sessionsWithMessages.length} sorted chat sessions with messages for user: ${userId}`
       );
 
       return {
-        sessions,
+        sessions: sessionsWithMessages,
         lastEvaluatedKey: result.LastEvaluatedKey
       };
     } catch (error) {
@@ -828,10 +909,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt",
+      UpdateExpression: "SET archived = :archived, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":archived": true,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
     };
 
@@ -873,11 +955,12 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET pageContent = :pageContent, contextChunks = :contextChunks, updatedAt = :updatedAt",
+        "SET pageContent = :pageContent, contextChunks = :contextChunks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":pageContent": pageContent,
         ":contextChunks": contextChunks,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -915,10 +998,11 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET title = :title, updatedAt = :updatedAt",
+        "SET title = :title, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":title": title,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -944,10 +1028,11 @@ export class ChatbotDB {
       sessionId,
       },
       UpdateExpression:
-        "SET portalType = :portalType, updatedAt = :updatedAt",
+        "SET portalType = :portalType, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":portalType": portalType,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -973,10 +1058,11 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET selectedStartupId = :selectedStartupId, updatedAt = :updatedAt",
+        "SET selectedStartupId = :selectedStartupId, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":selectedStartupId": selectedStartupId,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1001,10 +1087,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET shareMetadata = :shareMetadata, updatedAt = :updatedAt",
+      UpdateExpression: "SET shareMetadata = :shareMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":shareMetadata": shareMetadata,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1036,10 +1123,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET userId = :userId, updatedAt = :updatedAt",
+      UpdateExpression: "SET userId = :userId, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":userId": newUserId,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1064,10 +1152,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, updatedAt = :updatedAt",
+      UpdateExpression: "SET interactiveShareMetadata = :interactiveShareMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":interactiveShareMetadata": interactiveShareMetadata,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1123,10 +1212,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET workPlan = :workPlan, updatedAt = :updatedAt",
+      UpdateExpression: "SET workPlan = :workPlan, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":workPlan": validatedWorkPlan,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1152,10 +1242,11 @@ export class ChatbotDB {
         sessionId,
       },
       UpdateExpression:
-        "SET llmModel = :llmModel, updatedAt = :updatedAt",
+        "SET llmModel = :llmModel, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":llmModel": llmModel,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1194,10 +1285,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": updatedCounts,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1236,10 +1328,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": updatedCounts,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1264,10 +1357,11 @@ export class ChatbotDB {
       Key: {
         sessionId,
       },
-      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt",
+      UpdateExpression: "SET calledFunctions = :calledFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":calledFunctions": calledFunctions,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
       ReturnValues: "ALL_NEW",
     };
@@ -1347,7 +1441,38 @@ export class ChatbotDB {
     return allSessions;
   }
 
-  async updateMessageInSession(sessionId: string, messageIndex: number, updatedMessage: ChatMessage): Promise<ChatSession> {
+  async getRecentSessionsPage(
+    limit: number,
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key
+  ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+    const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+      TableName: this.tableName,
+      IndexName: "AdminUpdatedAtIndex",
+      KeyConditionExpression: "adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":adminListPartition": "all",
+      },
+      Limit: limit,
+      ScanIndexForward: false,
+    };
+
+    if (lastEvaluatedKey) {
+      params.ExclusiveStartKey = lastEvaluatedKey;
+    }
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return {
+        sessions: (result.Items as ChatSession[]) || [],
+        lastEvaluatedKey: result.LastEvaluatedKey,
+      };
+    } catch (error) {
+      console.error("Error getting recent chat sessions:", error);
+      throw error;
+    }
+  }
+
+  async updateMessageInSession(sessionId: string, messageIndex: number, updatedMessage: ChatMessage): Promise<void> {
     try {
       // First get the current session
       const currentSession = await this.getChatSession(sessionId);
@@ -1360,26 +1485,29 @@ export class ChatbotDB {
         throw new Error(`Message index ${messageIndex} is out of bounds for session ${sessionId}`);
       }
 
-      // Create a copy of messages array and update the specific message
-      const updatedMessages = [...currentSession.messages];
-      updatedMessages[messageIndex] = updatedMessage;
-
-      // Update the session with the new messages array
+      // Update the message in AW-ChatMessages table
       const params = {
-        TableName: this.tableName,
+        TableName: this.messagesTableName,
         Key: {
           sessionId,
+          messageIndex,
         },
-        UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
+        UpdateExpression: "SET message = :message",
         ExpressionAttributeValues: {
-          ":messages": updatedMessages,
-          ":updatedAt": new Date().toISOString(),
+          ":message": updatedMessage,
         },
-        ReturnValues: "ALL_NEW",
       };
 
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
+      try {
+        await dynamodb.update(params).promise();
+      } catch (error) {
+        // If table doesn't exist yet, log and continue
+        if ((error as any).code === 'ResourceNotFoundException') {
+          console.log(`ChatMessages table not found, skipping message update for session ${sessionId}`);
+        } else {
+          throw error;
+        }
+      }
     } catch (error) {
       console.error("Error updating message in session:", error);
       throw error;
@@ -2102,51 +2230,57 @@ export async function updateTaskExecutionStatus(
       throw new Error('Session not found');
     }
 
-    // Find the message with the task execution and update its status
-    const updatedMessages = session.messages?.map((message: ChatMessage) => {
+    // Find the message index with the task execution and update it
+    let messageIndexToUpdate: number | null = null;
+    let updatedMessage: ChatMessage | null = null;
+
+    for (let i = 0; i < session.messages.length; i++) {
+      const message = session.messages[i];
       if (message.metadata?.toolCalls) {
-        const updatedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
-          if (toolCall.result && 
-              toolCall.result.taskId === taskId && 
-              toolCall.result.executionId === executionId) {
-            return {
-              ...toolCall,
-              result: {
-                ...toolCall.result,
-                status: newStatus
-              }
-            };
-          }
-          return toolCall;
+        const hasMatchingToolCall = message.metadata.toolCalls.some((toolCall: any) => {
+          return toolCall.result && 
+                 toolCall.result.taskId === taskId && 
+                 toolCall.result.executionId === executionId;
         });
 
-        return {
-          ...message,
-          metadata: {
-            ...message.metadata,
-            toolCalls: updatedToolCalls
-          }
-        };
-      }
-      return message;
-    });
+        if (hasMatchingToolCall) {
+          const updatedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
+            if (toolCall.result && 
+                toolCall.result.taskId === taskId && 
+                toolCall.result.executionId === executionId) {
+              return {
+                ...toolCall,
+                result: {
+                  ...toolCall.result,
+                  status: newStatus
+                }
+              };
+            }
+            return toolCall;
+          });
 
-    // Update the session with the modified messages
-    const params = {
-      TableName: `${TABLE_PREFIX}AW-ChatSessions`,
-      Key: { sessionId },
-      UpdateExpression: "SET messages = :messages, updatedAt = :updatedAt",
-      ExpressionAttributeValues: {
-        ":messages": updatedMessages,
-        ":updatedAt": new Date().toISOString()
+          updatedMessage = {
+            ...message,
+            metadata: {
+              ...message.metadata,
+              toolCalls: updatedToolCalls
+            }
+          };
+          messageIndexToUpdate = i;
+          break;
+        }
       }
-    };
+    }
 
-    await dynamodb.update(params).promise();
-    console.log(`Successfully updated task execution status for session ${sessionId}`);
+    // Update the message in AW-ChatMessages if found
+    if (messageIndexToUpdate !== null && updatedMessage) {
+      await chatbotDb.updateMessageInSession(sessionId, messageIndexToUpdate, updatedMessage);
+      console.log(`Successfully updated task execution status for session ${sessionId} at message index ${messageIndexToUpdate}`);
+    } else {
+      console.log(`No matching message found for task ${taskId}, execution ${executionId} in session ${sessionId}`);
+    }
   } catch (error) {
     console.error('Error updating task execution status:', error);
     throw error;
   }
 }
-

@@ -331,6 +331,104 @@ describe('CRM Database Service', () => {
       expect(result!.emailDraft).toEqual(emailDraft);
     });
 
+    it('should handle emailDraftFormat updates', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { leadId, listId },
+        }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraftFormat: 'text',
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraftFormat: 'text' });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[':emailDraftFormat']).toBe('text');
+      expect(result!.emailDraftFormat).toBe('text');
+    });
+
+    it('should handle emailDraft with textContent', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { leadId, listId },
+        }),
+      });
+
+      const emailDraft = {
+        subject: 'Test Subject',
+        textContent: 'Plain text content',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraft,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraft });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result!.emailDraft).toEqual(emailDraft);
+      expect(result!.emailDraft!.textContent).toBe('Plain text content');
+      expect(result!.emailDraft!.htmlContent).toBeUndefined();
+    });
+
+    it('should handle emailDraft with htmlContent', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Item: { leadId, listId },
+        }),
+      });
+
+      const emailDraft = {
+        subject: 'Test Subject',
+        htmlContent: '<p>HTML content</p>',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId,
+            listId,
+            emailDraft,
+          },
+        }),
+      });
+
+      const result = await crmDb.updateLead(listId, leadId, { emailDraft });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      expect(result!.emailDraft).toEqual(emailDraft);
+      expect(result!.emailDraft!.htmlContent).toBe('<p>HTML content</p>');
+      expect(result!.emailDraft!.textContent).toBeUndefined();
+    });
+
     it('should handle removing emailDraft (setting to null)', async () => {
       const listId = 'list_123';
       const leadId = 'lead_123';
@@ -413,6 +511,153 @@ describe('CRM Database Service', () => {
 
       expect(result.mergedCount).toBe(1);
       expect(result.newCount).toBe(0);
+    });
+
+    it('should skip update if record is identical', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { 
+          email: 'existing@example.com', 
+          firstName: 'John', 
+          lastName: 'Doe',
+          customFields: { subscribed: 'yes' }
+        },
+      ];
+
+      // Mock existing lead with same data
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { 
+              leadId: 'lead1', 
+              listId, 
+              email: 'existing@example.com', 
+              firstName: 'John',
+              lastName: 'Doe',
+              customFields: { subscribed: 'yes' }
+            },
+          ],
+        }),
+      });
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+
+      // updateLead should NOT be called for identical records
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      // Should not count as merged since no update was needed
+      expect(result.mergedCount).toBe(0);
+      expect(result.newCount).toBe(0);
+      expect(result.successCount).toBe(0);
+      
+      // Verify updateLead was not called for the lead itself
+      // (updateFieldNames may still be called to update the list's fieldNames, but that's OK)
+      const leadUpdates = mockDocumentClientMethods.update.mock.calls.filter(
+        (call: any) => call[0].TableName === `${process.env.TABLE_PREFIX || ''}AW-Leads`
+      );
+      expect(leadUpdates.length).toBe(0);
+    });
+
+    it('should update if customFields are different', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { 
+          email: 'existing@example.com', 
+          firstName: 'John',
+          customFields: { subscribed: 'no' } // Changed from 'yes' to 'no'
+        },
+      ];
+
+      // Mock existing lead with different subscribed value
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { 
+              leadId: 'lead1', 
+              listId, 
+              email: 'existing@example.com', 
+              firstName: 'John',
+              customFields: { subscribed: 'yes' }
+            },
+          ],
+        }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId: 'lead1',
+            listId,
+            email: 'existing@example.com',
+            firstName: 'John',
+            customFields: { subscribed: 'no' }
+          },
+        }),
+      });
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      expect(result.mergedCount).toBe(1);
+      expect(result.successCount).toBe(1);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+    });
+
+    it('should update if standard fields are different', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { 
+          email: 'existing@example.com', 
+          firstName: 'Jane', // Changed from 'John'
+          lastName: 'Doe',
+        },
+      ];
+
+      // Mock existing lead
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { 
+              leadId: 'lead1', 
+              listId, 
+              email: 'existing@example.com', 
+              firstName: 'John',
+              lastName: 'Doe',
+            },
+          ],
+        }),
+      });
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: {
+            leadId: 'lead1',
+            listId,
+            email: 'existing@example.com',
+            firstName: 'Jane',
+            lastName: 'Doe',
+          },
+        }),
+      });
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      expect(result.mergedCount).toBe(1);
+      expect(result.successCount).toBe(1);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
     });
   });
 

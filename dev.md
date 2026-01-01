@@ -98,7 +98,7 @@ Prerequisites:
 - AWS CLI configured for the target account/region (`aws configure`)
 - Region: `us-west-2` (override with `--region` if different)
 
-Add index in Development (Dev- prefixed table):
+Add index in Development (Dev- prefixed table, provisioned capacity):
 
 ```bash
 aws dynamodb update-table \
@@ -108,7 +108,7 @@ aws dynamodb update-table \
   --region us-west-2
 ```
 
-Add index in Production (no prefix):
+Add index in Production (no prefix, PAY_PER_REQUEST billing mode):
 
 ```bash
 aws dynamodb update-table \
@@ -199,11 +199,60 @@ cd backend
 NODE_ENV=production npx ts-node src/scripts/@repair-tables.ts
 ```
 
+## DynamoDB: Add AdminUpdatedAtIndex to AW-ChatSessions
+
+If you need to add the `AdminUpdatedAtIndex` GSI to the `AW-ChatSessions` table (for admin chat history pagination), use these commands.
+
+Prerequisites:
+- AWS CLI configured for the target account/region (`aws configure`)
+- Region: `us-west-2` (override with `--region` if different)
+
+Add index in Development (Dev- prefixed table):
+
+```bash
+aws dynamodb update-table \
+  --table-name Dev-AW-ChatSessions \
+  --attribute-definitions AttributeName=adminListPartition,AttributeType=S AttributeName=updatedAt,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"AdminUpdatedAtIndex","KeySchema":[{"AttributeName":"adminListPartition","KeyType":"HASH"},{"AttributeName":"updatedAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}}]' \
+  --region us-west-2
+```
+
+Add index in Production (no prefix):
+
+```bash
+aws dynamodb update-table \
+  --table-name AW-ChatSessions \
+  --attribute-definitions AttributeName=adminListPartition,AttributeType=S AttributeName=updatedAt,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"AdminUpdatedAtIndex","KeySchema":[{"AttributeName":"adminListPartition","KeyType":"HASH"},{"AttributeName":"updatedAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+  --region us-west-2
+```
+
+Verify index status (repeat until `IndexStatus` is `ACTIVE`):
+
+```bash
+aws dynamodb describe-table \
+  --table-name Dev-AW-ChatSessions \
+  --region us-west-2 \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`AdminUpdatedAtIndex`].{IndexName:IndexName,IndexStatus:IndexStatus}'
+```
+
 Notes:
-- GSI creation is asynchronous; queries against `EmailDomainLeadEmailIndex` work after status becomes `ACTIVE`.
-- Replace `Dev-AW-EmailEvents` with `AW-EmailEvents` for production.
-- The `leadEmail` attribute must be populated in existing records for the index to be useful. Consider backfilling existing records if needed.
-- **Important**: The production `AW-EmailEvents` table uses `PAY_PER_REQUEST` billing mode, so `ProvisionedThroughput` should NOT be specified when creating indexes in production. The development table uses provisioned capacity, so it requires `ProvisionedThroughput` to be specified.
+- Do not specify `ProvisionedThroughput` when the table billing mode is `PAY_PER_REQUEST` (production).
+- After the index is active, backfill `adminListPartition` for existing items so they show up in the index.
+
+Backfill in Development:
+
+```bash
+cd backend
+NODE_ENV=development npx ts-node src/scripts/repair-chat-sessions-admin-index.ts
+```
+
+Backfill in Production:
+
+```bash
+cd backend
+NODE_ENV=production npx ts-node src/scripts/repair-chat-sessions-admin-index.ts
+```
 
 ## Port Management
 
@@ -283,6 +332,13 @@ There was two outages in recent three days. To debug, I downloaded the full log 
 November 24, 2025
 Added oncall alert on Agentweb-backend-env-prod-3 env as it is currently the prod backend and most risky outage.
 
+November 29, 2025
+## Azure Anthropic Foundry API Hanging Issue with Long Prompts
+
+The Azure Anthropic Foundry API (via `@anthropic-ai/foundry-sdk`) experiences hanging behavior when processing long prompts, particularly when combined with large `max_tokens` values. Testing revealed that prompts exceeding approximately 500 characters can cause the API to hang indefinitely, with requests timing out after 30-90 seconds or never completing. This issue appears to be a limitation of the Azure Anthropic Foundry service itself rather than a bug in the SDK libraries, as both `@anthropic-ai/foundry-sdk` (v0.2.0) and `@anthropic-ai/sdk` (v0.71.0) are at their latest versions.
+
+Because of this, it is hard to use Anthropic LLM via Azure.
+
 December 02, 2025
 VEO 3.1 integration doc: https://ai.google.dev/gemini-api/docs/video?example=dialogue#javascript_2
 
@@ -347,3 +403,12 @@ cd backend && npm list react react-dom
 ### References
 - CVE-2025-55182 Scanner: https://cve-2025-55182.com/
 - React Security Advisory: https://github.com/facebook/react/security
+
+## Dec 15, 2025
+to support pdf file uploads for Knowledge Base, add OCR Parser for PDF file formats so that Vertex AI Search will uses this parser to parse PDF files.
+
+## Dec 23, 2025
+After resolving conflicts, we need to use force push to remote. On Github Desktop, instead of clicking on the pull and push button, we should select force push from it because otherwise a pull will happen again which will get the conflicts happen again.
+
+## Dev 30, 2025
+If tests fail in PR, we could rerun the step in the PR to see whether it is a random issue. This worked for customer-portal.
