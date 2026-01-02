@@ -70,7 +70,8 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.createPost).toHaveBeenCalledWith(
         'test-access-token',
         'urn:li:person:abc123',
-        'Hello LinkedIn!'
+        'Hello LinkedIn!',
+        undefined
       );
       expect(result).toEqual({
         success: true,
@@ -88,7 +89,8 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.createPost).toHaveBeenCalledWith(
         'test-org-token',
         'urn:li:organization:123456',
-        'Company announcement'
+        'Company announcement',
+        undefined
       );
       expect(result.success).toBe(true);
     });

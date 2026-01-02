@@ -13,16 +13,35 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const token = config.access_token;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
-    // TODO: Implement media upload support when LinkedIn API supports it
-    if (mediaUrls && mediaUrls.length > 0) {
-      console.warn('[LinkedInAdapter] Media URLs provided but media upload not yet implemented');
-    }
-
     try {
-      const postUrn = await linkedInService.createPost(token, authorUrn, content);
+      // Upload images if provided
+      let imageUrns: string[] = [];
+      if (mediaUrls && mediaUrls.length > 0) {
+        console.log(`[LinkedInAdapter] Uploading ${mediaUrls.length} image(s)...`);
+        
+        for (const url of mediaUrls) {
+          try {
+            const imageUrn = await linkedInService.uploadImageFromUrl(token, authorUrn, url);
+            imageUrns.push(imageUrn);
+          } catch (uploadError: any) {
+            console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, uploadError.message);
+            // Continue with other images or post without this image
+          }
+        }
+        
+        if (imageUrns.length > 0) {
+          console.log(`[LinkedInAdapter] Successfully uploaded ${imageUrns.length} image(s)`);
+        }
+      }
+
+      // Create post (with or without images)
+      const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
+      
       return {
         success: true,
-        message: 'Posted successfully on LinkedIn',
+        message: imageUrns.length > 0 
+          ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)` 
+          : 'Posted successfully on LinkedIn',
         postId: postUrn,
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
       };

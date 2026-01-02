@@ -1,5 +1,4 @@
 import axios from 'axios';
-import type { AxiosInstance, AxiosError } from 'axios';
 import {
   LinkedInProfile,
   LinkedInPost,
@@ -13,7 +12,7 @@ import {
 } from '../types/linkedIn';
 
 export class LinkedInService {
-  private client: AxiosInstance;
+  private client: ReturnType<typeof axios.create>;
 
   constructor() {
     this.client = axios.create({
@@ -39,12 +38,11 @@ export class LinkedInService {
   }
 
   private handleError(error: any): void {
-    if (axios.isAxiosError(error)) {
-      const axiosError = error as AxiosError<LinkedInErrorResponse>;
-      const status = axiosError.response?.status;
-      const message = axiosError.response?.data?.message || axiosError.message;
+    if (error.isAxiosError || error.response) {
+      const status = error.response?.status;
+      const message = error.response?.data?.message || error.message;
       
-      console.error(`LinkedIn API Error [${status}]: ${message}`, axiosError.response?.data);
+      console.error(`LinkedIn API Error [${status}]: ${message}`, error.response?.data);
 
       if (status === 401) {
         throw new Error('LinkedIn access token expired or invalid');
@@ -151,9 +149,9 @@ export class LinkedInService {
    * Create a post (Versioned Post API)
    * Handles both Personal and Organization posts based on authorUrn
    */
-  async createPost(accessToken: string, authorUrn: string, text: string): Promise<string> {
+  async createPost(accessToken: string, authorUrn: string, text: string, imageUrns?: string[]): Promise<string> {
     return this.safeRequest(async () => {
-      const payload: LinkedInPost = {
+      const payload: any = {
         author: authorUrn,
         commentary: text,
         visibility: 'PUBLIC',
@@ -163,12 +161,94 @@ export class LinkedInService {
         }
       };
 
+      // Add media content if images are provided
+      if (imageUrns && imageUrns.length > 0) {
+        if (imageUrns.length === 1) {
+          // Single image - use 'image' content type
+          payload.content = {
+            media: {
+              id: imageUrns[0]
+            }
+          };
+        } else {
+          // Multiple images (2-20) - use 'multiImage' content type
+          payload.content = {
+            multiImage: {
+              images: imageUrns.map(urn => ({ id: urn }))
+            }
+          };
+        }
+      }
+
       const response = await this.client.post('/rest/posts', payload, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
 
       // LinkedIn Versioned API returns the URN in the x-restli-id header
       return response.headers['x-restli-id'] || (response.data as any).id;
+    });
+  }
+
+  /**
+   * Initialize image upload with LinkedIn
+   * Step 1 of the 3-step image upload process
+   */
+  async initializeImageUpload(accessToken: string, ownerUrn: string): Promise<{
+    uploadUrl: string;
+    imageUrn: string;
+  }> {
+    return this.safeRequest(async () => {
+      const response = await this.client.post('/rest/images?action=initializeUpload', {
+        initializeUploadRequest: {
+          owner: ownerUrn
+        }
+      }, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      const data = (response.data as any).value;
+      return {
+        uploadUrl: data.uploadUrl,
+        imageUrn: data.image
+      };
+    });
+  }
+
+  /**
+   * Upload image binary to LinkedIn's upload URL
+   * Step 2 of the 3-step image upload process
+   */
+  async uploadImageBinary(uploadUrl: string, imageBuffer: Buffer, contentType: string): Promise<void> {
+    await axios.put(uploadUrl, imageBuffer, {
+      headers: {
+        'Content-Type': contentType,
+      },
+    } as any);
+  }
+
+  /**
+   * Download image from URL and upload to LinkedIn
+   * Combines steps 1 & 2 for convenience
+   */
+  async uploadImageFromUrl(accessToken: string, ownerUrn: string, imageUrl: string): Promise<string> {
+    return this.safeRequest(async () => {
+      // Download image from URL (e.g., S3)
+      const imageResponse = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+      });
+
+      const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+      const contentType = imageResponse.headers['content-type'] || 'image/png';
+
+      // Step 1: Initialize upload
+      const { uploadUrl, imageUrn } = await this.initializeImageUpload(accessToken, ownerUrn);
+
+      // Step 2: Upload binary
+      await this.uploadImageBinary(uploadUrl, imageBuffer, contentType);
+
+      console.log(`[LinkedIn] Image uploaded successfully: ${imageUrn}`);
+      return imageUrn;
     });
   }
 
@@ -206,7 +286,7 @@ export class LinkedInService {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
 
-      const data = response.data;
+      const data = response.data as any;
       return {
         id: data.id?.toString() || orgId,
         name: data.localizedName || data.name?.localized?.en_US || `Organization ${orgId}`,
@@ -226,7 +306,7 @@ export class LinkedInService {
         headers: { Authorization: `Bearer ${accessToken}` },
         params: { edgeType: 'CompanyFollowedByMember' }
       });
-      return response.data.firstDegreeSize || 0;
+      return (response.data as any).firstDegreeSize || 0;
     } catch (error) {
       console.warn('[LinkedIn] Failed to get follower count:', error);
       return 0;
