@@ -1,6 +1,6 @@
 /**
  * Unit tests for AgentModeService - Connected Accounts / Social Media Tools
- * Tests cover: listConnectedAccounts, postOnAccount, loadConnectedAccountPosts, loadConnectedAccountMetrics
+ * Tests cover: listConnectedAccounts, postOnConnectedAccount, loadConnectedAccountPosts, loadConnectedAccountMetrics
  */
 
 // Mock dependencies
@@ -118,7 +118,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
   });
 
-  describe('postOnAccount', () => {
+  describe('postOnConnectedAccount', () => {
     const mockAdapter = {
       createPost: jest.fn(),
       listPosts: jest.fn(),
@@ -141,7 +141,7 @@ describe('AgentModeService - Social Media Tools', () => {
         postUrl: 'https://linkedin.com/feed/update/urn:li:share:123',
       });
 
-      const result = await service.postOnAccount(
+      const result = await service.postOnConnectedAccount(
         'user-123',
         'urn:li:organization:123456',
         'Hello from the API!',
@@ -162,7 +162,7 @@ describe('AgentModeService - Social Media Tools', () => {
     it('should return error when account not found', async () => {
       mockGetAccountById.mockResolvedValue(null);
 
-      const result = await service.postOnAccount(
+      const result = await service.postOnConnectedAccount(
         'user-123',
         'nonexistent-account',
         'Test content'
@@ -176,7 +176,7 @@ describe('AgentModeService - Social Media Tools', () => {
       mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
       mockIsTokenValid.mockResolvedValue(false);
 
-      const result = await service.postOnAccount(
+      const result = await service.postOnConnectedAccount(
         'user-123',
         'urn:li:organization:123456',
         'Test content'
@@ -191,7 +191,7 @@ describe('AgentModeService - Social Media Tools', () => {
       mockIsTokenValid.mockResolvedValue(true);
       mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn API error'));
 
-      const result = await service.postOnAccount(
+      const result = await service.postOnConnectedAccount(
         'user-123',
         'urn:li:organization:123456',
         'Test content'

@@ -1740,7 +1740,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
-          name: 'post_on_account',
+          name: 'post_on_connected_account',
           description: 'Create a post on a connected social media account',
           parameters: {
             type: 'object',
@@ -3689,8 +3689,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         });
       case 'load_connected_account_metrics':
         return await this.loadConnectedAccountMetrics(userId, args.account_id);
-      case 'post_on_account':
-        return await this.postOnAccount(userId, args.account_id, args.content, args.media_urls);
+      case 'post_on_connected_account':
+        return await this.postOnConnectedAccount(userId, args.account_id, args.content, args.media_urls);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -11530,7 +11530,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
     try {
       const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
