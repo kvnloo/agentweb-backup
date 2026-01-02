@@ -412,3 +412,15 @@ After resolving conflicts, we need to use force push to remote. On Github Deskto
 
 ## Dev 30, 2025
 If tests fail in PR, we could rerun the step in the PR to see whether it is a random issue. This worked for customer-portal.
+
+## Jan 2, 2026
+### LinkedIn Configuration Update
+Renamed LinkedIn credential functions and updated secret paths to clarify personal vs. company credentials.
+
+- **Personal Profile Integration**:
+  - Dev Secret: `dev/AgentWeb/LinkedIn/Personal`
+  - Prod Secret: `prod/AgentWeb/LinkedIn/Personal`
+
+- **Organization/Company Page Integration**:
+  - Dev Secret: `dev/AgentWeb/LinkedIn/Company`
+  - Prod Secret: `prod/AgentWeb/LinkedIn/Company`
