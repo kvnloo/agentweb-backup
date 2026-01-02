@@ -1,5 +1,5 @@
 
-import { getLinkedInCredentials, getLinkedInOrgCredentials } from '../utils/secretsManager';
+import { getLinkedInPersonalCredentials, getLinkedInCompanyCredentials } from '../utils/secretsManager';
 
 // Static configuration values (URLs, scopes, etc.)
 export const INTEGRATION_CONFIG = {
@@ -46,7 +46,7 @@ export interface LinkedInConfig {
  */
 export async function getLinkedInConfig(): Promise<LinkedInConfig> {
   // Fetch credentials from AWS Secrets Manager
-  const credentials = await getLinkedInCredentials();
+  const credentials = await getLinkedInPersonalCredentials();
 
   return {
     clientId: credentials.clientId,
@@ -65,7 +65,7 @@ export async function getLinkedInConfig(): Promise<LinkedInConfig> {
  * Credentials are stored at dev/AgentWeb/LinkedIn/OrganizationApp
  */
 export async function getLinkedInOrgConfig(): Promise<LinkedInConfig> {
-  const credentials = await getLinkedInOrgCredentials();
+  const credentials = await getLinkedInCompanyCredentials();
 
   return {
     clientId: credentials.clientId,

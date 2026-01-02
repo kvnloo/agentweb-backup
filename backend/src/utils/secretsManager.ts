@@ -108,12 +108,12 @@ export interface LinkedInCredentials {
  * Get LinkedIn OAuth credentials from AWS Secrets Manager
  * @returns The LinkedIn client credentials (clientId and clientSecret)
  */
-export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
+export async function getLinkedInPersonalCredentials(): Promise<LinkedInCredentials> {
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
-      ? 'prod/AgentWeb/LinkedIn/Company'
-      : 'dev/AgentWeb/LinkedIn/Company';
+      ? 'prod/AgentWeb/LinkedIn/Personal'
+      : 'dev/AgentWeb/LinkedIn/Personal';
     
     const secretString = await getSecret(secretName);
     
@@ -148,12 +148,12 @@ export interface LinkedInOrgCredentials {
  * This is a separate app with r_organization_admin, w_organization_social scopes
  * @returns The LinkedIn Organization App credentials (clientId and clientSecret)
  */
-export async function getLinkedInOrgCredentials(): Promise<LinkedInOrgCredentials> {
+export async function getLinkedInCompanyCredentials(): Promise<LinkedInOrgCredentials> {
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
-      ? 'prod/AgentWeb/LinkedIn/OrganizationApp'
-      : 'dev/AgentWeb/LinkedIn/OrganizationApp';
+      ? 'prod/AgentWeb/LinkedIn/Company'
+      : 'dev/AgentWeb/LinkedIn/Company';
     
     const secretString = await getSecret(secretName);
     
