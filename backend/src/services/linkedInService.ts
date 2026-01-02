@@ -236,9 +236,9 @@ export class LinkedInService {
   /**
    * Verify if an access token is still valid by making an API call
    * Uses the lightweight userinfo endpoint for personal tokens
-   * @returns Object with valid status and optional error message
+   * @returns Object with valid status, optional error message, and uncertain flag (Fix #6)
    */
-  async verifyToken(accessToken: string): Promise<{ valid: boolean; error?: string }> {
+  async verifyToken(accessToken: string): Promise<{ valid: boolean; error?: string; uncertain?: boolean }> {
     try {
       await axios.get('https://api.linkedin.com/v2/userinfo', {
         headers: { Authorization: `Bearer ${accessToken}` },
@@ -252,9 +252,9 @@ export class LinkedInService {
       if (error.response?.status === 403) {
         return { valid: false, error: 'Token permissions revoked' };
       }
-      // Network error - assume valid (might be temporary issue)
-      console.warn('[LinkedIn verifyToken] Network error, assuming valid:', error.code || error.message);
-      return { valid: true };
+      // Network error - return uncertain state
+      console.warn('[LinkedIn verifyToken] Network error:', error.code || error.message);
+      return { valid: true, uncertain: true, error: 'Network error - could not verify token' };
     }
   }
 }

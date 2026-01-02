@@ -13,6 +13,11 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const token = config.access_token;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
+    // TODO: Implement media upload support when LinkedIn API supports it
+    if (mediaUrls && mediaUrls.length > 0) {
+      console.warn('[LinkedInAdapter] Media URLs provided but media upload not yet implemented');
+    }
+
     try {
       const postUrn = await linkedInService.createPost(token, authorUrn, content);
       return {
@@ -22,6 +27,10 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
       };
     } catch (error: any) {
+      // Rate limit handling
+      if (error.response?.status === 429) {
+        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+      }
       if (error.response?.status === 401) {
         throw new Error('LinkedIn access token expired');
       }

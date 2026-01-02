@@ -28,6 +28,10 @@ import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
 import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
+import linkedinAuthRoutes from "./routes/linkedinAuth";
+import connectedAccountsRoutes from "./routes/connectedAccounts";
+
+const { version } = require('../package.json');
 
 
 // Import the new controller
@@ -152,11 +156,6 @@ app.use("/api/gtm-plan", gtmPlanRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
-import linkedinAuthRoutes from "./routes/linkedinAuth";
-import connectedAccountsRoutes from "./routes/connectedAccounts";
-
-// ... existing imports ...
-
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 
@@ -167,7 +166,6 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  const version = require('../package.json').version;
   res.status(200).json({ status: "healthy", version });
 });
 

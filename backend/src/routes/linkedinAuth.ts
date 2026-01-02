@@ -1,6 +1,8 @@
-import express from 'express';
+import express, { Request } from 'express';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
+import jwksClient from 'jwks-rsa';
 import { getLinkedInConfig, getLinkedInOrgConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
@@ -8,9 +10,67 @@ import { authenticateToken } from '../middleware/auth';
 
 const router = express.Router();
 
+// ============================================
+// Type Definitions (Fix #8)
+// ============================================
+interface AuthenticatedRequest extends Request {
+  user: { userId: string; email: string };
+}
+
+// ============================================
+// Constants (Fix #9)
+// ============================================
+const STATE_EXPIRATION = '15m';
+const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const SESSION_CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
 // JWT Secret for signing the state parameter
-// Use a dedicated secret or fall back to the main JWT secret
-const STATE_SECRET = process.env.JWT_SECRET || 'default-secret-change-me';
+// REQUIRED: Must be set in environment variables
+const STATE_SECRET = process.env.JWT_SECRET;
+if (!STATE_SECRET) {
+  throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
+}
+
+// ============================================
+// LinkedIn JWKS Client for id_token verification (Fix #1)
+// ============================================
+const linkedInJwksClient = jwksClient({
+  jwksUri: 'https://www.linkedin.com/oauth/openid/jwks',
+  cache: true,
+  cacheMaxAge: 86400000, // 24 hours
+  rateLimit: true,
+  jwksRequestsPerMinute: 10,
+});
+
+const getLinkedInSigningKey = (header: jwt.JwtHeader, callback: jwt.SigningKeyCallback): void => {
+  if (!header.kid) {
+    callback(new Error('No kid in token header'));
+    return;
+  }
+  linkedInJwksClient.getSigningKey(header.kid, (err, key) => {
+    if (err) {
+      callback(err);
+      return;
+    }
+    const signingKey = key?.getPublicKey();
+    callback(null, signingKey);
+  });
+};
+
+// Verify LinkedIn id_token with JWKS
+const verifyLinkedInIdToken = async (idToken: string): Promise<{ sub: string; name?: string; email?: string; picture?: string } | null> => {
+  return new Promise((resolve) => {
+    jwt.verify(idToken, getLinkedInSigningKey, { algorithms: ['RS256'] }, (err, decoded) => {
+      if (err) {
+        console.warn('[OAuth] LinkedIn id_token verification failed:', err.message);
+        resolve(null);
+      } else {
+        resolve(decoded as { sub: string; name?: string; email?: string; picture?: string });
+      }
+    });
+  });
+};
 
 interface StatePayload {
   userId: string;
@@ -18,12 +78,25 @@ interface StatePayload {
   type: 'personal' | 'organization';
 }
 
-// Helper to generate signed state
+// Helper to generate signed state with cryptographically secure nonce
 const generateState = (userId: string, type: 'personal' | 'organization'): string => {
-  const nonce = Math.random().toString(36).substring(7);
+  const nonce = crypto.randomBytes(16).toString('hex');
   const payload: StatePayload = { userId, nonce, type };
-  // Short expiration (e.g., 15 minutes) to prevent replay
-  return jwt.sign(payload, STATE_SECRET, { expiresIn: '15m' });
+  return jwt.sign(payload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
+};
+
+// ============================================
+// OAuth URL Builder Helper (Fix #13 - DRY)
+// ============================================
+const buildOAuthUrl = (config: { authorizationUrl: string; clientId?: string; redirectUri: string; scopes: string[] }, state: string): string => {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: config.clientId || '',
+    redirect_uri: config.redirectUri,
+    state: state,
+    scope: config.scopes.join(' ')
+  });
+  return `${config.authorizationUrl}?${params.toString()}`;
 };
 
 // Helper to verify state
@@ -35,6 +108,68 @@ const verifyState = (state: string, userId: string): boolean => {
     console.error('[OAuth] State verification failed:', error);
     return false;
   }
+};
+
+// ============================================
+// Token Session Store (Secure server-side storage)
+// ============================================
+// Stores tokens server-side with a secure session ID to avoid
+// passing sensitive tokens via postMessage in the browser.
+
+interface TokenSession {
+  tokens: {
+    access_token: string;
+    refresh_token?: string;
+    expires_in: number;
+    scopes: string[];
+  };
+  userId: string;
+  expires: number;
+}
+
+const tokenSessions = new Map<string, TokenSession>();
+// Using TOKEN_SESSION_TTL_MS from constants above
+
+// Clean up expired sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, session] of tokenSessions.entries()) {
+    if (now > session.expires) {
+      tokenSessions.delete(sessionId);
+    }
+  }
+}, SESSION_CLEANUP_INTERVAL_MS);
+
+const storeTokenSession = (userId: string, tokens: TokenSession['tokens']): string => {
+  const sessionId = crypto.randomBytes(32).toString('hex');
+  tokenSessions.set(sessionId, {
+    tokens,
+    userId,
+    expires: Date.now() + TOKEN_SESSION_TTL_MS
+  });
+  console.log(`[TokenSession] Stored session ${sessionId.substring(0, 8)}... for user ${userId}`);
+  return sessionId;
+};
+
+const retrieveTokenSession = (sessionId: string, userId: string): TokenSession['tokens'] | null => {
+  const session = tokenSessions.get(sessionId);
+  if (!session) {
+    console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... not found`);
+    return null;
+  }
+  if (session.userId !== userId) {
+    console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... userId mismatch`);
+    return null;
+  }
+  if (Date.now() > session.expires) {
+    console.warn(`[TokenSession] Session ${sessionId.substring(0, 8)}... expired`);
+    tokenSessions.delete(sessionId);
+    return null;
+  }
+  // One-time use: delete after retrieval
+  tokenSessions.delete(sessionId);
+  console.log(`[TokenSession] Retrieved and deleted session ${sessionId.substring(0, 8)}...`);
+  return session.tokens;
 };
 
 // ============================================
@@ -51,16 +186,8 @@ router.get('/init', authenticateToken, async (req: any, res) => {
     // Generate signed state
     const state = generateState(userId, 'personal');
     
-    // Construct URL
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: config.clientId || '',
-      redirect_uri: config.redirectUri,
-      state: state,
-      scope: config.scopes.join(' ')
-    });
-
-    const url = `${config.authorizationUrl}?${params.toString()}`;
+    // Build URL using helper
+    const url = buildOAuthUrl(config, state);
     res.json({ success: true, url });
     
   } catch (error) {
@@ -92,8 +219,16 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
   const { code, state } = req.body;
   const userId = req.user.userId;
 
+  // Input validation
+  if (!code || typeof code !== 'string' || code.trim() === '') {
+    return res.status(400).json({ error: 'Invalid or missing OAuth code' });
+  }
+  if (!state || typeof state !== 'string' || state.trim() === '') {
+    return res.status(400).json({ error: 'Invalid or missing state parameter' });
+  }
+
   // Security Check: Verify State
-  if (!state || !verifyState(state, userId)) {
+  if (!verifyState(state, userId)) {
     return res.status(403).json({ error: 'Invalid or expired state parameter. CSRF protection.' });
   }
 
@@ -124,19 +259,14 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       name: 'LinkedIn User' 
     };
     
-    // Method 1: Extract from id_token JWT
+    // Verify and extract from id_token using JWKS
     if (id_token) {
-      try {
-        const tokenParts = id_token.split('.');
-        if (tokenParts.length === 3) {
-          const payload = JSON.parse(Buffer.from(tokenParts[1], 'base64').toString());
-          if (payload.sub) profile.sub = payload.sub;
-          if (payload.name) profile.name = payload.name;
-          if (payload.email) profile.email = payload.email;
-          if (payload.picture) profile.picture = payload.picture;
-        }
-      } catch (jwtError) {
-        console.warn('[LinkedIn Connect] Failed to decode id_token:', jwtError);
+      const verifiedPayload = await verifyLinkedInIdToken(id_token);
+      if (verifiedPayload) {
+        if (verifiedPayload.sub) profile.sub = verifiedPayload.sub;
+        if (verifiedPayload.name) profile.name = verifiedPayload.name;
+        if (verifiedPayload.email) profile.email = verifiedPayload.email;
+        if (verifiedPayload.picture) profile.picture = verifiedPayload.picture;
       }
     }
     
@@ -180,7 +310,8 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 
   } catch (error: any) {
     console.error('Connect Error:', error);
-    res.status(500).json({ error: 'Failed to connect account', details: error.message });
+    const details = IS_PRODUCTION ? undefined : error.message;
+    res.status(500).json({ error: 'Failed to connect account', ...(details && { details }) });
   }
 });
 
@@ -196,15 +327,8 @@ router.get('/org/init', authenticateToken, async (req: any, res) => {
     
     const state = generateState(userId, 'organization');
     
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: config.clientId || '',
-      redirect_uri: config.redirectUri,
-      state: state,
-      scope: config.scopes.join(' ')
-    });
-
-    const url = `${config.authorizationUrl}?${params.toString()}`;
+    // Build URL using helper
+    const url = buildOAuthUrl(config, state);
     res.json({ success: true, url });
   } catch (error) {
     console.error('Error initializing LinkedIn Org OAuth:', error);
@@ -234,8 +358,16 @@ router.post('/organizations', authenticateToken, async (req: any, res) => {
   const { code, state } = req.body;
   const userId = req.user.userId;
 
+  // Input validation
+  if (!code || typeof code !== 'string' || code.trim() === '') {
+    return res.status(400).json({ error: 'Invalid or missing OAuth code' });
+  }
+  if (!state || typeof state !== 'string' || state.trim() === '') {
+    return res.status(400).json({ error: 'Invalid or missing state parameter' });
+  }
+
   // Security Check: Verify State
-  if (!state || !verifyState(state, userId)) {
+  if (!verifyState(state, userId)) {
     return res.status(403).json({ error: 'Invalid or expired state parameter. CSRF protection.' });
   }
 
@@ -288,37 +420,43 @@ router.post('/organizations', authenticateToken, async (req: any, res) => {
       })
     );
 
+    // Store tokens server-side and return session ID (not tokens)
+    const tokenSessionId = storeTokenSession(userId, {
+      access_token,
+      refresh_token,
+      expires_in,
+      scopes: config.scopes
+    });
+
     res.json({
       success: true,
       organizations,
-      _tokens: {
-        access_token,
-        refresh_token,
-        expires_in,
-        scopes: config.scopes
-      }
+      tokenSessionId
     });
 
   } catch (error: any) {
     console.error('Get Organizations Error:', error);
-    res.status(500).json({ error: 'Failed to get organizations', details: error.message });
+    const details = IS_PRODUCTION ? undefined : error.message;
+    res.status(500).json({ error: 'Failed to get organizations', ...(details && { details }) });
   }
 });
 
-// Connect selected company pages
-// State validation not strictly needed here if we trust the tokens? 
-// Actually this is a separate step post-OAuth. The tokens are passed in.
-// We verify the user logic normally via authenticateToken.
 router.post('/connect-pages', authenticateToken, async (req: any, res) => {
-  const { organizations, tokens } = req.body;
+  const { organizations, tokenSessionId } = req.body;
   const userId = req.user.userId;
 
   if (!organizations || !Array.isArray(organizations) || organizations.length === 0) {
     return res.status(400).json({ error: 'No organizations selected' });
   }
 
-  if (!tokens || !tokens.access_token) {
-    return res.status(400).json({ error: 'Missing access tokens' });
+  if (!tokenSessionId) {
+    return res.status(400).json({ error: 'Missing token session ID' });
+  }
+
+  // Retrieve tokens from secure server-side session
+  const tokens = retrieveTokenSession(tokenSessionId, userId);
+  if (!tokens) {
+    return res.status(401).json({ error: 'Invalid or expired token session. Please reconnect.' });
   }
 
   try {
@@ -351,7 +489,8 @@ router.post('/connect-pages', authenticateToken, async (req: any, res) => {
 
   } catch (error: any) {
     console.error('Connect Pages Error:', error);
-    res.status(500).json({ error: 'Failed to connect pages', details: error.message });
+    const details = IS_PRODUCTION ? undefined : error.message;
+    res.status(500).json({ error: 'Failed to connect pages', ...(details && { details }) });
   }
 });
 
