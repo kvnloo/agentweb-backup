@@ -70,7 +70,7 @@ export class AgentModeService {
     }
     return fallbackModel;
   }
-  
+
   // Helper method to create Azure OpenAI client for a specific deployment
   private getAzureOpenAIClient(deploymentName: string): OpenAI {
     return new OpenAI({
@@ -151,7 +151,7 @@ export class AgentModeService {
     messages: any[],
     options?: LLMCallOptions
   ) {
-    
+
     // Validate that the model exists
     if (!this.llmModels[model]) {
       const availableModels = Object.keys(this.llmModels).join(', ');
@@ -1659,9 +1659,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
                   description: 'A lead object with any fields you want to store. Use field names that make sense for your data. The email field (if provided) is used for deduplication and merging.',
                   additionalProperties: true,
                   properties: {
-                    email: { 
-                      type: 'string', 
-                      description: 'Email address (optional, but recommended for deduplication and merging existing leads)' 
+                    email: {
+                      type: 'string',
+                      description: 'Email address (optional, but recommended for deduplication and merging existing leads)'
                     }
                   }
                 },
@@ -1699,6 +1699,77 @@ Use the available tools to create tasks in the agent-engine when complex work is
               }
             },
             required: ['list_id', 'lead_id', 'instruction']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'list_connected_accounts',
+          description: 'Returns list of social media accounts connected by the user',
+          parameters: {
+            type: 'object',
+            properties: {
+              platform: {
+                type: 'string',
+                description: 'Filter by platform (e.g., "linkedin", "facebook", "twitter"), or "all" for all platforms',
+                default: 'all'
+              }
+            },
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'load_connected_account_metrics',
+          description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement).',
+          parameters: {
+            type: 'object',
+            properties: {
+              account_id: {
+                type: 'string',
+                description: 'The unique identifier (id) of the connected account to load metrics for'
+              }
+            },
+            required: ['account_id']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'post_on_connected_account',
+          description: 'Create a post on a connected social media account',
+          parameters: {
+            type: 'object',
+            properties: {
+              account_id: { type: 'string', description: 'The connected account ID' },
+              content: { type: 'string', description: 'Post text content. Length limits depend on the specific platform.' },
+              media_urls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional URLs of images/videos to attach'
+              }
+            },
+            required: ['account_id', 'content']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
+          name: 'list_connected_account_posts',
+          description: 'List posts from a connected social media account with optional metrics',
+          parameters: {
+            type: 'object',
+            properties: {
+              account_id: { type: 'string', description: 'The connected account ID' },
+              limit: { type: 'number', description: 'Maximum number of posts to return', default: 10 },
+              include_metrics: { type: 'boolean', description: 'Whether to include per-post metrics (likes, comments, etc.)', default: false }
+            },
+            required: ['account_id']
           }
         }
       },
@@ -2896,7 +2967,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           }
         };
       case 'get_book_content':
-        const mockContent = args.chapter_id 
+        const mockContent = args.chapter_id
           ? `# ${args.chapter_id ? 'Chapter' : 'Section'} Content\n\nThis is mock ${args.chapter_id ? 'chapter' : 'section'} content for testing purposes.\n\nIt contains markdown formatted text that can be used to demonstrate the content retrieval functionality.`
           : `# Section Content\n\nThis is mock section content for section ${args.section_id}.\n\n## Overview\n\nThis section provides an overview of the topic.\n\n## Key Points\n\n- Point 1\n- Point 2\n- Point 3`;
         const mockContentHash = createHash('sha256').update(mockContent).digest('hex');
@@ -2910,7 +2981,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           chapter_id: args.chapter_id || null,
           has_content: true
         };
-      
+
       case 'update_book_content':
         // Mock validation for update_book_content (always partial replacement)
         let mockBookReplacementInstructions = [];
@@ -2925,14 +2996,14 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        
+
         if (mockBookReplacementInstructions.length === 0) {
           return {
             success: false,
             message: 'At least one replacement instruction is required'
           };
         }
-        
+
         // Validate mock instructions (always partial replacement)
         for (let i = 0; i < mockBookReplacementInstructions.length; i++) {
           const instruction = mockBookReplacementInstructions[i];
@@ -2942,7 +3013,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
               message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
             };
           }
-          
+
           if (!instruction.old_content) {
             return {
               success: false,
@@ -2950,7 +3021,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             };
           }
         }
-        
+
         return {
           success: true,
           message: `Content updated successfully with ${mockBookReplacementInstructions.length} replacement(s)`,
@@ -2967,7 +3038,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           })),
           updated_content_length: 1000
         };
-      
+
       case 'generate_book_content':
         const mockLength = args.length || 'medium';
         const mockWordCounts: Record<string, number> = {
@@ -2986,7 +3057,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           target_word_range: mockLength === 'short' ? '1000-2000' : mockLength === 'medium' ? '2000-3000' : '3000-4000',
           content_preview: `# Generated Content\n\nThis is mock generated content for ${args.content_description || 'the specified section/chapter'}. The content would be ${mockLength} length (${mockWordCounts[mockLength]} words)...`
         };
-      
+
       case 'create_book':
         return {
           success: true,
@@ -3004,7 +3075,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             sections: []
           }
         };
-      
+
       case 'create_book_outline':
         let mockOutline = [];
         try {
@@ -3018,7 +3089,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
             error: error instanceof Error ? error.message : 'Unknown error'
           };
         }
-        const totalChapters = mockOutline.reduce((sum: number, section: any) => 
+        const totalChapters = mockOutline.reduce((sum: number, section: any) =>
           sum + (section.chapters?.length || 0), 0
         );
         return {
@@ -3048,7 +3119,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           characters_added: mockCharacters.length,
           characters: mockCharacters
         };
-      
+
       case 'read_brand_guidelines':
         return {
           success: true,
@@ -3609,6 +3680,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.addLeadsToList(args.list_id, args.leads || [], userId);
       case 'update_email_draft_for_lead':
         return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, sessionId, userId, args.email_format);
+      case 'list_connected_accounts':
+        return await this.listConnectedAccounts(userId, args.platform);
+      case 'list_connected_account_posts':
+        return await this.loadConnectedAccountPosts(userId, args.account_id, {
+          limit: args.limit,
+          include_metrics: args.include_metrics
+        });
+      case 'load_connected_account_metrics':
+        return await this.loadConnectedAccountMetrics(userId, args.account_id);
+      case 'post_on_connected_account':
+        return await this.postOnConnectedAccount(userId, args.account_id, args.content, args.media_urls);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -4287,7 +4369,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const { settingsService } = await import('./settingsService');
       const settingName = `crm_sender_emails_${userId}`;
       const setting = await settingsService.getSetting(settingName);
-      
+
       if (!setting) {
         return {
           success: true,
@@ -4338,18 +4420,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
       }
       if (!sender) {
         const defaultSenderId = sendersResult.defaultSenderId;
-        sender = defaultSenderId 
+        sender = defaultSenderId
           ? sendersResult.senders.find((s) => s.id === defaultSenderId)
           : sendersResult.senders[0];
       }
-      
+
       if (sender) {
         return {
           fromName: sender.fromName,
           notes: sender.notes
         };
       }
-      
+
       return null;
     } catch (error) {
       console.error('AgentMode: Error getting sender for lead:', error);
@@ -4754,7 +4836,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       // Process phases and work items
       const processedPhases = (phases || []).map((phase: any, phaseIndex: number) => {
         const phaseId = `phase-${Date.now()}-${phaseIndex}-${Math.random().toString(36).substring(2, 11)}`;
-        
+
         // Process work items for this phase
         const processedWorkItems = (phase.workItems || []).map((item: any, itemIndex: number) => ({
           id: `workitem-${Date.now()}-${phaseIndex}-${itemIndex}-${Math.random().toString(36).substring(2, 11)}`,
@@ -4835,7 +4917,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
       const { crmDb } = await import('./db');
       const lists = await crmDb.getLeadListsByUserId(userId);
-      
+
       return {
         success: true,
         message: `Found ${lists.length} lead list(s)`,
@@ -4862,7 +4944,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     try {
       const { crmDb } = await import('./db');
       const list = await crmDb.createLeadList(userId, name, description);
-      
+
       return {
         success: true,
         message: `Lead list "${name}" created successfully`,
@@ -4887,7 +4969,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      
+
       // Verify list ownership
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
@@ -4897,7 +4979,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           error: 'The specified lead list does not exist'
         };
       }
-      
+
       if (list.userId !== userId) {
         return {
           success: false,
@@ -4905,37 +4987,37 @@ Use the available tools to create tasks in the agent-engine when complex work is
           error: 'You do not have permission to add leads to this list'
         };
       }
-      
+
       // Convert leads array to the format expected by batchCreateLeads
       // Extract standard fields and put everything else in customFields
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
       const formattedLeads = leads.map((lead: any) => {
         const formatted: any = {};
         const customFields: Record<string, any> = {};
-        
+
         // Extract standard fields if they exist
         standardFields.forEach(field => {
           if (lead[field] !== undefined) {
             formatted[field] = lead[field];
           }
         });
-        
+
         // Put all other fields into customFields
         Object.keys(lead).forEach(key => {
           if (!standardFields.includes(key)) {
             customFields[key] = lead[key];
           }
         });
-        
+
         if (Object.keys(customFields).length > 0) {
           formatted.customFields = customFields;
         }
-        
+
         return formatted;
       });
-      
+
       const result = await crmDb.batchCreateLeads(listId, formattedLeads);
-      
+
       const messageParts: string[] = [];
       if (result.newCount > 0) {
         messageParts.push(`${result.newCount} new lead(s) created`);
@@ -4946,10 +5028,10 @@ Use the available tools to create tasks in the agent-engine when complex work is
       if (result.errorCount > 0) {
         messageParts.push(`${result.errorCount} lead(s) failed`);
       }
-      
+
       return {
         success: result.successCount > 0,
-        message: messageParts.length > 0 
+        message: messageParts.length > 0
           ? `Successfully processed: ${messageParts.join(', ')}.`
           : 'No leads were processed.',
         successCount: result.successCount,
@@ -4971,7 +5053,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string, emailFormat?: 'text' | 'html'): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      
+
       // Verify list ownership
       const list = await crmDb.getLeadListById(listId);
       if (!list) {
@@ -4981,7 +5063,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           error: 'The specified lead list does not exist'
         };
       }
-      
+
       if (list.userId !== userId) {
         return {
           success: false,
@@ -5025,7 +5107,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
 ## Lead Information:
 - Name: ${lead.firstName || ''} ${lead.lastName || ''}`.trim();
-      
+
       if (lead.company) {
         emailPrompt += `\n- Company: ${lead.company}`;
       }
@@ -5050,7 +5132,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
           if (eng.eventData?.subject) {
             emailPrompt += ` (Subject: ${eng.eventData.subject})`;
           }
-          
+
           // Include email content if available (first 1k characters)
           if (eng.emailContent) {
             let contentPreview = '';
@@ -5065,7 +5147,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 .trim();
               contentPreview = textFromHtml.substring(0, 1000);
             }
-            
+
             if (contentPreview) {
               const truncated = contentPreview.length >= 1000 ? contentPreview + '...' : contentPreview;
               emailPrompt += `\n   Email Content (first 1k characters):\n   ${truncated}`;
@@ -5107,7 +5189,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       // Add existing draft if it exists
       if (existingDraft) {
-        const existingContent = emailDraftFormat === 'text' 
+        const existingContent = emailDraftFormat === 'text'
           ? (existingDraft.textContent || existingDraft.htmlContent || '')
           : (existingDraft.htmlContent || existingDraft.textContent || '');
         emailPrompt += `\n\n## Existing Email Draft (to refine/update):\nSubject: ${existingDraft.subject}\nContent:\n${existingContent}`;
@@ -5130,12 +5212,12 @@ Use the available tools to create tasks in the agent-engine when complex work is
 ${emailDraftFormat === 'text' ? '10. Use plain text format only - no HTML tags, no formatting markup. Use line breaks and simple text formatting.' : '10. Use HTML format with proper email-friendly HTML tags and styling.'}
 
 Format the response as JSON with this structure:
-${emailDraftFormat === 'text' 
-  ? `{
+${emailDraftFormat === 'text'
+          ? `{
   "subject": "Email subject line (personalized, 50-60 characters)",
   "textContent": "Complete plain text email body (no HTML, use line breaks for paragraphs)"
-}` 
-  : `{
+}`
+          : `{
   "subject": "Email subject line (personalized, 50-60 characters)",
   "htmlContent": "Complete HTML email body (well-formatted, professional, email-friendly HTML)"
 }`}`;
@@ -5146,7 +5228,7 @@ ${emailDraftFormat === 'text'
         messages: [
           {
             role: "system",
-            content: emailDraftFormat === 'text' 
+            content: emailDraftFormat === 'text'
               ? "You are an expert email marketing strategist. Create personalized, professional plain text emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and textContent fields. Use plain text only - no HTML tags or formatting markup."
               : "You are an expert email marketing strategist. Create personalized, professional emails that align with brand guidelines and market strategy. Always respond with valid JSON containing subject and htmlContent fields.",
           },
@@ -5206,18 +5288,18 @@ ${emailDraftFormat === 'text'
 
       return {
         success: true,
-        message: existingDraft 
-          ? 'Email draft updated successfully' 
+        message: existingDraft
+          ? 'Email draft updated successfully'
           : 'Email draft created successfully',
-        data: emailDraftFormat === 'text' 
+        data: emailDraftFormat === 'text'
           ? {
-              subject: emailData.subject,
-              textContent: emailData.textContent
-            }
+            subject: emailData.subject,
+            textContent: emailData.textContent
+          }
           : {
-              subject: emailData.subject,
-              htmlContent: emailData.htmlContent
-            }
+            subject: emailData.subject,
+            htmlContent: emailData.htmlContent
+          }
       };
     } catch (error) {
       console.error('AgentMode: Error updating email draft for lead:', error);
@@ -7105,59 +7187,59 @@ ${emailDraftFormat === 'text'
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId);
 
-    // Use the common function to get tasks with knowledge base
-    const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
+      // Use the common function to get tasks with knowledge base
+      const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
 
-    if (!knowledgeBaseTasks || knowledgeBaseTasks.length === 0) {
+      if (!knowledgeBaseTasks || knowledgeBaseTasks.length === 0) {
+        return {
+          success: true,
+          message: 'No knowledge bases found',
+          knowledge_bases: [],
+          totalKnowledgeBases: 0,
+          totalFiles: 0
+        };
+      }
+
+      const knowledgeBases = knowledgeBaseTasks.map((task: any) => {
+        const taskId = task.taskId;
+        const taskName = task.name;
+        const kbType = task.knowledgeBaseType || 'private';
+        const kbUpdatedAt = task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt;
+        // Default file + uploaded files
+        const files = [
+          {
+            fileName: 'knowledge-base.txt',
+            fileSize: task.knowledgeBaseSize || 0,
+            url: task.knowledgeBase || null
+          },
+          ...(task.knowledgeBaseFiles || []).map((f: any) => ({
+            fileName: f.filename,
+            fileSize: f.size || 0,
+            url: f.url || null
+          }))
+        ];
+
+        return {
+          identifier: taskId,
+          name: taskName,
+          type: kbType,
+          updatedAt: kbUpdatedAt,
+          files
+        };
+      });
+
+      const totalFiles = knowledgeBases.reduce(
+        (sum: number, kb: any) => sum + (kb.files?.length || 0),
+        0
+      );
+
       return {
         success: true,
-        message: 'No knowledge bases found',
-        knowledge_bases: [],
-        totalKnowledgeBases: 0,
-        totalFiles: 0
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). Ensure to use the complete file URL to access the file.`,
+        knowledge_bases: knowledgeBases,
+        totalKnowledgeBases: knowledgeBases.length,
+        totalFiles
       };
-    }
-
-    const knowledgeBases = knowledgeBaseTasks.map((task: any) => {
-      const taskId = task.taskId;
-      const taskName = task.name;
-      const kbType = task.knowledgeBaseType || 'private';
-      const kbUpdatedAt = task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt;
-      // Default file + uploaded files (no URLs)
-      const files = [
-        {
-          fileName: 'knowledge-base.txt',
-          fileSize: task.knowledgeBaseSize || 0,
-          url: task.knowledgeBase || null
-        },
-        ...(task.knowledgeBaseFiles || []).map((f: any) => ({
-          fileName: f.filename,
-          fileSize: f.size || 0,
-          url: f.url || null
-        }))
-      ];
-
-      return {
-        identifier: taskId,
-        name: taskName,
-        type: kbType,
-        updatedAt: kbUpdatedAt,
-        files
-      };
-    });
-
-    const totalFiles = knowledgeBases.reduce(
-      (sum: number, kb: any) => sum + (kb.files?.length || 0),
-      0
-    );
-
-    return {
-      success: true,
-      message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). Ensure to use the complete file URL to access the file.`,
-      knowledge_bases: knowledgeBases,
-      totalKnowledgeBases: knowledgeBases.length,
-      totalFiles
-    };
     } catch (error) {
       console.error('AgentMode: Error listing knowledge base files:', error);
       return {
@@ -8357,7 +8439,7 @@ ${emailDraftFormat === 'text'
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const sanitizedTopic = topic.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().substring(0, 50);
       const filename = `research-${sanitizedTopic}-${Date.now()}.md`;
-      
+
       const uploadResult = await uploadFileToS3(
         researchResult.markdownContent,
         filename,
@@ -8427,7 +8509,7 @@ ${emailDraftFormat === 'text'
         // ========================================
         console.log('AgentMode: Deep research enabled, performing research...');
         const { deepResearchService } = await import('./deepResearchService');
-        
+
         const researchResult = await deepResearchService.performDeepResearch({
           topic,
           prompt: requirements || undefined,
@@ -8441,7 +8523,7 @@ ${emailDraftFormat === 'text'
 
         console.log('AgentMode: Deep research complete. Length:', researchResult.markdownContent.length);
         console.log('AgentMode: Restyling research content with tone:', tone, 'style:', style);
-        
+
         // Restyle with inline image placeholders
         blogData = await restyleContent(
           researchResult.markdownContent,
@@ -8464,7 +8546,7 @@ ${emailDraftFormat === 'text'
           const inlineImageResults = await Promise.all(
             placeholders.map(p => generateBlogImage(p.prompt, userId))
           );
-          
+
           const inlineImageUrls = inlineImageResults.map(r => r.imageUrl || '');
           inlineImagesCount = inlineImageUrls.filter(u => u).length;
           console.log(`AgentMode: Generated ${inlineImagesCount} inline images successfully`);
@@ -8482,7 +8564,7 @@ ${emailDraftFormat === 'text'
         // ========================================
         console.log('AgentMode: Generating blog content with LLM...');
         blogData = await generateBlogContent(
-          topic, keywords, tone, length, 
+          topic, keywords, tone, length,
           researchContext, requirements, style
         );
 
@@ -8582,11 +8664,11 @@ ${emailDraftFormat === 'text'
     caption: string;
   }> {
     const placeholders: Array<{ fullMatch: string; prompt: string; caption: string }> = [];
-    
+
     // Match {{IMAGE: prompt="...", caption="..."}} pattern
     const regex = /\{\{IMAGE:\s*prompt="([^"]+)",\s*caption="([^"]+)"\}\}/g;
     let match;
-    
+
     while ((match = regex.exec(content)) !== null) {
       placeholders.push({
         fullMatch: match[0],
@@ -8594,7 +8676,7 @@ ${emailDraftFormat === 'text'
         caption: match[2]
       });
     }
-    
+
     return placeholders;
   }
 
@@ -8607,7 +8689,7 @@ ${emailDraftFormat === 'text'
     imageUrls: string[]
   ): string {
     let result = content;
-    
+
     placeholders.forEach((placeholder, index) => {
       const imageUrl = imageUrls[index];
       if (!imageUrl) {
@@ -8615,15 +8697,15 @@ ${emailDraftFormat === 'text'
         result = result.replace(placeholder.fullMatch, '');
         return;
       }
-      
+
       const figureMarkdown = `
 ![${placeholder.caption}](${imageUrl})
 *${placeholder.caption}*
 `;
-      
+
       result = result.replace(placeholder.fullMatch, figureMarkdown);
     });
-    
+
     return result;
   }
 
@@ -9446,7 +9528,7 @@ ${emailDraftFormat === 'text'
           message: 'update_type must be either "part" or "full"'
         };
       }
-      
+
       // Validate replacement instructions (before fetching file)
       // This is a quick validation to catch errors early
       if (!Array.isArray(replacementInstructions)) {
@@ -9462,7 +9544,7 @@ ${emailDraftFormat === 'text'
           message: 'At least one replacement instruction is required'
         };
       }
-      
+
       // Fetch current file content
       const currentContent = await this.fetchFileContent(fileUrl);
       console.log(`AgentMode: Fetched file content, length: ${currentContent.length} characters`);
@@ -9470,7 +9552,7 @@ ${emailDraftFormat === 'text'
       // Compute hash of current content for verification
       const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
       console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
-      
+
       // Use common replacement function
       const replacementResult = this.performContentReplacements(
         currentContent,
@@ -9478,16 +9560,16 @@ ${emailDraftFormat === 'text'
         updateType,
         replacementInstructions
       );
-      
+
       if (!replacementResult.success) {
         // Map error messages to match expected format for HTML files
         let errorMessage = replacementResult.error?.message || 'Failed to perform replacements';
-        
+
         // Replace generic messages with HTML-specific ones for backward compatibility
         if (replacementResult.error?.isHashMismatch || errorMessage.includes('Content hash mismatch')) {
           errorMessage = errorMessage.replace('Content hash mismatch', 'File hash mismatch');
         }
-        
+
         return {
           success: false,
           message: errorMessage,
@@ -9502,7 +9584,7 @@ ${emailDraftFormat === 'text'
       const originalPath = this.extractPathFromS3Url(fileUrl);
       console.log(`AgentMode: Original path: ${originalPath}`);
       const uploadResult = await this.uploadUpdatedFile(replacementResult.updatedContent!, versionedFilename, originalPath);
-      
+
       return {
         success: true,
         s3_url: uploadResult.url,
@@ -9554,7 +9636,7 @@ ${emailDraftFormat === 'text'
         }
       };
     }
-    
+
     // Validate that replacementInstructions is an array
     if (!Array.isArray(replacementInstructions)) {
       return {
@@ -9564,7 +9646,7 @@ ${emailDraftFormat === 'text'
         }
       };
     }
-    
+
     if (replacementInstructions.length === 0) {
       return {
         success: false,
@@ -9573,11 +9655,11 @@ ${emailDraftFormat === 'text'
         }
       };
     }
-    
+
     // Validate each replacement instruction based on update_type
     for (let i = 0; i < replacementInstructions.length; i++) {
       const instruction = replacementInstructions[i];
-      
+
       if (instruction.new_content === undefined || instruction.expected_count === undefined) {
         return {
           success: false,
@@ -9586,7 +9668,7 @@ ${emailDraftFormat === 'text'
           }
         };
       }
-      
+
       if (updateType === 'full') {
         // For full replacement, require old_content_hash
         if (!instruction.old_content_hash) {
@@ -9625,32 +9707,32 @@ ${emailDraftFormat === 'text'
         }
       }
     }
-    
+
     let updatedContent = currentContent;
     const replacementResults = [];
-    
+
     // Perform all replacements
     for (let i = 0; i < replacementInstructions.length; i++) {
       const instruction = replacementInstructions[i];
       const { new_content, expected_count } = instruction;
-      
-        if (updateType === 'full') {
-          // Entire content replacement using hash
-          const providedHash = instruction.old_content_hash;
+
+      if (updateType === 'full') {
+        // Entire content replacement using hash
+        const providedHash = instruction.old_content_hash;
         console.log(`AgentMode: Full replacement ${i + 1}: hash: ${providedHash}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-        
-          // Verify that the provided hash matches the current content hash
-          if (providedHash !== currentContentHash) {
-            return {
-              success: false,
-              error: {
-                message: `Replacement ${i + 1} failed: Content hash mismatch. Expected: ${currentContentHash}, provided: ${providedHash}. The content may have been modified since it was last read.`,
-                suggestion: 'Use get_book_content or read_file_content to get the current content and hash, then retry the replacement',
-                isHashMismatch: true // Flag for HTML file error message mapping
-              }
-            };
-          }
-        
+
+        // Verify that the provided hash matches the current content hash
+        if (providedHash !== currentContentHash) {
+          return {
+            success: false,
+            error: {
+              message: `Replacement ${i + 1} failed: Content hash mismatch. Expected: ${currentContentHash}, provided: ${providedHash}. The content may have been modified since it was last read.`,
+              suggestion: 'Use get_book_content or read_file_content to get the current content and hash, then retry the replacement',
+              isHashMismatch: true // Flag for HTML file error message mapping
+            }
+          };
+        }
+
         // For hash-based replacement, we replace the entire content
         if (expected_count === 1) {
           console.log(`AgentMode: Hash verification successful, replacing entire content`);
@@ -9676,7 +9758,7 @@ ${emailDraftFormat === 'text'
         // Partial content replacement using old_content
         const { old_content } = instruction;
         console.log(`AgentMode: Part replacement ${i + 1}: old_content length: ${old_content.length}, new_content length: ${new_content.length}, expected_count: ${expected_count}`);
-        
+
         // Perform the replacement using the existing logic
         const replacementResult = this.performDirectReplacement(
           updatedContent,
@@ -9684,7 +9766,7 @@ ${emailDraftFormat === 'text'
           new_content,
           true // exact_match = true for partial replacements
         );
-        
+
         if (replacementResult === null) {
           return {
             success: false,
@@ -9694,7 +9776,7 @@ ${emailDraftFormat === 'text'
             }
           };
         }
-        
+
         // Check if the actual change count matches expected count
         if (replacementResult.changeCount !== expected_count) {
           return {
@@ -9705,7 +9787,7 @@ ${emailDraftFormat === 'text'
             }
           };
         }
-        
+
         updatedContent = replacementResult.content;
         replacementResults.push({
           index: i + 1,
@@ -9717,7 +9799,7 @@ ${emailDraftFormat === 'text'
         });
       }
     }
-    
+
     return {
       success: true,
       updatedContent,
@@ -10490,24 +10572,24 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
   private async listBooks(userId: string, type?: string, status?: string): Promise<any> {
     try {
       console.log('AgentMode: Listing books for user:', userId);
-      
+
       const { bookDb } = await import('./bookDb');
-      
+
       const filters: {
         type?: "book" | "whitepaper";
         status?: "draft" | "published" | "archived";
       } = {};
-      
+
       if (type === "book" || type === "whitepaper") {
         filters.type = type;
       }
-      
+
       if (status === "draft" || status === "published" || status === "archived") {
         filters.status = status;
       }
-      
+
       const books = await bookDb.getBooksByUser(userId, filters);
-      
+
       if (!books || books.length === 0) {
         return {
           success: true,
@@ -10551,12 +10633,12 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
   private async getBookDetails(bookId: string, userId: string): Promise<any> {
     try {
       console.log('AgentMode: Getting book details for:', bookId);
-      
+
       const { bookDb } = await import('./bookDb');
       const { bookContentDb } = await import('./bookContentDb');
-      
+
       const book = await bookDb.getBookById(bookId, userId);
-      
+
       if (!book) {
         return {
           success: false,
@@ -10567,7 +10649,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Load all contents for this book
       const contents = await bookContentDb.getAllBookContents(bookId, userId);
-      
+
       // Attach contents to sections and chapters
       if (book.sections) {
         for (const section of book.sections) {
@@ -10577,7 +10659,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           if (sectionContent) {
             section.content = sectionContent.content;
           }
-          
+
           for (const chapter of section.chapters) {
             const chapterContent = contents.find(
               (c) => c.sectionId === section.sectionId && c.chapterId === chapter.chapterId
@@ -10644,10 +10726,10 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
   ): Promise<any> {
     try {
       console.log('AgentMode: Getting book content for:', { bookId, sectionId, chapterId });
-      
+
       const { bookDb } = await import('./bookDb');
       const { bookContentDb } = await import('./bookContentDb');
-      
+
       // Verify book exists and belongs to user
       const book = await bookDb.getBookById(bookId, userId);
       if (!book) {
@@ -10682,7 +10764,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Get content from bookContentDb
       const content = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
-      
+
       if (!content) {
         const emptyContentHash = createHash('sha256').update('').digest('hex');
         return {
@@ -10736,25 +10818,25 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           message: 'replacement_json must be an array of replacement instructions'
         };
       }
-      
+
       if (replacementInstructions.length === 0) {
         return {
           success: false,
           message: 'At least one replacement instruction is required'
         };
       }
-      
+
       // Validate each replacement instruction (always partial replacement)
       for (let i = 0; i < replacementInstructions.length; i++) {
         const instruction = replacementInstructions[i];
-        
+
         if (instruction.new_content === undefined || instruction.expected_count === undefined) {
           return {
             success: false,
             message: `Missing required fields in replacement instruction ${i + 1}: new_content and expected_count are required`
           };
         }
-        
+
         // For partial replacement, require old_content
         if (!instruction.old_content) {
           return {
@@ -10767,7 +10849,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // Get current content
       const { bookDb } = await import('./bookDb');
       const { bookContentDb } = await import('./bookContentDb');
-      
+
       // Verify book exists and belongs to user
       const book = await bookDb.getBookById(bookId, userId);
       if (!book) {
@@ -10803,13 +10885,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // Get current content
       const currentContentRecord = await bookContentDb.getContent(bookId, userId, sectionId, chapterId);
       const currentContent = currentContentRecord?.content || '';
-      
+
       console.log(`AgentMode: Current content length: ${currentContent.length} characters`);
-      
+
       // Compute hash of current content for verification
       const currentContentHash = createHash('sha256').update(currentContent).digest('hex');
       console.log(`AgentMode: Computed current content hash: ${currentContentHash}`);
-      
+
       // Use common replacement function (always "part" for partial replacements)
       const replacementResult = this.performContentReplacements(
         currentContent,
@@ -10817,7 +10899,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         'part',
         replacementInstructions
       );
-      
+
       if (!replacementResult.success) {
         return {
           success: false,
@@ -10825,14 +10907,14 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           suggestion: replacementResult.error?.suggestion
         };
       }
-      
+
       // Save the updated content
       await bookContentDb.createOrUpdateContent(bookId, userId, {
         sectionId: sectionId,
         chapterId: chapterId,
         content: replacementResult.updatedContent!
       });
-      
+
       return {
         success: true,
         message: `Content updated successfully with ${replacementResult.replacementResults!.length} replacement(s)`,
@@ -10842,7 +10924,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         replacements: replacementResult.replacementResults,
         updated_content_length: replacementResult.updatedContent!.length
       };
-      
+
     } catch (error) {
       console.error('Error updating book content:', error);
       return {
@@ -10866,10 +10948,10 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
   ): Promise<any> {
     try {
       console.log('AgentMode: Generating book content for:', { bookId, sectionId, chapterId, length, imagine, userId, researchUrl: researchUrl ? 'provided' : 'not provided' });
-      
+
       const { bookDb } = await import('./bookDb');
       const { bookContentDb } = await import('./bookContentDb');
-      
+
       // Fetch research content from S3 URL if provided
       let researchContent = '';
       if (researchUrl) {
@@ -10886,7 +10968,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
           console.error('AgentMode: Error fetching research content:', fetchError);
         }
       }
-      
+
       // Verify book exists and belongs to user
       const book = await bookDb.getBookById(bookId, userId);
       if (!book) {
@@ -11034,14 +11116,14 @@ CITATION FORMATTING (REQUIRED):
       // Generate content using LangChain LLM service
       const { createLLMService } = await import('../utils/llmService');
       const modelName = contentModel || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
-      
+
       // Use XML format for Chinese content (more forgiving with quotes)
       const useXMLFormat = book.language === '中文';
       const format = useXMLFormat ? 'xml' : 'json';
       console.log(`[generateBookContent] Using model: ${modelName}, output format: ${format.toUpperCase()}, language: ${book.language}`);
-      
+
       const llmService = createLLMService(modelName, 0.8, 4000);
-      
+
       const systemPrompt = `You are a seasoned content writer specializing in ${book.type === 'book' ? 'books' : 'white papers'}. Write naturally, avoid AI patterns, and focus on providing comprehensive, well-structured content. ${book.language === '中文' ? 'Write in Chinese (中文).' : 'Write in English.'}
 
 ${useXMLFormat ? `CRITICAL: You MUST respond ONLY in XML format. Do NOT use JSON format.
@@ -11061,10 +11143,10 @@ IMPORTANT:
 }}
 
 IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly.`}`;
-      
+
       // Generate content using LangChain with appropriate format
       const contentData = await llmService.generateJSONContent<{ content: string }>(systemPrompt, contentPrompt, format);
-      
+
       // Extract content from JSON
       if (!contentData.content) {
         throw new Error('JSON response missing "content" field');
@@ -11410,6 +11492,227 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to add characters',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // List connected accounts helper
+   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
+    try {
+      const { getAccountsByUserId, isTokenValid } = await import('./connectedAccountsDb');
+
+      let accounts = await getAccountsByUserId(userId);
+
+      if (platform && platform !== 'all') {
+        accounts = accounts.filter(acc => acc.platform === platform);
+      }
+
+      return {
+        success: true,
+        message: `Found ${accounts.length} connected account(s)`,
+        accounts: await Promise.all(accounts.map(async acc => ({
+          id: acc.account_id,
+          platform: acc.platform,
+          account_name: acc.account_name,
+          account_type: acc.config.account_type,
+          is_active: await isTokenValid(acc)
+        })))
+      };
+    } catch (error) {
+      console.error('AgentMode: Error listing connected accounts:', error);
+      return {
+        success: false,
+        message: 'Failed to list connected accounts',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Post on connected account helper
+  async postOnConnectedAccount(userId: string, accountId: string, content: string, mediaUrls: string[] = []): Promise<any> {
+    try {
+      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      try {
+        const account = await getAccountById(accountId, userId);
+
+        if (!account) {
+          return {
+            success: false,
+            message: 'Account not found or access denied'
+          };
+        }
+
+        if (!(await isTokenValid(account))) {
+          return {
+            success: false,
+            message: 'Account token expired. Please reconnect the account in Settings.'
+          };
+        }
+
+        const adapter = socialPlatformService.getAdapter(account.platform);
+        const result = await adapter.createPost(account, content, mediaUrls);
+
+        return {
+          success: true,
+          message: result.message,
+          post_id: result.postId,
+          post_url: result.postUrl
+        };
+      } catch (error: any) {
+        // Handle specific error messages
+        let message = error.message;
+        if (message.includes('access token expired')) {
+          message = 'Account token expired. Please reconnect the account in Settings.';
+        }
+        
+        return {
+          success: false,
+          message: `Failed to post: ${message}`
+        };
+      }
+
+    } catch (error) {
+      console.error('AgentMode: Error posting on account:', error);
+      return {
+        success: false,
+        message: 'Failed to create post',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Load posts for connected account helper
+  async loadConnectedAccountPosts(
+    userId: string,
+    accountId: string,
+    options: { limit?: number; include_metrics?: boolean } = {}
+  ): Promise<any> {
+    try {
+      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      try {
+        const account = await getAccountById(accountId, userId);
+
+        if (!account) {
+          return {
+            success: false,
+            message: 'Account not found or access denied'
+          };
+        }
+
+        if (!(await isTokenValid(account))) {
+          return {
+            success: false,
+            message: 'Account token expired. Please reconnect the account in Settings.'
+          };
+        }
+
+        const adapter = socialPlatformService.getAdapter(account.platform);
+        const limit = options.limit || 10;
+        
+        // Fetch posts via adapter
+        let posts = await adapter.listPosts(account, { limit });
+        
+        // Fetch metrics merging if requested and supported
+        if (options.include_metrics && posts.length > 0) {
+          try {
+            // Assume posts have an 'id' field as per LinkedIn/generic structure
+            const postIds = posts.map(p => p.id).filter(Boolean);
+            if (postIds.length > 0) {
+              const metrics = await adapter.getPostMetrics(account, postIds);
+              
+              // Merge metrics into posts
+              posts = posts.map(post => {
+                const metric = metrics.find(m => m.share === post.id);
+                return {
+                  ...post,
+                  metrics: metric ? {
+                    likeCount: metric.likes,
+                    commentCount: metric.comments,
+                    shareCount: metric.shares,
+                    impressionCount: metric.impressions,
+                    clickCount: metric.clicks,
+                    engagement: metric.engagement
+                  } : null
+                };
+              });
+            }
+          } catch (metricError) {
+            console.warn('AgentMode: Failed to fetch post metrics:', metricError);
+            // Continue without metrics
+          }
+        }
+        
+        return {
+          success: true,
+          message: `Successfully loaded ${posts.length} posts from ${account.platform}`,
+          posts: posts
+        };
+
+      } catch (error: any) {
+        return {
+          success: false,
+          message: `Failed to load posts: ${error.message}`
+        };
+      }
+
+    } catch (error) {
+      console.error('AgentMode: Error loading connected account posts:', error);
+      return {
+        success: false,
+        message: 'Failed to load posts',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Load metrics for connected account helper
+  async loadConnectedAccountMetrics(userId: string, accountId: string): Promise<any> {
+    try {
+      const { getAccountById, isTokenValid } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      try {
+        const account = await getAccountById(accountId, userId);
+
+        if (!account) {
+          return {
+            success: false,
+            message: 'Account not found or access denied'
+          };
+        }
+
+        if (!(await isTokenValid(account))) {
+          return {
+            success: false,
+            message: 'Account token expired. Please reconnect the account in Settings.'
+          };
+        }
+
+        const adapter = socialPlatformService.getAdapter(account.platform);
+        const metrics = await adapter.getAccountMetrics(account);
+
+        return {
+          success: true,
+          message: `Metrics loaded successfully from ${account.platform}`,
+          metrics: metrics
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          message: `Failed to load metrics: ${error.message}`
+        };
+      }
+
+    } catch (error) {
+      console.error('AgentMode: Error loading connected account metrics:', error);
+      return {
+        success: false,
+        message: 'Failed to load metrics',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }

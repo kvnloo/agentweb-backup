@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-02',
+    changes: [
+      'Added support for Connected Accounts',
+      '- LinkedIn personal accounts are supported',
+      '- Company accounts are a work in progress',
+      'Added function calls for Emma to post on LinkedIn automatically',
+    ],
+  },
+  {
     date: '2026-01-01',
     changes: [
       'Added "Require Login" configuration for predefined work plans',
