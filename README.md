@@ -716,6 +716,29 @@ The script will:
 - `not found`: Wrong Property ID or service account can't access this property
 - `0 traffic`: Property ID is correct but no data in the selected date range
 
+### PageSpeed Insights API Configuration (Technical SEO Score)
+
+The SEO/GEO page can display a Technical SEO Score sourced from Google's PageSpeed Insights API (Lighthouse SEO category).
+
+1. **Enable the PageSpeed Insights API**
+   - Open [Google Cloud Console](https://console.cloud.google.com/apis/library/pagespeedonline.googleapis.com)
+   - Select the project you want to bill and click **Enable**
+
+2. **Create an API key**
+   - Go to **APIs & Services** > **Credentials**
+   - Click **Create Credentials** > **API key**
+   - Optionally restrict the key (recommended for production)
+
+3. **Configure the backend**
+   - Store the PageSpeed API key in AWS Secrets Manager:
+     - Secret Name: `dev/AgentWeb/Google/PageSpeed` or `prod/AgentWeb/Google/PageSpeed`
+     - Secret value can be the raw API key or JSON containing `apiKey`
+   - Optional: set `PAGESPEED_STRATEGY` to `mobile` or `desktop` (defaults to `mobile`)
+
+**Notes:**
+- The score is returned as a 0–100 integer (Lighthouse SEO category).
+- If the API key is missing or the API call fails, the score shows as `N/A`.
+
 ### CMS Configuration (BaseHub and Webflow)
 
 The blog publishing feature supports publishing to both BaseHub and Webflow CMS. Users can be configured with a CMS Type in the admin dashboard, and the system will automatically route blog posts to the appropriate CMS.
