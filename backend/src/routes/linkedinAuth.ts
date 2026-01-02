@@ -251,7 +251,7 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       }
     });
 
-    const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data;
+    const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number; id_token?: string };
     
     // Try to extract profile from id_token first
     let profile: { sub: string; name: string; email?: string; picture?: string } = { 
@@ -388,7 +388,7 @@ router.post('/organizations', authenticateToken, async (req: any, res) => {
       }
     });
 
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    const { access_token, refresh_token, expires_in } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number };
     
     // Get organizations where user is admin
     const aclResponse = await linkedInService.getAdminOrganizations(access_token);

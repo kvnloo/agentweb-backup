@@ -124,8 +124,8 @@ describe('LinkedInAdapter', () => {
 
     it('should list posts for company account', async () => {
       const mockPosts = [
-        { id: 'post1', commentary: 'Post 1' },
-        { id: 'post2', commentary: 'Post 2' },
+        { id: 'post1', commentary: 'Post 1', author: 'urn:li:organization:123456', visibility: 'PUBLIC' as const, lifecycleState: 'PUBLISHED' as const },
+        { id: 'post2', commentary: 'Post 2', author: 'urn:li:organization:123456', visibility: 'PUBLIC' as const, lifecycleState: 'PUBLISHED' as const },
       ];
       mockLinkedInService.listPosts.mockResolvedValue({ elements: mockPosts });
 
@@ -173,8 +173,10 @@ describe('LinkedInAdapter', () => {
     it('should return metrics for company account posts', async () => {
       const mockStats = [
         {
+          organizationalEntity: 'urn:li:organization:123456',
           share: 'urn:li:share:123',
           totalShareStatistics: {
+            uniqueImpressionsCount: 4500,
             likeCount: 100,
             commentCount: 20,
             shareCount: 10,

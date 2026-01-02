@@ -83,7 +83,7 @@ describe('LinkedInService', () => {
         message: 'Request failed',
       };
       mockClient.get.mockRejectedValue(axiosError);
-      (axios.isAxiosError as unknown as jest.Mock).mockReturnValue(true);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
 
       await expect(service.getProfile('expired-token')).rejects.toThrow(
         'LinkedIn access token expired or invalid'
@@ -97,7 +97,7 @@ describe('LinkedInService', () => {
         message: 'Request failed',
       };
       mockClient.get.mockRejectedValue(axiosError);
-      (axios.isAxiosError as unknown as jest.Mock).mockReturnValue(true);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
 
       await expect(service.getProfile('limited-token')).rejects.toThrow(
         'LinkedIn Permission Denied'
@@ -111,7 +111,7 @@ describe('LinkedInService', () => {
         message: 'Request failed',
       };
       mockClient.get.mockRejectedValue(axiosError);
-      (axios.isAxiosError as unknown as jest.Mock).mockReturnValue(true);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
 
       await expect(service.getProfile('token')).rejects.toThrow(
         'LinkedIn rate limit exceeded'
