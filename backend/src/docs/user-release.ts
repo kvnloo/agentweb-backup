@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2025-01-02',
+    changes: [
+      'Added Technical SEO Score on the SEO/GEO page',
+      '- Uses Google PageSpeed Insights (mobile strategy) for the score',
+    ],
+  },
+  {
     date: '2026-01-02',
     changes: [
       'Added support for Connected Accounts',

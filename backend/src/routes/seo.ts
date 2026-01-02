@@ -6,6 +6,7 @@ import { JWT } from "google-auth-library";
 import { BetaAnalyticsDataClient } from "@google-analytics/data";
 
 const router = express.Router();
+const pageSpeedStrategy = "mobile";
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
@@ -68,6 +69,76 @@ async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataClient |
     return client;
   } catch (error: any) {
     console.error("Error creating Google Analytics Data client:", error);
+    return null;
+  }
+}
+
+async function getPageSpeedApiKey(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/PageSpeed"
+      : "dev/AgentWeb/Google/PageSpeed";
+    const secretString = await getSecret(secretName);
+    const trimmed = secretString.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      const apiKey = parsed?.apiKey;
+      return typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : null;
+    } catch (parseError) {
+      return trimmed;
+    }
+  } catch (error) {
+    console.error("Error fetching PageSpeed API key:", error);
+    return null;
+  }
+}
+
+function buildPageSpeedUrl(domain: string): string {
+  if (!domain) {
+    return "";
+  }
+
+  if (domain.startsWith("http://") || domain.startsWith("https://")) {
+    return domain;
+  }
+
+  return `https://${domain}`;
+}
+
+async function getTechnicalSeoScore(domain: string): Promise<number | null> {
+  const pageSpeedApiKey = await getPageSpeedApiKey();
+  if (!pageSpeedApiKey) {
+    return null;
+  }
+
+  const targetUrl = buildPageSpeedUrl(domain);
+  if (!targetUrl) {
+    return null;
+  }
+
+  try {
+    const pageSpeedUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(targetUrl)}&category=seo&strategy=${encodeURIComponent(pageSpeedStrategy)}&key=${encodeURIComponent(pageSpeedApiKey)}`;
+    const response = await fetch(pageSpeedUrl);
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null);
+      console.error("PageSpeed Insights API error:", errorData || response.statusText);
+      return null;
+    }
+
+    const data = await response.json();
+    const score = data?.lighthouseResult?.categories?.seo?.score;
+    if (typeof score !== "number") {
+      return null;
+    }
+
+    return Math.round(score * 100);
+  } catch (error) {
+    console.error("Error fetching PageSpeed Insights data:", error);
     return null;
   }
 }
@@ -166,6 +237,7 @@ router.get("/metrics", async (req, res) => {
             impressions: 0,
             ctr: 0,
             position: 0,
+            technicalSeoScore: null,
             dailyData: [],
             topQueries: [],
             topPages: [],
@@ -306,12 +378,15 @@ router.get("/metrics", async (req, res) => {
             .slice(0, 10);
         }
 
+        const technicalSeoScore = await getTechnicalSeoScore(domain);
+
         return {
           domain,
           clicks: totalClicks,
           impressions: totalImpressions,
           ctr: avgCtr,
           position: avgPosition,
+          technicalSeoScore,
           dailyData,
           topQueries,
           topPages,
@@ -329,6 +404,7 @@ router.get("/metrics", async (req, res) => {
           impressions: 0,
           ctr: 0,
           position: 0,
+          technicalSeoScore: null,
           dailyData: [],
           topQueries: [],
           topPages: [],
@@ -695,4 +771,3 @@ router.get("/debug", async (req, res) => {
 });
 
 export default router;
-

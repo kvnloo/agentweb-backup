@@ -173,6 +173,73 @@ describe('SEO Routes', () => {
       expect(response.body.metrics[0].topPages).toHaveLength(1);
     });
 
+    it('should include technical SEO score when PageSpeed key is configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com',
+        seoDomains: ['example.com']
+      });
+
+      (getSecret as jest.Mock).mockImplementation(async (secretName: string) => {
+        if (secretName.includes('PageSpeed')) {
+          return 'test-pagespeed-key';
+        }
+
+        return JSON.stringify({
+          private_key: 'mock-private-key',
+          client_email: 'test@example.com.iam.gserviceaccount.com'
+        });
+      });
+
+      global.fetch = jest.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            rows: [
+              { keys: ['2024-11-10'], clicks: 13, impressions: 70 }
+            ]
+          })
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            rows: [
+              { clicks: 28, impressions: 150, position: 5.5 }
+            ]
+          })
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            rows: []
+          })
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            rows: []
+          })
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            lighthouseResult: {
+              categories: {
+                seo: {
+                  score: 0.92
+                }
+              }
+            }
+          })
+        });
+
+      const response = await request(app)
+        .get('/api/seo/metrics')
+        .expect(200);
+
+      expect(response.body.metrics[0].technicalSeoScore).toBe(92);
+    });
+
     it('should handle different timeframes', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         userId: 'test-user-123',
@@ -534,4 +601,3 @@ describe('SEO Routes', () => {
     });
   });
 });
-
