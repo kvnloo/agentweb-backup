@@ -200,7 +200,7 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 // This route is hit by LinkedIn. It renders the popup closer or redirects to frontend.
 router.get('/callback', async (req, res) => {
   const { code, state, error } = req.query;
-  const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+  const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
   if (error) {
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=linkedin_access_denied&details=${error}`);
@@ -339,7 +339,7 @@ router.get('/org/init', authenticateToken, async (req: any, res) => {
 // LinkedIn Organization OAuth Callback
 router.get('/org/callback', async (req, res) => {
   const { code, state, error } = req.query;
-  const frontendUrl = process.env.VITE_CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+  const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
   if (error) {
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=linkedin_org_access_denied&details=${error}`);

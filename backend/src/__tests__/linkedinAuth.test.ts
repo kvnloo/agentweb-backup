@@ -8,7 +8,7 @@ import express, { Application } from 'express';
 
 // Set required environment variable BEFORE any imports
 process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
-process.env.VITE_CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
+process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
 // Mock connectedAccountsDb
 jest.mock('../services/connectedAccountsDb', () => ({
