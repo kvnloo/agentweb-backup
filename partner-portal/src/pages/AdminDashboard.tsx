@@ -173,6 +173,7 @@ interface User {
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
+  clarityProjectId?: string; // Microsoft Clarity Project ID
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
 }
@@ -588,6 +589,7 @@ export default function AdminDashboard() {
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
+  const [clarityProjectId, setClarityProjectId] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
   const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
@@ -1481,12 +1483,19 @@ export default function AdminDashboard() {
         setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
         return;
       }
+
+      const clarityId = clarityProjectId.trim();
+      if (clarityId && !/^[a-zA-Z0-9_-]{6,32}$/.test(clarityId)) {
+        setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
+        return;
+      }
       
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
         { 
           seoDomains: domains,
-          googleAnalyticsPropertyId: gaId || null
+          googleAnalyticsPropertyId: gaId || null,
+          clarityProjectId: clarityId || null
         },
         {
           headers: { Authorization: `Bearer ${token}` }
@@ -1501,7 +1510,8 @@ export default function AdminDashboard() {
               ? { 
                   ...user, 
                   seoDomains: response.data.seoDomains || [],
-                  googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined
+                  googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined,
+                  clarityProjectId: response.data.clarityProjectId || undefined
                 }
               : user
           )
@@ -1511,6 +1521,7 @@ export default function AdminDashboard() {
         setEditingSeoDomainsUserId(null);
         setSeoDomainsText("");
         setGoogleAnalyticsPropertyId("");
+        setClarityProjectId("");
       }
     } catch (error: any) {
       console.error("Error updating SEO/AEO configuration:", error);
@@ -2458,6 +2469,15 @@ export default function AdminDashboard() {
                                   No GA ID
                                 </Typography>
                               )}
+                              {user.clarityProjectId ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  Clarity: {user.clarityProjectId}
+                                </Typography>
+                              ) : (
+                                <Typography variant="body2" color="text.secondary">
+                                  No Clarity ID
+                                </Typography>
+                              )}
                             </Box>
                             <IconButton
                               size="small"
@@ -2465,6 +2485,7 @@ export default function AdminDashboard() {
                                 setEditingSeoDomainsUserId(user.userId);
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
                                 setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
+                                setClarityProjectId(user.clarityProjectId || "");
                                 setSeoDomainsDialogOpen(true);
                               }}
                               disabled={seoDomainsEditLoading}
@@ -4636,6 +4657,7 @@ export default function AdminDashboard() {
           setEditingSeoDomainsUserId(null);
           setSeoDomainsText("");
           setGoogleAnalyticsPropertyId("");
+          setClarityProjectId("");
         }}
         maxWidth="sm"
         fullWidth
@@ -4649,6 +4671,7 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setClarityProjectId("");
             }}
             sx={{
               position: 'absolute',
@@ -4686,6 +4709,17 @@ export default function AdminDashboard() {
                 disabled={seoDomainsEditLoading}
               />
             </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Microsoft Clarity Project ID"
+                value={clarityProjectId}
+                onChange={(e) => setClarityProjectId(e.target.value)}
+                placeholder="ul13e4f7fe"
+                helperText="Enter your Microsoft Clarity Project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings."
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
           </Grid>
         </DialogContent>
         <DialogActions>
@@ -4695,6 +4729,7 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setClarityProjectId("");
             }}
             disabled={seoDomainsEditLoading}
           >

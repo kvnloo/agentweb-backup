@@ -663,6 +663,16 @@ If you see `PERMISSION_DENIED: Google Analytics Data API has not been used...` o
    - To find your Property ID: Go to GA4 Admin > Property Settings. The Property ID is the numeric value (e.g., `123456789`), not the Measurement ID which starts with `G-`
    - After enabling the API and granting access, retry the SEO/AEO page
 
+4. **Configure Microsoft Clarity Project ID (for SEO/GEO Clarity link)**
+   - In the partner portal Admin > Users tab, click the edit icon under the "SEO/AEO" column
+   - In the "Microsoft Clarity Project ID" field, enter the Clarity project ID (e.g., `ul13e4f7fe`)
+   - The customer portal SEO/GEO page will include a direct link to the Clarity dashboard
+
+5. **Enable GA4 integration inside Clarity (to see GA4 view in Clarity)**
+   - Open your Clarity project, go to Settings > Integrations
+   - Connect Google Analytics and choose the GA4 property/data stream for this site
+   - This unlocks the GA4 view and allows Clarity to show GA metrics alongside recordings
+
 **What is AEO (Answer Engine Optimization)?**
 
 AEO tracks how users discover your content through answer engines - AI-powered platforms like ChatGPT, Perplexity, Google Bard/Gemini, Bing Chat, LinkedIn, and other conversational search platforms. The SEO/AEO page shows:
