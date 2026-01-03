@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-03',
+    changes: [
+      'Added Microsoft Clarity Link and Configuration to SEO/GEO',
+      '- Customer portal SEO/GEO page now includes a direct link to the Clarity dashboard',
+      '- Admin Users > SEO/AEO now supports configuring a Clarity Project ID per user',
+    ],
+  },
+  {
     date: '2025-01-02',
     changes: [
       'Added Technical SEO Score on the SEO/GEO page',

@@ -128,23 +128,27 @@ describe('Admin SEO/AEO Configuration', () => {
         userId: 'test-user-123',
         email: 'test@example.com',
         seoDomains: ['example.com'],
-        googleAnalyticsPropertyId: '123456789'
+        googleAnalyticsPropertyId: '123456789',
+        clarityProjectId: 'ul13e4f7fe'
       });
 
       const response = await request(app)
         .put('/api/admin/users/test-user-123/seo-aeo')
         .send({
           seoDomains: ['example.com'],
-          googleAnalyticsPropertyId: '123456789'
+          googleAnalyticsPropertyId: '123456789',
+          clarityProjectId: 'ul13e4f7fe'
         })
         .expect(200);
 
       expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
         seoDomains: ['example.com'],
-        googleAnalyticsPropertyId: '123456789'
+        googleAnalyticsPropertyId: '123456789',
+        clarityProjectId: 'ul13e4f7fe'
       });
       expect(response.body.seoDomains).toEqual(['example.com']);
       expect(response.body.googleAnalyticsPropertyId).toBe('123456789');
+      expect(response.body.clarityProjectId).toBe('ul13e4f7fe');
     });
 
     it('should validate SEO domains format', async () => {
@@ -193,6 +197,46 @@ describe('Admin SEO/AEO Configuration', () => {
         .expect(400);
 
       expect(response.body.message).toContain('Invalid Google Analytics Property ID format');
+    });
+
+    it('should update Microsoft Clarity Project ID', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com'
+      });
+      (userDb.updateUser as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com',
+        clarityProjectId: 'ul13e4f7fe'
+      });
+
+      const response = await request(app)
+        .put('/api/admin/users/test-user-123/seo-aeo')
+        .send({
+          clarityProjectId: 'ul13e4f7fe'
+        })
+        .expect(200);
+
+      expect(userDb.updateUser).toHaveBeenCalledWith('test-user-123', {
+        clarityProjectId: 'ul13e4f7fe'
+      });
+      expect(response.body.clarityProjectId).toBe('ul13e4f7fe');
+    });
+
+    it('should validate Microsoft Clarity Project ID format', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-123',
+        email: 'test@example.com'
+      });
+
+      const response = await request(app)
+        .put('/api/admin/users/test-user-123/seo-aeo')
+        .send({
+          clarityProjectId: 'bad id!'
+        })
+        .expect(400);
+
+      expect(response.body.message).toContain('Invalid Microsoft Clarity Project ID format');
     });
 
     it('should accept empty string for GA Property ID to clear it', async () => {

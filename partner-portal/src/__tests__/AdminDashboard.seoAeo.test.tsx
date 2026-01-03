@@ -70,7 +70,8 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
         data: { 
           userId: mockUserId,
           seoDomains: ['example.com'],
-          googleAnalyticsPropertyId: '123456789'
+          googleAnalyticsPropertyId: '123456789',
+          clarityProjectId: 'ul13e4f7fe'
         },
         status: 200
       });
@@ -79,7 +80,8 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
         `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
         { 
           seoDomains: ['example.com'],
-          googleAnalyticsPropertyId: '123456789'
+          googleAnalyticsPropertyId: '123456789',
+          clarityProjectId: 'ul13e4f7fe'
         },
         {
           headers: { Authorization: `Bearer ${mockToken}` }
@@ -90,7 +92,8 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
         expect.stringContaining('/api/admin/users/user1/seo-aeo'),
         { 
           seoDomains: ['example.com'],
-          googleAnalyticsPropertyId: '123456789'
+          googleAnalyticsPropertyId: '123456789',
+          clarityProjectId: 'ul13e4f7fe'
         },
         expect.objectContaining({
           headers: { Authorization: `Bearer ${mockToken}` }
@@ -98,6 +101,7 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
       );
       expect(response.data.seoDomains).toEqual(['example.com']);
       expect(response.data.googleAnalyticsPropertyId).toBe('123456789');
+      expect(response.data.clarityProjectId).toBe('ul13e4f7fe');
     });
 
     it('should handle API errors for invalid GA Property ID format', async () => {
@@ -166,6 +170,33 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
       );
 
       expect(response.data.googleAnalyticsPropertyId).toBeNull();
+    });
+
+    it('should call API with Microsoft Clarity Project ID', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: { 
+          userId: mockUserId,
+          clarityProjectId: 'ul13e4f7fe'
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        { clarityProjectId: 'ul13e4f7fe' },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(mockedAxios.put).toHaveBeenCalledWith(
+        expect.stringContaining('/api/admin/users/user1/seo-aeo'),
+        { clarityProjectId: 'ul13e4f7fe' },
+        expect.objectContaining({
+          headers: { Authorization: `Bearer ${mockToken}` }
+        })
+      );
+      expect(response.data.clarityProjectId).toBe('ul13e4f7fe');
     });
   });
 });

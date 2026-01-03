@@ -65,6 +65,7 @@ export interface User {
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID (numeric, e.g., 123456789)
+  clarityProjectId?: string; // Microsoft Clarity Project ID (e.g., ul13e4f7fe)
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   companyName?: string;
   useCaseCategories?: string[];

@@ -38,6 +38,7 @@ interface User {
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
+  clarityProjectId?: string; // Microsoft Clarity Project ID
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
 }
