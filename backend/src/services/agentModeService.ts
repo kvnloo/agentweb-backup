@@ -232,7 +232,7 @@ export class AgentModeService {
 
       // Build initial messages array (preserve structured history and tool messages)
       const messages: any[] = [
-        { role: 'system', content: `${systemPrompt}\n\nCurrent time: ${new Date().toISOString()}` },
+        { role: 'system', content: `${systemPrompt}\n\nCurrent date: ${new Date().toISOString().split("T")[0]}` },
         { role: 'assistant', content: templatesContext },
         ...marketingMessages
       ];

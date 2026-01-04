@@ -12,6 +12,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Added Microsoft Clarity Link and Configuration to SEO/GEO',
       '- Customer portal SEO/GEO page now includes a direct link to the Clarity dashboard',
       '- Admin Users > SEO/AEO now supports configuring a Clarity Project ID per user',
+      'Agent Mode system prompt now includes only the current date (no time)',
+      '- This could make chats respond faster',
     ],
   },
   {
