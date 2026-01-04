@@ -15,7 +15,8 @@ jest.mock('../services/settingsService');
 jest.mock('../services/db', () => ({
   ...jest.requireActual('../services/db'),
   taskTemplateDb: {
-    getAllTemplates: jest.fn().mockResolvedValue([])
+    getAllTemplates: jest.fn().mockResolvedValue([]),
+    getPublishedTemplates: jest.fn().mockResolvedValue([])
   }
 }));
 jest.mock('../utils/secretsManager');
@@ -71,7 +72,44 @@ describe('AgentModeService - generateMarketingResponse', () => {
     llmCallSpy = jest.spyOn(agentModeService as any, 'callLLM');
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   describe('generateMarketingResponse', () => {
+    it('should include current date only in system message', async () => {
+      const isoSpy = jest
+        .spyOn(Date.prototype, 'toISOString')
+        .mockReturnValue('2026-01-03T12:34:56.000Z');
+
+      let systemMessageContent = '';
+      llmCallSpy.mockImplementation(async (_model: string, messages: any[]) => {
+        systemMessageContent = messages[0]?.content || '';
+        return {
+          choices: [{
+            message: {
+              content: 'Response',
+              tool_calls: null
+            }
+          }]
+        };
+      });
+
+      await agentModeService.generateMarketingResponse(
+        'Test message',
+        [],
+        'test-user',
+        agentModeService.default_model,
+        'test-session'
+      );
+
+      expect(systemMessageContent).toContain('Current date: 2026-01-03');
+      expect(systemMessageContent).not.toContain('Current time');
+      expect(systemMessageContent).not.toContain('T12:34:56');
+
+      isoSpy.mockRestore();
+    });
+
     it('should process LLM calls and tool calls correctly', async () => {
       // Mock callLLM to simulate multiple LLM calls with tool calls
       let callCount = 0;
@@ -441,4 +479,3 @@ describe('AgentModeService - generateMarketingResponse', () => {
     });
   });
 });
-
