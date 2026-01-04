@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useAdmin } from "../contexts/AdminContext";
-import { useSearchParams } from "react-router-dom";
+import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
   Box,
   Tabs,
@@ -39,7 +39,6 @@ import {
   Link,
 } from "@mui/material";
 import { format } from "date-fns";
-import { Link as RouterLink } from "react-router-dom";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
@@ -532,12 +531,12 @@ export default function AdminDashboard() {
     'subscriptions': 13,
   };
   
-  // Get initial tab value from URL or default to 0
+  // Get initial tab value from URL or default to Users
   const getInitialTabValue = () => {
     const tabParam = searchParams.get('tab');
     return tabParam && TAB_MAP[tabParam as keyof typeof TAB_MAP] !== undefined 
       ? TAB_MAP[tabParam as keyof typeof TAB_MAP] 
-      : 0;
+      : TAB_MAP.users;
   };
   
   const [tabValue, setTabValue] = useState(getInitialTabValue());
@@ -712,8 +711,11 @@ export default function AdminDashboard() {
     const tabParam = searchParams.get('tab');
     if (tabParam && TAB_MAP[tabParam as keyof typeof TAB_MAP] !== undefined) {
       setTabValue(TAB_MAP[tabParam as keyof typeof TAB_MAP]);
+      return;
     }
-  }, [searchParams]);
+    setSearchParams({ tab: "users" });
+    setTabValue(TAB_MAP.users);
+  }, [searchParams, setSearchParams]);
 
   // Track last loaded dates to prevent unnecessary reloads
   const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
@@ -924,7 +926,7 @@ export default function AdminDashboard() {
     if (tabName && tabName !== 'overview') {
       setSearchParams({ tab: tabName });
     } else {
-      setSearchParams({}); // Remove tab parameter for overview tab
+      setSearchParams({ tab: "overview" });
     }
   };
 
