@@ -44,7 +44,7 @@ describe('Admin Agent Mode Analytics', () => {
 
   const mockGetChatSession = (sessions: ChatSession[]) => {
     mockChatbotDb.getChatSession.mockImplementation(async (sessionId: string) => {
-      return sessions.find((session) => session.sessionId === sessionId);
+      return sessions.find((session) => session.sessionId === sessionId) ?? null;
     });
   };
 
