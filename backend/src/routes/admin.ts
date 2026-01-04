@@ -877,7 +877,7 @@ router.get("/analytics/agent-mode", async (req, res) => {
       (session) => session.portalType === "agent" && !session.archived
     );
 
-    const agentSessionsWithMessages = await Promise.all(
+    const agentSessionsWithMessagesPromise = Promise.all(
       agentSessions.map(async (session) => {
         try {
           const sessionWithMessages = await chatbotDb.getChatSession(
@@ -946,8 +946,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
     const uniqueUsers = new Set(actualUserSessions.map((s) => s.userId));
     const uniqueAnonymousUsers = new Set(anonymousUserSessions.map((s) => s.userId));
     
-    // Sessions in date range
-    const sessionsInRange = agentSessionsWithMessages.filter((s) => isInRange(s.createdAt));
+    // Sessions in date range (agent sessions only, no messages needed)
+    const sessionsInRange = agentSessions.filter((s) => isInRange(s.createdAt));
     const actualSessionsInRange = actualUserSessions.filter((s) => isInRange(s.createdAt));
     const anonymousSessionsInRange = anonymousUserSessions.filter((s) => isInRange(s.createdAt));
     
@@ -988,6 +988,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
     // Total unique users in range (for backward compatibility)
     const uniqueUsersInRange = activeUsers;
     
+    const agentSessionsWithMessages = await agentSessionsWithMessagesPromise;
+
     // Messages statistics
     const totalMessages = agentSessionsWithMessages.reduce(
       (sum, s) => sum + (s.messages?.length || 0),
@@ -997,8 +999,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
       totalSessions > 0 ? totalMessages / totalSessions : 0;
     
     // Messages in date range
-    const messagesInRange = sessionsInRange.reduce(
-      (sum, s) => sum + (s.messages?.length || 0),
+    const messagesInRange = agentSessionsWithMessages.reduce(
+      (sum, s) => (isInRange(s.createdAt) ? sum + (s.messages?.length || 0) : sum),
       0
     );
     const averageMessagesPerActiveUser =

@@ -689,9 +689,6 @@ export class ChatbotDB {
         console.log(`Migrating ${session.messages.length} messages from session record to AW-ChatMessages for session ${sessionId}`);
         await this.migrateMessagesToMessagesTable(sessionId, session.messages);
         messages = session.messages; // Use the migrated messages
-      } else if (messages.length > 0) {
-        // Messages exist in AW-ChatMessages, use those instead
-        console.log(`Using ${messages.length} messages from AW-ChatMessages for session ${sessionId}`);
       }
 
       // Remove messages from session object and replace with messages from messages table
