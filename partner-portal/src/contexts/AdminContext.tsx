@@ -29,6 +29,7 @@ interface User {
   roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;
   workflowCount?: number;
+  chatSessionCount?: number;
   isOAuthUser?: boolean;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID

@@ -164,6 +164,7 @@ interface User {
   roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;
   workflowCount?: number;
+  chatSessionCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
   stripe_customer_id?: string; // Added stripe_customer_id
   adAccount?: string; // Meta ad account ID
@@ -2315,6 +2316,7 @@ export default function AdminDashboard() {
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
                   <TableCell>Roles</TableCell>
+                  <TableCell>Chat Sessions</TableCell>
                   <TableCell>Tasks</TableCell>
                   <TableCell>Workflows</TableCell>
                   <TableCell>OAuth User</TableCell>
@@ -2327,7 +2329,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={17} align="center">
+                    <TableCell colSpan={20} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -2637,6 +2639,17 @@ export default function AdminDashboard() {
                               )
                             )}
                           </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            label={user.chatSessionCount || 0}
+                            size="small"
+                            color={
+                              (user.chatSessionCount ?? 0) > 0
+                                ? "primary"
+                                : "default"
+                            }
+                          />
                         </TableCell>
                         <TableCell>
                           <Chip
