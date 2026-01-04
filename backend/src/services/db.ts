@@ -29,6 +29,7 @@ AWS.config.update({
 });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
+const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 
 // Initialize S3 client
 const s3 = new S3();
@@ -197,6 +198,7 @@ interface TaskTemplate {
 interface UserWithCounts extends User {
   taskCount: number;
   workflowCount: number;
+  chatSessionCount?: number;
 }
 
 class UserDB {
@@ -223,6 +225,37 @@ class UserDB {
     } else {
       throw new Error(`Error during ${operation}: ${error.message}`);
     }
+  }
+
+  private async getChatSessionCount(userId: string): Promise<number> {
+    let totalCount = 0;
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined =
+      undefined;
+
+    do {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: CHAT_SESSIONS_TABLE,
+        IndexName: "UserIdIndex",
+        KeyConditionExpression: "userId = :userId",
+        Select: "COUNT",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+          ":archivedFalse": false,
+        },
+        FilterExpression:
+          "(attribute_not_exists(archived) OR archived = :archivedFalse)",
+      };
+
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await this.docClient.query(params).promise();
+      totalCount += result.Count || 0;
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+
+    return totalCount;
   }
 
   async createUser(
@@ -362,10 +395,13 @@ class UserDB {
             user.userId
           );
 
+          const chatSessionCount = await this.getChatSessionCount(user.userId);
+
           return {
             ...user,
             taskCount: tasks ? tasks.length : 0,
             workflowCount,
+            chatSessionCount,
           } as UserWithCounts;
         })
       );

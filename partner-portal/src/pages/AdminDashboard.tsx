@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useAdmin } from "../contexts/AdminContext";
-import { useSearchParams } from "react-router-dom";
+import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
   Box,
   Tabs,
@@ -39,7 +39,6 @@ import {
   Link,
 } from "@mui/material";
 import { format } from "date-fns";
-import { Link as RouterLink } from "react-router-dom";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
@@ -164,6 +163,7 @@ interface User {
   roles?: ("partner" | "customer" | "free")[];
   taskCount?: number;
   workflowCount?: number;
+  chatSessionCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
   stripe_customer_id?: string; // Added stripe_customer_id
   adAccount?: string; // Meta ad account ID
@@ -531,12 +531,12 @@ export default function AdminDashboard() {
     'subscriptions': 13,
   };
   
-  // Get initial tab value from URL or default to 0
+  // Get initial tab value from URL or default to Users
   const getInitialTabValue = () => {
     const tabParam = searchParams.get('tab');
     return tabParam && TAB_MAP[tabParam as keyof typeof TAB_MAP] !== undefined 
       ? TAB_MAP[tabParam as keyof typeof TAB_MAP] 
-      : 0;
+      : TAB_MAP.users;
   };
   
   const [tabValue, setTabValue] = useState(getInitialTabValue());
@@ -711,8 +711,11 @@ export default function AdminDashboard() {
     const tabParam = searchParams.get('tab');
     if (tabParam && TAB_MAP[tabParam as keyof typeof TAB_MAP] !== undefined) {
       setTabValue(TAB_MAP[tabParam as keyof typeof TAB_MAP]);
+      return;
     }
-  }, [searchParams]);
+    setSearchParams({ tab: "users" });
+    setTabValue(TAB_MAP.users);
+  }, [searchParams, setSearchParams]);
 
   // Track last loaded dates to prevent unnecessary reloads
   const lastLoadedDatesRef = React.useRef<{ startDate: string; endDate: string } | null>(null);
@@ -923,7 +926,7 @@ export default function AdminDashboard() {
     if (tabName && tabName !== 'overview') {
       setSearchParams({ tab: tabName });
     } else {
-      setSearchParams({}); // Remove tab parameter for overview tab
+      setSearchParams({ tab: "overview" });
     }
   };
 
@@ -2315,6 +2318,7 @@ export default function AdminDashboard() {
                   <TableCell>Last Login</TableCell>
                   <TableCell>Support Note</TableCell>
                   <TableCell>Roles</TableCell>
+                  <TableCell>Chat Sessions</TableCell>
                   <TableCell>Tasks</TableCell>
                   <TableCell>Workflows</TableCell>
                   <TableCell>OAuth User</TableCell>
@@ -2327,7 +2331,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={17} align="center">
+                    <TableCell colSpan={20} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -2637,6 +2641,17 @@ export default function AdminDashboard() {
                               )
                             )}
                           </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Chip
+                            label={user.chatSessionCount || 0}
+                            size="small"
+                            color={
+                              (user.chatSessionCount ?? 0) > 0
+                                ? "primary"
+                                : "default"
+                            }
+                          />
                         </TableCell>
                         <TableCell>
                           <Chip

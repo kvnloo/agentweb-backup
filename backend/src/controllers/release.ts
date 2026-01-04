@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-04",
+    changes: [
+      "Improved Admin Users and Overview analytics",
+      "- Users tab now shows Chat Sessions count per user",
+      "- Fixed the bug in Message Analytics to count messages",
+      "- admin page defaults to Users tab with admin?tab=users, and Overview remains at admin?tab=overview",
+    ],
+  },
+  {
     date: "2025-12-21",
     changes: [
       "Improved Admin Chat History performance",
