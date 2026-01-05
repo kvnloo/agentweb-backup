@@ -13,7 +13,7 @@ interface ImageGenerationResult {
 // Supported image generation models
 const SUPPORTED_MODELS = [
   "gpt-image-1",
-  "gemini-2.5-flash-image-preview",
+  "gemini-2.5-flash-image",
   "gemini-3-pro-image-preview",
   "gen4_image",
   "gemini_2.5_flash",
@@ -79,7 +79,7 @@ export class ImageService {
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Azure/Image" 
           : "prod/AgentWeb/Azure/Image";
-      } else if (model === "gemini-2.5-flash-image-preview" || model === "gemini-3-pro-image-preview") {
+      } else if (model === "gemini-2.5-flash-image" || model === "gemini-3-pro-image-preview") {
         // Google Gemini
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Google/Image" 
@@ -151,7 +151,7 @@ export class ImageService {
       try {
         if (modelToUse === "gpt-image-1") {
           result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
-        } else if (modelToUse === "gemini-2.5-flash-image-preview") {
+        } else if (modelToUse === "gemini-2.5-flash-image") {
           result = await this.generateWithGoogleGemini(params);
         } else if (modelToUse === "gemini-3-pro-image-preview") {
           result = await this.generateWithGoogleGemini3Pro(params);
@@ -429,9 +429,9 @@ export class ImageService {
       const { GoogleGenerativeAI } = require('@google/generative-ai');
       const axios = require('axios');
       
-      const apiKey = await this.getApiKey("gemini-2.5-flash-image-preview");
+      const apiKey = await this.getApiKey("gemini-2.5-flash-image");
       const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image-preview" });
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-image" });
       
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       

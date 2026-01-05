@@ -3198,7 +3198,7 @@ class WebAgent:
                     azure_model_name = "flux.1-kontext-pro"
                     
                     logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
-                elif model_to_use == "gemini-2.5-flash-image-preview":
+                elif model_to_use == "gemini-2.5-flash-image":
                     # Use Google Gemini Nano Banana image model
                     api_key = os.getenv('GOOGLE_IMAGE_API_KEY')
                     if not api_key:
@@ -3209,9 +3209,9 @@ class WebAgent:
                     except ImportError:
                         return ActionResult(error="google-genai package not installed. Install with: pip install google-genai")
 
-                    logger.info("Using Google Nano Banana (gemini-2.5-flash-image-preview)")
+                    logger.info("Using Google Nano Banana (gemini-2.5-flash-image)")
                     google_client = genai.Client(api_key=api_key)
-                    google_model_name = "gemini-2.5-flash-image-preview"
+                    google_model_name = "gemini-2.5-flash-image"
                 elif model_to_use == "gpt-image-1":
                     # Use Azure AI Services for gpt-image-1 model (same as FLUX)
                     api_key = os.getenv('AZURE_OPENAI_API_KEY2')

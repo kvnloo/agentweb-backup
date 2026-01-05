@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-05',
+    changes: [
+      'Migrated the Gemini image model from gemini-2.5-flash-image-preview to gemini-2.5-flash-image',
+      '- Google will discontinue gemini-2.5-flash-image-preview on January 15, 2026',
+    ],
+  },
+  {
     date: '2026-01-03',
     changes: [
       'Added Microsoft Clarity Link and Configuration to SEO/GEO',

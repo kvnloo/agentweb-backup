@@ -189,7 +189,7 @@ describe('AgentModeService - generate_image function', () => {
     });
 
     it('should handle all supported models', async () => {
-      const models = ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash'];
+      const models = ['gpt-image-1', 'gemini-2.5-flash-image', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash'];
       
       for (const model of models) {
         mockImageService.generateImage.mockResolvedValue({
@@ -368,7 +368,7 @@ describe('AgentModeService - generate_image function', () => {
         'https://example.com/image3.jpg'
       ];
 
-      const models = ['gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview'];
+      const models = ['gemini-2.5-flash-image', 'gemini-3-pro-image-preview'];
       
       for (const model of models) {
         const result = await (agentModeService as any).generateImage(
