@@ -15,6 +15,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The frontend now correctly clears the "running" status when deep research completes or errors',
       '- Increased worker timeout from 30 to 45 minutes to accommodate long-running deep research operations',
       '- Added better error handling and validation for deep research polling',
+      'History records now display in reverse chronological order with the latest runs shown first',
+      '- Also renamed "Test History of Scheduled Chats" to "Run History"',
     ],
   },
   {
