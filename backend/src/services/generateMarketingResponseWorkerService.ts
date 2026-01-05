@@ -74,11 +74,13 @@ export class GenerateMarketingResponseWorkerService {
         });
       }
 
-      // Set a timeout for the worker (30 minutes max)
+      // Set a timeout for the worker (45 minutes max)
+      // Increased from 30 minutes to accommodate deep research operations
+      // which can take up to 20 minutes (120 attempts * 10 seconds)
       const timeout = setTimeout(() => {
         worker.kill('SIGTERM');
-        reject(new Error('generateMarketingResponse worker timed out after 30 minutes'));
-      }, 30 * 60 * 1000);
+        reject(new Error('generateMarketingResponse worker timed out after 45 minutes'));
+      }, 45 * 60 * 1000);
 
       // Handle messages from worker
       worker.on('message', (message: any) => {

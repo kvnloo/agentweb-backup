@@ -191,10 +191,10 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
       const promise = workerService.runInWorker(mockParams);
 
-      // Fast-forward time to trigger timeout (30 minutes = 1800000ms)
-      jest.advanceTimersByTime(30 * 60 * 1000);
+      // Fast-forward time to trigger timeout (45 minutes = 2700000ms)
+      jest.advanceTimersByTime(45 * 60 * 1000);
 
-      await expect(promise).rejects.toThrow('generateMarketingResponse worker timed out after 30 minutes');
+      await expect(promise).rejects.toThrow('generateMarketingResponse worker timed out after 45 minutes');
       expect(mockWorker.kill).toHaveBeenCalledWith('SIGTERM');
 
       // Clean up
