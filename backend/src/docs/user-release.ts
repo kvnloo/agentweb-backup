@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Migrated the Gemini image model from gemini-2.5-flash-image-preview to gemini-2.5-flash-image',
       '- Google will discontinue gemini-2.5-flash-image-preview on January 15, 2026',
+      'Fixed bug where perform_deep_research appeared to be stuck running in the UI',
+      '- The frontend now correctly clears the "running" status when deep research completes or errors',
+      '- Increased worker timeout from 30 to 45 minutes to accommodate long-running deep research operations',
+      '- Added better error handling and validation for deep research polling',
     ],
   },
   {

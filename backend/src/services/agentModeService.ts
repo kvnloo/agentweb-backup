@@ -332,11 +332,13 @@ export class AgentModeService {
             });
 
             // Send progress update: tool executed
+            // Explicitly clear pendingTools to indicate this tool is done
             if (onProgress) {
               onProgress({
                 iteration,
                 status: 'tool_executed',
-                toolCalls: toolCalls.slice()
+                toolCalls: toolCalls.slice(),
+                pendingTools: [] // Clear pending tools to indicate this tool completed
               });
             }
 
@@ -366,6 +368,17 @@ export class AgentModeService {
               arguments: JSON.parse(toolCall.function.arguments),
               error: error instanceof Error ? error.message : 'Unknown error'
             });
+            
+            // Send progress update: tool failed (clear pendingTools)
+            if (onProgress) {
+              onProgress({
+                iteration,
+                status: 'tool_executed',
+                toolCalls: toolCalls.slice(),
+                pendingTools: [] // Clear pending tools even on error
+              });
+            }
+            
             // Ensure LLM receives the error to adjust its plan
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);

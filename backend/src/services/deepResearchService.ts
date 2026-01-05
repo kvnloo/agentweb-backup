@@ -161,15 +161,11 @@ export class DeepResearchService {
       let pollAttempts = 0;
       let interaction = initialInteraction;
 
-      while (interaction.status !== 'completed' && pollAttempts < maxPollAttempts) {
-        console.log(`Deep research status: ${interaction.status} (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
-        
-        // Wait 10 seconds before polling again
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        
-        // Get updated interaction status
-        interaction = await ai.interactions.get(initialInteraction.id);
-        pollAttempts++;
+      while (pollAttempts < maxPollAttempts) {
+        // Check if already completed before waiting
+        if (interaction.status === 'completed') {
+          break;
+        }
 
         // Check for failure states
         if (interaction.status === 'failed' || interaction.status === 'cancelled') {
@@ -179,12 +175,55 @@ export class DeepResearchService {
             error: `Deep research ${interaction.status}. Please try again.`
           };
         }
+
+        console.log(`Deep research status: ${interaction.status || 'unknown'} (attempt ${pollAttempts + 1}/${maxPollAttempts})`);
+        
+        // Wait 10 seconds before polling again
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        
+        // Get updated interaction status with error handling
+        try {
+          interaction = await ai.interactions.get(initialInteraction.id);
+          
+          // Validate interaction object
+          if (!interaction || typeof interaction.status !== 'string') {
+            console.error('Invalid interaction response:', interaction);
+            return {
+              success: false,
+              error: 'Deep research API returned invalid response. Please try again.'
+            };
+          }
+        } catch (error: any) {
+          console.error('Error getting interaction status:', error);
+          // If we've tried many times, give up
+          if (pollAttempts >= 10) {
+            return {
+              success: false,
+              error: `Deep research API error after ${pollAttempts} attempts: ${error.message || 'Unknown error'}`
+            };
+          }
+          // Otherwise, continue polling (might be a transient error)
+          pollAttempts++;
+          continue;
+        }
+        
+        pollAttempts++;
       }
 
-      if (interaction.status !== 'completed') {
+      // Check final status after loop exits
+      if (pollAttempts >= maxPollAttempts && interaction.status !== 'completed') {
+        console.error(`Deep research timed out after ${maxPollAttempts} attempts. Final status: ${interaction.status}`);
         return {
           success: false,
           error: 'Deep research timed out after 20 minutes. Please try again with a more specific topic.'
+        };
+      }
+
+      if (interaction.status !== 'completed') {
+        console.error(`Deep research ended with unexpected status: ${interaction.status}`);
+        return {
+          success: false,
+          error: `Deep research ended with status: ${interaction.status}. Please try again.`
         };
       }
 
