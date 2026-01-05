@@ -82,9 +82,9 @@ export default function ImageModelsSettings() {
           provider: "Azure"
         },
         {
-          value: "gemini-2.5-flash-image-preview",
+          value: "gemini-2.5-flash-image",
           label: "Nano Banana (Google Gemini)",
-          description: "gemini-2.5-flash-image-preview for image + text",
+          description: "gemini-2.5-flash-image for image + text",
           provider: "Google"
         }
       ];

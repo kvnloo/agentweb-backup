@@ -1843,8 +1843,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
               },
               imageModel: {
                 type: 'string',
-                description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-                enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
+                description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+                enum: ['gpt-image-1', 'gemini-2.5-flash-image', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
               }
             },
             required: ['prompt', 'filename']
