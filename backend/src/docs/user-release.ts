@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Run History entries no longer store the full AI response text, significantly reducing storage size',
       '- AI responses are now reconstructed from session messages when needed (e.g., when sending emails)',
       '- This allows storing ~8x more run history entries per schedule (from ~60-100 to ~490 entries)',
+      'Added drag & drop support for file attachments in Agent Mode',
+      '- The entire chat window in Agent Mode accepts drag & drop for easier file attachment',
+      '- Visual feedback shows when files are being dragged over the drop zone',
     ],
   },
   {
