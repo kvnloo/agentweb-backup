@@ -424,3 +424,60 @@ Renamed LinkedIn credential functions and updated secret paths to clarify person
 - **Organization/Company Page Integration**:
   - Dev Secret: `dev/AgentWeb/LinkedIn/Company`
   - Prod Secret: `prod/AgentWeb/LinkedIn/Company`
+
+## January 06, 2026
+### Scheduled Chat Run History: Optimized Storage to Prevent DynamoDB Size Limits
+
+#### Problem
+The `runResults` array stored in `AW-TaskSchedules` table was hitting DynamoDB's 400KB item size limit. The `actualResponse` field (containing the full AI response text) was the primary contributor to item size, often taking 1-20KB per entry.
+
+#### Solution
+Instead of storing `actualResponse` in the database, we now:
+1. **Exclude `actualResponse` when storing** run results to DynamoDB
+2. **Reconstruct `actualResponse` on-demand** from session messages only when needed (when sending emails)
+3. **Keep `actualResponse` in error cases** where there's no session to reconstruct from
+
+#### Implementation Details
+- Helper function `getActualResponseFromSession()` extracts the last assistant message from the session
+- `actualResponse` is removed from the result object before calling `addRunResult()`
+- Reconstruction happens in:
+  - `sendScheduledChatTestEmail()` - when user clicks "Send Email" in Run History
+  - `sendDailyDigestEmail()` - when sending daily digest emails
+
+#### Size Estimates
+
+**Per Entry (without `actualResponse`):**
+- Base fields: ~530 bytes
+  - scheduleId, runId, sessionId (UUIDs): ~120 bytes
+  - status, passed, attempt, executionTime: ~30 bytes
+  - createdAt (ISO string): ~30 bytes
+  - Arrays (keywordMatches, keywordMisses, functionCallMatches, etc.): ~200-400 bytes
+  - functionCallDetails object: ~100-500 bytes
+- **Average: ~800 bytes per entry**
+
+**Per Entry (with `actualResponse` - old method):**
+- Base fields: ~530 bytes
+- actualResponse: 1-20KB (average ~3-5KB)
+- **Average: ~3,800-6,500 bytes per entry**
+
+**Savings per entry: ~3-5KB**
+
+#### Capacity Estimates
+
+DynamoDB item size limit: **400KB**
+- Base schedule data (scheduleName, description, startingMessage, etc.): ~2-5KB
+- Available space for runResults: **~395-398KB**
+
+**Old Method (with `actualResponse`):**
+- 395KB ÷ 6.5KB (worst case) = **~60 entries**
+- 395KB ÷ 3.8KB (average) = **~104 entries**
+
+**New Method (without `actualResponse`):**
+- 395KB ÷ 0.8KB = **~490 entries**
+
+**Improvement: ~8x more entries can be stored** (from ~60-100 entries to ~490 entries)
+
+#### Notes
+- `actualResponse` is still available when needed (emails) via on-demand reconstruction
+- Error cases (no session) still store `actualResponse` since it can't be reconstructed
+- Frontend Run History display doesn't need `actualResponse`, so no performance impact on viewing history

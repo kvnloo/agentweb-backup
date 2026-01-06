@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-06',
+    changes: [
+      'Optimized Scheduled Chat Run History storage to mitigate database size limits',
+      '- Run History entries no longer store the full AI response text, significantly reducing storage size',
+      '- AI responses are now reconstructed from session messages when needed (e.g., when sending emails)',
+      '- This allows storing ~8x more run history entries per schedule (from ~60-100 to ~490 entries)',
+    ],
+  },
+  {
     date: '2026-01-05',
     changes: [
       'Migrated the Gemini image model from gemini-2.5-flash-image-preview to gemini-2.5-flash-image',
@@ -30,19 +39,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
-    date: '2025-01-02',
-    changes: [
-      'Added Technical SEO Score on the SEO/GEO page',
-      '- Uses Google PageSpeed Insights (mobile strategy) for the score',
-    ],
-  },
-  {
     date: '2026-01-02',
     changes: [
       'Added support for Connected Accounts',
       '- LinkedIn personal accounts are supported',
       '- Company accounts are a work in progress',
       'Added function calls for Emma to post on LinkedIn automatically',
+      'Added Technical SEO Score on the SEO/GEO page',
+      '- Uses Google PageSpeed Insights (mobile strategy) for the score',
     ],
   },
   {
