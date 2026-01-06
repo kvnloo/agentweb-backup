@@ -39,19 +39,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
-    date: '2025-01-02',
-    changes: [
-      'Added Technical SEO Score on the SEO/GEO page',
-      '- Uses Google PageSpeed Insights (mobile strategy) for the score',
-    ],
-  },
-  {
     date: '2026-01-02',
     changes: [
       'Added support for Connected Accounts',
       '- LinkedIn personal accounts are supported',
       '- Company accounts are a work in progress',
       'Added function calls for Emma to post on LinkedIn automatically',
+      'Added Technical SEO Score on the SEO/GEO page',
+      '- Uses Google PageSpeed Insights (mobile strategy) for the score',
     ],
   },
   {
