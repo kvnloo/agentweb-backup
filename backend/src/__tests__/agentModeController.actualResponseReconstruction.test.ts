@@ -187,7 +187,7 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
 
       // Verify the response includes actualResponse
       expect(mockRes.json).toHaveBeenCalled();
-      const responseData = mockRes.json.mock.calls[0][0];
+      const responseData = (mockRes.json as jest.Mock).mock.calls[0][0];
       expect(responseData).toHaveProperty('actualResponse', responseContent);
     });
   });
@@ -197,10 +197,10 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
       const sessionWithMessages = {
         ...mockSession,
         messages: [
-          { role: 'user', content: 'Hello' },
-          { role: 'assistant', content: 'Here is the AI response with marketing tips.' },
-          { role: 'user', content: 'More info' },
-          { role: 'assistant', content: 'Final response with strategy details.' },
+          { role: 'user' as const, content: 'Hello' },
+          { role: 'assistant' as const, content: 'Here is the AI response with marketing tips.' },
+          { role: 'user' as const, content: 'More info' },
+          { role: 'assistant' as const, content: 'Final response with strategy details.' },
         ],
       };
 
@@ -272,7 +272,7 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
       const sessionWithoutAssistantMessages = {
         ...mockSession,
         messages: [
-          { role: 'user', content: 'Hello' },
+          { role: 'user' as const, content: 'Hello' },
         ],
       };
 
@@ -359,8 +359,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
         ...mockSession,
         sessionId: 'session-1',
         messages: [
-          { role: 'user', content: 'Hello' },
-          { role: 'assistant', content: 'First response with tips.' },
+          { role: 'user' as const, content: 'Hello' },
+          { role: 'assistant' as const, content: 'First response with tips.' },
         ],
       };
 
@@ -368,8 +368,8 @@ describe('AgentModeController - actualResponse Reconstruction', () => {
         ...mockSession,
         sessionId: 'session-2',
         messages: [
-          { role: 'user', content: 'Hello' },
-          { role: 'assistant', content: 'Second response with strategy.' },
+          { role: 'user' as const, content: 'Hello' },
+          { role: 'assistant' as const, content: 'Second response with strategy.' },
         ],
       };
 
