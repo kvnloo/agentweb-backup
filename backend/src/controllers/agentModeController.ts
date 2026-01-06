@@ -108,6 +108,29 @@ interface ScheduledChatTestResult {
   createdAt: string;
 }
 
+// Helper function to reconstruct actualResponse from session messages (only used when sending emails)
+async function getActualResponseFromSession(sessionId: string): Promise<string> {
+  try {
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session?.messages || !Array.isArray(session.messages) || session.messages.length === 0) {
+      return '';
+    }
+    
+    // Iterate backwards to find the last assistant message with content
+    for (let i = session.messages.length - 1; i >= 0; i--) {
+      const msg = session.messages[i];
+      if (msg?.role === 'assistant' && typeof msg.content === 'string' && msg.content.trim().length > 0) {
+        return msg.content.trim();
+      }
+    }
+    
+    return '';
+  } catch (error) {
+    console.error(`[getActualResponseFromSession] Error getting actualResponse from session ${sessionId}:`, error);
+    return '';
+  }
+}
+
 // Evaluate schedule response against expected criteria
 function evaluateScheduleResponse(
   actualResponse: string,
@@ -222,10 +245,21 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
     const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
 
     const runResults = await scheduleDb.getRunResults(schedule.scheduleId);
-    const todaysResults = runResults.filter((result: any) => {
+    const todaysResultsRaw = runResults.filter((result: any) => {
       const resultDate = new Date(result.createdAt);
       return resultDate >= startOfDay && resultDate < endOfDay;
     });
+    
+    // Reconstruct actualResponse for results that don't have it (only needed for email)
+    const todaysResults = await Promise.all(
+      todaysResultsRaw.map(async (result: any) => {
+        if (!result.actualResponse && result.sessionId) {
+          const actualResponse = await getActualResponseFromSession(result.sessionId);
+          return { ...result, actualResponse };
+        }
+        return result;
+      })
+    );
 
     if (todaysResults.length === 0) {
       console.log(`No run results found for today for schedule ${schedule.scheduleName}`);
@@ -713,9 +747,11 @@ async function runScheduledChat(
       createdAt: new Date().toISOString()
     };
 
-    // Save the result to database
+    // Save the result to database (without actualResponse to save space)
+    const resultToStore = { ...finalResult };
+    delete (resultToStore as any).actualResponse;
     try {
-      await scheduleDb.addRunResult(schedule.scheduleId, finalResult);
+      await scheduleDb.addRunResult(schedule.scheduleId, resultToStore);
     } catch (error) {
       console.error('Error saving run result:', error);
       // Continue even if saving fails - we still want to return the result
@@ -2076,10 +2112,21 @@ export const agentModeController = {
         const startOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate());
         const endOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate() + 1);
 
-        const sameDayResults = testHistory.filter((result: any) => {
+        const sameDayResultsRaw = testHistory.filter((result: any) => {
           const resultDate = new Date(result.createdAt);
           return resultDate >= startOfDay && resultDate < endOfDay;
         });
+
+        // Reconstruct actualResponse for results that don't have it (only needed for email)
+        const sameDayResults = await Promise.all(
+          sameDayResultsRaw.map(async (result: any) => {
+            if (!result.actualResponse && result.sessionId) {
+              const actualResponse = await getActualResponseFromSession(result.sessionId);
+              return { ...result, actualResponse };
+            }
+            return result;
+          })
+        );
 
         if (sameDayResults.length > 0) {
           // Send daily digest email for the specific date
@@ -2108,10 +2155,16 @@ export const agentModeController = {
       }
 
       // For non-hourly schedules or hourly without daily digest, send individual email
+      // Reconstruct actualResponse from session if missing
+      let actualResponse = record.actualResponse || record.response || '';
+      if ((!actualResponse || actualResponse.trim().length === 0) && record.sessionId) {
+        actualResponse = await getActualResponseFromSession(record.sessionId);
+      }
+      
       // Build a result object compatible with emailService
       const resultForEmail = {
         passed: !!record.passed,
-        actualResponse: record.actualResponse || record.response || '',
+        actualResponse: actualResponse || 'Response not available. View the conversation to see the full response.',
         keywordMatches: record.keywordMatches || [],
         keywordMisses: record.keywordMisses || [],
         functionCallMatches: record.functionCallMatches || [],
