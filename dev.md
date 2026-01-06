@@ -481,3 +481,42 @@ DynamoDB item size limit: **400KB**
 - `actualResponse` is still available when needed (emails) via on-demand reconstruction
 - Error cases (no session) still store `actualResponse` since it can't be reconstructed
 - Frontend Run History display doesn't need `actualResponse`, so no performance impact on viewing history
+
+Ran repair script to clean up actualResponse
+NODE_ENV=production npx ts-node src/scripts/repair-scheduled-chat-run-results.ts 
+Repairing TaskSchedules table to remove actualResponse from runResults: {
+  environment: 'production',
+  region: 'us-west-2',
+  tablePrefix: '',
+  tableName: 'AW-TaskSchedules'
+}
+Starting repair process...
+
+(node:82443) NOTE: The AWS SDK for JavaScript (v2) is in maintenance mode.
+ SDK releases are limited to address critical bug fixes and security issues only.
+
+Please migrate your code to use AWS SDK for JavaScript (v3).
+For more information, check the blog post at https://a.co/cUPnyil
+(Use `node --trace-warnings ...` to show where the warning was created)
+Processing batch: 14 schedules (Total scanned: 14)
+Processing batch: 8 schedules (Total scanned: 22)
+  ✓ Updated 10 schedules, cleaned 734 runResults entries so far...
+Processing batch: 34 schedules (Total scanned: 56)
+  ✓ Updated 20 schedules, cleaned 1066 runResults entries so far...
+Processing batch: 20 schedules (Total scanned: 76)
+  ✓ Updated 30 schedules, cleaned 1533 runResults entries so far...
+Processing batch: 13 schedules (Total scanned: 89)
+Processing batch: 19 schedules (Total scanned: 108)
+  ✓ Updated 40 schedules, cleaned 2179 runResults entries so far...
+
+==================================================
+Repair process completed!
+==================================================
+Total schedules scanned: 108
+Total schedules updated: 43
+Total schedules skipped: 65 (no runResults or already cleaned)
+Total runResults entries cleaned: 2179
+Total errors: 0
+==================================================
+
+✅ Repair completed successfully!
