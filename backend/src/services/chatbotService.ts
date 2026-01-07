@@ -133,7 +133,7 @@ export interface ChatSession {
       stepCount: number; // Step number starting from 1
       title: string;
       description?: string;
-      status: 'pending' | 'completed' | 'skipped';
+      status: 'pending' | 'completed' | 'skipped' | 'failed' | 'in_progress';
       completedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
@@ -1175,7 +1175,7 @@ export class ChatbotDB {
         stepCount: number;
         title: string;
         description?: string;
-        status: 'pending' | 'completed' | 'skipped';
+        status: 'pending' | 'completed' | 'skipped' | 'failed' | 'in_progress';
         completedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];

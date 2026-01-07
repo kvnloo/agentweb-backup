@@ -1,31 +1,40 @@
 import { Request, Response } from 'express';
 
-// Mock AgentModeService used inside the controller
-jest.mock('../services/agentModeService', () => ({
-  AgentModeService: jest.fn().mockImplementation(() => ({
-    getAvailableTools: () => [
-      { type: 'function', function: { name: 'generate_image', description: 'Generate images' } },
-      { type: 'function', function: { name: 'generate_video', description: 'Generate videos' } },
-      { type: 'non-function', other: true },
-    ],
-  })),
-  // Some tests import the singleton, keep a minimal stub
-  agentModeService: {},
+// Mock the tools module with ToolRegistry
+const mockToolRegistry = {
+  getAll: jest.fn(() => [
+    { 
+      name: 'generate_image', 
+      category: 'content',
+      schema: { name: 'generate_image', description: 'Generate images', parameters: {} },
+      deprecated: false
+    },
+    { 
+      name: 'generate_video', 
+      category: 'content',
+      schema: { name: 'generate_video', description: 'Generate videos', parameters: {} },
+      deprecated: false
+    },
+  ]),
+};
+
+jest.mock('../tools', () => ({
+  toolRegistry: mockToolRegistry,
+  registerAllTools: jest.fn(),
+  allToolDefinitions: [],
 }));
 
-// Mock subscriptionService used by getAvailableFunctionCalls
-jest.mock('../services/subscriptionService', () => ({
-  getAllowedFunctionCalls: jest.fn(async (_userId: string) => ['generate_image']),
-  filterFunctionCalls: jest.fn((allTools: any[], allowed: string[]) =>
-    allTools.filter((t) => t.type !== 'function' || !t.function?.name || allowed.includes(t.function.name)),
-  ),
+// Mock SubscriptionToolFilter
+const mockFilterToolsBySubscription = jest.fn(async (tools: any[], _userId: string) => {
+  // Simulate filtering - only return 'generate_image'
+  return tools.filter(t => t.name === 'generate_image');
+});
+
+jest.mock('../tools/SubscriptionToolFilter', () => ({
+  filterToolsBySubscription: mockFilterToolsBySubscription,
 }));
 
 import { agentModeController } from '../controllers/agentModeController';
-import { getAllowedFunctionCalls, filterFunctionCalls } from '../services/subscriptionService';
-
-const mockedGetAllowed = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
-const mockedFilter = filterFunctionCalls as jest.MockedFunction<typeof filterFunctionCalls>;
 
 const makeRes = () => {
   const res: Partial<Response> = {};
@@ -37,6 +46,21 @@ const makeRes = () => {
 describe('agentModeController.getAvailableFunctionCalls subscription behaviour', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Reset mock implementations
+    mockToolRegistry.getAll.mockReturnValue([
+      { 
+        name: 'generate_image', 
+        category: 'content',
+        schema: { name: 'generate_image', description: 'Generate images', parameters: {} },
+        deprecated: false
+      },
+      { 
+        name: 'generate_video', 
+        category: 'content',
+        schema: { name: 'generate_video', description: 'Generate videos', parameters: {} },
+        deprecated: false
+      },
+    ]);
   });
 
   it('should filter function calls based on subscription for non-admin users', async () => {
@@ -47,9 +71,11 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
 
     await agentModeController.getAvailableFunctionCalls(req, res);
 
-    // Should have used subscriptionService helpers
-    expect(mockedGetAllowed).toHaveBeenCalledWith('user-1');
-    expect(mockedFilter).toHaveBeenCalled();
+    // Should have used filterToolsBySubscription
+    expect(mockFilterToolsBySubscription).toHaveBeenCalledWith(
+      expect.any(Array),
+      'user-1'
+    );
 
     // Response should only contain the allowed function
     expect(res.json).toHaveBeenCalledWith({
@@ -67,9 +93,8 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
 
     await agentModeController.getAvailableFunctionCalls(req, res);
 
-    // For admin users we should NOT call subscriptionService helpers
-    expect(mockedGetAllowed).not.toHaveBeenCalled();
-    expect(mockedFilter).not.toHaveBeenCalled();
+    // For admin users we should NOT call filterToolsBySubscription
+    expect(mockFilterToolsBySubscription).not.toHaveBeenCalled();
 
     // All function tools should be returned
     expect(res.json).toHaveBeenCalledWith({

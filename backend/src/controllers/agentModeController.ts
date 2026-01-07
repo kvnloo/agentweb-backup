@@ -12,6 +12,27 @@ import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore } from '../utils/sseProgress';
+import { toolRegistry, registerAllTools } from '../tools';
+import { filterToolsBySubscription } from '../tools/SubscriptionToolFilter';
+
+// Thread-safe tool registration lock
+let toolRegistrationPromise: Promise<void> | null = null;
+
+/**
+ * Ensure tools are registered exactly once (thread-safe)
+ */
+async function ensureToolsRegistered(): Promise<void> {
+  if (toolRegistry.getAll().length > 0) return;
+  
+  if (!toolRegistrationPromise) {
+    toolRegistrationPromise = Promise.resolve().then(() => {
+      if (toolRegistry.getAll().length === 0) {
+        registerAllTools(toolRegistry);
+      }
+    });
+  }
+  await toolRegistrationPromise;
+}
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -1117,25 +1138,25 @@ export const agentModeController = {
   async getAvailableFunctionCalls(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const agentModeService = new AgentModeService();
-      const allTools = agentModeService.getAvailableTools();
+      
+      // Ensure tools are registered (thread-safe)
+      await ensureToolsRegistered();
+      
+      // Get all tools from registry
+      let tools = toolRegistry.getAll();
       
       // For admin users, return all function calls without filtering
-      // For regular users, filter tools based on subscription
-      let toolsToReturn = allTools;
+      // For regular users, filter tools based on subscription from DB
       if (!user.isAdmin) {
-        const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
-        const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
-        // getAllowedFunctionCalls now always returns an array (never null)
-        toolsToReturn = filterFunctionCalls(allTools, allowedFunctionCalls);
+        tools = await filterToolsBySubscription(tools, user.userId);
       }
-
-      // Extract function names and descriptions
-      const functionCalls = toolsToReturn
-        .filter((tool: any) => tool.type === 'function')
-        .map((tool: any) => ({
-          name: tool.function.name,
-          description: tool.function.description
+      
+      // Convert to OpenAI format and extract function names and descriptions
+      const functionCalls = tools
+        .filter(tool => !tool.deprecated)
+        .map(tool => ({
+          name: tool.name,
+          description: tool.schema.description
         }));
 
       res.json({ functionCalls });
