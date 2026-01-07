@@ -2854,4 +2854,40 @@ export const agentModeController = {
       res.status(500).json({ error: 'Failed to update session LLM model' });
     }
   },
+
+  // Update session title
+  async updateSessionTitle(req: AuthenticatedRequest, res: Response) {
+    try {
+      const user = req.user;
+      if (!user) {
+        return res.status(401).json({ error: 'User not authenticated' });
+      }
+
+      const { sessionId } = req.params;
+      const { title } = req.body;
+
+      if (!title || typeof title !== 'string' || title.trim().length === 0) {
+        return res.status(400).json({ error: 'Title is required and must be a non-empty string' });
+      }
+
+      // Get the session to verify ownership
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if user owns the session (or is admin)
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // Update the session title
+      const updatedSession = await chatbotDb.updateSessionTitle(sessionId, title.trim());
+
+      res.json({ title: updatedSession.title });
+    } catch (error) {
+      console.error('AgentMode: Update session title error:', error);
+      res.status(500).json({ error: 'Failed to update session title' });
+    }
+  },
 };

@@ -12,6 +12,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Updated create_blog_article function to use title_draft and content_draft parameters',
       '- This allows Emma to refine and polish existing draft content rather than generating from scratch',
       '- It increases the bandwidth of Emma to blog content agents',
+      'Added editable chat session names in Agent Mode',
+      '- Users can now edit session titles directly from the Chat History sidebar',
+      '- Click the pencil icon that appears on hover to edit a session title inline',
+      '- Press Enter or click the checkmark to save, or Escape to cancel',
+      '- Session titles update immediately in both the sidebar and current session view',
     ],
   },
   {
