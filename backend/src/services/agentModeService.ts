@@ -1923,24 +1923,17 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'create_blog_article',
-          description: 'Create a complete blog article with content, images, and HTML file. Generates blog content using AI, creates a hero image, and produces a complete HTML file uploaded to S3.',
+          description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3. The final title will be generated from the drafts.',
           parameters: {
             type: 'object',
             properties: {
-              topic: {
+              title_draft: {
                 type: 'string',
-                description: 'The main topic or subject of the blog article'
+                description: 'A draft title for the blog article. The final title will be generated and optimized from this draft.'
               },
-              keywords: {
+              content_draft: {
                 type: 'string',
-                description: 'Comma-separated keywords to include in the article for SEO',
-                default: ''
-              },
-              tone: {
-                type: 'string',
-                description: 'The tone of voice for the article',
-                enum: ['professional', 'casual', 'friendly', 'authoritative', 'conversational'],
-                default: 'professional'
+                description: 'The blog article content in markdown format'
               },
               length: {
                 type: 'string',
@@ -1970,7 +1963,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
                 default: false
               }
             },
-            required: ['topic']
+            required: ['title_draft', 'content_draft']
           }
         }
       },
@@ -3627,7 +3620,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'remove_c2pa_from_image':
         return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
       case 'create_blog_article':
-        return await this.createBlogArticle(args.topic, args.keywords || '', args.tone || 'professional', args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
+        return await this.createBlogArticle(args.title_draft, args.content_draft, args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
       case 'perform_deep_research':
         return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas, userId);
       case 'publish_blog_article':
@@ -8562,9 +8555,8 @@ ${emailDraftFormat === 'text'
   }
 
   private async createBlogArticle(
-    topic: string,
-    keywords: string,
-    tone: string,
+    titleDraft: string,
+    contentDraft: string,
     length: string,
     researchContext: string,
     requirements: string,
@@ -8574,11 +8566,24 @@ ${emailDraftFormat === 'text'
     deepResearch: boolean = false
   ): Promise<any> {
     try {
-      console.log('AgentMode: Creating blog article for topic:', topic, 'tone:', tone, 'length:', length, 'deepResearch:', deepResearch, 'userId:', userId);
-
       // Import required services
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const { generateBlogImage, generateBlogHtml, generateBlogContent, restyleContent } = await import('../controllers/blog');
+      const { generateBlogImage, generateBlogHtml, generateBlogContent } = await import('../controllers/blog');
+
+      if (!titleDraft || !contentDraft) {
+        throw new Error("title_draft and content_draft are required");
+      }
+
+      // Calculate first and last 100 bytes for logging
+      const contentLength = contentDraft.length;
+      const first100Bytes = contentDraft.substring(0, Math.min(100, contentLength));
+      const last100Bytes = contentLength > 100 ? contentDraft.substring(contentLength - 100) : contentDraft;
+      const contentPreview = `${contentLength}: ${first100Bytes}...${last100Bytes}`;
+
+      console.log('AgentMode: Creating blog article for title_draft:', titleDraft, 'length:', length, 'deepResearch:', deepResearch, 'userId:', userId, 'content_draft:', contentPreview);
+
+      // Import restyleContent for processing the draft
+      const { restyleContent } = await import('../controllers/blog');
 
       let blogData: { title: string; description: string; content: string; imagePrompt: string };
       let finalContent: string;
@@ -8591,10 +8596,13 @@ ${emailDraftFormat === 'text'
         console.log('AgentMode: Deep research enabled, performing research...');
         const { deepResearchService } = await import('./deepResearchService');
 
+        // Combine title_draft and content_draft as topic for deep research
+        const researchTopic = `${titleDraft}\n\n${contentDraft}`;
+
         const researchResult = await deepResearchService.performDeepResearch({
-          topic,
+          topic: researchTopic,
           prompt: requirements || undefined,
-          tone,
+          tone: 'professional',
           style
         });
 
@@ -8603,20 +8611,22 @@ ${emailDraftFormat === 'text'
         }
 
         console.log('AgentMode: Deep research complete. Length:', researchResult.markdownContent.length);
-        console.log('AgentMode: Restyling research content with tone:', tone, 'style:', style);
+        console.log('AgentMode: Restyling research content with style:', style);
 
         // Restyle with inline image placeholders
         blogData = await restyleContent(
           researchResult.markdownContent,
-          topic,
-          tone,
+          titleDraft,
+          'professional',
           style,
           true // includeInlineImages = true for deep research
         );
 
         if (!blogData.title || !blogData.content) {
-          throw new Error("Blog content generation failed");
+          throw new Error("Blog content restyling failed");
         }
+
+        // Use the generated title from blogData (not the draft)
 
         // Parse and generate inline images
         const placeholders = this.parseImagePlaceholders(blogData.content);
@@ -8638,15 +8648,18 @@ ${emailDraftFormat === 'text'
         } else {
           finalContent = blogData.content;
         }
-
       } else {
         // ========================================
-        // STANDARD FLOW: Generate content only
+        // STANDARD FLOW: Generate content from draft
         // ========================================
-        console.log('AgentMode: Generating blog content with LLM...');
+        console.log('AgentMode: Generating blog content from draft with style:', style);
         blogData = await generateBlogContent(
-          topic, keywords, tone, length,
-          researchContext, requirements, style
+          titleDraft,
+          contentDraft,
+          length,
+          researchContext,
+          requirements,
+          style
         );
 
         if (!blogData.title || !blogData.content) {

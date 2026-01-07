@@ -154,9 +154,8 @@ interface BlogPostData {
 
 // Utility function to generate blog content (extracted from generateBlogPost)
 export async function generateBlogContent(
-  topic: string,
-  keywords: string = "",
-  tone: string = "professional",
+  titleDraft: string,
+  contentDraft: string,
   length: string = "medium",
   researchContext: string = "",
   requirements: string = "",
@@ -217,20 +216,26 @@ Substack-Style Writing Guidelines:
 - Use shorter paragraphs and sentences for better readability
 - Include transitions that feel natural, like "Here's what I've learned..." or "Let me share..."` : '';
 
-  // Generic blog prompt for content generation
-  let blogPrompt = `You are an expert marketing strategist and content writer. Create a high-quality, engaging blog post about: ${topic}
+  // Blog prompt for refining/polishing the draft content
+  let blogPrompt = `You are an expert marketing strategist and content writer. Refine and polish this draft blog article into a high-quality, engaging blog post.
+
+DRAFT TITLE:
+${titleDraft}
+
+DRAFT CONTENT:
+${contentDraft}
 
 Requirements:
-- Tone: ${tone} (be conversational but professional, avoid overly formal language)
 - Target length: approximately ${finalTargetWords} words (±10%). CRITICAL: The content must be comprehensive and meet this word count. Do not stop early.
-- Keywords to naturally include: ${keywords || "relevant industry keywords"}
+- Refine the title to be compelling and SEO-optimized
+- Polish the content to be publication-ready while preserving the core message and key points
 ${substackGuidelines}
 
 Content Guidelines:
 1. Write in a natural, human voice - avoid AI-generated patterns
 2. Use practical examples and actionable insights
 3. Structure with clear H2 and H3 headings (no H4+)
-4. If research context is provided, use it as a foundation but rewrite in your own voice
+4. If research context is provided, use it to enhance the content but maintain the draft's core message
 5. Avoid generic AI language - be specific, use real examples, and sound like a human expert
 6. Do NOT include the title as an H1 heading in the content - the title will be added separately
 7. Use tables, bullet points, numbered lists, or paragraphs for data presentation${isLongForm ? `
@@ -242,9 +247,9 @@ Content Guidelines:
 
 Format the response as JSON with this structure:
 {{
-  "title": "Compelling, SEO-optimized title",
+  "title": "Compelling, SEO-optimized title (refined from draft)",
   "description": "1-2 sentence meta description for SEO",
-  "content": "Full blog content in markdown format",
+  "content": "Full blog content in markdown format (polished from draft)",
   "imagePrompt": "Detailed visual description for hero image (avoid text, be conceptual)"
 }}`;
 
@@ -260,7 +265,7 @@ ${requirements}`;
   if (researchContext) {
     blogPrompt += `
 
-Research Context (use as foundation but rewrite naturally):
+Research Context (use to enhance the draft content):
 ${researchContext}`;
   }
 
@@ -318,30 +323,13 @@ CRITICAL REQUIREMENT: The article content must be approximately ${finalTargetWor
 
     return blogData;
   } catch (llmError: any) {
-    // Fallback to placeholder response if LLM fails
+    // Fallback to use the draft content if LLM fails
+    console.error('Error generating blog content:', llmError);
     return {
-      title: `Essential Guide: ${topic}`,
-      description: `A comprehensive guide to ${topic}, covering key strategies and practical implementation tips.`,
-      content: `# Essential Guide: ${topic}
-
-This guide covers the fundamentals of ${topic}.
-
-## Understanding ${topic}
-
-- Core concepts and principles
-- Why it matters
-- Key considerations for implementation
-
-## Practical Strategies
-
-- Step-by-step approach
-- Common challenges and solutions
-- Best practices
-
-## Getting Started
-
-This guide provides the essential information you need to get started with ${topic}.`,
-      imagePrompt: `A professional business illustration representing ${topic}. Clean, modern design with relevant visual elements. No text, conceptual business representation.`,
+      title: titleDraft || 'Blog Article',
+      description: `A comprehensive blog article covering key strategies and practical implementation tips.`,
+      content: contentDraft || '# Blog Article\n\nContent goes here.',
+      imagePrompt: `Professional illustration for an article titled "${titleDraft || 'Blog Article'}". Modern, clean design with relevant visual elements. No text, conceptual representation.`,
     };
   }
 }
@@ -954,7 +942,11 @@ export const generateBlogPost = async (req: AuthRequest, res: Response) => {
    - Link to https://www.agentweb.pro/pricing for cost discussions
 5. End with this exact CTA: "Ready to put your marketing on autopilot? [Book a call with Harsha](https://calendly.com/harsha-agentweb/30min) to walk through your current marketing workflow and see how AgentWeb can help you scale."`;
 
-      const blogData = await generateBlogContent(topic, keywords, tone, length, researchContext, agentWebRequirements);
+      // Create drafts from the topic for generateBlogContent
+      const titleDraft = topic;
+      const contentDraft = `# ${topic}\n\nThis article will cover ${topic}.`;
+      
+      const blogData = await generateBlogContent(titleDraft, contentDraft, length, researchContext, agentWebRequirements);
 
       console.log("✅ Content generation complete! Processing AI response...");
       console.log("✅ Content validation passed!");
