@@ -179,8 +179,8 @@ export class SocialMediaService implements ToolService {
     mediaUrls: string[] = []
   ): Promise<any> {
     try {
-      const { getAccountById, isTokenValid } = await import('../../connectedAccountsDb');
-      const { socialPlatformService } = await import('../../socialPlatformService');
+      const { getAccountById, isTokenValid } = await import('../connectedAccountsDb');
+      const { socialPlatformService } = await import('../socialPlatformService');
 
       try {
         const account = await getAccountById(accountId, userId);
