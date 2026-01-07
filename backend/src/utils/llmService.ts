@@ -157,6 +157,63 @@ export class LLMService {
       throw error;
     }
   }
+
+  /**
+   * Generate HTML content with required output format
+   * @param systemPrompt System prompt for HTML generation
+   * @param userPrompt User prompt with HTML requirements
+   * @returns The generated HTML content as a string
+   */
+  async generateHTML(
+    systemPrompt: string,
+    userPrompt: string
+  ): Promise<string> {
+    try {
+      const htmlSystemPrompt = `${systemPrompt}
+
+CRITICAL: You MUST wrap your HTML output in the following XML tags:
+<actual_html_content>
+[Your complete HTML code here]
+</actual_html_content>
+
+The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head, and body sections.`;
+
+      const prompt = ChatPromptTemplate.fromMessages([
+        ['system', htmlSystemPrompt],
+        ['user', userPrompt],
+      ]);
+
+      const chain = prompt.pipe(this.chatModel);
+      const response = await chain.invoke({}) as { content: string };
+      const rawResponse = response.content;
+
+      // Extract HTML from <actual_html_content> tags
+      const htmlMatch = rawResponse.match(/<actual_html_content>([\s\S]*?)<\/actual_html_content>/i);
+      if (htmlMatch && htmlMatch[1]) {
+        return htmlMatch[1].trim();
+      }
+
+      // Fallback: if tags are not found, try to extract HTML directly
+      // Look for DOCTYPE or <html> tag
+      const htmlStart = rawResponse.search(/<!DOCTYPE|<html/i);
+      if (htmlStart !== -1) {
+        const extractedHtml = rawResponse.substring(htmlStart).trim();
+        // Try to find the end of the HTML document
+        const htmlEnd = extractedHtml.lastIndexOf('</html>');
+        if (htmlEnd !== -1) {
+          return extractedHtml.substring(0, htmlEnd + '</html>'.length).trim();
+        }
+        return extractedHtml;
+      }
+
+      // If no HTML structure found, return the raw response as fallback
+      console.warn('LLMService: Could not extract HTML from response, returning raw content');
+      return rawResponse.trim();
+    } catch (error) {
+      console.error('LLMService: Error generating HTML:', error);
+      throw error;
+    }
+  }
 }
 
 /**

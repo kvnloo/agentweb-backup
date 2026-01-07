@@ -2247,6 +2247,31 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'create_html_file',
+          description: 'Create a well-formatted HTML file from a title, content draft, and format requirements. Uses LLM to generate professional HTML with proper structure, styling, and formatting.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the HTML document/page'
+              },
+              content_draft: {
+                type: 'string',
+                description: 'The draft content to be formatted into HTML. This can be plain text, markdown, or unstructured content.'
+              },
+              format_requirements: {
+                type: 'string',
+                description: 'Optional specific formatting requirements, styling preferences, or design guidelines for the HTML output. Examples: "modern minimalist design", "include responsive CSS", "use dark theme", etc.'
+              }
+            },
+            required: ['title', 'content_draft']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_work_plan',
           description: 'Create a multi-step work plan for the current chat session. Use this to organize complex projects like client onboarding, campaign planning, or content creation workflows. IMPORTANT: Check if a work plan already exists in the session context before creating a new one. If a work plan already exists, use modify_work_plan instead to add or update steps.',
           parameters: {
@@ -3442,6 +3467,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
           };
         }
 
+      case 'create_html_file':
+        // Mock validation
+        if (!args.title) {
+          return {
+            success: false,
+            message: 'title is required'
+          };
+        }
+        if (!args.content_draft) {
+          return {
+            success: false,
+            message: 'content_draft is required'
+          };
+        }
+        return {
+          success: true,
+          s3_url: `https://mock-s3-bucket.s3.amazonaws.com/html_${Date.now()}_${args.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`,
+          filename: `html_${Date.now()}_${args.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`,
+          title: args.title,
+          message: 'Mock HTML file created successfully'
+        };
+
       default:
         return {
           success: true,
@@ -3673,6 +3720,27 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
 
         return await this.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, userId, sessionId);
+      case 'create_html_file':
+        // Ensure we have the required parameters
+        if (!args.title) {
+          return {
+            success: false,
+            message: 'title is required'
+          };
+        }
+        if (!args.content_draft) {
+          return {
+            success: false,
+            message: 'content_draft is required'
+          };
+        }
+        return await this.createHtmlFile(
+          args.title,
+          args.content_draft,
+          args.format_requirements || '',
+          userId,
+          sessionId
+        );
       case 'create_work_plan':
         return await this.createWorkPlan(args.title, args.steps, sessionId);
       case 'modify_work_plan':
@@ -10239,6 +10307,87 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       return {
         success: false,
         message: 'Failed to create email HTML from template',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  private async createHtmlFile(
+    title: string,
+    contentDraft: string,
+    formatRequirements: string,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Use Claude model by default (check for Claude in model name)
+      const defaultClaudeModel = 'anthropic.claude-sonnet-4-5-20250929-v1:0';
+      
+      // Import LLMService
+      const { createLLMService } = await import('../utils/llmService');
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 4000);
+
+      // Build system prompt for HTML generation
+      const systemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
+
+Requirements:
+- Create a complete, valid HTML5 document with proper DOCTYPE, html, head, and body tags
+- Include appropriate meta tags for charset, viewport, and SEO
+- Add modern, clean CSS styling (embedded in <style> tag or inline as appropriate)
+- Ensure the HTML is responsive and works well on different screen sizes
+- Use semantic HTML5 elements where appropriate
+- Make the design professional and visually appealing
+- Ensure proper typography, spacing, and color scheme
+- Include the title in an appropriate heading element
+- Format the content draft into well-structured HTML with proper paragraphs, headings, lists, etc. as needed
+${formatRequirements ? `\nAdditional Format Requirements:\n${formatRequirements}` : ''}
+
+The HTML should be production-ready and well-formatted.`;
+
+      // Build user prompt
+      const userPrompt = `Create a well-formatted HTML document with the following:
+
+Title: ${title}
+
+Content Draft:
+${contentDraft}
+
+${formatRequirements ? `\nFormat Requirements:\n${formatRequirements}` : ''}
+
+Please generate a complete, professional HTML document that properly formats and presents this content.`;
+
+      // Generate HTML using LLMService
+      console.log('AgentMode: Generating HTML file with LLMService (Claude model)');
+      const htmlContent = await llmService.generateHTML(systemPrompt, userPrompt);
+
+      if (!htmlContent || htmlContent.trim().length === 0) {
+        throw new Error('LLM did not generate HTML content');
+      }
+
+      // Upload to S3
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      const uploadResult = await uploadFileToS3(htmlContent, filename, userId, 'text/html');
+
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+      }
+
+      const s3Url = uploadResult.url;
+      console.log('AgentMode: HTML file created and uploaded successfully to:', s3Url);
+
+      return {
+        success: true,
+        s3_url: s3Url,
+        filename: filename,
+        title: title,
+        message: 'HTML file created successfully'
+      };
+    } catch (error) {
+      console.error('Error creating HTML file:', error);
+      return {
+        success: false,
+        message: 'Failed to create HTML file',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
