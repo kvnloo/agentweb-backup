@@ -105,6 +105,10 @@ router.get('/session/:sessionId', asyncHandler(agentModeController.getSession));
 // Update session LLM model
 router.patch('/session/:sessionId/llm-model', asyncHandlerAuth(agentModeController.updateSessionLlmModel));
 
+// PATCH /api/agent-mode/session/:sessionId/title
+// Update session title
+router.patch('/session/:sessionId/title', asyncHandlerAuth(agentModeController.updateSessionTitle));
+
 // GET /api/agent-mode/function-calls
 // Get available function calls for benchmark tests
 router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunctionCalls));
