@@ -22,7 +22,7 @@ describe('Agent Mode Controller - Update Session Title', () => {
     userId: 'admin-123',
     email: 'admin@example.com',
     isAdmin: true,
-    roles: ['admin']
+    roles: ['partner']
   };
 
   const mockSession = {
