@@ -51,8 +51,9 @@ describe('KnowledgeBaseService', () => {
 
       expect(searchPlatformKnowledgeBase).toHaveBeenCalledWith('query', 5, 'user1');
       expect(result.success).toBe(true);
+      expect(result.results).toBeDefined();
       expect(result.results).toHaveLength(1);
-      expect(result.results[0].content).toBe('test content');
+      expect(result.results![0].content).toBe('test content');
     });
   });
 

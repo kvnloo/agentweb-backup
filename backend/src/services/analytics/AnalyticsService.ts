@@ -205,7 +205,7 @@ export class AnalyticsService implements ToolService {
   async getTaskSubscriberEngagementEvents(taskId: string, emailSubject: string | undefined, userId: string): Promise<any> {
     try {
       const { TaskSubscriberMetricsService } = await import('../taskSubscriberMetricsService');
-      const events = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
+      const events = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents(taskId, emailSubject || '', userId);
       return events;
     } catch (error: any) {
       console.error('AnalyticsService: Error getting engagement events:', error);
@@ -249,7 +249,7 @@ export class AnalyticsService implements ToolService {
   async loadConnectedAccountMetrics(userId: string, accountId: string): Promise<any> {
     try {
       const { getAccountById, isTokenValid } = await import('../connectedAccountsDb');
-      const { socialPlatformService } = await import('../../socialPlatformService');
+      const { socialPlatformService } = await import('../socialPlatformService');
 
       const account = await getAccountById(accountId, userId);
       if (!account) {
@@ -279,7 +279,7 @@ export class AnalyticsService implements ToolService {
   async listConnectedAccountPosts(userId: string, accountId: string, options: any): Promise<any> {
     try {
       const { getAccountById, isTokenValid } = await import('../connectedAccountsDb');
-      const { socialPlatformService } = await import('../../socialPlatformService');
+      const { socialPlatformService } = await import('../socialPlatformService');
       
       const account = await getAccountById(accountId, userId);
       if (!account) {
@@ -291,7 +291,7 @@ export class AnalyticsService implements ToolService {
       }
 
       const adapter = socialPlatformService.getAdapter(account.platform);
-      const posts = await adapter.getPosts(account, options?.limit || 10);
+      const posts = await adapter.listPosts(account, { limit: options?.limit || 10 });
       
       return {
         success: true,
