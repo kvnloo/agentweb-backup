@@ -11,8 +11,9 @@ dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 import { AgentModeService } from '../services/agentModeService';
 import { AgentModeServiceV2 } from '../services/AgentModeServiceV2';
 
-// Feature flag: Set USE_AGENT_V2=true to use the new modular architecture
-const USE_AGENT_V2 = process.env.USE_AGENT_V2 === 'true';
+// Feature flag: USE_AGENT_V2 defaults to true (new modular architecture)
+// Set USE_AGENT_V2=false explicitly to use the legacy service
+const USE_AGENT_V2 = process.env.USE_AGENT_V2 !== 'false';
 
 // Log immediately at startup
 console.log('='.repeat(60));
