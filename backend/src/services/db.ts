@@ -28,7 +28,7 @@ AWS.config.update({
   },
 });
 
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+export const dynamodb = new AWS.DynamoDB.DocumentClient();
 const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 
 // Initialize S3 client
