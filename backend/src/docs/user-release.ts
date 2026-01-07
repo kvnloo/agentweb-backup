@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-07',
+    changes: [
+      'Updated create_blog_article function to use title_draft and content_draft parameters',
+      '- This allows Emma to refine and polish existing draft content rather than generating from scratch',
+      '- It increases the bandwidth of Emma to blog content agents',
+    ],
+  },
+  {
     date: '2026-01-06',
     changes: [
       'Optimized Scheduled Chat Run History storage to mitigate database size limits',

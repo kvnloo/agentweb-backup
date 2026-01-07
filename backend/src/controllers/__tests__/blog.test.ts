@@ -91,9 +91,8 @@ describe('Blog Controller - generateBlogContent', () => {
       mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
       const result = await generateBlogContent(
-        'Test Topic',
-        'keyword1',
-        'conversational',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -132,9 +131,8 @@ describe('Blog Controller - generateBlogContent', () => {
       mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
       const result = await generateBlogContent(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -168,9 +166,8 @@ describe('Blog Controller - generateBlogContent', () => {
       mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
       const result = await generateBlogContent(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         ''
@@ -201,9 +198,8 @@ describe('Blog Controller - generateBlogContent', () => {
       mockGenerateJSONContent.mockResolvedValue(mockResponse);
 
       const result = await generateBlogContent(
-        'My Topic',
-        'seo, keywords',
-        'casual',
+        'My Title Draft',
+        '# My Content Draft with seo, keywords',
         'long',
         'Research context here',
         'Special requirements',
@@ -214,9 +210,8 @@ describe('Blog Controller - generateBlogContent', () => {
       const userPrompt = callArgs[1];
 
       // Verify all parameters are in the prompt
-      expect(userPrompt).toContain('My Topic');
-      expect(userPrompt).toContain('seo, keywords');
-      expect(userPrompt).toContain('casual');
+      expect(userPrompt).toContain('My Title Draft');
+      expect(userPrompt).toContain('My Content Draft with seo, keywords');
       expect(userPrompt).toContain('long');
       expect(userPrompt).toContain('Research context here');
       expect(userPrompt).toContain('Special requirements');

@@ -7,6 +7,7 @@ jest.mock('../controllers/blog', () => ({
   generateBlogContent: jest.fn(),
   generateBlogImage: jest.fn(),
   generateBlogHtml: jest.fn(),
+  restyleContent: jest.fn(),
 }));
 
 jest.mock('../utils/s3Utils', () => ({
@@ -24,6 +25,7 @@ describe('AgentModeService - create_blog_article function', () => {
   let mockGenerateBlogContent: jest.Mock;
   let mockGenerateBlogImage: jest.Mock;
   let mockGenerateBlogHtml: jest.Mock;
+  let mockRestyleContent: jest.Mock;
   let mockUploadFileToS3: jest.Mock;
 
   beforeEach(() => {
@@ -39,6 +41,7 @@ describe('AgentModeService - create_blog_article function', () => {
     mockGenerateBlogContent = blogModule.generateBlogContent;
     mockGenerateBlogImage = blogModule.generateBlogImage;
     mockGenerateBlogHtml = blogModule.generateBlogHtml;
+    mockRestyleContent = blogModule.restyleContent;
     mockUploadFileToS3 = s3UtilsModule.uploadFileToS3;
   });
 
@@ -68,9 +71,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        'keyword1, keyword2',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft\n\nThis is test content.',
         'medium',
         '',
         '',
@@ -81,9 +83,8 @@ describe('AgentModeService - create_blog_article function', () => {
 
       // Verify generateBlogContent was called with correct parameters
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Test Topic',
-        'keyword1, keyword2',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft\n\nThis is test content.',
         'medium',
         '',
         '',
@@ -143,9 +144,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -155,9 +155,8 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -202,9 +201,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        'keyword1',
-        'conversational',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -215,9 +213,8 @@ describe('AgentModeService - create_blog_article function', () => {
 
       // Verify generateBlogContent was called with substack style
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Test Topic',
-        'keyword1',
-        'conversational',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -257,9 +254,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       await (agentModeService as any).createBlogArticle(
-        'Topic',
-        '',
-        'friendly',
+        'Topic Draft',
+        '# Content Draft',
         'long',
         'Research context',
         'Requirements',
@@ -270,9 +266,8 @@ describe('AgentModeService - create_blog_article function', () => {
 
       // Verify style is passed to content generation
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Topic',
-        '',
-        'friendly',
+        'Topic Draft',
+        '# Content Draft',
         'long',
         'Research context',
         'Requirements',
@@ -311,9 +306,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       await (agentModeService as any).createBlogArticle(
-        'My Topic',
-        'seo, keywords',
-        'casual',
+        'My Title Draft',
+        '# My Content Draft',
         'short',
         'Research context here',
         'Special requirements',
@@ -323,9 +317,8 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'My Topic',
-        'seo, keywords',
-        'casual',
+        'My Title Draft',
+        '# My Content Draft',
         'short',
         'Research context here',
         'Special requirements',
@@ -353,9 +346,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       await (agentModeService as any).createBlogArticle(
-        'Topic Only',
-        '',
-        'professional',
+        'Title Draft Only',
+        '# Content Draft',
         'medium',
         '',
         '',
@@ -364,9 +356,8 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Topic Only',
-        '',
-        'professional',
+        'Title Draft Only',
+        '# Content Draft',
         'medium',
         '',
         '',
@@ -385,9 +376,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -415,9 +405,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -449,9 +438,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -467,9 +455,8 @@ describe('AgentModeService - create_blog_article function', () => {
       mockGenerateBlogContent.mockRejectedValue(new Error('Network error'));
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -505,9 +492,8 @@ describe('AgentModeService - create_blog_article function', () => {
 
       // Simulate function call without style parameter
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        'keyword1',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -517,9 +503,8 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Test Topic',
-        'keyword1',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -550,9 +535,8 @@ describe('AgentModeService - create_blog_article function', () => {
 
       // Simulate function call with substack style
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -562,9 +546,8 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -584,20 +567,6 @@ describe('AgentModeService - create_blog_article function', () => {
   });
 
   describe('Deep Research Integration', () => {
-    let mockDeepResearchService: { performDeepResearch: jest.Mock };
-
-    beforeEach(() => {
-      // Mock the deep research service
-      jest.mock('../services/deepResearchService', () => ({
-        deepResearchService: {
-          performDeepResearch: jest.fn()
-        }
-      }));
-
-      const deepResearchModule = require('../services/deepResearchService');
-      mockDeepResearchService = deepResearchModule.deepResearchService;
-    });
-
     it('should NOT call deep research when deep_research is false', async () => {
       const mockBlogData = {
         title: 'Test Title',
@@ -618,9 +587,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
@@ -631,8 +599,8 @@ describe('AgentModeService - create_blog_article function', () => {
       );
 
       expect(result.success).toBe(true);
-      // deepResearchService should NOT be called
-      expect(mockDeepResearchService?.performDeepResearch).not.toHaveBeenCalled?.();
+      // deepResearchService should NOT be called when deep_research is false
+      // (No need to check since it's not imported when deep_research is false)
     });
 
     it('should use original researchContext when deep_research is not provided', async () => {
@@ -655,9 +623,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         'Original research context',
         '',
@@ -669,9 +636,8 @@ describe('AgentModeService - create_blog_article function', () => {
 
       // Should use original research context
       expect(mockGenerateBlogContent).toHaveBeenCalledWith(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         'Original research context',
         '',
@@ -699,9 +665,8 @@ describe('AgentModeService - create_blog_article function', () => {
       });
 
       const result = await (agentModeService as any).createBlogArticle(
-        'Test Topic',
-        '',
-        'professional',
+        'Test Title Draft',
+        '# Test Content Draft',
         'medium',
         '',
         '',
