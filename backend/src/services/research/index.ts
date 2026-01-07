@@ -17,4 +17,5 @@ export {
   KnowledgeBaseFile, 
   KnowledgeBaseSearchResult 
 } from './KnowledgeBaseService';
-\nexport { DeepResearchService, deepResearchService } from './DeepResearchService';
+
+export { DeepResearchService, deepResearchService } from './DeepResearchService';
