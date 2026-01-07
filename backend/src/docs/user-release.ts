@@ -18,6 +18,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Visual feedback shows when files are being dragged over the drop zone',
       '- Users can copy files from their system (Finder/File Explorer) and paste them into the chat input field as attachments',
       '- Paste only processes files when the cursor is in the input field, allowing normal text pasting to work as expected',
+      'Added create_html_file function call in Agent Mode',
+      '- Emma can now create well-formatted HTML files from title, content draft, and optional format requirements',
+      '- Uses Claude model (default) via LLMService to generate professional HTML with proper structure and styling',
     ],
   },
   {
