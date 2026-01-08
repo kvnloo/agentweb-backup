@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
@@ -5579,46 +5579,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const savePredefinedWorkPlans = async () => {
-    try {
-      setSavingWorkPlans(true);
-      setError('');
-      setSuccess('');
-      
-      // Validate work plans
-      const validatedWorkPlans = predefinedWorkPlans.map(workPlan => ({
-        title: workPlan.title.trim(),
-        welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: workPlan.autocomplete || false,
-        requireLogin: workPlan.requireLogin || false,
-        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
-        steps: workPlan.steps
-          .filter(step => step.title.trim().length > 0)
-          .map((step, index) => ({
-            stepCount: index + 1,
-            title: step.title.trim(),
-            description: step.description?.trim() || undefined,
-            requiredFunctionCalls: step.requiredFunctionCalls?.filter(f => f.trim().length > 0) || undefined
-          }))
-      })).filter(workPlan => workPlan.title.length > 0 && workPlan.steps.length > 0);
-      
-      await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-        settingValue: JSON.stringify(validatedWorkPlans),
-        description: 'Agent Mode predefined work plans for Emma AI assistant'
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      setPredefinedWorkPlans(validatedWorkPlans);
-      setSuccess('Predefined work plans updated successfully!');
-    } catch (error) {
-      console.error('Error saving predefined work plans:', error);
-      setError('Failed to save predefined work plans');
-    } finally {
-      setSavingWorkPlans(false);
-    }
-  };
-
   const saveIndividualWorkPlan = async (workPlanIndex: number) => {
     const workPlan = predefinedWorkPlans[workPlanIndex];
     if (!workPlan) {
@@ -5788,7 +5748,7 @@ const AgentModeSettings = () => {
     ]);
     
     // Set the newly added plan ID to trigger scroll
-    setNewlyAddedPlanId(newWorkPlan.id);
+    setNewlyAddedPlanId(newWorkPlan.id || null);
   };
 
   const removeWorkPlan = async (index: number) => {
