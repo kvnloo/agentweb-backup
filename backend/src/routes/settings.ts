@@ -353,6 +353,223 @@ router.delete('/:settingName', authenticateToken, requireAdmin, async (req, res)
   }
 });
 
+// Individual Work Plan endpoints - MUST be before /:settingName route to avoid conflicts
+// These endpoints allow saving individual work plans to prevent conflicts when multiple admins edit different plans
+
+// Get a specific work plan by ID
+router.get('/agent-mode-predefined-workplans/:planId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+    
+    if (!setting || !setting.settingValue) {
+      return res.status(404).json({ error: 'No predefined work plans found' });
+    }
+    
+    const workPlans = JSON.parse(setting.settingValue);
+    const workPlan = workPlans.find((wp: any) => wp.id === planId);
+    
+    if (!workPlan) {
+      return res.status(404).json({ error: 'Work plan not found' });
+    }
+    
+    res.json(workPlan);
+  } catch (error) {
+    console.error('Error getting work plan:', error);
+    res.status(500).json({ error: 'Failed to get work plan' });
+  }
+});
+
+// Create a new work plan
+router.post('/agent-mode-predefined-workplans', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const workPlan = req.body;
+    const updatedBy = req.user?.email || 'unknown';
+    
+    if (!workPlan.title || !workPlan.steps || !Array.isArray(workPlan.steps)) {
+      return res.status(400).json({ error: 'title and steps are required' });
+    }
+    
+    // Generate ID if not provided
+    if (!workPlan.id) {
+      workPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+    
+    // Validate and normalize the work plan
+    const validatedWorkPlan = {
+      id: workPlan.id,
+      title: workPlan.title.trim(),
+      welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
+      autocomplete: workPlan.autocomplete || false,
+      requireLogin: workPlan.requireLogin || false,
+      showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+      steps: workPlan.steps
+        .filter((step: any) => step.title && step.title.trim().length > 0)
+        .map((step: any, index: number) => ({
+          stepCount: index + 1,
+          title: step.title.trim(),
+          description: step.description?.trim() || undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls?.filter((f: string) => f.trim().length > 0) || undefined
+        }))
+    };
+    
+    if (validatedWorkPlan.title.length === 0 || validatedWorkPlan.steps.length === 0) {
+      return res.status(400).json({ error: 'Work plan must have a title and at least one step' });
+    }
+    
+    // Get existing work plans
+    const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+    let workPlans = [];
+    
+    if (setting && setting.settingValue) {
+      try {
+        workPlans = JSON.parse(setting.settingValue);
+      } catch (error) {
+        console.error('Error parsing existing work plans:', error);
+        workPlans = [];
+      }
+    }
+    
+    // Check if ID already exists
+    if (workPlans.some((wp: any) => wp.id === validatedWorkPlan.id)) {
+      return res.status(409).json({ error: 'Work plan with this ID already exists' });
+    }
+    
+    // Add the new work plan
+    workPlans.push(validatedWorkPlan);
+    
+    // Save back to settings
+    await settingsService.setSetting(
+      'agent-mode-predefined-workplans',
+      JSON.stringify(workPlans),
+      'Agent Mode predefined work plans for Emma AI assistant',
+      updatedBy
+    );
+    
+    res.json({ success: true, workPlan: validatedWorkPlan });
+  } catch (error) {
+    console.error('Error creating work plan:', error);
+    res.status(500).json({ error: 'Failed to create work plan' });
+  }
+});
+
+// Update a specific work plan
+router.put('/agent-mode-predefined-workplans/:planId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const workPlan = req.body;
+    const updatedBy = req.user?.email || 'unknown';
+    
+    if (!workPlan.title || !workPlan.steps || !Array.isArray(workPlan.steps)) {
+      return res.status(400).json({ error: 'title and steps are required' });
+    }
+    
+    // Get existing work plans
+    const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+    
+    if (!setting || !setting.settingValue) {
+      return res.status(404).json({ error: 'No predefined work plans found' });
+    }
+    
+    let workPlans = [];
+    try {
+      workPlans = JSON.parse(setting.settingValue);
+    } catch (error) {
+      console.error('Error parsing existing work plans:', error);
+      return res.status(500).json({ error: 'Failed to parse existing work plans' });
+    }
+    
+    // Find the work plan index
+    const planIndex = workPlans.findIndex((wp: any) => wp.id === planId);
+    
+    if (planIndex === -1) {
+      return res.status(404).json({ error: 'Work plan not found' });
+    }
+    
+    // Validate and normalize the work plan
+    const validatedWorkPlan = {
+      id: planId, // Preserve the ID
+      title: workPlan.title.trim(),
+      welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
+      autocomplete: workPlan.autocomplete || false,
+      requireLogin: workPlan.requireLogin || false,
+      showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+      steps: workPlan.steps
+        .filter((step: any) => step.title && step.title.trim().length > 0)
+        .map((step: any, index: number) => ({
+          stepCount: index + 1,
+          title: step.title.trim(),
+          description: step.description?.trim() || undefined,
+          requiredFunctionCalls: step.requiredFunctionCalls?.filter((f: string) => f.trim().length > 0) || undefined
+        }))
+    };
+    
+    if (validatedWorkPlan.title.length === 0 || validatedWorkPlan.steps.length === 0) {
+      return res.status(400).json({ error: 'Work plan must have a title and at least one step' });
+    }
+    
+    // Update the work plan in the array
+    workPlans[planIndex] = validatedWorkPlan;
+    
+    // Save back to settings
+    await settingsService.setSetting(
+      'agent-mode-predefined-workplans',
+      JSON.stringify(workPlans),
+      'Agent Mode predefined work plans for Emma AI assistant',
+      updatedBy
+    );
+    
+    res.json({ success: true, workPlan: validatedWorkPlan });
+  } catch (error) {
+    console.error('Error updating work plan:', error);
+    res.status(500).json({ error: 'Failed to update work plan' });
+  }
+});
+
+// Delete a specific work plan
+router.delete('/agent-mode-predefined-workplans/:planId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const updatedBy = req.user?.email || 'unknown';
+    
+    // Get existing work plans
+    const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+    
+    if (!setting || !setting.settingValue) {
+      return res.status(404).json({ error: 'No predefined work plans found' });
+    }
+    
+    let workPlans = [];
+    try {
+      workPlans = JSON.parse(setting.settingValue);
+    } catch (error) {
+      console.error('Error parsing existing work plans:', error);
+      return res.status(500).json({ error: 'Failed to parse existing work plans' });
+    }
+    
+    // Filter out the work plan to delete
+    const initialLength = workPlans.length;
+    workPlans = workPlans.filter((wp: any) => wp.id !== planId);
+    
+    if (workPlans.length === initialLength) {
+      return res.status(404).json({ error: 'Work plan not found' });
+    }
+    
+    // Save back to settings
+    await settingsService.setSetting(
+      'agent-mode-predefined-workplans',
+      JSON.stringify(workPlans),
+      'Agent Mode predefined work plans for Emma AI assistant',
+      updatedBy
+    );
+    
+    res.json({ success: true, message: 'Work plan deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting work plan:', error);
+    res.status(500).json({ error: 'Failed to delete work plan' });
+  }
+});
+
 // These are intentionally placed after export for clarity but will still be registered.
 
 // Get email_campaign_tasks (customer accessible)

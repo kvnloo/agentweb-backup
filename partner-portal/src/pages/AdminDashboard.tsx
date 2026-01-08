@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useAdmin } from "../contexts/AdminContext";
 import { Link as RouterLink, useSearchParams } from "react-router-dom";
 import {
@@ -5056,6 +5056,7 @@ interface WorkPlanStep {
 }
 
 interface PredefinedWorkPlan {
+  id?: string;
   title: string;
   steps: WorkPlanStep[];
   welcomeMessage?: string;
@@ -5086,15 +5087,39 @@ const AgentModeSettings = () => {
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
   const [savingWorkPlans, setSavingWorkPlans] = useState(false);
+  const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
+  const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
+  const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
   useEffect(() => {
     loadAllSettings();
   }, []);
+
+  // Scroll to newly added work plan
+  useEffect(() => {
+    if (newlyAddedPlanId) {
+      // Use setTimeout to ensure DOM is updated
+      setTimeout(() => {
+        const element = document.getElementById(`work-plan-${newlyAddedPlanId}`);
+        if (element) {
+          element.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          // Focus on the title field for better UX
+          const titleInput = element.querySelector('input[type="text"]') as HTMLInputElement;
+          if (titleInput) {
+            titleInput.focus();
+          }
+        }
+        // Clear the newly added plan ID after scrolling
+        setNewlyAddedPlanId(null);
+      }, 100);
+    }
+  }, [newlyAddedPlanId, predefinedWorkPlans]);
 
   const loadAllSettings = async () => {
     try {
@@ -5291,6 +5316,7 @@ const AgentModeSettings = () => {
   };
 
   const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
+    id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
     autocomplete: false,
     requireLogin: false,
     showLoginSignup: 'after_plan_completed',
@@ -5340,20 +5366,30 @@ const AgentModeSettings = () => {
         if (response.data && response.data.settingValue) {
           const workPlans = JSON.parse(response.data.settingValue);
           
+          // Ensure all work plans have IDs (for backward compatibility)
+          const workPlansWithIds = workPlans.map((wp: PredefinedWorkPlan) => {
+            if (!wp.id) {
+              // Generate ID from title or create a new one
+              wp.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            }
+            return wp;
+          });
+          
           // Check if "Onboarding" work plan already exists
-          const hasOnboarding = workPlans.some((wp: PredefinedWorkPlan) => 
+          const hasOnboarding = workPlansWithIds.some((wp: PredefinedWorkPlan) => 
             wp.title.toLowerCase() === 'onboarding'
           );
           
           // If no Onboarding plan exists, add the default one
           if (!hasOnboarding) {
             const defaultOnboardingPlan = getDefaultOnboardingPlan();
-            workPlans.push(defaultOnboardingPlan);
+            defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            workPlansWithIds.push(defaultOnboardingPlan);
             
             // Save the updated work plans with the default Onboarding plan
             try {
               await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-                settingValue: JSON.stringify(workPlans),
+                settingValue: JSON.stringify(workPlansWithIds),
                 description: 'Agent Mode predefined work plans for Emma AI assistant'
               }, {
                 headers: { Authorization: `Bearer ${token}` }
@@ -5364,13 +5400,14 @@ const AgentModeSettings = () => {
             }
           }
           
-          setPredefinedWorkPlans(workPlans);
+          setPredefinedWorkPlans(workPlansWithIds);
           return;
         }
       } catch (settingsError: any) {
         // If setting doesn't exist (404), create default Onboarding plan
         if (settingsError.response?.status === 404) {
           const defaultOnboardingPlan = getDefaultOnboardingPlan();
+          defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           
           // Try to save the default Onboarding plan
           try {
@@ -5582,21 +5619,212 @@ const AgentModeSettings = () => {
     }
   };
 
-  const addWorkPlan = () => {
-    setPredefinedWorkPlans([
-      ...predefinedWorkPlans,
-      {
-        title: '',
-        steps: [{ stepCount: 1, title: '' }],
-        autocomplete: false,
-        requireLogin: false,
-        showLoginSignup: 'after_plan_completed'
+  const saveIndividualWorkPlan = async (workPlanIndex: number) => {
+    const workPlan = predefinedWorkPlans[workPlanIndex];
+    if (!workPlan) {
+      setError('Work plan not found');
+      return;
+    }
+
+    // Generate ID if it doesn't exist (for new plans)
+    const planId = workPlan.id || `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    // Clear previous messages
+    setError('');
+    setSuccess('');
+    setWorkPlanErrors(prev => {
+      const updated = { ...prev };
+      delete updated[planId];
+      return updated;
+    });
+    
+    try {
+      setSavingWorkPlanId(planId);
+      setSavingWorkPlanIndex(workPlanIndex);
+      
+      // Validate work plan title
+      if (workPlan.title.trim().length === 0) {
+        const errorMsg = 'Work plan must have a title';
+        setError(errorMsg);
+        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
+        setSavingWorkPlanId(null);
+        setSavingWorkPlanIndex(null);
+        // Scroll to the work plan
+        setTimeout(() => {
+          const workPlanCard = document.getElementById(`work-plan-${planId}`);
+          if (workPlanCard) {
+            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        }, 100);
+        return;
       }
-    ]);
+      
+      // Validate that at least one step exists
+      if (!workPlan.steps || workPlan.steps.length === 0) {
+        const errorMsg = 'Work plan must have at least one step';
+        setError(errorMsg);
+        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
+        setSavingWorkPlanId(null);
+        setSavingWorkPlanIndex(null);
+        setTimeout(() => {
+          const workPlanCard = document.getElementById(`work-plan-${planId}`);
+          if (workPlanCard) {
+            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        }, 100);
+        return;
+      }
+      
+      // Validate that the first step has a title (first step is required)
+      if (!workPlan.steps[0] || workPlan.steps[0].title.trim().length === 0) {
+        const errorMsg = 'The first step is required and must have a title';
+        setError(errorMsg);
+        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
+        setSavingWorkPlanId(null);
+        setSavingWorkPlanIndex(null);
+        // Scroll to the first step input field
+        setTimeout(() => {
+          const workPlanCard = document.getElementById(`work-plan-${planId}`);
+          if (workPlanCard) {
+            const firstStepInput = workPlanCard.querySelector('input[placeholder*="Step Title"]') as HTMLInputElement;
+            if (firstStepInput) {
+              firstStepInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+              firstStepInput.focus();
+            } else {
+              workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+          }
+        }, 100);
+        return;
+      }
+      
+      // Validate work plan
+      const validatedWorkPlan = {
+        id: planId,
+        title: workPlan.title.trim(),
+        welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
+        autocomplete: workPlan.autocomplete || false,
+        requireLogin: workPlan.requireLogin || false,
+        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+        steps: workPlan.steps
+          .filter(step => step.title.trim().length > 0)
+          .map((step, index) => ({
+            stepCount: index + 1,
+            title: step.title.trim(),
+            description: step.description?.trim() || undefined,
+            requiredFunctionCalls: step.requiredFunctionCalls?.filter(f => f.trim().length > 0) || undefined
+          }))
+      };
+
+      // Final validation after filtering
+      if (validatedWorkPlan.steps.length === 0) {
+        const errorMsg = 'Work plan must have at least one step with a title';
+        setError(errorMsg);
+        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
+        setSavingWorkPlanId(null);
+        setSavingWorkPlanIndex(null);
+        setTimeout(() => {
+          const workPlanCard = document.getElementById(`work-plan-${planId}`);
+          if (workPlanCard) {
+            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        }, 100);
+        return;
+      }
+      
+      // Try PUT first (for existing plans), fall back to POST if plan doesn't exist (404)
+      try {
+        // Try to update existing work plan
+        await axios.put(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${planId}`), validatedWorkPlan, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } catch (putError: any) {
+        // If PUT fails with 404, the plan doesn't exist yet, so create it with POST
+        if (putError.response?.status === 404) {
+          await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), validatedWorkPlan, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+        } else {
+          // Re-throw other errors
+          throw putError;
+        }
+      }
+      
+      // Update local state with the validated plan (including the ID)
+      const updated = [...predefinedWorkPlans];
+      updated[workPlanIndex] = validatedWorkPlan;
+      setPredefinedWorkPlans(updated);
+      setSuccess(`Work plan "${validatedWorkPlan.title}" saved successfully!`);
+      // Clear any work plan specific errors
+      setWorkPlanErrors(prev => {
+        const updated = { ...prev };
+        delete updated[planId];
+        return updated;
+      });
+    } catch (error: any) {
+      console.error('Error saving work plan:', error);
+      const errorMessage = error.response?.data?.error || 'Failed to save work plan';
+      setError(errorMessage);
+      setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMessage }));
+    } finally {
+      setSavingWorkPlanId(null);
+      setSavingWorkPlanIndex(null);
+    }
   };
 
-  const removeWorkPlan = (index: number) => {
+  const addWorkPlan = async () => {
+    const newWorkPlan: PredefinedWorkPlan = {
+      id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      title: '',
+      steps: [{ stepCount: 1, title: '' }],
+      autocomplete: false,
+      requireLogin: false,
+      showLoginSignup: 'after_plan_completed'
+    };
+    
+    setPredefinedWorkPlans([
+      ...predefinedWorkPlans,
+      newWorkPlan
+    ]);
+    
+    // Set the newly added plan ID to trigger scroll
+    setNewlyAddedPlanId(newWorkPlan.id);
+  };
+
+  const removeWorkPlan = async (index: number) => {
+    const workPlan = predefinedWorkPlans[index];
+    if (!workPlan) return;
+
+    // If the work plan has an ID and has been saved, delete it from the backend
+    if (workPlan.id) {
+      try {
+        setSavingWorkPlanId(workPlan.id);
+        setSavingWorkPlanIndex(index);
+        await axios.delete(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${workPlan.id}`), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } catch (error: any) {
+        console.error('Error deleting work plan from backend:', error);
+        const errorMessage = error.response?.data?.error || 'Failed to delete work plan from backend';
+        setError(errorMessage);
+        // Continue with local removal even if backend delete fails
+      } finally {
+        setSavingWorkPlanId(null);
+        setSavingWorkPlanIndex(null);
+      }
+    }
+
+    // Remove from local state
     setPredefinedWorkPlans(predefinedWorkPlans.filter((_, i) => i !== index));
+    
+    // Clear any errors for this work plan
+    if (workPlan.id) {
+      setWorkPlanErrors(prev => {
+        const updated = { ...prev };
+        delete updated[workPlan.id!];
+        return updated;
+      });
+    }
   };
 
   const updateWorkPlan = (index: number, workPlan: PredefinedWorkPlan) => {
@@ -5970,13 +6198,6 @@ const AgentModeSettings = () => {
               >
                 Add Work Plan
               </Button>
-              <Button
-                variant="contained"
-                onClick={savePredefinedWorkPlans}
-                disabled={savingWorkPlans}
-              >
-                {savingWorkPlans ? <CircularProgress size={20} /> : 'Save Changes'}
-              </Button>
             </Box>
           </Box>
           
@@ -5993,25 +6214,61 @@ const AgentModeSettings = () => {
           ) : (
             <Box>
               {predefinedWorkPlans.map((workPlan, workPlanIndex) => (
-                <Card key={workPlanIndex} sx={{ mb: 2, border: '1px solid', borderColor: 'divider' }}>
+                <Card 
+                  key={workPlan.id || workPlanIndex} 
+                  id={`work-plan-${workPlan.id || workPlanIndex}`}
+                  sx={{ mb: 2, border: '1px solid', borderColor: 'divider' }}
+                >
                   <CardContent>
+                    {workPlanErrors[workPlan.id || ''] && (
+                      <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
+                        setWorkPlanErrors(prev => {
+                          const updated = { ...prev };
+                          delete updated[workPlan.id || ''];
+                          return updated;
+                        });
+                      }}>
+                        {workPlanErrors[workPlan.id || '']}
+                      </Alert>
+                    )}
                     <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
                       <TextField
                         label="Work Plan Title"
                         value={workPlan.title}
-                        onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value })}
+                        onChange={(e) => {
+                          updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value });
+                          // Clear error when user starts typing
+                          if (workPlanErrors[workPlan.id || '']) {
+                            setWorkPlanErrors(prev => {
+                              const updated = { ...prev };
+                              delete updated[workPlan.id || ''];
+                              return updated;
+                            });
+                          }
+                        }}
                         placeholder="Enter work plan title..."
                         variant="outlined"
                         fullWidth
                         sx={{ mr: 2 }}
+                        error={!!workPlanErrors[workPlan.id || ''] && workPlanErrors[workPlan.id || ''].includes('title')}
                       />
-                      <IconButton
-                        color="error"
-                        onClick={() => removeWorkPlan(workPlanIndex)}
-                        disabled={savingWorkPlans}
-                      >
-                        <DeleteIcon />
-                      </IconButton>
+                      <Box display="flex" gap={1}>
+                        <Button
+                          variant="contained"
+                          onClick={() => saveIndividualWorkPlan(workPlanIndex)}
+                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) || savingWorkPlans}
+                          size="small"
+                        >
+                          {(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) ? <CircularProgress size={20} /> : 'Save'}
+                        </Button>
+                        <IconButton
+                          color="error"
+                          onClick={() => removeWorkPlan(workPlanIndex)}
+                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) || savingWorkPlans}
+                        >
+                          <DeleteIcon />
+                        </IconButton>
+                      </Box>
                     </Box>
 
                     <TextField

@@ -8,6 +8,14 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-08",
+    changes: [
+      "Improved Agent Mode work plan management in admin panel",
+      "- Work plans can now be saved individually instead of saving all plans at once",
+      "- This prevents conflicts when multiple admins edit different work plans simultaneously",
+    ],
+  },
+  {
     date: "2026-01-04",
     changes: [
       "Improved Admin Users and Overview analytics",
