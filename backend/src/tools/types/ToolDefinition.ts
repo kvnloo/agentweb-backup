@@ -24,19 +24,64 @@ export interface JSONSchemaType {
 }
 
 /**
- * Tool categories for intent-based loading
+ * All valid tool categories (SINGLE SOURCE OF TRUTH for TypeScript type)
+ * 
+ * WHY HERE? TypeScript types are erased at runtime. We need this compile-time
+ * constant to provide type safety. The CategoryConfig in each *Tools.ts file
+ * must use a name from this array - TypeScript will catch any typos.
+ * 
+ * WHEN ADDING A NEW CATEGORY:
+ * 1. Add the category name here
+ * 2. Create definitions/newCategoryTools.ts with CategoryConfig + tools
+ * 3. Import in definitions/index.ts
  */
-export type ToolCategory = 
-  | 'core'
-  | 'content'
-  | 'research'
-  | 'crm'
-  | 'gtm'
-  | 'analytics'
-  | 'automation'
-  | 'books'
-  | 'templates';
+export const TOOL_CATEGORY_NAMES = [
+  'core',
+  'content',
+  'research',
+  'crm',
+  'gtm',
+  'analytics',
+  'automation',
+  'books',
+  'templates'
+] as const;
 
+/**
+ * Tool category type - automatically derived from TOOL_CATEGORY_NAMES
+ */
+export type ToolCategory = typeof TOOL_CATEGORY_NAMES[number];
+
+
+/**
+ * Valid context arguments that can be injected into handler calls
+ */
+export type ContextArg = 'userId' | 'sessionId' | 'llmModel';
+
+/**
+ * Handler configuration for tool execution
+ * Defines how to map tool arguments to service method calls
+ */
+export interface ToolHandlerConfig {
+  /** Service to delegate to (e.g., 'image', 'blog', 'knowledge_base') */
+  serviceName?: string;
+  
+  /** Method name on the service to call */
+  methodName: string;
+  
+  /** Context fields to inject (e.g., ['userId', 'sessionId']) */
+  contextArgs?: ContextArg[];
+  
+  /** 
+   * Custom argument ordering if schema property order is insufficient.
+   * If not specified, args are derived from schema.parameters.properties order + contextArgs.
+   * Use paths like 'args.topic', 'context.userId', or 'args' for full args object.
+   */
+  customArgOrder?: string[];
+  
+  /** Whether this tool uses a special/custom handler instead of simple delegation */
+  specialHandler?: boolean;
+}
 
 /**
  * Tool definition structure
@@ -62,6 +107,20 @@ export interface ToolDefinition {
     description: string;
     parameters: JSONSchemaType;
   };
+
+  /** 
+   * Handler configuration for tool execution.
+   * Defines how to delegate to service methods.
+   * Optional during migration - will become required.
+   */
+  handler?: ToolHandlerConfig;
+
+  /**
+   * Keywords for intent detection via fuzzy matching.
+   * Used to identify when a user's message relates to this tool's category.
+   * Supplements category-level keywords for more specific matching.
+   */
+  intentKeywords?: string[];
 }
 
 /**

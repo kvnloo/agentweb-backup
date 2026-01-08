@@ -2,15 +2,43 @@
  * Content Tools Definitions
  * 
  * Tools for content creation: blog articles, images, videos, social media posts.
+ * 
+ * UNIFIED DEFINITION: Includes schema, handler config, and intent keywords.
+ * This is the single source of truth for content tools.
  */
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+/**
+ * Content category configuration
+ * Defines intent patterns and keywords for category detection
+ */
+export const contentCategory: CategoryConfig = {
+  name: 'content',
+  intentPatterns: [
+    /\b(blog|article|write|writing|post|image|video|creative|social\s*media|generate\s*image|photo|picture|linkedin\s*post|facebook\s*post|tweet|instagram)\b/i
+  ],
+  categoryKeywords: [
+    'blog', 'article', 'write', 'writing', 'post', 'image', 'video',
+    'creative', 'social', 'media', 'generate', 'photo', 'picture',
+    'linkedin', 'facebook', 'tweet', 'instagram', 'publish'
+  ]
+};
+
+// Register the category config for aggregation
+registerCategoryConfig(contentCategory);
+
+/**
+ * Content tools with unified definitions
+ * Each tool includes: schema (for LLM), handler config (for execution), and intent keywords
+ */
 export const contentTools: ToolDefinition[] = [
   {
     name: 'create_blog_article',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['blog', 'article', 'write', 'post', 'content'],
     schema: {
       description: 'Create a complete blog article with content, images, and HTML file. Generates blog content using AI, creates a hero image, and produces a complete HTML file uploaded to S3.',
       parameters: {
@@ -61,12 +89,23 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['topic']
       }
+    },
+    handler: {
+      serviceName: 'blog',
+      methodName: 'createBlogArticle',
+      // Custom order because context args are interleaved with schema args
+      customArgOrder: [
+        'args.topic', 'args.keywords', 'args.tone', 'args.length',
+        'args.researchContext', 'args.requirements', 'context.userId',
+        'context.sessionId', 'args.style', 'args.deep_research'
+      ]
     }
   },
   {
     name: 'publish_blog_article',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['publish', 'cms', 'webflow', 'basehub'],
     schema: {
       description: "Publish a blog article to CMS (Basehub or Webflow) based on the user's configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS.",
       parameters: {
@@ -91,12 +130,19 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['title', 'description', 'hero_image_url', 'blog_html_url']
       }
+    },
+    handler: {
+      serviceName: 'blog',
+      methodName: 'publishBlogArticle',
+      contextArgs: ['userId', 'sessionId']
+      // argOrder: schema properties order + contextArgs
     }
   },
   {
     name: 'generate_image',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['image', 'photo', 'picture', 'generate', 'create', 'ai image'],
     schema: {
       description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
       parameters: {
@@ -136,12 +182,22 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['prompt', 'filename']
       }
+    },
+    handler: {
+      serviceName: 'image',
+      methodName: 'generateImage',
+      // Custom order because context args are in the middle
+      customArgOrder: [
+        'args.prompt', 'args.filename', 'args.size', 'args.quality',
+        'args.inputImages', 'context.userId', 'context.sessionId', 'args.imageModel'
+      ]
     }
   },
   {
     name: 'generate_video',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['video', 'generate', 'create', 'ai video', 'veo'],
     schema: {
       description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation.',
       parameters: {
@@ -171,12 +227,22 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['prompt', 'filename']
       }
+    },
+    handler: {
+      serviceName: 'video',
+      methodName: 'generateVideo',
+      // Custom order because context args are in the middle
+      customArgOrder: [
+        'args.prompt', 'args.filename', 'context.userId', 'context.sessionId',
+        'args.videoModel', 'args.startFrame', 'args.endFrame'
+      ]
     }
   },
   {
     name: 'create_social_media_posts',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['social', 'media', 'post', 'linkedin', 'twitter', 'facebook', 'instagram'],
     schema: {
       description: 'Create a list of social media posts and generate an HTML file containing all posts. Each post includes type, rich text content, and optional image URL. The output is an HTML file stored in S3.',
       parameters: {
@@ -208,12 +274,18 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['posts']
       }
+    },
+    handler: {
+      serviceName: 'social_media',
+      methodName: 'createSocialMediaPosts',
+      contextArgs: ['userId', 'sessionId']
     }
   },
   {
     name: 'post_on_connected_account',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['post', 'publish', 'connected', 'account', 'share'],
     schema: {
       description: 'Create a post on a connected social media account',
       parameters: {
@@ -229,12 +301,19 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['account_id', 'content']
       }
+    },
+    handler: {
+      serviceName: 'social_media',
+      methodName: 'postOnConnectedAccount',
+      // Custom order: context.userId comes first
+      customArgOrder: ['context.userId', 'args.account_id', 'args.content', 'args.media_urls']
     }
   },
   {
     name: 'remove_c2pa_from_image',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['c2pa', 'metadata', 'remove', 'clean', 'strip'],
     schema: {
       description: 'Remove C2PA metadata from an image by downloading it from a URL, stripping metadata, and uploading the cleaned image to S3. Returns the new S3 URL.',
       parameters: {
@@ -251,12 +330,18 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['image_url']
       }
+    },
+    handler: {
+      serviceName: 'image',
+      methodName: 'removeC2PAFromImage',
+      customArgOrder: ['args.image_url', 'args.filename', 'context.userId']
     }
   },
   {
     name: 'describe_video',
     version: '1.0.0',
     category: 'content',
+    intentKeywords: ['describe', 'analyze', 'video', 'watch', 'understand'],
     schema: {
       description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video or when you need to understand video content.',
       parameters: {
@@ -274,6 +359,12 @@ export const contentTools: ToolDefinition[] = [
         },
         required: ['video_file_url']
       }
+    },
+    handler: {
+      serviceName: 'video',
+      methodName: 'describeVideo',
+      // No context args needed, just schema args
+      contextArgs: []
     }
   }
 ];

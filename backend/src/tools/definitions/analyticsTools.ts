@@ -2,15 +2,40 @@
  * Analytics Tools Definitions
  * 
  * Tools for metrics, campaign performance, and analytics.
+ * 
+ * UNIFIED DEFINITION: Includes schema, handler config, and intent keywords.
  */
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+/**
+ * Analytics category configuration
+ */
+export const analyticsCategory: CategoryConfig = {
+  name: 'analytics',
+  intentPatterns: [
+    /\b(metrics|performance|ads|campaign|stats|meta\s*ads|facebook\s*ads|analytics|engagement|impressions|clicks|ctr)\b/i
+  ],
+  categoryKeywords: [
+    'metrics', 'performance', 'ads', 'campaign', 'stats', 'meta',
+    'analytics', 'engagement', 'impressions', 'clicks', 'ctr',
+    'roi', 'conversion', 'tracking'
+  ]
+};
+
+// Register the category config for aggregation
+registerCategoryConfig(analyticsCategory);
+
+/**
+ * Analytics tools with unified definitions
+ */
 export const analyticsTools: ToolDefinition[] = [
   {
     name: 'get_meta_ads_metrics',
     version: '1.0.0',
     category: 'analytics',
+    intentKeywords: ['meta', 'ads', 'facebook', 'metrics', 'campaign', 'performance'],
     schema: {
       description: 'Get Meta ad performance metrics and campaign data',
       parameters: {
@@ -30,12 +55,17 @@ export const analyticsTools: ToolDefinition[] = [
         },
         required: []
       }
+    },
+    handler: {
+      methodName: 'getMetaAdsMetrics',
+      customArgOrder: ['args.timeframe', 'context.userId', 'args.campaign_name']
     }
   },
   {
     name: 'get_task_subscriber_metrics',
     version: '1.0.0',
     category: 'analytics',
+    intentKeywords: ['subscriber', 'email', 'metrics', 'open', 'rate', 'click'],
     schema: {
       description: 'Get comprehensive email metrics for all subscribers of a specific task, including open rates, click-through rates, and engagement data',
       parameters: {
@@ -48,12 +78,17 @@ export const analyticsTools: ToolDefinition[] = [
         },
         required: ['task_id']
       }
+    },
+    handler: {
+      methodName: 'getTaskSubscriberMetrics',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'get_task_subscriber_engagement_events',
     version: '1.0.0',
     category: 'analytics',
+    intentKeywords: ['engagement', 'events', 'email', 'opened', 'clicked', 'bounced'],
     schema: {
       description: 'Get email engagement events for a specific task and email subject, showing detailed event history like delivered, opened, clicked, bounced, etc.',
       parameters: {
@@ -70,12 +105,17 @@ export const analyticsTools: ToolDefinition[] = [
         },
         required: ['task_id', 'email_subject']
       }
+    },
+    handler: {
+      methodName: 'getTaskSubscriberEngagementEvents',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'list_connected_accounts',
     version: '1.0.0',
     category: 'analytics',
+    intentKeywords: ['connected', 'accounts', 'social', 'list', 'platforms'],
     schema: {
       description: 'Returns list of social media accounts connected by the user',
       parameters: {
@@ -89,12 +129,17 @@ export const analyticsTools: ToolDefinition[] = [
         },
         required: []
       }
+    },
+    handler: {
+      methodName: 'listConnectedAccounts',
+      customArgOrder: ['context.userId', 'args.platform']
     }
   },
   {
     name: 'load_connected_account_metrics',
     version: '1.0.0',
     category: 'analytics',
+    intentKeywords: ['account', 'metrics', 'followers', 'engagement', 'statistics'],
     schema: {
       description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement).',
       parameters: {
@@ -107,12 +152,17 @@ export const analyticsTools: ToolDefinition[] = [
         },
         required: ['account_id']
       }
+    },
+    handler: {
+      methodName: 'loadConnectedAccountMetrics',
+      customArgOrder: ['context.userId', 'args.account_id']
     }
   },
   {
     name: 'list_connected_account_posts',
     version: '1.0.0',
     category: 'analytics',
+    intentKeywords: ['posts', 'account', 'social', 'list', 'history'],
     schema: {
       description: 'List posts from a connected social media account with optional metrics',
       parameters: {
@@ -124,6 +174,11 @@ export const analyticsTools: ToolDefinition[] = [
         },
         required: ['account_id']
       }
+    },
+    handler: {
+      methodName: 'loadConnectedAccountPosts',
+      // Special case: passes full args object
+      customArgOrder: ['context.userId', 'args.account_id', 'args']
     }
   }
 ];

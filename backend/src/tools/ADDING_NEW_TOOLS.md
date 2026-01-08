@@ -4,28 +4,33 @@ This guide explains how to add new tools (function calls) to Emma, the AI assist
 
 ## Architecture Overview
 
-Emma's tool system has three main components:
+Emma's tool system uses a **unified definition approach** where each tool contains:
+- Schema (what the LLM sees)
+- Handler config (how to execute)
+- Intent keywords (for category detection)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Tool Architecture                            │
+│                    Unified Tool Architecture                         │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                       │
-│  1. Tool Definition (schema)     → What the LLM sees                 │
-│     └── definitions/*.ts                                              │
+│  1. Tool Definition (unified)    → definitions/*Tools.ts              │
+│     ├── schema                   → What the LLM sees                 │
+│     ├── handler                  → How to execute                    │
+│     └── intentKeywords           → For category detection            │
 │                                                                       │
-│  2. Handler Config (routing)     → Maps tool name → service method   │
-│     └── handlers/configs.ts                                           │
+│  2. Category Config              → Intent patterns & keywords         │
+│     └── definitions/*Tools.ts                                        │
 │                                                                       │
 │  3. Service Method (logic)       → Actual implementation             │
-│     └── agentModeService.ts                                           │
+│     └── services/*Service.ts                                         │
 │                                                                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick Start: Adding a Simple Tool
 
-### Step 1: Create the Tool Definition
+### Step 1: Add the Unified Tool Definition
 
 Add your tool to the appropriate file in `src/tools/definitions/`:
 
@@ -53,6 +58,9 @@ export const coreTools: ToolDefinition[] = [
     name: 'send_email',              // Unique identifier
     version: '1.0.0',                // Version tracking
     category: 'core',                // Must match file category
+    intentKeywords: ['email', 'send', 'message', 'mail'],  // For fuzzy matching
+    
+    // Schema - what the LLM sees
     schema: {
       description: 'Send an email to a recipient. Use this when the user wants to send an email.',
       parameters: {
@@ -78,49 +86,26 @@ export const coreTools: ToolDefinition[] = [
         },
         required: ['to', 'subject', 'body']
       }
+    },
+    
+    // Handler - how to execute
+    handler: {
+      serviceName: 'email',           // Optional: specific service to use
+      methodName: 'sendEmail',        // Method name in the service
+      contextArgs: ['userId', 'sessionId']  // Context fields to inject
+      // OR use customArgOrder for complex mappings:
+      // customArgOrder: ['args.to', 'args.subject', 'args.body', 'context.userId']
     }
   }
 ];
 ```
 
-### Step 2: Add the Handler Config
+### Step 2: Implement the Service Method
 
-Add a handler config to `src/tools/handlers/configs.ts`:
-
-```typescript
-// In src/tools/handlers/configs.ts
-
-export const coreHandlerConfigs: SimpleHandlerConfig[] = [
-  // ... existing configs ...
-
-  {
-    name: 'send_email',           // Must match tool definition name
-    methodName: 'sendEmail',      // Method name in agentModeService
-    argOrder: [                   // How to map args to method parameters
-      'args.to',                  // From tool call arguments
-      'args.subject',
-      'args.body',
-      'args.cc',
-      'context.userId',           // From execution context
-      'context.sessionId'
-    ]
-  }
-];
-```
-
-**Argument Mapping:**
-- `args.xxx` - Value from the tool call arguments
-- `context.userId` - Current user's ID
-- `context.sessionId` - Current session ID
-- `context.llmModel` - Current LLM model being used
-- `context.mockMode` - Whether running in mock mode
-
-### Step 3: Implement the Service Method
-
-Add the implementation in `src/services/agentModeService.ts`:
+Add the implementation in the appropriate service file:
 
 ```typescript
-// In src/services/agentModeService.ts
+// In src/services/emailService.ts (or agentModeService.ts)
 
 async sendEmail(
   to: string,
@@ -132,7 +117,7 @@ async sendEmail(
 ): Promise<any> {
   try {
     // Your implementation here
-    const result = await emailService.send({
+    const result = await emailClient.send({
       to,
       subject,
       body,
@@ -151,22 +136,11 @@ async sendEmail(
 }
 ```
 
-### Step 4: Update System Prompt (Optional)
-
-If the tool needs special instructions, update the system prompt in `agentModeService.ts`:
-
-```typescript
-// In getMarketingSystemPrompt()
-
-## Email Sending
-- Use 'send_email' to send emails on behalf of the user
-- Always confirm the email content with the user before sending
-- Do not send emails without explicit user approval
-```
+### That's it! No need to update multiple files.
 
 ---
 
-## Tool Definition Schema
+## Unified Tool Definition Schema
 
 ```typescript
 interface ToolDefinition {
@@ -178,6 +152,9 @@ interface ToolDefinition {
   
   /** Category for intent-based loading */
   category: ToolCategory;
+  
+  /** Keywords for fuzzy intent matching (optional but recommended) */
+  intentKeywords?: string[];
   
   /** Mark deprecated tools */
   deprecated?: boolean;
@@ -192,22 +169,47 @@ interface ToolDefinition {
       required: string[];     // Required parameter names
     };
   };
+  
+  /** Handler configuration for execution */
+  handler: {
+    serviceName?: string;     // Optional: specific service to use
+    methodName: string;       // Required: method name to call
+    contextArgs?: ContextArg[];  // Context fields to inject
+    customArgOrder?: string[];   // Custom argument ordering
+    specialHandler?: boolean;    // Uses special handler instead
+  };
 }
+
+type ContextArg = 'userId' | 'sessionId' | 'llmModel';
 ```
 
 ---
 
-## Handler Types
+## Handler Configuration Options
 
-### Simple Handlers (Most Common)
+### Simple Handler (Most Common)
 
-For tools that map directly to a service method:
+For tools that map directly to a service method with schema args + context:
 
 ```typescript
-{
-  name: 'tool_name',
-  methodName: 'serviceMethodName',
-  argOrder: ['args.param1', 'args.param2', 'context.userId']
+handler: {
+  serviceName: 'blog',
+  methodName: 'createBlogArticle',
+  contextArgs: ['userId', 'sessionId']  // Added after schema args
+}
+```
+
+**Argument order**: `[...schemaArgs, ...contextArgs]`
+
+### Custom Argument Order
+
+When the service method expects a specific argument order:
+
+```typescript
+handler: {
+  serviceName: 'image',
+  methodName: 'describeImage',
+  customArgOrder: ['context.llmModel', 'args.image_url', 'args.prompt']
 }
 ```
 
@@ -216,21 +218,22 @@ For tools that map directly to a service method:
 For tools needing custom logic, add to `src/tools/handlers/specialHandlers.ts`:
 
 ```typescript
-// In src/tools/handlers/specialHandlers.ts
+handler: {
+  methodName: 'createTaskFromTemplate',
+  specialHandler: true  // Indicates this uses a special handler
+}
+```
 
+Then implement in `specialHandlers.ts`:
+
+```typescript
 export function getSpecialHandlers(agentModeService: any): ToolHandler[] {
   return [
-    // ... existing handlers ...
-
     {
-      name: 'complex_tool',
+      name: 'create_task_from_template',
       execute: async (args: any, context: ToolContext) => {
         // Custom logic here
-        if (args.option === 'A') {
-          return await agentModeService.methodA(args.data, context.userId);
-        } else {
-          return await agentModeService.methodB(args.data, context.sessionId);
-        }
+        return await agentModeService.handleComplexTask(args, context);
       }
     }
   ];
@@ -257,11 +260,15 @@ description: 'Handle emails'
 description: 'Send an email to a recipient. Use this when the user wants to send an email, forward a message, or communicate via email.'
 ```
 
-### 3. Parameters
-- Mark required parameters explicitly
-- Provide helpful descriptions with examples
-- Use enums for constrained values:
+### 3. Intent Keywords
+Help the system detect when a user might need this tool:
 
+```typescript
+// Good: Specific keywords that indicate this tool's use case
+intentKeywords: ['email', 'send', 'message', 'mail', 'forward', 'reply']
+```
+
+### 4. Parameters
 ```typescript
 properties: {
   priority: {
@@ -273,51 +280,76 @@ properties: {
 }
 ```
 
-### 4. Return Values
-Always return a consistent structure:
-
+### 5. Return Values
 ```typescript
 return {
   success: true,
-  data: { ... },                    // Tool-specific data
-  formattedContent: '✅ Success!'  // Human-readable message for LLM
+  data: { ... },
+  formattedContent: '✅ Success!'  // Human-readable for LLM
 };
-```
-
-### 5. Error Handling
-Throw descriptive errors that help the LLM understand what went wrong:
-
-```typescript
-throw new Error(`Cannot send email: recipient "${to}" is not a valid email address`);
 ```
 
 ---
 
 ## Adding a New Category
 
-If you need a new tool category:
-
-### 1. Add the category type
+### 1. Add to TOOL_CATEGORY_NAMES (for type safety)
 
 ```typescript
 // In src/tools/types/ToolDefinition.ts
 
-export type ToolCategory = 
-  | 'core'
-  | 'content'
+export const TOOL_CATEGORY_NAMES = [
+  'core',
+  'content',
   // ... existing ...
-  | 'your_new_category';  // Add here
+  'your_new_category'  // Add here
+] as const;
 ```
+
+> **Why?** TypeScript needs compile-time type safety. This array defines valid category names.
 
 ### 2. Create the definitions file
 
 ```typescript
 // Create src/tools/definitions/yourCategoryTools.ts
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+// Category configuration
+export const yourCategory: CategoryConfig = {
+  name: 'your_new_category',  // Must match TOOL_CATEGORY_NAMES
+  intentPatterns: [
+    /\b(keyword1|keyword2|keyword3)\b/i
+  ],
+  categoryKeywords: [
+    'keyword1', 'keyword2', 'keyword3'
+  ]
+};
+
+// Register the category config
+registerCategoryConfig(yourCategory);
+
+// Your tools
 export const yourCategoryTools: ToolDefinition[] = [
-  // Your tools here
+  {
+    name: 'your_tool_name',
+    version: '1.0.0',
+    category: 'your_new_category',
+    intentKeywords: ['specific', 'keywords'],
+    schema: { 
+      description: 'What this tool does...',
+      parameters: {
+        type: 'object',
+        properties: { /* ... */ },
+        required: []
+      }
+    },
+    handler: { 
+      methodName: 'yourMethodName',
+      contextArgs: ['userId']
+    }
+  }
 ];
 ```
 
@@ -326,28 +358,13 @@ export const yourCategoryTools: ToolDefinition[] = [
 ```typescript
 // In src/tools/definitions/index.ts
 
-import { yourCategoryTools } from './yourCategoryTools';
+import { yourCategoryTools, yourCategory } from './yourCategoryTools';
 
-export { yourCategoryTools };
+export { yourCategoryTools, yourCategory };
 
 export const allToolDefinitions: ToolDefinition[] = [
   // ... existing ...
   ...yourCategoryTools
-];
-```
-
-### 4. Add handler configs
-
-```typescript
-// In src/tools/handlers/configs.ts
-
-export const yourCategoryHandlerConfigs: SimpleHandlerConfig[] = [
-  // Your handler configs
-];
-
-export const allHandlerConfigs: SimpleHandlerConfig[] = [
-  // ... existing ...
-  ...yourCategoryHandlerConfigs
 ];
 ```
 
@@ -357,31 +374,8 @@ export const allHandlerConfigs: SimpleHandlerConfig[] = [
 
 Tool access is controlled via the database, not through tool definitions.
 
-### How it works:
-
-1. **User subscription stored in DB**: Each user has a `subscriptionType` field (e.g., "Basic", "Pro", "Enterprise")
-
-2. **Subscription configs in settings**: The `subscription_types` setting defines which tools each tier can access:
-   ```json
-   [
-     {
-       "name": "Basic",
-       "allowedFunctionCalls": ["search_web", "read_file_content", "save_file"]
-     },
-     {
-       "name": "Pro", 
-       "allowedFunctionCalls": ["*"]  // All tools
-     }
-   ]
-   ```
-
-3. **Runtime filtering**: `subscriptionService.getAllowedFunctionCalls(userId)` fetches the allowed tools dynamically
-
-### To restrict a tool to specific tiers:
-
-1. Go to the settings table in the database
-2. Update the `subscription_types` setting
-3. Add/remove tool names from `allowedFunctionCalls` for each tier
+1. **User subscription stored in DB**: Each user has a `subscriptionType` field
+2. **Runtime filtering**: `subscriptionService.getAllowedFunctionCalls(userId)` fetches allowed tools
 
 See `subscriptionService.ts` for implementation details.
 
@@ -391,48 +385,44 @@ See `subscriptionService.ts` for implementation details.
 
 ```
 src/tools/
-├── definitions/           # Tool schemas (what LLM sees)
-│   ├── index.ts          # Barrel export & registration
-│   ├── coreTools.ts
-│   ├── contentTools.ts
-│   ├── researchTools.ts
-│   ├── crmTools.ts
-│   ├── gtmTools.ts
-│   ├── analyticsTools.ts
-│   ├── automationTools.ts
-│   ├── bookTools.ts
-│   └── templateTools.ts
-├── handlers/              # Tool execution mapping
-│   ├── index.ts
-│   ├── configs.ts        # Simple handler configs
-│   └── specialHandlers.ts # Complex handlers
-├── types/                 # TypeScript types
-│   ├── index.ts
-│   ├── ToolDefinition.ts
-│   ├── ToolHandler.ts
-│   └── ToolContext.ts
-├── ToolRegistry.ts        # Tool registration
-├── ToolSelector.ts        # Intent-based tool selection
-├── ToolExecutor.ts        # Tool execution engine
-├── HandlerFactory.ts      # Creates handlers from configs
-└── index.ts               # Main barrel export
+├── definitions/           # Tool definitions (SINGLE SOURCE OF TRUTH)
+│   ├── index.ts          # Aggregation & exports
+│   ├── utils.ts          # Derivation utilities
+│   ├── coreTools.ts      # Core tools + category config
+│   ├── contentTools.ts   # Content tools + category config
+│   ├── researchTools.ts  # Research tools + category config
+│   └── ...               # Other categories
+├── handlers/              
+│   ├── index.ts          # Exports allHandlerConfigs + getSpecialHandlers
+│   └── specialHandlers.ts # Complex custom handlers
+├── types/                 
+│   ├── ToolDefinition.ts # TOOL_CATEGORY_NAMES + ToolCategory type
+│   ├── CategoryConfig.ts # Category config type
+│   ├── ToolCategories.ts # Uses derived category data
+│   └── FuzzyMatcher.ts   # Uses derived keywords
+├── ToolRegistry.ts        
+├── ToolSelector.ts        
+├── ToolExecutor.ts        
+└── index.ts               
 ```
 
 ---
 
 ## Testing Your Tool
 
-1. **Check registration:**
+1. **Check compilation:**
+   ```bash
+   npx tsc --noEmit
+   ```
+
+2. **Check registration:**
    ```bash
    npm run dev
    # Look for: "AgentServiceFactory: Registering X tool definitions..."
    ```
 
-2. **Test in Emma chat:**
+3. **Test in Emma chat:**
    Ask Emma to use your tool and verify it executes correctly.
-
-3. **Check handler mapping:**
-   Look for errors like "Handler not found for tool: your_tool_name"
 
 ---
 
@@ -440,8 +430,26 @@ src/tools/
 
 | Issue | Solution |
 |-------|----------|
-| "Handler not found" | Add handler config to `handlers/configs.ts` |
 | Tool not showing in LLM | Check it's exported in `definitions/index.ts` |
-| Arguments undefined | Verify `argOrder` matches actual parameter names |
+| "Method not found" | Ensure method exists in the target service |
+| Arguments undefined | Check `contextArgs` or `customArgOrder` mapping |
 | Tool filtered out | Check subscription settings for the user |
-| Method not found | Ensure method exists in `agentModeService.ts` |
+| Handler not executing | Check if `specialHandler: true` is set but handler not in specialHandlers.ts |
+
+---
+
+## Migration Notes
+
+The tool system was consolidated on 2026-01-08. 
+
+**Previously**, adding a tool required updating:
+1. `definitions/*Tools.ts` - Tool schema
+2. `handlers/configs.ts` - Handler mapping (now deleted)
+3. `types/ToolCategories.ts` - Category mapping (now auto-derived)
+4. `types/FuzzyMatcher.ts` - Keywords (now auto-derived)
+
+**Now**, adding a tool requires only:
+1. `definitions/*Tools.ts` - Add unified tool definition (schema + handler + keywords)
+
+**For a new category**, also update:
+1. `types/ToolDefinition.ts` - Add to `TOOL_CATEGORY_NAMES` array

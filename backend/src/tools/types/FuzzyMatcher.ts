@@ -3,7 +3,12 @@
  * 
  * Provides fuzzy string matching for intent detection.
  * Handles typos in user messages when selecting tool categories.
+ * 
+ * CONSOLIDATED: This file now uses DERIVED keywords from tool definitions
+ * instead of manually-maintained constants. It's now a pure utility file.
  */
+
+import { DERIVED_CATEGORY_KEYWORDS } from '../definitions';
 
 /**
  * Calculate Levenshtein distance between two strings
@@ -88,42 +93,11 @@ export function extractWords(message: string): string[] {
 
 /**
  * Keywords for each category (used for fuzzy matching)
+ * NOW DERIVED from tool definitions (no manual maintenance needed)
+ * 
+ * @deprecated Use DERIVED_CATEGORY_KEYWORDS directly from definitions
  */
-export const CATEGORY_KEYWORDS: Record<string, string[]> = {
-  content: [
-    'blog', 'article', 'write', 'writing', 'post', 'image', 'video',
-    'creative', 'social', 'media', 'generate', 'photo', 'picture',
-    'linkedin', 'facebook', 'tweet', 'instagram', 'publish'
-  ],
-  research: [
-    'search', 'find', 'research', 'analyze', 'analysis', 'knowledge',
-    'investigate', 'lookup', 'explore', 'discover', 'data'
-  ],
-  crm: [
-    'lead', 'leads', 'brand', 'branding', 'strategy', 'customer',
-    'guideline', 'marketing', 'target', 'audience', 'competitor',
-    'icp', 'ideal', 'persona'
-  ],
-  gtm: [
-    'gtm', 'market', 'launch', 'entry', 'expansion', 'gomarket'
-  ],
-  analytics: [
-    'metrics', 'performance', 'ads', 'campaign', 'stats', 'meta',
-    'analytics', 'engagement', 'impressions', 'clicks', 'ctr',
-    'roi', 'conversion', 'tracking'
-  ],
-  automation: [
-    'task', 'template', 'work', 'plan', 'schedule', 'revision',
-    'automate', 'automation', 'workflow', 'process'
-  ],
-  books: [
-    'book', 'whitepaper', 'white', 'paper', 'chapter', 'outline',
-    'ebook', 'publication', 'manuscript', 'document'
-  ],
-  templates: [
-    'html', 'template', 'email', 'newsletter', 'layout'
-  ]
-};
+export const CATEGORY_KEYWORDS: Record<string, string[]> = DERIVED_CATEGORY_KEYWORDS;
 
 /**
  * Detect categories from message using fuzzy matching

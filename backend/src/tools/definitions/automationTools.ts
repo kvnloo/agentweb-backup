@@ -2,15 +2,39 @@
  * Automation Tools Definitions
  * 
  * Tools for task creation, work plans, and automation workflows.
+ * 
+ * UNIFIED DEFINITION: Includes schema, handler config, and intent keywords.
  */
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+/**
+ * Automation category configuration
+ */
+export const automationCategory: CategoryConfig = {
+  name: 'automation',
+  intentPatterns: [
+    /\b(task|template|work\s*plan|schedule|revision|automate|automation|workflow)\b/i
+  ],
+  categoryKeywords: [
+    'task', 'template', 'work', 'plan', 'schedule', 'revision',
+    'automate', 'automation', 'workflow', 'process'
+  ]
+};
+
+// Register the category config for aggregation
+registerCategoryConfig(automationCategory);
+
+/**
+ * Automation tools with unified definitions
+ */
 export const automationTools: ToolDefinition[] = [
   {
     name: 'create_task_from_template',
     version: '1.0.0',
     category: 'automation',
+    intentKeywords: ['task', 'template', 'create', 'automation'],
     schema: {
       description: 'Create a web automation task using a specific template with the provided parameters',
       parameters: {
@@ -43,12 +67,17 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['template_id', 'parameters_json']
       }
+    },
+    handler: {
+      methodName: 'createTaskFromTemplate',
+      specialHandler: true  // Uses special handler in specialHandlers.ts
     }
   },
   {
     name: 'create_task_from_prompt',
     version: '1.0.0',
     category: 'automation',
+    intentKeywords: ['task', 'prompt', 'create', 'custom'],
     schema: {
       description: 'Create a web automation task using a raw prompt when no suitable template is available',
       parameters: {
@@ -85,6 +114,10 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['task_name', 'prompt', 'category']
       }
+    },
+    handler: {
+      methodName: 'createTaskFromPrompt',
+      specialHandler: true  // Uses special handler in specialHandlers.ts
     }
   },
   {
@@ -93,6 +126,7 @@ export const automationTools: ToolDefinition[] = [
     category: 'automation',
     deprecated: true,
     deprecatedMessage: "Use 'generate_image' instead for creating and revising images.",
+    intentKeywords: ['image', 'task', 'create'],
     schema: {
       description: "[DEPRECATED] Create an image generation task using a raw prompt. Use 'generate_image' instead.",
       parameters: {
@@ -119,6 +153,10 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['task_name', 'prompt']
       }
+    },
+    handler: {
+      methodName: 'createImageTaskFromPrompt',
+      specialHandler: true  // Uses special handler in specialHandlers.ts
     }
   },
   {
@@ -127,6 +165,7 @@ export const automationTools: ToolDefinition[] = [
     category: 'automation',
     deprecated: true,
     deprecatedMessage: "For image revision, use 'generate_image' with the original image as input. For HTML report revision, use 'update_html_file'.",
+    intentKeywords: ['revision', 'revise', 'update', 'modify'],
     schema: {
       description: "[DEPRECATED] Create a revision of an existing completed task execution. Use 'generate_image' or 'update_html_file' instead.",
       parameters: {
@@ -152,12 +191,17 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['task_id', 'execution_id', 'revision_prompt']
       }
+    },
+    handler: {
+      methodName: 'createRevision',
+      specialHandler: true  // Uses special handler in specialHandlers.ts
     }
   },
   {
     name: 'create_work_plan',
     version: '1.0.0',
     category: 'automation',
+    intentKeywords: ['work', 'plan', 'create', 'steps', 'project'],
     schema: {
       description: 'Create a multi-step work plan for the current chat session. Use this to organize complex projects. IMPORTANT: Check if a work plan already exists before creating a new one.',
       parameters: {
@@ -188,12 +232,17 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['title', 'steps']
       }
+    },
+    handler: {
+      methodName: 'createWorkPlan',
+      contextArgs: ['sessionId']
     }
   },
   {
     name: 'modify_work_plan',
     version: '1.0.0',
     category: 'automation',
+    intentKeywords: ['work', 'plan', 'modify', 'update', 'add', 'remove'],
     schema: {
       description: 'Add new steps or modify existing step details in the current work plan. Does not change step status.',
       parameters: {
@@ -225,12 +274,17 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['steps']
       }
+    },
+    handler: {
+      methodName: 'modifyWorkPlan',
+      contextArgs: ['sessionId']
     }
   },
   {
     name: 'set_work_plan_status',
     version: '1.0.0',
     category: 'automation',
+    intentKeywords: ['work', 'plan', 'status', 'complete', 'skip', 'update'],
     schema: {
       description: 'Update the status of one or more steps in the work plan.',
       parameters: {
@@ -256,6 +310,10 @@ export const automationTools: ToolDefinition[] = [
         },
         required: ['updates']
       }
+    },
+    handler: {
+      methodName: 'setWorkPlanStatus',
+      contextArgs: ['sessionId']
     }
   }
 ];

@@ -2,15 +2,39 @@
  * Book Tools Definitions
  * 
  * Tools for creating and managing books, whitepapers, and long-form content.
+ * 
+ * UNIFIED DEFINITION: Includes schema, handler config, and intent keywords.
  */
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+/**
+ * Books category configuration
+ */
+export const booksCategory: CategoryConfig = {
+  name: 'books',
+  intentPatterns: [
+    /\b(book|whitepaper|white\s*paper|chapter|outline|ebook|e-book|publication|manuscript)\b/i
+  ],
+  categoryKeywords: [
+    'book', 'whitepaper', 'white', 'paper', 'chapter', 'outline',
+    'ebook', 'publication', 'manuscript', 'document'
+  ]
+};
+
+// Register the category config for aggregation
+registerCategoryConfig(booksCategory);
+
+/**
+ * Book tools with unified definitions
+ */
 export const bookTools: ToolDefinition[] = [
   {
     name: 'list_books',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['books', 'list', 'all', 'whitepapers'],
     schema: {
       description: 'List all books/whitepapers for the user. Optionally filter by type and status.',
       parameters: {
@@ -27,12 +51,17 @@ export const bookTools: ToolDefinition[] = [
         },
         required: []
       }
+    },
+    handler: {
+      methodName: 'listBooks',
+      customArgOrder: ['context.userId', 'args.type', 'args.status']
     }
   },
   {
     name: 'get_book_details',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'details', 'info', 'metadata'],
     schema: {
       description: 'Get detailed information about a specific book including outline, characters, and metadata.',
       parameters: {
@@ -45,12 +74,17 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['book_id']
       }
+    },
+    handler: {
+      methodName: 'getBookDetails',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'get_book_content',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'content', 'read', 'chapter', 'section'],
     schema: {
       description: 'Get the content of a specific section or chapter in a book.',
       parameters: {
@@ -62,12 +96,17 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['book_id', 'section_id']
       }
+    },
+    handler: {
+      methodName: 'getBookContent',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'update_book_content',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'update', 'edit', 'content', 'replace'],
     schema: {
       description: 'Update the content of a specific section or chapter using replacement instructions.',
       parameters: {
@@ -83,12 +122,17 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['book_id', 'section_id', 'replacement_json']
       }
+    },
+    handler: {
+      methodName: 'updateBookContent',
+      specialHandler: true  // Uses special handler
     }
   },
   {
     name: 'generate_book_content',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'generate', 'write', 'content', 'chapter'],
     schema: {
       description: 'Generate content for a section or chapter using AI.',
       parameters: {
@@ -119,12 +163,21 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['book_id', 'section_id', 'content_description']
       }
+    },
+    handler: {
+      methodName: 'generateBookContent',
+      customArgOrder: [
+        'args.book_id', 'args.section_id', 'args.chapter_id',
+        'args.content_description', 'args.length', 'args.imagine',
+        'context.userId', 'args.research_url'
+      ]
     }
   },
   {
     name: 'create_book',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'create', 'new', 'whitepaper'],
     schema: {
       description: 'Create a new book or whitepaper.',
       parameters: {
@@ -148,12 +201,20 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['title', 'description', 'type', 'author']
       }
+    },
+    handler: {
+      methodName: 'createBook',
+      customArgOrder: [
+        'args.title', 'args.description', 'args.type', 'args.author',
+        'args.language', 'args.genre', 'args.tags', 'context.userId'
+      ]
     }
   },
   {
     name: 'create_book_outline',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'outline', 'create', 'structure'],
     schema: {
       description: 'Create an outline for a book with sections and optional chapters.',
       parameters: {
@@ -167,12 +228,17 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['book_id', 'outline_json']
       }
+    },
+    handler: {
+      methodName: 'createBookOutline',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'add_characters',
     version: '1.0.0',
     category: 'books',
+    intentKeywords: ['book', 'characters', 'add', 'personas'],
     schema: {
       description: 'Add characters to a book (for fiction or case studies).',
       parameters: {
@@ -186,6 +252,10 @@ export const bookTools: ToolDefinition[] = [
         },
         required: ['book_id', 'characters_json']
       }
+    },
+    handler: {
+      methodName: 'addCharacters',
+      contextArgs: ['userId']
     }
   }
 ];

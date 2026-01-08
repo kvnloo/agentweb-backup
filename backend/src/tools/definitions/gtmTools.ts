@@ -2,15 +2,38 @@
  * GTM (Go-To-Market) Tools Definitions
  * 
  * Tools for managing Go-To-Market plans.
+ * 
+ * UNIFIED DEFINITION: Includes schema, handler config, and intent keywords.
  */
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+/**
+ * GTM category configuration
+ */
+export const gtmCategory: CategoryConfig = {
+  name: 'gtm',
+  intentPatterns: [
+    /\b(gtm|go[\s-]to[\s-]market|launch\s*plan|market\s*entry)\b/i
+  ],
+  categoryKeywords: [
+    'gtm', 'market', 'launch', 'entry', 'expansion', 'gomarket'
+  ]
+};
+
+// Register the category config for aggregation
+registerCategoryConfig(gtmCategory);
+
+/**
+ * GTM tools with unified definitions
+ */
 export const gtmTools: ToolDefinition[] = [
   {
     name: 'list_gtm_plans',
     version: '1.0.0',
     category: 'gtm',
+    intentKeywords: ['gtm', 'plans', 'list', 'all', 'show'],
     schema: {
       description: 'List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.',
       parameters: {
@@ -18,12 +41,17 @@ export const gtmTools: ToolDefinition[] = [
         properties: {},
         required: []
       }
+    },
+    handler: {
+      methodName: 'listGTMPlans',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'read_gtm_plan',
     version: '1.0.0',
     category: 'gtm',
+    intentKeywords: ['gtm', 'plan', 'read', 'get', 'details'],
     schema: {
       description: 'Read a specific GTM plan by its plan ID. Returns complete plan details including all phases and work items with their statuses.',
       parameters: {
@@ -36,12 +64,17 @@ export const gtmTools: ToolDefinition[] = [
         },
         required: ['plan_id']
       }
+    },
+    handler: {
+      methodName: 'readGTMPlan',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'create_gtm_plan',
     version: '1.0.0',
     category: 'gtm',
+    intentKeywords: ['gtm', 'plan', 'create', 'new', 'launch'],
     schema: {
       description: 'Create a new GTM plan with a title, optional description, optional DRI, and optional phases with work items.',
       parameters: {
@@ -90,6 +123,10 @@ export const gtmTools: ToolDefinition[] = [
         },
         required: ['title']
       }
+    },
+    handler: {
+      methodName: 'createGTMPlan',
+      customArgOrder: ['args.title', 'args.description', 'args.dri', 'args.phases', 'context.userId']
     }
   }
 ];
