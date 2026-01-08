@@ -5086,7 +5086,6 @@ const AgentModeSettings = () => {
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
-  const [savingWorkPlans, setSavingWorkPlans] = useState(false);
   const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
   const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
@@ -6153,7 +6152,7 @@ const AgentModeSettings = () => {
                 variant="outlined"
                 startIcon={<AddIcon />}
                 onClick={addWorkPlan}
-                disabled={savingWorkPlans}
+                disabled={false}
                 sx={{ mr: 1 }}
               >
                 Add Work Plan
@@ -6251,7 +6250,7 @@ const AgentModeSettings = () => {
                             <Checkbox
                               checked={workPlan.autocomplete || false}
                               onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
-                              disabled={savingWorkPlans}
+                              disabled={false}
                             />
                           }
                           label="Autocomplete Steps"
@@ -6261,7 +6260,7 @@ const AgentModeSettings = () => {
                             <Checkbox
                               checked={workPlan.requireLogin || false}
                               onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
-                              disabled={savingWorkPlans}
+                              disabled={false}
                             />
                           }
                           label="Require Login"
@@ -6288,7 +6287,7 @@ const AgentModeSettings = () => {
                             showLoginSignup: e.target.value as 'after_plan_completed' | 'always'
                           })
                         }
-                        disabled={savingWorkPlans}
+                        disabled={false}
                       >
                         <MenuItem value="after_plan_completed">After plan completed</MenuItem>
                         <MenuItem value="always">Always</MenuItem>
@@ -6312,7 +6311,7 @@ const AgentModeSettings = () => {
                             size="small"
                             color="error"
                             onClick={() => removeStepFromWorkPlan(workPlanIndex, stepIndex)}
-                            disabled={savingWorkPlans}
+                            disabled={false}
                           >
                             <DeleteIcon fontSize="small" />
                           </IconButton>
@@ -6407,7 +6406,7 @@ const AgentModeSettings = () => {
                                     });
                                   }}
                                   deleteIcon={<DeleteIcon />}
-                                  disabled={savingWorkPlans}
+                                  disabled={false}
                                   color="primary"
                                   variant="outlined"
                                 />
@@ -6426,7 +6425,7 @@ const AgentModeSettings = () => {
                       variant="outlined"
                       startIcon={<AddIcon />}
                       onClick={() => addStepToWorkPlan(workPlanIndex)}
-                      disabled={savingWorkPlans}
+                      disabled={false}
                       size="small"
                       sx={{ mt: 1 }}
                     >
