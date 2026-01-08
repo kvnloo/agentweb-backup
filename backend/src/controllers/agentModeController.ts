@@ -283,7 +283,7 @@ async function sendDailyDigestEmail(schedule: any, emailNotifications: string[])
 
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
-async function runVerifiedChat(
+export async function runVerifiedChat(
   params: {
     sessionId: string;
     userId: string;

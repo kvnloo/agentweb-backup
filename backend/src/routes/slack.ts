@@ -393,31 +393,375 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         // Automatically start a new revision execution with the feedback
         if (originalApproval && originalApproval.executionId) {
           try {
-            // Get the original execution to find the task ID
-            const execution = await taskDb.getTaskExecutionById(originalApproval.executionId);
-            if (execution) {
-              console.log(`🚀 Starting feedback-based revision for task: ${execution.taskId}`);
+            // Check if this is an Agent Mode asset (executionId pattern: ${sessionId}-images, -videos, or -html)
+            const isAgentModeImage = originalApproval.executionId.endsWith('-images');
+            const isAgentModeVideo = originalApproval.executionId.endsWith('-videos');
+            const isAgentModeHtml = originalApproval.executionId.endsWith('-html');
+            const isAgentModeAsset = isAgentModeImage || isAgentModeVideo || isAgentModeHtml;
+            const agentSessionId = isAgentModeAsset 
+              ? (isAgentModeImage
+                ? originalApproval.executionId.replace('-images', '')
+                : isAgentModeVideo
+                  ? originalApproval.executionId.replace('-videos', '')
+                  : originalApproval.executionId.replace('-html', ''))
+              : null;
+            
+            if (agentSessionId) {
+              // This is an Agent Mode asset - use the sessionId directly
+              console.log(`🤖 Agent Mode asset detected. Session ID: ${agentSessionId}`);
               
-              // Use the common function to create revision execution
-              const revisionResult = await createRevisionExecutionFromSlack(
-                execution.taskId,
-                `Please revise this ${originalApproval.assetType || 'asset'} based on the following feedback: ${feedbackValue}`,
-                originalApproval.assetUrl,
-                originalApproval.executionId,
-                originalApproval.assetType || 'asset',
-                user.username || user.id,
-                1,
-                originalApproval.slackChannel,
-                originalApproval.slackChannelName
-              );
-              
-              if (revisionResult.success && revisionResult.execution) {
-                console.log(`✅ Feedback-based revision started: ${revisionResult.execution.executionId}`);
-              } else {
-                console.error(`❌ Failed to start feedback-based revision`);
+              try {
+                // Get the session
+                const { chatbotDb } = await import('../services/chatbotService');
+                const session = await chatbotDb.getChatSession(agentSessionId);
+                if (!session) {
+                  throw new Error('Session not found');
+                }
+                
+                // Format revision message based on asset type (similar to Images/Reports pages)
+                let revisionMessage: string;
+                let requiredFunctions: Array<{ functionName: string; minCount: number }>;
+                
+                if (originalApproval.assetType === 'image') {
+                  // For images, use generate_image function
+                  revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
+                  requiredFunctions = [
+                    {
+                      functionName: 'generate_image',
+                      minCount: 1
+                    }
+                  ];
+                } else if (originalApproval.assetType === 'html') {
+                  // For HTML reports, use update_html_file function
+                  revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to get the current content and content_hash. Then use update_html_file to apply the requested changes based on the current content. Keep the HTML well-structured and production-ready.`;
+                  requiredFunctions = [
+                    {
+                      functionName: 'update_html_file',
+                      minCount: 1
+                    }
+                  ];
+                } else {
+                  throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
+                }
+                
+                // Use runVerifiedChat function (same as verified-generate endpoint)
+                const { runVerifiedChat } = await import('../controllers/agentModeController');
+                
+                // Call runVerifiedChat and wait for completion to get the new asset
+                // Run this asynchronously so we don't block the Slack response
+                runVerifiedChat({
+                  sessionId: agentSessionId,
+                  userId: session.userId,
+                  startingMessage: revisionMessage,
+                  requiredFunctions,
+                  keywords: [],
+                  attachments: [],
+                  maxAttempts: 5
+                }).then(async (result) => {
+                  console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
+                  
+                  // Extract the new asset URL from toolCalls
+                  let newAssetUrl: string | null = null;
+                  let newAssetFilename: string | null = null;
+                  
+                  if (result.success && result.toolCalls.length > 0) {
+                    // Find the tool call that created the asset
+                    for (const toolCall of result.toolCalls) {
+                      const toolResult = toolCall?.result || {};
+                      
+                      if (originalApproval.assetType === 'image') {
+                        // For images, look for imageUrl, image_url, s3_url, or url in generate_image result
+                        const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
+                        if (imageUrl) {
+                          newAssetUrl = imageUrl;
+                          newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
+                          break;
+                        }
+                      } else if (originalApproval.assetType === 'html') {
+                        // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file result
+                        const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
+                        if (htmlUrl) {
+                          newAssetUrl = htmlUrl;
+                          newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || `revised_${originalApproval.filename || 'report.html'}`;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  
+                  // If we found a new asset, send it to Slack for review
+                  if (newAssetUrl && newAssetFilename) {
+                    console.log(`📤 Sending new revision asset to Slack: ${newAssetUrl}`);
+                    
+                    try {
+                      // Get the asset type from filename
+                      const assetType = getAssetTypeFromFilename(newAssetFilename);
+                      
+                      // Send approval request to the same Slack channel
+                      const approvalResult = await sendApprovalRequestWithTracking({
+                        executionId: originalApproval.executionId, // Keep the same executionId format
+                        imageUrl: newAssetUrl,
+                        filename: newAssetFilename,
+                        assetType,
+                        userId: originalApproval.userId,
+                        channel: originalApproval.slackChannel,
+                        channelName: originalApproval.slackChannelName,
+                        note: `Revision based on feedback: ${feedbackValue}`
+                      });
+                      
+                      console.log(`✅ New revision asset sent to Slack for review: ${approvalResult.approvalId}`);
+                    } catch (error) {
+                      console.error('❌ Error sending revision asset to Slack:', error);
+                    }
+                  } else {
+                    console.warn(`⚠️ Could not extract new asset URL from toolCalls. Tool calls: ${JSON.stringify(result.toolCalls)}`);
+                    
+                    // Send oncall alert with session ishare link and context
+                    try {
+                      const { chatbotDb } = await import('../services/chatbotService');
+                      const { emailService } = await import('../services/emailService');
+                      
+                      // Get or create ishare link for the session
+                      let ishareLink = '';
+                      try {
+                        ishareLink = await chatbotDb.createOrReuseInteractiveShare(agentSessionId);
+                      } catch (shareError) {
+                        console.error('Error creating ishare link for oncall alert:', shareError);
+                        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+                        ishareLink = `${customerFrontendUrl}/agent-mode/${agentSessionId}`;
+                      }
+                      
+                      await emailService.sendOncallAlert(
+                        'Agent Mode Revision: Failed to Extract Asset URL',
+                        `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                        {
+                          'Session ID': agentSessionId,
+                          'iShare Link': ishareLink,
+                          'Asset Type': originalApproval.assetType || 'unknown',
+                          'Original Asset URL': originalApproval.assetUrl,
+                          'Original Filename': originalApproval.filename || 'unknown',
+                          'Feedback': feedbackValue,
+                          'Revision Success': result.success,
+                          'Tool Calls Count': result.toolCalls.length,
+                          'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
+                          'Execution ID': originalApproval.executionId,
+                          'Slack Channel': originalApproval.slackChannel || 'N/A',
+                          'User ID': originalApproval.userId || 'N/A'
+                        }
+                      );
+                    } catch (alertError) {
+                      console.error('❌ Error sending oncall alert:', alertError);
+                    }
+                  }
+                }).catch((error) => {
+                  console.error('❌ Error in Agent Mode verified-generate:', error);
+                });
+                
+                console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${agentSessionId}`);
+              } catch (agentModeError) {
+                console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);
+                // Don't fail the feedback submission if revision start fails
               }
             } else {
-              console.error(`❌ Could not find execution for ID: ${originalApproval.executionId}`);
+              // This is a regular browser task - try to get the execution
+              const execution = await taskDb.getTaskExecutionById(originalApproval.executionId);
+              if (execution) {
+                // Get the task to check if it's from Agent Mode
+                const task = await taskDb.getTaskById(execution.taskId);
+                const isAgentMode = task?.sessionId;
+                
+                if (isAgentMode) {
+                  // For Agent Mode sessions, use verified-generate approach like Images/Reports pages
+                  console.log(`🤖 Agent Mode session detected. Using verified-generate for session: ${task.sessionId}`);
+                  
+                  try {
+                    // Update task with Slack channel info so revision gets sent to Slack
+                    if (originalApproval.slackChannel) {
+                      await taskDb.updateTask(execution.taskId, {
+                        slackChannel: originalApproval.slackChannel
+                      });
+                    }
+                    
+                    // Get session to find userId
+                    const { chatbotDb } = await import('../services/chatbotService');
+                    const session = await chatbotDb.getChatSession(task.sessionId);
+                    if (!session) {
+                      throw new Error('Session not found');
+                    }
+                    
+                    // Format revision message based on asset type (similar to Images/Reports pages)
+                    let revisionMessage: string;
+                    let requiredFunctions: Array<{ functionName: string; minCount: number }>;
+                    
+                    if (originalApproval.assetType === 'image') {
+                      // For images, use generate_image function
+                      revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
+                      requiredFunctions = [
+                        {
+                          functionName: 'generate_image',
+                          minCount: 1
+                        }
+                      ];
+                    } else if (originalApproval.assetType === 'html') {
+                      // For HTML reports, use update_html_file function
+                      revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to get the current content and content_hash. Then use update_html_file to apply the requested changes based on the current content. Keep the HTML well-structured and production-ready.`;
+                      requiredFunctions = [
+                        {
+                          functionName: 'update_html_file',
+                          minCount: 1
+                        }
+                      ];
+                    } else {
+                      throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
+                    }
+                    
+                    // Use runVerifiedChat function (same as verified-generate endpoint)
+                    const { runVerifiedChat } = await import('../controllers/agentModeController');
+                    
+                    // Call runVerifiedChat and wait for completion to get the new asset
+                    // Run this asynchronously so we don't block the Slack response
+                    runVerifiedChat({
+                      sessionId: task.sessionId,
+                      userId: session.userId,
+                      startingMessage: revisionMessage,
+                      requiredFunctions,
+                      keywords: [],
+                      attachments: [],
+                      maxAttempts: 5
+                    }).then(async (result) => {
+                      console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
+                      
+                      // Extract the new asset URL from toolCalls
+                      let newAssetUrl: string | null = null;
+                      let newAssetFilename: string | null = null;
+                      
+                      if (result.success && result.toolCalls.length > 0) {
+                        // Find the tool call that created the asset
+                        for (const toolCall of result.toolCalls) {
+                          const toolResult = toolCall?.result || {};
+                          
+                          if (originalApproval.assetType === 'image') {
+                            // For images, look for imageUrl, image_url, s3_url, or url in generate_image result
+                            const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
+                            if (imageUrl) {
+                              newAssetUrl = imageUrl;
+                              newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
+                              break;
+                            }
+                          } else if (originalApproval.assetType === 'html') {
+                            // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file result
+                            const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
+                            if (htmlUrl) {
+                              newAssetUrl = htmlUrl;
+                              newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || `revised_${originalApproval.filename || 'report.html'}`;
+                              break;
+                            }
+                          }
+                        }
+                      }
+                      
+                      // If we found a new asset, send it to Slack for review
+                      if (newAssetUrl && newAssetFilename) {
+                        console.log(`📤 Sending new revision asset to Slack: ${newAssetUrl}`);
+                        
+                        try {
+                          // Get the asset type from filename
+                          const assetType = getAssetTypeFromFilename(newAssetFilename);
+                          
+                          // Send approval request to the same Slack channel
+                          const approvalResult = await sendApprovalRequestWithTracking({
+                            executionId: originalApproval.executionId,
+                            imageUrl: newAssetUrl,
+                            filename: newAssetFilename,
+                            assetType,
+                            userId: originalApproval.userId,
+                            channel: originalApproval.slackChannel,
+                            channelName: originalApproval.slackChannelName,
+                            note: `Revision based on feedback: ${feedbackValue}`
+                          });
+                          
+                          console.log(`✅ New revision asset sent to Slack for review: ${approvalResult.approvalId}`);
+                        } catch (error) {
+                          console.error('❌ Error sending revision asset to Slack:', error);
+                        }
+                      } else {
+                        console.warn(`⚠️ Could not extract new asset URL from toolCalls. Tool calls: ${JSON.stringify(result.toolCalls)}`);
+                        
+                        // Send oncall alert with session ishare link and context
+                        try {
+                          const { chatbotDb } = await import('../services/chatbotService');
+                          const { emailService } = await import('../services/emailService');
+                          
+                          // Get or create ishare link for the session
+                          let ishareLink = '';
+                          try {
+                            ishareLink = await chatbotDb.createOrReuseInteractiveShare(task.sessionId);
+                          } catch (shareError) {
+                            console.error('Error creating ishare link for oncall alert:', shareError);
+                            const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+                            ishareLink = `${customerFrontendUrl}/agent-mode/${task.sessionId}`;
+                          }
+                          
+                          await emailService.sendOncallAlert(
+                            'Agent Mode Revision: Failed to Extract Asset URL',
+                            `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                            {
+                              'Session ID': task.sessionId,
+                              'iShare Link': ishareLink,
+                              'Asset Type': originalApproval.assetType || 'unknown',
+                              'Original Asset URL': originalApproval.assetUrl,
+                              'Original Filename': originalApproval.filename || 'unknown',
+                              'Feedback': feedbackValue,
+                              'Revision Success': result.success,
+                              'Tool Calls Count': result.toolCalls.length,
+                              'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
+                              'Execution ID': originalApproval.executionId,
+                              'Task ID': execution.taskId,
+                              'Slack Channel': originalApproval.slackChannel || 'N/A',
+                              'User ID': originalApproval.userId || 'N/A'
+                            }
+                          );
+                        } catch (alertError) {
+                          console.error('❌ Error sending oncall alert:', alertError);
+                        }
+                      }
+                    }).catch((error) => {
+                      console.error('❌ Error in Agent Mode verified-generate:', error);
+                    });
+                    
+                    console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${task.sessionId}`);
+                  } catch (agentModeError) {
+                    console.error('❌ Error submitting feedback to Agent Mode session:', agentModeError);
+                    // Fall back to regular revision creation
+                    console.log('🔄 Falling back to regular revision creation');
+                    throw agentModeError; // Will be caught by outer catch
+                  }
+                } else {
+                  // For browser tasks, use the existing revision creation flow
+                  console.log(`🚀 Starting feedback-based revision for task: ${execution.taskId}`);
+                  
+                  // Use the common function to create revision execution
+                  const revisionResult = await createRevisionExecutionFromSlack(
+                    execution.taskId,
+                    `Please revise this ${originalApproval.assetType || 'asset'} based on the following feedback: ${feedbackValue}`,
+                    originalApproval.assetUrl,
+                    originalApproval.executionId,
+                    originalApproval.assetType || 'asset',
+                    user.username || user.id,
+                    1,
+                    originalApproval.slackChannel,
+                    originalApproval.slackChannelName
+                  );
+                  
+                  if (revisionResult.success && revisionResult.execution) {
+                    console.log(`✅ Feedback-based revision started: ${revisionResult.execution.executionId}`);
+                  } else {
+                    console.error(`❌ Failed to start feedback-based revision`);
+                  }
+                }
+              } else {
+                console.error(`❌ Could not find execution for ID: ${originalApproval.executionId}`);
+              }
             }
           } catch (error) {
             console.error('❌ Error starting feedback-based revision:', error);
