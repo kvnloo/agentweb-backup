@@ -146,7 +146,7 @@ export class ToolExecutor {
     options?: ExecuteOptions
   ): Promise<ToolResult<TResult>> {
     const startTime = new Date();
-    const { timeout = 300000, verbose = false } = options || {};
+    const { timeout = 3600000, verbose = false } = options || {}; // 1 hour timeout
 
     const handler = this.handlers.get(toolName);
     if (!handler) {
