@@ -7,6 +7,7 @@ import {
   sendApprovalRequestWithTracking,
   updateApprovalMessage,
   openFeedbackModal,
+  openRejectModal,
   openTestEmailModal
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
@@ -302,27 +303,21 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         res.status(200).json({}); // Empty response for modal trigger
 
       } else if (action.action_id === 'reject_asset') {
-        // Handle rejection directly
-        await updateApprovalMessage(
-          channel.id,
-          message.ts,
-          'rejected',
-          user.username || user.id,
-          undefined,
-          'asset'
-        );
-
-        await approvalDb.updateApprovalStatus(
+        // Get asset type for proper display
+        const approval = await approvalDb.getApproval(assetUrl);
+        const assetType = approval?.assetType || 'asset';
+        
+        // Open rejection modal to get rejection reason
+        await openRejectModal(
+          payload.trigger_id,
           assetUrl,
-          'rejected',
-          user.username || user.id
+          filename,
+          executionId,
+          assetType
         );
 
-        console.log(`❌ Rejected: ${assetUrl} by ${user.username}`);
-        res.status(200).json({
-          response_type: "in_channel",
-          text: `❌ Rejected by @${user.username}`
-        });
+        console.log(`📝 Opened reject modal for: ${assetUrl}`);
+        res.status(200).json({}); // Empty response for modal trigger
 
       } else if (action.action_id === 'test_email') {
         // Get asset type for proper display
@@ -431,6 +426,42 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         }
 
         console.log(`🔶 Changes requested for: ${assetUrl} by ${user.username}`);
+        res.status(200).json({}); // Empty response for successful submission
+      } else if (view.callback_id === 'reject_modal') {
+        const metadata = JSON.parse(view.private_metadata);
+        const { assetUrl, filename, executionId, assetType } = metadata;
+        
+        // Get rejection reason from the modal
+        const rejectReasonValue = view.state.values.reject_reason_input.reject_reason_text.value;
+        
+        console.log("❌ Rejection submission received:", {
+          assetUrl,
+          rejectReason: rejectReasonValue,
+          user: user.username
+        });
+
+        // Update approval status with rejection reason (stored as feedback)
+        await approvalDb.updateApprovalStatus(
+          assetUrl,
+          'rejected',
+          user.username || user.id,
+          rejectReasonValue
+        );
+
+        // Update the original message to show the rejection reason
+        const originalApproval = await approvalDb.getApproval(assetUrl);
+        if (originalApproval && originalApproval.slackChannel && originalApproval.slackMessageTs) {
+          await updateApprovalMessage(
+            originalApproval.slackChannel,
+            originalApproval.slackMessageTs,
+            'rejected',
+            user.username || user.id,
+            rejectReasonValue,
+            originalApproval.assetType || 'asset'
+          );
+        }
+
+        console.log(`❌ Rejected: ${assetUrl} by ${user.username} with reason: ${rejectReasonValue}`);
         res.status(200).json({}); // Empty response for successful submission
       } else if (view.callback_id === 'test_email_modal') {
         const metadata = JSON.parse(view.private_metadata);

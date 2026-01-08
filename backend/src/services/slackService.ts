@@ -271,6 +271,9 @@ export async function updateApprovalMessage(
     if (decision === "needs_changes" && feedback) {
       statusUpdateText += `\n*Feedback:* ${feedback}`;
     }
+    if (decision === "rejected" && feedback) {
+      statusUpdateText += `\n*Feedback:* ${feedback}`;
+    }
 
     const newStatusBlock: any = {
       type: "section",
@@ -487,6 +490,98 @@ export async function openFeedbackModal(
     console.log("✅ Feedback modal opened successfully");
   } catch (error) {
     console.error("❌ Error opening feedback modal:", error);
+    throw error;
+  }
+}
+
+/**
+ * Open modal dialog for rejection reason input
+ */
+export async function openRejectModal(
+  triggerId: string,
+  assetUrl: string,
+  filename: string,
+  executionId?: string,
+  assetType?: string
+): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  try {
+    // Customize placeholder text based on asset type
+    let placeholderText = "Please provide a reason for rejecting this asset...";
+    
+    if (assetType === 'image') {
+      placeholderText = "e.g., 'Does not match brand guidelines', 'Quality is too low', 'Wrong dimensions'";
+    } else if (assetType === 'html') {
+      placeholderText = "e.g., 'Layout is broken', 'Missing required sections', 'Does not meet accessibility standards'";
+    } else if (assetType === 'video') {
+      placeholderText = "e.g., 'Video quality is poor', 'Wrong duration', 'Audio issues'";
+    }
+
+    await slackClient.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: "modal",
+        callback_id: "reject_modal",
+        title: {
+          type: "plain_text",
+          text: "Reject Asset",
+        },
+        submit: {
+          type: "plain_text",
+          text: "Reject",
+        },
+        close: {
+          type: "plain_text",
+          text: "Cancel",
+        },
+        private_metadata: JSON.stringify({
+          assetUrl,
+          filename,
+          executionId,
+          assetType,
+        }),
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Asset:* ${filename}\n*Type:* ${assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Unknown'}\n*Action:* Reject Asset`,
+            },
+          },
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: "Please provide feedback why you want to reject it so we can improve.",
+            },
+          },
+          {
+            type: "input",
+            block_id: "reject_reason_input",
+            element: {
+              type: "plain_text_input",
+              action_id: "reject_reason_text",
+              multiline: true,
+              placeholder: {
+                type: "plain_text",
+                text: placeholderText,
+              },
+            },
+            label: {
+              type: "plain_text",
+              text: "Feedback",
+            },
+          },
+        ],
+      },
+    });
+
+    console.log("✅ Reject modal opened successfully");
+  } catch (error) {
+    console.error("❌ Error opening reject modal:", error);
     throw error;
   }
 }
