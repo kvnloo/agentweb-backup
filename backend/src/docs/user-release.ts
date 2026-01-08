@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-08',
+    changes: [
+      'Improved Slack review experience',
+      '- Now collects user feedback when rejecting assets',
+      '- Automatically generates new versions when changes are requested and sends them back to Slack',
+      '- Added oncall alerts for failed revision runs to help debug issues',
+    ],
+  },
+  {
     date: '2026-01-07',
     changes: [
       'Updated create_blog_article function to use title_draft and content_draft parameters',
