@@ -29,7 +29,7 @@ export class VideoService implements ToolService {
     endFrame?: string
   ): Promise<any> {
     try {
-      console.log('VideoService: Generating video with prompt:', prompt, 'filename:', filename);
+      console.log('VideoService: Generating video with prompt:', prompt, 'filename:', filename, 'videoModel:', videoModel, 'startFrame:', startFrame ? 'provided' : 'none', 'endFrame:', endFrame ? 'provided' : 'none', 'userId:', userId, 'sessionId:', sessionId);
 
       // Import the video generation service
       const { videoService } = await import('../videoGeneration');
@@ -39,7 +39,7 @@ export class VideoService implements ToolService {
       if (!isAvailable) {
         return {
           success: false,
-          message: 'Video generation service is not available. Please check API key configuration.',
+          message: 'Video generation service is not available. Please check API key configuration in AWS Secrets Manager.',
           error: 'Service unavailable'
         };
       }
@@ -55,6 +55,15 @@ export class VideoService implements ToolService {
       });
 
       if (result.success && result.videoUrl) {
+        // Save the video URL to the session for reference
+        const videoData = {
+          url: result.videoUrl,
+          filename: result.filename,
+          generatedAt: new Date().toISOString(),
+          prompt: prompt,
+          model: videoModel || 'veo-3.1-generate-preview'
+        };
+
         // Store video data in session metadata (optional)
         try {
           await chatbotDb.addMessageToSession(sessionId, {
@@ -104,7 +113,10 @@ export class VideoService implements ToolService {
 
     try {
       if (!videoFileUrl) {
-        return { success: false, message: 'No video URL provided' };
+        return {
+          success: false,
+          message: 'No video URL provided'
+        };
       }
 
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
@@ -112,7 +124,10 @@ export class VideoService implements ToolService {
       const geminiApiKey = await getSecret(geminiSecretName);
 
       if (!geminiApiKey || !geminiApiKey.trim()) {
-        return { success: false, message: 'Gemini API key is empty' };
+        return {
+          success: false,
+          message: 'Gemini API key is empty'
+        };
       }
 
       const { GoogleGenAI } = await import('@google/genai');
@@ -127,13 +142,19 @@ export class VideoService implements ToolService {
       let contents: any;
 
       if (isYoutube) {
-        contents = [{
-          role: 'user',
-          parts: [
-            { fileData: { fileUri: videoFileUrl } },
-            { text: analysisPrompt }
-          ]
-        }];
+        contents = [
+          {
+            role: 'user',
+            parts: [
+              {
+                fileData: {
+                  fileUri: videoFileUrl
+                }
+              },
+              { text: analysisPrompt }
+            ]
+          }
+        ];
       } else {
         const maxSizeMb = parseInt(process.env.MAX_DOWNLOADED_VIDEO_SIZE_MB || '100', 10);
         const maxSizeBytes = maxSizeMb * 1024 * 1024;
@@ -145,7 +166,7 @@ export class VideoService implements ToolService {
         if (declaredSize && declaredSize > maxSizeBytes) {
           return {
             success: false,
-            message: `Video file too large: ${Math.round(declaredSize / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
+            message: `Video file too large for analysis: ${Math.round(declaredSize / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
           };
         }
 
@@ -168,7 +189,6 @@ export class VideoService implements ToolService {
 
         const writer = createWriteStream(tempFilePath);
         let downloadedBytes = 0;
-
         await new Promise<void>((resolve, reject) => {
           responseStream.on('data', (chunk: Buffer) => {
             downloadedBytes += chunk.length;
@@ -182,9 +202,18 @@ export class VideoService implements ToolService {
           responseStream.pipe(writer);
         });
 
-        if (downloadedBytes === 0) return { success: false, message: 'Downloaded video file is empty' };
+        if (downloadedBytes === 0) {
+          return {
+            success: false,
+            message: 'Downloaded video file is empty'
+          };
+        }
+
         if (downloadedBytes > maxSizeBytes) {
-           return { success: false, message: `Video file too large: ${Math.round(downloadedBytes / (1024 * 1024))} MB exceeds limit` };
+          return {
+            success: false,
+            message: `Video file too large for analysis: ${Math.round(downloadedBytes / (1024 * 1024))} MB exceeds limit of ${maxSizeMb} MB`
+          };
         }
 
         const uploadResponse = await aiClient.files.upload({
@@ -196,19 +225,31 @@ export class VideoService implements ToolService {
         const uploadedMime = uploadResponse.mimeType || uploadResponse.file?.mimeType || mimeType;
         uploadedFileName = uploadResponse.name || uploadResponse.file?.name || fileUri || null;
 
-        if (!fileUri) return { success: false, message: 'Failed to upload video to Gemini Files API' };
+        if (!fileUri) {
+          return {
+            success: false,
+            message: 'Failed to upload video to Gemini Files API'
+          };
+        }
 
         if (uploadedFileName) {
           await this.waitForGeminiFileActive(aiClient, uploadedFileName);
         }
 
-        contents = [{
-          role: 'user',
-          parts: [
-            { fileData: { fileUri, mimeType: uploadedMime } },
-            { text: analysisPrompt }
-          ]
-        }];
+        contents = [
+          {
+            role: 'user',
+            parts: [
+              {
+                fileData: {
+                  fileUri,
+                  mimeType: uploadedMime
+                }
+              },
+              { text: analysisPrompt }
+            ]
+          }
+        ];
       }
 
       const response = await aiClient.models.generateContent({
@@ -217,7 +258,13 @@ export class VideoService implements ToolService {
       });
 
       const description = response.text;
-      if (!description) return { success: false, message: 'No description returned from Gemini' };
+
+      if (!description) {
+        return {
+          success: false,
+          message: 'No description returned from Gemini'
+        };
+      }
 
       return {
         success: true,
@@ -225,12 +272,12 @@ export class VideoService implements ToolService {
         videoUrl: videoFileUrl
       };
 
-    } catch (error: any) {
+    } catch (error) {
       console.error('VideoService: Error describing video:', error);
       return {
         success: false,
-        message: 'Failed to analyze video',
-        error: error.message
+        message: 'Failed to analyze video. Please check that the URL is accessible and contains a valid video.',
+        error: error instanceof Error ? error.message : 'Unknown error'
       };
     } finally {
       if (aiClient && uploadedFileName) {
@@ -238,14 +285,19 @@ export class VideoService implements ToolService {
           await aiClient.files.delete({ name: uploadedFileName });
         } catch (cleanupError) {
           try {
-             await (aiClient.files as any).delete(uploadedFileName);
-          } catch (e) { /* ignore */ }
+            await (aiClient.files as any).delete(uploadedFileName);
+          } catch (fallbackError) {
+            console.warn('VideoService: Failed to delete uploaded Gemini file:', fallbackError);
+          }
         }
       }
+
       if (tempDirPath) {
         try {
           await fs.rm(tempDirPath, { recursive: true, force: true });
-        } catch (e) { /* ignore */ }
+        } catch (cleanupError) {
+          console.warn('VideoService: Failed to clean up temp video file:', cleanupError);
+        }
       }
     }
   }
@@ -264,8 +316,13 @@ export class VideoService implements ToolService {
         }
 
         const state = fileInfo?.state || fileInfo?.file?.state;
-        if (state === 'ACTIVE') return;
-        if (state === 'FAILED') throw new Error('Gemini file processing failed');
+        if (state === 'ACTIVE') {
+          return;
+        }
+
+        if (state === 'FAILED') {
+          throw new Error('Gemini file processing failed');
+        }
       } catch (error) {
         if (attempt === maxAttempts) throw error;
       }

@@ -1,5 +1,4 @@
 
-import { userDb } from '../db';
 import { ToolService } from '../../tools/ServiceRegistry';
 import axios from 'axios';
 
@@ -78,21 +77,23 @@ function replaceImagePlaceholders(
   imageUrls: string[]
 ): string {
   let result = content;
-  
+
   placeholders.forEach((placeholder, index) => {
-    const imageUrl = imageUrls[index] || '';
-    if (imageUrl) {
-      const figureHtml = `<figure class="blog-inline-image">
-        <img src="${imageUrl}" alt="${placeholder.caption || placeholder.prompt}" />
-        ${placeholder.caption ? `<figcaption>${placeholder.caption}</figcaption>` : ''}
-      </figure>`;
-      result = result.replace(placeholder.fullMatch, figureHtml);
-    } else {
-      // Remove placeholder if image generation failed
+    const imageUrl = imageUrls[index];
+    if (!imageUrl) {
+      // Remove placeholder if no image was generated
       result = result.replace(placeholder.fullMatch, '');
+      return;
     }
+
+    const figureMarkdown = `
+![${placeholder.caption}](${imageUrl})
+*${placeholder.caption}*
+`;
+
+    result = result.replace(placeholder.fullMatch, figureMarkdown);
   });
-  
+
   return result;
 }
 
@@ -108,14 +109,14 @@ export class BlogService implements ToolService {
   async createBlogArticle(
     titleDraft: string,
     contentDraft: string,
-    length: 'short' | 'medium' | 'long' = 'medium',
-    researchContext: string = '',
-    requirements: string = '',
+    length: string,
+    researchContext: string,
+    requirements: string,
     userId: string,
     sessionId: string,
-    style: 'default' | 'substack' = 'default',
+    style: string = 'default',
     deepResearch: boolean = false
-  ): Promise<BlogArticleResult> {
+  ): Promise<any> {
     try {
       // Import required services
       const { uploadFileToS3 } = await import('../../utils/s3Utils');
@@ -265,7 +266,7 @@ export class BlogService implements ToolService {
 
       return {
         success: true,
-        message: this.getSuccessMessage(deepResearch, inlineImagesCount),
+        message: this.getBlogSuccessMessage(deepResearch, inlineImagesCount),
         data: {
           title: blogData.title,
           description: blogData.description,
@@ -313,50 +314,68 @@ export class BlogService implements ToolService {
 
       const htmlContent = htmlResponse.data as string;
 
-      // Extract content from <div class="content">
+      // Extract content from <div class="content"> - find first opening tag and last closing tag before </body>
       const contentDivStart = htmlContent.search(/<div[^>]*class=["'][^"']*content[^"']*["'][^>]*>/i);
       if (contentDivStart === -1) {
         throw new Error('Could not extract content from HTML. Expected <div class="content"> element.');
       }
 
+      // Find the position after the opening tag
       const afterOpenTag = htmlContent.indexOf('>', contentDivStart) + 1;
+
+      // Find the last </div> before </body>
       const bodyEnd = htmlContent.lastIndexOf('</body>');
       if (bodyEnd === -1) {
         throw new Error('Could not find </body> tag in HTML');
       }
 
+      // Find the last </div> before </body>
       const lastDivClose = htmlContent.lastIndexOf('</div>', bodyEnd);
       if (lastDivClose === -1) {
         throw new Error('Could not find closing </div> tag for content');
       }
 
+      // Extract everything between the opening tag and the last </div>
       let bodyHtml = htmlContent.substring(afterOpenTag, lastDivClose).trim();
+
       if (!bodyHtml) {
         throw new Error('Content is empty after cleaning');
       }
 
-      // Step 2: Get user's CMS type
+      // Extract image filename from URL
+      let imageFilename: string | undefined;
+      if (heroImageUrl) {
+        const urlParts = heroImageUrl.split('/');
+        imageFilename = urlParts[urlParts.length - 1];
+      }
+
+      // Step 3: Get user's CMS type
+      const { userDb } = await import('../db');
       const user = await userDb.getUserById(userId);
+
       if (!user) {
         throw new Error('User not found');
       }
 
       const cmsType = user.cmsType;
+
       if (!cmsType) {
         return {
           success: false,
-          message: 'CMS Type is not configured for this user.',
+          message: 'CMS Type is not configured for this user. Please contact an administrator to set up CMS publishing.',
           error: 'CMS Type not configured'
         };
       }
 
       console.log('BlogService: User CMS Type:', cmsType);
 
-      // Step 3: Publish to CMS (Webflow only for now)
+      // Step 4: Publish to CMS
+      // Only Webflow is supported for publish_blog_article function
       if (cmsType === 'Webflow') {
         const { getWebflowConfig } = await import('../../controllers/blog');
         const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
 
+        // Call Webflow publishing
         const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
         const cmsItemData: any = {
@@ -368,11 +387,21 @@ export class BlogService implements ToolService {
           }
         };
 
+        // Use body HTML directly for Webflow
+        // Webflow API may strip HTML tags if newlines are present, so remove them
         const cleanBodyHtml = bodyHtml.replace(/\n/g, '').replace(/\r/g, '');
 
-        if (fieldMappings?.summary) cmsItemData.fieldData[fieldMappings.summary] = description;
-        if (fieldMappings?.body) cmsItemData.fieldData[fieldMappings.body] = cleanBodyHtml;
-        if (heroImageUrl && fieldMappings?.image) cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
+        if (fieldMappings?.summary) {
+          cmsItemData.fieldData[fieldMappings.summary] = description;
+        }
+
+        if (fieldMappings?.body) {
+          cmsItemData.fieldData[fieldMappings.body] = cleanBodyHtml;
+        }
+
+        if (heroImageUrl && fieldMappings?.image) {
+          cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
+        }
 
         const headers = {
           Authorization: `Bearer ${apiToken}`,
@@ -380,55 +409,136 @@ export class BlogService implements ToolService {
           'accept-version': '2.0.0'
         };
 
-        const response = await axios.post(
-          `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
-          cmsItemData,
-          { headers }
-        );
+        try {
+          const response = await axios.post(
+            `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
+            cmsItemData,
+            { headers }
+          );
 
-        console.log('BlogService: Blog article published successfully to Webflow');
-        
-        // Remove large fields for response
-        const responseData = { ...(response.data as any) };
-        if (responseData.fieldData) {
-            delete responseData.fieldData['post-body'];
-            delete responseData.fieldData['body'];
-        }
+          console.log('BlogService: Blog article published successfully to Webflow');
 
-        return {
-          success: true,
-          message: 'Blog article published successfully to Webflow',
-          data: {
-              title,
-              slug,
-              webflowResponse: responseData
+          // Sanitize response to remove large content fields before sending to LLM
+          const responseData = response.data as any;
+          const sanitizedResponse = responseData && typeof responseData === 'object'
+            ? { ...responseData }
+            : responseData;
+
+          if (sanitizedResponse && sanitizedResponse.fieldData && typeof sanitizedResponse.fieldData === 'object') {
+            const sanitizedFieldData = { ...sanitizedResponse.fieldData };
+            // Remove large content fields that aren't needed by the LLM
+            delete sanitizedFieldData['post-body'];
+            delete sanitizedFieldData['body'];
+            sanitizedResponse.fieldData = sanitizedFieldData;
           }
+
+          return {
+            success: true,
+            message: 'Blog article published successfully to Webflow',
+            data: {
+              title,
+              cmsType: 'Webflow',
+              cmsResponse: sanitizedResponse
+            }
+          };
+        } catch (webflowError: any) {
+          // Extract detailed error information
+          const errorInfo: any = {
+            status: webflowError.response?.status,
+            statusText: webflowError.response?.statusText,
+          };
+
+          if (webflowError.response?.data) {
+            const errorData = webflowError.response.data;
+
+            if (errorData.message) {
+              errorInfo.message = errorData.message;
+            }
+
+            // Extract validation error details
+            if (errorData.details && Array.isArray(errorData.details)) {
+              errorInfo.details = errorData.details;
+              const detailMessages = errorData.details
+                .map((d: any) => `${d.param}: ${d.description}`)
+                .join('; ');
+              if (detailMessages) {
+                errorInfo.message = `${errorInfo.message || 'Validation Error'}. ${detailMessages}`;
+              }
+            }
+          }
+
+          // Log concise error summary
+          if (errorInfo.details && errorInfo.details.length > 0) {
+            const errorDetails = errorInfo.details
+              .map((d: any) => `${d.param}: ${d.description}`)
+              .join(', ');
+            console.error(`BlogService: Webflow API error (${errorInfo.status}): ${errorDetails}`);
+          } else {
+            console.error(`BlogService: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
+          }
+
+          // Create a more user-friendly error message
+          const errorMessage = errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`;
+          throw new Error(errorMessage);
+        }
+      } else if (cmsType === 'Basehub') {
+        return {
+          success: false,
+          message: 'Basehub CMS is not supported for publish_blog_article function. Please use the Research Reports page to publish to Basehub.',
+          error: 'Basehub not supported'
         };
       } else {
-          return {
-              success: false,
-              message: `CMS Type '${cmsType}' is not currently supported for automated publishing.`,
-              error: 'Unsupported CMS Type'
-          }
+        return {
+          success: false,
+          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub' and 'Webflow'.`,
+          error: 'Unsupported CMS Type'
+        };
       }
-
     } catch (error: any) {
       console.error('BlogService: Error publishing blog article:', error);
+
+      // Extract detailed error information for better user feedback
+      let errorMessage = error.message || 'Failed to publish blog article';
+
+      if (error.response?.data) {
+        const errorData = error.response.data;
+
+        // Extract validation error details
+        if (errorData.details && Array.isArray(errorData.details)) {
+          const detailMessages = errorData.details
+            .map((d: any) => {
+              if (d.param && d.description) {
+                return `${d.param}: ${d.description}`;
+              }
+              return JSON.stringify(d);
+            })
+            .join('; ');
+          if (detailMessages) {
+            errorMessage = `Webflow validation error: ${detailMessages}`;
+          }
+        } else if (errorData.message) {
+          errorMessage = errorData.message;
+        }
+      }
+
       return {
         success: false,
-        message: 'Failed to publish blog article',
-        error: error.message
+        message: errorMessage,
+        error: error.message || 'Unknown error'
       };
     }
   }
 
-  private getSuccessMessage(deepResearch: boolean, inlineCount: number): string {
-    if (deepResearch && inlineCount > 0) {
-      return `✅ Blog article created with deep research and ${inlineCount} inline images!`;
-    } else if (deepResearch) {
-      return '✅ Blog article created with deep research!';
+  /**
+   * Get success message based on options used
+   */
+  private getBlogSuccessMessage(deepResearch: boolean, inlineCount: number): string {
+    const parts = ['Blog article created successfully'];
+    if (deepResearch) parts.push('with deep research');
+    if (inlineCount > 0) {
+      parts.push(`and ${inlineCount} inline images`);
     }
-    return '✅ Blog article created successfully!';
+    return parts.join(' ');
   }
 }
 
