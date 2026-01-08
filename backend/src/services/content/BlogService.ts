@@ -10,12 +10,11 @@ import axios from 'axios';
  */
 
 /**
- * Blog article options
+ * Blog article options - matches agentModeService.ts pattern
  */
 export interface BlogArticleOptions {
-  topic: string;
-  keywords?: string;
-  tone?: 'professional' | 'casual' | 'friendly' | 'authoritative' | 'conversational';
+  titleDraft: string;
+  contentDraft: string;
   length?: 'short' | 'medium' | 'long';
   researchContext?: string;
   requirements?: string;
@@ -26,45 +25,52 @@ export interface BlogArticleOptions {
 }
 
 /**
- * Blog article result
+ * Blog article result - matches agentModeService.ts pattern
  */
 export interface BlogArticleResult {
   success: boolean;
   message: string;
-  title?: string;
-  description?: string;
-  htmlUrl?: string;
-  heroImageUrl?: string;
-  wordCount?: number;
-  inlineImagesCount?: number;
+  data?: {
+    title: string;
+    description: string;
+    heroImageUrl: string;
+    imageUrl: string;
+    htmlUrl: string;
+    deepResearchUsed: boolean;
+    inlineImagesCount: number;
+    wordCount: number;
+  };
   error?: string;
 }
 
 /**
  * Parse image placeholders from content
+ * Matches {{IMAGE: prompt="...", caption="..."}} pattern
  */
 function parseImagePlaceholders(content: string): Array<{
   fullMatch: string;
   prompt: string;
   caption: string;
 }> {
-  const regex = /\{\{IMAGE:\s*prompt="([^"]+)"(?:,\s*caption="([^"]*)")?\}\}/g;
   const placeholders: Array<{ fullMatch: string; prompt: string; caption: string }> = [];
-  
+
+  // Match {{IMAGE: prompt="...", caption="..."}} pattern
+  const regex = /\{\{IMAGE:\s*prompt="([^"]+)",\s*caption="([^"]+)"\}\}/g;
   let match;
+
   while ((match = regex.exec(content)) !== null) {
     placeholders.push({
       fullMatch: match[0],
       prompt: match[1],
-      caption: match[2] || ''
+      caption: match[2]
     });
   }
-  
+
   return placeholders;
 }
 
 /**
- * Replace image placeholders with actual HTML
+ * Replace {{IMAGE: ...}} placeholders with actual <figure> HTML
  */
 function replaceImagePlaceholders(
   content: string,
@@ -97,12 +103,11 @@ export class BlogService implements ToolService {
   readonly serviceName = 'blog';
 
   /**
-   * Create a blog article
+   * Create a blog article - refactored to match agentModeService.ts pattern
    */
   async createBlogArticle(
-    topic: string,
-    keywords: string = '',
-    tone: 'professional' | 'casual' | 'friendly' | 'authoritative' | 'conversational' = 'professional',
+    titleDraft: string,
+    contentDraft: string,
     length: 'short' | 'medium' | 'long' = 'medium',
     researchContext: string = '',
     requirements: string = '',
@@ -111,33 +116,44 @@ export class BlogService implements ToolService {
     style: 'default' | 'substack' = 'default',
     deepResearch: boolean = false
   ): Promise<BlogArticleResult> {
-    
-    // Normalize string boolean if needed
-    if (typeof deepResearch === 'string') {
-        deepResearch = (deepResearch === 'true');
-    }
-
     try {
-      console.log('BlogService: Creating article for topic:', topic, 'deepResearch:', deepResearch);
-
       // Import required services
       const { uploadFileToS3 } = await import('../../utils/s3Utils');
-      const { generateBlogImage, generateBlogHtml, generateBlogContent, restyleContent } = 
-        await import('../../controllers/blog');
+      const { generateBlogImage, generateBlogHtml, generateBlogContent } = await import('../../controllers/blog');
+
+      if (!titleDraft || !contentDraft) {
+        throw new Error("title_draft and content_draft are required");
+      }
+
+      // Calculate first and last 100 bytes for logging
+      const contentLength = contentDraft.length;
+      const first100Bytes = contentDraft.substring(0, Math.min(100, contentLength));
+      const last100Bytes = contentLength > 100 ? contentDraft.substring(contentLength - 100) : contentDraft;
+      const contentPreview = `${contentLength}: ${first100Bytes}...${last100Bytes}`;
+
+      console.log('BlogService: Creating blog article for title_draft:', titleDraft, 'length:', length, 'deepResearch:', deepResearch, 'userId:', userId, 'content_draft:', contentPreview);
+
+      // Import restyleContent for processing the draft
+      const { restyleContent } = await import('../../controllers/blog');
 
       let blogData: { title: string; description: string; content: string; imagePrompt: string };
       let finalContent: string;
       let inlineImagesCount = 0;
 
       if (deepResearch) {
-        // Deep research flow
-        console.log('BlogService: Performing deep research...');
+        // ========================================
+        // DEEP RESEARCH FLOW: Research + Restyle + Inline Images
+        // ========================================
+        console.log('BlogService: Deep research enabled, performing research...');
         const { deepResearchService } = await import('../deepResearchService');
 
+        // Combine title_draft and content_draft as topic for deep research
+        const researchTopic = `${titleDraft}\n\n${contentDraft}`;
+
         const researchResult = await deepResearchService.performDeepResearch({
-          topic,
+          topic: researchTopic,
           prompt: requirements || undefined,
-          tone,
+          tone: 'professional',
           style
         });
 
@@ -145,68 +161,91 @@ export class BlogService implements ToolService {
           throw new Error(researchResult.error || 'Deep research failed');
         }
 
+        console.log('BlogService: Deep research complete. Length:', researchResult.markdownContent.length);
+        console.log('BlogService: Restyling research content with style:', style);
+
         // Restyle with inline image placeholders
         blogData = await restyleContent(
           researchResult.markdownContent,
-          topic,
-          tone,
+          titleDraft,
+          'professional',
           style,
-          true // includeInlineImages
+          true // includeInlineImages = true for deep research
         );
 
         if (!blogData.title || !blogData.content) {
-          throw new Error('Blog content generation failed');
+          throw new Error("Blog content restyling failed");
         }
+
+        // Use the generated title from blogData (not the draft)
 
         // Parse and generate inline images
         const placeholders = parseImagePlaceholders(blogData.content);
-        
+        console.log(`BlogService: Found ${placeholders.length} image placeholders in content`);
+
         if (placeholders.length > 0) {
-          console.log(`BlogService: Generating ${placeholders.length} inline images...`);
+          console.log('BlogService: Generating inline images...');
           const inlineImageResults = await Promise.all(
             placeholders.map(p => generateBlogImage(p.prompt, userId))
           );
 
           const inlineImageUrls = inlineImageResults.map(r => r.imageUrl || '');
           inlineImagesCount = inlineImageUrls.filter(u => u).length;
+          console.log(`BlogService: Generated ${inlineImagesCount} inline images successfully`);
 
+          // Replace placeholders with actual image URLs
           finalContent = replaceImagePlaceholders(blogData.content, placeholders, inlineImageUrls);
+          console.log('BlogService: Replaced image placeholders with actual images');
         } else {
           finalContent = blogData.content;
         }
-
       } else {
-        // Standard flow
+        // ========================================
+        // STANDARD FLOW: Generate content from draft
+        // ========================================
+        console.log('BlogService: Generating blog content from draft with style:', style);
         blogData = await generateBlogContent(
-          topic, keywords, tone, length,
-          researchContext, requirements, style
+          titleDraft,
+          contentDraft,
+          length,
+          researchContext,
+          requirements,
+          style
         );
 
         if (!blogData.title || !blogData.content) {
-          throw new Error('Blog content generation failed');
+          throw new Error("Blog content generation failed");
         }
 
+        console.log('BlogService: Blog content ready. Title:', blogData.title);
         finalContent = blogData.content;
       }
 
-      // Generate hero image
+      // ========================================
+      // COMMON: Generate Hero Image
+      // ========================================
       console.log('BlogService: Generating hero image...');
       const heroResult = await generateBlogImage(blogData.imagePrompt, userId);
       if (!heroResult.imageUrl) {
         throw new Error('Hero image generation failed');
       }
+      const heroImageUrl = heroResult.imageUrl;
+      console.log('BlogService: Hero image generated successfully');
 
-      // Build HTML and upload
-      console.log('BlogService: Generating HTML...');
+      // ========================================
+      // COMMON: Build HTML and Upload to S3
+      // ========================================
+      console.log('BlogService: Generating HTML file with style:', style);
       const htmlContent = await generateBlogHtml(
         blogData.title,
         blogData.description,
         finalContent,
-        heroResult.imageUrl,
+        heroImageUrl,
         style
       );
-
+      console.log('BlogService: Uploading HTML file to S3...');
       const htmlFilename = `blog-${Date.now()}.html`;
+
       const uploadResult = await uploadFileToS3(
         htmlContent,
         htmlFilename,
@@ -215,25 +254,32 @@ export class BlogService implements ToolService {
       );
 
       if (!uploadResult.success || !uploadResult.url) {
-        throw new Error(uploadResult.error || 'Failed to upload HTML to S3');
+        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
       }
 
-      // Calculate word count
-      const wordCount = finalContent.split(/\s+/).filter(w => w.length > 0).length;
+      const htmlUrl = uploadResult.url;
+      console.log('BlogService: HTML file uploaded successfully to:', htmlUrl);
+
+      // Calculate word count from the content
+      const wordCount = blogData.content.split(/\s+/).filter((word: string) => word.length > 0).length;
 
       return {
         success: true,
         message: this.getSuccessMessage(deepResearch, inlineImagesCount),
-        title: blogData.title,
-        description: blogData.description,
-        htmlUrl: uploadResult.url,
-        heroImageUrl: heroResult.imageUrl,
-        wordCount,
-        inlineImagesCount
+        data: {
+          title: blogData.title,
+          description: blogData.description,
+          heroImageUrl: heroImageUrl,
+          imageUrl: heroImageUrl,
+          htmlUrl: htmlUrl,
+          deepResearchUsed: deepResearch,
+          inlineImagesCount: inlineImagesCount,
+          wordCount: wordCount
+        }
       };
 
     } catch (error: any) {
-      console.error('BlogService: Error creating article:', error);
+      console.error('BlogService: Error creating blog article:', error);
       return {
         success: false,
         message: 'Failed to create blog article',
