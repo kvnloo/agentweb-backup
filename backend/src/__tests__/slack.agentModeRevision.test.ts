@@ -70,14 +70,14 @@ describe('Agent Mode Revision from Slack Request Changes', () => {
           success: true,
           imageUrl: 'https://example.com/new-image.png',
           filename: 'new-image.png'
-        }
+        } as any
       }];
 
       let newAssetUrl: string | null = null;
       let newAssetFilename: string | null = null;
 
       for (const toolCall of toolCalls) {
-        const toolResult = toolCall?.result || {};
+        const toolResult: any = toolCall?.result || {};
         const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
         if (imageUrl) {
           newAssetUrl = imageUrl;
@@ -98,14 +98,14 @@ describe('Agent Mode Revision from Slack Request Changes', () => {
           success: true,
           s3_url: 'https://s3.amazonaws.com/bucket/report_v2.html',
           versioned_filename: 'report_v2.html'
-        }
+        } as any
       }];
 
       let newAssetUrl: string | null = null;
       let newAssetFilename: string | null = null;
 
       for (const toolCall of toolCalls) {
-        const toolResult = toolCall?.result || {};
+        const toolResult: any = toolCall?.result || {};
         const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
         if (htmlUrl) {
           newAssetUrl = htmlUrl;
@@ -131,7 +131,7 @@ describe('Agent Mode Revision from Slack Request Changes', () => {
           success: true,
           message: 'Image generated',
           // Missing imageUrl
-        }
+        } as any
       }];
 
       const agentSessionId = 'session123';
@@ -154,7 +154,7 @@ describe('Agent Mode Revision from Slack Request Changes', () => {
 
       if (toolCalls.length > 0) {
         for (const toolCall of toolCalls) {
-          const toolResult = toolCall?.result || {};
+          const toolResult: any = toolCall?.result || {};
           const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
           if (imageUrl) {
             newAssetUrl = imageUrl;
