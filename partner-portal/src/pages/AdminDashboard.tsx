@@ -6215,7 +6215,7 @@ const AgentModeSettings = () => {
                         <Button
                           variant="contained"
                           onClick={() => saveIndividualWorkPlan(workPlanIndex)}
-                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) || savingWorkPlans}
+                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
                           size="small"
                         >
                           {(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) ? <CircularProgress size={20} /> : 'Save'}
@@ -6223,7 +6223,7 @@ const AgentModeSettings = () => {
                         <IconButton
                           color="error"
                           onClick={() => removeWorkPlan(workPlanIndex)}
-                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) || savingWorkPlans}
+                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
                         >
                           <DeleteIcon />
                         </IconButton>
@@ -6365,7 +6365,7 @@ const AgentModeSettings = () => {
                                     }));
                                   }
                                 }}
-                                disabled={savingWorkPlans || availableFunctionCalls.length === 0}
+                                disabled={savingWorkPlanId !== null || availableFunctionCalls.length === 0}
                               >
                                 <MenuItem value="">
                                   <em>Select a function...</em>
