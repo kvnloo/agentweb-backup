@@ -259,35 +259,70 @@ export async function updateApprovalMessage(
     const originalBlocks = originalMessage.blocks || [];
     const newBlocks = [...originalBlocks];
 
-    // Find the section block with the submission details to update it
-    const statusBlockIndex = newBlocks.findIndex(
-      (block: any) =>
+    // Find all status blocks (there might be multiple if history is being tracked)
+    const statusBlockIndices: number[] = [];
+    newBlocks.forEach((block: any, index: number) => {
+      if (
         block.type === "section" &&
         block.text &&
-        block.text.text.includes("*Status:*")
-    );
+        block.text.text &&
+        (block.text.text.includes("*Status:*") || block.text.text.includes("*History:*"))
+      ) {
+        statusBlockIndices.push(index);
+      }
+    });
 
-    let statusUpdateText = `*Status:* ${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Request Changes" : "❌ Rejected"} by @${reviewedBy}`;
+    // Create new status update with timestamp
+    const timestamp = new Date().toLocaleString();
+    let newStatusUpdate = `${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Request Changes" : "❌ Rejected"} by @${reviewedBy} at ${timestamp}`;
     if (decision === "needs_changes" && feedback) {
-      statusUpdateText += `\n*Feedback:* ${feedback}`;
+      newStatusUpdate += `\n  • Feedback: ${feedback}`;
     }
     if (decision === "rejected" && feedback) {
-      statusUpdateText += `\n*Feedback:* ${feedback}`;
+      newStatusUpdate += `\n  • Feedback: ${feedback}`;
     }
 
-    const newStatusBlock: any = {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: statusUpdateText,
-      },
-    };
-
-    if (statusBlockIndex !== -1) {
-      // If a status block already exists, replace it
-      newBlocks[statusBlockIndex] = newStatusBlock;
+    // If status blocks exist, append to the first one (which contains the history)
+    if (statusBlockIndices.length > 0) {
+      const firstStatusBlockIndex = statusBlockIndices[0];
+      const existingStatusBlock = newBlocks[firstStatusBlockIndex];
+      const existingText = existingStatusBlock.text?.text;
+      
+      if (existingText) {
+        // Check if it already has a History section, otherwise convert Status to History
+        let updatedText: string;
+        if (existingText.includes("*History:*")) {
+          // Append to existing history
+          updatedText = existingText + `\n\n${newStatusUpdate}`;
+        } else {
+          // Convert Status to History and add new entry
+          updatedText = existingText.replace("*Status:*", "*History:*") + `\n\n${newStatusUpdate}`;
+        }
+        
+        newBlocks[firstStatusBlockIndex] = {
+          ...existingStatusBlock,
+          text: {
+            ...existingStatusBlock.text,
+            text: updatedText,
+          },
+        };
+      }
+      
+      // Remove any additional status blocks (they were duplicates)
+      for (let i = statusBlockIndices.length - 1; i > 0; i--) {
+        newBlocks.splice(statusBlockIndices[i], 1);
+      }
     } else {
-      // Otherwise, add it after the main content, before the actions
+      // No status block exists, create a new one with History header
+      const newStatusBlock: any = {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*History:*\n${newStatusUpdate}`,
+        },
+      };
+      
+      // Add it after the main content, before the actions
       const actionsBlockIndex = newBlocks.findIndex(
         (block: any) => block.type === "actions"
       );
@@ -298,10 +333,11 @@ export async function updateApprovalMessage(
       }
     }
 
-    // Remove the action buttons
-    const finalBlocks = newBlocks.filter(
-      (block: any) => block.type !== "actions"
-    );
+    // Remove the action buttons only for final decisions (approved or rejected)
+    // Keep buttons for needs_changes so users can approve or reject later
+    const finalBlocks = decision === "needs_changes" 
+      ? newBlocks 
+      : newBlocks.filter((block: any) => block.type !== "actions");
 
           const assetDisplayName = assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Asset';
       await slackClient.chat.update({
