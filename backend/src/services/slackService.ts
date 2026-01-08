@@ -163,7 +163,7 @@ export async function sendApprovalRequest(
               type: "button",
               text: {
                 type: "plain_text",
-                text: "🔶 Needs Changes",
+                text: "🔶 Request Changes",
                 emoji: true,
               },
               style: "danger",
@@ -259,32 +259,70 @@ export async function updateApprovalMessage(
     const originalBlocks = originalMessage.blocks || [];
     const newBlocks = [...originalBlocks];
 
-    // Find the section block with the submission details to update it
-    const statusBlockIndex = newBlocks.findIndex(
-      (block: any) =>
+    // Find all status blocks (there might be multiple if history is being tracked)
+    const statusBlockIndices: number[] = [];
+    newBlocks.forEach((block: any, index: number) => {
+      if (
         block.type === "section" &&
         block.text &&
-        block.text.text.includes("*Status:*")
-    );
+        block.text.text &&
+        (block.text.text.includes("*Status:*") || block.text.text.includes("*History:*"))
+      ) {
+        statusBlockIndices.push(index);
+      }
+    });
 
-    let statusUpdateText = `*Status:* ${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Needs Changes" : "❌ Rejected"} by @${reviewedBy}`;
+    // Create new status update with timestamp
+    const timestamp = new Date().toLocaleString();
+    let newStatusUpdate = `${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Request Changes" : "❌ Rejected"} by @${reviewedBy} at ${timestamp}`;
     if (decision === "needs_changes" && feedback) {
-      statusUpdateText += `\n*Feedback:* ${feedback}`;
+      newStatusUpdate += `\n  • Feedback: ${feedback}`;
+    }
+    if (decision === "rejected" && feedback) {
+      newStatusUpdate += `\n  • Feedback: ${feedback}`;
     }
 
-    const newStatusBlock: any = {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: statusUpdateText,
-      },
-    };
-
-    if (statusBlockIndex !== -1) {
-      // If a status block already exists, replace it
-      newBlocks[statusBlockIndex] = newStatusBlock;
+    // If status blocks exist, append to the first one (which contains the history)
+    if (statusBlockIndices.length > 0) {
+      const firstStatusBlockIndex = statusBlockIndices[0];
+      const existingStatusBlock = newBlocks[firstStatusBlockIndex];
+      const existingText = existingStatusBlock.text?.text;
+      
+      if (existingText) {
+        // Check if it already has a History section, otherwise convert Status to History
+        let updatedText: string;
+        if (existingText.includes("*History:*")) {
+          // Append to existing history
+          updatedText = existingText + `\n\n${newStatusUpdate}`;
+        } else {
+          // Convert Status to History and add new entry
+          updatedText = existingText.replace("*Status:*", "*History:*") + `\n\n${newStatusUpdate}`;
+        }
+        
+        newBlocks[firstStatusBlockIndex] = {
+          ...existingStatusBlock,
+          text: {
+            ...existingStatusBlock.text,
+            text: updatedText,
+          },
+        };
+      }
+      
+      // Remove any additional status blocks (they were duplicates)
+      for (let i = statusBlockIndices.length - 1; i > 0; i--) {
+        newBlocks.splice(statusBlockIndices[i], 1);
+      }
     } else {
-      // Otherwise, add it after the main content, before the actions
+      // No status block exists, create a new one with History header
+      const newStatusBlock: any = {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*History:*\n${newStatusUpdate}`,
+        },
+      };
+      
+      // Add it after the main content, before the actions
       const actionsBlockIndex = newBlocks.findIndex(
         (block: any) => block.type === "actions"
       );
@@ -295,16 +333,17 @@ export async function updateApprovalMessage(
       }
     }
 
-    // Remove the action buttons
-    const finalBlocks = newBlocks.filter(
-      (block: any) => block.type !== "actions"
-    );
+    // Remove the action buttons only for final decisions (approved or rejected)
+    // Keep buttons for needs_changes so users can approve or reject later
+    const finalBlocks = decision === "needs_changes" 
+      ? newBlocks 
+      : newBlocks.filter((block: any) => block.type !== "actions");
 
           const assetDisplayName = assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Asset';
       await slackClient.chat.update({
         channel,
         ts: messageTs,
-        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : decision === "needs_changes" ? "Needs Changes" : "Rejected"}`,
+        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : decision === "needs_changes" ? "Request Changes" : "Rejected"}`,
         blocks: finalBlocks as any,
       });
 
@@ -436,7 +475,7 @@ export async function openFeedbackModal(
         },
         submit: {
           type: "plain_text",
-          text: "Submit Changes",
+          text: "Request Changes",
         },
         close: {
           type: "plain_text",
@@ -487,6 +526,98 @@ export async function openFeedbackModal(
     console.log("✅ Feedback modal opened successfully");
   } catch (error) {
     console.error("❌ Error opening feedback modal:", error);
+    throw error;
+  }
+}
+
+/**
+ * Open modal dialog for rejection reason input
+ */
+export async function openRejectModal(
+  triggerId: string,
+  assetUrl: string,
+  filename: string,
+  executionId?: string,
+  assetType?: string
+): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  try {
+    // Customize placeholder text based on asset type
+    let placeholderText = "Please provide a reason for rejecting this asset...";
+    
+    if (assetType === 'image') {
+      placeholderText = "e.g., 'Does not match brand guidelines', 'Quality is too low', 'Wrong dimensions'";
+    } else if (assetType === 'html') {
+      placeholderText = "e.g., 'Layout is broken', 'Missing required sections', 'Does not meet accessibility standards'";
+    } else if (assetType === 'video') {
+      placeholderText = "e.g., 'Video quality is poor', 'Wrong duration', 'Audio issues'";
+    }
+
+    await slackClient.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: "modal",
+        callback_id: "reject_modal",
+        title: {
+          type: "plain_text",
+          text: "Reject Asset",
+        },
+        submit: {
+          type: "plain_text",
+          text: "Reject",
+        },
+        close: {
+          type: "plain_text",
+          text: "Cancel",
+        },
+        private_metadata: JSON.stringify({
+          assetUrl,
+          filename,
+          executionId,
+          assetType,
+        }),
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Asset:* ${filename}\n*Type:* ${assetType ? assetType.charAt(0).toUpperCase() + assetType.slice(1) : 'Unknown'}\n*Action:* Reject Asset`,
+            },
+          },
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: "Please provide feedback why you want to reject it so we can improve.",
+            },
+          },
+          {
+            type: "input",
+            block_id: "reject_reason_input",
+            element: {
+              type: "plain_text_input",
+              action_id: "reject_reason_text",
+              multiline: true,
+              placeholder: {
+                type: "plain_text",
+                text: placeholderText,
+              },
+            },
+            label: {
+              type: "plain_text",
+              text: "Feedback",
+            },
+          },
+        ],
+      },
+    });
+
+    console.log("✅ Reject modal opened successfully");
+  } catch (error) {
+    console.error("❌ Error opening reject modal:", error);
     throw error;
   }
 }

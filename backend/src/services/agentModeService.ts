@@ -2450,6 +2450,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
       };
     }
 
+    // For HTML file updates, return the essential fields
+    if (toolName === 'update_html_file') {
+      return {
+        success: result.success,
+        message: result.message,
+        s3_url: result.s3_url,
+        versioned_filename: result.versioned_filename
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
@@ -6408,7 +6418,12 @@ ${emailDraftFormat === 'text'
         original_execution_id: executionId,
         original_report_url: assetType === 'report' ? originalAssetUrl : undefined,
         original_image_url: assetType === 'image' ? originalAssetUrl : undefined,
-        variations: 1
+        variations: 1,
+        // Include Slack channel info from task so revision gets sent back to Slack
+        slack_channel: task.slackChannel,
+        slack_channel_name: task.slackChannelName,
+        requireApproval: task.requireApproval || false,
+        approvalAssetType: assetType === 'report' ? 'html' : assetType
       };
 
       await taskDb.createTaskExecution(revisionExecution);

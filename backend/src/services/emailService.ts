@@ -1198,5 +1198,63 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       console.error(`Error sending daily digest emails to ${emailList.join(', ')}:`, error);
       // Don't throw error - email failure shouldn't break the scheduled chat execution
     }
+  },
+
+  async sendOncallAlert(
+    subject: string,
+    message: string,
+    context?: Record<string, any>
+  ) {
+    try {
+      const oncallEmails = process.env.ONCALL_EMAIL_LIST?.split(',').filter(Boolean) || ['ruiw@agentweb.pro'];
+
+      const contextHtml = context
+        ? Object.entries(context)
+            .map(([key, value]) => {
+              const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+              return `<tr><td style="padding: 8px; border: 1px solid #ddd; font-weight: bold; background-color: #f8f9fa;">${this.escapeHtml(key)}</td><td style="padding: 8px; border: 1px solid #ddd; white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(displayValue)}</td></tr>`;
+            })
+            .join('')
+        : '';
+
+      const html = `
+        <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
+          <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h1 style="margin: 0; font-size: 24px;">⚠️ URGENT: Oncall Alert</h1>
+          </div>
+          <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <h2 style="color: #dc3545; margin-top: 0;">${this.escapeHtml(subject)}</h2>
+            <div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px;">
+              <p style="margin: 0; white-space: pre-wrap; word-wrap: break-word;">${this.escapeHtml(message)}</p>
+            </div>
+            ${contextHtml ? `
+            <h3 style="color: #495057; margin-top: 30px;">Additional Context:</h3>
+            <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+              ${contextHtml}
+            </table>
+            ` : ''}
+            <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e9ecef; color: #6c757d; font-size: 12px;">
+              <p>This is an automated alert that requires immediate attention.</p>
+            </div>
+          </div>
+        </div>
+      `;
+
+      const text = `
+⚠️ URGENT: Oncall Alert
+
+${subject}
+
+${message}
+
+${context ? Object.entries(context).map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value, null, 2) : value}`).join('\n') : ''}
+      `.trim();
+
+      await this.sendEmail(oncallEmails, `[URGENT] ${subject}`, text, html);
+      console.log(`Oncall alert sent to: ${oncallEmails.join(', ')}`);
+    } catch (error) {
+      console.error('Error sending oncall alert:', error);
+      // Don't throw - alert failure shouldn't break the main flow
+    }
   }
 }; 
