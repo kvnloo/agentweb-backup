@@ -2,15 +2,40 @@
  * CRM Tools Definitions
  * 
  * Tools for brand guidelines, market strategy, and lead management.
+ * 
+ * UNIFIED DEFINITION: Includes schema, handler config, and intent keywords.
  */
 
-import { ToolDefinition } from '../types';
+import { ToolDefinition, CategoryConfig } from '../types';
+import { registerCategoryConfig } from './utils';
 
+/**
+ * CRM category configuration
+ */
+export const crmCategory: CategoryConfig = {
+  name: 'crm',
+  intentPatterns: [
+    /\b(lead|leads|brand|branding|strategy|customer|guideline|marketing\s*strategy|target\s*audience|competitor|icp|ideal\s*customer)\b/i
+  ],
+  categoryKeywords: [
+    'lead', 'leads', 'brand', 'branding', 'strategy', 'customer',
+    'guideline', 'marketing', 'target', 'audience', 'competitor',
+    'icp', 'ideal', 'persona'
+  ]
+};
+
+// Register the category config for aggregation
+registerCategoryConfig(crmCategory);
+
+/**
+ * CRM tools with unified definitions
+ */
 export const crmTools: ToolDefinition[] = [
   {
     name: 'read_brand_guidelines',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['brand', 'guidelines', 'branding', 'read', 'get'],
     schema: {
       description: "Read the current user's brand guidelines (brand data and attachments). Returns exists=false if not set.",
       parameters: {
@@ -18,12 +43,18 @@ export const crmTools: ToolDefinition[] = [
         properties: {},
         required: []
       }
+    },
+    handler: {
+      serviceName: 'brand',
+      methodName: 'readBrandGuidelines',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'update_brand_guidelines',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['brand', 'guidelines', 'update', 'set', 'change'],
     schema: {
       description: "Update the user's brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed.",
       parameters: {
@@ -84,12 +115,19 @@ export const crmTools: ToolDefinition[] = [
         },
         required: []
       }
+    },
+    handler: {
+      serviceName: 'brand',
+      methodName: 'updateBrandGuidelines',
+      // Special: passes full args object first
+      customArgOrder: ['args', 'context.userId']
     }
   },
   {
     name: 'read_market_strategy',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['market', 'strategy', 'read', 'get', 'business'],
     schema: {
       description: "Read the current user's market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.",
       parameters: {
@@ -97,12 +135,18 @@ export const crmTools: ToolDefinition[] = [
         properties: {},
         required: []
       }
+    },
+    handler: {
+      serviceName: 'market_strategy',
+      methodName: 'readMarketStrategy',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'update_market_strategy',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['market', 'strategy', 'update', 'set', 'competitors', 'icp'],
     schema: {
       description: "Update the user's market strategy. IMPORTANT: Use read_market_strategy first to fetch the latest data, then only update the fields that need to be changed.",
       parameters: {
@@ -141,12 +185,19 @@ export const crmTools: ToolDefinition[] = [
         },
         required: []
       }
+    },
+    handler: {
+      serviceName: 'market_strategy',
+      methodName: 'updateMarketStrategy',
+      // Special: passes full args object first
+      customArgOrder: ['args', 'context.userId']
     }
   },
   {
     name: 'get_lead_lists',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['lead', 'lists', 'get', 'all', 'show'],
     schema: {
       description: 'Get all lead lists for the current user. Returns a list of lead lists with their IDs, names, descriptions, lead counts, and creation dates.',
       parameters: {
@@ -154,12 +205,18 @@ export const crmTools: ToolDefinition[] = [
         properties: {},
         required: []
       }
+    },
+    handler: {
+      serviceName: 'lead',
+      methodName: 'getLeadLists',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'create_lead_list',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['lead', 'list', 'create', 'new'],
     schema: {
       description: 'Create a new lead list with a name and optional description. Returns the created lead list with its ID.',
       parameters: {
@@ -176,12 +233,18 @@ export const crmTools: ToolDefinition[] = [
         },
         required: ['name']
       }
+    },
+    handler: {
+      serviceName: 'lead',
+      methodName: 'createLeadList',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'add_leads_to_list',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['lead', 'add', 'list', 'contacts'],
     schema: {
       description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields. The email field is used for deduplication and merging.',
       parameters: {
@@ -209,12 +272,18 @@ export const crmTools: ToolDefinition[] = [
         },
         required: ['list_id', 'leads']
       }
+    },
+    handler: {
+      serviceName: 'lead',
+      methodName: 'addLeadsToList',
+      contextArgs: ['userId']
     }
   },
   {
     name: 'update_email_draft_for_lead',
     version: '1.0.0',
     category: 'crm',
+    intentKeywords: ['email', 'draft', 'lead', 'personalize', 'write'],
     schema: {
       description: 'Create or update an email draft for a specific lead. Uses AI to generate a personalized email draft based on the instruction, lead data, engagement history, brand guidelines, and market strategy.',
       parameters: {
@@ -240,6 +309,11 @@ export const crmTools: ToolDefinition[] = [
         },
         required: ['list_id', 'lead_id', 'instruction']
       }
+    },
+    handler: {
+      serviceName: 'lead',
+      methodName: 'updateEmailDraftForLead',
+      customArgOrder: ['args.list_id', 'args.lead_id', 'args.instruction', 'context.sessionId', 'context.userId', 'args.email_format']
     }
   }
 ];

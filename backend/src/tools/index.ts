@@ -37,28 +37,15 @@ export {
   ToolServiceProvider
 } from './HandlerFactory';
 
-// Export handler configs
-export {
-  allHandlerConfigs,
-  coreHandlerConfigs,
-  contentHandlerConfigs,
-  researchHandlerConfigs,
-  crmHandlerConfigs,
-  gtmHandlerConfigs,
-  analyticsHandlerConfigs,
-  automationHandlerConfigs,
-  bookHandlerConfigs,
-  templateHandlerConfigs
-} from './handlers';
+// Export handlers
+export { allHandlerConfigs, getSpecialHandlers } from './handlers';
 
-// Export special handlers
-export { getSpecialHandlers } from './handlers';
-
-// Export definitions
+// Export definitions and derived data
 export {
   allToolDefinitions,
   registerAllTools,
   getToolCountByCategory,
+  validateAllTools,
   coreTools,
   contentTools,
   researchTools,
@@ -67,10 +54,14 @@ export {
   analyticsTools,
   automationTools,
   bookTools,
-  templateTools
+  templateTools,
+  // Derived data (single source of truth)
+  DERIVED_TOOL_CATEGORIES,
+  DERIVED_CATEGORY_KEYWORDS,
+  DERIVED_CATEGORY_INTENT_PATTERNS,
+  DERIVED_HANDLER_CONFIGS
 } from './definitions';
 
 // Re-export commonly used types for convenience
 export type { ToolDefinition, ToolCategory, OpenAITool } from './types';
 export type { ToolHandler, ToolContext, ToolResult } from './types';
-
