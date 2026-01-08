@@ -163,7 +163,7 @@ export async function sendApprovalRequest(
               type: "button",
               text: {
                 type: "plain_text",
-                text: "🔶 Needs Changes",
+                text: "🔶 Request Changes",
                 emoji: true,
               },
               style: "danger",
@@ -267,7 +267,7 @@ export async function updateApprovalMessage(
         block.text.text.includes("*Status:*")
     );
 
-    let statusUpdateText = `*Status:* ${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Needs Changes" : "❌ Rejected"} by @${reviewedBy}`;
+    let statusUpdateText = `*Status:* ${decision === "approved" ? "✅ Approved" : decision === "needs_changes" ? "🔶 Request Changes" : "❌ Rejected"} by @${reviewedBy}`;
     if (decision === "needs_changes" && feedback) {
       statusUpdateText += `\n*Feedback:* ${feedback}`;
     }
@@ -307,7 +307,7 @@ export async function updateApprovalMessage(
       await slackClient.chat.update({
         channel,
         ts: messageTs,
-        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : decision === "needs_changes" ? "Needs Changes" : "Rejected"}`,
+        text: `${assetDisplayName} ${decision}: ${decision === "approved" ? "Approved" : decision === "needs_changes" ? "Request Changes" : "Rejected"}`,
         blocks: finalBlocks as any,
       });
 
@@ -439,7 +439,7 @@ export async function openFeedbackModal(
         },
         submit: {
           type: "plain_text",
-          text: "Submit Changes",
+          text: "Request Changes",
         },
         close: {
           type: "plain_text",
