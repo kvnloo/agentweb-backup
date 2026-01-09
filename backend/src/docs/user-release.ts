@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-09',
+    changes: [
+      'Improved error handling in Agent Mode',
+      '- Error messages now display the actual error details from the backend instead of generic messages',
+      '- Added automatic oncall alerts for unknown errors to help diagnose issues faster',
+    ],
+  },
+  {
     date: '2026-01-08',
     changes: [
       'Improved Slack review experience',

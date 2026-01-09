@@ -12,6 +12,7 @@ import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore } from '../utils/sseProgress';
+import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -1192,6 +1193,20 @@ export const agentModeController = {
 
       // Handle specific error types
       if (error instanceof Error) {
+        if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
+          // Extract the actual error message from the error
+          const errorMessage = error.message.includes(':') 
+            ? error.message.split(':').slice(1).join(':').trim()
+            : `This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`;
+          res.status(413).json({
+            error: 'Session message limit exceeded',
+            message: errorMessage,
+            code: 'SESSION_MESSAGE_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
+        }
+
         if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
           res.status(413).json({
             error: 'Session size limit exceeded',
@@ -1231,6 +1246,39 @@ export const agentModeController = {
           });
           return;
         }
+
+        // Unknown error - send oncall alert
+        const user = req.user as User;
+        const sessionId = req.body?.sessionId;
+        const userMessage = req.body?.userMessage;
+        const llmModel = req.body?.llmModel;
+        const attachments = req.body?.attachments;
+        const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
+        
+        // Send oncall alert asynchronously (don't await to avoid blocking response)
+        emailService.sendOncallAlert(
+          'Agent Mode: Unknown Error in Generate Response',
+          `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          {
+            'Error Message': error.message || 'Unknown error',
+            'Error Stack': error.stack || 'No stack trace available',
+            'Error Name': error.name || 'Unknown',
+            'Session ID': sessionId || 'Not provided',
+            'User ID': user?.userId || 'Not available',
+            'User Email': user?.email || 'Not available',
+            'User Message': userMessage ? (userMessage.length > 500 ? userMessage.substring(0, 500) + '...' : userMessage) : 'Not provided',
+            'LLM Model': llmModel || 'Not specified',
+            'Attachments Count': attachments?.length || 0,
+            'Session Exists': session ? 'Yes' : 'No',
+            'Session User ID': session?.userId || 'N/A',
+            'Session Title': session?.title || 'N/A',
+            'Session Message Count': session?.messages?.length || 0,
+            'Timestamp': new Date().toISOString(),
+            'Request Method': req.method,
+            'Request Path': req.path,
+            'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
+          }
+        ).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
@@ -1566,6 +1614,20 @@ export const agentModeController = {
 
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
+        if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
+          // Extract the actual error message from the error
+          const errorMessage = error.message.includes(':') 
+            ? error.message.split(':').slice(1).join(':').trim()
+            : `This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`;
+          res.status(413).json({
+            error: 'Session message limit exceeded',
+            message: errorMessage,
+            code: 'SESSION_MESSAGE_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
+        }
+
         if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
           res.status(413).json({
             error: 'Session size limit exceeded',
@@ -1605,6 +1667,39 @@ export const agentModeController = {
           });
           return;
         }
+
+        // Unknown error - send oncall alert
+        const shareId = req.params?.shareId;
+        const conversable = req.query?.conversable;
+        const userMessage = req.body?.userMessage;
+        const llmModel = req.body?.llmModel;
+        const attachments = req.body?.attachments || [];
+        const session = shareId ? await chatbotDb.getChatSession(shareId).catch(() => null) : null;
+        
+        // Send oncall alert asynchronously (don't await to avoid blocking response)
+        emailService.sendOncallAlert(
+          'Agent Mode: Unknown Error in Generate Shared Response',
+          `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          {
+            'Error Message': error.message || 'Unknown error',
+            'Error Stack': error.stack || 'No stack trace available',
+            'Error Name': error.name || 'Unknown',
+            'Session ID (Share ID)': shareId || 'Not provided',
+            'Conversable Token': conversable ? 'Provided' : 'Not provided',
+            'Session User ID': session?.userId || 'N/A',
+            'User Message': userMessage ? (userMessage.length > 500 ? userMessage.substring(0, 500) + '...' : userMessage) : 'Not provided',
+            'LLM Model': llmModel || session?.llmModel || 'Not specified',
+            'Attachments Count': attachments?.length || 0,
+            'Session Exists': session ? 'Yes' : 'No',
+            'Session Title': session?.title || 'N/A',
+            'Session Message Count': session?.messages?.length || 0,
+            'Is Conversable Mode': session?.interactiveShareMetadata?.isActive ? 'Yes' : 'No',
+            'Timestamp': new Date().toISOString(),
+            'Request Method': req.method,
+            'Request Path': req.path,
+            'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
+          }
+        ).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
