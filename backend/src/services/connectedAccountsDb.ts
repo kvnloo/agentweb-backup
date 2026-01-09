@@ -307,19 +307,28 @@ export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> 
   
   // First check: is the token expired based on timestamp?
   if (account.config.token_expires_at <= now) {
-    return false;
+    // For LinkedIn, if we have a refresh token, we can try to refresh it via the adapter
+    if (account.platform === 'linkedin' && account.config.refresh_token) {
+      // Allow proceeding to API verification
+    } else {
+      return false;
+    }
   }
   
   // Second check: verify via API (only for LinkedIn for now)
   if (account.platform === 'linkedin') {
     try {
-      // Use real LinkedIn service for API verification
-      const { linkedInService } = await import('./linkedInService');
-      const result = await linkedInService.verifyToken(account.config.access_token);
-      return result.valid;
+      // Use adapter for verification which handles auto-refresh
+      const { socialPlatformService } = await import('./socialPlatformService');
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      return await adapter.verifyToken(account);
     } catch (error) {
-      console.warn('[isTokenValid] Failed to verify token via API, assuming valid:', error);
-      return true; // Assume valid if API check fails
+      console.warn('[isTokenValid] Failed to verify token via API/Adapter:', error);
+      // If expired by timestamp AND API check failed/threw, then it's definitely invalid
+      if (account.config.token_expires_at <= now) {
+        return false;
+      }
+      return true; // Assume valid if API check fails but timestamp is okay (network error)
     }
   }
   

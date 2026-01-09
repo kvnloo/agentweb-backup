@@ -373,6 +373,7 @@ router.post('/organizations', authenticateToken, async (req: any, res) => {
 
   try {
     const config = await getLinkedInOrgConfig();
+
     
     // Exchange code for access token
     const tokenResponse = await axios.post(config.tokenUrl, null, {
@@ -385,14 +386,24 @@ router.post('/organizations', authenticateToken, async (req: any, res) => {
       },
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded'
-      }
+      },
+      timeout: 15000 // 15 second timeout
     });
+
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number };
     
     // Get organizations where user is admin
     const aclResponse = await linkedInService.getAdminOrganizations(access_token);
-    const orgUrns = aclResponse.elements.map(acl => acl.organizationTarget);
+
+    
+    // Filter out any undefined or invalid organization targets
+    // Note: LinkedIn API returns 'organization' field, not 'organizationTarget'
+    const orgUrns = aclResponse.elements
+      .map(acl => (acl as any).organization || acl.organizationTarget)
+      .filter((urn): urn is string => urn != null && typeof urn === 'string' && urn.length > 0);
+    
+
     
     // Get details for each organization
     const organizations = await Promise.all(

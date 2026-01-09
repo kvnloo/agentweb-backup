@@ -17,9 +17,9 @@ export const INTEGRATION_CONFIG = {
     organization: {
       redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/linkedin/org/callback`,
       scopes: [
-        'r_organization_admin',
+        'r_organization_social',  // Required to read organization ACLs and details
+        'rw_organization_admin',
         'w_organization_social',
-        'rw_organization_admin'
       ],
     },
     // LinkedIn OAuth V2 Endpoints (shared)
