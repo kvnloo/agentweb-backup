@@ -13,6 +13,12 @@ const releases: Release[] = [
       "Improved Agent Mode work plan management in admin panel",
       "- Work plans can now be saved individually instead of saving all plans at once",
       "- This prevents conflicts when multiple admins edit different work plans simultaneously",
+      "Enhanced delegate access to support multiple users in the same browser",
+      "- Admins can now open multiple customer portal sessions in different tabs simultaneously",
+      "- Each delegate access session is isolated using tab-specific storage (sessionStorage)",
+      "- Delegate tokens are stored separately per user email to prevent session conflicts",
+      "- Fixed Brand Guidelines, SEO, Settings, and LinkedIn OAuth pages to work with delegate access",
+      "- All pages now use AuthContext token instead of reading directly from localStorage",
     ],
   },
   {
