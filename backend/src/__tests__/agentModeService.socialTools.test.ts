@@ -152,7 +152,8 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(mockAdapter.createPost).toHaveBeenCalledWith(
         mockLinkedInAccount,
         'Hello from the API!',
-        []
+        [],
+        'user-123'
       );
       expect(result.success).toBe(true);
       expect(result.post_id).toBe('urn:li:share:123');
@@ -172,9 +173,11 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toBe('Account not found or access denied');
     });
 
-    it('should return error when token is expired', async () => {
+    it('should return error when adapter fails due to expired token', async () => {
       mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(false);
+      // The implementation doesn't check isTokenValid - it lets the adapter handle token refresh
+      // So we need to mock the adapter throwing an error when token refresh fails
+      mockAdapter.createPost.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
       const result = await service.postOnConnectedAccount(
         'user-123',
@@ -215,12 +218,12 @@ describe('AgentModeService - Social Media Tools', () => {
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
     });
 
-    it('should load posts for account', async () => {
+    it('should load posts for company page account', async () => {
       mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
       mockIsTokenValid.mockResolvedValue(true);
       mockAdapter.listPosts.mockResolvedValue([
-        { id: 'post1', commentary: 'First post' },
-        { id: 'post2', commentary: 'Second post' },
+        { id: 'urn:li:share:post1', commentary: 'First company post', author: 'urn:li:organization:123456' },
+        { id: 'urn:li:share:post2', commentary: 'Second company post', author: 'urn:li:organization:123456' },
       ]);
 
       const result = await service.loadConnectedAccountPosts(
@@ -232,14 +235,25 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(mockAdapter.listPosts).toHaveBeenCalledWith(mockLinkedInAccount, { limit: 10 });
       expect(result.success).toBe(true);
       expect(result.posts).toHaveLength(2);
+      expect(result.message).toContain('Successfully loaded');
     });
 
-    it('should include metrics when requested', async () => {
+    it('should include metrics when requested for company page', async () => {
       mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
       mockIsTokenValid.mockResolvedValue(true);
-      mockAdapter.listPosts.mockResolvedValue([{ id: 'post1' }]);
+      mockAdapter.listPosts.mockResolvedValue([
+        { id: 'urn:li:share:post1', commentary: 'Company post' }
+      ]);
       mockAdapter.getPostMetrics.mockResolvedValue([
-        { share: 'post1', likes: 50, comments: 10, shares: 5 },
+        { 
+          share: 'urn:li:share:post1', 
+          likes: 50, 
+          comments: 10, 
+          shares: 5,
+          impressions: 1000,
+          clicks: 25,
+          engagement: 0.09
+        },
       ]);
 
       const result = await service.loadConnectedAccountPosts(
@@ -248,9 +262,34 @@ describe('AgentModeService - Social Media Tools', () => {
         { limit: 10, include_metrics: true }
       );
 
-      expect(mockAdapter.getPostMetrics).toHaveBeenCalled();
+      expect(mockAdapter.getPostMetrics).toHaveBeenCalledWith(
+        mockLinkedInAccount,
+        ['urn:li:share:post1']
+      );
       expect(result.posts[0].metrics).toBeDefined();
       expect(result.posts[0].metrics.likeCount).toBe(50);
+      expect(result.posts[0].metrics.commentCount).toBe(10);
+      expect(result.posts[0].metrics.shareCount).toBe(5);
+      expect(result.posts[0].metrics.impressionCount).toBe(1000);
+      expect(result.posts[0].metrics.clickCount).toBe(25);
+      expect(result.posts[0].metrics.engagement).toBe(0.09);
+    });
+
+    it('should handle posts without IDs gracefully when fetching metrics', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockIsTokenValid.mockResolvedValue(true);
+      mockAdapter.listPosts.mockResolvedValue([
+        { commentary: 'Post without ID' }
+      ]);
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:organization:123456',
+        { include_metrics: true }
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockAdapter.getPostMetrics).not.toHaveBeenCalled();
     });
 
     it('should continue without metrics on metric fetch failure', async () => {
@@ -281,9 +320,11 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toBe('Account not found or access denied');
     });
 
-    it('should return error when token is expired', async () => {
+    it('should return error when adapter fails due to expired token', async () => {
       mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(false);
+      // The implementation doesn't check isTokenValid - it lets the adapter handle token refresh
+      // So we need to mock the adapter throwing an error when token refresh fails
+      mockAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
       const result = await service.loadConnectedAccountPosts(
         'user-123',
@@ -291,7 +332,100 @@ describe('AgentModeService - Social Media Tools', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('token expired');
+      expect(result.message).toContain('Failed to load posts');
+    });
+
+    it('should handle empty posts list', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockIsTokenValid.mockResolvedValue(true);
+      mockAdapter.listPosts.mockResolvedValue([]);
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:organization:123456'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.posts).toEqual([]);
+      expect(result.message).toContain('Successfully loaded 0 posts');
+    });
+  });
+
+  describe('loadConnectedAccountMetrics', () => {
+    const mockAdapter = {
+      createPost: jest.fn(),
+      listPosts: jest.fn(),
+      getPostMetrics: jest.fn(),
+      getAccountMetrics: jest.fn(),
+      verifyToken: jest.fn(),
+    };
+
+    beforeEach(() => {
+      mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
+    });
+
+    it('should load metrics for company page account', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockIsTokenValid.mockResolvedValue(true);
+      mockAdapter.getAccountMetrics.mockResolvedValue({
+        followers: [{ followerCount: 1000, timeRange: { start: 1234567890 } }],
+        pageViews: [{ pageViews: 5000, timeRange: { start: 1234567890 } }],
+      });
+
+      const result = await service.loadConnectedAccountMetrics(
+        'user-123',
+        'urn:li:organization:123456'
+      );
+
+      expect(mockAdapter.getAccountMetrics).toHaveBeenCalledWith(mockLinkedInAccount);
+      expect(result.success).toBe(true);
+      expect(result.metrics).toBeDefined();
+      expect(result.metrics.followers).toBeDefined();
+      expect(result.metrics.pageViews).toBeDefined();
+    });
+
+    it('should return error when account not found', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+
+      const result = await service.loadConnectedAccountMetrics(
+        'user-123',
+        'nonexistent-account'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Account not found or access denied');
+    });
+
+    it('should handle token refresh through adapter when token is expired', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      // The adapter will handle token refresh, so we test successful metrics fetch
+      mockAdapter.getAccountMetrics.mockResolvedValue({
+        followers: [{ followerCount: 2000 }],
+        pageViews: [{ pageViews: 8000 }],
+      });
+
+      const result = await service.loadConnectedAccountMetrics(
+        'user-123',
+        'urn:li:organization:123456'
+      );
+
+      // The adapter handles token refresh internally, so we expect success
+      expect(result.success).toBe(true);
+      expect(result.metrics).toBeDefined();
+    });
+
+    it('should handle adapter errors gracefully', async () => {
+      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
+      mockIsTokenValid.mockResolvedValue(true);
+      mockAdapter.getAccountMetrics.mockRejectedValue(new Error('LinkedIn API error'));
+
+      const result = await service.loadConnectedAccountMetrics(
+        'user-123',
+        'urn:li:organization:123456'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to load metrics');
     });
   });
 });

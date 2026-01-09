@@ -26,8 +26,12 @@ export interface AccountMetrics {
 export interface SocialPlatformAdapter {
   /**
    * Post content to the social platform
+   * @param account - The connected account to post from
+   * @param content - The content to post
+   * @param mediaUrls - Optional media URLs to attach
+   * @param userId - Optional user ID for token refresh capability
    */
-  createPost(account: ConnectedAccount, content: string, mediaUrls?: string[]): Promise<PostResult>;
+  createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult>;
 
   /**
    * List posts from the account

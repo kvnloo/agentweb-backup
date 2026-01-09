@@ -13,11 +13,15 @@ jest.mock('axios', () => {
     create: mockCreate,
     isAxiosError: jest.fn(),
     get: jest.fn(),
+    put: jest.fn(),
+    post: jest.fn(),
     __esModule: true,
     default: {
       create: mockCreate,
       isAxiosError: jest.fn(),
       get: jest.fn(),
+      put: jest.fn(),
+      post: jest.fn(),
     },
   };
 });
@@ -49,6 +53,7 @@ describe('LinkedInService', () => {
     it('should create axios client with correct base URL and headers', () => {
       expect(axios.create).toHaveBeenCalledWith({
         baseURL: 'https://api.linkedin.com',
+        timeout: 15000,
         headers: {
           'X-Restli-Protocol-Version': '2.0.0',
           'LinkedIn-Version': '202511',
@@ -136,35 +141,79 @@ describe('LinkedInService', () => {
       });
       expect(result).toEqual(mockResponse);
     });
+
+    it('should handle empty organizations list', async () => {
+      const mockResponse = { elements: [] };
+      mockClient.get.mockResolvedValue({ data: mockResponse });
+
+      const result = await service.getAdminOrganizations('test-token');
+
+      expect(result.elements).toEqual([]);
+    });
+
+    it('should handle multiple organizations', async () => {
+      const mockResponse = {
+        elements: [
+          { organizationTarget: 'urn:li:organization:123', role: 'ADMINISTRATOR' },
+          { organizationTarget: 'urn:li:organization:456', role: 'ADMINISTRATOR' },
+        ],
+      };
+      mockClient.get.mockResolvedValue({ data: mockResponse });
+
+      const result = await service.getAdminOrganizations('test-token');
+
+      expect(result.elements).toHaveLength(2);
+    });
   });
 
   describe('getFollowerStatistics', () => {
-    it('should fetch follower statistics for organization', async () => {
+    it('should fetch follower statistics for organization with proper URL encoding', async () => {
       const mockStats = [{ followerCount: 1000 }];
       mockClient.get.mockResolvedValue({ data: { elements: mockStats } });
 
       const result = await service.getFollowerStatistics('token', 'urn:li:organization:123');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/organizationalEntityFollowerStatistics', {
-        params: { q: 'organizationalEntity', organizationalEntity: 'urn:li:organization:123' },
-        headers: { Authorization: 'Bearer token' },
-      });
+      // Verify the URL is properly encoded and FINDER header is set
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('organizationalEntityFollowerStatistics');
+      expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
+      expect(callArgs[1].headers.Authorization).toBe('Bearer token');
       expect(result).toEqual(mockStats);
+    });
+
+    it('should handle URL encoding of organization URN with special characters', async () => {
+      const mockStats = [{ followerCount: 500 }];
+      mockClient.get.mockResolvedValue({ data: { elements: mockStats } });
+
+      await service.getFollowerStatistics('token', 'urn:li:organization:123456');
+
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:123456'));
     });
   });
 
   describe('getPageStatistics', () => {
-    it('should fetch page statistics for organization', async () => {
+    it('should fetch page statistics for organization with FINDER header', async () => {
       const mockStats = [{ pageViews: 5000 }];
       mockClient.get.mockResolvedValue({ data: { elements: mockStats } });
 
       const result = await service.getPageStatistics('token', 'urn:li:organization:456');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/organizationPageStatistics', {
-        params: { q: 'organization', organization: 'urn:li:organization:456' },
-        headers: { Authorization: 'Bearer token' },
-      });
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('organizationPageStatistics');
+      expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
+      expect(callArgs[1].headers.Authorization).toBe('Bearer token');
       expect(result).toEqual(mockStats);
+    });
+
+    it('should properly encode organization URN in query string', async () => {
+      const mockStats = [{ pageViews: 3000 }];
+      mockClient.get.mockResolvedValue({ data: { elements: mockStats } });
+
+      await service.getPageStatistics('token', 'urn:li:organization:789');
+
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:789'));
     });
   });
 
@@ -175,10 +224,11 @@ describe('LinkedInService', () => {
 
       const result = await service.getShareStatistics('token', 'urn:li:organization:123');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/organizationalEntityShareStatistics', {
-        params: { q: 'organizationalEntity', organizationalEntity: 'urn:li:organization:123' },
-        headers: { Authorization: 'Bearer token' },
-      });
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('/rest/organizationalEntityShareStatistics');
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:123'));
+      expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
+      expect(callArgs[1].headers.Authorization).toBe('Bearer token');
       expect(result).toEqual(mockStats);
     });
 
@@ -188,14 +238,11 @@ describe('LinkedInService', () => {
 
       await service.getShareStatistics('token', 'urn:li:organization:123', ['urn:li:share:1', 'urn:li:share:2']);
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/organizationalEntityShareStatistics', {
-        params: {
-          q: 'organizationalEntity',
-          organizationalEntity: 'urn:li:organization:123',
-          shares: 'List(urn:li:share:1,urn:li:share:2)',
-        },
-        headers: { Authorization: 'Bearer token' },
-      });
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('/rest/organizationalEntityShareStatistics');
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:123'));
+      expect(callArgs[0]).toContain('shares=List');
+      expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
     });
   });
 
@@ -206,10 +253,13 @@ describe('LinkedInService', () => {
 
       const result = await service.listPosts('token', 'urn:li:person:123', 0, 10);
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/posts', {
-        params: { q: 'author', author: 'urn:li:person:123', start: 0, count: 10 },
-        headers: { Authorization: 'Bearer token' },
-      });
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('/rest/posts');
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:person:123'));
+      expect(callArgs[0]).toContain('start=0');
+      expect(callArgs[0]).toContain('count=10');
+      expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
+      expect(callArgs[1].headers.Authorization).toBe('Bearer token');
       expect(result).toEqual(mockPosts);
     });
 
@@ -218,10 +268,12 @@ describe('LinkedInService', () => {
 
       await service.listPosts('token', 'urn:li:organization:123');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/posts', {
-        params: { q: 'author', author: 'urn:li:organization:123', start: 0, count: 50 },
-        headers: { Authorization: 'Bearer token' },
-      });
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('/rest/posts');
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:123'));
+      expect(callArgs[0]).toContain('start=0');
+      expect(callArgs[0]).toContain('count=50');
+      expect(callArgs[1].headers['X-RestLi-Method']).toBe('FINDER');
     });
   });
 
@@ -248,6 +300,77 @@ describe('LinkedInService', () => {
       expect(result).toBe('urn:li:share:123456');
     });
 
+    it('should create a post for company page', async () => {
+      mockClient.post.mockResolvedValue({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:789' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:organization:123', 'Company post');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        '/rest/posts',
+        {
+          author: 'urn:li:organization:123',
+          commentary: 'Company post',
+          visibility: 'PUBLIC',
+          lifecycleState: 'PUBLISHED',
+          distribution: { feedDistribution: 'MAIN_FEED' },
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:share:789');
+    });
+
+    it('should create a post with single image for company page', async () => {
+      mockClient.post.mockResolvedValue({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:111' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:organization:123', 'Post with image', ['urn:li:image:abc']);
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        '/rest/posts',
+        {
+          author: 'urn:li:organization:123',
+          commentary: 'Post with image',
+          visibility: 'PUBLIC',
+          lifecycleState: 'PUBLISHED',
+          distribution: { feedDistribution: 'MAIN_FEED' },
+          content: {
+            media: {
+              id: 'urn:li:image:abc'
+            }
+          }
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:share:111');
+    });
+
+    it('should create a post with multiple images for company page', async () => {
+      mockClient.post.mockResolvedValue({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:222' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:organization:123', 'Post with images', ['urn:li:image:1', 'urn:li:image:2']);
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        '/rest/posts',
+        expect.objectContaining({
+          content: {
+            multiImage: {
+              images: [{ id: 'urn:li:image:1' }, { id: 'urn:li:image:2' }]
+            }
+          }
+        }),
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:share:222');
+    });
+
     it('should return id from response body if header not present', async () => {
       mockClient.post.mockResolvedValue({
         data: { id: 'urn:li:share:789' },
@@ -261,19 +384,22 @@ describe('LinkedInService', () => {
   });
 
   describe('getAggregatedMetrics', () => {
-    it('should aggregate follower and page statistics', async () => {
+    it('should aggregate follower, page, and share statistics', async () => {
       const followerStats = [{ followerCount: 100 }];
       const pageStats = [{ pageViews: 500 }];
+      const shareStats = [{ share: 'urn:li:share:123', totalShareStatistics: { likeCount: 50 } }];
       
       mockClient.get
         .mockResolvedValueOnce({ data: { elements: followerStats } })
-        .mockResolvedValueOnce({ data: { elements: pageStats } });
+        .mockResolvedValueOnce({ data: { elements: pageStats } })
+        .mockResolvedValueOnce({ data: { elements: shareStats } });
 
       const result = await service.getAggregatedMetrics('token', 'urn:li:organization:123');
 
       expect(result).toEqual({
         followerStatistics: followerStats,
         pageStatistics: pageStats,
+        shareStatistics: shareStats,
       });
     });
   });
@@ -317,17 +443,18 @@ describe('LinkedInService', () => {
   });
 
   describe('getOrganizationFollowerCount', () => {
-    it('should return follower count from networkSizes endpoint', async () => {
+    it('should return follower count from networkSizes endpoint with proper URL encoding', async () => {
       mockClient.get.mockResolvedValue({
         data: { firstDegreeSize: 2500 },
       });
 
       const result = await service.getOrganizationFollowerCount('token', 'urn:li:organization:123');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/rest/networkSizes/urn:li:organization:123', {
-        headers: { Authorization: 'Bearer token' },
-        params: { edgeType: 'CompanyFollowedByMember' },
-      });
+      const callArgs = mockClient.get.mock.calls[0];
+      expect(callArgs[0]).toContain('networkSizes');
+      expect(callArgs[0]).toContain(encodeURIComponent('urn:li:organization:123'));
+      expect(callArgs[1].params.edgeType).toBe('COMPANY_FOLLOWED_BY_MEMBER');
+      expect(callArgs[1].headers.Authorization).toBe('Bearer token');
       expect(result).toBe(2500);
     });
 
@@ -337,6 +464,88 @@ describe('LinkedInService', () => {
       const result = await service.getOrganizationFollowerCount('token', 'urn:li:organization:123');
 
       expect(result).toBe(0);
+    });
+
+    it('should handle 403 permission errors gracefully', async () => {
+      const axiosError = {
+        response: { status: 403, data: { message: 'Permission denied' } },
+        isAxiosError: true,
+      };
+      mockClient.get.mockRejectedValue(axiosError);
+
+      const result = await service.getOrganizationFollowerCount('token', 'urn:li:organization:123');
+
+      expect(result).toBe(0);
+    });
+  });
+
+  describe('initializeImageUpload', () => {
+    it('should initialize image upload for company page', async () => {
+      mockClient.post.mockResolvedValue({
+        data: {
+          value: {
+            uploadUrl: 'https://upload.linkedin.com/image/upload',
+            image: 'urn:li:image:123456'
+          }
+        }
+      });
+
+      const result = await service.initializeImageUpload('token', 'urn:li:organization:123');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        '/rest/images?action=initializeUpload',
+        {
+          initializeUploadRequest: {
+            owner: 'urn:li:organization:123'
+          }
+        },
+        {
+          headers: { Authorization: 'Bearer token' }
+        }
+      );
+      expect(result.uploadUrl).toBe('https://upload.linkedin.com/image/upload');
+      expect(result.imageUrn).toBe('urn:li:image:123456');
+    });
+  });
+
+  describe('uploadImageFromUrl', () => {
+    beforeEach(() => {
+      // Mock axios.get for downloading image
+      (axios.get as jest.Mock).mockResolvedValue({
+        data: Buffer.from('fake-image-data'),
+        headers: { 'content-type': 'image/png' }
+      });
+      // Mock axios.put for uploading image
+      (axios.put as jest.Mock).mockResolvedValue({});
+    });
+
+    it('should upload image from URL for company page', async () => {
+      mockClient.post.mockResolvedValue({
+        data: {
+          value: {
+            uploadUrl: 'https://upload.linkedin.com/image/upload',
+            image: 'urn:li:image:789'
+          }
+        }
+      });
+
+      const result = await service.uploadImageFromUrl('token', 'urn:li:organization:123', 'https://example.com/image.png');
+
+      expect(axios.get).toHaveBeenCalledWith('https://example.com/image.png', {
+        responseType: 'arraybuffer',
+        timeout: 30000
+      });
+      expect(mockClient.post).toHaveBeenCalled();
+      expect(axios.put).toHaveBeenCalledWith(
+        'https://upload.linkedin.com/image/upload',
+        expect.any(Buffer),
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            'Content-Type': 'image/png'
+          })
+        })
+      );
+      expect(result).toBe('urn:li:image:789');
     });
   });
 

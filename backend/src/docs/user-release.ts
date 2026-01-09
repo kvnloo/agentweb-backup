@@ -12,6 +12,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improved error handling in Agent Mode',
       '- Error messages now display the actual error details from the backend instead of generic messages',
       '- Added automatic oncall alerts for unknown errors to help diagnose issues faster',
+      'Added support for Company Pages with LinkedIn Integration',
+      '- Users can connect their LinkedIn account and select company pages that they want AgentWeb to manage',
+      '- Users can ask Emma to pull metrics and make posts to company pages',
     ],
   },
   {

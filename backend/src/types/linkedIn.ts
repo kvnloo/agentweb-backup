@@ -58,7 +58,8 @@ export interface LinkedInOrganizationAcl {
   roleContext?: string;
   roleAssignee?: string;
   state: 'APPROVED' | 'REQUESTED';
-  organizationTarget: string;
+  organization?: string;  // LinkedIn API returns this field
+  organizationTarget?: string;  // Some versions may use this
 }
 
 export interface LinkedInPaginatedResponse<T> {
