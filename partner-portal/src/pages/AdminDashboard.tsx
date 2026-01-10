@@ -552,6 +552,11 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [testDialogOpen, setTestDialogOpen] = useState(false);
+  const [testRecipients, setTestRecipients] = useState("");
+  const [testLoading, setTestLoading] = useState(false);
+  const [htmlUrl, setHtmlUrl] = useState("");
+  const [loadingHtml, setLoadingHtml] = useState(false);
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
   const [deactivateDialogOpen, setDeactivateDialogOpen] = useState(false);
   const [chatSessions, setChatSessions] = useState<AdminChatSession[]>([]);
@@ -1103,6 +1108,108 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to send announcement");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleTestAnnouncement = async () => {
+    if (!message.trim() || !title.trim()) {
+      setError("Please enter both title and message");
+      return;
+    }
+
+    if (!testRecipients.trim()) {
+      setError("Please enter at least one recipient email address");
+      return;
+    }
+
+    // Parse recipients (comma or newline separated)
+    const recipients = testRecipients
+      .split(/[,\n]/)
+      .map((email) => email.trim())
+      .filter((email) => email.length > 0);
+
+    if (recipients.length === 0) {
+      setError("Please enter at least one valid recipient email address");
+      return;
+    }
+
+    setTestLoading(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const response = await axios.post(
+        buildApiUrl("/api/admin/announcements/test"),
+        {
+          title,
+          message: formatMessageToHtml(message),
+          recipients,
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      
+      const details = response.data.details;
+      let successMessage = response.data.message;
+      
+      if (details.invalidEmails && details.invalidEmails.length > 0) {
+        successMessage += `. Invalid emails: ${details.invalidEmails.join(", ")}`;
+      }
+      
+      if (details.failedEmails && details.failedEmails.length > 0) {
+        successMessage += `. Failed to send to: ${details.failedEmails.join(", ")}`;
+      }
+      
+      setSuccess(successMessage);
+      setTestDialogOpen(false);
+      setTestRecipients("");
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to send test announcement");
+    } finally {
+      setTestLoading(false);
+    }
+  };
+
+  const handleLoadFromUrl = async () => {
+    if (!htmlUrl.trim()) {
+      setError("Please enter a URL");
+      return;
+    }
+
+    // Basic URL validation
+    try {
+      new URL(htmlUrl);
+    } catch {
+      setError("Please enter a valid URL");
+      return;
+    }
+
+    setLoadingHtml(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const response = await axios.post(
+        buildApiUrl("/api/admin/announcements/load-from-url"),
+        { url: htmlUrl.trim() },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.data.success) {
+        setTitle(response.data.title || "");
+        setMessage(response.data.message || "");
+        setSuccess("Content loaded successfully from URL");
+        setHtmlUrl("");
+      } else {
+        setError(response.data.message || "Failed to load content from URL");
+      }
+    } catch (error: any) {
+      setError(
+        error.response?.data?.message ||
+          error.response?.data?.error ||
+          "Failed to load content from URL"
+      );
+    } finally {
+      setLoadingHtml(false);
     }
   };
 
@@ -2229,6 +2336,34 @@ export default function AdminDashboard() {
               </Alert>
             )}
 
+            {/* Load from URL section */}
+            <Paper sx={{ p: 2, mb: 3, backgroundColor: "grey.50" }}>
+              <Typography variant="subtitle2" gutterBottom>
+                Load from HTML URL
+              </Typography>
+              <Box sx={{ display: "flex", gap: 2, alignItems: "flex-start" }}>
+                <TextField
+                  label="HTML URL"
+                  value={htmlUrl}
+                  onChange={(e) => setHtmlUrl(e.target.value)}
+                  placeholder="https://example.com/page.html"
+                  fullWidth
+                  size="small"
+                  disabled={loadingHtml}
+                  helperText="Enter a URL to load title and content from an HTML file"
+                />
+                <Button
+                  type="button"
+                  variant="outlined"
+                  onClick={handleLoadFromUrl}
+                  disabled={loadingHtml || !htmlUrl.trim()}
+                  sx={{ minWidth: 100, mt: 0.5 }}
+                >
+                  {loadingHtml ? <CircularProgress size={20} /> : "Load"}
+                </Button>
+              </Box>
+            </Paper>
+
             <TextField
               label="Announcement Title"
               value={title}
@@ -2280,15 +2415,71 @@ export default function AdminDashboard() {
               </Box>
             )}
 
-            <Button
-              type="submit"
-              variant="contained"
-              disabled={loading}
-              sx={{ minWidth: 120 }}
-            >
-              {loading ? <CircularProgress size={24} /> : "Send"}
-            </Button>
+            <Box sx={{ display: "flex", gap: 2, mt: 2 }}>
+              <Button
+                type="submit"
+                variant="contained"
+                disabled={loading}
+                sx={{ minWidth: 120 }}
+              >
+                {loading ? <CircularProgress size={24} /> : "Send"}
+              </Button>
+              <Button
+                type="button"
+                variant="outlined"
+                onClick={() => setTestDialogOpen(true)}
+                disabled={loading || !title.trim() || !message.trim()}
+                sx={{ minWidth: 120 }}
+              >
+                Test
+              </Button>
+            </Box>
           </Box>
+
+          {/* Test Email Dialog */}
+          <Dialog
+            open={testDialogOpen}
+            onClose={() => !testLoading && setTestDialogOpen(false)}
+            maxWidth="sm"
+            fullWidth
+          >
+            <DialogTitle>Send Test Email</DialogTitle>
+            <DialogContent>
+              <DialogContentText sx={{ mb: 2 }}>
+                Enter email addresses (comma or newline separated) to send a test announcement.
+                The email will be marked as a test email.
+              </DialogContentText>
+              <TextField
+                label="Recipients"
+                multiline
+                rows={4}
+                value={testRecipients}
+                onChange={(e) => setTestRecipients(e.target.value)}
+                fullWidth
+                placeholder="email1@example.com, email2@example.com"
+                helperText="Enter email addresses separated by commas or newlines"
+                disabled={testLoading}
+              />
+            </DialogContent>
+            <DialogActions>
+              <Button
+                onClick={() => {
+                  setTestDialogOpen(false);
+                  setTestRecipients("");
+                }}
+                disabled={testLoading}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleTestAnnouncement}
+                variant="contained"
+                disabled={testLoading || !testRecipients.trim()}
+              >
+                {testLoading ? <CircularProgress size={24} /> : "Send Test"}
+              </Button>
+            </DialogActions>
+          </Dialog>
         </TabPanel>
 
         <TabPanel value={tabValue} index={2}>

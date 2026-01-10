@@ -1,6 +1,7 @@
 import express from "express";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb } from "../services/db";
@@ -1295,6 +1296,71 @@ router.delete("/tasks/:taskId/subscribers/:email", async (req, res) => {
   }
 });
 
+// Helper function to generate announcement email HTML
+const generateAnnouncementEmailHtml = (title: string, message: string, isTest: boolean = false) => {
+  const testBanner = isTest ? `
+    <div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">
+      🧪 TEST EMAIL - This is a test announcement
+    </div>
+  ` : '';
+  
+  return `<!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+          }
+          .header {
+            background-color: #1976d2;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            border-radius: 4px 4px 0 0;
+          }
+          .content {
+            padding: 20px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 0 0 4px 4px;
+          }
+          .content p {
+            margin: 0 0 1em 0;
+          }
+          .content p:last-child {
+            margin-bottom: 0;
+          }
+          .footer {
+            text-align: center;
+            margin-top: 20px;
+            color: #666;
+            font-size: 0.9em;
+          }
+        </style>
+      </head>
+      <body>
+        ${testBanner}
+        <div class="header">
+          <h2 style="margin:0;padding:0;font-size:24px;">${title}</h2>
+        </div>
+        <div class="content">
+          ${message}
+        </div>
+        <div class="footer">
+          <p>This is an official announcement from AgentWeb</p>
+          <p>If you have any questions, please contact our support team at support@agentweb.pro</p>
+        </div>
+      </body>
+    </html>`;
+};
+
 // Send announcement to all users
 router.post("/announcements/send", async (req, res) => {
   try {
@@ -1336,61 +1402,8 @@ router.post("/announcements/send", async (req, res) => {
               .replace(/&gt;/g, ">")
               .replace(/&quot;/g, '"')
               .trim(),
-            // HTML version with improved formatting
-            `<!DOCTYPE html>
-            <html>
-              <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                  body {
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 600px;
-                    margin: 0 auto;
-                    padding: 20px;
-                  }
-                  .header {
-                    background-color: #1976d2;
-                    color: white;
-                    padding: 20px;
-                    text-align: center;
-                    border-radius: 4px 4px 0 0;
-                  }
-                  .content {
-                    padding: 20px;
-                    background: #fff;
-                    border: 1px solid #ddd;
-                    border-radius: 0 0 4px 4px;
-                  }
-                  .content p {
-                    margin: 0 0 1em 0;
-                  }
-                  .content p:last-child {
-                    margin-bottom: 0;
-                  }
-                  .footer {
-                    text-align: center;
-                    margin-top: 20px;
-                    color: #666;
-                    font-size: 0.9em;
-                  }
-                </style>
-              </head>
-              <body>
-                <div class="header">
-                  <h2 style="margin:0;padding:0;font-size:24px;">${title}</h2>
-                </div>
-                <div class="content">
-                  ${message}
-                </div>
-                <div class="footer">
-                  <p>This is an official announcement from AgentWeb</p>
-                  <p>If you have any questions, please contact our support team at support@agentweb.pro</p>
-                </div>
-              </body>
-            </html>`
+            // HTML version - use message directly without wrapper
+            message
           );
           results.successful++;
         } catch (error) {
@@ -1414,6 +1427,236 @@ router.post("/announcements/send", async (req, res) => {
   } catch (error) {
     console.error("Error sending announcement:", error);
     res.status(500).json({ message: "Error sending announcement" });
+  }
+});
+
+// Send test announcement to specified recipients
+router.post("/announcements/test", async (req, res) => {
+  try {
+    const { title, message, recipients } = req.body;
+    if (!message || !title) {
+      return res
+        .status(400)
+        .json({ message: "Title and message are required" });
+    }
+    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "At least one recipient email is required" });
+    }
+
+    // Validate email addresses
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const validEmails = recipients.filter((email: string) => emailRegex.test(email.trim()));
+    const invalidEmails = recipients.filter((email: string) => !emailRegex.test(email.trim()));
+
+    if (validEmails.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "No valid email addresses provided" });
+    }
+
+    // Track successful and failed emails
+    const results = {
+      total: validEmails.length,
+      successful: 0,
+      failed: 0,
+      failedEmails: [] as string[],
+      invalidEmails: invalidEmails,
+    };
+
+    // Send test announcement email to specified recipients
+    await Promise.allSettled(
+      validEmails.map(async (email: string) => {
+        try {
+          // Add test banner to the message HTML
+          const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">🧪 TEST EMAIL - This is a test announcement</div>`;
+          const testMessage = testBanner + message;
+          
+          await emailService.sendEmail(
+            email.trim(),
+            `[TEST] ${title}`,
+            // Plain text version - strip HTML tags and decode entities
+            message
+              .replace(/<[^>]*>/g, "")
+              .replace(/&nbsp;/g, " ")
+              .replace(/&amp;/g, "&")
+              .replace(/&lt;/g, "<")
+              .replace(/&gt;/g, ">")
+              .replace(/&quot;/g, '"')
+              .trim(),
+            // HTML version - use message directly with test banner prepended
+            testMessage
+          );
+          results.successful++;
+        } catch (error) {
+          console.error(`Failed to send test announcement to ${email}:`, error);
+          results.failed++;
+          results.failedEmails.push(email);
+        }
+      })
+    );
+
+    // Return detailed results
+    res.json({
+      message: `Test announcement sent to ${results.successful} out of ${results.total} recipients`,
+      details: {
+        total: results.total,
+        successful: results.successful,
+        failed: results.failed,
+        failedEmails: results.failedEmails,
+        invalidEmails: results.invalidEmails,
+      },
+    });
+  } catch (error) {
+    console.error("Error sending test announcement:", error);
+    res.status(500).json({ message: "Error sending test announcement" });
+  }
+});
+
+// Load announcement content from HTML URL
+router.post("/announcements/load-from-url", async (req, res) => {
+  const { url } = req.body;
+  
+  try {
+    if (!url || typeof url !== "string") {
+      return res
+        .status(400)
+        .json({ message: "URL is required and must be a string" });
+    }
+
+    // Validate URL format
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+      return res
+        .status(400)
+        .json({ message: "Invalid URL format. Must be HTTP or HTTPS." });
+    }
+
+    console.log(`🔽 Fetching HTML content from: ${url}`);
+
+    // Fetch the HTML content
+    const response = await axios.get(url, {
+      timeout: 15000, // 15 seconds timeout
+      responseType: "text",
+      headers: {
+        "User-Agent": "AgentWeb-Backend/1.0",
+      },
+    });
+
+    const html = response.data as string;
+    console.log(`✅ Successfully fetched HTML, length: ${html.length}`);
+
+    // Extract title from <title> tag
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    let extractedTitle = titleMatch ? titleMatch[1].trim() : "";
+
+    // If no title found, try to get from h1 tag
+    if (!extractedTitle) {
+      const h1Match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+      extractedTitle = h1Match ? h1Match[1].trim() : "Announcement";
+    }
+
+    // Decode HTML entities in title
+    extractedTitle = extractedTitle
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/g, "'");
+
+    // Extract body content
+    let bodyContent = "";
+    
+    // Try to extract from <body> tag first
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    if (bodyMatch) {
+      bodyContent = bodyMatch[1];
+    } else {
+      // If no body tag, use the entire HTML
+      bodyContent = html;
+    }
+
+    // Remove script and style tags
+    bodyContent = bodyContent
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, "");
+
+    // Try to extract main content from common semantic tags
+    const mainContentSelectors = [
+      /<main[^>]*>([\s\S]*?)<\/main>/i,
+      /<article[^>]*>([\s\S]*?)<\/article>/i,
+      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+      /<div[^>]*id="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+    ];
+
+    for (const selector of mainContentSelectors) {
+      const match = bodyContent.match(selector);
+      if (match && match[1].trim().length > 50) {
+        bodyContent = match[1];
+        break;
+      }
+    }
+
+    // Clean up the HTML content
+    // Remove comments
+    bodyContent = bodyContent.replace(/<!--[\s\S]*?-->/g, "");
+    
+    // Remove excessive whitespace but preserve structure
+    bodyContent = bodyContent
+      .replace(/\s+/g, " ")
+      .replace(/>\s+</g, "><")
+      .trim();
+
+    // If content is too short, use the original body content
+    if (bodyContent.length < 50) {
+      const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      if (bodyMatch) {
+        bodyContent = bodyMatch[1]
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .trim();
+      }
+    }
+
+    // Limit content length to prevent issues
+    if (bodyContent.length > 50000) {
+      bodyContent = bodyContent.substring(0, 50000) + "...";
+    }
+
+    return res.json({
+      success: true,
+      title: extractedTitle,
+      message: bodyContent,
+    });
+  } catch (error: any) {
+    console.error(`❌ Error loading HTML from URL: ${url}`, error.message);
+
+    let errorMessage = "Failed to load HTML content";
+    let statusCode = 500;
+
+    if (error.response) {
+      statusCode = error.response.status;
+      errorMessage = `HTTP ${error.response.status}: ${error.response.statusText}`;
+    } else if (error.code === "ENOTFOUND") {
+      statusCode = 404;
+      errorMessage = "URL not found or unreachable";
+    } else if (error.code === "ETIMEDOUT") {
+      statusCode = 408;
+      errorMessage = "Request timeout while fetching HTML";
+    } else if (error.code === "ECONNREFUSED") {
+      statusCode = 503;
+      errorMessage = "Connection refused";
+    }
+
+    return res.status(statusCode).json({
+      success: false,
+      message: errorMessage,
+      error: error.message,
+    });
   }
 });
 

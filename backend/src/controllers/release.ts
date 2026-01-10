@@ -8,6 +8,14 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-09",
+    changes: [
+      "Enhanced Admin Announcement feature",
+      "- Added Test button to send test emails to a list of recipients before sending to all users",
+      "- Added ability to load announcement content from HTML URL",
+    ],
+  },
+  {
     date: "2026-01-08",
     changes: [
       "Improved Agent Mode work plan management in admin panel",
