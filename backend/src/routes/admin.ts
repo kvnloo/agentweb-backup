@@ -7,6 +7,7 @@ import { isAdmin } from "../middleware/admin";
 import { userDb, taskDb, subscriberDb } from "../services/db";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
+import { resendService } from "../services/resendService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
@@ -1386,15 +1387,16 @@ router.post("/announcements/send", async (req, res) => {
       failedEmails: [] as string[],
     };
 
-    // Send announcement email to all active users
+    // Send announcement email to all active users using Resend
+    const fromEmail = "no-reply@updates.agentweb.pro";
     await Promise.allSettled(
       activeEmails.map(async (email) => {
         try {
-          await emailService.sendEmail(
-            email,
-            title,
-            // Plain text version - strip HTML tags and decode entities
-            message
+          await resendService.sendEmail({
+            from: fromEmail,
+            to: email,
+            subject: title,
+            text: message
               .replace(/<[^>]*>/g, "")
               .replace(/&nbsp;/g, " ")
               .replace(/&amp;/g, "&")
@@ -1402,9 +1404,8 @@ router.post("/announcements/send", async (req, res) => {
               .replace(/&gt;/g, ">")
               .replace(/&quot;/g, '"')
               .trim(),
-            // HTML version - use message directly without wrapper
-            message
-          );
+            html: message, // HTML version - use message directly without wrapper
+          });
           results.successful++;
         } catch (error) {
           console.error(`Failed to send announcement to ${email}:`, error);
@@ -1465,7 +1466,8 @@ router.post("/announcements/test", async (req, res) => {
       invalidEmails: invalidEmails,
     };
 
-    // Send test announcement email to specified recipients
+    // Send test announcement email to specified recipients using Resend
+    const fromEmail = "no-reply@updates.agentweb.pro";
     await Promise.allSettled(
       validEmails.map(async (email: string) => {
         try {
@@ -1473,11 +1475,11 @@ router.post("/announcements/test", async (req, res) => {
           const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">🧪 TEST EMAIL - This is a test announcement</div>`;
           const testMessage = testBanner + message;
           
-          await emailService.sendEmail(
-            email.trim(),
-            `[TEST] ${title}`,
-            // Plain text version - strip HTML tags and decode entities
-            message
+          await resendService.sendEmail({
+            from: fromEmail,
+            to: email.trim(),
+            subject: `[TEST] ${title}`,
+            text: message
               .replace(/<[^>]*>/g, "")
               .replace(/&nbsp;/g, " ")
               .replace(/&amp;/g, "&")
@@ -1485,9 +1487,8 @@ router.post("/announcements/test", async (req, res) => {
               .replace(/&gt;/g, ">")
               .replace(/&quot;/g, '"')
               .trim(),
-            // HTML version - use message directly with test banner prepended
-            testMessage
-          );
+            html: testMessage, // HTML version - use message directly with test banner prepended
+          });
           results.successful++;
         } catch (error) {
           console.error(`Failed to send test announcement to ${email}:`, error);

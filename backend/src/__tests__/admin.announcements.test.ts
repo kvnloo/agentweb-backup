@@ -2,16 +2,16 @@ import request from 'supertest';
 import express from 'express';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
-import { emailService } from '../services/emailService';
+import { resendService } from '../services/resendService';
 import axios from 'axios';
 
 // Mock the dependencies
 jest.mock('../services/db');
-jest.mock('../services/emailService');
+jest.mock('../services/resendService');
 jest.mock('axios');
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
-const mockEmailService = emailService as jest.Mocked<typeof emailService>;
+const mockResendService = resendService as jest.Mocked<typeof resendService>;
 const mockAxios = axios as jest.Mocked<typeof axios>;
 
 // Mock auth middleware
@@ -37,7 +37,7 @@ describe('Admin Announcements', () => {
     jest.clearAllMocks();
     
     // Default mock implementations
-    (mockEmailService as any).sendEmail = jest.fn().mockResolvedValue(undefined);
+    (mockResendService as any).sendEmail = jest.fn().mockResolvedValue({ id: 'test-email-id' });
     (mockUserDb as any).getAllUsers = jest.fn().mockResolvedValue([
       { userId: 'user1', email: 'user1@example.com', isActive: true },
       { userId: 'user2', email: 'user2@example.com', isActive: true },
@@ -59,14 +59,15 @@ describe('Admin Announcements', () => {
       expect(response.body.details.total).toBe(2); // Only active users
       expect(response.body.details.successful).toBe(2);
 
-      // Verify emailService.sendEmail was called with message directly (no wrapper)
-      expect(mockEmailService.sendEmail).toHaveBeenCalledTimes(2);
-      expect(mockEmailService.sendEmail).toHaveBeenCalledWith(
-        'user1@example.com',
-        title,
-        expect.stringContaining('This is a test message'), // Plain text version
-        message // HTML version - used directly without wrapper
-      );
+      // Verify resendService.sendEmail was called with message directly (no wrapper) and correct from address
+      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
+        from: 'no-reply@updates.agentweb.pro',
+        to: 'user1@example.com',
+        subject: title,
+        text: expect.stringContaining('This is a test message'), // Plain text version
+        html: message // HTML version - used directly without wrapper
+      });
     });
 
     it('should return 400 if title is missing', async () => {
@@ -88,9 +89,9 @@ describe('Admin Announcements', () => {
     });
 
     it('should handle email sending failures gracefully', async () => {
-      (mockEmailService as any).sendEmail = jest.fn()
+      (mockResendService as any).sendEmail = jest.fn()
         .mockRejectedValueOnce(new Error('Email failed'))
-        .mockResolvedValueOnce(undefined);
+        .mockResolvedValueOnce({ id: 'test-email-id' });
 
       const response = await request(app)
         .post('/api/admin/announcements/send')
@@ -121,20 +122,22 @@ describe('Admin Announcements', () => {
       expect(response.body.details.total).toBe(2);
       expect(response.body.details.successful).toBe(2);
 
-      // Verify emailService.sendEmail was called with [TEST] prefix and test banner
-      expect(mockEmailService.sendEmail).toHaveBeenCalledTimes(2);
-      expect(mockEmailService.sendEmail).toHaveBeenCalledWith(
-        'test1@example.com',
-        '[TEST] Test Announcement',
-        expect.stringContaining('This is a test message'), // Plain text version
-        expect.stringContaining('🧪 TEST EMAIL - This is a test announcement') // Test banner
-      );
-      expect(mockEmailService.sendEmail).toHaveBeenCalledWith(
-        'test1@example.com',
-        '[TEST] Test Announcement',
-        expect.any(String),
-        expect.stringMatching(/<div style="background-color: #ff9800.*TEST EMAIL.*<\/div>.*<p>This is a test message<\/p>/s)
-      );
+      // Verify resendService.sendEmail was called with [TEST] prefix, test banner, and correct from address
+      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
+        from: 'no-reply@updates.agentweb.pro',
+        to: 'test1@example.com',
+        subject: '[TEST] Test Announcement',
+        text: expect.stringContaining('This is a test message'), // Plain text version
+        html: expect.stringContaining('🧪 TEST EMAIL - This is a test announcement') // Test banner
+      });
+      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
+        from: 'no-reply@updates.agentweb.pro',
+        to: 'test1@example.com',
+        subject: '[TEST] Test Announcement',
+        text: expect.any(String),
+        html: expect.stringMatching(/<div style="background-color: #ff9800.*TEST EMAIL.*<\/div>.*<p>This is a test message<\/p>/s)
+      });
     });
 
     it('should return 400 if title is missing', async () => {
@@ -198,7 +201,7 @@ describe('Admin Announcements', () => {
 
       expect(response.body.details.total).toBe(2); // Only valid emails
       expect(response.body.details.invalidEmails).toContain('invalid-email');
-      expect(mockEmailService.sendEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
     });
 
     it('should return 400 if no valid email addresses provided', async () => {
@@ -225,18 +228,21 @@ describe('Admin Announcements', () => {
         .expect(200);
 
       expect(response.body.details.total).toBe(2);
-      expect(mockEmailService.sendEmail).toHaveBeenCalledWith(
-        'valid@example.com', // Trimmed
-        expect.any(String),
-        expect.any(String),
-        expect.any(String)
+      expect(mockResendService.sendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          from: 'no-reply@updates.agentweb.pro',
+          to: 'valid@example.com', // Trimmed
+          subject: expect.any(String),
+          text: expect.any(String),
+          html: expect.any(String)
+        })
       );
     });
 
     it('should handle email sending failures and track failed emails', async () => {
-      (mockEmailService as any).sendEmail = jest.fn()
+      (mockResendService as any).sendEmail = jest.fn()
         .mockRejectedValueOnce(new Error('Email failed'))
-        .mockResolvedValueOnce(undefined);
+        .mockResolvedValueOnce({ id: 'test-email-id' });
 
       const response = await request(app)
         .post('/api/admin/announcements/test')
