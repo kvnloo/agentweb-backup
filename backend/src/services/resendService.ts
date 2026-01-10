@@ -114,9 +114,11 @@ class ResendService {
     const recipient = Array.isArray(to) ? to.join(', ') : to;
     console.log(`Sending Resend email to: ${recipient}`);
 
-    // Add 500ms delay before attempting to send to minimize rate limit hits
-    console.log(`Waiting 500ms before sending email to ${recipient}...`);
-    await this.sleep(500);
+    // Add delay before attempting to send to respect rate limit (2 per second = 500ms minimum)
+    // Using 600ms to provide a safety margin and account for processing time
+    const RATE_LIMIT_DELAY = 600; // 600ms = ~1.67 emails/second, safely under 2/second limit
+    console.log(`Waiting ${RATE_LIMIT_DELAY}ms before sending email to ${recipient}...`);
+    await this.sleep(RATE_LIMIT_DELAY);
 
     const result = await this.retryWithBackoff(
       async () => {

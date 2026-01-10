@@ -1388,32 +1388,43 @@ router.post("/announcements/send", async (req, res) => {
     };
 
     // Send announcement email to all active users using Resend
+    // Process sequentially to respect rate limits and handle errors properly
     const fromEmail = "no-reply@updates.agentweb.pro";
-    await Promise.allSettled(
-      activeEmails.map(async (email) => {
-        try {
-          await resendService.sendEmail({
-            from: fromEmail,
-            to: email,
-            subject: title,
-            text: message
-              .replace(/<[^>]*>/g, "")
-              .replace(/&nbsp;/g, " ")
-              .replace(/&amp;/g, "&")
-              .replace(/&lt;/g, "<")
-              .replace(/&gt;/g, ">")
-              .replace(/&quot;/g, '"')
-              .trim(),
-            html: message, // HTML version - use message directly without wrapper
-          });
+    const plainTextMessage = message
+      .replace(/<[^>]*>/g, "")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .trim();
+
+    for (const email of activeEmails) {
+      try {
+        const result = await resendService.sendEmail({
+          from: fromEmail,
+          to: email,
+          subject: title,
+          text: plainTextMessage,
+          html: message, // HTML version - use message directly without wrapper
+        });
+
+        // Check if email was sent successfully (resendService returns null on failure)
+        if (result && result.id) {
           results.successful++;
-        } catch (error) {
-          console.error(`Failed to send announcement to ${email}:`, error);
+          console.log(`✅ Announcement sent successfully to ${email} (ID: ${result.id})`);
+        } else {
+          // resendService.sendEmail returns null after all retries failed
           results.failed++;
           results.failedEmails.push(email);
+          console.error(`❌ Failed to send announcement to ${email} after retries`);
         }
-      })
-    );
+      } catch (error: any) {
+        console.error(`❌ Error sending announcement to ${email}:`, error.message || error);
+        results.failed++;
+        results.failedEmails.push(email);
+      }
+    }
 
     // Return detailed results
     res.json({
@@ -1467,36 +1478,45 @@ router.post("/announcements/test", async (req, res) => {
     };
 
     // Send test announcement email to specified recipients using Resend
+    // Process sequentially to respect rate limits and handle errors properly
     const fromEmail = "no-reply@updates.agentweb.pro";
-    await Promise.allSettled(
-      validEmails.map(async (email: string) => {
-        try {
-          // Add test banner to the message HTML
-          const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">🧪 TEST EMAIL - This is a test announcement</div>`;
-          const testMessage = testBanner + message;
-          
-          await resendService.sendEmail({
-            from: fromEmail,
-            to: email.trim(),
-            subject: `[TEST] ${title}`,
-            text: message
-              .replace(/<[^>]*>/g, "")
-              .replace(/&nbsp;/g, " ")
-              .replace(/&amp;/g, "&")
-              .replace(/&lt;/g, "<")
-              .replace(/&gt;/g, ">")
-              .replace(/&quot;/g, '"')
-              .trim(),
-            html: testMessage, // HTML version - use message directly with test banner prepended
-          });
+    const plainTextMessage = message
+      .replace(/<[^>]*>/g, "")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .trim();
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">🧪 TEST EMAIL - This is a test announcement</div>`;
+    const testMessage = testBanner + message;
+
+    for (const email of validEmails) {
+      try {
+        const result = await resendService.sendEmail({
+          from: fromEmail,
+          to: email.trim(),
+          subject: `[TEST] ${title}`,
+          text: plainTextMessage,
+          html: testMessage, // HTML version - use message directly with test banner prepended
+        });
+
+        // Check if email was sent successfully (resendService returns null on failure)
+        if (result && result.id) {
           results.successful++;
-        } catch (error) {
-          console.error(`Failed to send test announcement to ${email}:`, error);
+          console.log(`✅ Test announcement sent successfully to ${email} (ID: ${result.id})`);
+        } else {
+          // resendService.sendEmail returns null after all retries failed
           results.failed++;
           results.failedEmails.push(email);
+          console.error(`❌ Failed to send test announcement to ${email} after retries`);
         }
-      })
-    );
+      } catch (error: any) {
+        console.error(`❌ Error sending test announcement to ${email}:`, error.message || error);
+        results.failed++;
+        results.failedEmails.push(email);
+      }
+    }
 
     // Return detailed results
     res.json({
