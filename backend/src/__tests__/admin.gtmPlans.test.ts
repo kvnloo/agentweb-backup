@@ -27,6 +27,13 @@ jest.mock('../middleware/admin', () => ({
 jest.mock('aws-sdk', () => {
   const mockScan = jest.fn();
   return {
+    default: {
+      SecretsManager: jest.fn(() => ({
+        getSecretValue: jest.fn().mockReturnValue({
+          promise: jest.fn().mockResolvedValue({ SecretString: 'test-secret' }),
+        }),
+      })),
+    },
     config: {
       update: jest.fn(),
     },
@@ -35,12 +42,22 @@ jest.mock('aws-sdk', () => {
         scan: mockScan,
       })),
     },
+    SecretsManager: jest.fn(() => ({
+      getSecretValue: jest.fn().mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'test-secret' }),
+      }),
+    })),
   };
 });
 
 // Mock other dependencies that might be imported
 jest.mock('../services/waitlistDb', () => ({}));
 jest.mock('../services/emailService', () => ({}));
+jest.mock('../services/resendService', () => ({
+  resendService: {
+    sendEmail: jest.fn(),
+  },
+}));
 jest.mock('../services/workflowDb', () => ({}));
 jest.mock('../services/chatbotService', () => ({}));
 
