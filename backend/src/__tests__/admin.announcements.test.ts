@@ -105,6 +105,24 @@ describe('Admin Announcements', () => {
       expect(response.body.details.failed).toBe(1);
       expect(response.body.details.failedEmails).toContain('user1@example.com');
     });
+
+    it('should handle null return value from resendService (failed after retries)', async () => {
+      (mockResendService as any).sendEmail = jest.fn()
+        .mockResolvedValueOnce(null) // Failed after retries
+        .mockResolvedValueOnce({ id: 'test-email-id' });
+
+      const response = await request(app)
+        .post('/api/admin/announcements/send')
+        .send({ 
+          title: 'Test Announcement',
+          message: '<p>Test message</p>'
+        })
+        .expect(200);
+
+      expect(response.body.details.successful).toBe(1);
+      expect(response.body.details.failed).toBe(1);
+      expect(response.body.details.failedEmails).toContain('user1@example.com');
+    });
   });
 
   describe('POST /api/admin/announcements/test', () => {
@@ -242,6 +260,25 @@ describe('Admin Announcements', () => {
     it('should handle email sending failures and track failed emails', async () => {
       (mockResendService as any).sendEmail = jest.fn()
         .mockRejectedValueOnce(new Error('Email failed'))
+        .mockResolvedValueOnce({ id: 'test-email-id' });
+
+      const response = await request(app)
+        .post('/api/admin/announcements/test')
+        .send({ 
+          title: 'Test Announcement',
+          message: '<p>Test message</p>',
+          recipients: ['test1@example.com', 'test2@example.com']
+        })
+        .expect(200);
+
+      expect(response.body.details.successful).toBe(1);
+      expect(response.body.details.failed).toBe(1);
+      expect(response.body.details.failedEmails).toContain('test1@example.com');
+    });
+
+    it('should handle null return value from resendService (failed after retries)', async () => {
+      (mockResendService as any).sendEmail = jest.fn()
+        .mockResolvedValueOnce(null) // Failed after retries
         .mockResolvedValueOnce({ id: 'test-email-id' });
 
       const response = await request(app)
