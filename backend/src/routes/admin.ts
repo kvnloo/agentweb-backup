@@ -2135,6 +2135,155 @@ router.get("/gtm-plans", async (req, res) => {
   }
 });
 
+// Update GTM plan item (work item) - status, notes, PoC (dri)
+router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (req, res) => {
+  try {
+    const { planId, phaseId, workItemId } = req.params;
+    const { status, notes, dri } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Phase not found",
+      });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+
+    // Find the work item
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Work item not found",
+      });
+    }
+
+    // Update the work item
+    const updatedWorkItem = {
+      ...workItems[workItemIndex],
+      ...(status !== undefined && { status }),
+      ...(notes !== undefined && { notes }),
+      ...(dri !== undefined && { dri: dri || null }),
+    };
+
+    workItems[workItemIndex] = updatedWorkItem;
+
+    // Recalculate phase status based on work items
+    const hasWorkItems = workItems.length > 0;
+    const allItemsDone = hasWorkItems && workItems.every(
+      (item: any) => item.status === "completed" || item.status === "skipped"
+    );
+    const updatedPhase = {
+      ...phase,
+      workItems,
+      status: allItemsDone ? "completed" : "in_progress",
+    };
+
+    phases[phaseIndex] = updatedPhase;
+
+    // Recalculate plan status based on phases
+    const hasPhases = phases.length > 0;
+    const allPhasesCompleted = hasPhases && phases.every(
+      (phase: any) => phase.status === "completed"
+    );
+    const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+    // Check if plan is transitioning to completed
+    const wasCompleted = plan.status === "completed";
+    const isNowCompleted = planStatus === "completed";
+    const justCompleted = !wasCompleted && isNowCompleted;
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    updateExpressions.push("#phases = :phases");
+    expressionAttributeNames["#phases"] = "phases";
+    expressionAttributeValues[":phases"] = phases;
+
+    updateExpressions.push("#status = :status");
+    expressionAttributeNames["#status"] = "status";
+    expressionAttributeValues[":status"] = planStatus;
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    if (justCompleted) {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = new Date().toISOString();
+    } else if (wasCompleted && !isNowCompleted) {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = null;
+    }
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Work item updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan work item:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating work item",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
 // Subscription Types endpoints
 
 // Get all subscription types
