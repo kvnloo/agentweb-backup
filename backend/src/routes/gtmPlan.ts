@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
+import { sendGTMPlanUpdateNotifications } from "../services/gtmPlanNotificationService";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient({
@@ -290,6 +291,176 @@ router.put("/:planId", authenticateToken, async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Internal server error",
+    });
+  }
+});
+
+// Update a specific work item in a GTM plan (with notification support)
+router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId, workItemId } = req.params;
+    const { status, notes, dri, notifications } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    // Verify the plan belongs to the user
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+
+    // Find the work item
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    // Store original values for change detection
+    const originalItem = workItems[workItemIndex];
+    const changes: { status?: string; notes?: string; dri?: string } = {};
+
+    // Update the work item
+    const updatedWorkItem = {
+      ...originalItem,
+      ...(status !== undefined && { status, ...(changes.status = status, {}) }),
+      ...(notes !== undefined && { notes: notes || null, ...(changes.notes = notes || null, {}) }),
+      ...(dri !== undefined && { dri: dri || null, ...(changes.dri = dri || null, {}) }),
+    };
+
+    // Only track actual changes
+    if (status !== undefined && status !== originalItem.status) {
+      changes.status = status;
+    }
+    if (notes !== undefined && notes !== originalItem.notes) {
+      changes.notes = notes || null;
+    }
+    if (dri !== undefined && dri !== originalItem.dri) {
+      changes.dri = dri || null;
+    }
+
+    workItems[workItemIndex] = updatedWorkItem;
+
+    // Recalculate phase status based on work items
+    const hasWorkItems = workItems.length > 0;
+    const allItemsDone = hasWorkItems && workItems.every(
+      (item: any) => item.status === "completed" || item.status === "skipped"
+    );
+    const updatedPhase = {
+      ...phase,
+      workItems,
+      status: allItemsDone ? "completed" : "in_progress",
+    };
+
+    phases[phaseIndex] = updatedPhase;
+
+    // Recalculate plan status based on phases
+    const hasPhases = phases.length > 0;
+    const allPhasesCompleted = hasPhases && phases.every(
+      (phase: any) => phase.status === "completed"
+    );
+    const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+    // Check if plan is transitioning to completed
+    const wasCompleted = plan.status === "completed";
+    const isNowCompleted = planStatus === "completed";
+    const justCompleted = !wasCompleted && isNowCompleted;
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    updateExpressions.push("#phases = :phases");
+    expressionAttributeNames["#phases"] = "phases";
+    expressionAttributeValues[":phases"] = phases;
+
+    updateExpressions.push("#status = :status");
+    expressionAttributeNames["#status"] = "status";
+    expressionAttributeValues[":status"] = planStatus;
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    if (justCompleted) {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = new Date().toISOString();
+    } else if (wasCompleted && !isNowCompleted) {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = null;
+    }
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    // Handle notifications if requested
+    if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
+      try {
+        const updatedPlan = result.Attributes;
+        if (updatedPlan) {
+          await sendGTMPlanUpdateNotifications(
+            updatedPlan,
+            phaseId,
+            workItemId,
+            changes,
+            notifications
+          );
+        }
+      } catch (notificationError: any) {
+        console.error("Error sending notifications:", notificationError);
+        // Don't fail the request if notifications fail
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Work item updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan work item:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
     });
   }
 });
