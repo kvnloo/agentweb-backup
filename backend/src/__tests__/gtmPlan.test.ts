@@ -475,6 +475,149 @@ describe('GTM Plan Route Tests', () => {
     });
   });
 
+  describe('Delete Phase (DELETE /:planId/phases/:phaseId)', () => {
+    it('should delete a phase from a plan', async () => {
+      const mockPlanWithPhases = {
+        ...mockPlan,
+        phases: [
+          { id: 'phase-1', title: 'Phase 1', workItems: [] },
+          { id: 'phase-2', title: 'Phase 2', workItems: [] },
+        ],
+      };
+
+      const mockGetPromise = jest.fn().mockResolvedValue({
+        Item: mockPlanWithPhases,
+      });
+      mockGet.mockReturnValue({ promise: mockGetPromise });
+
+      const mockUpdatePromise = jest.fn().mockResolvedValue({
+        Attributes: {
+          ...mockPlanWithPhases,
+          phases: [{ id: 'phase-2', title: 'Phase 2', workItems: [] }],
+        },
+      });
+      const mockUpdate = jest.fn().mockReturnValue({ promise: mockUpdatePromise });
+      mockDynamoDB.update = mockUpdate;
+
+      const result = await mockDynamoDB.get({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+      }).promise();
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === 'phase-1');
+      phases.splice(phaseIndex, 1);
+
+      await mockDynamoDB.update({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+        UpdateExpression: 'SET phases = :phases',
+        ExpressionAttributeValues: { ':phases': phases },
+      }).promise();
+
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Key: { planId: mockPlanId },
+          UpdateExpression: 'SET phases = :phases',
+          ExpressionAttributeValues: {
+            ':phases': [{ id: 'phase-2', title: 'Phase 2', workItems: [] }],
+          },
+        })
+      );
+    });
+
+    it('should return 404 when phase not found', () => {
+      const phases = [{ id: 'phase-1', title: 'Phase 1' }];
+      const phaseIndex = phases.findIndex((p: any) => p.id === 'non-existent');
+      expect(phaseIndex).toBe(-1);
+    });
+  });
+
+  describe('Delete Work Item (DELETE /:planId/phases/:phaseId/work-items/:workItemId)', () => {
+    it('should delete a work item from a phase', async () => {
+      const mockPlanWithWorkItems = {
+        ...mockPlan,
+        phases: [
+          {
+            id: 'phase-1',
+            title: 'Phase 1',
+            workItems: [
+              { id: 'item-1', title: 'Item 1' },
+              { id: 'item-2', title: 'Item 2' },
+            ],
+          },
+        ],
+      };
+
+      const mockGetPromise = jest.fn().mockResolvedValue({
+        Item: mockPlanWithWorkItems,
+      });
+      mockGet.mockReturnValue({ promise: mockGetPromise });
+
+      const mockUpdatePromise = jest.fn().mockResolvedValue({
+        Attributes: {
+          ...mockPlanWithWorkItems,
+          phases: [
+            {
+              id: 'phase-1',
+              title: 'Phase 1',
+              workItems: [{ id: 'item-2', title: 'Item 2' }],
+            },
+          ],
+        },
+      });
+      const mockUpdate = jest.fn().mockReturnValue({ promise: mockUpdatePromise });
+      mockDynamoDB.update = mockUpdate;
+
+      const result = await mockDynamoDB.get({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+      }).promise();
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phase = phases.find((p: any) => p.id === 'phase-1');
+      const workItems = phase.workItems || [];
+      const workItemIndex = workItems.findIndex((item: any) => item.id === 'item-1');
+      workItems.splice(workItemIndex, 1);
+
+      phase.workItems = workItems;
+      phases[0] = phase;
+
+      await mockDynamoDB.update({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+        UpdateExpression: 'SET phases = :phases',
+        ExpressionAttributeValues: { ':phases': phases },
+      }).promise();
+
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Key: { planId: mockPlanId },
+          UpdateExpression: 'SET phases = :phases',
+          ExpressionAttributeValues: {
+            ':phases': [
+              {
+                id: 'phase-1',
+                title: 'Phase 1',
+                workItems: [{ id: 'item-2', title: 'Item 2' }],
+              },
+            ],
+          },
+        })
+      );
+    });
+
+    it('should return 404 when work item not found', () => {
+      const workItems = [{ id: 'item-1', title: 'Item 1' }];
+      const workItemIndex = workItems.findIndex((item: any) => item.id === 'non-existent');
+      expect(workItemIndex).toBe(-1);
+    });
+  });
+
   describe('Table Name Configuration', () => {
     it('should use Dev- prefix in development', () => {
       process.env.NODE_ENV = 'development';

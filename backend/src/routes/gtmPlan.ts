@@ -455,7 +455,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
     // Handle notifications if requested
     if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
       try {
-        const updatedPlan = result.Attributes;
+        const updatedPlan = result.Attributes as any;
         if (updatedPlan) {
           await sendGTMPlanUpdateNotifications(
             updatedPlan,
@@ -478,6 +478,200 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
     });
   } catch (error: any) {
     console.error("Error updating GTM plan work item:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Create a new phase in a GTM plan
+router.post("/:planId/phases", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId } = req.params;
+    const { title, description, dri, dueDate } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        error: "Phase title is required",
+      });
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    // Verify the plan belongs to the user
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Create new phase
+    const phaseId = `phase-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    const newPhase = {
+      id: phaseId,
+      title,
+      description: description || null,
+      dri: dri || null,
+      status: "in_progress",
+      workItems: [],
+      dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null,
+    };
+
+    phases.push(newPhase);
+
+    // Update plan
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: {
+        "#phases": "phases",
+        "#updatedAt": "updatedAt",
+      },
+      ExpressionAttributeValues: {
+        ":phases": phases,
+        ":updatedAt": new Date().toISOString(),
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Phase created successfully",
+    });
+  } catch (error: any) {
+    console.error("Error creating phase:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Create a new work item in a phase
+router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId } = req.params;
+    const { title, description, dri, dueDate } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        error: "Work item title is required",
+      });
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    // Verify the plan belongs to the user
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+
+    // Create new work item
+    const workItemId = `item-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    const newWorkItem = {
+      id: workItemId,
+      title,
+      description: description || null,
+      dri: dri || null,
+      status: "pending",
+      notes: null,
+      dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null,
+    };
+
+    workItems.push(newWorkItem);
+
+    // Update phase
+    const updatedPhase = {
+      ...phase,
+      workItems,
+      status: "in_progress", // Phase becomes in_progress when work items are added
+    };
+
+    phases[phaseIndex] = updatedPhase;
+
+    // Update plan
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: {
+        "#phases": "phases",
+        "#updatedAt": "updatedAt",
+      },
+      ExpressionAttributeValues: {
+        ":phases": phases,
+        ":updatedAt": new Date().toISOString(),
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Work item created successfully",
+    });
+  } catch (error: any) {
+    console.error("Error creating work item:", error);
     return res.status(500).json({
       success: false,
       error: error?.message || "Internal server error",
