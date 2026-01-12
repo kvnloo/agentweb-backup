@@ -2304,6 +2304,180 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
   }
 });
 
+// Update GTM plan PoC (dri)
+router.put("/gtm-plans/:planId", async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const { dri } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    if (dri !== undefined) {
+      updateExpressions.push("#dri = :dri");
+      expressionAttributeNames["#dri"] = "dri";
+      expressionAttributeValues[":dri"] = dri || null;
+    }
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Plan PoC updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan PoC:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating plan PoC",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Update GTM plan phase PoC (dri)
+router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
+  try {
+    const { planId, phaseId } = req.params;
+    const { dri } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Phase not found",
+      });
+    }
+
+    // Update the phase
+    const updatedPhase = {
+      ...phases[phaseIndex],
+      ...(dri !== undefined && { dri: dri || null }),
+    };
+
+    phases[phaseIndex] = updatedPhase;
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    updateExpressions.push("#phases = :phases");
+    expressionAttributeNames["#phases"] = "phases";
+    expressionAttributeValues[":phases"] = phases;
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Phase PoC updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan phase PoC:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating phase PoC",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
 // Subscription Types endpoints
 
 // Get all subscription types

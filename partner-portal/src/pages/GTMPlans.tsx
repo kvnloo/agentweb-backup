@@ -88,10 +88,11 @@ export default function GTMPlans() {
   const [error, setError] = useState<string | null>(null);
   const [editingItem, setEditingItem] = useState<{
     planId: string;
-    phaseId: string;
-    workItemId: string;
+    phaseId?: string;
+    workItemId?: string;
     field: "status" | "notes" | "dri" | "statusAndNotes";
     value: any;
+    type: "plan" | "phase" | "workItem";
   } | null>(null);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [editValue, setEditValue] = useState("");
@@ -157,14 +158,15 @@ export default function GTMPlans() {
 
   const handleEditClick = (
     planId: string,
-    phaseId: string,
-    workItemId: string,
+    type: "plan" | "phase" | "workItem",
     field: "status" | "notes" | "dri" | "statusAndNotes",
+    phaseId?: string,
+    workItemId?: string,
     currentValue?: any,
     currentStatus?: string,
     currentNotes?: string
   ) => {
-    setEditingItem({ planId, phaseId, workItemId, field, value: currentValue });
+    setEditingItem({ planId, phaseId, workItemId, field, value: currentValue, type });
     
     if (field === "statusAndNotes") {
       setEditStatus(currentStatus || "");
@@ -182,6 +184,19 @@ export default function GTMPlans() {
   const handleSave = () => {
     if (!editingItem) return;
 
+    // Handle plan-level PoC updates (no notifications needed)
+    if (editingItem.type === "plan" && editingItem.field === "dri") {
+      performPlanUpdate(editingItem.planId, { dri: editValue || null });
+      return;
+    }
+
+    // Handle phase-level PoC updates (no notifications needed)
+    if (editingItem.type === "phase" && editingItem.field === "dri" && editingItem.phaseId) {
+      performPhaseUpdate(editingItem.planId, editingItem.phaseId, { dri: editValue || null });
+      return;
+    }
+
+    // Handle work item updates (existing logic with notifications)
     const updateData: any = {};
     
     if (editingItem.field === "statusAndNotes") {
@@ -214,7 +229,7 @@ export default function GTMPlans() {
 
     // If there's nothing to notify, proceed directly
     if (!hasPocs && !hasUser) {
-      performUpdate(updateData, editingItem.planId, editingItem.phaseId, editingItem.workItemId);
+      performUpdate(updateData, editingItem.planId, editingItem.phaseId!, editingItem.workItemId!);
       return;
     }
 
@@ -222,10 +237,105 @@ export default function GTMPlans() {
     setPendingUpdate({
       updateData,
       planId: editingItem.planId,
-      phaseId: editingItem.phaseId,
-      workItemId: editingItem.workItemId,
+      phaseId: editingItem.phaseId!,
+      workItemId: editingItem.workItemId!,
     });
     setConfirmDialogOpen(true);
+  };
+
+  const performPlanUpdate = async (
+    planId: string,
+    updateData: { dri?: string | null }
+  ) => {
+    try {
+      setSaving(true);
+      setError(null);
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/gtm-plans/${planId}`),
+        updateData,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (response.data.success && response.data.data) {
+        const updatedPlan = response.data.data;
+        setPlans((prevPlans) =>
+          prevPlans.map((plan) => {
+            if (plan.planId === planId) {
+              return {
+                ...updatedPlan,
+                userEmail: plan.userEmail,
+                userName: plan.userName,
+              };
+            }
+            return plan;
+          })
+        );
+      } else {
+        await fetchPlans(); // Fallback
+      }
+
+      setEditDialogOpen(false);
+      setEditingItem(null);
+      setEditValue("");
+    } catch (err: any) {
+      console.error("Error updating plan:", err);
+      setError(err.response?.data?.error || "Failed to update plan");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const performPhaseUpdate = async (
+    planId: string,
+    phaseId: string,
+    updateData: { dri?: string | null }
+  ) => {
+    try {
+      setSaving(true);
+      setError(null);
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/gtm-plans/${planId}/phases/${phaseId}`),
+        updateData,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (response.data.success && response.data.data) {
+        const updatedPlan = response.data.data;
+        setPlans((prevPlans) =>
+          prevPlans.map((plan) => {
+            if (plan.planId === planId) {
+              return {
+                ...updatedPlan,
+                userEmail: plan.userEmail,
+                userName: plan.userName,
+              };
+            }
+            return plan;
+          })
+        );
+      } else {
+        await fetchPlans(); // Fallback
+      }
+
+      setEditDialogOpen(false);
+      setEditingItem(null);
+      setEditValue("");
+    } catch (err: any) {
+      console.error("Error updating phase:", err);
+      setError(err.response?.data?.error || "Failed to update phase");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const performUpdate = async (
@@ -384,7 +494,7 @@ export default function GTMPlans() {
                         {plan.description}
                       </Typography>
                     )}
-                    <Box sx={{ display: "flex", gap: 1, mt: 1, flexWrap: "wrap" }}>
+                    <Box sx={{ display: "flex", gap: 1, mt: 1, flexWrap: "wrap", alignItems: "center" }}>
                       <Chip label={plan.status} color={getStatusColor(plan.status) as any} size="small" />
                       {plan.userName && (
                         <Chip
@@ -408,6 +518,16 @@ export default function GTMPlans() {
                           variant="outlined"
                         />
                       )}
+                      <Tooltip title="Assign Plan PoC">
+                        <IconButton
+                          size="small"
+                          onClick={() =>
+                            handleEditClick(plan.planId, "plan", "dri", undefined, undefined, plan.dri)
+                          }
+                        >
+                          <PersonIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
                       <Chip
                         label={`Created: ${format(new Date(plan.createdAt), "MMM d, yyyy")}`}
                         size="small"
@@ -448,6 +568,17 @@ export default function GTMPlans() {
                               variant="outlined"
                             />
                           )}
+                          <Tooltip title="Assign Phase PoC">
+                            <IconButton
+                              size="small"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleEditClick(plan.planId, "phase", "dri", phase.id, undefined, phase.dri);
+                              }}
+                            >
+                              <PersonIcon fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
                         </Box>
                       </AccordionSummary>
                       <AccordionDetails>
@@ -519,7 +650,7 @@ export default function GTMPlans() {
                                           <IconButton
                                             size="small"
                                             onClick={() =>
-                                              handleEditClick(plan.planId, phase.id, item.id, "statusAndNotes", undefined, item.status, item.notes)
+                                              handleEditClick(plan.planId, "workItem", "statusAndNotes", phase.id, item.id, undefined, item.status, item.notes)
                                             }
                                           >
                                             <CheckCircleIcon fontSize="small" />
@@ -529,7 +660,7 @@ export default function GTMPlans() {
                                           <IconButton
                                             size="small"
                                             onClick={() =>
-                                              handleEditClick(plan.planId, phase.id, item.id, "dri", item.dri)
+                                              handleEditClick(plan.planId, "workItem", "dri", phase.id, item.id, item.dri)
                                             }
                                           >
                                             <PersonIcon fontSize="small" />
@@ -563,7 +694,11 @@ export default function GTMPlans() {
 
       <Dialog open={editDialogOpen} onClose={handleCancel} maxWidth="sm" fullWidth>
         <DialogTitle>
-          {editingItem?.field === "statusAndNotes" 
+          {editingItem?.type === "plan"
+            ? "Assign Plan PoC"
+            : editingItem?.type === "phase"
+            ? "Assign Phase PoC"
+            : editingItem?.field === "statusAndNotes" 
             ? "Edit Status & Notes" 
             : editingItem?.field === "dri" 
             ? "Assign PoC" 
@@ -621,7 +756,13 @@ export default function GTMPlans() {
           ) : (
             <TextField
               fullWidth
-              label="PoC (Point of Contact) Email"
+              label={
+                editingItem?.type === "plan"
+                  ? "Plan PoC (Point of Contact) Email"
+                  : editingItem?.type === "phase"
+                  ? "Phase PoC (Point of Contact) Email"
+                  : "PoC (Point of Contact) Email"
+              }
               value={editValue}
               onChange={(e) => setEditValue(e.target.value)}
               sx={{ mt: 2 }}
