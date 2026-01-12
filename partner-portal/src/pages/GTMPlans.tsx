@@ -27,6 +27,13 @@ import {
   FormControl,
   InputLabel,
   Tooltip,
+  Checkbox,
+  FormGroup,
+  FormControlLabel,
+  List,
+  ListItem,
+  ListItemText,
+  Divider,
 } from "@mui/material";
 import {
   ExpandMore as ExpandMoreIcon,
@@ -83,15 +90,46 @@ export default function GTMPlans() {
     planId: string;
     phaseId: string;
     workItemId: string;
-    field: "status" | "notes" | "dri";
+    field: "status" | "notes" | "dri" | "statusAndNotes";
     value: any;
   } | null>(null);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [editValue, setEditValue] = useState("");
+  const [editStatus, setEditStatus] = useState("");
+  const [editNotes, setEditNotes] = useState("");
   const [saving, setSaving] = useState(false);
+  const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
+  const [notificationOptions, setNotificationOptions] = useState<{
+    notifyUser: boolean;
+    notifyItemPoc: boolean;
+    notifyPhasePoc: boolean;
+    notifyPlanPoc: boolean;
+  }>({
+    notifyUser: false,
+    notifyItemPoc: false,
+    notifyPhasePoc: false,
+    notifyPlanPoc: false,
+  });
+  const [notificationMessage, setNotificationMessage] = useState("");
+  const [pendingUpdate, setPendingUpdate] = useState<{
+    updateData: any;
+    planId: string;
+    phaseId: string;
+    workItemId: string;
+  } | null>(null);
 
   useEffect(() => {
     fetchPlans();
+    // Load notification preferences from localStorage
+    const savedPrefs = localStorage.getItem("gtm-plans-notification-prefs");
+    if (savedPrefs) {
+      try {
+        const prefs = JSON.parse(savedPrefs);
+        setNotificationOptions(prefs);
+      } catch (e) {
+        console.error("Error loading notification preferences:", e);
+      }
+    }
   }, []);
 
   const fetchPlans = async () => {
@@ -121,28 +159,99 @@ export default function GTMPlans() {
     planId: string,
     phaseId: string,
     workItemId: string,
-    field: "status" | "notes" | "dri",
-    currentValue: any
+    field: "status" | "notes" | "dri" | "statusAndNotes",
+    currentValue?: any,
+    currentStatus?: string,
+    currentNotes?: string
   ) => {
     setEditingItem({ planId, phaseId, workItemId, field, value: currentValue });
-    setEditValue(currentValue || "");
+    
+    if (field === "statusAndNotes") {
+      setEditStatus(currentStatus || "");
+      setEditNotes(currentNotes || "");
+      setEditValue(""); // Not used for this mode
+    } else {
+      setEditValue(currentValue || "");
+      setEditStatus("");
+      setEditNotes("");
+    }
+    
     setEditDialogOpen(true);
   };
 
-  const handleSave = async () => {
+  const handleSave = () => {
     if (!editingItem) return;
 
+    const updateData: any = {};
+    
+    if (editingItem.field === "statusAndNotes") {
+      // Handle both status and notes together
+      updateData.status = editStatus;
+      updateData.notes = editNotes || null;
+    } else {
+      // Handle single field updates
+      updateData[editingItem.field] = editingItem.field === "status" ? editValue : editValue || null;
+    }
+
+    // Find the plan, phase, and work item to get PoCs
+    const plan = plans.find((p) => p.planId === editingItem.planId);
+    if (!plan) return;
+
+    const phase = plan.phases?.find((p) => p.id === editingItem.phaseId);
+    if (!phase) return;
+
+    const workItem = phase.workItems?.find((item) => item.id === editingItem.workItemId);
+    if (!workItem) return;
+
+    // Collect all PoCs
+    const itemPoc = workItem.dri;
+    const phasePoc = phase.dri;
+    const planPoc = plan.dri;
+
+    // Check if there are any PoCs or user to notify
+    const hasPocs = !!(itemPoc || phasePoc || planPoc);
+    const hasUser = !!(plan.userEmail);
+
+    // If there's nothing to notify, proceed directly
+    if (!hasPocs && !hasUser) {
+      performUpdate(updateData, editingItem.planId, editingItem.phaseId, editingItem.workItemId);
+      return;
+    }
+
+    // Store pending update and show confirmation dialog
+    setPendingUpdate({
+      updateData,
+      planId: editingItem.planId,
+      phaseId: editingItem.phaseId,
+      workItemId: editingItem.workItemId,
+    });
+    setConfirmDialogOpen(true);
+  };
+
+  const performUpdate = async (
+    updateData: any,
+    planId: string,
+    phaseId: string,
+    workItemId: string
+  ) => {
     try {
       setSaving(true);
       setError(null);
-      const updateData: any = {};
-      updateData[editingItem.field] = editingItem.field === "status" ? editValue : editValue || null;
+
+      // Add notification preferences and message to update data
+      const updatePayload = {
+        ...updateData,
+        notifications: {
+          ...notificationOptions,
+          message: notificationMessage.trim() || undefined,
+        },
+      };
 
       const response = await axios.put(
         buildApiUrl(
-          `/api/admin/gtm-plans/${editingItem.planId}/phases/${editingItem.phaseId}/work-items/${editingItem.workItemId}`
+          `/api/admin/gtm-plans/${planId}/phases/${phaseId}/work-items/${workItemId}`
         ),
-        updateData,
+        updatePayload,
         {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -157,7 +266,7 @@ export default function GTMPlans() {
         // Preserve user info from existing plan and merge with updated data
         setPlans((prevPlans) =>
           prevPlans.map((plan) => {
-            if (plan.planId === editingItem.planId) {
+            if (plan.planId === planId) {
               return {
                 ...updatedPlan,
                 userEmail: plan.userEmail,
@@ -173,8 +282,13 @@ export default function GTMPlans() {
       }
 
       setEditDialogOpen(false);
+      setConfirmDialogOpen(false);
       setEditingItem(null);
       setEditValue("");
+      setEditStatus("");
+      setEditNotes("");
+      setNotificationMessage("");
+      setPendingUpdate(null);
     } catch (err: any) {
       console.error("Error updating work item:", err);
       setError(err.response?.data?.error || "Failed to update work item");
@@ -183,10 +297,32 @@ export default function GTMPlans() {
     }
   };
 
+  const handleConfirmSave = () => {
+    // Save notification preferences to localStorage
+    localStorage.setItem("gtm-plans-notification-prefs", JSON.stringify(notificationOptions));
+
+    if (pendingUpdate) {
+      performUpdate(
+        pendingUpdate.updateData,
+        pendingUpdate.planId,
+        pendingUpdate.phaseId,
+        pendingUpdate.workItemId
+      );
+    }
+  };
+
+  const handleCancelConfirm = () => {
+    setConfirmDialogOpen(false);
+    setPendingUpdate(null);
+    setNotificationMessage("");
+  };
+
   const handleCancel = () => {
     setEditDialogOpen(false);
     setEditingItem(null);
     setEditValue("");
+    setEditStatus("");
+    setEditNotes("");
   };
 
   const getStatusColor = (status: string) => {
@@ -379,24 +515,14 @@ export default function GTMPlans() {
                                     </TableCell>
                                     <TableCell align="right">
                                       <Box sx={{ display: "flex", gap: 0.5, justifyContent: "flex-end" }}>
-                                        <Tooltip title="Edit Status">
+                                        <Tooltip title="Edit Status & Notes">
                                           <IconButton
                                             size="small"
                                             onClick={() =>
-                                              handleEditClick(plan.planId, phase.id, item.id, "status", item.status)
+                                              handleEditClick(plan.planId, phase.id, item.id, "statusAndNotes", undefined, item.status, item.notes)
                                             }
                                           >
                                             <CheckCircleIcon fontSize="small" />
-                                          </IconButton>
-                                        </Tooltip>
-                                        <Tooltip title="Edit Notes">
-                                          <IconButton
-                                            size="small"
-                                            onClick={() =>
-                                              handleEditClick(plan.planId, phase.id, item.id, "notes", item.notes)
-                                            }
-                                          >
-                                            <EditIcon fontSize="small" />
                                           </IconButton>
                                         </Tooltip>
                                         <Tooltip title="Assign PoC">
@@ -437,10 +563,38 @@ export default function GTMPlans() {
 
       <Dialog open={editDialogOpen} onClose={handleCancel} maxWidth="sm" fullWidth>
         <DialogTitle>
-          Edit {editingItem?.field === "status" ? "Status" : editingItem?.field === "notes" ? "Notes" : "PoC"}
+          {editingItem?.field === "statusAndNotes" 
+            ? "Edit Status & Notes" 
+            : editingItem?.field === "dri" 
+            ? "Assign PoC" 
+            : `Edit ${editingItem?.field === "status" ? "Status" : "Notes"}`}
         </DialogTitle>
         <DialogContent>
-          {editingItem?.field === "status" ? (
+          {editingItem?.field === "statusAndNotes" ? (
+            <Box sx={{ mt: 2 }}>
+              <FormControl fullWidth sx={{ mb: 2 }}>
+                <InputLabel>Status</InputLabel>
+                <Select
+                  value={editStatus}
+                  onChange={(e) => setEditStatus(e.target.value)}
+                  label="Status"
+                >
+                  <MenuItem value="pending">Pending</MenuItem>
+                  <MenuItem value="completed">Completed</MenuItem>
+                  <MenuItem value="skipped">Skipped</MenuItem>
+                </Select>
+              </FormControl>
+              <TextField
+                fullWidth
+                multiline
+                rows={4}
+                label="Notes"
+                value={editNotes}
+                onChange={(e) => setEditNotes(e.target.value)}
+                placeholder="Enter notes about this work item..."
+              />
+            </Box>
+          ) : editingItem?.field === "status" ? (
             <FormControl fullWidth sx={{ mt: 2 }}>
               <InputLabel>Status</InputLabel>
               <Select
@@ -482,6 +636,160 @@ export default function GTMPlans() {
           </Button>
           <Button onClick={handleSave} variant="contained" disabled={saving}>
             {saving ? <CircularProgress size={20} /> : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={confirmDialogOpen} onClose={handleCancelConfirm} maxWidth="sm" fullWidth>
+        <DialogTitle>Confirm Update & Notification</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Select who should be notified about this update:
+          </Typography>
+          
+          <TextField
+            fullWidth
+            multiline
+            rows={3}
+            label="Optional Message (included in notification email)"
+            value={notificationMessage}
+            onChange={(e) => setNotificationMessage(e.target.value)}
+            placeholder="Add a personal message to include in the notification email..."
+            sx={{ mb: 3 }}
+            helperText="This message will be included in the notification email sent to selected recipients."
+          />
+          
+          {pendingUpdate && (() => {
+            const plan = plans.find((p) => p.planId === pendingUpdate.planId);
+            const phase = plan?.phases?.find((p) => p.id === pendingUpdate.phaseId);
+            const workItem = phase?.workItems?.find((item) => item.id === pendingUpdate.workItemId);
+            
+            const itemPoc = workItem?.dri;
+            const phasePoc = phase?.dri;
+            const planPoc = plan?.dri;
+            const userEmail = plan?.userEmail;
+            
+            return (
+              <FormGroup>
+                {userEmail && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={notificationOptions.notifyUser}
+                        onChange={(e) =>
+                          setNotificationOptions((prev) => ({
+                            ...prev,
+                            notifyUser: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Plan Owner
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {userEmail}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+                
+                {planPoc && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={notificationOptions.notifyPlanPoc}
+                        onChange={(e) =>
+                          setNotificationOptions((prev) => ({
+                            ...prev,
+                            notifyPlanPoc: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Plan PoC
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {planPoc}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+                
+                {phasePoc && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={notificationOptions.notifyPhasePoc}
+                        onChange={(e) =>
+                          setNotificationOptions((prev) => ({
+                            ...prev,
+                            notifyPhasePoc: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Phase PoC
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {phasePoc}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+                
+                {itemPoc && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={notificationOptions.notifyItemPoc}
+                        onChange={(e) =>
+                          setNotificationOptions((prev) => ({
+                            ...prev,
+                            notifyItemPoc: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Work Item PoC
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {itemPoc}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+                
+                {!userEmail && !planPoc && !phasePoc && !itemPoc && (
+                  <Typography variant="body2" color="text.secondary">
+                    No recipients available to notify.
+                  </Typography>
+                )}
+              </FormGroup>
+            );
+          })()}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCancelConfirm} disabled={saving}>
+            Cancel
+          </Button>
+          <Button onClick={handleConfirmSave} variant="contained" disabled={saving}>
+            {saving ? <CircularProgress size={20} /> : "Confirm & Update"}
           </Button>
         </DialogActions>
       </Dialog>

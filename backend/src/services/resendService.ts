@@ -1,6 +1,7 @@
 import { Resend } from 'resend';
 import { getSecret } from '../utils/secretsManager';
 import axios from 'axios';
+import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
 class ResendService {
   private resend: Resend | null = null;
@@ -140,6 +141,34 @@ class ResendService {
     }
 
     return result;
+  }
+
+  /**
+   * Send a system email using the configured system email address
+   * This is a convenience method for system-generated emails
+   */
+  async sendSystemEmail({
+    to,
+    subject,
+    html,
+    text,
+    inReplyTo
+  }: {
+    to: string | string[];
+    subject: string;
+    html?: string;
+    text?: string;
+    inReplyTo?: string;
+  }) {
+    const from = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
+    return this.sendEmail({
+      from,
+      to,
+      subject,
+      html,
+      text,
+      inReplyTo
+    });
   }
 
   /**

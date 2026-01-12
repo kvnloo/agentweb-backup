@@ -1389,7 +1389,6 @@ router.post("/announcements/send", async (req, res) => {
 
     // Send announcement email to all active users using Resend
     // Process sequentially to respect rate limits and handle errors properly
-    const fromEmail = "no-reply@updates.agentweb.pro";
     const plainTextMessage = message
       .replace(/<[^>]*>/g, "")
       .replace(/&nbsp;/g, " ")
@@ -1401,8 +1400,7 @@ router.post("/announcements/send", async (req, res) => {
 
     for (const email of activeEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from: fromEmail,
+        const result = await resendService.sendSystemEmail({
           to: email,
           subject: title,
           text: plainTextMessage,
@@ -1479,7 +1477,6 @@ router.post("/announcements/test", async (req, res) => {
 
     // Send test announcement email to specified recipients using Resend
     // Process sequentially to respect rate limits and handle errors properly
-    const fromEmail = "no-reply@updates.agentweb.pro";
     const plainTextMessage = message
       .replace(/<[^>]*>/g, "")
       .replace(/&nbsp;/g, " ")
@@ -1493,8 +1490,7 @@ router.post("/announcements/test", async (req, res) => {
 
     for (const email of validEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from: fromEmail,
+        const result = await resendService.sendSystemEmail({
           to: email.trim(),
           subject: `[TEST] ${title}`,
           text: plainTextMessage,
@@ -2139,7 +2135,7 @@ router.get("/gtm-plans", async (req, res) => {
 router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (req, res) => {
   try {
     const { planId, phaseId, workItemId } = req.params;
-    const { status, notes, dri } = req.body;
+    const { status, notes, dri, notifications } = req.body;
 
     const dynamodb = new DynamoDB.DocumentClient({
       region: process.env.AWS_REGION || "us-west-2",
@@ -2268,6 +2264,135 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
     };
 
     const result = await dynamodb.update(updateParams).promise();
+
+    // Handle notifications if requested
+    if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
+      try {
+        const updatedPlan = result.Attributes;
+        if (!updatedPlan) {
+          console.error("Updated plan not found in result");
+        } else {
+          const phase = updatedPlan.phases?.find((p: any) => p.id === phaseId);
+          const workItem = phase?.workItems?.find((item: any) => item.id === workItemId);
+        
+        const recipients: string[] = [];
+        
+        // Collect recipients based on preferences
+        if (notifications.notifyUser && updatedPlan.userId) {
+          try {
+            const user = await userDb.getUserById(updatedPlan.userId);
+            if (user?.email) {
+              recipients.push(user.email);
+            }
+          } catch (err) {
+            console.error("Error fetching user for notification:", err);
+          }
+        }
+        
+        if (notifications.notifyPlanPoc && updatedPlan.dri) {
+          recipients.push(updatedPlan.dri);
+        }
+        
+        if (notifications.notifyPhasePoc && phase?.dri) {
+          recipients.push(phase.dri);
+        }
+        
+        if (notifications.notifyItemPoc && workItem?.dri) {
+          recipients.push(workItem.dri);
+        }
+        
+        // Remove duplicates
+        const uniqueRecipients = Array.from(new Set(recipients));
+        
+        if (uniqueRecipients.length > 0) {
+          // Determine what was changed
+          const changeDescription = [];
+          if (status !== undefined) changeDescription.push(`Status changed to: ${status}`);
+          if (notes !== undefined) changeDescription.push(`Notes updated`);
+          if (dri !== undefined) changeDescription.push(`PoC ${dri ? `assigned to: ${dri}` : 'removed'}`);
+          
+          const changeText = changeDescription.length > 0 
+            ? changeDescription.join(", ")
+            : "Work item updated";
+          
+          // Get updated notes if they were changed
+          const updatedNotes = notes !== undefined ? workItem?.notes : null;
+          
+          // Get optional message from notifications
+          const customMessage = notifications?.message && notifications.message.trim() ? notifications.message.trim() : null;
+          
+          // Get customer portal URL
+          const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+          const gtmPlanUrl = `${customerFrontendUrl}/gtm-plan`;
+          
+          const subject = `GTM Plan Update: ${updatedPlan.title}`;
+          const html = `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #333;">GTM Plan Update Notification</h2>
+              <p>Hello,</p>
+              <p>This is to notify you that a work item in the GTM Plan "<strong>${updatedPlan.title}</strong>" has been updated.</p>
+              <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
+                <p style="margin: 0;"><strong>Plan:</strong> ${updatedPlan.title}</p>
+                ${phase ? `<p style="margin: 5px 0;"><strong>Phase:</strong> ${phase.title}</p>` : ''}
+                ${workItem ? `<p style="margin: 5px 0;"><strong>Work Item:</strong> ${workItem.title}</p>` : ''}
+                <p style="margin: 5px 0;"><strong>Change:</strong> ${changeText}</p>
+              </div>
+              ${updatedNotes ? `
+              <div style="background-color: #fff9e6; padding: 15px; border-left: 4px solid #ffc107; margin: 20px 0; border-radius: 4px;">
+                <p style="margin: 0; font-weight: 600; color: #f57c00;">Updated Notes:</p>
+                <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${updatedNotes.replace(/\n/g, '<br>')}</p>
+              </div>
+              ` : ''}
+              ${customMessage ? `
+              <div style="background-color: #e3f2fd; padding: 15px; border-left: 4px solid #2196f3; margin: 20px 0; border-radius: 4px;">
+                <p style="margin: 0; font-weight: 600; color: #1976d2;">Additional Message:</p>
+                <p style="margin: 10px 0 0 0; white-space: pre-wrap;">${customMessage.replace(/\n/g, '<br>')}</p>
+              </div>
+              ` : ''}
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="${gtmPlanUrl}" style="display: inline-block; background-color: #643B7E; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; font-weight: 600;">View GTM Plan</a>
+              </div>
+              <p style="color: #666; font-size: 12px; margin-top: 30px;">This is an automated notification from AgentWeb.</p>
+            </div>
+          `;
+          
+          const text = `
+GTM Plan Update Notification
+
+Hello,
+
+This is to notify you that a work item in the GTM Plan "${updatedPlan.title}" has been updated.
+
+Plan: ${updatedPlan.title}
+${phase ? `Phase: ${phase.title}\n` : ''}${workItem ? `Work Item: ${workItem.title}\n` : ''}Change: ${changeText}
+${updatedNotes ? `\nUpdated Notes:\n${updatedNotes}\n` : ''}${customMessage ? `\nAdditional Message:\n${customMessage}\n` : ''}
+View your GTM Plan: ${gtmPlanUrl}
+
+This is an automated notification from AgentWeb.
+          `.trim();
+          
+          // Send emails to all recipients using system email
+          for (const recipient of uniqueRecipients) {
+            try {
+              await resendService.sendSystemEmail({
+                to: recipient,
+                subject,
+                html,
+                text,
+              });
+              console.log(`GTM Plan update notification sent to ${recipient}`);
+            } catch (emailError: any) {
+              console.error(`Failed to send notification to ${recipient}:`, emailError);
+              // Don't fail the entire request if email fails
+            }
+          }
+        }
+        }
+      } catch (notificationError: any) {
+        console.error("Error sending notifications:", notificationError);
+        // Don't fail the request if notifications fail
+      }
+    }
 
     return res.json({
       success: true,
