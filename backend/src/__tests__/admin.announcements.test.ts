@@ -37,7 +37,15 @@ describe('Admin Announcements', () => {
     jest.clearAllMocks();
     
     // Default mock implementations
+    // sendSystemEmail internally calls sendEmail with the correct from address
     (mockResendService as any).sendEmail = jest.fn().mockResolvedValue({ id: 'test-email-id' });
+    (mockResendService as any).sendSystemEmail = jest.fn().mockImplementation(async (params: any) => {
+      // Simulate what sendSystemEmail does: call sendEmail with from field set
+      return (mockResendService as any).sendEmail({
+        from: 'AgentWeb <no-reply@updates.agentweb.pro>',
+        ...params
+      });
+    });
     (mockUserDb as any).getAllUsers = jest.fn().mockResolvedValue([
       { userId: 'user1', email: 'user1@example.com', isActive: true },
       { userId: 'user2', email: 'user2@example.com', isActive: true },
@@ -59,14 +67,22 @@ describe('Admin Announcements', () => {
       expect(response.body.details.total).toBe(2); // Only active users
       expect(response.body.details.successful).toBe(2);
 
-      // Verify resendService.sendEmail was called with message directly (no wrapper) and correct from address
-      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
-      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
-        from: 'no-reply@updates.agentweb.pro',
+      // Verify resendService.sendSystemEmail was called (which internally calls sendEmail with correct from)
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledWith({
         to: 'user1@example.com',
         subject: title,
         text: expect.stringContaining('This is a test message'), // Plain text version
         html: message // HTML version - used directly without wrapper
+      });
+      // Verify sendEmail was called with correct from address
+      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
+        from: 'AgentWeb <no-reply@updates.agentweb.pro>',
+        to: 'user1@example.com',
+        subject: title,
+        text: expect.stringContaining('This is a test message'),
+        html: message
       });
     });
 
@@ -92,6 +108,12 @@ describe('Admin Announcements', () => {
       (mockResendService as any).sendEmail = jest.fn()
         .mockRejectedValueOnce(new Error('Email failed'))
         .mockResolvedValueOnce({ id: 'test-email-id' });
+      (mockResendService as any).sendSystemEmail = jest.fn().mockImplementation(async (params: any) => {
+        return (mockResendService as any).sendEmail({
+          from: 'AgentWeb <no-reply@updates.agentweb.pro>',
+          ...params
+        });
+      });
 
       const response = await request(app)
         .post('/api/admin/announcements/send')
@@ -140,21 +162,28 @@ describe('Admin Announcements', () => {
       expect(response.body.details.total).toBe(2);
       expect(response.body.details.successful).toBe(2);
 
-      // Verify resendService.sendEmail was called with [TEST] prefix, test banner, and correct from address
-      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
-      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
-        from: 'no-reply@updates.agentweb.pro',
+      // Verify resendService.sendSystemEmail was called (which internally calls sendEmail with correct from)
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledWith({
         to: 'test1@example.com',
         subject: '[TEST] Test Announcement',
         text: expect.stringContaining('This is a test message'), // Plain text version
         html: expect.stringContaining('🧪 TEST EMAIL - This is a test announcement') // Test banner
       });
-      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
-        from: 'no-reply@updates.agentweb.pro',
-        to: 'test1@example.com',
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledWith({
+        to: 'test2@example.com',
         subject: '[TEST] Test Announcement',
         text: expect.any(String),
         html: expect.stringMatching(/<div style="background-color: #ff9800.*TEST EMAIL.*<\/div>.*<p>This is a test message<\/p>/s)
+      });
+      // Verify sendEmail was called with correct from address
+      expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
+      expect(mockResendService.sendEmail).toHaveBeenCalledWith({
+        from: 'AgentWeb <no-reply@updates.agentweb.pro>',
+        to: 'test1@example.com',
+        subject: '[TEST] Test Announcement',
+        text: expect.stringContaining('This is a test message'),
+        html: expect.stringContaining('🧪 TEST EMAIL - This is a test announcement')
       });
     });
 
@@ -219,6 +248,7 @@ describe('Admin Announcements', () => {
 
       expect(response.body.details.total).toBe(2); // Only valid emails
       expect(response.body.details.invalidEmails).toContain('invalid-email');
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
       expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
     });
 
@@ -246,9 +276,17 @@ describe('Admin Announcements', () => {
         .expect(200);
 
       expect(response.body.details.total).toBe(2);
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'valid@example.com', // Trimmed
+          subject: expect.any(String),
+          text: expect.any(String),
+          html: expect.any(String)
+        })
+      );
       expect(mockResendService.sendEmail).toHaveBeenCalledWith(
         expect.objectContaining({
-          from: 'no-reply@updates.agentweb.pro',
+          from: 'AgentWeb <no-reply@updates.agentweb.pro>',
           to: 'valid@example.com', // Trimmed
           subject: expect.any(String),
           text: expect.any(String),
@@ -261,6 +299,12 @@ describe('Admin Announcements', () => {
       (mockResendService as any).sendEmail = jest.fn()
         .mockRejectedValueOnce(new Error('Email failed'))
         .mockResolvedValueOnce({ id: 'test-email-id' });
+      (mockResendService as any).sendSystemEmail = jest.fn().mockImplementation(async (params: any) => {
+        return (mockResendService as any).sendEmail({
+          from: 'AgentWeb <no-reply@updates.agentweb.pro>',
+          ...params
+        });
+      });
 
       const response = await request(app)
         .post('/api/admin/announcements/test')

@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-12',
+    changes: [
+      'Improved GTM Plan page with due date management, notifications, and enhanced editing',
+      '- Added due date support for plans, phases, and work items with visual indicators (yellow for 3 days or less, red for overdue)',
+      '- Added notification with role-based selection (Plan Owner, Plan PoC, Phase PoC, Work Item PoC)',
+    ],
+  },
+  {
     date: '2026-01-09',
     changes: [
       'Improved error handling in Agent Mode',
