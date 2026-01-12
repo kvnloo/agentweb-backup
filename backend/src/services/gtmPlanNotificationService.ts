@@ -44,6 +44,7 @@ interface UpdateChanges {
   status?: string;
   notes?: string;
   dri?: string;
+  dueDate?: string | null;
 }
 
 /**
@@ -121,6 +122,21 @@ export async function sendGTMPlanUpdateNotifications(
     if (changes.dri !== undefined) {
       changeDescription.push(`PoC ${changes.dri ? `assigned to: ${changes.dri}` : 'removed'}`);
     }
+    if (changes.dueDate !== undefined) {
+      if (changes.dueDate) {
+        // Format the due date nicely
+        const [year, month, day] = changes.dueDate.split('-').map(Number);
+        const dueDateObj = new Date(year, month - 1, day);
+        const formattedDate = dueDateObj.toLocaleDateString('en-US', { 
+          year: 'numeric', 
+          month: 'long', 
+          day: 'numeric' 
+        });
+        changeDescription.push(`Due date set to: ${formattedDate}`);
+      } else {
+        changeDescription.push(`Due date removed`);
+      }
+    }
 
     const changeText = changeDescription.length > 0
       ? changeDescription.join(", ")
@@ -192,7 +208,6 @@ This is an automated notification from AgentWeb.
           html,
           text,
         });
-        console.log(`GTM Plan update notification sent to ${recipient}`);
       } catch (emailError: any) {
         console.error(`Failed to send notification to ${recipient}:`, emailError);
         // Don't fail the entire request if email fails

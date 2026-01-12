@@ -40,11 +40,16 @@ import {
   Edit as EditIcon,
   Person as PersonIcon,
   CheckCircle as CheckCircleIcon,
+  CalendarToday as CalendarTodayIcon,
+  Warning as WarningIcon,
+  Error as ErrorIcon,
 } from "@mui/icons-material";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
+import toast from "react-hot-toast";
 
 interface WorkItem {
   id: string;
@@ -54,6 +59,7 @@ interface WorkItem {
   dri?: string;
   status: "pending" | "completed" | "skipped";
   notes?: string;
+  dueDate?: string;
 }
 
 interface Phase {
@@ -64,6 +70,7 @@ interface Phase {
   dri?: string;
   status: "in_progress" | "completed";
   workItems: WorkItem[];
+  dueDate?: string;
 }
 
 interface GTMPlan {
@@ -79,6 +86,7 @@ interface GTMPlan {
   completedAt?: string;
   userEmail?: string;
   userName?: string;
+  dueDate?: string;
 }
 
 export default function GTMPlans() {
@@ -90,7 +98,7 @@ export default function GTMPlans() {
     planId: string;
     phaseId?: string;
     workItemId?: string;
-    field: "status" | "notes" | "dri" | "statusAndNotes";
+    field: "status" | "notes" | "dri" | "statusAndNotes" | "dueDate";
     value: any;
     type: "plan" | "phase" | "workItem";
   } | null>(null);
@@ -98,7 +106,14 @@ export default function GTMPlans() {
   const [editValue, setEditValue] = useState("");
   const [editStatus, setEditStatus] = useState("");
   const [editNotes, setEditNotes] = useState("");
+  const [editDueDate, setEditDueDate] = useState<string>("");
+  const [editDueDateValue, setEditDueDateValue] = useState<Date | null>(null);
   const [saving, setSaving] = useState(false);
+  const [constraintDialogOpen, setConstraintDialogOpen] = useState(false);
+  const [constraintMessage, setConstraintMessage] = useState("");
+  const [pendingConstraintUpdate, setPendingConstraintUpdate] = useState<{
+    updateFn: () => Promise<void>;
+  } | null>(null);
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
   const [notificationOptions, setNotificationOptions] = useState<{
     notifyUser: boolean;
@@ -159,12 +174,13 @@ export default function GTMPlans() {
   const handleEditClick = (
     planId: string,
     type: "plan" | "phase" | "workItem",
-    field: "status" | "notes" | "dri" | "statusAndNotes",
+    field: "status" | "notes" | "dri" | "statusAndNotes" | "dueDate",
     phaseId?: string,
     workItemId?: string,
     currentValue?: any,
     currentStatus?: string,
-    currentNotes?: string
+    currentNotes?: string,
+    currentDueDate?: string
   ) => {
     setEditingItem({ planId, phaseId, workItemId, field, value: currentValue, type });
     
@@ -172,10 +188,26 @@ export default function GTMPlans() {
       setEditStatus(currentStatus || "");
       setEditNotes(currentNotes || "");
       setEditValue(""); // Not used for this mode
+      setEditDueDate("");
+      setEditDueDateValue(null);
+    } else if (field === "dueDate") {
+      const dateStr = currentDueDate || "";
+      setEditDueDate(dateStr);
+      if (dateStr) {
+        const [year, month, day] = dateStr.split('-').map(Number);
+        setEditDueDateValue(new Date(year, month - 1, day));
+      } else {
+        setEditDueDateValue(null);
+      }
+      setEditValue("");
+      setEditStatus("");
+      setEditNotes("");
     } else {
       setEditValue(currentValue || "");
       setEditStatus("");
       setEditNotes("");
+      setEditDueDate("");
+      setEditDueDateValue(null);
     }
     
     setEditDialogOpen(true);
@@ -184,15 +216,47 @@ export default function GTMPlans() {
   const handleSave = () => {
     if (!editingItem) return;
 
-    // Handle plan-level PoC updates (no notifications needed)
-    if (editingItem.type === "plan" && editingItem.field === "dri") {
-      performPlanUpdate(editingItem.planId, { dri: editValue || null });
+    // Handle plan-level updates (no notifications needed)
+    if (editingItem.type === "plan") {
+      if (editingItem.field === "dri") {
+        performPlanUpdate(editingItem.planId, { dri: editValue || null });
+      } else if (editingItem.field === "dueDate") {
+        // Check constraints before saving
+        if (editDueDateValue) {
+          const constraintMsg = checkDateConstraints(editDueDateValue, "plan", editingItem.planId);
+          if (constraintMsg) {
+            setConstraintMessage(constraintMsg);
+            setPendingConstraintUpdate({
+              updateFn: () => performPlanUpdate(editingItem.planId, { dueDate: editDueDate || null }, editDueDateValue),
+            });
+            setConstraintDialogOpen(true);
+            return;
+          }
+        }
+        performPlanUpdate(editingItem.planId, { dueDate: editDueDate || null }, editDueDateValue);
+      }
       return;
     }
 
-    // Handle phase-level PoC updates (no notifications needed)
-    if (editingItem.type === "phase" && editingItem.field === "dri" && editingItem.phaseId) {
-      performPhaseUpdate(editingItem.planId, editingItem.phaseId, { dri: editValue || null });
+    // Handle phase-level updates (no notifications needed)
+    if (editingItem.type === "phase" && editingItem.phaseId) {
+      if (editingItem.field === "dri") {
+        performPhaseUpdate(editingItem.planId, editingItem.phaseId, { dri: editValue || null });
+      } else if (editingItem.field === "dueDate") {
+        // Check constraints before saving
+        if (editDueDateValue) {
+          const constraintMsg = checkDateConstraints(editDueDateValue, "phase", editingItem.planId, editingItem.phaseId);
+          if (constraintMsg) {
+            setConstraintMessage(constraintMsg);
+            setPendingConstraintUpdate({
+              updateFn: () => performPhaseUpdate(editingItem.planId, editingItem.phaseId!, { dueDate: editDueDate || null }, editDueDateValue),
+            });
+            setConstraintDialogOpen(true);
+            return;
+          }
+        }
+        performPhaseUpdate(editingItem.planId, editingItem.phaseId, { dueDate: editDueDate || null }, editDueDateValue);
+      }
       return;
     }
 
@@ -203,6 +267,58 @@ export default function GTMPlans() {
       // Handle both status and notes together
       updateData.status = editStatus;
       updateData.notes = editNotes || null;
+    } else if (editingItem.field === "dueDate") {
+      // Check constraints before saving
+      if (editDueDateValue) {
+        const constraintMsg = checkDateConstraints(
+          editDueDateValue,
+          "workItem",
+          editingItem.planId,
+          editingItem.phaseId,
+          editingItem.workItemId
+        );
+        if (constraintMsg) {
+          setConstraintMessage(constraintMsg);
+          setPendingConstraintUpdate({
+            updateFn: async () => {
+              // After constraint confirmation, proceed with normal update flow
+              const updateData: any = { dueDate: editDueDate || null };
+              // Find the plan, phase, and work item to get PoCs
+              const plan = plans.find((p) => p.planId === editingItem.planId);
+              if (!plan) return;
+              const phase = plan.phases?.find((p) => p.id === editingItem.phaseId);
+              if (!phase) return;
+              const workItem = phase.workItems?.find((item) => item.id === editingItem.workItemId);
+              if (!workItem) return;
+              
+              // Check if there are any PoCs or user to notify
+              const itemPoc = workItem.dri;
+              const phasePoc = phase.dri;
+              const planPoc = plan.dri;
+              const hasPocs = !!(itemPoc || phasePoc || planPoc);
+              const hasUser = !!(plan.userEmail);
+              
+              // If there's nothing to notify, proceed directly
+              if (!hasPocs && !hasUser) {
+                await performUpdate(updateData, editingItem.planId, editingItem.phaseId!, editingItem.workItemId!);
+              } else {
+                // Store pending update and show confirmation dialog
+                setPendingUpdate({
+                  updateData,
+                  planId: editingItem.planId,
+                  phaseId: editingItem.phaseId!,
+                  workItemId: editingItem.workItemId!,
+                });
+                setConfirmDialogOpen(true);
+              }
+            },
+          });
+          setConstraintDialogOpen(true);
+          return;
+        }
+      }
+      // No constraint violation, proceed with normal update flow
+      updateData.dueDate = editDueDate || null;
     } else {
       // Handle single field updates
       updateData[editingItem.field] = editingItem.field === "status" ? editValue : editValue || null;
@@ -245,7 +361,8 @@ export default function GTMPlans() {
 
   const performPlanUpdate = async (
     planId: string,
-    updateData: { dri?: string | null }
+    updateData: { dri?: string | null; dueDate?: string | null },
+    dueDateValue?: Date | null
   ) => {
     try {
       setSaving(true);
@@ -282,6 +399,8 @@ export default function GTMPlans() {
       setEditDialogOpen(false);
       setEditingItem(null);
       setEditValue("");
+      setEditDueDate("");
+      setEditDueDateValue(null);
     } catch (err: any) {
       console.error("Error updating plan:", err);
       setError(err.response?.data?.error || "Failed to update plan");
@@ -293,7 +412,8 @@ export default function GTMPlans() {
   const performPhaseUpdate = async (
     planId: string,
     phaseId: string,
-    updateData: { dri?: string | null }
+    updateData: { dri?: string | null; dueDate?: string | null },
+    dueDateValue?: Date | null
   ) => {
     try {
       setSaving(true);
@@ -330,6 +450,8 @@ export default function GTMPlans() {
       setEditDialogOpen(false);
       setEditingItem(null);
       setEditValue("");
+      setEditDueDate("");
+      setEditDueDateValue(null);
     } catch (err: any) {
       console.error("Error updating phase:", err);
       setError(err.response?.data?.error || "Failed to update phase");
@@ -397,6 +519,8 @@ export default function GTMPlans() {
       setEditValue("");
       setEditStatus("");
       setEditNotes("");
+      setEditDueDate("");
+      setEditDueDateValue(null);
       setNotificationMessage("");
       setPendingUpdate(null);
     } catch (err: any) {
@@ -427,12 +551,34 @@ export default function GTMPlans() {
     setNotificationMessage("");
   };
 
+  const handleConstraintConfirm = async () => {
+    if (pendingConstraintUpdate) {
+      await pendingConstraintUpdate.updateFn();
+    }
+    setConstraintDialogOpen(false);
+    setPendingConstraintUpdate(null);
+    setConstraintMessage("");
+  };
+
+  const handleConstraintCancel = () => {
+    setConstraintDialogOpen(false);
+    setPendingConstraintUpdate(null);
+    setConstraintMessage("");
+    // Reset the edit dialog state
+    setEditDialogOpen(false);
+    setEditingItem(null);
+    setEditValue("");
+    setEditDueDate("");
+    setEditDueDateValue(null);
+  };
+
   const handleCancel = () => {
     setEditDialogOpen(false);
     setEditingItem(null);
     setEditValue("");
     setEditStatus("");
     setEditNotes("");
+    setEditDueDate("");
   };
 
   const getStatusColor = (status: string) => {
@@ -448,6 +594,158 @@ export default function GTMPlans() {
       default:
         return "default";
     }
+  };
+
+  const getDueDateStatus = (
+    dueDate?: string,
+    itemStatus?: string,
+    itemType?: "plan" | "phase" | "workItem"
+  ): "overdue" | "warning" | "ok" | null => {
+    if (!dueDate) return null;
+    
+    // Only show color difference based on status
+    // If status or type is not provided, don't show colors (safety check)
+    if (!itemStatus || !itemType) {
+      return null;
+    }
+    
+    // Only show warning/overdue colors for active items
+    if (itemType === "workItem") {
+      if (itemStatus !== "pending") {
+        return null; // Don't show warning/overdue for completed or skipped items
+      }
+    } else if (itemType === "plan" || itemType === "phase") {
+      if (itemStatus !== "in_progress") {
+        return null; // Don't show warning/overdue for completed plans/phases
+      }
+    }
+    
+    // Parse date as local date (YYYY-MM-DD format)
+    const [year, month, day] = dueDate.split('-').map(Number);
+    const due = new Date(year, month - 1, day);
+    due.setHours(0, 0, 0, 0);
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const diffTime = due.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays < 0) {
+      return "overdue"; // Past due - red
+    } else if (diffDays === 0) {
+      return "overdue"; // Due today - red
+    } else if (diffDays <= 3) {
+      return "warning"; // 3 days or less before due - yellow
+    }
+    
+    return "ok"; // More than 3 days away - no warning
+  };
+
+  const checkDateConstraints = (
+    date: Date,
+    type: "plan" | "phase" | "workItem",
+    planId: string,
+    phaseId?: string,
+    workItemId?: string
+  ): string | null => {
+    const plan = plans.find((p) => p.planId === planId);
+    if (!plan) return null;
+
+    let warningMessage = "";
+
+    if (type === "workItem") {
+      // Work item due date should not be after phase due date
+      const phase = plan.phases?.find((p) => p.id === phaseId);
+      if (phase?.dueDate) {
+        const [year, month, day] = phase.dueDate.split('-').map(Number);
+        const phaseDueDate = new Date(year, month - 1, day);
+        phaseDueDate.setHours(23, 59, 59, 999);
+        if (date > phaseDueDate) {
+          warningMessage = `Warning: Work item due date (${format(date, "MMM d, yyyy")}) is after phase due date (${format(phaseDueDate, "MMM d, yyyy")})`;
+        }
+      }
+      // Also check plan due date if phase doesn't have one
+      if (!warningMessage && plan.dueDate) {
+        const [year, month, day] = plan.dueDate.split('-').map(Number);
+        const planDueDate = new Date(year, month - 1, day);
+        planDueDate.setHours(23, 59, 59, 999);
+        if (date > planDueDate) {
+          warningMessage = `Warning: Work item due date (${format(date, "MMM d, yyyy")}) is after plan due date (${format(planDueDate, "MMM d, yyyy")})`;
+        }
+      }
+    } else if (type === "phase") {
+      // Phase due date should not be after plan due date
+      if (plan.dueDate) {
+        const [year, month, day] = plan.dueDate.split('-').map(Number);
+        const planDueDate = new Date(year, month - 1, day);
+        planDueDate.setHours(23, 59, 59, 999);
+        if (date > planDueDate) {
+          warningMessage = `Warning: Phase due date (${format(date, "MMM d, yyyy")}) is after plan due date (${format(planDueDate, "MMM d, yyyy")})`;
+        }
+      }
+      // Phase due date should not be before work item due dates
+      const phase = plan.phases?.find((p) => p.id === phaseId);
+      if (phase?.workItems) {
+        for (const item of phase.workItems) {
+          if (item.dueDate) {
+            const [itemYear, itemMonth, itemDay] = item.dueDate.split('-').map(Number);
+            const itemDueDate = new Date(itemYear, itemMonth - 1, itemDay);
+            itemDueDate.setHours(0, 0, 0, 0);
+            if (date < itemDueDate) {
+              warningMessage = `Warning: Phase due date (${format(date, "MMM d, yyyy")}) is before work item due date (${format(itemDueDate, "MMM d, yyyy")} for item "${item.title}")`;
+              break;
+            }
+          }
+        }
+      }
+    } else if (type === "plan") {
+      // Plan due date should not be before phase or work item due dates
+      for (const phase of plan.phases || []) {
+        if (phase.dueDate) {
+          const [year, month, day] = phase.dueDate.split('-').map(Number);
+          const phaseDueDate = new Date(year, month - 1, day);
+          phaseDueDate.setHours(0, 0, 0, 0);
+          if (date < phaseDueDate) {
+            warningMessage = `Warning: Plan due date (${format(date, "MMM d, yyyy")}) is before phase due date (${format(phaseDueDate, "MMM d, yyyy")} for phase "${phase.title}")`;
+            break;
+          }
+        }
+        // Check work items
+        if (!warningMessage && phase.workItems) {
+          for (const item of phase.workItems) {
+            if (item.dueDate) {
+              const [itemYear, itemMonth, itemDay] = item.dueDate.split('-').map(Number);
+              const itemDueDate = new Date(itemYear, itemMonth - 1, itemDay);
+              itemDueDate.setHours(0, 0, 0, 0);
+              if (date < itemDueDate) {
+                warningMessage = `Warning: Plan due date (${format(date, "MMM d, yyyy")}) is before work item due date (${format(itemDueDate, "MMM d, yyyy")} for item "${item.title}" in phase "${phase.title}")`;
+                break;
+              }
+            }
+          }
+        }
+        if (warningMessage) break;
+      }
+    }
+
+    return warningMessage || null;
+  };
+
+  const getDueDateIcon = (
+    dueDate?: string,
+    itemStatus?: string,
+    itemType?: "plan" | "phase" | "workItem"
+  ) => {
+    const status = getDueDateStatus(dueDate, itemStatus, itemType);
+    if (status === "overdue") {
+      return <ErrorIcon fontSize="small" sx={{ color: "error.main" }} />;
+    } else if (status === "warning") {
+      return <WarningIcon fontSize="small" sx={{ color: "warning.main" }} />;
+    } else if (dueDate) {
+      return <CalendarTodayIcon fontSize="small" />;
+    }
+    return undefined;
   };
 
   if (loading) {
@@ -485,7 +783,7 @@ export default function GTMPlans() {
             <Paper key={plan.planId} sx={{ p: 2 }}>
               <Box sx={{ mb: 2 }}>
                 <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", mb: 1 }}>
-                  <Box>
+                  <Box sx={{ flex: 1 }}>
                     <Typography variant="h6" component="h2">
                       {plan.title}
                     </Typography>
@@ -518,16 +816,26 @@ export default function GTMPlans() {
                           variant="outlined"
                         />
                       )}
-                      <Tooltip title="Assign Plan PoC">
-                        <IconButton
-                          size="small"
-                          onClick={() =>
-                            handleEditClick(plan.planId, "plan", "dri", undefined, undefined, plan.dri)
-                          }
-                        >
-                          <PersonIcon fontSize="small" />
-                        </IconButton>
-                      </Tooltip>
+                      {plan.dueDate && (() => {
+                        const [year, month, day] = plan.dueDate.split('-').map(Number);
+                        const dueDateLocal = new Date(year, month - 1, day);
+                        const dueDateStatus = getDueDateStatus(plan.dueDate, plan.status, "plan");
+                        return (
+                          <Chip
+                            icon={getDueDateIcon(plan.dueDate, plan.status, "plan")}
+                            label={format(dueDateLocal, "MMM d, yyyy")}
+                            size="small"
+                            variant="outlined"
+                            color={
+                              dueDateStatus === "overdue"
+                                ? "error"
+                                : dueDateStatus === "warning"
+                                ? "warning"
+                                : "default"
+                            }
+                          />
+                        );
+                      })()}
                       <Chip
                         label={`Created: ${format(new Date(plan.createdAt), "MMM d, yyyy")}`}
                         size="small"
@@ -542,6 +850,28 @@ export default function GTMPlans() {
                         />
                       )}
                     </Box>
+                  </Box>
+                  <Box sx={{ display: "flex", gap: 0.5, ml: 2 }}>
+                    <Tooltip title="Assign Plan PoC">
+                      <IconButton
+                        size="small"
+                        onClick={() =>
+                          handleEditClick(plan.planId, "plan", "dri", undefined, undefined, plan.dri)
+                        }
+                      >
+                        <PersonIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title="Set Plan Due Date">
+                      <IconButton
+                        size="small"
+                        onClick={() =>
+                          handleEditClick(plan.planId, "plan", "dueDate", undefined, undefined, undefined, undefined, undefined, plan.dueDate)
+                        }
+                      >
+                        <CalendarTodayIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
                   </Box>
                 </Box>
               </Box>
@@ -568,17 +898,62 @@ export default function GTMPlans() {
                               variant="outlined"
                             />
                           )}
-                          <Tooltip title="Assign Phase PoC">
-                            <IconButton
-                              size="small"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleEditClick(plan.planId, "phase", "dri", phase.id, undefined, phase.dri);
-                              }}
-                            >
-                              <PersonIcon fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
+                          {phase.dueDate && (() => {
+                            const [year, month, day] = phase.dueDate.split('-').map(Number);
+                            const dueDateLocal = new Date(year, month - 1, day);
+                            const dueDateStatus = getDueDateStatus(phase.dueDate, phase.status, "phase");
+                            const dueDateIcon = getDueDateIcon(phase.dueDate, phase.status, "phase");
+                            return (
+                              <Chip
+                                {...(dueDateIcon && { icon: dueDateIcon })}
+                                label={format(dueDateLocal, "MMM d, yyyy")}
+                                size="small"
+                                variant="outlined"
+                                color={
+                                  dueDateStatus === "overdue"
+                                    ? "error"
+                                    : dueDateStatus === "warning"
+                                    ? "warning"
+                                    : "default"
+                                }
+                              />
+                            );
+                          })()}
+                          <Box
+                            component="div"
+                            sx={{ display: "flex", alignItems: "center", gap: 0.5 }}
+                            onClick={(e) => e.stopPropagation()}
+                            onMouseDown={(e) => e.stopPropagation()}
+                          >
+                            <Tooltip title="Assign Phase PoC">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleEditClick(plan.planId, "phase", "dri", phase.id, undefined, phase.dri);
+                                  }}
+                                  onMouseDown={(e) => e.stopPropagation()}
+                                >
+                                  <PersonIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                            <Tooltip title="Set Phase Due Date">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleEditClick(plan.planId, "phase", "dueDate", phase.id, undefined, undefined, undefined, undefined, phase.dueDate);
+                                  }}
+                                  onMouseDown={(e) => e.stopPropagation()}
+                                >
+                                  <CalendarTodayIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                          </Box>
                         </Box>
                       </AccordionSummary>
                       <AccordionDetails>
@@ -594,6 +969,7 @@ export default function GTMPlans() {
                                 <TableRow>
                                   <TableCell>Title</TableCell>
                                   <TableCell>Status</TableCell>
+                                  <TableCell>Due Date</TableCell>
                                   <TableCell>PoC</TableCell>
                                   <TableCell>Notes</TableCell>
                                   <TableCell align="right">Actions</TableCell>
@@ -618,6 +994,33 @@ export default function GTMPlans() {
                                         color={getStatusColor(item.status) as any}
                                         size="small"
                                       />
+                                    </TableCell>
+                                    <TableCell>
+                                      {item.dueDate ? (() => {
+                                        const [year, month, day] = item.dueDate.split('-').map(Number);
+                                        const dueDateLocal = new Date(year, month - 1, day);
+                                        const dueDateStatus = getDueDateStatus(item.dueDate, item.status, "workItem");
+                                        const dueDateIcon = getDueDateIcon(item.dueDate, item.status, "workItem");
+                                        return (
+                                          <Chip
+                                            {...(dueDateIcon && { icon: dueDateIcon })}
+                                            label={format(dueDateLocal, "MMM d, yyyy")}
+                                            size="small"
+                                            variant="outlined"
+                                            color={
+                                              dueDateStatus === "overdue"
+                                                ? "error"
+                                                : dueDateStatus === "warning"
+                                                ? "warning"
+                                                : "default"
+                                            }
+                                          />
+                                        );
+                                      })() : (
+                                        <Typography variant="body2" color="text.secondary">
+                                          -
+                                        </Typography>
+                                      )}
                                     </TableCell>
                                     <TableCell>
                                       {item.dri ? (
@@ -664,6 +1067,16 @@ export default function GTMPlans() {
                                             }
                                           >
                                             <PersonIcon fontSize="small" />
+                                          </IconButton>
+                                        </Tooltip>
+                                        <Tooltip title="Set Due Date">
+                                          <IconButton
+                                            size="small"
+                                            onClick={() =>
+                                              handleEditClick(plan.planId, "workItem", "dueDate", phase.id, item.id, undefined, undefined, undefined, item.dueDate)
+                                            }
+                                          >
+                                            <CalendarTodayIcon fontSize="small" />
                                           </IconButton>
                                         </Tooltip>
                                       </Box>
@@ -753,6 +1166,39 @@ export default function GTMPlans() {
               sx={{ mt: 2 }}
               placeholder="Enter notes about this work item..."
             />
+          ) : editingItem?.field === "dueDate" ? (
+            <Box sx={{ mt: 2 }}>
+              <DatePicker
+                label={
+                  editingItem?.type === "plan"
+                    ? "Plan Due Date"
+                    : editingItem?.type === "phase"
+                    ? "Phase Due Date"
+                    : "Work Item Due Date"
+                }
+                value={editDueDateValue}
+                onChange={(newValue) => {
+                  if (newValue) {
+                    const year = newValue.getFullYear();
+                    const month = String(newValue.getMonth() + 1).padStart(2, '0');
+                    const day = String(newValue.getDate()).padStart(2, '0');
+                    const dateStr = `${year}-${month}-${day}`;
+                    setEditDueDate(dateStr);
+                    setEditDueDateValue(newValue);
+                    // Don't show warning on date selection - will show after save
+                  } else {
+                    setEditDueDate("");
+                    setEditDueDateValue(null);
+                  }
+                }}
+                slotProps={{
+                  textField: {
+                    fullWidth: true,
+                    helperText: "Click the calendar icon to pick a date. Leave empty to remove the due date.",
+                  },
+                }}
+              />
+            </Box>
           ) : (
             <TextField
               fullWidth
@@ -931,6 +1377,34 @@ export default function GTMPlans() {
           </Button>
           <Button onClick={handleConfirmSave} variant="contained" disabled={saving}>
             {saving ? <CircularProgress size={20} /> : "Confirm & Update"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={constraintDialogOpen} onClose={handleConstraintCancel} maxWidth="sm" fullWidth>
+        <DialogTitle>Date Constraint Warning</DialogTitle>
+        <DialogContent>
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            {constraintMessage}
+          </Alert>
+          <Typography variant="body2">
+            This date violates the constraint that:
+          </Typography>
+          <Typography variant="body2" component="ul" sx={{ mt: 1, pl: 2 }}>
+            <li>Work item due dates should not be after phase due dates</li>
+            <li>Phase due dates should not be after plan due dates</li>
+            <li>Plan due dates should not be before phase or work item due dates</li>
+          </Typography>
+          <Typography variant="body2" sx={{ mt: 2 }}>
+            Do you want to proceed with this update anyway?
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleConstraintCancel} disabled={saving}>
+            Cancel
+          </Button>
+          <Button onClick={handleConstraintConfirm} variant="contained" color="warning" disabled={saving}>
+            {saving ? <CircularProgress size={20} /> : "Proceed Anyway"}
           </Button>
         </DialogActions>
       </Dialog>

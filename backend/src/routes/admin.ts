@@ -2136,7 +2136,7 @@ router.get("/gtm-plans", async (req, res) => {
 router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (req, res) => {
   try {
     const { planId, phaseId, workItemId } = req.params;
-    const { status, notes, dri, notifications } = req.body;
+    const { status, notes, dri, dueDate, notifications } = req.body;
 
     const dynamodb = new DynamoDB.DocumentClient({
       region: process.env.AWS_REGION || "us-west-2",
@@ -2192,12 +2192,16 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       });
     }
 
+    // Store original item BEFORE updating (for change tracking)
+    const originalItem = { ...workItems[workItemIndex] };
+
     // Update the work item
     const updatedWorkItem = {
       ...workItems[workItemIndex],
       ...(status !== undefined && { status }),
       ...(notes !== undefined && { notes }),
       ...(dri !== undefined && { dri: dri || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null }),
     };
 
     workItems[workItemIndex] = updatedWorkItem;
@@ -2271,15 +2275,31 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       try {
         const updatedPlan = result.Attributes as any;
         if (updatedPlan) {
+          // Track changes for notifications (using originalItem stored before update)
+          const changes: { status?: string; notes?: string; dri?: string; dueDate?: string | null } = {};
+          
+          if (status !== undefined && status !== originalItem.status) {
+            changes.status = status;
+          }
+          if (notes !== undefined && notes !== originalItem.notes) {
+            changes.notes = notes || null;
+          }
+          if (dri !== undefined && dri !== originalItem.dri) {
+            changes.dri = dri || null;
+          }
+          if (dueDate !== undefined) {
+            const newDueDate = dueDate && dueDate.trim() !== "" ? dueDate.trim() : null;
+            const oldDueDate = originalItem.dueDate || null;
+            if (newDueDate !== oldDueDate) {
+              changes.dueDate = newDueDate;
+            }
+          }
+
           await sendGTMPlanUpdateNotifications(
             updatedPlan,
             phaseId,
             workItemId,
-            {
-              status: status !== undefined ? status : undefined,
-              notes: notes !== undefined ? notes : undefined,
-              dri: dri !== undefined ? dri : undefined,
-            },
+            changes,
             notifications
           );
         }
@@ -2304,11 +2324,11 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
   }
 });
 
-// Update GTM plan PoC (dri)
+// Update GTM plan PoC (dri) or dueDate
 router.put("/gtm-plans/:planId", async (req, res) => {
   try {
     const { planId } = req.params;
-    const { dri } = req.body;
+    const { dri, dueDate } = req.body;
 
     const dynamodb = new DynamoDB.DocumentClient({
       region: process.env.AWS_REGION || "us-west-2",
@@ -2350,6 +2370,12 @@ router.put("/gtm-plans/:planId", async (req, res) => {
       expressionAttributeValues[":dri"] = dri || null;
     }
 
+    if (dueDate !== undefined) {
+      updateExpressions.push("#dueDate = :dueDate");
+      expressionAttributeNames["#dueDate"] = "dueDate";
+      expressionAttributeValues[":dueDate"] = dueDate || null;
+    }
+
     updateExpressions.push("#updatedAt = :updatedAt");
     expressionAttributeNames["#updatedAt"] = "updatedAt";
     expressionAttributeValues[":updatedAt"] = new Date().toISOString();
@@ -2382,11 +2408,11 @@ router.put("/gtm-plans/:planId", async (req, res) => {
   }
 });
 
-// Update GTM plan phase PoC (dri)
+// Update GTM plan phase PoC (dri) or dueDate
 router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
   try {
     const { planId, phaseId } = req.params;
-    const { dri } = req.body;
+    const { dri, dueDate } = req.body;
 
     const dynamodb = new DynamoDB.DocumentClient({
       region: process.env.AWS_REGION || "us-west-2",
@@ -2434,6 +2460,7 @@ router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
     const updatedPhase = {
       ...phases[phaseIndex],
       ...(dri !== undefined && { dri: dri || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate || null }),
     };
 
     phases[phaseIndex] = updatedPhase;

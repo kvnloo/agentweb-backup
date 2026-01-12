@@ -18,9 +18,6 @@ const dynamodb = new DynamoDB.DocumentClient({
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
-console.log(`[GTM PLAN] Using table prefix: ${TABLE_PREFIX}`);
-console.log(`[GTM PLAN] Table name: ${TABLE_NAME}`);
-console.log(`[GTM PLAN] NODE_ENV: ${process.env.NODE_ENV}`);
 
 // Get all GTM plans for user
 router.get("/", authenticateToken, async (req, res) => {
@@ -31,7 +28,6 @@ router.get("/", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
-    console.log(`[GTM PLAN] Querying table: ${TABLE_NAME} for user: ${userId}`);
 
     const result = await dynamodb
       .query({
@@ -161,12 +157,12 @@ router.post("/", authenticateToken, async (req, res) => {
   }
 });
 
-// Update a GTM plan (title, description, dri, or phases)
+// Update a GTM plan (title, description, dri, dueDate, or phases)
 router.put("/:planId", authenticateToken, async (req, res) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId } = req.params;
-    const { title, description, dri, phases } = req.body;
+    const { title, description, dri, dueDate, phases } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -215,7 +211,16 @@ router.put("/:planId", authenticateToken, async (req, res) => {
       expressionAttributeValues[":dri"] = dri || null; // Allow null to remove DRI
     }
 
+    if (dueDate !== undefined) {
+      updateExpressions.push("#dueDate = :dueDate");
+      expressionAttributeNames["#dueDate"] = "dueDate";
+      expressionAttributeValues[":dueDate"] = dueDate || null; // Allow null to remove due date
+    }
+
     if (phases !== undefined) {
+      // Note: We allow dates to be saved even if they violate constraints
+      // Frontend will show warnings to the user
+      
       // Check if all work items in each phase are completed or skipped
       const updatedPhases = phases.map((phase: any) => {
         // Phase is only completed if it has work items AND all are done
@@ -300,7 +305,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId, phaseId, workItemId } = req.params;
-    const { status, notes, dri, title, description, notifications } = req.body;
+    const { status, notes, dri, title, description, dueDate, notifications } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -345,7 +350,11 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
 
     // Store original values for change detection
     const originalItem = workItems[workItemIndex];
-    const changes: { status?: string; notes?: string; dri?: string } = {};
+    const changes: { status?: string; notes?: string; dri?: string; dueDate?: string | null } = {};
+
+    // Check work item due date constraint (warning only, don't block)
+    // Note: We allow the date to be saved even if it violates constraints
+    // Frontend will show warnings to the user
 
     // Update the work item
     const updatedWorkItem = {
@@ -355,6 +364,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
       ...(dri !== undefined && { dri: dri || null }),
       ...(title !== undefined && { title }),
       ...(description !== undefined && { description: description || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null }),
     };
 
     // Only track actual changes for notifications
@@ -366,6 +376,13 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
     }
     if (dri !== undefined && dri !== originalItem.dri) {
       changes.dri = dri || null;
+    }
+    if (dueDate !== undefined) {
+      const newDueDate = dueDate && dueDate.trim() !== "" ? dueDate.trim() : null;
+      const oldDueDate = originalItem.dueDate || null;
+      if (newDueDate !== oldDueDate) {
+        changes.dueDate = newDueDate;
+      }
     }
     // Title and description changes don't trigger notifications
 
