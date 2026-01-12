@@ -300,7 +300,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     const { planId, phaseId, workItemId } = req.params;
-    const { status, notes, dri, notifications } = req.body;
+    const { status, notes, dri, title, description, notifications } = req.body;
 
     if (!userId) {
       return res.status(401).json({ error: "User ID not provided" });
@@ -350,12 +350,14 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
     // Update the work item
     const updatedWorkItem = {
       ...originalItem,
-      ...(status !== undefined && { status, ...(changes.status = status, {}) }),
-      ...(notes !== undefined && { notes: notes || null, ...(changes.notes = notes || null, {}) }),
-      ...(dri !== undefined && { dri: dri || null, ...(changes.dri = dri || null, {}) }),
+      ...(status !== undefined && { status }),
+      ...(notes !== undefined && { notes: notes || null }),
+      ...(dri !== undefined && { dri: dri || null }),
+      ...(title !== undefined && { title }),
+      ...(description !== undefined && { description: description || null }),
     };
 
-    // Only track actual changes
+    // Only track actual changes for notifications
     if (status !== undefined && status !== originalItem.status) {
       changes.status = status;
     }
@@ -365,6 +367,7 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
     if (dri !== undefined && dri !== originalItem.dri) {
       changes.dri = dri || null;
     }
+    // Title and description changes don't trigger notifications
 
     workItems[workItemIndex] = updatedWorkItem;
 
