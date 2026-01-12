@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Box,
   Typography,
@@ -30,14 +30,9 @@ import {
   Checkbox,
   FormGroup,
   FormControlLabel,
-  List,
-  ListItem,
-  ListItemText,
-  Divider,
 } from "@mui/material";
 import {
   ExpandMore as ExpandMoreIcon,
-  Edit as EditIcon,
   Person as PersonIcon,
   CheckCircle as CheckCircleIcon,
   CalendarToday as CalendarTodayIcon,
@@ -49,7 +44,6 @@ import { format } from "date-fns";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
-import toast from "react-hot-toast";
 
 interface WorkItem {
   id: string;
@@ -227,13 +221,13 @@ export default function GTMPlans() {
           if (constraintMsg) {
             setConstraintMessage(constraintMsg);
             setPendingConstraintUpdate({
-              updateFn: () => performPlanUpdate(editingItem.planId, { dueDate: editDueDate || null }, editDueDateValue),
+              updateFn: () => performPlanUpdate(editingItem.planId, { dueDate: editDueDate || null }),
             });
             setConstraintDialogOpen(true);
             return;
           }
         }
-        performPlanUpdate(editingItem.planId, { dueDate: editDueDate || null }, editDueDateValue);
+        performPlanUpdate(editingItem.planId, { dueDate: editDueDate || null });
       }
       return;
     }
@@ -249,13 +243,13 @@ export default function GTMPlans() {
           if (constraintMsg) {
             setConstraintMessage(constraintMsg);
             setPendingConstraintUpdate({
-              updateFn: () => performPhaseUpdate(editingItem.planId, editingItem.phaseId!, { dueDate: editDueDate || null }, editDueDateValue),
+              updateFn: () => performPhaseUpdate(editingItem.planId, editingItem.phaseId!, { dueDate: editDueDate || null }),
             });
             setConstraintDialogOpen(true);
             return;
           }
         }
-        performPhaseUpdate(editingItem.planId, editingItem.phaseId, { dueDate: editDueDate || null }, editDueDateValue);
+        performPhaseUpdate(editingItem.planId, editingItem.phaseId, { dueDate: editDueDate || null });
       }
       return;
     }
@@ -274,8 +268,7 @@ export default function GTMPlans() {
           editDueDateValue,
           "workItem",
           editingItem.planId,
-          editingItem.phaseId,
-          editingItem.workItemId
+          editingItem.phaseId
         );
         if (constraintMsg) {
           setConstraintMessage(constraintMsg);
@@ -361,8 +354,7 @@ export default function GTMPlans() {
 
   const performPlanUpdate = async (
     planId: string,
-    updateData: { dri?: string | null; dueDate?: string | null },
-    dueDateValue?: Date | null
+    updateData: { dri?: string | null; dueDate?: string | null }
   ) => {
     try {
       setSaving(true);
@@ -412,8 +404,7 @@ export default function GTMPlans() {
   const performPhaseUpdate = async (
     planId: string,
     phaseId: string,
-    updateData: { dri?: string | null; dueDate?: string | null },
-    dueDateValue?: Date | null
+    updateData: { dri?: string | null; dueDate?: string | null }
   ) => {
     try {
       setSaving(true);
@@ -646,8 +637,7 @@ export default function GTMPlans() {
     date: Date,
     type: "plan" | "phase" | "workItem",
     planId: string,
-    phaseId?: string,
-    workItemId?: string
+    phaseId?: string
   ): string | null => {
     const plan = plans.find((p) => p.planId === planId);
     if (!plan) return null;
