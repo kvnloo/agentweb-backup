@@ -15,6 +15,7 @@ import SharedExecution from './pages/SharedExecution';
 import Layout from './components/Layout';
 import OAuthCallback from './pages/OAuthCallback';
 import AdminDashboard from './pages/AdminDashboard';
+import GTMPlans from './pages/GTMPlans';
 import PrivateRoute from './components/PrivateRoute';
 import AdminRoute from './components/AdminRoute';
 import PartnerRoute from './components/PartnerRoute';
@@ -81,6 +82,14 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <AdminDashboard />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="gtm-ops"
+                      element={
+                        <AdminRoute>
+                          <GTMPlans />
                         </AdminRoute>
                       }
                     />

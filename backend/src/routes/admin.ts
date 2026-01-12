@@ -8,6 +8,7 @@ import { userDb, taskDb, subscriberDb } from "../services/db";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
+import { sendGTMPlanUpdateNotifications } from "../services/gtmPlanNotificationService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
@@ -1389,7 +1390,6 @@ router.post("/announcements/send", async (req, res) => {
 
     // Send announcement email to all active users using Resend
     // Process sequentially to respect rate limits and handle errors properly
-    const fromEmail = "no-reply@updates.agentweb.pro";
     const plainTextMessage = message
       .replace(/<[^>]*>/g, "")
       .replace(/&nbsp;/g, " ")
@@ -1401,8 +1401,7 @@ router.post("/announcements/send", async (req, res) => {
 
     for (const email of activeEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from: fromEmail,
+        const result = await resendService.sendSystemEmail({
           to: email,
           subject: title,
           text: plainTextMessage,
@@ -1479,7 +1478,6 @@ router.post("/announcements/test", async (req, res) => {
 
     // Send test announcement email to specified recipients using Resend
     // Process sequentially to respect rate limits and handle errors properly
-    const fromEmail = "no-reply@updates.agentweb.pro";
     const plainTextMessage = message
       .replace(/<[^>]*>/g, "")
       .replace(/&nbsp;/g, " ")
@@ -1493,8 +1491,7 @@ router.post("/announcements/test", async (req, res) => {
 
     for (const email of validEmails) {
       try {
-        const result = await resendService.sendEmail({
-          from: fromEmail,
+        const result = await resendService.sendSystemEmail({
           to: email.trim(),
           subject: `[TEST] ${title}`,
           text: plainTextMessage,
@@ -2130,6 +2127,379 @@ router.get("/gtm-plans", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error fetching GTM plans",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Update GTM plan item (work item) - status, notes, PoC (dri)
+router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (req, res) => {
+  try {
+    const { planId, phaseId, workItemId } = req.params;
+    const { status, notes, dri, dueDate, notifications } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Phase not found",
+      });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+
+    // Find the work item
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Work item not found",
+      });
+    }
+
+    // Store original item BEFORE updating (for change tracking)
+    const originalItem = { ...workItems[workItemIndex] };
+
+    // Update the work item
+    const updatedWorkItem = {
+      ...workItems[workItemIndex],
+      ...(status !== undefined && { status }),
+      ...(notes !== undefined && { notes }),
+      ...(dri !== undefined && { dri: dri || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null }),
+    };
+
+    workItems[workItemIndex] = updatedWorkItem;
+
+    // Recalculate phase status based on work items
+    const hasWorkItems = workItems.length > 0;
+    const allItemsDone = hasWorkItems && workItems.every(
+      (item: any) => item.status === "completed" || item.status === "skipped"
+    );
+    const updatedPhase = {
+      ...phase,
+      workItems,
+      status: allItemsDone ? "completed" : "in_progress",
+    };
+
+    phases[phaseIndex] = updatedPhase;
+
+    // Recalculate plan status based on phases
+    const hasPhases = phases.length > 0;
+    const allPhasesCompleted = hasPhases && phases.every(
+      (phase: any) => phase.status === "completed"
+    );
+    const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+    // Check if plan is transitioning to completed
+    const wasCompleted = plan.status === "completed";
+    const isNowCompleted = planStatus === "completed";
+    const justCompleted = !wasCompleted && isNowCompleted;
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    updateExpressions.push("#phases = :phases");
+    expressionAttributeNames["#phases"] = "phases";
+    expressionAttributeValues[":phases"] = phases;
+
+    updateExpressions.push("#status = :status");
+    expressionAttributeNames["#status"] = "status";
+    expressionAttributeValues[":status"] = planStatus;
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    if (justCompleted) {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = new Date().toISOString();
+    } else if (wasCompleted && !isNowCompleted) {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = null;
+    }
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    // Handle notifications if requested
+    if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
+      try {
+        const updatedPlan = result.Attributes as any;
+        if (updatedPlan) {
+          // Track changes for notifications (using originalItem stored before update)
+          const changes: { status?: string; notes?: string; dri?: string; dueDate?: string | null } = {};
+          
+          if (status !== undefined && status !== originalItem.status) {
+            changes.status = status;
+          }
+          if (notes !== undefined && notes !== originalItem.notes) {
+            changes.notes = notes || null;
+          }
+          if (dri !== undefined && dri !== originalItem.dri) {
+            changes.dri = dri || null;
+          }
+          if (dueDate !== undefined) {
+            const newDueDate = dueDate && dueDate.trim() !== "" ? dueDate.trim() : null;
+            const oldDueDate = originalItem.dueDate || null;
+            if (newDueDate !== oldDueDate) {
+              changes.dueDate = newDueDate;
+            }
+          }
+
+          await sendGTMPlanUpdateNotifications(
+            updatedPlan,
+            phaseId,
+            workItemId,
+            changes,
+            notifications
+          );
+        }
+      } catch (notificationError: any) {
+        console.error("Error sending notifications:", notificationError);
+        // Don't fail the request if notifications fail
+      }
+    }
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Work item updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan work item:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating work item",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Update GTM plan PoC (dri) or dueDate
+router.put("/gtm-plans/:planId", async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const { dri, dueDate } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    if (dri !== undefined) {
+      updateExpressions.push("#dri = :dri");
+      expressionAttributeNames["#dri"] = "dri";
+      expressionAttributeValues[":dri"] = dri || null;
+    }
+
+    if (dueDate !== undefined) {
+      updateExpressions.push("#dueDate = :dueDate");
+      expressionAttributeNames["#dueDate"] = "dueDate";
+      expressionAttributeValues[":dueDate"] = dueDate || null;
+    }
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Plan PoC updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan PoC:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating plan PoC",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Update GTM plan phase PoC (dri) or dueDate
+router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
+  try {
+    const { planId, phaseId } = req.params;
+    const { dri, dueDate } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({
+        success: false,
+        error: "Phase not found",
+      });
+    }
+
+    // Update the phase
+    const updatedPhase = {
+      ...phases[phaseIndex],
+      ...(dri !== undefined && { dri: dri || null }),
+      ...(dueDate !== undefined && { dueDate: dueDate || null }),
+    };
+
+    phases[phaseIndex] = updatedPhase;
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: { [key: string]: string } = {};
+    const expressionAttributeValues: { [key: string]: any } = {};
+
+    updateExpressions.push("#phases = :phases");
+    expressionAttributeNames["#phases"] = "phases";
+    expressionAttributeValues[":phases"] = phases;
+
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: {
+        planId: planId,
+      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Phase PoC updated successfully",
+    });
+  } catch (error: any) {
+    console.error("Error updating GTM plan phase PoC:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating phase PoC",
       error: error?.message || "Internal server error",
     });
   }

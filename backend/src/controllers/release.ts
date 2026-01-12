@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-12",
+    changes: [
+      "Added GTM Plans page to Partner Portal",
+      "- New admin-protected GTM Plans page accessible from the navigation menu",
+      "- Displays all GTM Plans from all users in a unified view",
+      "- Admins can update status, edit notes, assign PoC, and set due dates for plans, phases, and work items",
+      "- Supports role-based notifications with customizable recipient selection",
+      "- Includes due date management with visual indicators and constraint warnings",
+    ],
+  },
+  {
     date: "2026-01-09",
     changes: [
       "Enhanced Admin Announcement feature",

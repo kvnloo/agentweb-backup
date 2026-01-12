@@ -9,3 +9,8 @@ export const MAX_FILE_SIZE = 100 * 1024 * 1024;
 // AI Model Configuration
 export const DEEP_RESEARCH_AGENT = 'deep-research-pro-preview-12-2025';
 export const CONTENT_RESTYLE_MODEL = 'gemini-3-flash-preview';
+
+// Resend System Email Configuration
+// This is used for all system-generated emails (notifications, announcements, etc.)
+export const RESEND_SYSTEM_EMAIL = 'no-reply@updates.agentweb.pro';
+export const RESEND_SYSTEM_NAME = 'AgentWeb';

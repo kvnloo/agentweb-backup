@@ -149,14 +149,24 @@ export default function Layout() {
                     Tasks
                   </Button>
                   {user.isAdmin && (
-                    <Button 
-                      color="primary" 
-                      component={RouterLink} 
-                      to="/templates"
-                      variant={isActivePath('/templates') ? 'contained' : 'text'}
-                    >
-                      Templates
-                    </Button>
+                    <>
+                      <Button 
+                        color="primary" 
+                        component={RouterLink} 
+                        to="/templates"
+                        variant={isActivePath('/templates') ? 'contained' : 'text'}
+                      >
+                        Templates
+                      </Button>
+                      <Button 
+                        color="primary" 
+                        component={RouterLink} 
+                        to="/gtm-ops"
+                        variant={isActivePath('/gtm-ops') ? 'contained' : 'text'}
+                      >
+                        GTM Plans
+                      </Button>
+                    </>
                   )}
                   <Button 
                     color="primary" 
