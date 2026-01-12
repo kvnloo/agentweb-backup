@@ -485,6 +485,171 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
   }
 });
 
+// Delete a phase from a GTM plan
+router.delete("/:planId/phases/:phaseId", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    // Verify the plan belongs to the user
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    // Remove the phase
+    phases.splice(phaseIndex, 1);
+
+    // Update the plan
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+        UpdateExpression: "SET phases = :phases",
+        ExpressionAttributeValues: {
+          ":phases": phases,
+        },
+      })
+      .promise();
+
+    // Return the updated plan
+    const updatedPlan = {
+      ...plan,
+      phases: phases,
+    };
+
+    return res.json({
+      success: true,
+      data: updatedPlan,
+      message: "Phase deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error in DELETE /gtm-plan/:planId/phases/:phaseId:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Internal server error",
+    });
+  }
+});
+
+// Delete a work item from a phase
+router.delete("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId, workItemId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    // Verify the plan belongs to the user
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+
+    // Find the work item
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    // Remove the work item
+    workItems.splice(workItemIndex, 1);
+
+    // Update the phase
+    phases[phaseIndex] = {
+      ...phase,
+      workItems: workItems,
+    };
+
+    // Update the plan
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+        UpdateExpression: "SET phases = :phases",
+        ExpressionAttributeValues: {
+          ":phases": phases,
+        },
+      })
+      .promise();
+
+    // Return the updated plan
+    const updatedPlan = {
+      ...plan,
+      phases: phases,
+    };
+
+    return res.json({
+      success: true,
+      data: updatedPlan,
+      message: "Work item deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error in DELETE /gtm-plan/:planId/phases/:phaseId/work-items/:workItemId:", error);
+    return res.status(500).json({
+      success: false,
+      error: "Internal server error",
+    });
+  }
+});
+
 // Delete a GTM plan
 router.delete("/:planId", authenticateToken, async (req, res) => {
   try {
