@@ -8,6 +8,16 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-13",
+    changes: [
+      "Added column sorting to the Admin Users table and Waitlist table",
+      "- Default sort is Created (descending) for Users table",
+      "- Default sort is Joined At (descending) for Waitlist table",
+      "- All user columns are sortable for quick triage",
+      "- All waitlist columns are sortable for quick triage",
+    ],
+  },
+  {
     date: "2026-01-12",
     changes: [
       "Added GTM Plans page to Partner Portal",
