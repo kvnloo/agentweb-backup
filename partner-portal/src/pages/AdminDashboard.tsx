@@ -5073,6 +5073,7 @@ interface WorkPlanStep {
 interface PredefinedWorkPlan {
   id?: string;
   title: string;
+  description?: string;
   steps: WorkPlanStep[];
   welcomeMessage?: string;
   autocomplete?: boolean;
@@ -5676,6 +5677,7 @@ const AgentModeSettings = () => {
       const validatedWorkPlan = {
         id: planId,
         title: workPlan.title.trim(),
+        description: workPlan.description?.trim() || undefined,
         welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
         autocomplete: workPlan.autocomplete || false,
         requireLogin: workPlan.requireLogin || false,
@@ -6244,6 +6246,19 @@ const AgentModeSettings = () => {
                         </IconButton>
                       </Box>
                     </Box>
+
+                    <TextField
+                      label="Description (Optional)"
+                      value={workPlan.description || ''}
+                      onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, description: e.target.value })}
+                      placeholder="Enter a brief description of this work plan..."
+                      variant="outlined"
+                      fullWidth
+                      multiline
+                      rows={2}
+                      sx={{ mb: 2 }}
+                      helperText="This description will be displayed on the work plan card in Agent Mode."
+                    />
 
                     <TextField
                       label="Welcome Message (Optional)"
