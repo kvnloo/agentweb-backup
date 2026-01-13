@@ -395,6 +395,12 @@ const ChatDialog = ({
                             {new Date(msg.metadata.timestamp).toLocaleString()}
                           </>
                         )}
+                      {msg.role === "assistant" && msg.llm && (
+                        <>
+                          {" "}
+                          - <Chip label={msg.llm} size="small" sx={{ fontSize: '0.65rem', height: '18px' }} />
+                        </>
+                      )}
                     </Typography>
                     <Box
                       sx={{

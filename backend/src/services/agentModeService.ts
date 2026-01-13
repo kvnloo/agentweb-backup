@@ -286,6 +286,9 @@ export class AgentModeService {
           content = responseContent;
         }
 
+        // Add LLM model to the response message
+        responseMessage.llm = llmModel;
+
         // Append the model's message to conversation before handling tool calls
         (messages as any[]).push(responseMessage);
 
