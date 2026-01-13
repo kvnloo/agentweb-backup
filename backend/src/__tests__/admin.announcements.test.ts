@@ -1,4 +1,4 @@
-import { Request, Response } from 'express';
+import { Request } from 'express';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
@@ -40,17 +40,30 @@ const getRouteHandler = (path: string, method: 'post' | 'get' | 'put' | 'delete'
   return stack[stack.length - 1].handle;
 };
 
-const mockResponse = () => {
-  const res: any = {};
-  res.status = jest.fn().mockReturnValue(res);
-  res.json = jest.fn().mockImplementation((payload: any) => {
+type MockResponse = {
+  status: jest.Mock;
+  json: jest.Mock;
+  body?: any;
+};
+
+const mockResponse = (): MockResponse => {
+  const res: MockResponse = {
+    status: jest.fn(),
+    json: jest.fn(),
+  };
+  res.status.mockReturnValue(res);
+  res.json.mockImplementation((payload: any) => {
     res.body = payload;
     return res;
   });
-  return res as Response;
+  return res;
 };
 
-const invokeRoute = async (path: string, method: 'post' | 'get' | 'put' | 'delete', body: any) => {
+const invokeRoute = async (
+  path: string,
+  method: 'post' | 'get' | 'put' | 'delete',
+  body: any
+): Promise<MockResponse> => {
   const handler = getRouteHandler(path, method);
   const req = {
     body,

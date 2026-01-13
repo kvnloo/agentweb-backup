@@ -24,7 +24,7 @@ const CONTEXT_LIMIT_PATTERNS = [
   /request too large/i
 ];
 
-export function isContextLimitError(error: unknown): error is Error {
+export function isContextLimitError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
   return CONTEXT_LIMIT_PATTERNS.some((pattern) => pattern.test(message));
