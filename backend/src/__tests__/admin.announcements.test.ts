@@ -1,5 +1,5 @@
 import request from 'supertest';
-import express from 'express';
+import express, { Request, Response } from 'express';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
@@ -31,6 +31,26 @@ jest.mock('../middleware/admin', () => ({
 const app = express();
 app.use(express.json());
 app.use('/api/admin', adminRoutes);
+
+const getRouteHandler = (path: string, method: 'post' | 'get' | 'put' | 'delete') => {
+  const layer = (adminRoutes as any).stack.find((item: any) =>
+    item.route && item.route.path === path && item.route.methods?.[method]
+  );
+
+  if (!layer) {
+    throw new Error(`Route not found: ${method.toUpperCase()} ${path}`);
+  }
+
+  const stack = layer.route.stack;
+  return stack[stack.length - 1].handle;
+};
+
+const mockResponse = () => {
+  const res: any = {};
+  res.status = jest.fn().mockReturnValue(res);
+  res.json = jest.fn().mockReturnValue(res);
+  return res as Response;
+};
 
 describe('Admin Announcements', () => {
   beforeEach(() => {
@@ -96,12 +116,16 @@ describe('Admin Announcements', () => {
     });
 
     it('should return 400 if message is missing', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/send')
-        .send({ title: 'Test Title' })
-        .expect(400);
+      const handler = getRouteHandler('/announcements/send', 'post');
+      const req = {
+        body: { title: 'Test Title' }
+      } as unknown as Request;
+      const res = mockResponse();
 
-      expect(response.body.message).toBe('Title and message are required');
+      await handler(req, res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({ message: 'Title and message are required' });
     });
 
     it('should handle email sending failures gracefully', async () => {
