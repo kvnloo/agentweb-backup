@@ -2,6 +2,30 @@ import { Request, Response } from "express";
 import http from "http"; // Import Node.js http module
 import https from "https"; // Import Node.js https module
 import axios from "axios";
+import { uploadFileToS3WithPath } from "../utils/s3Utils";
+
+const DEFAULT_BUCKET = process.env.AWS_S3_BUCKET || "agentweb-user-files";
+
+const extractS3Key = (fileUrl: string, bucket: string): string | null => {
+  try {
+    const url = new URL(fileUrl);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname.replace(/^\/+/, "");
+
+    if (host.startsWith(`${bucket}.`)) {
+      return path || null;
+    }
+
+    if (path.startsWith(`${bucket}/`)) {
+      return path.substring(bucket.length + 1) || null;
+    }
+
+    return null;
+  } catch (error) {
+    console.error("Error parsing S3 URL:", error);
+    return null;
+  }
+};
 
 export const viewExternalFile = async (req: Request, res: Response) => {
   const { url } = req.query;
@@ -157,6 +181,74 @@ export const getFileContent = async (req: Request, res: Response) => {
     return res.status(statusCode).json({
       success: false,
       message: errorMessage,
+      error: error.message,
+    });
+  }
+};
+
+export const saveHtmlContent = async (req: Request, res: Response) => {
+  const { url, content } = req.body as { url?: string; content?: string };
+
+  if (!url || typeof url !== "string") {
+    return res.status(400).json({
+      success: false,
+      message: "url is required and must be a string.",
+    });
+  }
+
+  if (typeof content !== "string") {
+    return res.status(400).json({
+      success: false,
+      message: "content is required and must be a string.",
+    });
+  }
+
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid URL format. Must be HTTP or HTTPS.",
+    });
+  }
+
+  const key = extractS3Key(url, DEFAULT_BUCKET);
+  if (!key) {
+    return res.status(400).json({
+      success: false,
+      message: "URL must reference a file in the configured S3 bucket.",
+    });
+  }
+
+  const lastSlashIndex = key.lastIndexOf("/");
+  const filename =
+    lastSlashIndex === -1 ? key : key.substring(lastSlashIndex + 1);
+  const path = lastSlashIndex === -1 ? "" : key.substring(0, lastSlashIndex);
+
+  try {
+    const uploadResult = await uploadFileToS3WithPath(
+      content,
+      filename,
+      "text/html",
+      path
+    );
+
+    if (!uploadResult.success || !uploadResult.url) {
+      return res.status(500).json({
+        success: false,
+        message: uploadResult.error || "Failed to save HTML content.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      url: uploadResult.url,
+      key: uploadResult.key,
+      filename,
+    });
+  } catch (error: any) {
+    console.error("Error saving HTML content:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save HTML content.",
       error: error.message,
     });
   }

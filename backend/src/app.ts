@@ -30,6 +30,7 @@ import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
+import { authenticateToken } from "./middleware/auth";
 
 const { version } = require('../package.json');
 
@@ -38,6 +39,7 @@ const { version } = require('../package.json');
 import {
   viewExternalFile,
   getFileContent,
+  saveHtmlContent,
 } from "./controllers/filesController";
 
 const app = express();
@@ -126,6 +128,7 @@ app.use(passport.initialize());
 const fileRoutes = express.Router();
 fileRoutes.get("/view-external", viewExternalFile);
 fileRoutes.get("/content", getFileContent);
+fileRoutes.post("/html", authenticateToken, saveHtmlContent);
 
 // Routes
 app.use("/api/auth", authRoutes);
