@@ -381,6 +381,27 @@ describe('AdminDashboard Predefined Work Plans', () => {
       );
     });
 
+    it('should apply defaults for requireLogin and showLoginSignup', async () => {
+      const workPlans: PredefinedWorkPlan[] = [
+        {
+          title: 'Plan With Defaults',
+          steps: [
+            { stepCount: 1, title: 'Step 1' }
+          ]
+        }
+      ];
+
+      mockedAxios.put.mockResolvedValueOnce({ data: {} });
+
+      await savePredefinedWorkPlans(workPlans, mockToken, mockBuildApiUrl);
+
+      const callArgs = mockedAxios.put.mock.calls[0][1] as any;
+      const savedPlans = JSON.parse(callArgs.settingValue);
+
+      expect(savedPlans[0].requireLogin).toBe(false);
+      expect(savedPlans[0].showLoginSignup).toBe('after_plan_completed');
+    });
+
     it('should filter out empty work plans and steps', async () => {
       const workPlans: PredefinedWorkPlan[] = [
         {

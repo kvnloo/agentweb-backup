@@ -399,6 +399,7 @@ router.post('/agent-mode-predefined-workplans', authenticateToken, requireAdmin,
     const validatedWorkPlan = {
       id: workPlan.id,
       title: workPlan.title.trim(),
+      description: workPlan.description?.trim() || undefined,
       welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
       autocomplete: workPlan.autocomplete || false,
       requireLogin: workPlan.requireLogin || false,
@@ -435,8 +436,32 @@ router.post('/agent-mode-predefined-workplans', authenticateToken, requireAdmin,
       return res.status(409).json({ error: 'Work plan with this ID already exists' });
     }
     
-    // Add the new work plan
-    workPlans.push(validatedWorkPlan);
+    // If work plan has no ID, check if one with same title exists
+    if (!validatedWorkPlan.id || !workPlans.some((wp: any) => wp.id === validatedWorkPlan.id)) {
+      const existingPlan = workPlans.find((wp: any) => 
+        wp.title && wp.title.trim().toLowerCase() === validatedWorkPlan.title.trim().toLowerCase()
+      );
+      
+      if (existingPlan) {
+        console.log('Found existing plan without ID:', existingPlan);
+        // Give it an ID if it doesn't have one
+        if (!existingPlan.id) {
+          existingPlan.id = validatedWorkPlan.id;
+        }
+        // Update the existing plan
+        const planIndex = workPlans.findIndex((wp: any) => 
+          wp.title && wp.title.trim().toLowerCase() === validatedWorkPlan.title.trim().toLowerCase()
+        );
+        validatedWorkPlan.id = existingPlan.id;
+        workPlans[planIndex] = validatedWorkPlan;
+      } else {
+        // Add the new work plan
+        workPlans.push(validatedWorkPlan);
+      }
+    } else {
+      // Add the new work plan
+      workPlans.push(validatedWorkPlan);
+    }
     
     // Save back to settings
     await settingsService.setSetting(
@@ -490,6 +515,7 @@ router.put('/agent-mode-predefined-workplans/:planId', authenticateToken, requir
     const validatedWorkPlan = {
       id: planId, // Preserve the ID
       title: workPlan.title.trim(),
+      description: workPlan.description?.trim() || undefined,
       welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
       autocomplete: workPlan.autocomplete || false,
       requireLogin: workPlan.requireLogin || false,

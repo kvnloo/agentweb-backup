@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-13',
+    changes: [
+      'Added support for choosing Work Plans when creating a new session in Agent Mode',
+      '- Users can now select from predefined work plans when starting a new chat session',
+      '- Work plans are displayed as cards with descriptions below the conversation starters',
+      '- Each work plan guides the AI through a structured sequence of steps to complete specific tasks',
+    ],
+  },
+  {
     date: '2026-01-12',
     changes: [
       'Improved GTM Plan page with due date management, notifications, and enhanced editing',

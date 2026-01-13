@@ -61,6 +61,10 @@ router.get('/public/welcome-message', asyncHandler(agentModeController.getWelcom
 // Get current conversation starters (public)
 router.get('/public/conversation-starters', asyncHandler(agentModeController.getConversationStarters));
 
+// GET /api/agent-mode/public/plans
+// Get all predefined work plans (public)
+router.get('/public/plans', asyncHandler(agentModeController.getAllPredefinedWorkPlans));
+
 // GET /api/agent-mode/public/plan/:planTitle
 // Get predefined work plan by title (public)
 router.get('/public/plan/:planTitle', asyncHandler(agentModeController.getPredefinedWorkPlan));

@@ -2548,6 +2548,23 @@ export const agentModeController = {
     }
   },
 
+  // Get all predefined work plans (public)
+  async getAllPredefinedWorkPlans(req: Request, res: Response) {
+    try {
+      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+      
+      if (!setting || !setting.settingValue) {
+        return res.json([]);
+      }
+      
+      const workPlans = JSON.parse(setting.settingValue);
+      res.json(workPlans);
+    } catch (error) {
+      console.error('AgentMode: Get all predefined work plans error:', error);
+      res.status(500).json({ error: 'Failed to get all predefined work plans' });
+    }
+  },
+
   // Get predefined work plan by title (public)
   async getPredefinedWorkPlan(req: Request, res: Response) {
     try {
