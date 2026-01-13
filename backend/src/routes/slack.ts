@@ -14,6 +14,8 @@ import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
 import { emailService } from "../services/emailService";
 import { createRevisionExecutionFromSlack } from "../controllers/tasks";
+import { isSessionLimitError } from "../utils/agentModeErrors";
+import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 
 const router = express.Router();
 
@@ -531,11 +533,11 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         ishareLink = `${customerFrontendUrl}/agent-mode/${agentSessionId}`;
                       }
                       
-                      await emailService.sendOncallAlert(
-                        'Agent Mode Revision: Failed to Extract Asset URL',
-                        `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
-                        {
-                          'Session ID': agentSessionId,
+                      await sendAgentModeOncallAlert({
+                        subject: 'Agent Mode Revision: Failed to Extract Asset URL',
+                        message: `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                        sessionId: agentSessionId,
+                        context: {
                           'iShare Link': ishareLink,
                           'Asset Type': originalApproval.assetType || 'unknown',
                           'Original Asset URL': originalApproval.assetUrl,
@@ -548,13 +550,37 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           'Slack Channel': originalApproval.slackChannel || 'N/A',
                           'User ID': originalApproval.userId || 'N/A'
                         }
-                      );
+                      });
                     } catch (alertError) {
                       console.error('❌ Error sending oncall alert:', alertError);
                     }
                   }
-                }).catch((error) => {
+                }).catch(async (error) => {
                   console.error('❌ Error in Agent Mode verified-generate:', error);
+                  try {
+                    const isSessionLimit = isSessionLimitError(error);
+                    await sendAgentModeOncallAlert({
+                      subject: isSessionLimit
+                        ? 'Agent Mode Verified Generate: Session limit exceeded'
+                        : 'Agent Mode Verified Generate: Failed',
+                      message: isSessionLimit
+                        ? `Verified generation failed because the session reached its limit.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`
+                        : `Verified generation failed.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                      sessionId: agentSessionId,
+                      context: {
+                        'Asset Type': originalApproval.assetType || 'unknown',
+                        'Original Asset URL': originalApproval.assetUrl,
+                        'Original Filename': originalApproval.filename || 'unknown',
+                        'Feedback': feedbackValue,
+                        'Execution ID': originalApproval.executionId,
+                        'Slack Channel': originalApproval.slackChannel || 'N/A',
+                        'User ID': originalApproval.userId || 'N/A',
+                        'Error': error.message || String(error)
+                      }
+                    });
+                  } catch (alertError) {
+                    console.error('❌ Error sending oncall alert:', alertError);
+                  }
                 });
                 
                 console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${agentSessionId}`);
@@ -702,11 +728,11 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                             ishareLink = `${customerFrontendUrl}/agent-mode/${task.sessionId}`;
                           }
                           
-                          await emailService.sendOncallAlert(
-                            'Agent Mode Revision: Failed to Extract Asset URL',
-                            `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
-                            {
-                              'Session ID': task.sessionId,
+                          await sendAgentModeOncallAlert({
+                            subject: 'Agent Mode Revision: Failed to Extract Asset URL',
+                            message: `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                            sessionId: task.sessionId,
+                            context: {
                               'iShare Link': ishareLink,
                               'Asset Type': originalApproval.assetType || 'unknown',
                               'Original Asset URL': originalApproval.assetUrl,
@@ -720,13 +746,38 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                               'Slack Channel': originalApproval.slackChannel || 'N/A',
                               'User ID': originalApproval.userId || 'N/A'
                             }
-                          );
+                          });
                         } catch (alertError) {
                           console.error('❌ Error sending oncall alert:', alertError);
                         }
                       }
-                    }).catch((error) => {
+                    }).catch(async (error) => {
                       console.error('❌ Error in Agent Mode verified-generate:', error);
+                      try {
+                        const isSessionLimit = isSessionLimitError(error);
+                        await sendAgentModeOncallAlert({
+                          subject: isSessionLimit
+                            ? 'Agent Mode Verified Generate: Session limit exceeded'
+                            : 'Agent Mode Verified Generate: Failed',
+                          message: isSessionLimit
+                            ? `Verified generation failed because the session reached its limit.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`
+                            : `Verified generation failed.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                          sessionId: task.sessionId,
+                          context: {
+                            'Asset Type': originalApproval.assetType || 'unknown',
+                            'Original Asset URL': originalApproval.assetUrl,
+                            'Original Filename': originalApproval.filename || 'unknown',
+                            'Feedback': feedbackValue,
+                            'Execution ID': originalApproval.executionId,
+                            'Task ID': execution.taskId,
+                            'Slack Channel': originalApproval.slackChannel || 'N/A',
+                            'User ID': originalApproval.userId || 'N/A',
+                            'Error': error.message || String(error)
+                          }
+                        });
+                      } catch (alertError) {
+                        console.error('❌ Error sending oncall alert:', alertError);
+                      }
                     });
                     
                     console.log(`✅ Submitted feedback to Agent Mode session via verified-generate: ${task.sessionId}`);
