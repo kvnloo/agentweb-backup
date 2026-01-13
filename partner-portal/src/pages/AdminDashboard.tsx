@@ -546,6 +546,10 @@ export default function AdminDashboard() {
   const [tasks, setTasks] = useState<AdminTask[]>([]);
   const [orderBy, setOrderBy] = useState<string>("latestRunTime");
   const [order, setOrder] = useState<"asc" | "desc">("desc");
+  const [usersOrderBy, setUsersOrderBy] = useState<keyof User>("createdAt");
+  const [usersOrder, setUsersOrder] = useState<"asc" | "desc">("desc");
+  const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
+  const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
   const [title, setTitle] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1012,6 +1016,96 @@ export default function AdminDashboard() {
     });
   }, [tasks, order, orderBy]);
 
+  const getUserSortValue = (user: User, property: keyof User) => {
+    switch (property) {
+      case "createdAt":
+        return user.createdAt ? new Date(user.createdAt).getTime() : 0;
+      case "lastLoginTime":
+        return user.lastLoginTime ? new Date(user.lastLoginTime).getTime() : 0;
+      case "chatSessionCount":
+        return user.chatSessionCount ?? 0;
+      case "taskCount":
+        return user.taskCount ?? 0;
+      case "workflowCount":
+        return user.workflowCount ?? 0;
+      case "roles":
+        return (user.roles ?? []).join(",");
+      case "seoDomains":
+        return (user.seoDomains ?? []).join(",");
+      case "isOAuthUser":
+        return user.isOAuthUser ? 1 : 0;
+      case "isAdmin":
+        return user.isAdmin ? 1 : 0;
+      case "isActive":
+        return user.isActive === false ? 0 : 1;
+      default:
+        return (user as unknown as Record<string, unknown>)[property] ?? "";
+    }
+  };
+
+  const sortedUsers = React.useMemo(() => {
+    return [...contextUsers].sort((a, b) => {
+      const aVal = getUserSortValue(a, usersOrderBy);
+      const bVal = getUserSortValue(b, usersOrderBy);
+
+      if (typeof aVal === "number" && typeof bVal === "number") {
+        return usersOrder === "asc" ? aVal - bVal : bVal - aVal;
+      }
+
+      const aStr = String(aVal ?? "").toLowerCase();
+      const bStr = String(bVal ?? "").toLowerCase();
+      return usersOrder === "asc"
+        ? aStr.localeCompare(bStr)
+        : bStr.localeCompare(aStr);
+    });
+  }, [contextUsers, usersOrder, usersOrderBy]);
+
+  const handleUserSort = (property: keyof User) => {
+    const isAsc = usersOrderBy === property && usersOrder === "asc";
+    setUsersOrder(isAsc ? "desc" : "asc");
+    setUsersOrderBy(property);
+  };
+
+  const getWaitlistSortValue = (entry: WaitlistEntry, property: keyof WaitlistEntry) => {
+    switch (property) {
+      case "createdAt":
+      case "invitedAt":
+      case "joinedAt":
+        return entry[property] ? new Date(entry[property] as string).getTime() : 0;
+      case "useCaseCategories":
+        return (entry.useCaseCategories ?? []).join(",");
+      case "marketingChannels":
+        return (entry.marketingChannels ?? []).join(",");
+      case "requestReport":
+        return entry.requestReport ? 1 : 0;
+      default:
+        return (entry as unknown as Record<string, unknown>)[property] ?? "";
+    }
+  };
+
+  const sortedWaitlist = React.useMemo(() => {
+    return [...waitlist].sort((a, b) => {
+      const aVal = getWaitlistSortValue(a, waitlistOrderBy);
+      const bVal = getWaitlistSortValue(b, waitlistOrderBy);
+
+      if (typeof aVal === "number" && typeof bVal === "number") {
+        return waitlistOrder === "asc" ? aVal - bVal : bVal - aVal;
+      }
+
+      const aStr = String(aVal ?? "").toLowerCase();
+      const bStr = String(bVal ?? "").toLowerCase();
+      return waitlistOrder === "asc"
+        ? aStr.localeCompare(bStr)
+        : bStr.localeCompare(aStr);
+    });
+  }, [waitlist, waitlistOrder, waitlistOrderBy]);
+
+  const handleWaitlistSort = (property: keyof WaitlistEntry) => {
+    const isAsc = waitlistOrderBy === property && waitlistOrder === "asc";
+    setWaitlistOrder(isAsc ? "desc" : "asc");
+    setWaitlistOrderBy(property);
+  };
+
   const SortLabel = ({
     property,
     label,
@@ -1035,6 +1129,62 @@ export default function AdminDashboard() {
       {orderBy === property ? (
         <Box component="span" sx={{ ml: 1 }}>
           {order === "desc" ? "↓" : "↑"}
+        </Box>
+      ) : null}
+    </Box>
+  );
+
+  const UserSortLabel = ({
+    property,
+    label,
+  }: {
+    property: keyof User;
+    label: string;
+  }) => (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        cursor: "pointer",
+        userSelect: "none",
+        "&:hover": {
+          color: "primary.main",
+        },
+      }}
+      onClick={() => handleUserSort(property)}
+    >
+      {label}
+      {usersOrderBy === property ? (
+        <Box component="span" sx={{ ml: 1 }}>
+          {usersOrder === "desc" ? "↓" : "↑"}
+        </Box>
+      ) : null}
+    </Box>
+  );
+
+  const WaitlistSortLabel = ({
+    property,
+    label,
+  }: {
+    property: keyof WaitlistEntry;
+    label: string;
+  }) => (
+    <Box
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        cursor: "pointer",
+        userSelect: "none",
+        "&:hover": {
+          color: "primary.main",
+        },
+      }}
+      onClick={() => handleWaitlistSort(property)}
+    >
+      {label}
+      {waitlistOrderBy === property ? (
+        <Box component="span" sx={{ ml: 1 }}>
+          {waitlistOrder === "desc" ? "↓" : "↑"}
         </Box>
       ) : null}
     </Box>
@@ -2464,25 +2614,87 @@ export default function AdminDashboard() {
             <Table>
               <TableHead>
                 <TableRow>
-                  <TableCell>Email</TableCell>
-                  <TableCell>User ID</TableCell>
-                  <TableCell>Stripe Customer ID</TableCell>
-                  <TableCell>Ad Account</TableCell>
-                  <TableCell>Email Sender</TableCell>
-                  <TableCell>Slack Channel</TableCell>
-                  <TableCell>SEO/AEO</TableCell>
-                  <TableCell>CMS Type</TableCell>
-                  <TableCell>Created</TableCell>
-                  <TableCell>Last Login</TableCell>
-                  <TableCell>Support Note</TableCell>
-                  <TableCell>Roles</TableCell>
-                  <TableCell>Chat Sessions</TableCell>
-                  <TableCell>Tasks</TableCell>
-                  <TableCell>Workflows</TableCell>
-                  <TableCell>OAuth User</TableCell>
-                  <TableCell>Admin</TableCell>
-                  <TableCell>Status</TableCell>
-                  <TableCell>Subscription Type</TableCell>
+                  <TableCell>
+                    <UserSortLabel property="email" label="Email" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="userId" label="User ID" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="stripe_customer_id"
+                      label="Stripe Customer ID"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="adAccount" label="Ad Account" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="emailDomain"
+                      label="Email Sender"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="slackChannel"
+                      label="Slack Channel"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="seoDomains" label="SEO/AEO" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="cmsType" label="CMS Type" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="createdAt" label="Created" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="lastLoginTime"
+                      label="Last Login"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="supportNote"
+                      label="Support Note"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="roles" label="Roles" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="chatSessionCount"
+                      label="Chat Sessions"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="taskCount" label="Tasks" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="workflowCount" label="Workflows" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="isOAuthUser"
+                      label="OAuth User"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="isAdmin" label="Admin" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel property="isActive" label="Status" />
+                  </TableCell>
+                  <TableCell>
+                    <UserSortLabel
+                      property="subscriptionType"
+                      label="Subscription Type"
+                    />
+                  </TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
@@ -2494,7 +2706,7 @@ export default function AdminDashboard() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  contextUsers.map((user) => {
+                  sortedUsers.map((user) => {
                     // Determine roles to display, SOLELY from roles array.
                     let displayRoles: ("partner" | "customer" | "free")[] = [];
                     if (user.roles && user.roles.length > 0) {
@@ -3041,42 +3253,62 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>
-                    <SortLabel property="email" label="Email" />
-                  </TableCell>
-                  <TableCell>Stripe Customer ID</TableCell>
-                  <TableCell>
-                    <SortLabel property="fullName" label="Full Name" />
+                    <WaitlistSortLabel property="email" label="Email" />
                   </TableCell>
                   <TableCell>
-                    <SortLabel property="companyName" label="Company" />
+                    <WaitlistSortLabel
+                      property="stripe_customer_id"
+                      label="Stripe Customer ID"
+                    />
                   </TableCell>
                   <TableCell>
-                    <SortLabel property="phoneNumber" label="Phone Number" />
+                    <WaitlistSortLabel property="fullName" label="Full Name" />
                   </TableCell>
                   <TableCell>
-                    <SortLabel
+                    <WaitlistSortLabel property="companyName" label="Company" />
+                  </TableCell>
+                  <TableCell>
+                    <WaitlistSortLabel property="phoneNumber" label="Phone Number" />
+                  </TableCell>
+                  <TableCell>
+                    <WaitlistSortLabel
                       property="monthlyMarketingSpend"
                       label="Marketing Spend"
                     />
                   </TableCell>
                   <TableCell>
-                    <SortLabel
+                    <WaitlistSortLabel
                       property="marketingChannels"
                       label="Marketing Channels"
                     />
                   </TableCell>
                   <TableCell>
-                    <SortLabel property="businessArea" label="Business Area" />
+                    <WaitlistSortLabel property="businessArea" label="Business Area" />
                   </TableCell>
                   <TableCell>
-                    <SortLabel property="joinedAt" label="Joined" />
+                    <WaitlistSortLabel property="joinedAt" label="Joined" />
                   </TableCell>
                   <TableCell>Details</TableCell>
-                  <TableCell>Use Case</TableCell>
-                  <TableCell>Request Report</TableCell>
-                  <TableCell>Support Note</TableCell>
                   <TableCell>
-                    <SortLabel property="status" label="Status" />
+                    <WaitlistSortLabel
+                      property="useCaseDescription"
+                      label="Use Case"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <WaitlistSortLabel
+                      property="requestReport"
+                      label="Request Report"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <WaitlistSortLabel
+                      property="supportNote"
+                      label="Support Note"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <WaitlistSortLabel property="status" label="Status" />
                   </TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -3089,7 +3321,7 @@ export default function AdminDashboard() {
                     </TableCell>
                   </TableRow>
                 ) : (
-                  waitlist.map((entry: WaitlistEntry) => {
+                  sortedWaitlist.map((entry: WaitlistEntry) => {
                     const existingUser = contextUsers.find(
                       (user) => user.email === entry.email
                     );
