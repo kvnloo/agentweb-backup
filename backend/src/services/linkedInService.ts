@@ -42,7 +42,7 @@ export class LinkedInService {
     if (error.isAxiosError || error.response) {
       const status = error.response?.status;
       const message = error.response?.data?.message || error.message;
-      
+
       console.error(`LinkedIn API Error [${status}]: ${message}`, JSON.stringify(error.response?.data, null, 2));
 
       if (status === 401) {
@@ -54,7 +54,7 @@ export class LinkedInService {
       if (status === 429) {
         throw new Error('LinkedIn rate limit exceeded');
       }
-      
+
       throw new Error(`LinkedIn Error: ${message}`);
     }
     throw error;
@@ -108,14 +108,59 @@ export class LinkedInService {
   }
 
   /**
-   * Get current user profile
+   * Get current user profile using /v2/me endpoint
+   * Note: We use /v2/me instead of /v2/userinfo because OpenID scopes
+   * (openid, profile, email) cannot be used with Community Management API scopes
    */
   async getProfile(accessToken: string): Promise<LinkedInProfile> {
     return this.safeRequest(async () => {
-      const response = await this.client.get<LinkedInProfile>('/v2/userinfo', {
+      const response = await this.client.get<any>('/v2/me', {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
-      return response.data;
+
+      // Transform /v2/me response to match LinkedInProfile interface
+      const data = response.data;
+      return {
+        sub: data.id, // Member ID from /v2/me
+        name: `${data.localizedFirstName || ''} ${data.localizedLastName || ''}`.trim(),
+        given_name: data.localizedFirstName || '',
+        family_name: data.localizedLastName || '',
+        picture: '', // /v2/me doesn't include profile picture
+        locale: '', // /v2/me doesn't include locale
+        email: '', // Email requires separate API call or r_emailaddress scope
+        email_verified: false,
+      };
+    });
+  }
+
+  /**
+   * Get profile picture URL for the authenticated user
+   * Uses /v2/me with profilePicture projection
+   */
+  async getProfilePicture(accessToken: string): Promise<string | null> {
+    return this.safeRequest(async () => {
+      try {
+        const response = await this.client.get<any>('/v2/me', {
+          params: {
+            projection: '(id,profilePicture(displayImage~:playableStreams))'
+          },
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+
+        const displayImage = response.data?.profilePicture?.['displayImage~'];
+        const elements = displayImage?.elements;
+
+        if (elements && elements.length > 0) {
+          // Get the largest image
+          const largestImage = elements[elements.length - 1];
+          return largestImage?.identifiers?.[0]?.identifier || null;
+        }
+
+        return null;
+      } catch (error) {
+        console.warn('[LinkedIn] Failed to fetch profile picture:', error);
+        return null;
+      }
     });
   }
 
@@ -140,18 +185,18 @@ export class LinkedInService {
   async getFollowerStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInFollowerStatistics[]> {
     return this.safeRequest(async () => {
 
-      
+
       const encodedUrn = encodeURIComponent(organizationUrn);
       const queryString = `q=organizationalEntity&organizationalEntity=${encodedUrn}`;
 
-      
+
       const response = await this.client.get<{ elements: LinkedInFollowerStatistics[] }>(
         `/rest/organizationalEntityFollowerStatistics?${queryString}`,
-        { 
-          headers: { 
+        {
+          headers: {
             Authorization: `Bearer ${accessToken}`,
             'X-RestLi-Method': 'FINDER'
-          } 
+          }
         }
       );
 
@@ -168,18 +213,18 @@ export class LinkedInService {
   async getPageStatistics(accessToken: string, organizationUrn: string): Promise<LinkedInPageStatistics[]> {
     return this.safeRequest(async () => {
 
-      
+
       const encodedUrn = encodeURIComponent(organizationUrn);
       const queryString = `q=organization&organization=${encodedUrn}`;
 
-      
+
       const response = await this.client.get<{ elements: LinkedInPageStatistics[] }>(
         `/rest/organizationPageStatistics?${queryString}`,
-        { 
-          headers: { 
+        {
+          headers: {
             Authorization: `Bearer ${accessToken}`,
             'X-RestLi-Method': 'FINDER'
-          } 
+          }
         }
       );
 
@@ -198,25 +243,25 @@ export class LinkedInService {
   ): Promise<LinkedInShareStatistics[]> {
     return this.safeRequest(async () => {
 
-      
+
       // Build URL manually to ensure proper encoding
       const encodedOrgUrn = encodeURIComponent(organizationUrn);
       let queryString = `q=organizationalEntity&organizationalEntity=${encodedOrgUrn}`;
-      
+
       if (shareUrns && shareUrns.length > 0) {
         const encodedShares = shareUrns.map(urn => encodeURIComponent(urn)).join(',');
         queryString += `&shares=List(${encodedShares})`;
       }
-      
+
 
 
       const response = await this.client.get<{ elements: LinkedInShareStatistics[] }>(
         `/rest/organizationalEntityShareStatistics?${queryString}`,
-        { 
-          headers: { 
+        {
+          headers: {
             Authorization: `Bearer ${accessToken}`,
             'X-RestLi-Method': 'FINDER'
-          } 
+          }
         }
       );
 
@@ -234,18 +279,18 @@ export class LinkedInService {
   async listPosts(accessToken: string, authorUrn: string, start: number = 0, count: number = 50): Promise<LinkedInPaginatedResponse<LinkedInPost>> {
     return this.safeRequest(async () => {
 
-      
+
       // Count must be <= 100
       const safeCount = Math.min(count, 100);
-      
+
       // Build URL manually to ensure proper encoding (axios doesn't encode colons by default)
       const encodedAuthor = encodeURIComponent(authorUrn);
       const queryString = `q=author&author=${encodedAuthor}&start=${start}&count=${safeCount}&sortBy=LAST_MODIFIED`;
 
-      
+
       try {
         const response = await this.client.get<LinkedInPaginatedResponse<LinkedInPost>>(`/rest/posts?${queryString}`, {
-          headers: { 
+          headers: {
             Authorization: `Bearer ${accessToken}`,
             'X-RestLi-Method': 'FINDER'  // Required for finder endpoints
           },
@@ -413,7 +458,7 @@ export class LinkedInService {
     }
     return this.safeRequest(async () => {
       const orgId = orgUrn.replace('urn:li:organization:', '');
-      
+
       const response = await this.client.get(`/rest/organizations/${orgId}`, {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
@@ -474,6 +519,117 @@ export class LinkedInService {
       console.warn('[LinkedIn verifyToken] Network error:', error.code || error.message);
       return { valid: true, uncertain: true, error: 'Network error - could not verify token' };
     }
+  }
+
+  /**
+   * Get follower count for personal profile
+   * Uses the memberFollowersCount API endpoint
+   */
+  async getPersonalFollowerCount(accessToken: string): Promise<number> {
+    return this.safeRequest(async () => {
+      const response = await this.client.get<{ elements: Array<{ memberFollowersCount: number }> }>(
+        '/rest/memberFollowersCount',
+        {
+          params: { q: 'me' },
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+
+      const followers = response.data.elements?.[0]?.memberFollowersCount || 0;
+      return followers;
+    });
+  }
+
+  /**
+   * Get aggregated post analytics for personal profile
+   * Retrieves impressions and members reached for a date range
+   * @param accessToken - OAuth access token
+   * @param startDate - Optional start date (defaults to 30 days ago)
+   * @param endDate - Optional end date (defaults to today)
+   */
+  async getPersonalPostAnalytics(
+    accessToken: string,
+    startDate?: Date,
+    endDate?: Date
+  ): Promise<{ impression: number; members_reached: number }> {
+    return this.safeRequest(async () => {
+      const end = endDate || new Date();
+      const start = startDate || new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+
+      // Build date range parameter
+      const dateRange = `(start:(day:${start.getDate()},month:${start.getMonth() + 1},year:${start.getFullYear()}),end:(day:${end.getDate()},month:${end.getMonth() + 1},year:${end.getFullYear()}))`;
+
+      const metrics = ['IMPRESSION', 'MEMBERS_REACHED'];
+      const analyticsData: any = {};
+
+      for (const metric of metrics) {
+        const url = `/rest/memberCreatorPostAnalytics?q=me&queryType=${metric}&aggregation=TOTAL&dateRange=${dateRange}`;
+
+        try {
+          const response = await this.client.get<{ elements: Array<{ count: number }> }>(url, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+
+          const totalCount = response.data.elements?.reduce((sum, el) => sum + (el.count || 0), 0) || 0;
+          analyticsData[metric.toLowerCase()] = totalCount;
+        } catch (error) {
+          console.warn(`[LinkedIn] Failed to fetch ${metric}:`, error);
+          analyticsData[metric.toLowerCase()] = 0;
+        }
+      }
+
+      return analyticsData;
+    });
+  }
+
+  /**
+   * Get analytics for a specific personal post by URN
+   * Retrieves detailed metrics including impressions, reach, reactions, comments, and reshares
+   * @param accessToken - OAuth access token
+   * @param postUrn - Post URN (e.g., "urn:li:share:123" or "urn:li:ugcPost:456")
+   */
+  async getPersonalPostAnalyticsByUrn(
+    accessToken: string,
+    postUrn: string
+  ): Promise<{
+    impression: number;
+    members_reached: number;
+    reaction: number;
+    comment: number;
+    reshare: number;
+  }> {
+    return this.safeRequest(async () => {
+      // Determine entity type from URN
+      let entityParam: string;
+      if (postUrn.startsWith('urn:li:share:')) {
+        entityParam = `(share:${encodeURIComponent(postUrn)})`;
+      } else if (postUrn.startsWith('urn:li:ugcPost:')) {
+        entityParam = `(ugc:${encodeURIComponent(postUrn)})`;
+      } else {
+        throw new Error('Invalid post URN format. Must be urn:li:share: or urn:li:ugcPost:');
+      }
+
+      const metrics = ['IMPRESSION', 'MEMBERS_REACHED', 'REACTION', 'COMMENT', 'RESHARE'];
+      const analyticsData: any = {};
+
+      for (const metric of metrics) {
+        const url = `/rest/memberCreatorPostAnalytics?q=entity&entity=${entityParam}&queryType=${metric}&aggregation=TOTAL`;
+
+        try {
+          const response = await this.client.get<{ elements: Array<{ count: number }> }>(url, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+
+          const totalCount = response.data.elements?.reduce((sum, el) => sum + (el.count || 0), 0) || 0;
+          analyticsData[metric.toLowerCase()] = totalCount;
+        } catch (error) {
+          console.warn(`[LinkedIn] Failed to fetch ${metric} for post ${postUrn}:`, error);
+          analyticsData[metric.toLowerCase()] = 0;
+        }
+      }
+
+      return analyticsData;
+    });
   }
 }
 

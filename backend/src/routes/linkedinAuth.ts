@@ -3,7 +3,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import jwksClient from 'jwks-rsa';
-import { getLinkedInConfig, getLinkedInOrgConfig } from '../config/integrations';
+import { getLinkedInConfig } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
@@ -75,13 +75,12 @@ const verifyLinkedInIdToken = async (idToken: string): Promise<{ sub: string; na
 interface StatePayload {
   userId: string;
   nonce: string;
-  type: 'personal' | 'organization';
 }
 
 // Helper to generate signed state with cryptographically secure nonce
-const generateState = (userId: string, type: 'personal' | 'organization'): string => {
+const generateState = (userId: string): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  const payload: StatePayload = { userId, nonce, type };
+  const payload: StatePayload = { userId, nonce };
   return jwt.sign(payload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
 };
 
@@ -173,31 +172,31 @@ const retrieveTokenSession = (sessionId: string, userId: string): TokenSession['
 };
 
 // ============================================
-// LinkedIn Personal Profile OAuth
+// LinkedIn Unified OAuth (Personal + Organization)
 // ============================================
 
-// LinkedIn Personal OAuth Init
-// Returns the authorization URL to the frontend
+// LinkedIn OAuth Init
+// Returns the authorization URL with all scopes for both personal and organization
 router.get('/init', authenticateToken, async (req: any, res) => {
   try {
     const userId = req.user.userId;
     const config = await getLinkedInConfig();
-    
+
     // Generate signed state
-    const state = generateState(userId, 'personal');
-    
+    const state = generateState(userId);
+
     // Build URL using helper
     const url = buildOAuthUrl(config, state);
     res.json({ success: true, url });
-    
+
   } catch (error) {
     console.error('Error initializing LinkedIn OAuth:', error);
     res.status(500).json({ error: 'Failed to initialize LinkedIn OAuth' });
   }
 });
 
-// LinkedIn Personal OAuth Callback
-// This route is hit by LinkedIn. It renders the popup closer or redirects to frontend.
+// LinkedIn OAuth Callback
+// This route is hit by LinkedIn after authorization
 router.get('/callback', async (req, res) => {
   const { code, state, error } = req.query;
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
@@ -210,12 +209,12 @@ router.get('/callback', async (req, res) => {
     return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
   }
 
-  // Pass the state back to the frontend so it can be sent to /connect
-  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_code=${code}&state=${state}`);
+  // Pass code and state to frontend for finalization
+  res.redirect(`${frontendUrl}/oauth/linkedin/callback?code=${code}&state=${state}`);
 });
 
-// Finalize LinkedIn Personal Connection
-router.post('/connect', authenticateToken, async (req: any, res) => {
+// Finalize LinkedIn OAuth - Exchange code for token and fetch available accounts
+router.post('/finalize', authenticateToken, async (req: any, res) => {
   const { code, state } = req.body;
   const userId = req.user.userId;
 
@@ -234,10 +233,10 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
 
   try {
     const config = await getLinkedInConfig();
-    
-    console.log('[LinkedIn Connect] Exchanging code for tokens...');
-    
-    // Exchange code
+
+    console.log('[LinkedIn Finalize] Exchanging code for tokens...');
+
+    // Exchange code for access token
     const tokenResponse = await axios.post(config.tokenUrl, null, {
       params: {
         grant_type: 'authorization_code',
@@ -252,14 +251,14 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     });
 
     const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number; id_token?: string };
-    
-    // Try to extract profile from id_token first
-    let profile: { sub: string; name: string; email?: string; picture?: string } = { 
+
+    // Fetch personal profile
+    let profile: { sub: string; name: string; email?: string; picture?: string } = {
       sub: `linkedin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      name: 'LinkedIn User' 
+      name: 'LinkedIn User'
     };
-    
-    // Verify and extract from id_token using JWKS
+
+    // Try id_token first
     if (id_token) {
       const verifiedPayload = await verifyLinkedInIdToken(id_token);
       if (verifiedPayload) {
@@ -269,169 +268,73 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
         if (verifiedPayload.picture) profile.picture = verifiedPayload.picture;
       }
     }
-    
-    // Method 2: If id_token didn't have info, try the API call
+
+    // Fallback to API call if needed
     if (profile.sub.startsWith('linkedin_')) {
       try {
         const apiProfile = await linkedInService.getProfile(access_token);
         profile.sub = apiProfile.sub;
         profile.name = apiProfile.name;
         if (apiProfile.email) profile.email = apiProfile.email;
-        if (apiProfile.picture) profile.picture = apiProfile.picture;
-      } catch (profileError: any) {
-        console.warn('[LinkedIn Connect] Profile API failed, using fallback.', profileError.message);
-      }
-    }
 
-    // Ensure URN format for account_id
-    let accountId = profile.sub;
-    if (!accountId.startsWith('urn:')) {
-      accountId = `urn:li:person:${accountId}`;
-    }
-
-    // Save to DB
-    const accountInput = {
-      account_id: accountId,
-      account_name: profile.name,
-      config: {
-        account_type: 'personal' as const,
-        profile_id: accountId,
-        profile_image_url: profile.picture,
-        access_token,
-        refresh_token,
-        token_expires_at: Date.now() + (expires_in * 1000),
-        scopes: config.scopes
-      }
-    };
-
-    const account = await createAccount(userId, 'linkedin', accountInput);
-
-    res.json({ success: true, account });
-
-  } catch (error: any) {
-    console.error('Connect Error:', error);
-    const details = IS_PRODUCTION ? undefined : error.message;
-    res.status(500).json({ error: 'Failed to connect account', ...(details && { details }) });
-  }
-});
-
-// ============================================
-// LinkedIn Organization/Company Pages OAuth
-// ============================================
-
-// LinkedIn Organization OAuth Init
-router.get('/org/init', authenticateToken, async (req: any, res) => {
-  try {
-    const userId = req.user.userId;
-    const config = await getLinkedInOrgConfig();
-    
-    const state = generateState(userId, 'organization');
-    
-    // Build URL using helper
-    const url = buildOAuthUrl(config, state);
-    res.json({ success: true, url });
-  } catch (error) {
-    console.error('Error initializing LinkedIn Org OAuth:', error);
-    res.status(500).json({ error: 'Failed to initialize LinkedIn Organization OAuth' });
-  }
-});
-
-// LinkedIn Organization OAuth Callback
-router.get('/org/callback', async (req, res) => {
-  const { code, state, error } = req.query;
-  const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-
-  if (error) {
-    return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=linkedin_org_access_denied&details=${error}`);
-  }
-
-  if (!code) {
-    return res.redirect(`${frontendUrl}/oauth/linkedin/callback?error=no_code_provided`);
-  }
-
-  // Redirect with org-specific code parameter AND state
-  res.redirect(`${frontendUrl}/oauth/linkedin/callback?linkedin_org_code=${code}&state=${state}`);
-});
-
-// Get user's admin organizations (after org OAuth)
-router.post('/organizations', authenticateToken, async (req: any, res) => {
-  const { code, state } = req.body;
-  const userId = req.user.userId;
-
-  // Input validation
-  if (!code || typeof code !== 'string' || code.trim() === '') {
-    return res.status(400).json({ error: 'Invalid or missing OAuth code' });
-  }
-  if (!state || typeof state !== 'string' || state.trim() === '') {
-    return res.status(400).json({ error: 'Invalid or missing state parameter' });
-  }
-
-  // Security Check: Verify State
-  if (!verifyState(state, userId)) {
-    return res.status(403).json({ error: 'Invalid or expired state parameter. CSRF protection.' });
-  }
-
-  try {
-    const config = await getLinkedInOrgConfig();
-
-    
-    // Exchange code for access token
-    const tokenResponse = await axios.post(config.tokenUrl, null, {
-      params: {
-        grant_type: 'authorization_code',
-        code: code,
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        redirect_uri: config.redirectUri
-      },
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      timeout: 15000 // 15 second timeout
-    });
-
-
-    const { access_token, refresh_token, expires_in } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number };
-    
-    // Get organizations where user is admin
-    const aclResponse = await linkedInService.getAdminOrganizations(access_token);
-
-    
-    // Filter out any undefined or invalid organization targets
-    // Note: LinkedIn API returns 'organization' field, not 'organizationTarget'
-    const orgUrns = aclResponse.elements
-      .map(acl => (acl as any).organization || acl.organizationTarget)
-      .filter((urn): urn is string => urn != null && typeof urn === 'string' && urn.length > 0);
-    
-
-    
-    // Get details for each organization
-    const organizations = await Promise.all(
-      orgUrns.map(async (orgUrn: string) => {
+        // Fetch profile picture separately
         try {
-          const orgDetails = await linkedInService.getOrganization(access_token, orgUrn);
-          const followerCount = await linkedInService.getOrganizationFollowerCount(access_token, orgUrn);
-          return {
-            urn: orgUrn,
-            id: orgDetails.id,
-            name: orgDetails.name,
-            vanityName: orgDetails.vanityName,
-            logoUrl: orgDetails.logoUrl,
-            followerCount,
-          };
-        } catch (err) {
-          console.warn(`Failed to get details for org ${orgUrn}:`, err);
-          return {
-            urn: orgUrn,
-            id: orgUrn.replace('urn:li:organization:', ''),
-            name: `Organization ${orgUrn.replace('urn:li:organization:', '')}`,
-            followerCount: 0,
-          };
+          const pictureUrl = await linkedInService.getProfilePicture(access_token);
+          if (pictureUrl) profile.picture = pictureUrl;
+        } catch (pictureError) {
+          console.warn('[LinkedIn Finalize] Failed to fetch profile picture:', pictureError);
         }
-      })
-    );
+      } catch (profileError: any) {
+        console.warn('[LinkedIn Finalize] Profile API failed, using fallback.', profileError.message);
+      }
+    }
 
-    // Store tokens server-side and return session ID (not tokens)
+
+    // Ensure URN format
+    let profileUrn = profile.sub;
+    if (!profileUrn.startsWith('urn:')) {
+      profileUrn = `urn:li:person:${profileUrn}`;
+    }
+
+    // Fetch organizations where user has admin access
+    let organizations: any[] = [];
+    try {
+      const aclResponse = await linkedInService.getAdminOrganizations(access_token);
+      const orgUrns = aclResponse.elements
+        .map(acl => (acl as any).organization || acl.organizationTarget)
+        .filter((urn): urn is string => urn != null && typeof urn === 'string' && urn.length > 0);
+
+      // Get details for each organization
+      organizations = await Promise.all(
+        orgUrns.map(async (orgUrn: string) => {
+          try {
+            const orgDetails = await linkedInService.getOrganization(access_token, orgUrn);
+            const followerCount = await linkedInService.getOrganizationFollowerCount(access_token, orgUrn);
+            return {
+              urn: orgUrn,
+              id: orgDetails.id,
+              name: orgDetails.name,
+              vanityName: orgDetails.vanityName,
+              logoUrl: orgDetails.logoUrl,
+              followerCount,
+            };
+          } catch (err) {
+            console.warn(`Failed to get details for org ${orgUrn}:`, err);
+            return {
+              urn: orgUrn,
+              id: orgUrn.replace('urn:li:organization:', ''),
+              name: `Organization ${orgUrn.replace('urn:li:organization:', '')}`,
+              followerCount: 0,
+            };
+          }
+        })
+      );
+    } catch (error: any) {
+      console.warn('[LinkedIn Finalize] Failed to fetch organizations:', error.message);
+      // Continue without organizations - user can still connect personal account
+    }
+
+    // Store tokens server-side and return session ID
     const tokenSessionId = storeTokenSession(userId, {
       access_token,
       refresh_token,
@@ -441,23 +344,31 @@ router.post('/organizations', authenticateToken, async (req: any, res) => {
 
     res.json({
       success: true,
+      profile: {
+        urn: profileUrn,
+        name: profile.name,
+        email: profile.email,
+        picture: profile.picture
+      },
       organizations,
       tokenSessionId
     });
 
   } catch (error: any) {
-    console.error('Get Organizations Error:', error);
+    console.error('[LinkedIn Finalize] Error:', error);
     const details = IS_PRODUCTION ? undefined : error.message;
-    res.status(500).json({ error: 'Failed to get organizations', ...(details && { details }) });
+    res.status(500).json({ error: 'Failed to finalize LinkedIn connection', ...(details && { details }) });
   }
 });
 
-router.post('/connect-pages', authenticateToken, async (req: any, res) => {
-  const { organizations, tokenSessionId } = req.body;
+// Connect selected LinkedIn accounts (personal and/or organizations)
+router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
+  const { personal, organizations, profile, tokenSessionId } = req.body;
   const userId = req.user.userId;
 
-  if (!organizations || !Array.isArray(organizations) || organizations.length === 0) {
-    return res.status(400).json({ error: 'No organizations selected' });
+  // Validate at least one account is selected
+  if (!personal && (!organizations || organizations.length === 0)) {
+    return res.status(400).json({ error: 'No accounts selected' });
   }
 
   if (!tokenSessionId) {
@@ -471,20 +382,18 @@ router.post('/connect-pages', authenticateToken, async (req: any, res) => {
   }
 
   try {
-    const config = await getLinkedInOrgConfig();
+    const config = await getLinkedInConfig();
     const connectedAccounts = [];
 
-    for (const org of organizations) {
+    // Connect personal account if selected
+    if (personal && profile) {
       const accountInput = {
-        account_id: org.urn,
-        account_name: org.name,
+        account_id: profile.urn,
+        account_name: profile.name,
         config: {
-          account_type: 'company_page' as const,
-          page_id: org.id,
-          organization_id: org.urn,
-          profile_image_url: org.logoUrl,
-          follower_count: org.followerCount,
-          account_handle: org.vanityName,
+          account_type: 'personal' as const,
+          profile_id: profile.urn,
+          profile_image_url: profile.picture,
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
           token_expires_at: Date.now() + (tokens.expires_in * 1000),
@@ -496,12 +405,37 @@ router.post('/connect-pages', authenticateToken, async (req: any, res) => {
       connectedAccounts.push(account);
     }
 
+    // Connect selected organizations
+    if (organizations && Array.isArray(organizations)) {
+      for (const org of organizations) {
+        const accountInput = {
+          account_id: org.urn,
+          account_name: org.name,
+          config: {
+            account_type: 'company_page' as const,
+            page_id: org.id,
+            organization_id: org.urn,
+            profile_image_url: org.logoUrl,
+            follower_count: org.followerCount,
+            account_handle: org.vanityName,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            token_expires_at: Date.now() + (tokens.expires_in * 1000),
+            scopes: config.scopes
+          }
+        };
+
+        const account = await createAccount(userId, 'linkedin', accountInput);
+        connectedAccounts.push(account);
+      }
+    }
+
     res.json({ success: true, accounts: connectedAccounts });
 
   } catch (error: any) {
-    console.error('Connect Pages Error:', error);
+    console.error('[LinkedIn Connect Accounts] Error:', error);
     const details = IS_PRODUCTION ? undefined : error.message;
-    res.status(500).json({ error: 'Failed to connect pages', ...(details && { details }) });
+    res.status(500).json({ error: 'Failed to connect accounts', ...(details && { details }) });
   }
 });
 
