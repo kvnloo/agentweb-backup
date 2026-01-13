@@ -12,6 +12,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    createOrReuseInteractiveShare: jest.fn(),
   },
   updateTaskExecutionStatus: jest.fn(),
 }));
@@ -67,6 +68,7 @@ describe('AgentModeController - Error Handling', () => {
     jest.clearAllMocks();
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
+    mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('http://ishare.test/session');
     mockEmailService.sendOncallAlert.mockResolvedValue(undefined);
     // Default successful response
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
@@ -174,6 +176,7 @@ describe('AgentModeController - Error Handling', () => {
       } as unknown as Response;
 
       await agentModeController.generateResponse(mockReq, mockRes);
+      await new Promise((resolve) => setImmediate(resolve));
 
       // Should send oncall alert
       expect(mockEmailService.sendOncallAlert).toHaveBeenCalledWith(
@@ -224,6 +227,7 @@ describe('AgentModeController - Error Handling', () => {
       } as unknown as Response;
 
       await agentModeController.generateResponse(mockReq, mockRes);
+      await new Promise((resolve) => setImmediate(resolve));
 
       // Should log error but not throw
       expect(consoleErrorSpy).toHaveBeenCalledWith(
@@ -261,6 +265,7 @@ describe('AgentModeController - Error Handling', () => {
       } as unknown as Response;
 
       await agentModeController.generateResponse(mockReq, mockRes);
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(mockEmailService.sendOncallAlert).toHaveBeenCalledWith(
         expect.any(String),
@@ -348,6 +353,7 @@ describe('AgentModeController - Error Handling', () => {
       } as any);
 
       await agentModeController.generateSharedResponse(mockReq, mockRes);
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(mockEmailService.sendOncallAlert).toHaveBeenCalledWith(
         'Agent Mode: Unknown Error in Generate Shared Response',

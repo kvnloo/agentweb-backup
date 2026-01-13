@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users can now select from predefined work plans when starting a new chat session',
       '- Work plans are displayed as cards with descriptions below the conversation starters',
       '- Each work plan guides the AI through a structured sequence of steps to complete specific tasks',
+      'Improved Agent Mode oncall alerting for context-limit errors',
+      '- Oncall alerts now trigger when model context limits are exceeded in Agent Mode responses',
+      '- Lifted the message count limit from 150 to 300 per session',
     ],
   },
   {

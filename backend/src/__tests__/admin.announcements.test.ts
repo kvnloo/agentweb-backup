@@ -1,5 +1,4 @@
-import request from 'supertest';
-import express, { Request, Response } from 'express';
+import { Request } from 'express';
 import adminRoutes from '../routes/admin';
 import { userDb } from '../services/db';
 import { resendService } from '../services/resendService';
@@ -28,10 +27,6 @@ jest.mock('../middleware/admin', () => ({
   },
 }));
 
-const app = express();
-app.use(express.json());
-app.use('/api/admin', adminRoutes);
-
 const getRouteHandler = (path: string, method: 'post' | 'get' | 'put' | 'delete') => {
   const layer = (adminRoutes as any).stack.find((item: any) =>
     item.route && item.route.path === path && item.route.methods?.[method]
@@ -45,11 +40,38 @@ const getRouteHandler = (path: string, method: 'post' | 'get' | 'put' | 'delete'
   return stack[stack.length - 1].handle;
 };
 
-const mockResponse = () => {
-  const res: any = {};
-  res.status = jest.fn().mockReturnValue(res);
-  res.json = jest.fn().mockReturnValue(res);
-  return res as Response;
+type MockResponse = {
+  status: jest.Mock;
+  json: jest.Mock;
+  body?: any;
+};
+
+const mockResponse = (): MockResponse => {
+  const res: MockResponse = {
+    status: jest.fn(),
+    json: jest.fn(),
+  };
+  res.status.mockReturnValue(res);
+  res.json.mockImplementation((payload: any) => {
+    res.body = payload;
+    return res;
+  });
+  return res;
+};
+
+const invokeRoute = async (
+  path: string,
+  method: 'post' | 'get' | 'put' | 'delete',
+  body: any
+): Promise<MockResponse> => {
+  const handler = getRouteHandler(path, method);
+  const req = {
+    body,
+    user: { userId: 'test-admin', isAdmin: true },
+  } as unknown as Request;
+  const res = mockResponse();
+  await handler(req, res);
+  return res;
 };
 
 describe('Admin Announcements', () => {
@@ -78,14 +100,12 @@ describe('Admin Announcements', () => {
       const title = 'Test Announcement';
       const message = '<p>This is a test message</p>';
 
-      const response = await request(app)
-        .post('/api/admin/announcements/send')
-        .send({ title, message })
-        .expect(200);
+      const res = await invokeRoute('/announcements/send', 'post', { title, message });
 
-      expect(response.body.message).toContain('Announcement sent to');
-      expect(response.body.details.total).toBe(2); // Only active users
-      expect(response.body.details.successful).toBe(2);
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(res.body.message).toContain('Announcement sent to');
+      expect(res.body.details.total).toBe(2); // Only active users
+      expect(res.body.details.successful).toBe(2);
 
       // Verify resendService.sendSystemEmail was called (which internally calls sendEmail with correct from)
       expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
@@ -107,12 +127,10 @@ describe('Admin Announcements', () => {
     });
 
     it('should return 400 if title is missing', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/send')
-        .send({ message: '<p>Test message</p>' })
-        .expect(400);
+      const res = await invokeRoute('/announcements/send', 'post', { message: '<p>Test message</p>' });
 
-      expect(response.body.message).toBe('Title and message are required');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('Title and message are required');
     });
 
     it('should return 400 if message is missing', async () => {
@@ -139,17 +157,15 @@ describe('Admin Announcements', () => {
         });
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/send')
-        .send({ 
-          title: 'Test Announcement',
-          message: '<p>Test message</p>'
-        })
-        .expect(200);
+      const res = await invokeRoute('/announcements/send', 'post', { 
+        title: 'Test Announcement',
+        message: '<p>Test message</p>'
+      });
 
-      expect(response.body.details.successful).toBe(1);
-      expect(response.body.details.failed).toBe(1);
-      expect(response.body.details.failedEmails).toContain('user1@example.com');
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(res.body.details.successful).toBe(1);
+      expect(res.body.details.failed).toBe(1);
+      expect(res.body.details.failedEmails).toContain('user1@example.com');
     });
 
     it('should handle null return value from resendService (failed after retries)', async () => {
@@ -157,17 +173,15 @@ describe('Admin Announcements', () => {
         .mockResolvedValueOnce(null) // Failed after retries
         .mockResolvedValueOnce({ id: 'test-email-id' });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/send')
-        .send({ 
-          title: 'Test Announcement',
-          message: '<p>Test message</p>'
-        })
-        .expect(200);
+      const res = await invokeRoute('/announcements/send', 'post', { 
+        title: 'Test Announcement',
+        message: '<p>Test message</p>'
+      });
 
-      expect(response.body.details.successful).toBe(1);
-      expect(response.body.details.failed).toBe(1);
-      expect(response.body.details.failedEmails).toContain('user1@example.com');
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(res.body.details.successful).toBe(1);
+      expect(res.body.details.failed).toBe(1);
+      expect(res.body.details.failedEmails).toContain('user1@example.com');
     });
   });
 
@@ -177,14 +191,12 @@ describe('Admin Announcements', () => {
       const message = '<p>This is a test message</p>';
       const recipients = ['test1@example.com', 'test2@example.com'];
 
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ title, message, recipients })
-        .expect(200);
+      const res = await invokeRoute('/announcements/test', 'post', { title, message, recipients });
 
-      expect(response.body.message).toContain('Test announcement sent to');
-      expect(response.body.details.total).toBe(2);
-      expect(response.body.details.successful).toBe(2);
+      expect(res.status).not.toHaveBeenCalledWith(400);
+      expect(res.body.message).toContain('Test announcement sent to');
+      expect(res.body.details.total).toBe(2);
+      expect(res.body.details.successful).toBe(2);
 
       // Verify resendService.sendSystemEmail was called (which internally calls sendEmail with correct from)
       expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
@@ -212,52 +224,44 @@ describe('Admin Announcements', () => {
     });
 
     it('should return 400 if title is missing', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          message: '<p>Test message</p>',
-          recipients: ['test@example.com']
-        })
-        .expect(400);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        message: '<p>Test message</p>',
+        recipients: ['test@example.com']
+      });
 
-      expect(response.body.message).toBe('Title and message are required');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('Title and message are required');
     });
 
     it('should return 400 if message is missing', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          title: 'Test Title',
-          recipients: ['test@example.com']
-        })
-        .expect(400);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        title: 'Test Title',
+        recipients: ['test@example.com']
+      });
 
-      expect(response.body.message).toBe('Title and message are required');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('Title and message are required');
     });
 
     it('should return 400 if recipients array is missing', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          title: 'Test Title',
-          message: '<p>Test message</p>'
-        })
-        .expect(400);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        title: 'Test Title',
+        message: '<p>Test message</p>'
+      });
 
-      expect(response.body.message).toBe('At least one recipient email is required');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('At least one recipient email is required');
     });
 
     it('should return 400 if recipients array is empty', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          title: 'Test Title',
-          message: '<p>Test message</p>',
-          recipients: []
-        })
-        .expect(400);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        title: 'Test Title',
+        message: '<p>Test message</p>',
+        recipients: []
+      });
 
-      expect(response.body.message).toBe('At least one recipient email is required');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('At least one recipient email is required');
     });
 
     it('should filter out invalid email addresses', async () => {
@@ -265,28 +269,23 @@ describe('Admin Announcements', () => {
       const message = '<p>Test message</p>';
       const recipients = ['valid@example.com', 'invalid-email', 'another@example.com'];
 
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ title, message, recipients })
-        .expect(200);
+      const res = await invokeRoute('/announcements/test', 'post', { title, message, recipients });
 
-      expect(response.body.details.total).toBe(2); // Only valid emails
-      expect(response.body.details.invalidEmails).toContain('invalid-email');
+      expect(res.body.details.total).toBe(2); // Only valid emails
+      expect(res.body.details.invalidEmails).toContain('invalid-email');
       expect(mockResendService.sendSystemEmail).toHaveBeenCalledTimes(2);
       expect(mockResendService.sendEmail).toHaveBeenCalledTimes(2);
     });
 
     it('should return 400 if no valid email addresses provided', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          title: 'Test Title',
-          message: '<p>Test message</p>',
-          recipients: ['invalid-email', 'also-invalid']
-        })
-        .expect(400);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        title: 'Test Title',
+        message: '<p>Test message</p>',
+        recipients: ['invalid-email', 'also-invalid']
+      });
 
-      expect(response.body.message).toBe('No valid email addresses provided');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('No valid email addresses provided');
     });
 
     it('should trim email addresses before validation', async () => {
@@ -294,12 +293,9 @@ describe('Admin Announcements', () => {
       const message = '<p>Test message</p>';
       const recipients = ['  valid@example.com  ', '  another@example.com  '];
 
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ title, message, recipients })
-        .expect(200);
+      const res = await invokeRoute('/announcements/test', 'post', { title, message, recipients });
 
-      expect(response.body.details.total).toBe(2);
+      expect(res.body.details.total).toBe(2);
       expect(mockResendService.sendSystemEmail).toHaveBeenCalledWith(
         expect.objectContaining({
           to: 'valid@example.com', // Trimmed
@@ -330,18 +326,15 @@ describe('Admin Announcements', () => {
         });
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          title: 'Test Announcement',
-          message: '<p>Test message</p>',
-          recipients: ['test1@example.com', 'test2@example.com']
-        })
-        .expect(200);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        title: 'Test Announcement',
+        message: '<p>Test message</p>',
+        recipients: ['test1@example.com', 'test2@example.com']
+      });
 
-      expect(response.body.details.successful).toBe(1);
-      expect(response.body.details.failed).toBe(1);
-      expect(response.body.details.failedEmails).toContain('test1@example.com');
+      expect(res.body.details.successful).toBe(1);
+      expect(res.body.details.failed).toBe(1);
+      expect(res.body.details.failedEmails).toContain('test1@example.com');
     });
 
     it('should handle null return value from resendService (failed after retries)', async () => {
@@ -349,18 +342,15 @@ describe('Admin Announcements', () => {
         .mockResolvedValueOnce(null) // Failed after retries
         .mockResolvedValueOnce({ id: 'test-email-id' });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/test')
-        .send({ 
-          title: 'Test Announcement',
-          message: '<p>Test message</p>',
-          recipients: ['test1@example.com', 'test2@example.com']
-        })
-        .expect(200);
+      const res = await invokeRoute('/announcements/test', 'post', { 
+        title: 'Test Announcement',
+        message: '<p>Test message</p>',
+        recipients: ['test1@example.com', 'test2@example.com']
+      });
 
-      expect(response.body.details.successful).toBe(1);
-      expect(response.body.details.failed).toBe(1);
-      expect(response.body.details.failedEmails).toContain('test1@example.com');
+      expect(res.body.details.successful).toBe(1);
+      expect(res.body.details.failed).toBe(1);
+      expect(res.body.details.failedEmails).toContain('test1@example.com');
     });
   });
 
@@ -386,15 +376,12 @@ describe('Admin Announcements', () => {
         headers: { 'content-type': 'text/html' }
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.success).toBe(true);
-      expect(response.body.title).toBe('Test Page Title');
-      expect(response.body.message).toContain('Main Content');
-      expect(response.body.message).toContain('This is the body content');
+      expect(res.body.success).toBe(true);
+      expect(res.body.title).toBe('Test Page Title');
+      expect(res.body.message).toContain('Main Content');
+      expect(res.body.message).toContain('This is the body content');
       expect(mockAxios.get).toHaveBeenCalledWith(
         'https://example.com/page.html',
         expect.objectContaining({
@@ -421,12 +408,9 @@ describe('Admin Announcements', () => {
         data: mockHtml
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.title).toBe('H1 Title');
+      expect(res.body.title).toBe('H1 Title');
     });
 
     it('should use default title if neither title nor h1 found', async () => {
@@ -436,12 +420,9 @@ describe('Admin Announcements', () => {
         data: mockHtml
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.title).toBe('Announcement');
+      expect(res.body.title).toBe('Announcement');
     });
 
     it('should remove script and style tags from content', async () => {
@@ -459,14 +440,11 @@ describe('Admin Announcements', () => {
         data: mockHtml
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.message).not.toContain('alert');
-      expect(response.body.message).not.toContain('.test { color: red; }');
-      expect(response.body.message).toContain('Actual content');
+      expect(res.body.message).not.toContain('alert');
+      expect(res.body.message).not.toContain('.test { color: red; }');
+      expect(res.body.message).toContain('Actual content');
     });
 
     it('should extract content from main or article tags when available', async () => {
@@ -486,39 +464,30 @@ describe('Admin Announcements', () => {
         data: mockHtml
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.message).toContain('Main content here');
+      expect(res.body.message).toContain('Main content here');
     });
 
     it('should return 400 if URL is missing', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({})
-        .expect(400);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', {});
 
-      expect(response.body.message).toBe('URL is required and must be a string');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('URL is required and must be a string');
     });
 
     it('should return 400 if URL is not a string', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 123 })
-        .expect(400);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 123 });
 
-      expect(response.body.message).toBe('URL is required and must be a string');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('URL is required and must be a string');
     });
 
     it('should return 400 if URL is not HTTP/HTTPS', async () => {
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'ftp://example.com/file.html' })
-        .expect(400);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'ftp://example.com/file.html' });
 
-      expect(response.body.message).toBe('Invalid URL format. Must be HTTP or HTTPS.');
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.body.message).toBe('Invalid URL format. Must be HTTP or HTTPS.');
     });
 
     it('should handle HTTP errors from axios', async () => {
@@ -529,13 +498,11 @@ describe('Admin Announcements', () => {
         }
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/notfound.html' })
-        .expect(404);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/notfound.html' });
 
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain('HTTP 404');
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toContain('HTTP 404');
     });
 
     it('should handle network errors', async () => {
@@ -544,13 +511,11 @@ describe('Admin Announcements', () => {
         message: 'DNS lookup failed'
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://nonexistent.example.com/page.html' })
-        .expect(404);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://nonexistent.example.com/page.html' });
 
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toBe('URL not found or unreachable');
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe('URL not found or unreachable');
     });
 
     it('should handle timeout errors', async () => {
@@ -559,13 +524,11 @@ describe('Admin Announcements', () => {
         message: 'Request timeout'
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/slow.html' })
-        .expect(408);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/slow.html' });
 
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toBe('Request timeout while fetching HTML');
+      expect(res.status).toHaveBeenCalledWith(408);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe('Request timeout while fetching HTML');
     });
 
     it('should handle connection refused errors', async () => {
@@ -574,13 +537,11 @@ describe('Admin Announcements', () => {
         message: 'Connection refused'
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(503);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.success).toBe(false);
-      expect(response.body.message).toBe('Connection refused');
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.body.success).toBe(false);
+      expect(res.body.message).toBe('Connection refused');
     });
 
     it('should decode HTML entities in title', async () => {
@@ -599,12 +560,9 @@ describe('Admin Announcements', () => {
         data: mockHtml
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.title).toBe('Test & Title <Special>');
+      expect(res.body.title).toBe('Test & Title <Special>');
     });
 
     it('should limit content length to 50KB', async () => {
@@ -615,13 +573,10 @@ describe('Admin Announcements', () => {
         data: mockHtml
       });
 
-      const response = await request(app)
-        .post('/api/admin/announcements/load-from-url')
-        .send({ url: 'https://example.com/page.html' })
-        .expect(200);
+      const res = await invokeRoute('/announcements/load-from-url', 'post', { url: 'https://example.com/page.html' });
 
-      expect(response.body.message.length).toBeLessThanOrEqual(50003); // 50000 + "..."
-      expect(response.body.message).toContain('...');
+      expect(res.body.message.length).toBeLessThanOrEqual(50003); // 50000 + "..."
+      expect(res.body.message).toContain('...');
     });
   });
 });

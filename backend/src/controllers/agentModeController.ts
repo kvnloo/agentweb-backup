@@ -13,6 +13,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -506,6 +508,9 @@ export async function runVerifiedChat(
 
     } catch (error) {
       console.error(`Run verified chat attempt ${attempt} failed:`, error);
+      if (isSessionLimitError(error)) {
+        throw error;
+      }
       if (attempt === maxAttempts) {
         throw error;
       }
@@ -1217,6 +1222,47 @@ export const agentModeController = {
           return;
         }
 
+        if (isContextLimitError(error)) {
+          const user = req.user as User;
+          const sessionId = req.body?.sessionId;
+          const userMessage = req.body?.userMessage;
+          const llmModel = req.body?.llmModel;
+          const attachments = req.body?.attachments;
+          const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
+
+          sendAgentModeOncallAlert({
+            subject: 'Agent Mode: Context limit exceeded',
+            message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
+            sessionId,
+            context: {
+              'Error Message': error.message || 'Unknown error',
+              'Error Stack': error.stack || 'No stack trace available',
+              'Error Name': error.name || 'Unknown',
+              'User ID': user?.userId || 'Not available',
+              'User Email': user?.email || 'Not available',
+              'User Message': userMessage ? (userMessage.length > 500 ? userMessage.substring(0, 500) + '...' : userMessage) : 'Not provided',
+              'LLM Model': llmModel || 'Not specified',
+              'Attachments Count': attachments?.length || 0,
+              'Session Exists': session ? 'Yes' : 'No',
+              'Session User ID': session?.userId || 'N/A',
+              'Session Title': session?.title || 'N/A',
+              'Session Message Count': session?.messages?.length || 0,
+              'Timestamp': new Date().toISOString(),
+              'Request Method': req.method,
+              'Request Path': req.path,
+              'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
+            }
+          }).catch(err => console.error('Failed to send oncall alert:', err));
+
+          res.status(413).json({
+            error: 'Context limit exceeded',
+            message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
+            code: 'CONTEXT_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
+        }
+
         if (error.message.includes('MESSAGE_TOO_LARGE')) {
           res.status(413).json({
             error: 'Message too large',
@@ -1256,14 +1302,14 @@ export const agentModeController = {
         const session = sessionId ? await chatbotDb.getChatSession(sessionId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
-        emailService.sendOncallAlert(
-          'Agent Mode: Unknown Error in Generate Response',
-          `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
-          {
+        sendAgentModeOncallAlert({
+          subject: 'Agent Mode: Unknown Error in Generate Response',
+          message: `An unknown error occurred while generating a response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          sessionId,
+          context: {
             'Error Message': error.message || 'Unknown error',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
-            'Session ID': sessionId || 'Not provided',
             'User ID': user?.userId || 'Not available',
             'User Email': user?.email || 'Not available',
             'User Message': userMessage ? (userMessage.length > 500 ? userMessage.substring(0, 500) + '...' : userMessage) : 'Not provided',
@@ -1278,7 +1324,7 @@ export const agentModeController = {
             'Request Path': req.path,
             'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
           }
-        ).catch(err => console.error('Failed to send oncall alert:', err));
+        }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
@@ -1638,6 +1684,48 @@ export const agentModeController = {
           return;
         }
 
+        if (isContextLimitError(error)) {
+          const shareId = req.params?.shareId;
+          const conversable = req.query?.conversable;
+          const userMessage = req.body?.userMessage;
+          const llmModel = req.body?.llmModel;
+          const attachments = req.body?.attachments || [];
+          const session = shareId ? await chatbotDb.getChatSession(shareId).catch(() => null) : null;
+
+          sendAgentModeOncallAlert({
+            subject: 'Agent Mode: Context limit exceeded (shared response)',
+            message: `The request exceeded the model context window.\n\nError: ${error.message || 'Unknown error'}`,
+            sessionId: shareId,
+            context: {
+              'Error Message': error.message || 'Unknown error',
+              'Error Stack': error.stack || 'No stack trace available',
+              'Error Name': error.name || 'Unknown',
+              'Session ID (Share ID)': shareId || 'Not provided',
+              'Conversable Token': conversable ? 'Provided' : 'Not provided',
+              'Session User ID': session?.userId || 'N/A',
+              'User Message': userMessage ? (userMessage.length > 500 ? userMessage.substring(0, 500) + '...' : userMessage) : 'Not provided',
+              'LLM Model': llmModel || session?.llmModel || 'Not specified',
+              'Attachments Count': attachments?.length || 0,
+              'Session Exists': session ? 'Yes' : 'No',
+              'Session Title': session?.title || 'N/A',
+              'Session Message Count': session?.messages?.length || 0,
+              'Is Conversable Mode': session?.interactiveShareMetadata?.isActive ? 'Yes' : 'No',
+              'Timestamp': new Date().toISOString(),
+              'Request Method': req.method,
+              'Request Path': req.path,
+              'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
+            }
+          }).catch(err => console.error('Failed to send oncall alert:', err));
+
+          res.status(413).json({
+            error: 'Context limit exceeded',
+            message: 'This conversation is too long for the current model context window. Please start a new session or shorten the request.',
+            code: 'CONTEXT_LIMIT_EXCEEDED',
+            suggestion: 'start_new_session'
+          });
+          return;
+        }
+
         if (error.message.includes('MESSAGE_TOO_LARGE')) {
           res.status(413).json({
             error: 'Message too large',
@@ -1677,10 +1765,11 @@ export const agentModeController = {
         const session = shareId ? await chatbotDb.getChatSession(shareId).catch(() => null) : null;
         
         // Send oncall alert asynchronously (don't await to avoid blocking response)
-        emailService.sendOncallAlert(
-          'Agent Mode: Unknown Error in Generate Shared Response',
-          `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
-          {
+        sendAgentModeOncallAlert({
+          subject: 'Agent Mode: Unknown Error in Generate Shared Response',
+          message: `An unknown error occurred while generating a shared response in Agent Mode.\n\nError: ${error.message || 'Unknown error'}`,
+          sessionId: shareId,
+          context: {
             'Error Message': error.message || 'Unknown error',
             'Error Stack': error.stack || 'No stack trace available',
             'Error Name': error.name || 'Unknown',
@@ -1699,7 +1788,7 @@ export const agentModeController = {
             'Request Path': req.path,
             'Request IP': req.ip || req.socket.remoteAddress || 'Unknown'
           }
-        ).catch(err => console.error('Failed to send oncall alert:', err));
+        }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
@@ -2891,6 +2980,30 @@ export const agentModeController = {
       });
     } catch (error: any) {
       console.error('AgentMode: Verified generate error:', error);
+      const sessionId = req.body?.sessionId;
+      const user = req.user as User;
+      const isSessionLimit = isSessionLimitError(error);
+
+      try {
+        await sendAgentModeOncallAlert({
+          subject: isSessionLimit
+            ? 'Agent Mode Verified Generate: Session limit exceeded'
+            : 'Agent Mode Verified Generate: Failed',
+          message: isSessionLimit
+            ? `Verified generation failed because the session reached its limit.\n\nSession: ${sessionId || 'unknown'}\nUser: ${user?.userId || 'unknown'}`
+            : `Verified generation failed.\n\nSession: ${sessionId || 'unknown'}\nUser: ${user?.userId || 'unknown'}`,
+          sessionId,
+          context: {
+            'User ID': user?.userId || 'unknown',
+            'Error': error.message || String(error),
+            'Starting Message': req.body?.startingMessage || 'N/A',
+            'Required Functions': JSON.stringify(req.body?.requiredFunctions || []),
+            'Keywords': JSON.stringify(req.body?.keywords || [])
+          }
+        });
+      } catch (alertError) {
+        console.error('❌ Error sending oncall alert:', alertError);
+      }
       res.status(500).json({
         error: 'Failed to perform verified generation',
         message: error.message || 'Unknown error'

@@ -58,6 +58,7 @@ jest.mock('../../controllers/docsController', () => ({
 }));
 
 import { chatbotDb, ChatMessage, ChatSession } from '../chatbotService';
+import { MAX_MESSAGE_SIZE_PER_SESSION } from '../../config';
 import AWS from 'aws-sdk';
 
 describe('ChatbotDB - Messages Table', () => {
@@ -316,7 +317,6 @@ describe('ChatbotDB - Messages Table', () => {
     });
 
     it('should throw error when message limit is exceeded', async () => {
-      const MAX_MESSAGE_SIZE_PER_SESSION = 150;
       const existingMessages = Array.from({ length: MAX_MESSAGE_SIZE_PER_SESSION }, (_, i) => ({
         sessionId,
         messageIndex: i,
@@ -443,8 +443,7 @@ describe('ChatbotDB - Messages Table', () => {
     });
 
     it('should throw error when adding messages would exceed limit', async () => {
-      const MAX_MESSAGE_SIZE_PER_SESSION = 150;
-      const existingMessages = Array.from({ length: 149 }, (_, i) => ({
+      const existingMessages = Array.from({ length: MAX_MESSAGE_SIZE_PER_SESSION - 1 }, (_, i) => ({
         sessionId,
         messageIndex: i,
         message: {
