@@ -725,6 +725,98 @@ describe('Blog Controller - Image Quality Defaulting', () => {
       });
     });
 
+    it('should parse fieldMappings when stored as JSON string', async () => {
+      const configWithStringMappings = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: JSON.stringify({
+          summary: 'custom-summary',
+          body: 'custom-body',
+          image: 'custom-image',
+          publishDate: 'published-date'
+        })
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithStringMappings));
+
+      const config = await getWebflowConfig();
+
+      expect(config.fieldMappings).toEqual({
+        summary: 'custom-summary',
+        body: 'custom-body',
+        image: 'custom-image',
+        publishDate: 'published-date'
+      });
+    });
+
+    it('should use fieldMappings as object when already parsed', async () => {
+      const configWithObjectMappings = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: {
+          summary: 'excerpt',
+          body: 'content',
+          image: 'featured-image',
+          publishDate: null
+        }
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithObjectMappings));
+
+      const config = await getWebflowConfig();
+
+      expect(config.fieldMappings).toEqual({
+        summary: 'excerpt',
+        body: 'content',
+        image: 'featured-image',
+        publishDate: null
+      });
+    });
+
+    it('should fall back to defaults when fieldMappings string is invalid JSON', async () => {
+      const configWithInvalidStringMappings = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: 'invalid json string {'
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithInvalidStringMappings));
+
+      const config = await getWebflowConfig();
+
+      // Should fall back to defaults when parsing fails
+      expect(config.fieldMappings).toEqual({
+        summary: 'post-summary',
+        body: 'post-body',
+        image: 'main-image',
+        publishDate: undefined
+      });
+    });
+
+    it('should handle fieldMappings with partial fields', async () => {
+      const configWithPartialMappings = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: {
+          summary: 'post-excerpt',
+          body: 'post-content'
+          // image and publishDate not provided
+        }
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithPartialMappings));
+
+      const config = await getWebflowConfig();
+
+      expect(config.fieldMappings).toEqual({
+        summary: 'post-excerpt',
+        body: 'post-content'
+        // image and publishDate should be undefined when not provided
+      });
+      expect(config.fieldMappings?.image).toBeUndefined();
+      expect(config.fieldMappings?.publishDate).toBeUndefined();
+    });
+
     it('should throw error when required fields are missing', async () => {
       const invalidConfig = {
         apiToken: 'test-api-token'

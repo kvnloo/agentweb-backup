@@ -800,25 +800,39 @@ Webflow configuration is stored in AWS Secrets Manager. You can configure either
 
 **For Development (global):**
 - Secret Name: `dev/AgentWeb/Webflow`
-- Secret Value (JSON format, shared across all users who don’t have their own Webflow config):
+- Secret Value (JSON format, shared across all users who don't have their own Webflow config):
 ```json
 {
   "apiToken": "your_webflow_api_token",
   "siteId": "your_webflow_site_id",
-  "collectionId": "your_webflow_collection_id"
+  "collectionId": "your_webflow_collection_id",
+  "fieldMappings": {
+    "summary": "post-summary",
+    "body": "post-body",
+    "image": "main-image",
+    "publishDate": null
+  }
 }
 ```
 
 **For Production (global):**
 - Secret Name: `prod/AgentWeb/Webflow`
-- Secret Value (JSON format, shared across all users who don’t have their own Webflow config):
+- Secret Value (JSON format, shared across all users who don't have their own Webflow config):
 ```json
 {
   "apiToken": "your_webflow_api_token",
   "siteId": "your_webflow_site_id",
-  "collectionId": "your_webflow_collection_id"
+  "collectionId": "your_webflow_collection_id",
+  "fieldMappings": {
+    "summary": "post-summary",
+    "body": "post-body",
+    "image": "main-image",
+    "publishDate": null
+  }
 }
 ```
+
+**Note:** The `fieldMappings` field is optional but **highly recommended**. If omitted, the system will use default field names (`post-summary`, `post-body`, `main-image`) which may not match your Webflow collection schema. See the "Configuring Field Mappings" section below for details.
 
 **Per-User Webflow Configuration (preferred):**
 
@@ -846,7 +860,70 @@ Example per-user secret value:
 }
 ```
 
-Notes:
+**Configuring Field Mappings (Required):**
+
+The `fieldMappings` object maps AgentWeb's blog post fields to your Webflow collection's field slugs. **This is critical** - if the field names don't match your Webflow collection schema, you'll get validation errors.
+
+**How to find your Webflow collection field slugs:**
+
+1. Go to your Webflow site dashboard
+2. Navigate to **CMS Collections** > Your blog posts collection
+3. Click on any field (e.g., "Post Summary", "Post Body", "Main Image")
+4. The field slug is shown in the field settings or in the URL
+5. Alternatively, use the Webflow API to list collection fields:
+   ```bash
+   curl -X GET "https://api.webflow.com/v2/collections/{collectionId}" \
+     -H "Authorization: Bearer {apiToken}" \
+     -H "accept-version: 2.0.0"
+   ```
+   Look for the `fields` array - each field has a `slug` property
+
+**Field Mappings Configuration:**
+
+The `fieldMappings` object supports the following fields:
+
+- **`summary`** (optional): Maps to the field that stores the blog post summary/description. Set to `null` or omit if your collection doesn't have this field.
+- **`body`** (optional): Maps to the field that stores the blog post body/content (HTML). Set to `null` or omit if your collection doesn't have this field.
+- **`image`** (optional): Maps to the field that stores the hero/main image URL. Set to `null` or omit if your collection doesn't have this field.
+- **`publishDate`** (optional): Maps to the field that stores the publish date. Set to `null` or omit if your collection doesn't have this field.
+
+**Example configurations:**
+
+If your Webflow collection uses different field names:
+```json
+{
+  "apiToken": "your_token",
+  "siteId": "your_site_id",
+  "collectionId": "your_collection_id",
+  "fieldMappings": {
+    "summary": "excerpt",
+    "body": "content",
+    "image": "featured-image",
+    "publishDate": "published-on"
+  }
+}
+```
+
+If your collection doesn't have a publish date field:
+```json
+{
+  "apiToken": "your_token",
+  "siteId": "your_site_id",
+  "collectionId": "your_collection_id",
+  "fieldMappings": {
+    "summary": "post-summary",
+    "body": "post-body",
+    "image": "main-image",
+    "publishDate": null
+  }
+}
+```
+
+**Important Notes:**
+- Field slugs are case-sensitive and must match exactly
+- If `fieldMappings` is not provided, the system will use default values (`post-summary`, `post-body`, `main-image`), which may not match your collection schema
+- If you get validation errors like "Field not described in schema", check that your `fieldMappings` match your actual Webflow collection field slugs
+- You can configure `fieldMappings` in both global and per-user secrets
 - When a `userId` is provided, the backend will **only** read from `dev/AgentWeb/Webflow/<user_id>` or `prod/AgentWeb/Webflow/<user_id>` and will **not** fall back to the global secret.
 - When no `userId` is provided (legacy flows), the global secret (`dev/AgentWeb/Webflow` or `prod/AgentWeb/Webflow`) is used.
 

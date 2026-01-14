@@ -7,6 +7,12 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-14',
+    changes: [
+      'Fixed bug where support for customizable field mappings in Webflow blog publishing was not working',
+    ],
+  },
+  {
     date: '2026-01-13',
     changes: [
       'Added support for choosing Work Plans when creating a new session in Agent Mode',
