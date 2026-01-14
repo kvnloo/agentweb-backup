@@ -331,7 +331,20 @@ export async function runVerifiedChat(
   let attempt = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
-  const defaultModel = params.llmModel || await agentModeService.getDefaultModel();
+  const sessionForModel = await chatbotDb.getChatSession(sessionId);
+  let sessionModel = sessionForModel?.llmModel;
+  const normalizedStartingMessage = startingMessage.toLowerCase();
+  const shouldUseReportsModel = requiredFunctions.some((reqFunc) => (
+    reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content'
+  ));
+  if (shouldUseReportsModel) {
+    const reportsModel = await agentModeService.getReportsModel();
+    if (sessionModel !== reportsModel) {
+      await chatbotDb.updateSessionLlmModel(sessionId, reportsModel);
+      sessionModel = reportsModel;
+    }
+  }
+  const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
 
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
@@ -1071,8 +1084,11 @@ export const agentModeController = {
       );
 
       // Set default model for new sessions
-      const defaultModel = await agentModeService.getDefaultModel();
-      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
+      // Use reports model for report_generation sessions, otherwise use default model
+      const modelToUse = finalSessionType === 'report_generation'
+        ? await agentModeService.getReportsModel()
+        : await agentModeService.getDefaultModel();
+      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
       res.status(201).json(sessionWithModel);
     } catch (error) {

@@ -5335,6 +5335,7 @@ const AgentModeSettings = () => {
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [contentModel, setContentModel] = useState('');
+  const [reportsModel, setReportsModel] = useState('');
   const [loading, setLoading] = useState(true);
   const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
@@ -5343,6 +5344,7 @@ const AgentModeSettings = () => {
   const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
   const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
+  const [savingReportsModel, setSavingReportsModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
@@ -5378,27 +5380,30 @@ const AgentModeSettings = () => {
     try {
       setLoading(true);
       setError('');
-      
+
       const models = await loadSupportedModels();
       await loadDefaultModel(models);
 
       // Load system prompt
       await loadSystemPrompt();
-      
+
       // Load welcome message
       await loadWelcomeMessage();
-      
+
       // Load conversation starters
       await loadConversationStarters();
-      
+
       // Load available function calls
       await loadAvailableFunctionCalls();
-      
+
       // Load predefined work plans
       await loadPredefinedWorkPlans();
-      
+
       // Load content model
       await loadContentModel();
+
+      // Load reports model (pass models array for validation)
+      await loadReportsModel(models);
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
@@ -5720,20 +5725,79 @@ const AgentModeSettings = () => {
       setSavingContentModel(true);
       setError('');
       setSuccess('');
-      
+
       await axios.put(buildApiUrl('/api/settings/agent_mode_content_model'), {
         settingValue: contentModel,
         description: 'Content model for blog article and book content generation (e.g., gpt-4, claude-sonnet-4-5 via AWS Bedrock). Note: This does not affect Agent Mode chat conversations.'
       }, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      
+
       setSuccess('Content model updated successfully!');
     } catch (error) {
       console.error('Error saving content model:', error);
       setError('Failed to save content model');
     } finally {
       setSavingContentModel(false);
+    }
+  };
+
+  const loadReportsModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      try {
+        // Try to get reports model from settings
+        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_reports_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        if (response.data && response.data.settingValue) {
+          const configuredModel = response.data.settingValue;
+          // Verify the model is in available Agent Mode models list
+          if (availableModels.includes(configuredModel)) {
+            setReportsModel(configuredModel);
+            return;
+          } else {
+            console.warn('Configured reports model not in supported Agent Mode models list, using fallback');
+          }
+        }
+      } catch (settingsError: any) {
+        // If setting doesn't exist (404), use default
+        if (settingsError.response?.status !== 404) {
+          console.error('Error loading reports model:', settingsError);
+        }
+      }
+
+      // Default to fallbackDefaultModel or first supported model
+      const fallback = availableModels.includes(fallbackDefaultModel)
+        ? fallbackDefaultModel
+        : (availableModels[0] || 'gpt-5-chat-2');
+      setReportsModel(fallback);
+    } catch (error) {
+      console.error('Error loading reports model:', error);
+      setReportsModel(availableModels[0] || 'gpt-5-chat-2');
+    }
+  };
+
+  const saveReportsModel = async () => {
+    try {
+      setSavingReportsModel(true);
+      setError('');
+      setSuccess('');
+
+      await axios.put(buildApiUrl('/api/settings/agent_mode_reports_model'), {
+        settingValue: reportsModel,
+        description: 'Default LLM model for Reports page (for creating and revising reports in Agent Mode). This is used as the initial model selection when creating new reports or revising existing reports.'
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      setSuccess('Reports model updated successfully!');
+    } catch (error) {
+      console.error('Error saving reports model:', error);
+      setError('Failed to save reports model');
+    } finally {
+      setSavingReportsModel(false);
     }
   };
 
@@ -6252,6 +6316,41 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Select the LLM model to use for blog article and book content generation. This setting does NOT affect Agent Mode chat conversations, which use their own model configuration.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Reports Model Configuration */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Reports Model (Default)</Typography>
+            <Button
+              variant="contained"
+              onClick={saveReportsModel}
+              disabled={savingReportsModel}
+            >
+              {savingReportsModel ? <CircularProgress size={20} /> : 'Save Changes'}
+            </Button>
+          </Box>
+
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel>Reports Model</InputLabel>
+            <Select
+              value={reportsModel}
+              onChange={(e) => setReportsModel(e.target.value)}
+              label="Reports Model"
+            >
+              {supportedModels.map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Select the default LLM model for the Reports page in Agent Mode. This model will be used when creating new reports and as the default when revising existing reports. This uses the same models available for Agent Mode sessions.
           </Typography>
         </CardContent>
       </Card>

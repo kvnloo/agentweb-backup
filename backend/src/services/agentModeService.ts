@@ -71,6 +71,23 @@ export class AgentModeService {
     return fallbackModel;
   }
 
+  async getReportsModel(): Promise<string> {
+    const fallbackModel = this.default_model;
+    try {
+      const setting = await settingsService.getSetting('agent_mode_reports_model');
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported reports model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting reports model setting:', error);
+    }
+    return fallbackModel;
+  }
+
   // Helper method to create Azure OpenAI client for a specific deployment
   private getAzureOpenAIClient(deploymentName: string): OpenAI {
     return new OpenAI({
