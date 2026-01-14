@@ -113,11 +113,22 @@ export async function getWebflowConfig(userId?: string): Promise<{
       throw new Error("Webflow configuration missing required fields");
     }
     
+    // Handle fieldMappings - it might be a string (JSON) or an object
+    let fieldMappings = config.fieldMappings;
+    if (typeof fieldMappings === 'string') {
+      try {
+        fieldMappings = JSON.parse(fieldMappings);
+      } catch (parseError) {
+        console.warn('Failed to parse fieldMappings as JSON string, using defaults:', parseError);
+        fieldMappings = undefined;
+      }
+    }
+    
     return {
       apiToken: config.apiToken,
       siteId: config.siteId,
       collectionId: config.collectionId,
-      fieldMappings: config.fieldMappings || {
+      fieldMappings: fieldMappings || {
         summary: "post-summary",
         body: "post-body",
         image: "main-image",
