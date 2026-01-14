@@ -5317,6 +5317,7 @@ interface PredefinedWorkPlan {
   autocomplete?: boolean;
   requireLogin?: boolean;
   showLoginSignup?: 'after_plan_completed' | 'always';
+  showInAgentMode?: boolean;
 }
 
 interface AvailableFunctionCall {
@@ -5578,6 +5579,7 @@ const AgentModeSettings = () => {
     autocomplete: false,
     requireLogin: false,
     showLoginSignup: 'after_plan_completed',
+    showInAgentMode: false,
     title: 'Onboarding',
     welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
     steps: [
@@ -5984,6 +5986,7 @@ const AgentModeSettings = () => {
         autocomplete: workPlan.autocomplete || false,
         requireLogin: workPlan.requireLogin || false,
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+        showInAgentMode: workPlan.showInAgentMode || false,
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
           .map((step, index) => ({
@@ -6057,7 +6060,8 @@ const AgentModeSettings = () => {
       steps: [{ stepCount: 1, title: '' }],
       autocomplete: false,
       requireLogin: false,
-      showLoginSignup: 'after_plan_completed'
+      showLoginSignup: 'after_plan_completed',
+      showInAgentMode: false
     };
     
     setPredefinedWorkPlans([
@@ -6611,35 +6615,54 @@ const AgentModeSettings = () => {
                     />
 
                     <Box sx={{ mb: 2 }}>
-                      <Box display="flex" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={2}>
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              checked={workPlan.autocomplete || false}
-                              onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
-                              disabled={false}
+                      <Box display="flex" flexDirection="column" gap={2}>
+                        <Box display="flex" flexWrap="wrap" gap={3}>
+                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
+                            <FormControlLabel
+                              control={
+                                <Checkbox
+                                  checked={workPlan.autocomplete || false}
+                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
+                                  disabled={false}
+                                />
+                              }
+                              label="Autocomplete Steps"
                             />
-                          }
-                          label="Autocomplete Steps"
-                        />
-                        <FormControlLabel
-                          control={
-                            <Checkbox
-                              checked={workPlan.requireLogin || false}
-                              onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
-                              disabled={false}
+                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
+                              When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
+                            </Typography>
+                          </Box>
+                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
+                            <FormControlLabel
+                              control={
+                                <Checkbox
+                                  checked={workPlan.requireLogin || false}
+                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
+                                  disabled={false}
+                                />
+                              }
+                              label="Require Login"
                             />
-                          }
-                          label="Require Login"
-                        />
-                      </Box>
-                      <Box display="flex" justifyContent="space-between" flexWrap="wrap" gap={2} sx={{ mt: 0.5 }}>
-                        <Typography variant="caption" color="text.secondary" sx={{ ml: 4, maxWidth: 520 }}>
-                          When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary" sx={{ mr: 2 }}>
-                          Users must log in before starting this plan.
-                        </Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
+                              Users must log in before starting this plan.
+                            </Typography>
+                          </Box>
+                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
+                            <FormControlLabel
+                              control={
+                                <Checkbox
+                                  checked={workPlan.showInAgentMode || false}
+                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, showInAgentMode: e.target.checked })}
+                                  disabled={false}
+                                />
+                              }
+                              label="Show in Agent Mode"
+                            />
+                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
+                              When enabled, this plan will be displayed on the agent-mode/new page in the customer portal.
+                            </Typography>
+                          </Box>
+                        </Box>
                       </Box>
                     </Box>
 

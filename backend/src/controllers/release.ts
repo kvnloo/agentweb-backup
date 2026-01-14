@@ -8,6 +8,13 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-14",
+    changes: [
+      "Added showInAgentMode configuration for predefined work plans",
+      "- Admins can now control which predefined work plans are displayed on the agent-mode/new page in the customer portal",
+    ],
+  },
+  {
     date: "2026-01-13",
     changes: [
       "Added column sorting to the Admin Users table and Waitlist table",

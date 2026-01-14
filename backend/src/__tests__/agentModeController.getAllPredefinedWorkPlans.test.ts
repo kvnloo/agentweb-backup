@@ -25,7 +25,7 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
     jest.clearAllMocks();
   });
 
-  it('should return all predefined work plans', async () => {
+  it('should return only predefined work plans with showInAgentMode === true', async () => {
     const mockWorkPlans = [
       {
         id: 'plan-1',
@@ -39,7 +39,8 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
             requiredFunctionCalls: ['function1']
           }
         ],
-        welcomeMessage: 'Welcome!'
+        welcomeMessage: 'Welcome!',
+        showInAgentMode: true
       },
       {
         id: 'plan-2',
@@ -51,7 +52,21 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
             title: 'Analyze market',
             requiredFunctionCalls: ['analyze_market']
           }
-        ]
+        ],
+        showInAgentMode: false
+      },
+      {
+        id: 'plan-3',
+        title: 'Content Creation',
+        description: 'Create content',
+        steps: [
+          {
+            stepCount: 1,
+            title: 'Create content',
+            requiredFunctionCalls: ['create_content']
+          }
+        ],
+        showInAgentMode: true
       }
     ];
 
@@ -66,7 +81,11 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
     await agentModeController.getAllPredefinedWorkPlans(req, res);
 
     expect(mockSettingsService.getSetting).toHaveBeenCalledWith('agent-mode-predefined-workplans');
-    expect(res.json).toHaveBeenCalledWith(mockWorkPlans);
+    // Should only return plans with showInAgentMode === true
+    expect(res.json).toHaveBeenCalledWith([
+      mockWorkPlans[0],
+      mockWorkPlans[2]
+    ]);
     expect(res.status).not.toHaveBeenCalled();
   });
 

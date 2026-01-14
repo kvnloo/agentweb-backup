@@ -2663,7 +2663,9 @@ export const agentModeController = {
       }
       
       const workPlans = JSON.parse(setting.settingValue);
-      res.json(workPlans);
+      // Filter plans to only include those with showInAgentMode === true
+      const visiblePlans = workPlans.filter((plan: any) => plan.showInAgentMode === true);
+      res.json(visiblePlans);
     } catch (error) {
       console.error('AgentMode: Get all predefined work plans error:', error);
       res.status(500).json({ error: 'Failed to get all predefined work plans' });
