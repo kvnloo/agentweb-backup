@@ -2109,12 +2109,14 @@ router.get("/gtm-plans", async (req, res) => {
             ...plan,
             userEmail: user?.email || undefined,
             userName: user?.name || undefined,
+            supportNote: user?.supportNote || undefined,
           };
         } catch (error) {
           return {
             ...plan,
             userEmail: undefined,
             userName: undefined,
+            supportNote: undefined,
           };
         }
       })

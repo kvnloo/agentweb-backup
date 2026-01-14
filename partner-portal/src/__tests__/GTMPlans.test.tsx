@@ -66,6 +66,7 @@ const mockPlans = [
     userId: 'user-1',
     userEmail: 'user1@example.com',
     userName: 'User 1',
+    supportNote: 'Test Company 1',
     title: 'Test Plan 1',
     description: 'Test Description 1',
     dri: 'plan-poc@example.com',
@@ -102,6 +103,7 @@ const mockPlans = [
     userId: 'user-2',
     userEmail: 'user2@example.com',
     userName: 'User 2',
+    supportNote: 'Test Company 2',
     title: 'Test Plan 2',
     description: 'Test Description 2',
     status: 'completed',
@@ -118,6 +120,253 @@ const toLocalDateString = (date: Date) => {
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 };
+
+// Helper function to click on a user card to navigate to their plans
+const clickUserCard = async (user: any, userIdentifier: string) => {
+  // Find the card by the text and then find the button within or closest to it
+  const cardText = screen.getByText(userIdentifier);
+  const cardButton = cardText.closest('button') ||
+                     cardText.closest('.MuiCard-root')?.querySelector('button');
+
+  if (cardButton) {
+    await user.click(cardButton);
+  } else {
+    throw new Error(`Could not find clickable card for ${userIdentifier}`);
+  }
+};
+
+describe('GTMPlans - Two-Level View', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockedAxios.get = jest.fn();
+    mockedAxios.put = jest.fn();
+
+    mockedAxios.get.mockResolvedValue({
+      data: { success: true, data: mockPlans },
+    });
+  });
+
+  it('shows user cards in Level 1 view', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      // Should show company names from supportNote
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+      expect(screen.getByText('Test Company 2')).toBeInTheDocument();
+    });
+  });
+
+  it('displays user email on user cards', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('user1@example.com')).toBeInTheDocument();
+      expect(screen.getByText('user2@example.com')).toBeInTheDocument();
+    });
+  });
+
+  it('displays total plans count on user cards', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      const cards = screen.getAllByText(/Total Plans:/i);
+      expect(cards.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('displays in-progress plans count on user cards', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      const inProgressLabels = screen.getAllByText(/In Progress:/i);
+      expect(inProgressLabels.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('navigates to user plans when clicking a user card', async () => {
+    const user = userEvent.setup();
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    // Click on user card
+    await clickUserCard(user, 'Test Company 1');
+
+    await waitFor(() => {
+      // Should show Back button
+      expect(screen.getByText(/Back to Users/i)).toBeInTheDocument();
+      // Should show the plan title
+      expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
+    });
+  });
+
+  it('navigates back to user cards when clicking Back button', async () => {
+    const user = userEvent.setup();
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    // Navigate to user plans
+    await clickUserCard(user, 'Test Company 1');
+
+    await waitFor(() => {
+      expect(screen.getByText(/Back to Users/i)).toBeInTheDocument();
+    });
+
+    // Click Back button
+    const backButton = screen.getByText(/Back to Users/i);
+    await user.click(backButton);
+
+    await waitFor(() => {
+      // Should be back at user cards view
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+      expect(screen.getByText('Test Company 2')).toBeInTheDocument();
+      // Plan title should not be visible
+      expect(screen.queryByText('Test Plan 1')).not.toBeInTheDocument();
+    });
+  });
+
+  it('does not show cards for users without plans', async () => {
+    const plansWithEmptyUser = [
+      ...mockPlans,
+      {
+        planId: 'plan-3',
+        userId: 'user-3',
+        userEmail: 'user3@example.com',
+        userName: 'User 3',
+        supportNote: 'Test Company 3',
+        title: 'Test Plan 3',
+        status: 'in_progress',
+        phases: [],
+        createdAt: '2024-01-03T00:00:00Z',
+        updatedAt: '2024-01-03T00:00:00Z',
+      },
+    ];
+
+    mockedAxios.get.mockResolvedValue({
+      data: { success: true, data: plansWithEmptyUser },
+    });
+
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      // Should show all three companies
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+      expect(screen.getByText('Test Company 2')).toBeInTheDocument();
+      expect(screen.getByText('Test Company 3')).toBeInTheDocument();
+    });
+  });
+
+  it('shows yellow warning badge for plans due in 3 days', async () => {
+    const today = new Date();
+    const threeDaysLater = new Date(today);
+    threeDaysLater.setDate(today.getDate() + 2);
+    const dueDateStr = toLocalDateString(threeDaysLater);
+
+    const planWithNearDueDate = {
+      ...mockPlans[0],
+      dueDate: dueDateStr,
+      status: 'in_progress',
+    };
+
+    mockedAxios.get.mockResolvedValue({
+      data: { success: true, data: [planWithNearDueDate] },
+    });
+
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      // Should show the user card
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+      // Should show "Due in 3 Days" label
+      expect(screen.getByText(/Due in 3 Days:/i)).toBeInTheDocument();
+    });
+  });
+
+  it('shows red alert badge for overdue plans', async () => {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const dueDateStr = toLocalDateString(yesterday);
+
+    const planWithOverdueDate = {
+      ...mockPlans[0],
+      dueDate: dueDateStr,
+      status: 'in_progress',
+    };
+
+    mockedAxios.get.mockResolvedValue({
+      data: { success: true, data: [planWithOverdueDate] },
+    });
+
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      // Should show the user card
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+      // Should show "Overdue/Due Today" label
+      expect(screen.getByText(/Overdue\/Due Today:/i)).toBeInTheDocument();
+    });
+  });
+});
 
 describe('GTMPlans - Basic Tests', () => {
   beforeEach(() => {
@@ -155,6 +404,7 @@ describe('GTMPlans - Basic Tests', () => {
   });
 
   it('loads and displays GTM plans', async () => {
+    const user = userEvent.setup();
     render(
       <BrowserRouter>
         <AuthProvider>
@@ -162,10 +412,16 @@ describe('GTMPlans - Basic Tests', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    // Click on first user card
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
-      expect(screen.getByText('Test Plan 2')).toBeInTheDocument();
     });
   });
 
@@ -185,6 +441,7 @@ describe('GTMPlans - Basic Tests', () => {
   });
 
   it('displays plan PoC when present', async () => {
+    const user = userEvent.setup();
     render(
       <BrowserRouter>
         <AuthProvider>
@@ -192,13 +449,20 @@ describe('GTMPlans - Basic Tests', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText(/plan-poc@example.com/i)).toBeInTheDocument();
     });
   });
 
   it('displays plan due date when present', async () => {
+    const user = userEvent.setup();
     render(
       <BrowserRouter>
         <AuthProvider>
@@ -206,7 +470,13 @@ describe('GTMPlans - Basic Tests', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText(/Dec 31, 2024/i)).toBeInTheDocument();
     });
@@ -237,7 +507,13 @@ describe('GTMPlans - Phase Expansion', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -262,7 +538,13 @@ describe('GTMPlans - Phase Expansion', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -287,7 +569,13 @@ describe('GTMPlans - Phase Expansion', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -325,7 +613,13 @@ describe('GTMPlans - Work Item Display', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -353,7 +647,13 @@ describe('GTMPlans - Work Item Display', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -480,7 +780,13 @@ describe('GTMPlans - Due Date Management', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -530,7 +836,13 @@ describe('GTMPlans - PoC Assignment', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -585,7 +897,13 @@ describe('GTMPlans - PoC Assignment', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -650,7 +968,13 @@ describe('GTMPlans - Due Date Updates', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -675,7 +999,13 @@ describe('GTMPlans - Due Date Updates', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
@@ -787,7 +1117,13 @@ describe('GTMPlans - Status and Notes Updates', () => {
         </AuthProvider>
       </BrowserRouter>
     );
-    
+
+    await waitFor(() => {
+      expect(screen.getByText('Test Company 1')).toBeInTheDocument();
+    });
+
+    await clickUserCard(user, 'Test Company 1');
+
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });

@@ -30,6 +30,10 @@ import {
   Checkbox,
   FormGroup,
   FormControlLabel,
+  Card,
+  CardContent,
+  CardActionArea,
+  Grid,
 } from "@mui/material";
 import {
   ExpandMore as ExpandMoreIcon,
@@ -38,6 +42,8 @@ import {
   CalendarToday as CalendarTodayIcon,
   Warning as WarningIcon,
   Error as ErrorIcon,
+  ArrowBack as ArrowBackIcon,
+  Business as BusinessIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
@@ -80,7 +86,20 @@ interface GTMPlan {
   completedAt?: string;
   userEmail?: string;
   userName?: string;
+  supportNote?: string;
   dueDate?: string;
+}
+
+interface UserStats {
+  userId: string;
+  userEmail?: string;
+  userName?: string;
+  supportNote?: string;
+  totalPlans: number;
+  incompletePlans: number;
+  yellowWarningPlans: number;
+  redAlertPlans: number;
+  plans: GTMPlan[];
 }
 
 export default function GTMPlans() {
@@ -88,6 +107,7 @@ export default function GTMPlans() {
   const [plans, setPlans] = useState<GTMPlan[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [editingItem, setEditingItem] = useState<{
     planId: string;
     phaseId?: string;
@@ -738,6 +758,48 @@ export default function GTMPlans() {
     return undefined;
   };
 
+  const groupPlansByUser = (): UserStats[] => {
+    const userMap = new Map<string, UserStats>();
+
+    plans.forEach((plan) => {
+      if (!userMap.has(plan.userId)) {
+        userMap.set(plan.userId, {
+          userId: plan.userId,
+          userEmail: plan.userEmail,
+          userName: plan.userName,
+          supportNote: plan.supportNote,
+          totalPlans: 0,
+          incompletePlans: 0,
+          yellowWarningPlans: 0,
+          redAlertPlans: 0,
+          plans: [],
+        });
+      }
+
+      const userStats = userMap.get(plan.userId)!;
+      userStats.plans.push(plan);
+      userStats.totalPlans++;
+
+      if (plan.status === "in_progress") {
+        userStats.incompletePlans++;
+
+        const dueDateStatus = getDueDateStatus(plan.dueDate, plan.status, "plan");
+        if (dueDateStatus === "overdue") {
+          userStats.redAlertPlans++;
+        } else if (dueDateStatus === "warning") {
+          userStats.yellowWarningPlans++;
+        }
+      }
+    });
+
+    return Array.from(userMap.values()).filter((stats) => stats.totalPlans > 0);
+  };
+
+  const userStatsList = groupPlansByUser();
+  const selectedUserStats = selectedUserId
+    ? userStatsList.find((stats) => stats.userId === selectedUserId)
+    : null;
+
   if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
@@ -767,9 +829,103 @@ export default function GTMPlans() {
             No GTM plans found.
           </Typography>
         </Paper>
+      ) : !selectedUserId ? (
+        // Level 1: User Cards View
+        <Box>
+          <Grid container spacing={3}>
+            {userStatsList.map((userStats) => (
+              <Grid item xs={12} sm={6} md={4} key={userStats.userId}>
+                <Card sx={{ height: "100%" }}>
+                  <CardActionArea onClick={() => setSelectedUserId(userStats.userId)}>
+                    <CardContent>
+                      <Box sx={{ display: "flex", alignItems: "center", mb: 2 }}>
+                        <BusinessIcon sx={{ mr: 1, color: "primary.main" }} />
+                        <Typography variant="h6" component="div">
+                          {userStats.supportNote || userStats.userName || "Unknown User"}
+                        </Typography>
+                      </Box>
+
+                      {userStats.userEmail && (
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                          {userStats.userEmail}
+                        </Typography>
+                      )}
+
+                      <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                        <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <Typography variant="body2" color="text.secondary">
+                            Total Plans:
+                          </Typography>
+                          <Chip label={userStats.totalPlans} size="small" color="default" />
+                        </Box>
+
+                        <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                          <Typography variant="body2" color="text.secondary">
+                            In Progress:
+                          </Typography>
+                          <Chip label={userStats.incompletePlans} size="small" color="info" />
+                        </Box>
+
+                        {userStats.yellowWarningPlans > 0 && (
+                          <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <Typography variant="body2" color="text.secondary">
+                              Due in 3 Days:
+                            </Typography>
+                            <Chip
+                              label={userStats.yellowWarningPlans}
+                              size="small"
+                              color="warning"
+                              icon={<WarningIcon />}
+                            />
+                          </Box>
+                        )}
+
+                        {userStats.redAlertPlans > 0 && (
+                          <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <Typography variant="body2" color="text.secondary">
+                              Overdue/Due Today:
+                            </Typography>
+                            <Chip
+                              label={userStats.redAlertPlans}
+                              size="small"
+                              color="error"
+                              icon={<ErrorIcon />}
+                            />
+                          </Box>
+                        )}
+                      </Box>
+                    </CardContent>
+                  </CardActionArea>
+                </Card>
+              </Grid>
+            ))}
+          </Grid>
+        </Box>
       ) : (
-        <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-          {plans.map((plan) => (
+        // Level 2: Plans for Selected User
+        <Box>
+          <Box sx={{ mb: 3, display: "flex", alignItems: "center", gap: 2 }}>
+            <Button
+              startIcon={<ArrowBackIcon />}
+              onClick={() => setSelectedUserId(null)}
+              variant="outlined"
+            >
+              Back to Users
+            </Button>
+            <Box sx={{ flex: 1 }}>
+              <Typography variant="h5" component="div">
+                {selectedUserStats?.supportNote || selectedUserStats?.userName || "User Plans"}
+              </Typography>
+              {selectedUserStats?.userEmail && (
+                <Typography variant="body2" color="text.secondary">
+                  {selectedUserStats.userEmail}
+                </Typography>
+              )}
+            </Box>
+          </Box>
+
+          <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            {selectedUserStats?.plans.map((plan) => (
             <Paper key={plan.planId} sx={{ p: 2 }}>
               <Box sx={{ mb: 2 }}>
                 <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", mb: 1 }}>
@@ -1092,6 +1248,7 @@ export default function GTMPlans() {
               )}
             </Paper>
           ))}
+        </Box>
         </Box>
       )}
 
