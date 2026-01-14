@@ -60,6 +60,7 @@ export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   timestamp?: string; // Add direct timestamp field
+  llm?: string; // LLM model used for this message (for assistant messages)
   name?: string; // For tool messages
   tool_call_id?: string; // For tool messages
   tool_calls?: any[]; // For assistant messages with tool calls

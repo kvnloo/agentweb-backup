@@ -112,6 +112,13 @@ const mockPlans = [
   },
 ];
 
+const toLocalDateString = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
 describe('GTMPlans - Basic Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -382,7 +389,7 @@ describe('GTMPlans - Due Date Management', () => {
     const today = new Date();
     const threeDaysLater = new Date(today);
     threeDaysLater.setDate(today.getDate() + 3);
-    const dueDateStr = threeDaysLater.toISOString().split('T')[0];
+    const dueDateStr = toLocalDateString(threeDaysLater);
 
     const planWithNearDueDate = {
       ...mockPlans[0],
@@ -412,7 +419,7 @@ describe('GTMPlans - Due Date Management', () => {
   it('shows error icon for overdue due dates', async () => {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
-    const dueDateStr = yesterday.toISOString().split('T')[0];
+    const dueDateStr = toLocalDateString(yesterday);
 
     const planWithOverdueDate = {
       ...mockPlans[0],
