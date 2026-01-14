@@ -404,6 +404,7 @@ router.post('/agent-mode-predefined-workplans', authenticateToken, requireAdmin,
       autocomplete: workPlan.autocomplete || false,
       requireLogin: workPlan.requireLogin || false,
       showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+      showInAgentMode: workPlan.showInAgentMode || false,
       steps: workPlan.steps
         .filter((step: any) => step.title && step.title.trim().length > 0)
         .map((step: any, index: number) => ({
@@ -520,6 +521,7 @@ router.put('/agent-mode-predefined-workplans/:planId', authenticateToken, requir
       autocomplete: workPlan.autocomplete || false,
       requireLogin: workPlan.requireLogin || false,
       showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
+      showInAgentMode: workPlan.showInAgentMode || false,
       steps: workPlan.steps
         .filter((step: any) => step.title && step.title.trim().length > 0)
         .map((step: any, index: number) => ({

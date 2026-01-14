@@ -27,6 +27,7 @@ interface PredefinedWorkPlan {
   steps: WorkPlanStep[];
   requireLogin?: boolean;
   showLoginSignup?: 'after_plan_completed' | 'always';
+  showInAgentMode?: boolean;
 }
 
 // Helper function to get default onboarding plan
