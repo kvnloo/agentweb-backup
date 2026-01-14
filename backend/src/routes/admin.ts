@@ -466,7 +466,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     const delegateToken = jwt.sign(
       delegatePayload,
       process.env.JWT_SECRET || "your-secret-key",
-      { expiresIn: "24h" } // Delegate tokens expire in 24 hours for security
+      { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
     );
 
     // Return the delegate token and customer portal URL
@@ -475,7 +475,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     res.json({ 
       delegateToken,
       customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
-      expiresIn: "24h"
+      expiresIn: "90d"
     });
   } catch (error) {
     console.error("Error creating delegate access:", error);
