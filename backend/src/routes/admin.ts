@@ -296,8 +296,10 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     }
 
     // Update the user's CMS Type
+    // Preserve null to allow clearing the field, convert empty string to null, otherwise use the value or undefined
+    const cmsTypeValue = cmsType === null || cmsType === "" ? null : (cmsType || undefined);
     const updatedUser = await userDb.updateUser(userId, { 
-      cmsType: cmsType || undefined 
+      cmsType: cmsTypeValue
     });
     res.json(updatedUser);
   } catch (error) {
