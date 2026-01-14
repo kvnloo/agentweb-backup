@@ -520,3 +520,6 @@ Total errors: 0
 ==================================================
 
 ✅ Repair completed successfully!
+
+## Jan 14 2026
+Configured Claude Code and use AWS Bedrock for the LLM: https://code.claude.com/docs/en/amazon-bedrock. In future, we could also use Azure as it starts to offer Claude models but no quota at the moment.
