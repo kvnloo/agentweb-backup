@@ -10,6 +10,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
     date: '2026-01-14',
     changes: [
       'Fixed bug where support for customizable field mappings in Webflow blog publishing was not working',
+      'Restructured GTM Plans page with two-level user-based view in Partner Portal',
+      '- Level 1: User cards showing company names (Support Note), total plans, in-progress plans, and due date alerts',
+      '- Level 2: Individual user\'s plans view with full plan management capabilities',
+      '- Color-coded alerts: yellow for plans due in 3 days, red for overdue or due today',
+      '- Users without plans are automatically hidden from the view',
+      '- Added Support Note field to user data to identify company names',
+      '- Improved navigation with back button to return to user cards view',
     ],
   },
   {
