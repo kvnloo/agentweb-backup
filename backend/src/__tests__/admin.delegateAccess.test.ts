@@ -85,7 +85,7 @@ describe('Admin delegate access endpoint', () => {
   it('should return 404 when user does not exist', async () => {
     const targetUserId = 'non-existent-user';
     
-    mockUserDb.getUserById.mockResolvedValue(null);
+    mockUserDb.getUserById.mockResolvedValue(null as any);
 
     const res = await request(app)
       .post(`/api/admin/users/${targetUserId}/delegate-access`)

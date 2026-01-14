@@ -163,7 +163,7 @@ describe("Admin CMS Type endpoint", () => {
   it("should return 404 when user does not exist", async () => {
     const userId = "non-existent-user";
 
-    mockUserDb.getUserById.mockResolvedValue(null);
+    mockUserDb.getUserById.mockResolvedValue(null as any);
 
     const res = await request(app)
       .put(`/api/admin/users/${userId}/cms-type`)
