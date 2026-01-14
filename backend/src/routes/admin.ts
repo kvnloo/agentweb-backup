@@ -296,8 +296,10 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     }
 
     // Update the user's CMS Type
+    // Preserve null to allow clearing the field, convert empty string to null, otherwise use the value or undefined
+    const cmsTypeValue = cmsType === null || cmsType === "" ? null : (cmsType || undefined);
     const updatedUser = await userDb.updateUser(userId, { 
-      cmsType: cmsType || undefined 
+      cmsType: cmsTypeValue
     });
     res.json(updatedUser);
   } catch (error) {
@@ -466,7 +468,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     const delegateToken = jwt.sign(
       delegatePayload,
       process.env.JWT_SECRET || "your-secret-key",
-      { expiresIn: "24h" } // Delegate tokens expire in 24 hours for security
+      { expiresIn: "90d" } // Delegate tokens expire in 90 days for security
     );
 
     // Return the delegate token and customer portal URL
@@ -475,7 +477,7 @@ router.post("/users/:userId/delegate-access", async (req, res) => {
     res.json({ 
       delegateToken,
       customerPortalUrl: `${customerPortalUrl}/oauth-callback?token=${delegateToken}`,
-      expiresIn: "24h"
+      expiresIn: "90d"
     });
   } catch (error) {
     console.error("Error creating delegate access:", error);
