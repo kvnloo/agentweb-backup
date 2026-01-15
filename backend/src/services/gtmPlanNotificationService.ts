@@ -474,7 +474,7 @@ export async function sendPlanStatusReport(
       // Collect all unique phase PoCs
       const phasePocs = plan.phases
         .map((p: Phase) => p.dri)
-        .filter(Boolean);
+        .filter((dri): dri is string => Boolean(dri));
       recipients.push(...phasePocs);
     }
 
