@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-15',
+    changes: [
+      'Added upload preview support in Agent Mode',
+      '- Images now display as square thumbnails showing the actual image content',
+      '- Non-image files show the file extension in a square preview card',
+      '- Filenames appear below each preview with truncation for long names',
+    ],
+  },
+  {
     date: '2026-01-14',
     changes: [
       'Fixed bug where support for customizable field mappings in Webflow blog publishing was not working',
