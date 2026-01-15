@@ -1,14 +1,14 @@
 import { linkedInService } from '../linkedInService';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics } from './socialPlatformTypes';
-import { getLinkedInConfig, getLinkedInOrgConfig } from '../../config/integrations';
+import { getLinkedInConfig } from '../../config/integrations';
 
 /**
  * LinkedIn Adapter Implementation
  * Handles differences between Personal and Company pages
  */
 export class LinkedInAdapter implements SocialPlatformAdapter {
-  
+
   /**
    * Get a valid access token, refreshing if expired
    * Returns the token and whether it was refreshed (so caller can update DB if needed)
@@ -19,36 +19,32 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
   ): Promise<{ token: string; wasRefreshed: boolean }> {
     const config = account.config as LinkedInConfig;
     const now = Date.now();
-    
+
     // Check if token is still valid (with 5 minute buffer)
     const bufferMs = 5 * 60 * 1000;
     const expiresAt = config.token_expires_at;
     const timeUntilExpiry = expiresAt - now;
-    
+
     if (expiresAt > now + bufferMs) {
       return { token: config.access_token, wasRefreshed: false };
     }
-    
+
     // Token is expired or about to expire - try to refresh
     if (!config.refresh_token) {
       console.error('[LinkedInAdapter] No refresh token available!');
       throw new Error('LinkedIn access token expired and no refresh token available. Please reconnect your account.');
     }
-    
 
-    
-    // Get the appropriate config based on account type
-    const oauthConfig = config.account_type === 'company_page' 
-      ? await getLinkedInOrgConfig()
-      : await getLinkedInConfig();
-    
+    // Get the unified LinkedIn config (works for both personal and company accounts)
+    const oauthConfig = await getLinkedInConfig();
+
     try {
       const newTokens = await linkedInService.refreshAccessToken(
         config.refresh_token,
         oauthConfig.clientId,
         oauthConfig.clientSecret
       );
-      
+
       // Update the account in DB if userId is provided
       if (userId) {
         await updateAccountTokens(userId, account.platform, {
@@ -58,7 +54,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         });
 
       }
-      
+
       return { token: newTokens.access_token, wasRefreshed: true };
     } catch (error) {
       console.error('[LinkedInAdapter] Token refresh failed:', error);
@@ -75,12 +71,12 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     try {
       // Get valid token (refreshes if expired)
       const { token } = await this.getValidToken(account, userId);
-      
+
       // Upload images if provided
       let imageUrns: string[] = [];
       if (mediaUrls && mediaUrls.length > 0) {
 
-        
+
         for (const url of mediaUrls) {
           try {
             const imageUrn = await linkedInService.uploadImageFromUrl(token, authorUrn, url);
@@ -90,17 +86,28 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
             // Continue with other images or post without this image
           }
         }
-        
+
 
       }
 
       // Create post (with or without images)
       const postUrn = await linkedInService.createPost(token, authorUrn, content, imageUrns.length > 0 ? imageUrns : undefined);
-      
+
+      // Store post in database for personal accounts only
+      if (userId && config.account_type === 'personal') {
+        try {
+          const { createPost: storePost } = await import('../linkedInPostsDb');
+          await storePost(userId, authorUrn, postUrn, content, mediaUrls);
+        } catch (dbError) {
+          console.error('[LinkedInAdapter] Failed to store post in DB:', dbError);
+          // Don't fail the entire operation if DB storage fails
+        }
+      }
+
       return {
         success: true,
-        message: imageUrns.length > 0 
-          ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)` 
+        message: imageUrns.length > 0
+          ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
           : 'Posted successfully on LinkedIn',
         postId: postUrn,
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
@@ -117,32 +124,69 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async listPosts(account: ConnectedAccount, options?: { limit?: number }): Promise<any[]> {
+  async listPosts(account: ConnectedAccount, options?: { limit?: number }, userId?: string): Promise<any[]> {
     const config = account.config as LinkedInConfig;
-    
-    // Personal profiles do not support listing posts via API in the same way (requires different scopes/endpoints often not available)
+    const limit = options?.limit || 10;
+
+    // Personal profiles: fetch from database
     if (config.account_type === 'personal') {
-      console.warn('Listing posts is not supported for LinkedIn personal profiles');
-      return []; 
+      try {
+        const { getPostsByAccount } = await import('../linkedInPostsDb');
+        const posts = await getPostsByAccount(account.account_id, limit);
+
+        // Transform to match expected format
+        return posts.map(post => ({
+          id: post.postId,
+          author: post.accountId,
+          commentary: post.content,
+          created: { time: new Date(post.createdAt).getTime() },
+          lifecycleState: 'PUBLISHED',
+          visibility: 'PUBLIC'
+        }));
+      } catch (error) {
+        return [];
+      }
     }
 
+    // Organization accounts: use LinkedIn API
     const token = config.access_token;
     const authorUrn = account.account_id;
-    const limit = options?.limit || 10;
 
     const response = await linkedInService.listPosts(token, authorUrn, 0, limit);
     return response.elements || [];
   }
 
-  async getPostMetrics(account: ConnectedAccount, postIds: string[]): Promise<PostMetric[]> {
+  async getPostMetrics(account: ConnectedAccount, postIds: string[], userId?: string): Promise<PostMetric[]> {
     const config = account.config as LinkedInConfig;
 
     if (config.account_type === 'personal') {
-      // Personal profiles don't expose granular post stats via Organization API
-      return [];
+      // Fetch analytics for personal accounts using per-post API
+      const { token } = await this.getValidToken(account, userId);
+
+      const metrics = await Promise.all(
+        postIds.map(async (postUrn) => {
+          try {
+            const analytics = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
+            return {
+              share: postUrn,
+              likes: analytics.reaction || 0,
+              comments: analytics.comment || 0,
+              shares: analytics.reshare || 0,
+              impressions: analytics.impression,
+              engagement: (analytics.reaction || 0) + (analytics.comment || 0) + (analytics.reshare || 0)
+            };
+          } catch (error) {
+            console.warn(`[LinkedInAdapter] Failed to fetch metrics for post ${postUrn}:`, error);
+            return null;
+          }
+        })
+      );
+
+      return metrics.filter(m => m !== null) as PostMetric[];
     }
 
-    const token = config.access_token;
+    // Organization accounts - use existing batch API
+    const { token } = await this.getValidToken(account, userId);
     const authorUrn = account.account_id;
 
     try {
@@ -192,4 +236,3 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
   }
 
 }
-

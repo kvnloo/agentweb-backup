@@ -2,9 +2,7 @@ import axios from 'axios';
 import {
   LinkedInProfile,
   LinkedInPost,
-  LinkedInErrorResponse,
   LinkedInAclResponse,
-  LinkedInOrganizationAcl,
   LinkedInFollowerStatistics,
   LinkedInPageStatistics,
   LinkedInShareStatistics,
@@ -541,20 +539,70 @@ export class LinkedInService {
   }
 
   /**
-   * Get aggregated post analytics for personal profile
-   * Retrieves impressions and members reached for a date range
+   * Get analytics for personal profile posts
+   * - If postUrn is provided: Returns detailed metrics for that specific post
+   * - If no postUrn: Returns aggregated metrics for a date range
+   * 
    * @param accessToken - OAuth access token
-   * @param startDate - Optional start date (defaults to 30 days ago)
-   * @param endDate - Optional end date (defaults to today)
+   * @param options - Optional configuration
+   * @param options.postUrn - Post URN for per-post analytics (e.g., "urn:li:share:123" or "urn:li:ugcPost:456")
+   * @param options.startDate - Start date for aggregated analytics (defaults to 30 days ago)
+   * @param options.endDate - End date for aggregated analytics (defaults to today)
    */
   async getPersonalPostAnalytics(
     accessToken: string,
-    startDate?: Date,
-    endDate?: Date
-  ): Promise<{ impression: number; members_reached: number }> {
+    options?: {
+      postUrn?: string;
+      startDate?: Date;
+      endDate?: Date;
+    }
+  ): Promise<{
+    impression: number;
+    members_reached: number;
+    reaction?: number;
+    comment?: number;
+    reshare?: number;
+  }> {
     return this.safeRequest(async () => {
-      const end = endDate || new Date();
-      const start = startDate || new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
+      // If postUrn is provided, fetch per-post analytics
+      if (options?.postUrn) {
+        const postUrn = options.postUrn;
+
+        // Determine entity type from URN
+        let entityParam: string;
+        if (postUrn.startsWith('urn:li:share:')) {
+          entityParam = `(share:${encodeURIComponent(postUrn)})`;
+        } else if (postUrn.startsWith('urn:li:ugcPost:')) {
+          entityParam = `(ugc:${encodeURIComponent(postUrn)})`;
+        } else {
+          throw new Error('Invalid post URN format. Must be urn:li:share: or urn:li:ugcPost:');
+        }
+
+        const metrics = ['IMPRESSION', 'MEMBERS_REACHED', 'REACTION', 'COMMENT', 'RESHARE'];
+        const analyticsData: any = {};
+
+        for (const metric of metrics) {
+          const url = `/rest/memberCreatorPostAnalytics?q=entity&entity=${entityParam}&queryType=${metric}&aggregation=TOTAL`;
+
+          try {
+            const response = await this.client.get<{ elements: Array<{ count: number }> }>(url, {
+              headers: { Authorization: `Bearer ${accessToken}` },
+            });
+
+            const totalCount = response.data.elements?.reduce((sum, el) => sum + (el.count || 0), 0) || 0;
+            analyticsData[metric.toLowerCase()] = totalCount;
+          } catch (error) {
+            console.warn(`[LinkedIn] Failed to fetch ${metric} for post ${postUrn}:`, error);
+            analyticsData[metric.toLowerCase()] = 0;
+          }
+        }
+
+        return analyticsData;
+      }
+
+      // Otherwise, fetch aggregated analytics for date range
+      const end = options?.endDate || new Date();
+      const start = options?.startDate || new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000); // 30 days ago
 
       // Build date range parameter
       const dateRange = `(start:(day:${start.getDate()},month:${start.getMonth() + 1},year:${start.getFullYear()}),end:(day:${end.getDate()},month:${end.getMonth() + 1},year:${end.getFullYear()}))`;
@@ -574,56 +622,6 @@ export class LinkedInService {
           analyticsData[metric.toLowerCase()] = totalCount;
         } catch (error) {
           console.warn(`[LinkedIn] Failed to fetch ${metric}:`, error);
-          analyticsData[metric.toLowerCase()] = 0;
-        }
-      }
-
-      return analyticsData;
-    });
-  }
-
-  /**
-   * Get analytics for a specific personal post by URN
-   * Retrieves detailed metrics including impressions, reach, reactions, comments, and reshares
-   * @param accessToken - OAuth access token
-   * @param postUrn - Post URN (e.g., "urn:li:share:123" or "urn:li:ugcPost:456")
-   */
-  async getPersonalPostAnalyticsByUrn(
-    accessToken: string,
-    postUrn: string
-  ): Promise<{
-    impression: number;
-    members_reached: number;
-    reaction: number;
-    comment: number;
-    reshare: number;
-  }> {
-    return this.safeRequest(async () => {
-      // Determine entity type from URN
-      let entityParam: string;
-      if (postUrn.startsWith('urn:li:share:')) {
-        entityParam = `(share:${encodeURIComponent(postUrn)})`;
-      } else if (postUrn.startsWith('urn:li:ugcPost:')) {
-        entityParam = `(ugc:${encodeURIComponent(postUrn)})`;
-      } else {
-        throw new Error('Invalid post URN format. Must be urn:li:share: or urn:li:ugcPost:');
-      }
-
-      const metrics = ['IMPRESSION', 'MEMBERS_REACHED', 'REACTION', 'COMMENT', 'RESHARE'];
-      const analyticsData: any = {};
-
-      for (const metric of metrics) {
-        const url = `/rest/memberCreatorPostAnalytics?q=entity&entity=${entityParam}&queryType=${metric}&aggregation=TOTAL`;
-
-        try {
-          const response = await this.client.get<{ elements: Array<{ count: number }> }>(url, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-          });
-
-          const totalCount = response.data.elements?.reduce((sum, el) => sum + (el.count || 0), 0) || 0;
-          analyticsData[metric.toLowerCase()] = totalCount;
-        } catch (error) {
-          console.warn(`[LinkedIn] Failed to fetch ${metric} for post ${postUrn}:`, error);
           analyticsData[metric.toLowerCase()] = 0;
         }
       }
