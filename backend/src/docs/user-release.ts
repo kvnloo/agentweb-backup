@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-15',
+    changes: [
+      'Added Send Status Report feature to GTM Plans in both Partner Portal and Customer Portal',
+      '- Added status report icons (chart icon) at both plan and phase levels',
+      '- Users can now send status reports to plan owners, POCs, and phase POCs to give updates on plan progress',
+    ],
+  },
+  {
     date: '2026-01-14',
     changes: [
       'Fixed bug where support for customizable field mappings in Webflow blog publishing was not working',

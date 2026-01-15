@@ -44,6 +44,7 @@ import {
   Error as ErrorIcon,
   ArrowBack as ArrowBackIcon,
   Business as BusinessIcon,
+  Assessment as AssessmentIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
@@ -147,6 +148,25 @@ export default function GTMPlans() {
     phaseId: string;
     workItemId: string;
   } | null>(null);
+  const [statusReportDialogOpen, setStatusReportDialogOpen] = useState(false);
+  const [statusReportType, setStatusReportType] = useState<"phase" | "plan" | null>(null);
+  const [statusReportTarget, setStatusReportTarget] = useState<{
+    planId: string;
+    phaseId?: string;
+  } | null>(null);
+  const [statusReportMessage, setStatusReportMessage] = useState("");
+  const [statusReportOptions, setStatusReportOptions] = useState<{
+    notifyUser: boolean;
+    notifyPlanPoc: boolean;
+    notifyPhasePocs: boolean;
+    notifyPhasePoc: boolean;
+  }>({
+    notifyUser: false,
+    notifyPlanPoc: false,
+    notifyPhasePocs: false,
+    notifyPhasePoc: false,
+  });
+  const [sendingStatusReport, setSendingStatusReport] = useState(false);
 
   useEffect(() => {
     fetchPlans();
@@ -592,6 +612,92 @@ export default function GTMPlans() {
     setEditDueDate("");
   };
 
+  // Status Report Handlers
+  const handleOpenStatusReport = (type: "phase" | "plan", planId: string, phaseId?: string) => {
+    setStatusReportType(type);
+    setStatusReportTarget({ planId, phaseId });
+    setStatusReportMessage("");
+
+    // Load preferences from localStorage
+    const storageKey = type === "phase"
+      ? "gtm-plans-phase-status-report-prefs"
+      : "gtm-plans-plan-status-report-prefs";
+    const savedPrefs = localStorage.getItem(storageKey);
+
+    if (savedPrefs) {
+      try {
+        const prefs = JSON.parse(savedPrefs);
+        setStatusReportOptions(prefs);
+      } catch (e) {
+        // Use defaults if parsing fails
+        setStatusReportOptions({
+          notifyUser: false,
+          notifyPlanPoc: false,
+          notifyPhasePocs: false,
+          notifyPhasePoc: false,
+        });
+      }
+    } else {
+      // Default all to true for first-time users
+      setStatusReportOptions({
+        notifyUser: true,
+        notifyPlanPoc: true,
+        notifyPhasePocs: type === "plan",
+        notifyPhasePoc: type === "phase",
+      });
+    }
+
+    setStatusReportDialogOpen(true);
+  };
+
+  const handleCancelStatusReport = () => {
+    setStatusReportDialogOpen(false);
+    setStatusReportType(null);
+    setStatusReportTarget(null);
+    setStatusReportMessage("");
+  };
+
+  const handleSendStatusReport = async () => {
+    if (!statusReportTarget) return;
+
+    setSendingStatusReport(true);
+
+    try {
+      // Save preferences to localStorage
+      const storageKey = statusReportType === "phase"
+        ? "gtm-plans-phase-status-report-prefs"
+        : "gtm-plans-plan-status-report-prefs";
+      localStorage.setItem(storageKey, JSON.stringify(statusReportOptions));
+
+      const endpoint = statusReportType === "phase"
+        ? `/api/admin/gtm-plans/${statusReportTarget.planId}/phases/${statusReportTarget.phaseId}/send-status-report`
+        : `/api/admin/gtm-plans/${statusReportTarget.planId}/send-status-report`;
+
+      const response = await axios.post(
+        buildApiUrl(endpoint),
+        {
+          notifications: statusReportOptions,
+          message: statusReportMessage || undefined,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        }
+      );
+
+      if (response.data.success) {
+        handleCancelStatusReport();
+      } else {
+        throw new Error(response.data.error || "Failed to send status report");
+      }
+    } catch (err: any) {
+      console.error("Error sending status report:", err);
+    } finally {
+      setSendingStatusReport(false);
+    }
+  };
+
   const getStatusColor = (status: string) => {
     switch (status) {
       case "completed":
@@ -1018,6 +1124,14 @@ export default function GTMPlans() {
                         <CalendarTodayIcon fontSize="small" />
                       </IconButton>
                     </Tooltip>
+                    <Tooltip title="Send Plan Status Report">
+                      <IconButton
+                        size="small"
+                        onClick={() => handleOpenStatusReport("plan", plan.planId)}
+                      >
+                        <AssessmentIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
                   </Box>
                 </Box>
               </Box>
@@ -1096,6 +1210,20 @@ export default function GTMPlans() {
                                   onMouseDown={(e) => e.stopPropagation()}
                                 >
                                   <CalendarTodayIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                            <Tooltip title="Send Phase Status Report">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleOpenStatusReport("phase", plan.planId, phase.id);
+                                  }}
+                                  onMouseDown={(e) => e.stopPropagation()}
+                                >
+                                  <AssessmentIcon fontSize="small" />
                                 </IconButton>
                               </span>
                             </Tooltip>
@@ -1552,6 +1680,175 @@ export default function GTMPlans() {
           </Button>
           <Button onClick={handleConstraintConfirm} variant="contained" color="warning" disabled={saving}>
             {saving ? <CircularProgress size={20} /> : "Proceed Anyway"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Status Report Dialog */}
+      <Dialog open={statusReportDialogOpen} onClose={handleCancelStatusReport} maxWidth="sm" fullWidth>
+        <DialogTitle>
+          Send {statusReportType === "phase" ? "Phase" : "Plan"} Status Report
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Select who should receive this status report:
+          </Typography>
+
+          <TextField
+            fullWidth
+            multiline
+            rows={3}
+            label="Optional Message (included in status report email)"
+            value={statusReportMessage}
+            onChange={(e) => setStatusReportMessage(e.target.value)}
+            placeholder="Add a personal message to include in the status report email..."
+            sx={{ mb: 3 }}
+            helperText="This message will be included at the top of the status report email."
+          />
+
+          {statusReportTarget && (() => {
+            const plan = plans.find((p) => p.planId === statusReportTarget.planId);
+            const phase = statusReportType === "phase" && statusReportTarget.phaseId
+              ? plan?.phases?.find((p) => p.id === statusReportTarget.phaseId)
+              : null;
+
+            const userEmail = plan?.userEmail;
+            const planPoc = plan?.dri;
+            const phasePoc = phase?.dri;
+
+            // For plan-level reports, get all unique phase PoCs
+            const allPhasePocs = statusReportType === "plan"
+              ? Array.from(new Set(
+                  plan?.phases?.map(p => p.dri).filter(Boolean) || []
+                ))
+              : [];
+
+            return (
+              <FormGroup>
+                {userEmail && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={statusReportOptions.notifyUser}
+                        onChange={(e) =>
+                          setStatusReportOptions((prev) => ({
+                            ...prev,
+                            notifyUser: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Plan Owner
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {userEmail}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+
+                {planPoc && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={statusReportOptions.notifyPlanPoc}
+                        onChange={(e) =>
+                          setStatusReportOptions((prev) => ({
+                            ...prev,
+                            notifyPlanPoc: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Plan PoC
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {planPoc}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+
+                {statusReportType === "phase" && phasePoc && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={statusReportOptions.notifyPhasePoc}
+                        onChange={(e) =>
+                          setStatusReportOptions((prev) => ({
+                            ...prev,
+                            notifyPhasePoc: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify Phase PoC
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {phasePoc}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+
+                {statusReportType === "plan" && allPhasePocs.length > 0 && (
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={statusReportOptions.notifyPhasePocs}
+                        onChange={(e) =>
+                          setStatusReportOptions((prev) => ({
+                            ...prev,
+                            notifyPhasePocs: e.target.checked,
+                          }))
+                        }
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2" fontWeight="medium">
+                          Notify All Phase PoCs
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {allPhasePocs.join(", ")}
+                        </Typography>
+                      </Box>
+                    }
+                  />
+                )}
+
+                {!userEmail && !planPoc &&
+                 (statusReportType === "phase" ? !phasePoc : allPhasePocs.length === 0) && (
+                  <Typography variant="body2" color="text.secondary">
+                    No recipients available to notify.
+                  </Typography>
+                )}
+              </FormGroup>
+            );
+          })()}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={handleCancelStatusReport} disabled={sendingStatusReport}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSendStatusReport}
+            variant="contained"
+            disabled={sendingStatusReport}
+          >
+            {sendingStatusReport ? <CircularProgress size={20} /> : "Send Status Report"}
           </Button>
         </DialogActions>
       </Dialog>

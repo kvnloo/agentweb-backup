@@ -8,7 +8,7 @@ import { userDb, taskDb, subscriberDb } from "../services/db";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
-import { sendGTMPlanUpdateNotifications } from "../services/gtmPlanNotificationService";
+import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
@@ -2504,6 +2504,134 @@ router.put("/gtm-plans/:planId/phases/:phaseId", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error updating phase PoC",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Send phase status report
+router.post("/gtm-plans/:planId/phases/:phaseId/send-status-report", async (req, res) => {
+  try {
+    const { planId, phaseId } = req.params;
+    const { notifications, message } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+
+    // Verify phase exists
+    const phase = plan.phases?.find((p: any) => p.id === phaseId);
+    if (!phase) {
+      return res.status(404).json({
+        success: false,
+        error: "Phase not found",
+      });
+    }
+
+    // Send status report
+    await sendPhaseStatusReport(
+      plan as any,
+      phaseId,
+      { ...notifications, message },
+      process.env.CUSTOMER_FRONTEND_URL
+    );
+
+    return res.json({
+      success: true,
+      message: "Phase status report sent successfully",
+    });
+  } catch (error: any) {
+    console.error("Error sending phase status report:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error sending phase status report",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Send plan status report
+router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
+  try {
+    const { planId } = req.params;
+    const { notifications, message } = req.body;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: {
+          planId: planId,
+        },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+
+    // Send status report
+    await sendPlanStatusReport(
+      plan as any,
+      { ...notifications, message },
+      process.env.CUSTOMER_FRONTEND_URL
+    );
+
+    return res.json({
+      success: true,
+      message: "Plan status report sent successfully",
+    });
+  } catch (error: any) {
+    console.error("Error sending plan status report:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error sending plan status report",
       error: error?.message || "Internal server error",
     });
   }
