@@ -1,5 +1,5 @@
 
-import { getLinkedInPersonalCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials } from '../utils/secretsManager';
 
 // Static configuration values (URLs, scopes, etc.)
 export const INTEGRATION_CONFIG = {
@@ -13,7 +13,6 @@ export const INTEGRATION_CONFIG = {
       'w_member_social',              // Create/modify posts on personal profile
       'r_member_postAnalytics',       // Retrieve personal post analytics
       'r_member_profileAnalytics',    // Retrieve personal profile analytics
-      'r_1st_connections_size',       // Retrieve connection count
       'w_member_social_feed',         // Manage personal post comments/reactions
       
       // Organization Account Permissions
@@ -21,7 +20,6 @@ export const INTEGRATION_CONFIG = {
       'rw_organization_admin',        // Manage organization pages
       'w_organization_social',        // Create/modify organization posts
       'r_organization_followers',     // Access follower data
-      'w_organization_social_feed',   // Manage organization post comments/reactions
       'r_organization_social_feed'    // Read organization engagement data
     ],
     // LinkedIn OAuth V2 Endpoints
@@ -49,7 +47,7 @@ export interface LinkedInConfig {
  */
 export async function getLinkedInConfig(): Promise<LinkedInConfig> {
   // Fetch credentials from AWS Secrets Manager
-  const credentials = await getLinkedInPersonalCredentials();
+  const credentials = await getLinkedInCredentials();
 
   return {
     clientId: credentials.clientId,
