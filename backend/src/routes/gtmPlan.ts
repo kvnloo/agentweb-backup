@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
-import { sendGTMPlanUpdateNotifications } from "../services/gtmPlanNotificationService";
+import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient({
@@ -892,6 +892,136 @@ router.delete("/:planId", authenticateToken, async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "Internal server error",
+    });
+  }
+});
+
+// Send phase status report
+router.post("/:planId/phases/:phaseId/send-status-report", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId } = req.params;
+    const { notifications, message } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: "User ID not provided",
+      });
+    }
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: { planId: planId },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+
+    // Verify the plan belongs to the user
+    if (plan.userId !== userId) {
+      return res.status(403).json({
+        success: false,
+        error: "You do not have permission to access this plan",
+      });
+    }
+
+    // Verify phase exists
+    const phase = plan.phases?.find((p: any) => p.id === phaseId);
+    if (!phase) {
+      return res.status(404).json({
+        success: false,
+        error: "Phase not found",
+      });
+    }
+
+    // Send status report
+    await sendPhaseStatusReport(
+      plan as any,
+      phaseId,
+      { ...notifications, message },
+      process.env.CUSTOMER_FRONTEND_URL
+    );
+
+    return res.json({
+      success: true,
+      message: "Phase status report sent successfully",
+    });
+  } catch (error: any) {
+    console.error("Error sending phase status report:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error sending phase status report",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Send plan status report
+router.post("/:planId/send-status-report", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId } = req.params;
+    const { notifications, message } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        error: "User ID not provided",
+      });
+    }
+
+    // Get the existing plan
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: { planId: planId },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({
+        success: false,
+        error: "GTM Plan not found",
+      });
+    }
+
+    const plan = getResult.Item;
+
+    // Verify the plan belongs to the user
+    if (plan.userId !== userId) {
+      return res.status(403).json({
+        success: false,
+        error: "You do not have permission to access this plan",
+      });
+    }
+
+    // Send status report
+    await sendPlanStatusReport(
+      plan as any,
+      { ...notifications, message },
+      process.env.CUSTOMER_FRONTEND_URL
+    );
+
+    return res.json({
+      success: true,
+      message: "Plan status report sent successfully",
+    });
+  } catch (error: any) {
+    console.error("Error sending plan status report:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error sending plan status report",
+      error: error?.message || "Internal server error",
     });
   }
 });

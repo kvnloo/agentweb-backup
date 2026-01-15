@@ -13,6 +13,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Images now display as square thumbnails showing the actual image content',
       '- Non-image files show the file extension in a square preview card',
       '- Filenames appear below each preview with truncation for long names',
+      'Added Send Status Report feature to GTM Plans in both Partner Portal and Customer Portal',
+      '- Added status report icons (chart icon) at both plan and phase levels',
+      '- Users can now send status reports to plan owners, POCs, and phase POCs to give updates on plan progress',
     ],
   },
   {

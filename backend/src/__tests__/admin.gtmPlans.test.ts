@@ -658,4 +658,214 @@ describe('Admin GTM Plans Update Endpoints', () => {
       // (This is tested indirectly through the successful response)
     });
   });
+
+  describe('Status Report Endpoints', () => {
+    let mockGet: jest.Mock;
+    let mockSendPhaseStatusReport: jest.Mock;
+    let mockSendPlanStatusReport: jest.Mock;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+
+      mockGet = jest.fn();
+      (DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => ({
+        get: mockGet,
+      }));
+
+      // Mock the notification service functions
+      mockSendPhaseStatusReport = jest.fn().mockResolvedValue(undefined);
+      mockSendPlanStatusReport = jest.fn().mockResolvedValue(undefined);
+
+      jest.doMock('../services/gtmPlanNotificationService', () => ({
+        sendGTMPlanUpdateNotifications: jest.fn(),
+        sendPhaseStatusReport: mockSendPhaseStatusReport,
+        sendPlanStatusReport: mockSendPlanStatusReport,
+      }));
+    });
+
+    describe('POST /api/admin/gtm-plans/:planId/phases/:phaseId/send-status-report', () => {
+      it('should send a phase status report successfully', async () => {
+        const mockPlan = {
+          planId: 'plan-1',
+          userId: 'user-1',
+          title: 'Test Plan',
+          phases: [
+            {
+              id: 'phase-1',
+              title: 'Test Phase',
+              status: 'in_progress',
+              dri: 'phase-poc@example.com',
+              workItems: [
+                {
+                  id: 'item-1',
+                  title: 'Test Item',
+                  status: 'pending',
+                  dri: 'item-poc@example.com',
+                },
+              ],
+            },
+          ],
+        };
+
+        mockGet.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Item: mockPlan,
+          }),
+        });
+
+        const response = await request(app)
+          .post('/api/admin/gtm-plans/plan-1/phases/phase-1/send-status-report')
+          .send({
+            notifications: {
+              notifyUser: true,
+              notifyPlanPoc: false,
+              notifyPhasePoc: true,
+            },
+            message: 'Custom status report message',
+          })
+          .expect(200);
+
+        expect(response.body.success).toBe(true);
+        expect(response.body.message).toBe('Phase status report sent successfully');
+      });
+
+      it('should return 404 if plan is not found', async () => {
+        mockGet.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({}),
+        });
+
+        const response = await request(app)
+          .post('/api/admin/gtm-plans/plan-999/phases/phase-1/send-status-report')
+          .send({
+            notifications: {
+              notifyUser: true,
+            },
+          })
+          .expect(404);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toBe('GTM Plan not found');
+      });
+
+      it('should return 404 if phase is not found', async () => {
+        const mockPlan = {
+          planId: 'plan-1',
+          userId: 'user-1',
+          title: 'Test Plan',
+          phases: [
+            {
+              id: 'phase-1',
+              title: 'Test Phase',
+            },
+          ],
+        };
+
+        mockGet.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Item: mockPlan,
+          }),
+        });
+
+        const response = await request(app)
+          .post('/api/admin/gtm-plans/plan-1/phases/phase-999/send-status-report')
+          .send({
+            notifications: {
+              notifyUser: true,
+            },
+          })
+          .expect(404);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toBe('Phase not found');
+      });
+    });
+
+    describe('POST /api/admin/gtm-plans/:planId/send-status-report', () => {
+      it('should send a plan status report successfully', async () => {
+        const mockPlan = {
+          planId: 'plan-1',
+          userId: 'user-1',
+          title: 'Test Plan',
+          dri: 'plan-poc@example.com',
+          phases: [
+            {
+              id: 'phase-1',
+              title: 'Phase 1',
+              status: 'in_progress',
+              dri: 'phase1-poc@example.com',
+              workItems: [],
+            },
+            {
+              id: 'phase-2',
+              title: 'Phase 2',
+              status: 'completed',
+              dri: 'phase2-poc@example.com',
+              workItems: [],
+            },
+          ],
+        };
+
+        mockGet.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Item: mockPlan,
+          }),
+        });
+
+        const response = await request(app)
+          .post('/api/admin/gtm-plans/plan-1/send-status-report')
+          .send({
+            notifications: {
+              notifyUser: true,
+              notifyPlanPoc: true,
+              notifyPhasePocs: true,
+            },
+            message: 'Overall plan status report',
+          })
+          .expect(200);
+
+        expect(response.body.success).toBe(true);
+        expect(response.body.message).toBe('Plan status report sent successfully');
+      });
+
+      it('should return 404 if plan is not found', async () => {
+        mockGet.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({}),
+        });
+
+        const response = await request(app)
+          .post('/api/admin/gtm-plans/plan-999/send-status-report')
+          .send({
+            notifications: {
+              notifyUser: true,
+            },
+          })
+          .expect(404);
+
+        expect(response.body.success).toBe(false);
+        expect(response.body.error).toBe('GTM Plan not found');
+      });
+
+      it('should handle missing notification options gracefully', async () => {
+        const mockPlan = {
+          planId: 'plan-1',
+          userId: 'user-1',
+          title: 'Test Plan',
+          phases: [],
+        };
+
+        mockGet.mockReturnValue({
+          promise: jest.fn().mockResolvedValue({
+            Item: mockPlan,
+          }),
+        });
+
+        const response = await request(app)
+          .post('/api/admin/gtm-plans/plan-1/send-status-report')
+          .send({})
+          .expect(200);
+
+        expect(response.body.success).toBe(true);
+      });
+    });
+  });
 });
