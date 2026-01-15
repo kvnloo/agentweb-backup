@@ -28,7 +28,6 @@ jest.mock('../services/linkedInService', () => ({
 // Mock integrations config
 jest.mock('../config/integrations', () => ({
   getLinkedInConfig: jest.fn(),
-  getLinkedInOrgConfig: jest.fn(),
 }));
 
 // Mock axios
@@ -46,7 +45,7 @@ jest.mock('../middleware/auth', () => ({
 import linkedinAuthRouter from '../routes/linkedinAuth';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
-import { getLinkedInConfig, getLinkedInOrgConfig } from '../config/integrations';
+import { getLinkedInConfig } from '../config/integrations';
 import axios from 'axios';
 
 // Create test app
@@ -64,7 +63,6 @@ describe('LinkedIn OAuth Routes', () => {
   const mockCreateAccount = createAccount as jest.MockedFunction<typeof createAccount>;
   const mockLinkedInService = linkedInService as jest.Mocked<typeof linkedInService>;
   const mockGetLinkedInConfig = getLinkedInConfig as jest.MockedFunction<typeof getLinkedInConfig>;
-  const mockGetLinkedInOrgConfig = getLinkedInOrgConfig as jest.MockedFunction<typeof getLinkedInOrgConfig>;
   const mockAxios = axios as jest.Mocked<typeof axios>;
 
   // Mock LinkedIn config
@@ -86,10 +84,6 @@ describe('LinkedIn OAuth Routes', () => {
 
     // Setup default mock returns
     mockGetLinkedInConfig.mockResolvedValue(mockLinkedInConfigData as any);
-    mockGetLinkedInOrgConfig.mockResolvedValue({
-      ...mockLinkedInConfigData,
-      scopes: ['r_organization_admin', 'w_organization_social'],
-    } as any);
   });
 
   afterAll(() => {
@@ -215,7 +209,7 @@ describe('LinkedIn OAuth Routes', () => {
           .get('/api/oauth/linkedin/org/init')
           .expect(200);
 
-        expect(mockGetLinkedInOrgConfig).toHaveBeenCalled();
+        expect(mockGetLinkedInConfig).toHaveBeenCalled();
         expect(response.body.success).toBe(true);
         expect(response.body.url).toContain('https://www.linkedin.com/oauth/v2/authorization');
       });
