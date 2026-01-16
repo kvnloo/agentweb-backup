@@ -24,6 +24,15 @@ jest.mock('../services/linkedInPostsDb', () => ({
   getPostByUrn: jest.fn(),
 }));
 
+// Mock getLinkedInConfig to prevent real secrets manager calls
+jest.mock('../config/integrations', () => ({
+  getLinkedInConfig: jest.fn().mockResolvedValue({
+    clientId: 'mock-client-id',
+    clientSecret: 'mock-client-secret',
+    redirectUri: 'https://mock-redirect.com/callback',
+  }),
+}));
+
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { linkedInService } from '../services/linkedInService';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
@@ -159,9 +168,12 @@ describe('LinkedInAdapter', () => {
       await expect(adapter.createPost(mockPersonalAccount, 'Test')).rejects.toThrow('Network error');
     });
   });
-
   describe('listPosts', () => {
-    it('should return empty array for personal profiles', async () => {
+    it('should fetch posts from database for personal profiles', async () => {
+      const mockPostsDb = linkedInPostsDb as jest.Mocked<typeof linkedInPostsDb>;
+      mockPostsDb.getPostsByAccount.mockResolvedValue([]);
+      
+      
       const result = await adapter.listPosts(mockPersonalAccount);
 
       expect(mockLinkedInService.listPosts).not.toHaveBeenCalled();
@@ -209,11 +221,16 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('getPostMetrics', () => {
-    it('should return empty array for personal profiles', async () => {
+    it('should return metrics with error info for personal profiles', async () => {
+      // Personal accounts use getPersonalPostAnalytics which is mocked to return undefined
+      // This triggers the error handling path and returns error info
       const result = await adapter.getPostMetrics(mockPersonalAccount, ['post1']);
 
       expect(mockLinkedInService.getShareStatistics).not.toHaveBeenCalled();
-      expect(result).toEqual([]);
+      // Now returns error info instead of empty array
+      expect(result).toHaveLength(1);
+      expect(result[0].share).toBe('post1');
+      expect(result[0].error).toBeDefined();
     });
 
     it('should return metrics for company account posts', async () => {
@@ -495,15 +512,14 @@ describe('LinkedInAdapter', () => {
       expect(result[0].created.time).toBeDefined();
     });
 
-    it('should return empty array on DB error', async () => {
+    it('should throw error with message on DB error', async () => {
       // Arrange
       mockPostsDb.getPostsByAccount.mockRejectedValue(new Error('DB error'));
 
-      // Act
-      const result = await adapter.listPosts(mockPersonalAccount);
-
-      // Assert
-      expect(result).toEqual([]);
+      // Act & Assert - Now throws error instead of returning empty array
+      await expect(adapter.listPosts(mockPersonalAccount)).rejects.toThrow(
+        'Failed to load posts for personal account: DB error'
+      );
     });
   });
 
@@ -553,7 +569,7 @@ describe('LinkedInAdapter', () => {
       });
     });
 
-    it('should filter out null metrics when some posts fail', async () => {
+    it('should include failed metrics with error info instead of filtering', async () => {
       // Arrange
       mockLinkedInService.getPersonalPostAnalytics
         .mockResolvedValueOnce({
@@ -572,9 +588,15 @@ describe('LinkedInAdapter', () => {
         'user-123'
       );
 
-      // Assert - Only successful metric should be returned
-      expect(result).toHaveLength(1);
+      // Assert - Both metrics returned, failed one has error info
+      expect(result).toHaveLength(2);
       expect(result[0].share).toBe('urn:li:share:success');
+      expect(result[0].likes).toBe(15);
+      expect(result[0].error).toBeUndefined();
+      
+      expect(result[1].share).toBe('urn:li:share:failure');
+      expect(result[1].likes).toBe(0);
+      expect(result[1].error).toBe('API error for this post');
     });
 
     it('should use organization API for company accounts (no change)', async () => {
@@ -607,6 +629,221 @@ describe('LinkedInAdapter', () => {
       expect(mockLinkedInService.getShareStatistics).toHaveBeenCalled();
       expect(mockLinkedInService.getPersonalPostAnalytics).not.toHaveBeenCalled();
       expect(result[0].likes).toBe(50);
+    });
+  });
+
+  // ============================================
+  // Get Post Analytics Tests
+  // ============================================
+  describe('getPostAnalytics', () => {
+  
+    describe('Personal Account', () => {
+      
+      it('should fetch analytics for multiple posts', async () => {
+        // Arrange
+        mockLinkedInService.getPersonalPostAnalytics
+          .mockResolvedValueOnce({
+            impression: 1000,
+            members_reached: 800,
+            reaction: 50,
+            comment: 15,
+            reshare: 8,
+          })
+          .mockResolvedValueOnce({
+            impression: 500,
+            members_reached: 400,
+            reaction: 25,
+            comment: 5,
+            reshare: 3,
+          });
+
+        // Act
+        const result = await adapter.getPostAnalytics(
+          mockPersonalAccount,
+          ['urn:li:share:post-1', 'urn:li:share:post-2'],
+          'user-123'
+        );
+
+        // Assert
+        expect(mockLinkedInService.getPersonalPostAnalytics).toHaveBeenCalledTimes(2);
+        expect(result).toHaveLength(2);
+        expect(result[0]).toEqual(expect.objectContaining({
+          postId: 'urn:li:share:post-1',
+          likes: 50,
+          comments: 15,
+          shares: 8,
+          impressions: 1000,
+          engagement: 73, // 50 + 15 + 8
+        }));
+        expect(result[0].fetchedAt).toBeDefined();
+        expect(result[0].error).toBeUndefined();
+      });
+
+      it('should handle empty post_ids array gracefully', async () => {
+        // Act
+        const result = await adapter.getPostAnalytics(
+          mockPersonalAccount,
+          [],
+          'user-123'
+        );
+
+        // Assert
+        expect(result).toEqual([]);
+        expect(mockLinkedInService.getPersonalPostAnalytics).not.toHaveBeenCalled();
+      });
+
+      it('should return analytics with error for failed posts without throwing', async () => {
+        // Arrange
+        mockLinkedInService.getPersonalPostAnalytics
+          .mockResolvedValueOnce({
+            impression: 100,
+            members_reached: 80,
+            reaction: 10,
+            comment: 2,
+            reshare: 1,
+          })
+          .mockRejectedValueOnce(new Error('Post not found'));
+
+        // Act
+        const result = await adapter.getPostAnalytics(
+          mockPersonalAccount,
+          ['urn:li:share:success', 'urn:li:share:not-found'],
+          'user-123'
+        );
+
+        // Assert
+        expect(result).toHaveLength(2);
+        expect(result[0].error).toBeUndefined();
+        expect(result[1].error).toBe('Post not found');
+        expect(result[1].likes).toBe(0);
+      });
+
+      it('should include metric-level errors when LinkedIn returns partial failures', async () => {
+        // Arrange - LinkedIn returns 500 for RESHARE metric only
+        mockLinkedInService.getPersonalPostAnalytics.mockResolvedValueOnce({
+          impression: 100,
+          members_reached: 80,
+          reaction: 10,
+          comment: 2,
+          reshare: 0,
+          metricErrors: [
+            { metric: 'RESHARE', error: 'Internal Server Error', status: 500 }
+          ]
+        });
+
+        // Act
+        const result = await adapter.getPostAnalytics(
+          mockPersonalAccount,
+          ['urn:li:share:partial-failure'],
+          'user-123'
+        );
+
+        // Assert - Emma should see the error details
+        expect(result).toHaveLength(1);
+        expect(result[0].likes).toBe(10); // Successful metrics still present
+        expect(result[0].error).toContain('Some metrics failed');
+        expect(result[0].error).toContain('RESHARE');
+        expect(result[0].error).toContain('Internal Server Error');
+        expect(result[0].error).toContain('HTTP 500');
+        expect(result[0].metricErrors).toHaveLength(1);
+      });
+
+      it('should throw for deactivated app error during token refresh', async () => {
+        // Arrange - token refresh fails with deactivated app
+        const expiredAccount = {
+          ...mockPersonalAccount,
+          config: {
+            ...mockPersonalAccount.config,
+            token_expires_at: Date.now() - 1000, // Expired
+            refresh_token: 'valid-refresh',
+          }
+        };
+        mockLinkedInService.refreshAccessToken.mockRejectedValue(
+          new Error('The LinkedIn app used for authentication has been deactivated.')
+        );
+
+        // Act & Assert
+        await expect(
+          adapter.getPostAnalytics(expiredAccount, ['post-1'], 'user-123')
+        ).rejects.toThrow(/deactivated/i);
+      });
+    });
+
+    describe('Company Account', () => {
+      
+      it('should use batch API for organization accounts', async () => {
+        // Arrange
+        const mockStats = [
+          {
+            organizationalEntity: 'urn:li:organization:123456',
+            share: 'urn:li:share:org-post-1',
+            totalShareStatistics: {
+              uniqueImpressionsCount: 4500,
+              likeCount: 200,
+              commentCount: 30,
+              shareCount: 20,
+              impressionCount: 5000,
+              clickCount: 150,
+              engagement: 0.08,
+            },
+          },
+          {
+            organizationalEntity: 'urn:li:organization:123456',
+            share: 'urn:li:share:org-post-2',
+            totalShareStatistics: {
+              uniqueImpressionsCount: 1800,
+              likeCount: 100,
+              commentCount: 10,
+              shareCount: 5,
+              impressionCount: 2000,
+              clickCount: 80,
+              engagement: 0.05,
+            },
+          },
+        ];
+        mockLinkedInService.getShareStatistics.mockResolvedValue(mockStats);
+
+        // Act
+        const result = await adapter.getPostAnalytics(
+          mockCompanyAccount,
+          ['urn:li:share:org-post-1', 'urn:li:share:org-post-2'],
+          'user-123'
+        );
+
+        // Assert
+        expect(mockLinkedInService.getShareStatistics).toHaveBeenCalledWith(
+          'test-org-token',
+          'urn:li:organization:123456',
+          ['urn:li:share:org-post-1', 'urn:li:share:org-post-2']
+        );
+        expect(result).toHaveLength(2);
+        expect(result[0]).toEqual(expect.objectContaining({
+          postId: 'urn:li:share:org-post-1',
+          likes: 200,
+          clicks: 150,
+        }));
+      });
+
+      it('should return all posts with error on batch API failure', async () => {
+        // Arrange
+        mockLinkedInService.getShareStatistics.mockRejectedValue(
+          new Error('Rate limit exceeded')
+        );
+
+        // Act
+        const result = await adapter.getPostAnalytics(
+          mockCompanyAccount,
+          ['post-1', 'post-2', 'post-3'],
+          'user-123'
+        );
+
+        // Assert
+        expect(result).toHaveLength(3);
+        result.forEach((analytics: any) => {
+          expect(analytics.error).toBe('Rate limit exceeded');
+          expect(analytics.likes).toBe(0);
+        });
+      });
     });
   });
 });

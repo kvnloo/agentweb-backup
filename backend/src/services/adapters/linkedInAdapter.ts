@@ -1,6 +1,6 @@
 import { linkedInService } from '../linkedInService';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
 import { getLinkedInConfig } from '../../config/integrations';
 
 /**
@@ -56,8 +56,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
 
       return { token: newTokens.access_token, wasRefreshed: true };
-    } catch (error) {
+    } catch (error: any) {
       console.error('[LinkedInAdapter] Token refresh failed:', error);
+      
+      // Detect deactivated app (invalid_client error)
+      const errorMessage = error?.message || '';
+      const errorData = error?.response?.data;
+      if (
+        errorMessage.includes('invalid_client') ||
+        errorData?.error === 'invalid_client' ||
+        errorData?.error_description?.includes('client') ||
+        errorMessage.includes('app') && errorMessage.includes('deactivated')
+      ) {
+        throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+      }
+      
       throw new Error('LinkedIn access token expired. Please reconnect your account.');
     }
   }
@@ -72,22 +85,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       // Get valid token (refreshes if expired)
       const { token } = await this.getValidToken(account, userId);
 
-      // Upload images if provided
+      // Upload images if provided - track failures for transparency
       let imageUrns: string[] = [];
+      let failedImageUploads: { url: string; error: string }[] = [];
+      
       if (mediaUrls && mediaUrls.length > 0) {
-
-
         for (const url of mediaUrls) {
           try {
             const imageUrn = await linkedInService.uploadImageFromUrl(token, authorUrn, url);
             imageUrns.push(imageUrn);
           } catch (uploadError: any) {
-            console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, uploadError.message);
-            // Continue with other images or post without this image
+            const errorMsg = uploadError?.message || 'Unknown upload error';
+            console.error(`[LinkedInAdapter] Failed to upload image ${url}:`, errorMsg);
+            failedImageUploads.push({ url, error: errorMsg });
           }
         }
-
-
       }
 
       // Create post (with or without images)
@@ -100,11 +112,11 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           await storePost(userId, authorUrn, postUrn, content, mediaUrls);
         } catch (dbError) {
           console.error('[LinkedInAdapter] Failed to store post in DB:', dbError);
-          // Don't fail the entire operation if DB storage fails
         }
       }
 
-      return {
+      // Build result with optional warning for failed uploads
+      const result: PostResult = {
         success: true,
         message: imageUrns.length > 0
           ? `Posted successfully on LinkedIn with ${imageUrns.length} image(s)`
@@ -112,6 +124,14 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         postId: postUrn,
         postUrl: `https://www.linkedin.com/feed/update/${postUrn}`
       };
+      
+      // Add warning if some images failed to upload
+      if (failedImageUploads.length > 0) {
+        result.warning = `${failedImageUploads.length} image(s) failed to upload: ${failedImageUploads.map(f => f.url).join(', ')}`;
+        result.failedUploads = failedImageUploads;
+      }
+      
+      return result;
     } catch (error: any) {
       // Rate limit handling
       if (error.response?.status === 429) {
@@ -143,8 +163,9 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           lifecycleState: 'PUBLISHED',
           visibility: 'PUBLIC'
         }));
-      } catch (error) {
-        return [];
+      } catch (error: any) {
+        console.error('[LinkedInAdapter] Failed to fetch personal posts from DB:', error);
+        throw new Error(`Failed to load posts for personal account: ${error?.message || 'Database error'}`);
       }
     }
 
@@ -161,7 +182,17 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
     if (config.account_type === 'personal') {
       // Fetch analytics for personal accounts using per-post API
-      const { token } = await this.getValidToken(account, userId);
+      let token: string;
+      try {
+        const tokenResult = await this.getValidToken(account, userId);
+        token = tokenResult.token;
+      } catch (error: any) {
+        // Check for deactivated app error
+        if (error?.message?.includes('deactivated')) {
+          throw error; // Re-throw deactivated app errors
+        }
+        throw new Error('Failed to authenticate with LinkedIn. Please reconnect your account.');
+      }
 
       const metrics = await Promise.all(
         postIds.map(async (postUrn) => {
@@ -175,14 +206,31 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
               impressions: analytics.impression,
               engagement: (analytics.reaction || 0) + (analytics.comment || 0) + (analytics.reshare || 0)
             };
-          } catch (error) {
-            console.warn(`[LinkedInAdapter] Failed to fetch metrics for post ${postUrn}:`, error);
-            return null;
+          } catch (error: any) {
+            const errorMsg = error?.message || 'Unknown error';
+            console.warn(`[LinkedInAdapter] Failed to fetch metrics for post ${postUrn}:`, errorMsg);
+            
+            // Check for deactivated app error
+            if (errorMsg.includes('deactivated') || errorMsg.includes('invalid_client')) {
+              throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+            }
+            
+            // Return metric with error info instead of null
+            return {
+              share: postUrn,
+              likes: 0,
+              comments: 0,
+              shares: 0,
+              impressions: 0,
+              engagement: 0,
+              error: errorMsg
+            };
           }
         })
       );
 
-      return metrics.filter(m => m !== null) as PostMetric[];
+      // Return all metrics including those with errors
+      return metrics as PostMetric[];
     }
 
     // Organization accounts - use existing batch API
@@ -232,6 +280,115 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     } catch (error) {
       console.warn('[LinkedInAdapter] specific token verification failed:', error);
       return false;
+    }
+  }
+
+  async getPostAnalytics(
+    account: ConnectedAccount,
+    postIds: string[],
+    userId?: string
+  ): Promise<PostAnalytics[]> {
+    const config = account.config as LinkedInConfig;
+
+    // Handle empty array gracefully
+    if (!postIds || postIds.length === 0) {
+      return [];
+    }
+
+    // Get valid token (refreshes if expired)
+    let token: string;
+    try {
+      const tokenResult = await this.getValidToken(account, userId);
+      token = tokenResult.token;
+    } catch (error: any) {
+      // Check for deactivated app error
+      if (error?.message?.includes('deactivated')) {
+        throw error; // Re-throw deactivated app errors
+      }
+      throw new Error('Failed to authenticate with LinkedIn. Please reconnect your account.');
+    }
+
+    const fetchedAt = new Date().toISOString();
+
+    if (config.account_type === 'personal') {
+      // Personal accounts: use per-post analytics API
+      const analytics = await Promise.all(
+        postIds.map(async (postUrn) => {
+          try {
+            const data = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
+            
+            // Build base analytics response
+            const result: any = {
+              postId: postUrn,
+              likes: data.reaction || 0,
+              comments: data.comment || 0,
+              shares: data.reshare || 0,
+              impressions: data.impression || 0,
+              engagement: (data.reaction || 0) + (data.comment || 0) + (data.reshare || 0),
+              fetchedAt,
+            };
+            
+            // If there were metric errors, include them so Emma can see what failed
+            if (data.metricErrors && data.metricErrors.length > 0) {
+              const errorSummary = data.metricErrors
+                .map(e => `${e.metric}: ${e.error}${e.status ? ` (HTTP ${e.status})` : ''}`)
+                .join('; ');
+              result.error = `Some metrics failed: ${errorSummary}`;
+              result.metricErrors = data.metricErrors;
+            }
+            
+            return result;
+          } catch (error: any) {
+            const errorMsg = error?.message || 'Failed to fetch analytics';
+            console.warn(`[LinkedInAdapter] Failed to fetch analytics for post ${postUrn}:`, errorMsg);
+            
+            // Check for deactivated app error
+            if (errorMsg.includes('deactivated') || errorMsg.includes('invalid_client')) {
+              throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+            }
+            
+            return {
+              postId: postUrn,
+              likes: 0,
+              comments: 0,
+              shares: 0,
+              impressions: 0,
+              engagement: 0,
+              fetchedAt,
+              error: errorMsg,
+            };
+          }
+        })
+      );
+      return analytics;
+    }
+
+    // Organization accounts: use batch share statistics API
+    try {
+      const stats = await linkedInService.getShareStatistics(token, account.account_id, postIds);
+      return stats.map(s => ({
+        postId: s.share || '',
+        likes: s.totalShareStatistics.likeCount || 0,
+        comments: s.totalShareStatistics.commentCount || 0,
+        shares: s.totalShareStatistics.shareCount || 0,
+        impressions: s.totalShareStatistics.impressionCount || 0,
+        clicks: s.totalShareStatistics.clickCount || 0,
+        engagement: s.totalShareStatistics.engagement || 0,
+        fetchedAt,
+      }));
+    } catch (error: any) {
+      console.warn('[LinkedInAdapter] Failed to fetch organization post analytics:', error?.message);
+      // Return all posts with error status
+      return postIds.map(postId => ({
+        postId,
+        likes: 0,
+        comments: 0,
+        shares: 0,
+        impressions: 0,
+        engagement: 0,
+        fetchedAt,
+        error: error?.message || 'Failed to fetch analytics',
+      }));
     }
   }
 

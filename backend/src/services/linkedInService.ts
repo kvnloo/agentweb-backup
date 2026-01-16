@@ -40,8 +40,19 @@ export class LinkedInService {
     if (error.isAxiosError || error.response) {
       const status = error.response?.status;
       const message = error.response?.data?.message || error.message;
+      const errorCode = error.response?.data?.error;
+      const errorDescription = error.response?.data?.error_description || '';
 
       console.error(`LinkedIn API Error [${status}]: ${message}`, JSON.stringify(error.response?.data, null, 2));
+
+      // Detect deactivated app (invalid_client error from OAuth)
+      if (
+        errorCode === 'invalid_client' ||
+        errorDescription.includes('client') ||
+        message?.includes('invalid_client')
+      ) {
+        throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+      }
 
       if (status === 401) {
         throw new Error('LinkedIn access token expired or invalid');
@@ -101,6 +112,19 @@ export class LinkedInService {
       };
     } catch (error: any) {
       console.error('[LinkedIn] Token refresh failed:', error.response?.data || error.message);
+      
+      // Detect deactivated app (invalid_client error)
+      const errorCode = error.response?.data?.error;
+      const errorDescription = error.response?.data?.error_description || '';
+      if (
+        errorCode === 'invalid_client' ||
+        errorDescription.includes('client') ||
+        errorDescription.includes('revoked') ||
+        errorDescription.includes('invalid')
+      ) {
+        throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+      }
+      
       throw new Error('LinkedIn token refresh failed. Please reconnect your account.');
     }
   }
@@ -562,6 +586,8 @@ export class LinkedInService {
     reaction?: number;
     comment?: number;
     reshare?: number;
+    /** Errors encountered while fetching individual metrics */
+    metricErrors?: { metric: string; error: string; status?: number }[];
   }> {
     return this.safeRequest(async () => {
       // If postUrn is provided, fetch per-post analytics
@@ -580,6 +606,7 @@ export class LinkedInService {
 
         const metrics = ['IMPRESSION', 'MEMBERS_REACHED', 'REACTION', 'COMMENT', 'RESHARE'];
         const analyticsData: any = {};
+        const metricErrors: { metric: string; error: string; status?: number }[] = [];
 
         for (const metric of metrics) {
           const url = `/rest/memberCreatorPostAnalytics?q=entity&entity=${entityParam}&queryType=${metric}&aggregation=TOTAL`;
@@ -591,10 +618,18 @@ export class LinkedInService {
 
             const totalCount = response.data.elements?.reduce((sum, el) => sum + (el.count || 0), 0) || 0;
             analyticsData[metric.toLowerCase()] = totalCount;
-          } catch (error) {
-            console.warn(`[LinkedIn] Failed to fetch ${metric} for post ${postUrn}:`, error);
+          } catch (error: any) {
+            const status = error?.response?.status;
+            const errorMessage = error?.response?.data?.message || error?.message || 'Unknown error';
+            console.warn(`[LinkedIn] Failed to fetch ${metric} for post ${postUrn}: [${status}] ${errorMessage}`);
             analyticsData[metric.toLowerCase()] = 0;
+            metricErrors.push({ metric, error: errorMessage, status });
           }
+        }
+
+        // Include errors in response if any occurred
+        if (metricErrors.length > 0) {
+          analyticsData.metricErrors = metricErrors;
         }
 
         return analyticsData;

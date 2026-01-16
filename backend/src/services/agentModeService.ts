@@ -1809,6 +1809,28 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'get_post_analytics',
+          description: 'Get detailed analytics for specific posts from a connected social media account. Returns engagement metrics including likes, comments, shares, impressions, and clicks.',
+          parameters: {
+            type: 'object',
+            properties: {
+              account_id: { 
+                type: 'string', 
+                description: 'The connected account ID (must belong to the authenticated user)' 
+              },
+              post_ids: { 
+                type: 'array', 
+                items: { type: 'string' },
+                description: 'Array of post IDs to fetch analytics for (e.g., LinkedIn URNs like "urn:li:share:123")'
+              }
+            },
+            required: ['account_id', 'post_ids']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'read_file_content',
           description: 'Read and extract content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Returns the raw text content for analysis.',
           parameters: {
@@ -3795,6 +3817,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.loadConnectedAccountMetrics(userId, args.account_id);
       case 'post_on_connected_account':
         return await this.postOnConnectedAccount(userId, args.account_id, args.content, args.media_urls);
+      case 'get_post_analytics':
+        return await this.getPostAnalytics(userId, args.account_id, args.post_ids);
       default:
         throw new Error(`Unknown tool: ${toolName}`);
     }
@@ -11942,6 +11966,71 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to load metrics',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Get detailed analytics for specific posts
+   * The account must belong to the authenticated user
+   */
+  async getPostAnalytics(
+    userId: string,
+    accountId: string,
+    postIds: string[]
+  ): Promise<any> {
+    console.log('[AgentMode] getPostAnalytics called:', {
+      userId,
+      accountId,
+      postIds: postIds?.length || 0
+    });
+
+    try {
+      if (!postIds || postIds.length === 0) {
+        return {
+          success: false,
+          message: 'No post IDs provided'
+        };
+      }
+
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      // Verify account ownership
+      const account = await getAccountById(accountId, userId);
+      if (!account) {
+        return {
+          success: false,
+          message: 'Account not found or access denied'
+        };
+      }
+
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      const analytics = await adapter.getPostAnalytics(account, postIds, userId);
+
+      // Check for any errors in the results
+      const failedCount = analytics.filter((a: any) => a.error).length;
+      const successCount = analytics.length - failedCount;
+
+      return {
+        success: true,
+        message: failedCount > 0
+          ? `Retrieved analytics for ${successCount}/${analytics.length} posts (${failedCount} failed)`
+          : `Successfully retrieved analytics for ${analytics.length} post(s)`,
+        analytics,
+        summary: {
+          totalPosts: analytics.length,
+          successCount,
+          failedCount
+        }
+      };
+
+    } catch (error) {
+      console.error('AgentMode: Error getting post analytics:', error);
+      return {
+        success: false,
+        message: 'Failed to get post analytics',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
