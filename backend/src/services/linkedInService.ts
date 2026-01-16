@@ -620,7 +620,22 @@ export class LinkedInService {
             analyticsData[metric.toLowerCase()] = totalCount;
           } catch (error: any) {
             const status = error?.response?.status;
-            const errorMessage = error?.response?.data?.message || error?.message || 'Unknown error';
+            const rawMessage = error?.response?.data?.message || error?.message || 'Unknown error';
+            
+            // Provide clearer error messages based on status code
+            let errorMessage: string;
+            if (status === 403) {
+              errorMessage = 'Permission denied: Your LinkedIn account needs analytics permissions. Please reconnect your account.';
+            } else if (status === 401) {
+              errorMessage = 'Access token expired or invalid. Please reconnect your LinkedIn account.';
+            } else if (status === 500) {
+              errorMessage = 'LinkedIn server error. This post may have been deleted or is no longer available.';
+            } else if (status === 429) {
+              errorMessage = 'Rate limit exceeded. Please try again later.';
+            } else {
+              errorMessage = rawMessage;
+            }
+            
             console.warn(`[LinkedIn] Failed to fetch ${metric} for post ${postUrn}: [${status}] ${errorMessage}`);
             analyticsData[metric.toLowerCase()] = 0;
             metricErrors.push({ metric, error: errorMessage, status });
