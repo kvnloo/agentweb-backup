@@ -210,7 +210,7 @@ router.get('/callback', async (req, res) => {
   }
 
   // Pass code and state to frontend for finalization
-  res.redirect(`${frontendUrl}/oauth/linkedin/callback?code=${code}&state=${state}`);
+  const redirectUrl = `${frontendUrl}/oauth/linkedin/callback?code=${code}&state=${state}`;
 });
 
 // Finalize LinkedIn OAuth - Exchange code for token and fetch available accounts
