@@ -118,7 +118,7 @@ export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
       ? 'prod/AgentWeb/LinkedIn/Company'
-      : 'dev/AgentWeb/LinkedIn/Comoany';
+      : 'dev/AgentWeb/LinkedIn/Company';
 
     const secretString = await getSecret(secretName);
 
