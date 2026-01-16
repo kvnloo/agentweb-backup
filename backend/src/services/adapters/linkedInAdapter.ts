@@ -254,11 +254,58 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async getAccountMetrics(account: ConnectedAccount): Promise<AccountMetrics> {
+  async getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics> {
     const config = account.config as LinkedInConfig;
 
     if (config.account_type === 'personal') {
-      throw new Error('Analytics are not available for LinkedIn personal profiles');
+      try {
+        // Get valid token (refreshes if needed)
+        const { token } = await this.getValidToken(account, userId);
+        
+        // Fetch personal metrics
+        const [followers, analytics] = await Promise.all([
+          linkedInService.getPersonalFollowerCount(token),
+          linkedInService.getPersonalPostAnalytics(token) // Aggregated last 30 days
+        ]);
+
+        return {
+          followers: [{ followerCount: followers }],
+          pageViews: [], // Not available for personal
+          shareStatistics: [{
+            share: 'aggregated_30d',
+            totalShareStatistics: {
+              impressionCount: analytics.impression,
+              uniqueImpressionsCount: analytics.members_reached,
+              engagement: 0, // Not provided directly in aggregated view
+              clickCount: 0,
+              likeCount: 0,
+              commentCount: 0,
+              shareCount: 0
+            }
+          }]
+        };
+      } catch (error: any) {
+        console.warn('[LinkedInAdapter] Failed to fetch personal metrics:', error);
+        
+        // Check for specific permission errors to prompt reconnect
+        const status = error?.response?.status;
+        const msg = error?.message || '';
+        
+        if (status === 403 || msg.includes('Permission denied') || msg.includes('scope')) {
+          throw new Error('Analytics permissions are missing. Please reconnect your LinkedIn account to enable analytics.');
+        }
+        
+        if (status === 401 || msg.includes('expired')) {
+          throw new Error('LinkedIn access token expired. Please reconnect your account.');
+        }
+
+        // For other errors, return empty metrics instead of failing hard
+        return {
+          followers: [],
+          pageViews: [],
+          shareStatistics: []
+        };
+      }
     }
 
     const token = config.access_token;

@@ -14,6 +14,7 @@ jest.mock('../services/linkedInService', () => ({
     refreshAccessToken: jest.fn(),
     uploadImageFromUrl: jest.fn(),
     getPersonalPostAnalytics: jest.fn(),
+    getPersonalFollowerCount: jest.fn(),
   },
 }));
 
@@ -281,9 +282,32 @@ describe('LinkedInAdapter', () => {
   });
 
   describe('getAccountMetrics', () => {
-    it('should throw error for personal profiles', async () => {
+    it('should return metrics for personal profiles', async () => {
+      mockLinkedInService.getPersonalFollowerCount.mockResolvedValue(500);
+      mockLinkedInService.getPersonalPostAnalytics.mockResolvedValue({
+        impression: 1000,
+        members_reached: 800,
+        reaction: 50,
+        comment: 10,
+        reshare: 5,
+      });
+
+      const result = await adapter.getAccountMetrics(mockPersonalAccount);
+
+      expect(mockLinkedInService.getPersonalFollowerCount).toHaveBeenCalled();
+      expect(mockLinkedInService.getPersonalPostAnalytics).toHaveBeenCalled();
+      expect(result.followers[0].followerCount).toBe(500);
+      expect(result.shareStatistics[0].totalShareStatistics.impressionCount).toBe(1000);
+    });
+
+    it('should throw reconnect error when permissions missing for personal profile', async () => {
+      mockLinkedInService.getPersonalFollowerCount.mockRejectedValue({
+        response: { status: 403 },
+        message: 'Permission denied'
+      });
+
       await expect(adapter.getAccountMetrics(mockPersonalAccount)).rejects.toThrow(
-        'Analytics are not available for LinkedIn personal profiles'
+        'Analytics permissions are missing. Please reconnect your LinkedIn account to enable analytics.'
       );
     });
 

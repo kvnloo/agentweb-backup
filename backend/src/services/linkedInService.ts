@@ -670,8 +670,27 @@ export class LinkedInService {
 
           const totalCount = response.data.elements?.reduce((sum, el) => sum + (el.count || 0), 0) || 0;
           analyticsData[metric.toLowerCase()] = totalCount;
-        } catch (error) {
-          console.warn(`[LinkedIn] Failed to fetch ${metric}:`, error);
+        } catch (error: any) {
+          const status = error?.response?.status;
+          const msg = error?.message || '';
+          const responseData = JSON.stringify(error?.response?.data || {});
+          
+          // Rethrow permission errors so they can be handled by the adapter to prompt reconnection
+          // Check status codes and common error messages
+          if (
+            status === 403 || 
+            status === 401 || 
+            msg.includes('Access Denied') || 
+            msg.includes('Forbidden') || 
+            msg.includes('Unauthorized') ||
+            responseData.includes('Access Denied') ||
+            responseData.includes('serviceErrorCode":100') // LinkedIn common access denied code
+          ) {
+            console.warn(`[LinkedIn] Permission error for ${metric}:`, msg);
+            throw error;
+          }
+          
+          console.warn(`[LinkedIn] Failed to fetch ${metric}:`, msg);
           analyticsData[metric.toLowerCase()] = 0;
         }
       }
