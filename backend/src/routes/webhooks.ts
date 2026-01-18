@@ -102,25 +102,26 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 
 // Public endpoint for forwarding leads to CRM
 router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
+  // Extract API key from header or body
+  const apiKey = req.headers['x-api-key'] as string || req.body.apiKey;
+
+  if (!apiKey) {
+    return res.status(401).json({
+      success: false,
+      message: 'API key is required. Provide it in X-API-Key header or apiKey field in request body.'
+    });
+  }
+
+  // Verify API key and get lead list
+  const leadList = await crmDb.getLeadListByApiKey(apiKey);
+  if (!leadList) {
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid API key'
+    });
+  }
+
   try {
-    // Extract API key from header or body
-    const apiKey = req.headers['x-api-key'] as string || req.body.apiKey;
-
-    if (!apiKey) {
-      return res.status(401).json({
-        success: false,
-        message: 'API key is required. Provide it in X-API-Key header or apiKey field in request body.'
-      });
-    }
-
-    // Verify API key and get lead list
-    const leadList = await crmDb.getLeadListByApiKey(apiKey);
-    if (!leadList) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid API key'
-      });
-    }
 
     // Extract lead data from request body
     const {
@@ -170,6 +171,25 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // Create the lead
     const lead = await crmDb.createLead(leadList.listId, leadData);
 
+    // Trigger api.lead_added alert if configured
+    try {
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        leadList,
+        lead,
+        'api.lead_added',
+        {
+          source: mergedCustomFields.source,
+          forwardedAt: mergedCustomFields.forwardedAt,
+          company: leadData.company,
+          phone: leadData.phone,
+        },
+        new Date().toISOString()
+      );
+    } catch (alertError) {
+      console.error('Failed to send api.lead_added alert:', alertError);
+      // Don't fail the request if alert fails
+    }
+
     res.status(201).json({
       success: true,
       message: 'Lead forwarded successfully',
@@ -179,6 +199,28 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   } catch (error: any) {
     console.error('Lead forwarding error:', error);
+
+    // Trigger api.lead_failed alert if configured
+    try {
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        leadList,
+        {
+          leadId: 'failed',
+          email: req.body.email || 'unknown',
+          firstName: req.body.firstName || '',
+          lastName: req.body.lastName || '',
+        },
+        'api.lead_failed',
+        {
+          error: error.message || 'Unknown error',
+          source: req.body.source || req.body.customFields?.source || 'api',
+          email: req.body.email || 'unknown',
+        },
+        new Date().toISOString()
+      );
+    } catch (alertError) {
+      console.error('Failed to send api.lead_failed alert:', alertError);
+    }
 
     // Handle duplicate email error
     if (error.message?.includes('already exists') || error.message?.includes('duplicate')) {
