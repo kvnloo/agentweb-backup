@@ -20,6 +20,21 @@ const buildEventDetails = (eventType: string, eventData: any) => {
   }
 
   const details: Array<{ label: string; value: string }> = [];
+
+  // API event details
+  if (eventType === 'api.lead_added') {
+    if (eventData.source) details.push({ label: 'Source', value: String(eventData.source) });
+    if (eventData.forwardedAt) details.push({ label: 'Forwarded At', value: new Date(eventData.forwardedAt).toLocaleString() });
+    if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
+    if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
+  }
+  if (eventType === 'api.lead_failed') {
+    if (eventData.error) details.push({ label: 'Error', value: String(eventData.error) });
+    if (eventData.source) details.push({ label: 'Source', value: String(eventData.source) });
+    if (eventData.email) details.push({ label: 'Email', value: String(eventData.email) });
+  }
+
+  // Email event details
   if (eventData.subject) details.push({ label: 'Subject', value: String(eventData.subject) });
   if (eventData.from) details.push({ label: 'From', value: String(eventData.from) });
   if (eventData.to) {
