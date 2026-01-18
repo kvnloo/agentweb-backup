@@ -1083,6 +1083,129 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/api-key
+ * @desc Generate or regenerate API key for lead forwarding
+ * @access Private
+ */
+router.post('/lists/:listId/api-key', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const updatedList = await crmDb.generateApiKeyForLeadList(listId);
+
+    if (!updatedList) {
+      return res.status(500).json({ message: 'Failed to generate API key' });
+    }
+
+    res.json({
+      success: true,
+      apiKey: updatedList.apiKey,
+      apiKeyCreatedAt: updatedList.apiKeyCreatedAt,
+      message: 'API key generated successfully'
+    });
+  } catch (error: any) {
+    console.error('Error generating API key:', error);
+    res.status(500).json({ message: error.message || 'Failed to generate API key' });
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/api-key
+ * @desc Get API key for a lead list
+ * @access Private
+ */
+router.get('/lists/:listId/api-key', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (!list.apiKey) {
+      return res.json({
+        hasApiKey: false,
+        apiKey: null,
+        apiKeyCreatedAt: null
+      });
+    }
+
+    res.json({
+      hasApiKey: true,
+      apiKey: list.apiKey,
+      apiKeyCreatedAt: list.apiKeyCreatedAt
+    });
+  } catch (error: any) {
+    console.error('Error fetching API key:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch API key' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/lists/:listId/api-key
+ * @desc Delete API key for a lead list
+ * @access Private
+ */
+router.delete('/lists/:listId/api-key', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    await crmDb.deleteApiKeyForLeadList(listId);
+    res.json({
+      success: true,
+      message: 'API key deleted successfully'
+    });
+  } catch (error: any) {
+    console.error('Error deleting API key:', error);
+    res.status(500).json({ message: error.message || 'Failed to delete API key' });
+  }
+});
+
+/**
  * @route POST /api/crm/sync-subscribers
  * @desc Sync task subscribers to a CRM lead list
  * @access Private

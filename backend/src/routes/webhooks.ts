@@ -4,6 +4,7 @@ import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { crmDb } from '../services/db';
 
 const router = express.Router();
 
@@ -95,6 +96,101 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
     res.status(400).json({ 
       message: 'Webhook processing failed',
       error: error.message 
+    });
+  }
+});
+
+// Public endpoint for forwarding leads to CRM
+router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
+  try {
+    // Extract API key from header or body
+    const apiKey = req.headers['x-api-key'] as string || req.body.apiKey;
+
+    if (!apiKey) {
+      return res.status(401).json({
+        success: false,
+        message: 'API key is required. Provide it in X-API-Key header or apiKey field in request body.'
+      });
+    }
+
+    // Verify API key and get lead list
+    const leadList = await crmDb.getLeadListByApiKey(apiKey);
+    if (!leadList) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid API key'
+      });
+    }
+
+    // Extract lead data from request body
+    const {
+      email,
+      firstName,
+      lastName,
+      phone,
+      company,
+      title,
+      notes,
+      linkedin,
+      source,
+      customFields
+    } = req.body;
+
+    // Validate required field (email)
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email is required'
+      });
+    }
+
+    // Prepare lead data
+    const leadData: any = {
+      email: email.trim(),
+      firstName: firstName?.trim() || '',
+      lastName: lastName?.trim() || '',
+      phone: phone?.trim() || '',
+      company: company?.trim() || '',
+      title: title?.trim() || '',
+      notes: notes?.trim() || '',
+      linkedin: linkedin?.trim() || '',
+    };
+
+    // Add custom fields with source and createdAt tracking
+    const mergedCustomFields: Record<string, any> = {
+      ...(customFields && typeof customFields === 'object' ? customFields : {}),
+      // Add source field (from request or default to 'api')
+      source: source?.trim() || customFields?.source || 'api',
+      // Add timestamp when lead was forwarded
+      forwardedAt: new Date().toISOString(),
+    };
+
+    leadData.customFields = mergedCustomFields;
+
+    // Create the lead
+    const lead = await crmDb.createLead(leadList.listId, leadData);
+
+    res.status(201).json({
+      success: true,
+      message: 'Lead forwarded successfully',
+      leadId: lead.leadId,
+      listId: leadList.listId
+    });
+
+  } catch (error: any) {
+    console.error('Lead forwarding error:', error);
+
+    // Handle duplicate email error
+    if (error.message?.includes('already exists') || error.message?.includes('duplicate')) {
+      return res.status(409).json({
+        success: false,
+        message: 'A lead with this email already exists in the list'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to forward lead'
     });
   }
 });

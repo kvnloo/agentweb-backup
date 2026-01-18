@@ -3907,4 +3907,75 @@ export const crmDb = {
       throw error;
     }
   },
+
+  // API Key operations for lead forwarding
+  async generateApiKeyForLeadList(listId: string) {
+    try {
+      // Generate a secure API key
+      const crypto = require('crypto');
+      const apiKey = `aw_${crypto.randomBytes(32).toString('hex')}`;
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+        UpdateExpression: 'SET apiKey = :apiKey, apiKeyCreatedAt = :createdAt, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':apiKey': apiKey,
+          ':createdAt': new Date().toISOString(),
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "generateApiKeyForLeadList");
+      throw error;
+    }
+  },
+
+  async getLeadListByApiKey(apiKey: string) {
+    try {
+      // We need to scan the table since apiKey is not a key
+      // In production, consider creating a GSI on apiKey for better performance
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        FilterExpression: 'apiKey = :apiKey',
+        ExpressionAttributeValues: {
+          ':apiKey': apiKey,
+        },
+      };
+
+      const result = await dynamodb.scan(params).promise();
+      return result.Items && result.Items.length > 0 ? result.Items[0] : null;
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadListByApiKey");
+      throw error;
+    }
+  },
+
+  async deleteApiKeyForLeadList(listId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        Key: {
+          listId,
+        },
+        UpdateExpression: 'REMOVE apiKey, apiKeyCreatedAt SET updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "deleteApiKeyForLeadList");
+      throw error;
+    }
+  },
 };
