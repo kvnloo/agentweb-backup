@@ -7,6 +7,22 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-18',
+    changes: [
+      'Added Lead Forwarding API for CRM',
+      '- Added public API endpoint (/api/webhooks/forward-lead) to receive leads from external sources',
+      '- Users can generate API keys for each lead list to enable programmatic lead forwarding',
+      '- API Integration dialog provides ready-to-use code examples in JavaScript, Python, and cURL',
+      '- Automatic source tracking: leads include a "source" field (e.g., "website_contact_form") to identify origin',
+      '- Automatic timestamp tracking: "forwardedAt" field captures exact time when lead was received',
+      '- Both tracking fields stored in customFields and visible in lead details',
+      'Added Alert Events for API Lead Forwarding',
+      '- Added "api.lead_added" alert event: sends email notification when a lead is successfully forwarded via API',
+      '- Added "api.lead_failed" alert event: sends email notification when API lead forwarding fails',
+      '- Alert emails include source, timestamp, company info, and error details (for failures)',
+    ],
+  },
+  {
     date: '2026-01-15',
     changes: [
       'Added upload preview support in Agent Mode',
