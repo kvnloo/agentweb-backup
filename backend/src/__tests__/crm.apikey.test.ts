@@ -54,16 +54,16 @@ describe('CRM API Key Management', () => {
       const result = await crmDb.generateApiKeyForLeadList('list_123');
 
       expect(result).toBeDefined();
-      expect(result.apiKey).toBeDefined();
-      expect(result.apiKey).toMatch(/^aw_[a-f0-9]{64}$/);
-      expect(result.apiKeyCreatedAt).toBeDefined();
+      expect(result?.apiKey).toBeDefined();
+      expect(result?.apiKey).toMatch(/^aw_[a-f0-9]{64}$/);
+      expect(result?.apiKeyCreatedAt).toBeDefined();
     });
 
     it('should generate unique API keys for different requests', async () => {
       const result1 = await crmDb.generateApiKeyForLeadList('list_123');
       const result2 = await crmDb.generateApiKeyForLeadList('list_456');
 
-      expect(result1.apiKey).not.toBe(result2.apiKey);
+      expect(result1?.apiKey).not.toBe(result2?.apiKey);
     });
   });
 
@@ -72,8 +72,8 @@ describe('CRM API Key Management', () => {
       const result = await crmDb.getLeadListByApiKey('aw_test_key_123');
 
       expect(result).toBeDefined();
-      expect(result.listId).toBe('list_123');
-      expect(result.apiKey).toBe('aw_test_key_123');
+      expect(result?.listId).toBe('list_123');
+      expect(result?.apiKey).toBe('aw_test_key_123');
     });
 
     it('should return null for invalid API key', async () => {
@@ -107,8 +107,8 @@ describe('CRM API Key Management', () => {
       const result = await crmDb.deleteApiKeyForLeadList('list_123');
 
       expect(result).toBeDefined();
-      expect(result.apiKey).toBeUndefined();
-      expect(result.apiKeyCreatedAt).toBeUndefined();
+      expect(result?.apiKey).toBeUndefined();
+      expect(result?.apiKeyCreatedAt).toBeUndefined();
     });
   });
 });
