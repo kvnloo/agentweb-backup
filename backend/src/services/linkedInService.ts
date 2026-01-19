@@ -58,7 +58,9 @@ export class LinkedInService {
         throw new Error('LinkedIn access token expired or invalid');
       }
       if (status === 403) {
-        throw new Error('LinkedIn Permission Denied: You might not have administrator access to this organization or are missing required scopes (rw_organization_admin / r_organization_social)');
+        // Use actual LinkedIn error message - different APIs have different scope requirements
+        const linkedInMessage = error.response?.data?.message || message || 'Access denied';
+        throw new Error(`LinkedIn Permission Denied: ${linkedInMessage}`);
       }
       if (status === 429) {
         throw new Error('LinkedIn rate limit exceeded');
@@ -130,6 +132,45 @@ export class LinkedInService {
   }
 
   /**
+   * Resolve a LinkedIn media URN to an actual downloadable URL
+   * LinkedIn returns URNs like urn:li:digitalmediaAsset:xxx which need to be
+   * converted to urn:li:image:xxx and resolved via the Images API
+   */
+  async resolveImageUrl(accessToken: string, mediaUrn: string): Promise<string | null> {
+    if (!mediaUrn) return null;
+    
+    // If it's already an HTTPS URL, return as-is
+    if (mediaUrn.startsWith('https://')) {
+      return mediaUrn;
+    }
+    
+    // Convert digitalmediaAsset URN to image URN if needed
+    let imageUrn = mediaUrn;
+    if (mediaUrn.includes('digitalmediaAsset')) {
+      imageUrn = mediaUrn.replace('digitalmediaAsset', 'image');
+    }
+    
+    // If not a valid URN format, return null
+    if (!imageUrn.startsWith('urn:li:image:')) {
+      console.warn('[LinkedIn] Cannot resolve non-image URN:', mediaUrn);
+      return null;
+    }
+    
+    try {
+      const encodedUrn = encodeURIComponent(imageUrn);
+      const response = await this.client.get(`/rest/images/${encodedUrn}`, {
+        params: { fields: 'downloadUrl' },
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      
+      return (response.data as any)?.downloadUrl || null;
+    } catch (error: any) {
+      console.warn('[LinkedIn] Failed to resolve image URL:', error.message);
+      return null;
+    }
+  }
+
+  /**
    * Get current user profile using /v2/me endpoint
    * Note: We use /v2/me instead of /v2/userinfo because OpenID scopes
    * (openid, profile, email) cannot be used with Community Management API scopes
@@ -186,6 +227,8 @@ export class LinkedInService {
     });
   }
 
+
+
   /**
    * Discovery: Get organizations where the user has an admin role
    */
@@ -198,6 +241,69 @@ export class LinkedInService {
 
       return response.data;
     });
+  }
+
+  /**
+   * Discovery: Get detailed organization info for all admin organizations
+   * Including logo, name, and follower count
+   */
+  async getAdminOrganizationDetails(accessToken: string): Promise<Array<{
+    urn: string;
+    id: string;
+    name: string;
+    vanityName?: string;
+    logoUrl?: string;
+    followerCount: number;
+  }>> {
+    try {
+      const aclResponse = await this.getAdminOrganizations(accessToken);
+      
+      const orgUrns = aclResponse.elements
+        .map(acl => (acl as any).organization || acl.organizationTarget)
+        .filter((urn): urn is string => urn != null && typeof urn === 'string' && urn.length > 0);
+
+      // Get details for each organization with retry logic
+      const organizations = await Promise.all(
+        orgUrns.map(async (orgUrn: string) => {
+          const maxRetries = 2;
+          let lastError: any;
+          
+          for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+              const [orgDetails, followerCount] = await Promise.all([
+                this.getOrganization(accessToken, orgUrn),
+                this.getOrganizationFollowerCount(accessToken, orgUrn)
+              ]);
+              
+              return {
+                urn: orgUrn,
+                id: orgDetails.id,
+                name: orgDetails.name,
+                vanityName: orgDetails.vanityName,
+                logoUrl: orgDetails.logoUrl,
+                followerCount,
+              };
+            } catch (err: any) {
+              lastError = err;
+              console.warn(`[LinkedInService] Attempt ${attempt}/${maxRetries} failed for org ${orgUrn}:`, err.message);
+              
+              // Wait before retry (exponential backoff)
+              if (attempt < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+              }
+            }
+          }
+          
+          // All retries exhausted - throw the error
+          throw new Error(`Failed to fetch organization details for ${orgUrn} after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`);
+        })
+      );
+      
+      return organizations;
+    } catch (error: any) {
+      console.warn('[LinkedInService] Failed to fetch admin organizations:', error.message);
+      return [];
+    }
   }
 
   /**
@@ -486,11 +592,25 @@ export class LinkedInService {
       });
 
       const data = response.data as any;
+      
+      // Get the logo URN and resolve it to an actual URL
+      const logoUrn = data.logoV2?.original || data.logoV2?.['cropped-mini'];
+      let logoUrl: string | undefined;
+      
+      if (logoUrn) {
+        try {
+          const resolvedUrl = await this.resolveImageUrl(accessToken, logoUrn);
+          logoUrl = resolvedUrl || undefined;
+        } catch (error: any) {
+          console.warn(`[LinkedIn] Failed to resolve logo for org ${orgId}:`, error.message);
+        }
+      }
+      
       return {
         id: data.id?.toString() || orgId,
         name: data.localizedName || data.name?.localized?.en_US || `Organization ${orgId}`,
         vanityName: data.vanityName,
-        logoUrl: data.logoV2?.original || data.logoV2?.['cropped-mini'] || undefined,
+        logoUrl,
       };
     });
   }

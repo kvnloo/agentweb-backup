@@ -1,33 +1,41 @@
 
 import { getLinkedInCredentials } from '../utils/secretsManager';
 
+// LinkedIn account type for OAuth
+export type LinkedInAccountType = 'personal' | 'company';
+
 // Static configuration values (URLs, scopes, etc.)
 export const INTEGRATION_CONFIG = {
   linkedin: {
     // Unified configuration for both personal and organization accounts
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/linkedin/callback`,
+    // Combined scopes (legacy - for unified flow)
     scopes: [
       'r_basicprofile',
-      
-      // Personal Account Permissions
-      'w_member_social',              // Create/modify posts on personal profile
-      'r_member_postAnalytics',       // Retrieve personal post analytics
-      'r_member_profileAnalytics',    // Retrieve personal profile analytics
-      'w_member_social_feed',         // Manage personal post comments/reactions
-      
-      // Organization Account Permissions
-      'r_organization_social',        // Read organization posts and data
-      'rw_organization_admin',        // Manage organization pages
-      'w_organization_social',        // Create/modify organization posts
-      'r_organization_followers',     // Access follower data
-      'r_organization_social_feed'    // Read organization engagement data
+      'w_member_social',
+      'r_member_postAnalytics',
+      'r_member_profileAnalytics',
+      'w_member_social_feed',
+      'r_organization_social',
+      'rw_organization_admin',
+      'w_organization_social',
+      'r_organization_followers',
+      'r_organization_social_feed'
     ],
+    
     // LinkedIn OAuth V2 Endpoints
     authorizationUrl: 'https://www.linkedin.com/oauth/v2/authorization',
     tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken',
     profileUrl: 'https://api.linkedin.com/v2/userinfo'
   }
 };
+
+/**
+ * Get scopes for a specific LinkedIn account type
+ */
+export function getLinkedInScopesForType(type: LinkedInAccountType): string[] {
+  return INTEGRATION_CONFIG.linkedin.scopes;
+}
 
 // LinkedIn configuration interface
 export interface LinkedInConfig {

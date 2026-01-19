@@ -2,8 +2,7 @@ import express, { Request } from 'express';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
-import jwksClient from 'jwks-rsa';
-import { getLinkedInConfig } from '../config/integrations';
+import { getLinkedInConfig, getLinkedInScopesForType, LinkedInAccountType } from '../config/integrations';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
 import { authenticateToken } from '../middleware/auth';
@@ -32,55 +31,18 @@ if (!STATE_SECRET) {
   throw new Error('JWT_SECRET environment variable must be set for OAuth state verification');
 }
 
-// ============================================
-// LinkedIn JWKS Client for id_token verification (Fix #1)
-// ============================================
-const linkedInJwksClient = jwksClient({
-  jwksUri: 'https://www.linkedin.com/oauth/openid/jwks',
-  cache: true,
-  cacheMaxAge: 86400000, // 24 hours
-  rateLimit: true,
-  jwksRequestsPerMinute: 10,
-});
 
-const getLinkedInSigningKey = (header: jwt.JwtHeader, callback: jwt.SigningKeyCallback): void => {
-  if (!header.kid) {
-    callback(new Error('No kid in token header'));
-    return;
-  }
-  linkedInJwksClient.getSigningKey(header.kid, (err, key) => {
-    if (err) {
-      callback(err);
-      return;
-    }
-    const signingKey = key?.getPublicKey();
-    callback(null, signingKey);
-  });
-};
-
-// Verify LinkedIn id_token with JWKS
-const verifyLinkedInIdToken = async (idToken: string): Promise<{ sub: string; name?: string; email?: string; picture?: string } | null> => {
-  return new Promise((resolve) => {
-    jwt.verify(idToken, getLinkedInSigningKey, { algorithms: ['RS256'] }, (err, decoded) => {
-      if (err) {
-        console.warn('[OAuth] LinkedIn id_token verification failed:', err.message);
-        resolve(null);
-      } else {
-        resolve(decoded as { sub: string; name?: string; email?: string; picture?: string });
-      }
-    });
-  });
-};
 
 interface StatePayload {
   userId: string;
   nonce: string;
+  accountType?: LinkedInAccountType;
 }
 
 // Helper to generate signed state with cryptographically secure nonce
-const generateState = (userId: string): string => {
+const generateState = (userId: string, accountType?: LinkedInAccountType): string => {
   const nonce = crypto.randomBytes(16).toString('hex');
-  const payload: StatePayload = { userId, nonce };
+  const payload: StatePayload = { userId, nonce, accountType };
   return jwt.sign(payload, STATE_SECRET, { expiresIn: STATE_EXPIRATION });
 };
 
@@ -98,14 +60,15 @@ const buildOAuthUrl = (config: { authorizationUrl: string; clientId?: string; re
   return `${config.authorizationUrl}?${params.toString()}`;
 };
 
-// Helper to verify state
-const verifyState = (state: string, userId: string): boolean => {
+// Helper to verify state and extract payload
+const verifyState = (state: string, userId: string): StatePayload | null => {
   try {
     const decoded = jwt.verify(state, STATE_SECRET) as StatePayload;
-    return decoded.userId === userId;
+    if (decoded.userId !== userId) return null;
+    return decoded;
   } catch (error) {
     console.error('[OAuth] State verification failed:', error);
-    return false;
+    return null;
   }
 };
 
@@ -172,22 +135,32 @@ const retrieveTokenSession = (sessionId: string, userId: string): TokenSession['
 };
 
 // ============================================
-// LinkedIn Unified OAuth (Personal + Organization)
+// LinkedIn Type-Specific OAuth (Personal or Company)
 // ============================================
 
 // LinkedIn OAuth Init
-// Returns the authorization URL with all scopes for both personal and organization
+// Accepts optional 'type' query param: 'personal' or 'company'
+// Returns authorization URL with type-specific scopes
 router.get('/init', authenticateToken, async (req: any, res) => {
   try {
     const userId = req.user.userId;
+    const accountType = req.query.type as LinkedInAccountType | undefined;
+    
     const config = await getLinkedInConfig();
+    
+    // Use type-specific scopes if type is provided
+    let scopes = config.scopes;
+    if (accountType && (accountType === 'personal' || accountType === 'company')) {
+      scopes = getLinkedInScopesForType(accountType);
+    }
 
-    // Generate signed state
-    const state = generateState(userId);
+    // Generate signed state with account type
+    const state = generateState(userId, accountType);
 
-    // Build URL using helper
-    const url = buildOAuthUrl(config, state);
-    res.json({ success: true, url });
+    // Build URL with appropriate scopes
+    const url = buildOAuthUrl({ ...config, scopes }, state);
+    
+    res.json({ success: true, url, accountType: accountType || 'unified' });
 
   } catch (error) {
     console.error('Error initializing LinkedIn OAuth:', error);
@@ -210,7 +183,7 @@ router.get('/callback', async (req, res) => {
   }
 
   // Pass code and state to frontend for finalization
-  const redirectUrl = `${frontendUrl}/oauth/linkedin/callback?code=${code}&state=${state}`;
+  res.redirect(`${frontendUrl}/oauth/linkedin/callback?code=${code}&state=${state}`);
 });
 
 // Finalize LinkedIn OAuth - Exchange code for token and fetch available accounts
@@ -226,10 +199,14 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     return res.status(400).json({ error: 'Invalid or missing state parameter' });
   }
 
-  // Security Check: Verify State
-  if (!verifyState(state, userId)) {
+  // Security Check: Verify State and extract payload
+  const statePayload = verifyState(state, userId);
+  if (!statePayload) {
     return res.status(403).json({ error: 'Invalid or expired state parameter. CSRF protection.' });
   }
+  
+  const accountType = statePayload.accountType;
+  console.log(`[LinkedIn Finalize] Account type from state: ${accountType || 'unified'}`);
 
   try {
     const config = await getLinkedInConfig();
@@ -250,88 +227,83 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       }
     });
 
-    const { access_token, refresh_token, expires_in, id_token } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number; id_token?: string };
+    const { access_token, refresh_token, expires_in } = tokenResponse.data as { access_token: string; refresh_token?: string; expires_in: number };
 
-    // Fetch personal profile
-    let profile: { sub: string; name: string; email?: string; picture?: string } = {
-      sub: `linkedin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      name: 'LinkedIn User'
-    };
+    // Get the scopes used for this OAuth flow
+    const scopesUsed = accountType ? getLinkedInScopesForType(accountType) : config.scopes;
 
-    // Try id_token first
-    if (id_token) {
-      const verifiedPayload = await verifyLinkedInIdToken(id_token);
-      if (verifiedPayload) {
-        if (verifiedPayload.sub) profile.sub = verifiedPayload.sub;
-        if (verifiedPayload.name) profile.name = verifiedPayload.name;
-        if (verifiedPayload.email) profile.email = verifiedPayload.email;
-        if (verifiedPayload.picture) profile.picture = verifiedPayload.picture;
-      }
-    }
+    // Fetch personal profile (for personal type or unified)
+    let profile: { sub: string; name: string; email?: string; picture?: string } | null = null;
+    
+    if (accountType !== 'company') {
+      profile = {
+        sub: `linkedin_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: 'LinkedIn User'
+      };
+      console.log('[LinkedIn Finalize] Fetching personal profile...');
 
-    // Fallback to API call if needed
-    if (profile.sub.startsWith('linkedin_')) {
-      try {
-        const apiProfile = await linkedInService.getProfile(access_token);
-        profile.sub = apiProfile.sub;
-        profile.name = apiProfile.name;
-        if (apiProfile.email) profile.email = apiProfile.email;
-
-        // Fetch profile picture separately
+      const maxRetries = 2;
+      let lastError: any;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const pictureUrl = await linkedInService.getProfilePicture(access_token);
-          if (pictureUrl) profile.picture = pictureUrl;
-        } catch (pictureError) {
-          console.warn('[LinkedIn Finalize] Failed to fetch profile picture:', pictureError);
+          const apiProfile = await linkedInService.getProfile(access_token);
+          profile.sub = apiProfile.sub;
+          profile.name = apiProfile.name;
+          if (apiProfile.email) profile.email = apiProfile.email;
+
+          // Fetch profile picture separately (with retry)
+          for (let picAttempt = 1; picAttempt <= maxRetries; picAttempt++) {
+            try {
+              const pictureUrl = await linkedInService.getProfilePicture(access_token);
+              if (pictureUrl) profile.picture = pictureUrl;
+              break;
+            } catch (pictureError: any) {
+              console.warn(`[LinkedIn Finalize] Picture fetch attempt ${picAttempt}/${maxRetries} failed:`, pictureError.message);
+              if (picAttempt < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, 1000 * picAttempt));
+              }
+            }
+          }
+          
+          break;
+        } catch (profileError: any) {
+          lastError = profileError;
+          console.warn(`[LinkedIn Finalize] Profile fetch attempt ${attempt}/${maxRetries} failed:`, profileError.message);
+          
+          if (attempt < maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          }
         }
-      } catch (profileError: any) {
-        console.warn('[LinkedIn Finalize] Profile API failed, using fallback.', profileError.message);
+      }
+      
+      // If all retries failed for personal type, throw error
+      if (accountType === 'personal' && profile.sub.startsWith('linkedin_') && lastError) {
+        throw new Error(`Failed to fetch LinkedIn profile after ${maxRetries} attempts: ${lastError.message}`);
       }
     }
 
-
-    // Ensure URN format
-    let profileUrn = profile.sub;
-    if (!profileUrn.startsWith('urn:')) {
-      profileUrn = `urn:li:person:${profileUrn}`;
+    // Ensure URN format for profile
+    let profileUrn: string | null = null;
+    if (profile) {
+      profileUrn = profile.sub;
+      if (!profileUrn.startsWith('urn:')) {
+        profileUrn = `urn:li:person:${profileUrn}`;
+      }
     }
 
-    // Fetch organizations where user has admin access
+    // Fetch organizations (for company type or unified)
     let organizations: any[] = [];
-    try {
-      const aclResponse = await linkedInService.getAdminOrganizations(access_token);
-      const orgUrns = aclResponse.elements
-        .map(acl => (acl as any).organization || acl.organizationTarget)
-        .filter((urn): urn is string => urn != null && typeof urn === 'string' && urn.length > 0);
-
-      // Get details for each organization
-      organizations = await Promise.all(
-        orgUrns.map(async (orgUrn: string) => {
-          try {
-            const orgDetails = await linkedInService.getOrganization(access_token, orgUrn);
-            const followerCount = await linkedInService.getOrganizationFollowerCount(access_token, orgUrn);
-            return {
-              urn: orgUrn,
-              id: orgDetails.id,
-              name: orgDetails.name,
-              vanityName: orgDetails.vanityName,
-              logoUrl: orgDetails.logoUrl,
-              followerCount,
-            };
-          } catch (err) {
-            console.warn(`Failed to get details for org ${orgUrn}:`, err);
-            return {
-              urn: orgUrn,
-              id: orgUrn.replace('urn:li:organization:', ''),
-              name: `Organization ${orgUrn.replace('urn:li:organization:', '')}`,
-              followerCount: 0,
-            };
-          }
-        })
-      );
-    } catch (error: any) {
-      console.warn('[LinkedIn Finalize] Failed to fetch organizations:', error.message);
-      // Continue without organizations - user can still connect personal account
+    if (accountType !== 'personal') {
+      try {
+        organizations = await linkedInService.getAdminOrganizationDetails(access_token);
+      } catch (error: any) {
+        console.warn('[LinkedIn Finalize] Failed to fetch organizations:', error.message);
+        // For company type, this is an error; for unified, we continue
+        if (accountType === 'company') {
+          throw new Error(`Failed to fetch organizations: ${error.message}`);
+        }
+      }
     }
 
     // Store tokens server-side and return session ID
@@ -339,17 +311,18 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
       access_token,
       refresh_token,
       expires_in,
-      scopes: config.scopes
+      scopes: scopesUsed
     });
 
     res.json({
       success: true,
-      profile: {
+      accountType: accountType || 'unified',
+      profile: profile ? {
         urn: profileUrn,
         name: profile.name,
         email: profile.email,
         picture: profile.picture
-      },
+      } : null,
       organizations,
       tokenSessionId
     });
@@ -367,7 +340,7 @@ router.post('/connect-accounts', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   // Validate at least one account is selected
-  if (!personal && (!organizations || organizations.length === 0)) {
+  if (!personal && (!organizations || !Array.isArray(organizations) || organizations.length === 0)) {
     return res.status(400).json({ error: 'No accounts selected' });
   }
 

@@ -291,8 +291,9 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         const status = error?.response?.status;
         const msg = error?.message || '';
         
-        if (status === 403 || msg.includes('Permission denied') || msg.includes('scope')) {
-          throw new Error('Analytics permissions are missing. Please reconnect your LinkedIn account to enable analytics.');
+        const msgLower = msg.toLowerCase();
+        if (status === 403 || msgLower.includes('permission denied') || msgLower.includes('scope') || msgLower.includes('access denied')) {
+          throw new Error(`Analytics permissions are missing. ${msg || 'Please reconnect your LinkedIn account to enable analytics.'}`);
         }
         
         if (status === 401 || msg.includes('expired')) {

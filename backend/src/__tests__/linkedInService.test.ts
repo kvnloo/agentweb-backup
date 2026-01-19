@@ -65,20 +65,31 @@ describe('LinkedInService', () => {
 
   describe('getProfile', () => {
     it('should fetch user profile with correct authorization header', async () => {
-      const mockProfile = {
+      const mockResponse = {
+        id: 'user123',
+        localizedFirstName: 'John',
+        localizedLastName: 'Doe',
+      };
+      
+      const expectedProfile = {
         sub: 'user123',
         name: 'John Doe',
-        email: 'john@example.com',
-        picture: 'https://example.com/photo.jpg',
+        given_name: 'John',
+        family_name: 'Doe',
+        picture: '',
+        locale: '',
+        email: '',
+        email_verified: false,
       };
-      mockClient.get.mockResolvedValue({ data: mockProfile });
+
+      mockClient.get.mockResolvedValue({ data: mockResponse });
 
       const result = await service.getProfile('test-access-token');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/v2/userinfo', {
+      expect(mockClient.get).toHaveBeenCalledWith('/v2/me', {
         headers: { Authorization: 'Bearer test-access-token' },
       });
-      expect(result).toEqual(mockProfile);
+      expect(result).toEqual(expectedProfile);
     });
 
     it('should throw error with message for 401 response', async () => {

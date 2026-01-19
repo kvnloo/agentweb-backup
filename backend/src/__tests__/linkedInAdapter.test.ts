@@ -307,7 +307,7 @@ describe('LinkedInAdapter', () => {
       });
 
       await expect(adapter.getAccountMetrics(mockPersonalAccount)).rejects.toThrow(
-        'Analytics permissions are missing. Please reconnect your LinkedIn account to enable analytics.'
+        'Analytics permissions are missing. Permission denied'
       );
     });
 
