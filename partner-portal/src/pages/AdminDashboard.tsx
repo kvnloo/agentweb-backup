@@ -69,6 +69,8 @@ import {
   OpenInNew as OpenInNewIcon,
   Lock as LockIcon,
   Add as AddIcon,
+  ThumbUp as ThumbUpIcon,
+  ThumbDown as ThumbDownIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -384,22 +386,35 @@ const ChatDialog = ({
                             ? "#7b1fa2"
                             : "text.secondary",
                         fontWeight: "bold",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 0.5,
                       }}
                     >
-                      {msg.role.toUpperCase()}
-                      {msg.metadata?.timestamp &&
-                        !isNaN(new Date(msg.metadata.timestamp).getTime()) && (
-                          <>
-                            {" "}
-                            -{" "}
-                            {new Date(msg.metadata.timestamp).toLocaleString()}
-                          </>
-                        )}
+                      <span>
+                        {msg.role.toUpperCase()}
+                        {msg.metadata?.timestamp &&
+                          !isNaN(new Date(msg.metadata.timestamp).getTime()) && (
+                            <>
+                              {" "}
+                              -{" "}
+                              {new Date(msg.metadata.timestamp).toLocaleString()}
+                            </>
+                          )}
+                      </span>
                       {msg.role === "assistant" && msg.llm && (
-                        <>
-                          {" "}
-                          - <Chip label={msg.llm} size="small" sx={{ fontSize: '0.65rem', height: '18px' }} />
-                        </>
+                        <Chip label={msg.llm} size="small" sx={{ fontSize: '0.65rem', height: '18px' }} />
+                      )}
+                      {msg.role === "assistant" && msg.metadata?.feedback && (
+                        <Tooltip title={`User feedback: ${msg.metadata.feedback.type}`}>
+                          <Box sx={{ display: 'inline-flex', alignItems: 'center', ml: 0.5 }}>
+                            {msg.metadata.feedback.type === 'like' ? (
+                              <ThumbUpIcon sx={{ fontSize: '0.9rem', color: 'success.main' }} />
+                            ) : (
+                              <ThumbDownIcon sx={{ fontSize: '0.9rem', color: 'error.main' }} />
+                            )}
+                          </Box>
+                        </Tooltip>
                       )}
                     </Typography>
                     <Box
@@ -465,6 +480,30 @@ const ChatDialog = ({
                           <pre style={{ fontSize: "0.75rem", margin: "4px 0 0 0", overflowX: "auto", whiteSpace: "pre-wrap" }}>
                             {msg.content}
                           </pre>
+                        </Box>
+                      )}
+
+                      {/* Display user feedback for assistant messages */}
+                      {msg.role === "assistant" && msg.metadata?.feedback && (
+                        <Box sx={{ mt: 2, p: 1.5, backgroundColor: msg.metadata.feedback.type === 'like' ? 'rgba(76, 175, 80, 0.08)' : 'rgba(244, 67, 54, 0.08)', borderRadius: 1, borderLeft: `3px solid ${msg.metadata.feedback.type === 'like' ? '#4caf50' : '#f44336'}` }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: msg.metadata.feedback.comment ? 1 : 0 }}>
+                            {msg.metadata.feedback.type === 'like' ? (
+                              <ThumbUpIcon sx={{ fontSize: '1rem', color: 'success.main' }} />
+                            ) : (
+                              <ThumbDownIcon sx={{ fontSize: '1rem', color: 'error.main' }} />
+                            )}
+                            <Typography variant="caption" sx={{ fontWeight: "bold", color: msg.metadata.feedback.type === 'like' ? 'success.dark' : 'error.dark' }}>
+                              User Feedback
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ ml: 'auto' }}>
+                              {new Date(msg.metadata.feedback.timestamp).toLocaleString()}
+                            </Typography>
+                          </Box>
+                          {msg.metadata.feedback.comment && (
+                            <Typography variant="body2" sx={{ mt: 0.5, fontSize: '0.85rem', fontStyle: 'italic', color: 'text.secondary' }}>
+                              "{msg.metadata.feedback.comment}"
+                            </Typography>
+                          )}
                         </Box>
                       )}
                     </Box>
@@ -3898,13 +3937,14 @@ export default function AdminDashboard() {
                   <TableCell>Created At</TableCell>
                   <TableCell>Updated At</TableCell>
                   <TableCell>Message Count</TableCell>
+                  <TableCell>Feedback</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center">
+                    <TableCell colSpan={9} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4001,6 +4041,49 @@ export default function AdminDashboard() {
                           />
                         </TableCell>
                         <TableCell>
+                          {(() => {
+                            const likes = session.messages?.filter((msg: any) =>
+                              msg?.role === 'assistant' && msg?.metadata?.feedback?.type === 'like'
+                            ).length || 0;
+                            const dislikes = session.messages?.filter((msg: any) =>
+                              msg?.role === 'assistant' && msg?.metadata?.feedback?.type === 'dislike'
+                            ).length || 0;
+
+                            if (likes === 0 && dislikes === 0) {
+                              return <span style={{ color: '#999' }}>-</span>;
+                            }
+
+                            return (
+                              <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+                                {likes > 0 && (
+                                  <Chip
+                                    icon={<ThumbUpIcon sx={{ fontSize: '0.9rem' }} />}
+                                    label={likes}
+                                    size="small"
+                                    sx={{
+                                      backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                                      color: 'success.main',
+                                      '& .MuiChip-icon': { color: 'success.main' }
+                                    }}
+                                  />
+                                )}
+                                {dislikes > 0 && (
+                                  <Chip
+                                    icon={<ThumbDownIcon sx={{ fontSize: '0.9rem' }} />}
+                                    label={dislikes}
+                                    size="small"
+                                    sx={{
+                                      backgroundColor: 'rgba(244, 67, 54, 0.1)',
+                                      color: 'error.main',
+                                      '& .MuiChip-icon': { color: 'error.main' }
+                                    }}
+                                  />
+                                )}
+                              </Box>
+                            );
+                          })()}
+                        </TableCell>
+                        <TableCell>
                           <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                             <Button
                               variant="outlined"
@@ -4047,7 +4130,7 @@ export default function AdminDashboard() {
                     ))}
                     {chatSessionsLoading && (
                       <TableRow>
-                        <TableCell colSpan={8} align="center">
+                        <TableCell colSpan={9} align="center">
                           <CircularProgress size={24} />
                         </TableCell>
                       </TableRow>

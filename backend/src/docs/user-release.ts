@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-19',
+    changes: [
+      'Added Message Feedback System for Agent Mode',
+      '- Users can now provide feedback on Emma\'s responses with like (👍) and dislike (👎) buttons',
+      '- Admin dashboard now shows feedback summary for each chat session (e.g., "3 👍, 1 👎")',
+      '- Individual feedback details (type, comment, timestamp) are visible in the admin chat history view',
+    ],
+  },
+  {
     date: '2026-01-18',
     changes: [
       'Added Lead Forwarding API for CRM',

@@ -55,6 +55,14 @@ const embeddingsClient = new OpenAI({
   defaultHeaders: { "api-key": process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY },
 });
 
+// Interface for message feedback
+export interface MessageFeedback {
+  type: 'like' | 'dislike';           // User's rating
+  comment?: string;                    // Optional text feedback
+  timestamp: string;                   // ISO timestamp when feedback given
+  userId: string;                      // User who gave feedback
+}
+
 // Interface for chat messages
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -64,6 +72,7 @@ export interface ChatMessage {
   name?: string; // For tool messages
   tool_call_id?: string; // For tool messages
   tool_calls?: any[]; // For assistant messages with tool calls
+  messageIndex?: number; // Index of message in the database (included when loading from DB)
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
@@ -97,6 +106,7 @@ export interface ChatMessage {
       mimetype: string;
       uploadedAt: string;
     }>;
+    feedback?: MessageFeedback;        // NEW: Feedback data
   };
 }
 
@@ -568,6 +578,64 @@ export class ChatbotDB {
     };
   }
 
+  // Update message feedback in AW-ChatMessages table
+  async updateMessageFeedback(
+    sessionId: string,
+    messageIndex: number,
+    feedback: MessageFeedback
+  ): Promise<ChatMessage> {
+    // Get the current message
+    const params = {
+      TableName: this.messagesTableName,
+      Key: {
+        sessionId,
+        messageIndex,
+      },
+    };
+
+    try {
+      const result = await dynamodb.get(params).promise();
+      if (!result.Item) {
+        throw new Error('Message not found');
+      }
+
+      const currentMessage = result.Item.message as ChatMessage;
+
+      // Update the message with feedback
+      const updatedMessage: ChatMessage = {
+        ...currentMessage,
+        metadata: {
+          ...currentMessage.metadata,
+          timestamp: currentMessage.metadata?.timestamp || new Date().toISOString(),
+          feedback,
+        },
+      };
+
+      // Update the message in the table
+      const updateParams = {
+        TableName: this.messagesTableName,
+        Key: {
+          sessionId,
+          messageIndex,
+        },
+        UpdateExpression: 'SET #message = :message',
+        ExpressionAttributeNames: {
+          '#message': 'message',
+        },
+        ExpressionAttributeValues: {
+          ':message': updatedMessage,
+        },
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const updateResult = await dynamodb.update(updateParams).promise();
+      return updateResult.Attributes?.message as ChatMessage;
+    } catch (error) {
+      console.error('Error updating message feedback:', error);
+      throw error;
+    }
+  }
+
   // Get message count from AW-ChatMessages table (optimized for list views)
   private async getMessageCountFromMessagesTable(sessionId: string): Promise<number> {
     const params = {
@@ -594,7 +662,7 @@ export class ChatbotDB {
   }
 
   // Get messages from AW-ChatMessages table
-  private async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
+  async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
     const params = {
       TableName: this.messagesTableName,
       KeyConditionExpression: "sessionId = :sessionId",
@@ -609,10 +677,13 @@ export class ChatbotDB {
       if (!result.Items || result.Items.length === 0) {
         return [];
       }
-      // Sort by messageIndex and extract messages
+      // Sort by messageIndex and extract messages, including messageIndex in each message
       const messages = result.Items
         .sort((a, b) => a.messageIndex - b.messageIndex)
-        .map((item) => item.message as ChatMessage);
+        .map((item) => ({
+          ...(item.message as ChatMessage),
+          messageIndex: item.messageIndex, // Include the database messageIndex
+        }));
       return messages;
     } catch (error) {
       // If table doesn't exist yet, return empty array
