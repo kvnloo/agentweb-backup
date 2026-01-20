@@ -1,4 +1,5 @@
 import app from './app';
+import { agentModeService } from './services/agentModeService';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import http from 'http';
@@ -173,7 +174,16 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 });
 
 // Create test account before starting the server
-createTestAccount().then(() => {
+createTestAccount().then(async () => {
+  // Initialize Agent Mode tools
+  try {
+    console.log('Initializing Agent Mode Tools...');
+    await agentModeService.initialize();
+    console.log('Agent Mode Tools initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize Agent Mode Tools:', error);
+  }
+
   server.listen(port, () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);

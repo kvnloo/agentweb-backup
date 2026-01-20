@@ -91,8 +91,7 @@ export async function getSubscriptionTypeConfig(
  */
 export async function getAllAvailableFunctionCalls(): Promise<string[]> {
   try {
-    const { AgentModeService } = await import("./agentModeService");
-    const agentModeService = new AgentModeService();
+    const { agentModeService } = await import("./agentModeService");
     const tools = agentModeService.getAvailableTools();
     return tools
       .filter((tool: any) => tool.type === "function")

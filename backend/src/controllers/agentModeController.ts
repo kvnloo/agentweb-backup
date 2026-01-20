@@ -1139,17 +1139,16 @@ export const agentModeController = {
   async getAvailableFunctionCalls(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const agentModeService = new AgentModeService();
-      const allTools = agentModeService.getAvailableTools();
+      const tools = agentModeService.getAvailableTools();
       
       // For admin users, return all function calls without filtering
       // For regular users, filter tools based on subscription
-      let toolsToReturn = allTools;
+      let toolsToReturn = tools;
       if (!user.isAdmin) {
         const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
         const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
         // getAllowedFunctionCalls now always returns an array (never null)
-        toolsToReturn = filterFunctionCalls(allTools, allowedFunctionCalls);
+        toolsToReturn = filterFunctionCalls(tools, allowedFunctionCalls);
       }
 
       // Extract function names and descriptions
@@ -1349,7 +1348,6 @@ export const agentModeController = {
 
   async getSupportedModels(req: Request, res: Response) {
     try {
-      const agentModeService = new AgentModeService();
       const models = await agentModeService.getSupportedModels();
       res.json(models);
     } catch (error) {

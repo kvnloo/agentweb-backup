@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "agentweb-tools": {
+      "url": "http://localhost:3002/sse"
+    }
+  }
+}

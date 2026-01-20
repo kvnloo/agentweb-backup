@@ -9,7 +9,10 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "create-tables": "ts-node scripts/create-tables.ts",
-    "create-admin": "ts-node src/scripts/create-admin.ts"
+    "create-admin": "ts-node src/scripts/create-admin.ts",
+    "mcp:start": "export IS_MCP_SERVER=true && node dist/mcp-server/index.js",
+    "mcp:dev": "export IS_MCP_SERVER=true && ts-node-dev --respawn --transpile-only src/mcp-server/index.ts",
+    "mcp:inspector": "export IS_MCP_SERVER=true && export TRANSPORT=stdio && npx @modelcontextprotocol/inspector node dist/mcp-server/index.js"
   },
   "keywords": [],
   "author": "",
@@ -25,6 +28,7 @@
     "@langchain/aws": "^1.1.0",
     "@langchain/core": "^1.1.5",
     "@langchain/openai": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.25.2",
     "@reactflow/core": "^11.11.4",
     "@runwayml/sdk": "^3.7.0",
     "@slack/web-api": "^7.9.3",
