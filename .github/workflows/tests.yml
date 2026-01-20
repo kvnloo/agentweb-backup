@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
   id-token: write
 
 env:
@@ -83,23 +83,49 @@ jobs:
         working-directory: backend
         run: npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary
 
-      - name: Coverage summary
-        working-directory: backend
-        run: |
-          echo "## 📊 Backend Test Coverage" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Coverage |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
-          STATEMENTS=$(jq '.total.statements.pct' coverage/coverage-summary.json)
-          BRANCHES=$(jq '.total.branches.pct' coverage/coverage-summary.json)
-          FUNCTIONS=$(jq '.total.functions.pct' coverage/coverage-summary.json)
-          LINES=$(jq '.total.lines.pct' coverage/coverage-summary.json)
-          echo "| Statements | ${STATEMENTS}% |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branches | ${BRANCHES}% |" >> $GITHUB_STEP_SUMMARY
-          echo "| Functions | ${FUNCTIONS}% |" >> $GITHUB_STEP_SUMMARY
-          echo "| Lines | ${LINES}% |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **Threshold: 90%**" >> $GITHUB_STEP_SUMMARY
+      - name: Post coverage comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const coverage = JSON.parse(fs.readFileSync('backend/coverage/coverage-summary.json', 'utf8'));
+            const { statements, branches, functions, lines } = coverage.total;
+
+            const body = `## 📊 Backend Test Coverage
+
+            | Metric | Coverage | Threshold |
+            |--------|----------|-----------|
+            | Statements | ${statements.pct}% | 90% |
+            | Branches | ${branches.pct}% | 90% |
+            | Functions | ${functions.pct}% | 90% |
+            | Lines | ${lines.pct}% | 90% |
+
+            ${branches.pct >= 90 ? '✅' : '❌'} **All thresholds must be ≥ 90%**`;
+
+            // Find existing coverage comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const coverageComment = comments.find(c => c.body.includes('📊 Backend Test Coverage'));
+
+            if (coverageComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: coverageComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
 
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
