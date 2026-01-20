@@ -1,0 +1,405 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1768884043673" clover="3.2.0">
+  <project timestamp="1768884043673" name="All files">
+    <metrics statements="360" coveredstatements="358" conditionals="216" coveredconditionals="195" methods="42" coveredmethods="42" elements="618" coveredelements="595" complexity="0" loc="360" ncloc="360" packages="1" files="13" classes="13"/>
+    <file name="agentModeAlerts.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/agentModeAlerts.ts">
+      <metrics statements="18" coveredstatements="18" conditionals="11" coveredconditionals="11" methods="2" coveredmethods="2"/>
+      <line num="1" count="26" type="stmt"/>
+      <line num="2" count="26" type="stmt"/>
+      <line num="12" count="24" type="cond" truecount="2" falsecount="0"/>
+      <line num="15" count="26" type="stmt"/>
+      <line num="18" count="12" type="stmt"/>
+      <line num="20" count="12" type="stmt"/>
+      <line num="21" count="12" type="cond" truecount="1" falsecount="0"/>
+      <line num="22" count="8" type="stmt"/>
+      <line num="23" count="8" type="stmt"/>
+      <line num="25" count="2" type="stmt"/>
+      <line num="26" count="2" type="cond" truecount="2" falsecount="0"/>
+      <line num="27" count="2" type="stmt"/>
+      <line num="31" count="12" type="stmt"/>
+      <line num="32" count="12" type="cond" truecount="1" falsecount="0"/>
+      <line num="33" count="11" type="cond" truecount="2" falsecount="0"/>
+      <line num="35" count="12" type="cond" truecount="1" falsecount="0"/>
+      <line num="36" count="11" type="cond" truecount="2" falsecount="0"/>
+      <line num="39" count="12" type="stmt"/>
+    </file>
+    <file name="agentModeErrors.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/agentModeErrors.ts">
+      <metrics statements="10" coveredstatements="10" conditionals="6" coveredconditionals="6" methods="4" coveredmethods="4"/>
+      <line num="1" count="26" type="stmt"/>
+      <line num="6" count="26" type="stmt"/>
+      <line num="7" count="35" type="cond" truecount="1" falsecount="0"/>
+      <line num="8" count="32" type="cond" truecount="2" falsecount="0"/>
+      <line num="9" count="62" type="stmt"/>
+      <line num="12" count="26" type="stmt"/>
+      <line num="27" count="26" type="stmt"/>
+      <line num="28" count="23" type="cond" truecount="1" falsecount="0"/>
+      <line num="29" count="21" type="cond" truecount="2" falsecount="0"/>
+      <line num="30" count="150" type="stmt"/>
+    </file>
+    <file name="errorHandler.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/errorHandler.ts">
+      <metrics statements="9" coveredstatements="9" conditionals="3" coveredconditionals="3" methods="1" coveredmethods="1"/>
+      <line num="1" count="12" type="stmt"/>
+      <line num="2" count="6" type="stmt"/>
+      <line num="4" count="6" type="cond" truecount="1" falsecount="0"/>
+      <line num="5" count="1" type="stmt"/>
+      <line num="8" count="5" type="cond" truecount="1" falsecount="0"/>
+      <line num="9" count="1" type="stmt"/>
+      <line num="12" count="4" type="cond" truecount="1" falsecount="0"/>
+      <line num="13" count="1" type="stmt"/>
+      <line num="16" count="3" type="stmt"/>
+    </file>
+    <file name="fileProcessor.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/fileProcessor.ts">
+      <metrics statements="19" coveredstatements="19" conditionals="23" coveredconditionals="18" methods="3" coveredmethods="3"/>
+      <line num="4" count="7" type="stmt"/>
+      <line num="34" count="8" type="cond" truecount="0" falsecount="1"/>
+      <line num="36" count="8" type="stmt"/>
+      <line num="58" count="8" type="cond" truecount="2" falsecount="0"/>
+      <line num="64" count="7" type="stmt"/>
+      <line num="65" count="21" type="cond" truecount="4" falsecount="2"/>
+      <line num="67" count="21" type="cond" truecount="1" falsecount="0"/>
+      <line num="68" count="6" type="stmt"/>
+      <line num="71" count="15" type="cond" truecount="1" falsecount="0"/>
+      <line num="72" count="12" type="cond" truecount="3" falsecount="0"/>
+      <line num="73" count="4" type="stmt"/>
+      <line num="75" count="8" type="stmt"/>
+      <line num="76" count="8" type="stmt"/>
+      <line num="79" count="3" type="stmt"/>
+      <line num="85" count="7" type="stmt"/>
+      <line num="86" count="26" type="cond" truecount="1" falsecount="0"/>
+      <line num="88" count="24" type="cond" truecount="4" falsecount="2"/>
+      <line num="89" count="24" type="stmt"/>
+      <line num="113" count="24" type="cond" truecount="2" falsecount="0"/>
+    </file>
+    <file name="llmService.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/llmService.ts">
+      <metrics statements="86" coveredstatements="86" conditionals="68" coveredconditionals="61" methods="6" coveredmethods="6"/>
+      <line num="1" count="2" type="stmt"/>
+      <line num="2" count="2" type="stmt"/>
+      <line num="3" count="2" type="stmt"/>
+      <line num="4" count="2" type="stmt"/>
+      <line num="5" count="2" type="stmt"/>
+      <line num="9" count="2" type="stmt"/>
+      <line num="13" count="36" type="cond" truecount="2" falsecount="1"/>
+      <line num="14" count="36" type="cond" truecount="3" falsecount="0"/>
+      <line num="16" count="36" type="cond" truecount="2" falsecount="0"/>
+      <line num="17" count="14" type="cond" truecount="1" falsecount="2"/>
+      <line num="18" count="14" type="stmt"/>
+      <line num="26" count="14" type="cond" truecount="2" falsecount="0"/>
+      <line num="30" count="14" type="stmt"/>
+      <line num="38" count="22" type="cond" truecount="1" falsecount="1"/>
+      <line num="39" count="22" type="stmt"/>
+      <line num="40" count="22" type="cond" truecount="3" falsecount="0"/>
+      <line num="41" count="1" type="stmt"/>
+      <line num="43" count="21" type="stmt"/>
+      <line num="44" count="21" type="stmt"/>
+      <line num="67" count="4" type="stmt"/>
+      <line num="68" count="4" type="stmt"/>
+      <line num="73" count="4" type="stmt"/>
+      <line num="75" count="4" type="cond" truecount="2" falsecount="0"/>
+      <line num="77" count="2" type="stmt"/>
+      <line num="78" count="2" type="stmt"/>
+      <line num="79" count="2" type="stmt"/>
+      <line num="81" count="2" type="cond" truecount="2" falsecount="0"/>
+      <line num="84" count="2" type="stmt"/>
+      <line num="85" count="1" type="stmt"/>
+      <line num="88" count="1" type="stmt"/>
+      <line num="89" count="1" type="stmt"/>
+      <line num="97" count="5" type="stmt"/>
+      <line num="98" count="5" type="stmt"/>
+      <line num="99" count="5" type="cond" truecount="5" falsecount="0"/>
+      <line num="100" count="3" type="stmt"/>
+      <line num="102" count="5" type="stmt"/>
+      <line num="103" count="5" type="cond" truecount="5" falsecount="0"/>
+      <line num="104" count="5" type="stmt"/>
+      <line num="105" count="5" type="cond" truecount="5" falsecount="0"/>
+      <line num="106" count="5" type="stmt"/>
+      <line num="107" count="5" type="cond" truecount="5" falsecount="0"/>
+      <line num="108" count="5" type="stmt"/>
+      <line num="123" count="7" type="stmt"/>
+      <line num="124" count="7" type="stmt"/>
+      <line num="129" count="7" type="stmt"/>
+      <line num="130" count="7" type="stmt"/>
+      <line num="131" count="6" type="stmt"/>
+      <line num="133" count="6" type="cond" truecount="1" falsecount="0"/>
+      <line num="134" count="5" type="stmt"/>
+      <line num="135" count="5" type="cond" truecount="3" falsecount="0"/>
+      <line num="136" count="3" type="stmt"/>
+      <line num="139" count="2" type="stmt"/>
+      <line num="140" count="2" type="cond" truecount="1" falsecount="0"/>
+      <line num="141" count="1" type="stmt"/>
+      <line num="142" count="1" type="stmt"/>
+      <line num="143" count="1" type="cond" truecount="1" falsecount="1"/>
+      <line num="144" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="145" count="1" type="stmt"/>
+      <line num="148" count="1" type="stmt"/>
+      <line num="152" count="1" type="stmt"/>
+      <line num="153" count="1" type="stmt"/>
+      <line num="154" count="1" type="stmt"/>
+      <line num="156" count="2" type="stmt"/>
+      <line num="157" count="2" type="stmt"/>
+      <line num="171" count="15" type="stmt"/>
+      <line num="172" count="15" type="stmt"/>
+      <line num="181" count="15" type="stmt"/>
+      <line num="186" count="15" type="stmt"/>
+      <line num="187" count="15" type="stmt"/>
+      <line num="188" count="13" type="stmt"/>
+      <line num="191" count="13" type="stmt"/>
+      <line num="192" count="13" type="cond" truecount="3" falsecount="0"/>
+      <line num="193" count="5" type="stmt"/>
+      <line num="198" count="8" type="stmt"/>
+      <line num="199" count="8" type="cond" truecount="1" falsecount="0"/>
+      <line num="200" count="6" type="stmt"/>
+      <line num="202" count="6" type="stmt"/>
+      <line num="203" count="6" type="cond" truecount="1" falsecount="0"/>
+      <line num="204" count="5" type="stmt"/>
+      <line num="206" count="1" type="stmt"/>
+      <line num="210" count="2" type="stmt"/>
+      <line num="211" count="2" type="stmt"/>
+      <line num="213" count="2" type="stmt"/>
+      <line num="214" count="2" type="stmt"/>
+      <line num="222" count="2" type="stmt"/>
+      <line num="227" count="12" type="stmt"/>
+    </file>
+    <file name="metaApiFetch.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/metaApiFetch.ts">
+      <metrics statements="32" coveredstatements="31" conditionals="16" coveredconditionals="16" methods="4" coveredmethods="4"/>
+      <line num="13" count="3" type="cond" truecount="2" falsecount="0"/>
+      <line num="14" count="198" type="stmt"/>
+      <line num="15" count="231" type="stmt"/>
+      <line num="16" count="231" type="stmt"/>
+      <line num="19" count="226" type="cond" truecount="1" falsecount="0"/>
+      <line num="20" count="147" type="stmt"/>
+      <line num="24" count="79" type="cond" truecount="3" falsecount="0"/>
+      <line num="25" count="39" type="stmt"/>
+      <line num="27" count="39" type="cond" truecount="1" falsecount="0"/>
+      <line num="29" count="29" type="stmt"/>
+      <line num="30" count="29" type="stmt"/>
+      <line num="31" count="29" type="stmt"/>
+      <line num="32" count="29" type="stmt"/>
+      <line num="37" count="50" type="stmt"/>
+      <line num="39" count="5" type="stmt"/>
+      <line num="41" count="5" type="cond" truecount="1" falsecount="0"/>
+      <line num="43" count="4" type="stmt"/>
+      <line num="44" count="4" type="stmt"/>
+      <line num="45" count="4" type="stmt"/>
+      <line num="46" count="4" type="stmt"/>
+      <line num="50" count="1" type="stmt"/>
+      <line num="55" count="0" type="stmt"/>
+      <line num="64" count="3" type="stmt"/>
+      <line num="65" count="191" type="stmt"/>
+      <line num="66" count="191" type="stmt"/>
+      <line num="69" count="191" type="cond" truecount="3" falsecount="0"/>
+      <line num="70" count="10" type="stmt"/>
+      <line num="73" count="10" type="stmt"/>
+      <line num="76" count="10" type="cond" truecount="5" falsecount="0"/>
+      <line num="77" count="10" type="stmt"/>
+      <line num="81" count="10" type="stmt"/>
+      <line num="84" count="191" type="stmt"/>
+    </file>
+    <file name="s3Utils.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/s3Utils.ts">
+      <metrics statements="30" coveredstatements="30" conditionals="22" coveredconditionals="20" methods="3" coveredmethods="3"/>
+      <line num="1" count="35" type="stmt"/>
+      <line num="2" count="35" type="stmt"/>
+      <line num="5" count="35" type="stmt"/>
+      <line num="26" count="35" type="stmt"/>
+      <line num="32" count="10" type="stmt"/>
+      <line num="34" count="10" type="cond" truecount="2" falsecount="0"/>
+      <line num="40" count="10" type="stmt"/>
+      <line num="41" count="160" type="stmt"/>
+      <line num="45" count="10" type="stmt"/>
+      <line num="50" count="10" type="cond" truecount="3" falsecount="0"/>
+      <line num="61" count="10" type="stmt"/>
+      <line num="64" count="10" type="cond" truecount="2" falsecount="0"/>
+      <line num="65" count="10" type="stmt"/>
+      <line num="77" count="10" type="stmt"/>
+      <line num="79" count="8" type="stmt"/>
+      <line num="85" count="2" type="stmt"/>
+      <line num="86" count="2" type="stmt"/>
+      <line num="101" count="35" type="stmt"/>
+      <line num="107" count="8" type="stmt"/>
+      <line num="109" count="8" type="cond" truecount="2" falsecount="0"/>
+      <line num="115" count="8" type="stmt"/>
+      <line num="120" count="8" type="cond" truecount="3" falsecount="0"/>
+      <line num="131" count="8" type="stmt"/>
+      <line num="136" count="8" type="cond" truecount="2" falsecount="0"/>
+      <line num="139" count="8" type="cond" truecount="1" falsecount="1"/>
+      <line num="140" count="8" type="stmt"/>
+      <line num="152" count="8" type="stmt"/>
+      <line num="154" count="6" type="stmt"/>
+      <line num="160" count="2" type="stmt"/>
+      <line num="161" count="2" type="stmt"/>
+    </file>
+    <file name="schedule.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/schedule.ts">
+      <metrics statements="20" coveredstatements="19" conditionals="6" coveredconditionals="5" methods="1" coveredmethods="1"/>
+      <line num="1" count="1" type="stmt"/>
+      <line num="2" count="1" type="stmt"/>
+      <line num="4" count="1" type="cond" truecount="1" falsecount="0"/>
+      <line num="5" count="6" type="stmt"/>
+      <line num="6" count="6" type="stmt"/>
+      <line num="10" count="6" type="stmt"/>
+      <line num="11" count="6" type="stmt"/>
+      <line num="13" count="6" type="cond" truecount="4" falsecount="0"/>
+      <line num="15" count="3" type="stmt"/>
+      <line num="16" count="3" type="stmt"/>
+      <line num="18" count="1" type="stmt"/>
+      <line num="19" count="1" type="stmt"/>
+      <line num="21" count="1" type="stmt"/>
+      <line num="22" count="1" type="stmt"/>
+      <line num="26" count="1" type="stmt"/>
+      <line num="30" count="6" type="stmt"/>
+      <line num="31" count="6" type="stmt"/>
+      <line num="34" count="6" type="cond" truecount="0" falsecount="1"/>
+      <line num="35" count="0" type="stmt"/>
+      <line num="38" count="6" type="stmt"/>
+    </file>
+    <file name="scheduleUtils.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/scheduleUtils.ts">
+      <metrics statements="24" coveredstatements="24" conditionals="5" coveredconditionals="5" methods="3" coveredmethods="3"/>
+      <line num="1" count="2" type="stmt"/>
+      <line num="5" count="2" type="stmt"/>
+      <line num="7" count="6" type="stmt"/>
+      <line num="10" count="6" type="stmt"/>
+      <line num="11" count="6" type="stmt"/>
+      <line num="12" count="6" type="stmt"/>
+      <line num="13" count="6" type="stmt"/>
+      <line num="16" count="6" type="cond" truecount="1" falsecount="0"/>
+      <line num="17" count="6" type="stmt"/>
+      <line num="21" count="6" type="cond" truecount="4" falsecount="0"/>
+      <line num="24" count="2" type="stmt"/>
+      <line num="26" count="2" type="stmt"/>
+      <line num="27" count="2" type="stmt"/>
+      <line num="29" count="1" type="stmt"/>
+      <line num="30" count="1" type="stmt"/>
+      <line num="32" count="1" type="stmt"/>
+      <line num="35" count="5" type="stmt"/>
+      <line num="38" count="2" type="stmt"/>
+      <line num="39" count="8" type="stmt"/>
+      <line num="42" count="2" type="stmt"/>
+      <line num="43" count="7" type="stmt"/>
+      <line num="44" count="7" type="stmt"/>
+      <line num="45" count="4" type="stmt"/>
+      <line num="47" count="3" type="stmt"/>
+    </file>
+    <file name="secretsManager.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/secretsManager.ts">
+      <metrics statements="63" coveredstatements="63" conditionals="39" coveredconditionals="33" methods="6" coveredmethods="6"/>
+      <line num="1" count="87" type="stmt"/>
+      <line num="4" count="87" type="stmt"/>
+      <line num="13" count="87" type="stmt"/>
+      <line num="14" count="21" type="stmt"/>
+      <line num="15" count="21" type="stmt"/>
+      <line num="19" count="20" type="cond" truecount="1" falsecount="0"/>
+      <line num="20" count="19" type="stmt"/>
+      <line num="23" count="1" type="stmt"/>
+      <line num="25" count="2" type="stmt"/>
+      <line num="26" count="2" type="stmt"/>
+      <line num="35" count="87" type="stmt"/>
+      <line num="36" count="3" type="stmt"/>
+      <line num="38" count="3" type="stmt"/>
+      <line num="41" count="1" type="stmt"/>
+      <line num="44" count="2" type="cond" truecount="1" falsecount="0"/>
+      <line num="45" count="1" type="stmt"/>
+      <line num="48" count="1" type="cond" truecount="1" falsecount="2"/>
+      <line num="50" count="1" type="stmt"/>
+      <line num="58" count="87" type="stmt"/>
+      <line num="59" count="3" type="stmt"/>
+      <line num="60" count="3" type="cond" truecount="2" falsecount="0"/>
+      <line num="61" count="3" type="stmt"/>
+      <line num="63" count="3" type="cond" truecount="3" falsecount="0"/>
+      <line num="64" count="1" type="stmt"/>
+      <line num="67" count="2" type="stmt"/>
+      <line num="69" count="1" type="stmt"/>
+      <line num="70" count="1" type="stmt"/>
+      <line num="78" count="87" type="stmt"/>
+      <line num="79" count="4" type="stmt"/>
+      <line num="80" count="4" type="cond" truecount="1" falsecount="1"/>
+      <line num="81" count="4" type="cond" truecount="2" falsecount="0"/>
+      <line num="85" count="4" type="stmt"/>
+      <line num="87" count="4" type="cond" truecount="3" falsecount="0"/>
+      <line num="88" count="1" type="stmt"/>
+      <line num="92" count="3" type="stmt"/>
+      <line num="94" count="1" type="stmt"/>
+      <line num="95" count="1" type="stmt"/>
+      <line num="111" count="87" type="stmt"/>
+      <line num="112" count="5" type="stmt"/>
+      <line num="113" count="5" type="cond" truecount="1" falsecount="1"/>
+      <line num="114" count="5" type="cond" truecount="2" falsecount="0"/>
+      <line num="118" count="5" type="stmt"/>
+      <line num="120" count="5" type="cond" truecount="3" falsecount="0"/>
+      <line num="121" count="1" type="stmt"/>
+      <line num="124" count="4" type="stmt"/>
+      <line num="126" count="4" type="cond" truecount="3" falsecount="0"/>
+      <line num="127" count="2" type="stmt"/>
+      <line num="130" count="2" type="stmt"/>
+      <line num="132" count="3" type="stmt"/>
+      <line num="133" count="3" type="stmt"/>
+      <line num="151" count="87" type="stmt"/>
+      <line num="152" count="6" type="stmt"/>
+      <line num="153" count="6" type="cond" truecount="1" falsecount="1"/>
+      <line num="154" count="6" type="cond" truecount="2" falsecount="0"/>
+      <line num="158" count="6" type="stmt"/>
+      <line num="160" count="6" type="cond" truecount="3" falsecount="0"/>
+      <line num="161" count="1" type="stmt"/>
+      <line num="164" count="5" type="stmt"/>
+      <line num="166" count="5" type="cond" truecount="3" falsecount="0"/>
+      <line num="167" count="2" type="stmt"/>
+      <line num="170" count="3" type="stmt"/>
+      <line num="172" count="3" type="stmt"/>
+      <line num="173" count="3" type="stmt"/>
+    </file>
+    <file name="sseProgress.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/sseProgress.ts">
+      <metrics statements="25" coveredstatements="25" conditionals="6" coveredconditionals="6" methods="6" coveredmethods="6"/>
+      <line num="11" count="22" type="stmt"/>
+      <line num="14" count="22" type="stmt"/>
+      <line num="19" count="22" type="stmt"/>
+      <line num="23" count="12" type="cond" truecount="1" falsecount="0"/>
+      <line num="24" count="9" type="stmt"/>
+      <line num="26" count="12" type="stmt"/>
+      <line num="29" count="12" type="stmt"/>
+      <line num="30" count="3" type="stmt"/>
+      <line num="31" count="3" type="cond" truecount="1" falsecount="0"/>
+      <line num="32" count="3" type="stmt"/>
+      <line num="33" count="3" type="cond" truecount="1" falsecount="0"/>
+      <line num="34" count="3" type="stmt"/>
+      <line num="43" count="22" type="stmt"/>
+      <line num="45" count="18" type="stmt"/>
+      <line num="48" count="18" type="stmt"/>
+      <line num="49" count="18" type="cond" truecount="3" falsecount="0"/>
+      <line num="50" count="9" type="stmt"/>
+      <line num="51" count="12" type="stmt"/>
+      <line num="52" count="12" type="stmt"/>
+      <line num="54" count="1" type="stmt"/>
+      <line num="63" count="22" type="stmt"/>
+      <line num="64" count="33" type="stmt"/>
+      <line num="70" count="22" type="stmt"/>
+      <line num="71" count="34" type="stmt"/>
+      <line num="72" count="34" type="stmt"/>
+    </file>
+    <file name="tokenUtils.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/tokenUtils.ts">
+      <metrics statements="21" coveredstatements="21" conditionals="11" coveredconditionals="11" methods="2" coveredmethods="2"/>
+      <line num="12" count="1" type="stmt"/>
+      <line num="13" count="5" type="stmt"/>
+      <line num="14" count="5" type="stmt"/>
+      <line num="16" count="5" type="cond" truecount="1" falsecount="0"/>
+      <line num="17" count="1" type="stmt"/>
+      <line num="19" count="4" type="cond" truecount="1" falsecount="0"/>
+      <line num="20" count="2" type="stmt"/>
+      <line num="22" count="2" type="stmt"/>
+      <line num="30" count="1" type="stmt"/>
+      <line num="31" count="8" type="stmt"/>
+      <line num="32" count="8" type="stmt"/>
+      <line num="34" count="8" type="cond" truecount="1" falsecount="0"/>
+      <line num="35" count="1" type="stmt"/>
+      <line num="38" count="7" type="stmt"/>
+      <line num="39" count="7" type="cond" truecount="1" falsecount="0"/>
+      <line num="40" count="2" type="cond" truecount="2" falsecount="0"/>
+      <line num="43" count="5" type="stmt"/>
+      <line num="44" count="5" type="cond" truecount="1" falsecount="0"/>
+      <line num="45" count="2" type="cond" truecount="2" falsecount="0"/>
+      <line num="48" count="3" type="stmt"/>
+      <line num="49" count="3" type="cond" truecount="2" falsecount="0"/>
+    </file>
+    <file name="validation.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/validation.ts">
+      <metrics statements="3" coveredstatements="3" conditionals="0" coveredconditionals="0" methods="1" coveredmethods="1"/>
+      <line num="1" count="1" type="stmt"/>
+      <line num="2" count="10" type="stmt"/>
+      <line num="3" count="10" type="stmt"/>
+    </file>
+  </project>
+</coverage>
