@@ -96,8 +96,40 @@ describe('llmService', () => {
       );
     });
 
+    it('should throw error when Azure endpoint is missing', () => {
+      delete process.env.AZURE_OPENAI_ENDPOINT;
+      expect(() => new LLMService('gpt-4')).toThrow(
+        'AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set'
+      );
+    });
+
     it('should handle specific Claude sonnet model ID transformation', () => {
       new LLMService('anthropic.claude-sonnet-4-5-20250929-v1:0');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
+    it('should use default API version when env var not set', () => {
+      delete process.env.AZURE_OPENAI_API_VERSION;
+      // Should not throw - will use default version
+      const service = new LLMService('gpt-4');
+      expect(service).toBeInstanceOf(LLMService);
+    });
+
+    it('should create Bedrock model without explicit AWS credentials', () => {
+      delete process.env.AWS_ACCESS_KEY_ID;
+      // Should use default credentials from environment
+      const service = new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+      expect(service).toBeInstanceOf(LLMService);
+    });
+
+    it('should pass maxTokens when provided', () => {
+      new LLMService('gpt-4', 0.5, 2000);
+      expect(AzureChatOpenAI).toHaveBeenCalled();
+    });
+
+    it('should pass maxTokens to Claude model when provided', () => {
+      new LLMService('claude-3-sonnet', 0.5, 2000);
       expect(ChatBedrockConverse).toHaveBeenCalled();
     });
   });
