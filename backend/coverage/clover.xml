@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<coverage generated="1768923480603" clover="3.2.0">
-  <project timestamp="1768923480603" name="All files">
+<coverage generated="1768931972045" clover="3.2.0">
+  <project timestamp="1768931972045" name="All files">
     <metrics statements="360" coveredstatements="358" conditionals="216" coveredconditionals="197" methods="42" coveredmethods="42" elements="618" coveredelements="597" complexity="0" loc="360" ncloc="360" packages="1" files="13" classes="13"/>
     <file name="agentModeAlerts.ts" path="/Users/ruiwang/Documents/GitHub/agentweb/backend/src/utils/agentModeAlerts.ts">
       <metrics statements="18" coveredstatements="18" conditionals="11" coveredconditionals="11" methods="2" coveredmethods="2"/>
@@ -260,7 +260,7 @@
       <line num="12" count="8" type="stmt"/>
       <line num="13" count="8" type="stmt"/>
       <line num="16" count="8" type="cond" truecount="1" falsecount="0"/>
-      <line num="17" count="1" type="stmt"/>
+      <line num="17" count="7" type="stmt"/>
       <line num="21" count="8" type="cond" truecount="4" falsecount="0"/>
       <line num="24" count="4" type="stmt"/>
       <line num="26" count="2" type="stmt"/>

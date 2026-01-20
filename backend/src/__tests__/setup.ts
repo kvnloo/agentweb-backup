@@ -17,6 +17,11 @@ process.env.AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || 'https:
 process.env.AZURE_OPENAI_DEPLOYMENT = process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
 process.env.AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview';
 
+// Set Azure OpenAI embeddings environment variables for tests
+process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY = process.env.AZURE_OPENAI_EMBEDDINGS_API_KEY || 'test-embeddings-api-key';
+process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT = process.env.AZURE_OPENAI_EMBEDDINGS_ENDPOINT || 'https://test-embeddings.openai.azure.com';
+process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT = process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT || 'text-embedding-ada-002';
+
 // Suppress console.log during tests unless explicitly needed
 const originalConsoleLog = console.log;
 console.log = (...args) => {
