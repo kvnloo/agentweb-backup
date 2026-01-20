@@ -161,6 +161,10 @@ router.delete('/session/:sessionId', asyncHandler(agentModeController.archiveSes
 // Update task execution status in session
 router.put('/session/:sessionId/task/:taskId/execution/:executionId/status', asyncHandler(agentModeController.updateTaskStatus));
 
+// PUT /api/agent-mode/session/:sessionId/message/:messageIndex/feedback
+// Submit or update message feedback
+router.put('/session/:sessionId/message/:messageIndex/feedback', asyncHandlerAuth(agentModeController.submitMessageFeedback));
+
 // POST /api/agent-mode/share
 // Create shareable link for conversation
 router.post('/share', asyncHandler(agentModeController.createShareLink));

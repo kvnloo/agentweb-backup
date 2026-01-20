@@ -1842,6 +1842,76 @@ export const agentModeController = {
     }
   },
 
+  // Submit or update message feedback
+  async submitMessageFeedback(req: AuthenticatedRequest, res: Response) {
+    try {
+      const { sessionId, messageIndex } = req.params;
+      const { type, comment } = req.body;
+      const user = req.user as User;
+
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Validate feedback type
+      if (!type || (type !== 'like' && type !== 'dislike')) {
+        return res.status(400).json({ error: 'Invalid feedback type. Must be "like" or "dislike"' });
+      }
+
+      // Validate comment length if provided
+      if (comment && comment.length > 500) {
+        return res.status(400).json({ error: 'Comment too long. Maximum 500 characters' });
+      }
+
+      // Check if session exists and verify ownership or admin access
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Only allow the session owner or admin to submit feedback
+      if (session.userId !== user.userId && !user.isAdmin) {
+        return res.status(403).json({ error: 'Cannot rate other user\'s sessions' });
+      }
+
+      // Get all messages to verify the message exists and is an assistant message
+      const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+      const messageIndexNum = parseInt(messageIndex, 10);
+
+      if (isNaN(messageIndexNum) || messageIndexNum < 0 || messageIndexNum >= messages.length) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      const message = messages[messageIndexNum];
+      if (message.role !== 'assistant') {
+        return res.status(400).json({ error: 'Can only rate assistant messages' });
+      }
+
+      // Create feedback object
+      const feedback = {
+        type: type as 'like' | 'dislike',
+        comment: comment || undefined,
+        timestamp: new Date().toISOString(),
+        userId: user.userId,
+      };
+
+      // Update the message with feedback
+      const updatedMessage = await chatbotDb.updateMessageFeedback(
+        sessionId,
+        messageIndexNum,
+        feedback
+      );
+
+      res.json({
+        success: true,
+        message: updatedMessage,
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit message feedback error:', error);
+      res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
   // Upload file attachment for Agent Mode
   async uploadAttachment(req: Request, res: Response) {
     try {
