@@ -70,6 +70,16 @@ describe('fileProcessor utils', () => {
       expect(isSupportedFileType('filename', 'application/pdf')).toBe(true);
     });
 
+    it('should handle filename with no dot returning empty extension', () => {
+      // This tests the || '' fallback on line 65
+      expect(isSupportedFileType('nodotfile')).toBe(false);
+    });
+
+    it('should call getFileTypeFromMime with undefined and return unknown', () => {
+      // Test file with unsupported extension and mime type that maps to unknown
+      expect(isSupportedFileType('file.xyz', 'application/x-unknown-type')).toBe(false);
+    });
+
     it('should support all office document mime types', () => {
       expect(isSupportedFileType('file.unknown', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')).toBe(true);
       expect(isSupportedFileType('file.unknown', 'application/vnd.openxmlformats-officedocument.presentationml.presentation')).toBe(true);
@@ -118,6 +128,11 @@ describe('fileProcessor utils', () => {
 
     it('should handle files without extension', () => {
       expect(getContentType('filename')).toBe('application/octet-stream');
+    });
+
+    it('should handle filename with no dot returning empty extension', () => {
+      // This tests the || '' fallback on line 88
+      expect(getContentType('nodotfile')).toBe('application/octet-stream');
     });
 
     it('should return content types for all image types', () => {

@@ -1,10 +1,16 @@
 // Mock LangChain modules before imports
 const mockInvoke = jest.fn();
 
+// Define the chain mock type
+interface ChainMock {
+  invoke: jest.Mock;
+  pipe: jest.Mock;
+}
+
 // Create a chainable mock that supports nested pipe calls
-const createChainMock = () => ({
+const createChainMock = (): ChainMock => ({
   invoke: mockInvoke,
-  pipe: jest.fn(() => createChainMock())
+  pipe: jest.fn((): ChainMock => createChainMock())
 });
 
 const mockChain = createChainMock();
