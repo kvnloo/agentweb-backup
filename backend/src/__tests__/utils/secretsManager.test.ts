@@ -11,8 +11,7 @@ import {
   secretExists,
   getMetaAccessToken,
   getGCSPPrivateKey,
-  getLinkedInPersonalCredentials,
-  getLinkedInCompanyCredentials
+  getLinkedInCredentials
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -152,7 +151,7 @@ describe('secretsManager utils', () => {
     });
   });
 
-  describe('getLinkedInPersonalCredentials', () => {
+  describe('getLinkedInCredentials', () => {
     it('should return LinkedIn credentials', async () => {
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
@@ -163,7 +162,7 @@ describe('secretsManager utils', () => {
         })
       });
 
-      const result = await getLinkedInPersonalCredentials();
+      const result = await getLinkedInCredentials();
       expect(result.clientId).toBe('client-123');
       expect(result.clientSecret).toBe('secret-456');
     });
@@ -173,7 +172,7 @@ describe('secretsManager utils', () => {
         promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
       });
 
-      await expect(getLinkedInPersonalCredentials()).rejects.toThrow(
+      await expect(getLinkedInCredentials()).rejects.toThrow(
         'Failed to fetch LinkedIn credentials'
       );
     });
@@ -185,7 +184,7 @@ describe('secretsManager utils', () => {
         })
       });
 
-      await expect(getLinkedInPersonalCredentials()).rejects.toThrow(
+      await expect(getLinkedInCredentials()).rejects.toThrow(
         'Failed to fetch LinkedIn credentials'
       );
     });
@@ -197,7 +196,7 @@ describe('secretsManager utils', () => {
         })
       });
 
-      await expect(getLinkedInPersonalCredentials()).rejects.toThrow(
+      await expect(getLinkedInCredentials()).rejects.toThrow(
         'Failed to fetch LinkedIn credentials'
       );
     });
@@ -210,72 +209,7 @@ describe('secretsManager utils', () => {
         })
       });
 
-      await getLinkedInPersonalCredentials();
-      expect(mockGetSecretValue).toHaveBeenCalledWith({
-        SecretId: 'prod/AgentWeb/LinkedIn/Personal'
-      });
-    });
-  });
-
-  describe('getLinkedInCompanyCredentials', () => {
-    it('should return LinkedIn company credentials', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({
-            clientId: 'company-client-123',
-            clientSecret: 'company-secret-456'
-          })
-        })
-      });
-
-      const result = await getLinkedInCompanyCredentials();
-      expect(result.clientId).toBe('company-client-123');
-      expect(result.clientSecret).toBe('company-secret-456');
-    });
-
-    it('should throw error when credentials are empty', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
-      });
-
-      await expect(getLinkedInCompanyCredentials()).rejects.toThrow(
-        'Failed to fetch LinkedIn Organization App credentials'
-      );
-    });
-
-    it('should throw error when clientId is missing', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientSecret: 'secret' })
-        })
-      });
-
-      await expect(getLinkedInCompanyCredentials()).rejects.toThrow(
-        'Failed to fetch LinkedIn Organization App credentials'
-      );
-    });
-
-    it('should throw error when clientSecret is missing', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'client' })
-        })
-      });
-
-      await expect(getLinkedInCompanyCredentials()).rejects.toThrow(
-        'Failed to fetch LinkedIn Organization App credentials'
-      );
-    });
-
-    it('should use prod secret in production', async () => {
-      process.env.NODE_ENV = 'production';
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
-        })
-      });
-
-      await getLinkedInCompanyCredentials();
+      await getLinkedInCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'prod/AgentWeb/LinkedIn/Company'
       });
@@ -289,7 +223,7 @@ describe('secretsManager utils', () => {
         })
       });
 
-      await getLinkedInCompanyCredentials();
+      await getLinkedInCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/LinkedIn/Company'
       });
