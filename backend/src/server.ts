@@ -175,18 +175,19 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 
 // Create test account before starting the server
 createTestAccount().then(async () => {
-  // Initialize Agent Mode tools
-  try {
-    console.log('Initializing Agent Mode Tools...');
-    await agentModeService.initialize();
-    console.log('Agent Mode Tools initialized successfully');
-  } catch (error) {
-    console.error('Failed to initialize Agent Mode Tools:', error);
-  }
 
-  server.listen(port, () => {
+  server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
+
+    // Initialize Agent Mode tools AFTER the server is listening
+    try {
+      console.log('Initializing Agent Mode Tools...');
+      await agentModeService.initialize();
+      console.log('Agent Mode Tools initialized successfully');
+    } catch (error) {
+      console.error('Failed to initialize Agent Mode Tools:', error);
+    }
   });
 }); 

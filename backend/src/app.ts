@@ -35,7 +35,7 @@ import { authenticateToken } from "./middleware/auth";
 const { version } = require('../package.json');
 
 
-// Import the new controller
+import { setupMcpServer } from "./mcp-server/mcpServer";
 import {
   viewExternalFile,
   getFileContent,
@@ -43,6 +43,9 @@ import {
 } from "./controllers/filesController";
 
 const app = express();
+
+// Initialize MCP Server routes BEFORE glocal body parsers
+setupMcpServer(app);
 
 // CORS configuration
 const corsOptions = {

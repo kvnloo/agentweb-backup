@@ -1,6 +1,6 @@
 {
   "name": "backend",
-  "version": "23.2.0",
+  "version": "23.1.0",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
@@ -10,9 +10,7 @@
     "test:watch": "jest --watch",
     "create-tables": "ts-node scripts/create-tables.ts",
     "create-admin": "ts-node src/scripts/create-admin.ts",
-    "mcp:start": "export IS_MCP_SERVER=true && node dist/mcp-server/index.js",
-    "mcp:dev": "export IS_MCP_SERVER=true && ts-node-dev --respawn --transpile-only src/mcp-server/index.ts",
-    "mcp:inspector": "export IS_MCP_SERVER=true && export TRANSPORT=stdio && npx @modelcontextprotocol/inspector node dist/mcp-server/index.js"
+    "mcp:inspector": "PORT=5180 npx @modelcontextprotocol/inspector --transport sse --server-url http://localhost:3001/mcp/server"
   },
   "keywords": [],
   "author": "",

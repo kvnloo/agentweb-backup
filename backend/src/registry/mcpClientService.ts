@@ -1,19 +1,33 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { AgentTool, ToolContext } from "./toolRegistry";
 import fs from "fs";
 import path from "path";
 
 interface McpServerConfig {
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  url?: string;
+  url: string;
+  isInternal?: boolean;
 }
 
 interface McpConfig {
   mcpServers: Record<string, McpServerConfig>;
+}
+
+/**
+ * Resolves environment variable placeholders in a string.
+ * Supports ${VAR_NAME} syntax.
+ */
+function resolveEnvPlaceholders(value: string): string {
+  return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
+    const envValue = process.env[varName];
+    if (envValue) return envValue;
+    // Fallback defaults
+    if (varName === 'BACKEND_URL') {
+      const port = process.env.PORT || '3001';
+      return `http://localhost:${port}`;
+    }
+    return '';
+  });
 }
 
 export class McpClientService {
@@ -53,30 +67,13 @@ export class McpClientService {
   }
 
   private async connectToServer(name: string, config: McpServerConfig): Promise<void> {
-    let transport;
-
-    if (config.url) {
-      console.log(`MCP: Connecting to SSE server for ${name} at ${config.url}`);
-      transport = new SSEClientTransport(new URL(config.url));
-    } else if (config.command) {
-      const env: Record<string, string> = {};
-      for (const [key, value] of Object.entries(process.env)) {
-        if (value !== undefined) {
-          env[key] = value;
-        }
-      }
-      if (config.env) {
-        Object.assign(env, config.env);
-      }
-
-      transport = new StdioClientTransport({
-        command: config.command,
-        args: config.args || [],
-        env
-      });
-    } else {
-      throw new Error(`Invalid configuration for MCP server ${name}: must provide 'url' or 'command'`);
+    if (!config.url) {
+      throw new Error(`Invalid configuration for MCP server ${name}: must provide 'url'`);
     }
+
+    const resolvedUrl = resolveEnvPlaceholders(config.url);
+    console.log(`MCP: Connecting to SSE server for ${name} at ${resolvedUrl}`);
+    const transport = new SSEClientTransport(new URL(resolvedUrl));
 
     const client = new Client(
       {
@@ -97,7 +94,7 @@ export class McpClientService {
     );
 
     transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
-    transport.onerror = (err) => console.error(`MCP: Transport error for ${name}:`, err);
+    transport.onerror = (err: any) => console.error(`MCP: Transport error for ${name}:`, err);
 
     await Promise.race([connectPromise, timeoutPromise]);
     this.clients.set(name, client);
@@ -118,14 +115,19 @@ export class McpClientService {
         },
         execute: async (args: any, context: ToolContext) => {
           try {
-            const result = await client.callTool({
-              name: tool.name,
-              arguments: {
-                ...args,
+            // Conditionally inject technical parameters if server is internal
+            const toolArgs = { ...args };
+            if (config.isInternal) {
+              Object.assign(toolArgs, {
                 userId: context.userId,
                 sessionId: context.sessionId,
                 llmModel: context.llmModel
-              }
+              });
+            }
+
+            const result = await client.callTool({
+              name: tool.name,
+              arguments: toolArgs
             });
             
             // Cast content to any to access properties safely
