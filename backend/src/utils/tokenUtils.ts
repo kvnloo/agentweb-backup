@@ -46,5 +46,10 @@ export function formatExpiryMessage(expiresAt: number): string {
   }
 
   const minutes = Math.floor((diffMs + 500) / (60 * 1000));
+  // If we're very close to the 1 hour boundary, rounding can produce 60 minutes.
+  // Prefer showing "1 hour" to avoid flaky output around the boundary.
+  if (minutes >= 60) {
+    return 'Expires in 1 hour';
+  }
   return `Expires in ${minutes} minute${minutes > 1 ? 's' : ''}`;
 }

@@ -123,6 +123,7 @@ describe('AgentModeService - Social Media Tools', () => {
       createPost: jest.fn(),
       listPosts: jest.fn(),
       getPostMetrics: jest.fn(),
+      getPostAnalytics: jest.fn(),
       getAccountMetrics: jest.fn(),
       verifyToken: jest.fn(),
     };
@@ -210,6 +211,7 @@ describe('AgentModeService - Social Media Tools', () => {
       createPost: jest.fn(),
       listPosts: jest.fn(),
       getPostMetrics: jest.fn(),
+      getPostAnalytics: jest.fn(),
       getAccountMetrics: jest.fn(),
       verifyToken: jest.fn(),
     };
@@ -356,6 +358,7 @@ describe('AgentModeService - Social Media Tools', () => {
       createPost: jest.fn(),
       listPosts: jest.fn(),
       getPostMetrics: jest.fn(),
+      getPostAnalytics: jest.fn(),
       getAccountMetrics: jest.fn(),
       verifyToken: jest.fn(),
     };
