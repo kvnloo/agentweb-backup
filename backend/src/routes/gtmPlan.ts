@@ -107,7 +107,9 @@ router.get("/:planId", authenticateToken, async (req, res) => {
 // Create a new GTM plan
 router.post("/", authenticateToken, async (req, res) => {
   try {
-    const userId = (req as AuthenticatedRequest).user?.userId;
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const userEmail = authReq.user?.email;
     const { title, description, dri } = req.body;
 
     if (!userId) {
@@ -121,6 +123,11 @@ router.post("/", authenticateToken, async (req, res) => {
       });
     }
 
+    // Determine default DRI: use admin email for delegated access, otherwise user email
+    const defaultDri = authReq.delegateInfo?.isDelegated
+      ? authReq.delegateInfo.adminEmail
+      : userEmail;
+
     const planId = `plan-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
     const now = new Date().toISOString();
 
@@ -129,7 +136,7 @@ router.post("/", authenticateToken, async (req, res) => {
       userId,
       title,
       description: description || "",
-      dri: dri || undefined, // DRI (Directly Responsible Individual) email at plan level
+      dri: dri || defaultDri || undefined, // DRI defaults to admin email (if delegated) or user email
       status: "in_progress", // Plan starts as in_progress
       phases: [],
       createdAt: now,
