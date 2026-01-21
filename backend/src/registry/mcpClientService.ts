@@ -6,6 +6,7 @@ import path from "path";
 
 interface McpServerConfig {
   url: string;
+  accessToken?: string;
   isInternal?: boolean;
 }
 
@@ -72,8 +73,35 @@ export class McpClientService {
     }
 
     const resolvedUrl = resolveEnvPlaceholders(config.url);
+    const resolvedToken = config.accessToken ? resolveEnvPlaceholders(config.accessToken) : undefined;
+    
     console.log(`MCP: Connecting to SSE server for ${name} at ${resolvedUrl}`);
-    const transport = new SSEClientTransport(new URL(resolvedUrl));
+    
+    // Build transport options with optional Authorization header
+    const transportOptions: { 
+      eventSourceInit?: { fetch: typeof fetch };
+      requestInit?: RequestInit;
+    } = {};
+    
+    if (resolvedToken) {
+      // Create a custom fetch with Authorization header for SSE connection
+      const authFetch = (url: string | URL | Request, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        headers.set('Authorization', `Bearer ${resolvedToken}`);
+        return fetch(url, { ...init, headers });
+      };
+      transportOptions.eventSourceInit = { fetch: authFetch as typeof fetch };
+      
+      // Also set headers for POST requests (tool calls)
+      transportOptions.requestInit = {
+        headers: {
+          'Authorization': `Bearer ${resolvedToken}`
+        }
+      };
+      console.log(`MCP: Using access token authentication for ${name}`);
+    }
+    
+    const transport = new SSEClientTransport(new URL(resolvedUrl), transportOptions);
 
     const client = new Client(
       {

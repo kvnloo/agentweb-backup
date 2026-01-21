@@ -2,6 +2,7 @@
   "mcpServers": {
     "agentweb-tools": {
       "url": "${BACKEND_URL}/mcp/server",
+      "accessToken": "${MCP_ACCESS_TOKEN}",
       "isInternal": true
     }
   }

@@ -5,10 +5,43 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { mcpToolRegistry } from './registry';
-import express from "express";
+import express, { Request, Response, NextFunction } from "express";
 
 // Import all tools to register them
 import './tools';
+
+/**
+ * Middleware to validate MCP access token.
+ * If MCP_ACCESS_TOKEN is set in environment, requests must include
+ * Authorization: Bearer <token> header with matching token.
+ * If MCP_ACCESS_TOKEN is not set, all requests are allowed (backward compatible).
+ */
+function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
+  const expectedToken = process.env.MCP_ACCESS_TOKEN;
+  
+  // If no token is configured, skip validation
+  if (!expectedToken) {
+    return next();
+  }
+  
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader) {
+    console.error("[MCP] Access denied: Missing Authorization header");
+    return res.status(401).json({ error: "Unauthorized: Missing access token" });
+  }
+  
+  // Support "Bearer <token>" format
+  const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  const providedToken = tokenMatch ? tokenMatch[1] : authHeader;
+  
+  if (providedToken !== expectedToken) {
+    console.error("[MCP] Access denied: Invalid access token");
+    return res.status(403).json({ error: "Forbidden: Invalid access token" });
+  }
+  
+  next();
+}
 
 export function setupMcpServer(app: express.Express) {
   const server = new Server(
@@ -70,7 +103,7 @@ export function setupMcpServer(app: express.Express) {
   const transports = new Map<string, SSEServerTransport>();
 
   // Use a dedicated path for MCP SSE connections
-  app.get("/mcp/server", async (req, res) => {
+  app.get("/mcp/server", validateMcpAccessToken, async (req, res) => {
     console.log("[MCP] New SSE connection established");
     const transport = new SSEServerTransport("/mcp/messages", res);
     
@@ -86,7 +119,7 @@ export function setupMcpServer(app: express.Express) {
     });
   });
 
-  app.post("/mcp/messages", async (req, res) => {
+  app.post("/mcp/messages", validateMcpAccessToken, async (req, res) => {
     const sessionId = req.query.sessionId as string;
     const transport = transports.get(sessionId);
 
@@ -103,5 +136,6 @@ export function setupMcpServer(app: express.Express) {
     }
   });
 
-  console.log("[MCP] MCP routes mounted at /mcp/server and /mcp/messages");
+  const isSecured = !!process.env.MCP_ACCESS_TOKEN;
+  console.log(`[MCP] MCP routes mounted at /mcp/server and /mcp/messages (secured: ${isSecured})`);
 }
