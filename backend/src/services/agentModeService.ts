@@ -3797,7 +3797,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'read_gtm_plan':
         return await this.readGTMPlan(args.plan_id, userId);
       case 'create_gtm_plan':
-        return await this.createGTMPlan(args.title, args.description || '', args.dri || undefined, args.phases || [], userId);
+        return await this.createGTMPlan(args.title, args.description || '', args.dri || undefined, args.phases || [], userId, sessionId);
       case 'get_lead_lists':
         return await this.getLeadLists(userId);
       case 'create_lead_list':
@@ -4942,7 +4942,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create a new GTM plan
-  private async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string): Promise<any> {
+  private async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string, sessionId: string): Promise<any> {
     try {
       const { DynamoDB } = await import('aws-sdk');
       const dynamodb = new DynamoDB.DocumentClient({
@@ -4957,6 +4957,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
       const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
       const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      // Determine default DRI based on delegate access
+      let defaultDri: string | undefined;
+
+      // Get session to check for delegateInfo
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (session?.delegateInfo?.isDelegated && session.delegateInfo.adminEmail) {
+        // For delegated access, use admin's email as default DRI
+        defaultDri = session.delegateInfo.adminEmail;
+      } else {
+        // For regular access, look up user email from database
+        const { userDb } = await import('./db');
+        const user = await userDb.getUserById(userId);
+        defaultDri = user?.email;
+      }
 
       const planId = `plan-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
       const now = new Date().toISOString();
@@ -5004,7 +5019,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         userId,
         title,
         description: description || "",
-        dri: dri || undefined, // DRI at plan level
+        dri: dri || defaultDri || undefined, // DRI defaults to admin email (if delegated) or user email
         status: planStatus,
         phases: processedPhases,
         createdAt: now,

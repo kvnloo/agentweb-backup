@@ -45,6 +45,6 @@ export function formatExpiryMessage(expiresAt: number): string {
     return `Expires in ${hours} hour${hours > 1 ? 's' : ''}`;
   }
 
-  const minutes = Math.floor(diffMs / (60 * 1000));
+  const minutes = Math.floor((diffMs + 500) / (60 * 1000));
   return `Expires in ${minutes} minute${minutes > 1 ? 's' : ''}`;
 }

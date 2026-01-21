@@ -71,7 +71,8 @@ describe('AgentModeController - createSession', () => {
       undefined,
       undefined,
       undefined,
-      'regular'
+      'regular',
+      undefined // delegateInfo
     );
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
       mockSession.sessionId,
@@ -120,7 +121,8 @@ describe('AgentModeController - createSession', () => {
       undefined,
       undefined,
       undefined,
-      'image-generation'
+      'image-generation',
+      undefined // delegateInfo
     );
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
       mockSessionWithImageType.sessionId,

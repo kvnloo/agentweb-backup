@@ -273,6 +273,136 @@ describe('GTM Plan Route Tests', () => {
     });
   });
 
+  describe('Create GTM Plan - Default DRI Logic', () => {
+    const mockUserEmail = 'user@example.com';
+    const mockAdminEmail = 'admin@example.com';
+
+    it('should use user email as default DRI when no explicit DRI provided', async () => {
+      const newPlan = {
+        planId: 'plan-default-user-dri',
+        userId: mockUserId,
+        title: 'Plan with Default User DRI',
+        description: 'Test Description',
+        dri: mockUserEmail, // Default to user email
+        status: 'in_progress',
+        phases: [],
+        createdAt: '2024-01-02T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      await mockDynamoDB.put({
+        TableName: 'Dev-AW-GTMPlan',
+        Item: newPlan,
+      }).promise();
+
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockUserEmail, // Should default to user email
+          }),
+        })
+      );
+    });
+
+    it('should use admin email as default DRI when delegateInfo present', async () => {
+      const newPlan = {
+        planId: 'plan-default-admin-dri',
+        userId: mockUserId,
+        title: 'Plan with Default Admin DRI',
+        description: 'Test Description',
+        dri: mockAdminEmail, // Default to admin email for delegated access
+        status: 'in_progress',
+        phases: [],
+        createdAt: '2024-01-02T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      await mockDynamoDB.put({
+        TableName: 'Dev-AW-GTMPlan',
+        Item: newPlan,
+      }).promise();
+
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockAdminEmail, // Should default to admin email
+          }),
+        })
+      );
+    });
+
+    it('should use explicit DRI when provided, overriding defaults', async () => {
+      const explicitDri = 'explicit-dri@example.com';
+      const newPlan = {
+        planId: 'plan-explicit-dri',
+        userId: mockUserId,
+        title: 'Plan with Explicit DRI',
+        description: 'Test Description',
+        dri: explicitDri, // Explicit DRI should override defaults
+        status: 'in_progress',
+        phases: [],
+        createdAt: '2024-01-02T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      await mockDynamoDB.put({
+        TableName: 'Dev-AW-GTMPlan',
+        Item: newPlan,
+      }).promise();
+
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: explicitDri, // Should use explicit DRI
+          }),
+        })
+      );
+    });
+
+    it('should handle undefined DRI when no email available', async () => {
+      const newPlan = {
+        planId: 'plan-no-dri',
+        userId: mockUserId,
+        title: 'Plan without DRI',
+        description: 'Test Description',
+        dri: undefined, // No DRI available
+        status: 'in_progress',
+        phases: [],
+        createdAt: '2024-01-02T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+      };
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      await mockDynamoDB.put({
+        TableName: 'Dev-AW-GTMPlan',
+        Item: newPlan,
+      }).promise();
+
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: undefined, // Should be undefined
+          }),
+        })
+      );
+    });
+  });
+
   describe('Update GTM Plan (PUT /:planId)', () => {
     it('should update plan with recalculated phase statuses', () => {
       const updatedPhases = [

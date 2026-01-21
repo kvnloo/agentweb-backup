@@ -159,6 +159,11 @@ export interface ChatSession {
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"; // Type of session based on how it was created
   llmModel?: string; // Selected LLM model for this session
+  delegateInfo?: {
+    adminUserId: string;
+    adminEmail: string;
+    isDelegated: boolean;
+  }; // Delegate access info when admin is acting on behalf of a user
 }
 
 // Interface for context chunks
@@ -386,7 +391,8 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -423,6 +429,7 @@ export class ChatbotDB {
       executionId,
       emailCampaignTaskId,
       sessionType: sessionType || "regular", // Default to regular if not specified
+      delegateInfo, // Store delegate access info if provided
     };
 
     if (pageContent) {
