@@ -65,20 +65,31 @@ describe('LinkedInService', () => {
 
   describe('getProfile', () => {
     it('should fetch user profile with correct authorization header', async () => {
-      const mockProfile = {
+      const mockResponse = {
+        id: 'user123',
+        localizedFirstName: 'John',
+        localizedLastName: 'Doe',
+      };
+      
+      const expectedProfile = {
         sub: 'user123',
         name: 'John Doe',
-        email: 'john@example.com',
-        picture: 'https://example.com/photo.jpg',
+        given_name: 'John',
+        family_name: 'Doe',
+        picture: '',
+        locale: '',
+        email: '',
+        email_verified: false,
       };
-      mockClient.get.mockResolvedValue({ data: mockProfile });
+
+      mockClient.get.mockResolvedValue({ data: mockResponse });
 
       const result = await service.getProfile('test-access-token');
 
-      expect(mockClient.get).toHaveBeenCalledWith('/v2/userinfo', {
+      expect(mockClient.get).toHaveBeenCalledWith('/v2/me', {
         headers: { Authorization: 'Bearer test-access-token' },
       });
-      expect(result).toEqual(mockProfile);
+      expect(result).toEqual(expectedProfile);
     });
 
     it('should throw error with message for 401 response', async () => {
@@ -591,6 +602,188 @@ describe('LinkedInService', () => {
       const result = await service.verifyToken('token');
 
       expect(result).toEqual({ valid: true, uncertain: true, error: 'Network error - could not verify token' });
+    });
+  });
+
+  // ============================================
+  // Personal Account Analytics Tests
+  // ============================================
+  describe('getPersonalFollowerCount', () => {
+    it('should return follower count from memberFollowersCount endpoint', async () => {
+      mockClient.get.mockResolvedValue({
+        data: { elements: [{ memberFollowersCount: 1500 }] },
+      });
+
+      const result = await service.getPersonalFollowerCount('token');
+
+      expect(mockClient.get).toHaveBeenCalledWith('/rest/memberFollowersCount', {
+        params: { q: 'me' },
+        headers: { Authorization: 'Bearer token' },
+      });
+      expect(result).toBe(1500);
+    });
+
+    it('should return 0 when elements array is empty', async () => {
+      mockClient.get.mockResolvedValue({
+        data: { elements: [] },
+      });
+
+      const result = await service.getPersonalFollowerCount('token');
+
+      expect(result).toBe(0);
+    });
+
+    it('should return 0 when memberFollowersCount is undefined', async () => {
+      mockClient.get.mockResolvedValue({
+        data: { elements: [{}] },
+      });
+
+      const result = await service.getPersonalFollowerCount('token');
+
+      expect(result).toBe(0);
+    });
+
+    it('should throw error on API failure', async () => {
+      const axiosError = {
+        response: { status: 401, data: { message: 'Unauthorized' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.get.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(service.getPersonalFollowerCount('invalid-token')).rejects.toThrow(
+        'LinkedIn access token expired or invalid'
+      );
+    });
+  });
+
+  describe('getPersonalPostAnalytics', () => {
+    describe('per-post analytics', () => {
+      it('should fetch analytics for a specific share post URN', async () => {
+        // Mock responses for each metric
+        mockClient.get
+          .mockResolvedValueOnce({ data: { elements: [{ count: 100 }] } }) // IMPRESSION
+          .mockResolvedValueOnce({ data: { elements: [{ count: 80 }] } })  // MEMBERS_REACHED
+          .mockResolvedValueOnce({ data: { elements: [{ count: 25 }] } })  // REACTION
+          .mockResolvedValueOnce({ data: { elements: [{ count: 10 }] } })  // COMMENT
+          .mockResolvedValueOnce({ data: { elements: [{ count: 5 }] } });  // RESHARE
+
+        const result = await service.getPersonalPostAnalytics('token', {
+          postUrn: 'urn:li:share:123456',
+        });
+
+        expect(mockClient.get).toHaveBeenCalledTimes(5);
+        expect(result).toEqual({
+          impression: 100,
+          members_reached: 80,
+          reaction: 25,
+          comment: 10,
+          reshare: 5,
+        });
+      });
+
+      it('should fetch analytics for a UGC post URN', async () => {
+        mockClient.get
+          .mockResolvedValueOnce({ data: { elements: [{ count: 50 }] } })
+          .mockResolvedValueOnce({ data: { elements: [{ count: 40 }] } })
+          .mockResolvedValueOnce({ data: { elements: [{ count: 15 }] } })
+          .mockResolvedValueOnce({ data: { elements: [{ count: 5 }] } })
+          .mockResolvedValueOnce({ data: { elements: [{ count: 2 }] } });
+
+        const result = await service.getPersonalPostAnalytics('token', {
+          postUrn: 'urn:li:ugcPost:789',
+        });
+
+        expect(result.impression).toBe(50);
+        expect(result.reaction).toBe(15);
+      });
+
+      it('should throw error for invalid post URN format', async () => {
+        await expect(
+          service.getPersonalPostAnalytics('token', {
+            postUrn: 'invalid:urn:format',
+          })
+        ).rejects.toThrow('Invalid post URN format');
+      });
+
+      it('should return 0 for metrics that fail to fetch', async () => {
+        mockClient.get
+          .mockResolvedValueOnce({ data: { elements: [{ count: 100 }] } }) // IMPRESSION success
+          .mockRejectedValueOnce(new Error('API error')) // MEMBERS_REACHED fails
+          .mockResolvedValueOnce({ data: { elements: [] } }) // REACTION empty
+          .mockResolvedValueOnce({ data: { elements: [{ count: 5 }] } }) // COMMENT success
+          .mockRejectedValueOnce(new Error('Rate limit')); // RESHARE fails
+
+        const result = await service.getPersonalPostAnalytics('token', {
+          postUrn: 'urn:li:share:123',
+        });
+
+        expect(result.impression).toBe(100);
+        expect(result.members_reached).toBe(0); // Error fallback
+        expect(result.reaction).toBe(0); // Empty elements
+        expect(result.comment).toBe(5);
+        expect(result.reshare).toBe(0); // Error fallback
+      });
+    });
+
+    describe('aggregated analytics', () => {
+      it('should fetch aggregated analytics with default date range (30 days)', async () => {
+        mockClient.get
+          .mockResolvedValueOnce({ data: { elements: [{ count: 5000 }] } }) // IMPRESSION
+          .mockResolvedValueOnce({ data: { elements: [{ count: 3000 }] } }); // MEMBERS_REACHED
+
+        const result = await service.getPersonalPostAnalytics('token');
+
+        expect(mockClient.get).toHaveBeenCalledTimes(2);
+        expect(result.impression).toBe(5000);
+        expect(result.members_reached).toBe(3000);
+      });
+
+      it('should fetch aggregated analytics with custom date range', async () => {
+        mockClient.get
+          .mockResolvedValueOnce({ data: { elements: [{ count: 1000 }] } })
+          .mockResolvedValueOnce({ data: { elements: [{ count: 800 }] } });
+
+        const startDate = new Date('2025-01-01');
+        const endDate = new Date('2025-01-15');
+
+        const result = await service.getPersonalPostAnalytics('token', {
+          startDate,
+          endDate,
+        });
+
+        // Verify the URL contains the date range
+        const callArgs = mockClient.get.mock.calls[0];
+        expect(callArgs[0]).toContain('dateRange');
+        expect(result.impression).toBe(1000);
+      });
+
+      it('should aggregate multiple elements in response', async () => {
+        mockClient.get
+          .mockResolvedValueOnce({
+            data: { elements: [{ count: 100 }, { count: 200 }, { count: 300 }] },
+          })
+          .mockResolvedValueOnce({
+            data: { elements: [{ count: 50 }, { count: 150 }] },
+          });
+
+        const result = await service.getPersonalPostAnalytics('token');
+
+        expect(result.impression).toBe(600); // 100 + 200 + 300
+        expect(result.members_reached).toBe(200); // 50 + 150
+      });
+
+      it('should return 0 for missing elements', async () => {
+        mockClient.get
+          .mockResolvedValueOnce({ data: {} }) // No elements property
+          .mockResolvedValueOnce({ data: { elements: null } }); // Null elements
+
+        const result = await service.getPersonalPostAnalytics('token');
+
+        expect(result.impression).toBe(0);
+        expect(result.members_reached).toBe(0);
+      });
     });
   });
 });

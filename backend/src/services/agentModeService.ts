@@ -3260,6 +3260,21 @@ Use the available tools to create tasks in the agent-engine when complex work is
       const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
       const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
+      // Determine default DRI based on delegate access
+      let defaultDri: string | undefined;
+
+      // Get session to check for delegateInfo
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (session?.delegateInfo?.isDelegated && session.delegateInfo.adminEmail) {
+        // For delegated access, use admin's email as default DRI
+        defaultDri = session.delegateInfo.adminEmail;
+      } else {
+        // For regular access, look up user email from database
+        const { userDb } = await import('./db');
+        const user = await userDb.getUserById(userId);
+        defaultDri = user?.email;
+      }
+
       const planId = `plan-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
       const now = new Date().toISOString();
 
@@ -3306,7 +3321,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         userId,
         title,
         description: description || "",
-        dri: dri || undefined, // DRI at plan level
+        dri: dri || defaultDri || undefined, // DRI defaults to admin email (if delegated) or user email
         status: planStatus,
         phases: processedPhases,
         createdAt: now,
@@ -10268,6 +10283,71 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to load metrics',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Get detailed analytics for specific posts
+   * The account must belong to the authenticated user
+   */
+  async getPostAnalytics(
+    userId: string,
+    accountId: string,
+    postIds: string[]
+  ): Promise<any> {
+    console.log('[AgentMode] getPostAnalytics called:', {
+      userId,
+      accountId,
+      postIds: postIds?.length || 0
+    });
+
+    try {
+      if (!postIds || postIds.length === 0) {
+        return {
+          success: false,
+          message: 'No post IDs provided'
+        };
+      }
+
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      // Verify account ownership
+      const account = await getAccountById(accountId, userId);
+      if (!account) {
+        return {
+          success: false,
+          message: 'Account not found or access denied'
+        };
+      }
+
+      const adapter = socialPlatformService.getAdapter(account.platform);
+      const analytics = await adapter.getPostAnalytics(account, postIds, userId);
+
+      // Check for any errors in the results
+      const failedCount = analytics.filter((a: any) => a.error).length;
+      const successCount = analytics.length - failedCount;
+
+      return {
+        success: true,
+        message: failedCount > 0
+          ? `Retrieved analytics for ${successCount}/${analytics.length} posts (${failedCount} failed)`
+          : `Successfully retrieved analytics for ${analytics.length} post(s)`,
+        analytics,
+        summary: {
+          totalPosts: analytics.length,
+          successCount,
+          failedCount
+        }
+      };
+
+    } catch (error) {
+      console.error('AgentMode: Error getting post analytics:', error);
+      return {
+        success: false,
+        message: 'Failed to get post analytics',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }

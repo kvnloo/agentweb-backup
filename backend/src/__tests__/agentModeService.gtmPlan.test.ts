@@ -36,8 +36,13 @@ jest.mock('../services/db', () => ({
   taskDb: {
     getTasksWithKnowledgeBase: jest.fn(),
   },
+}));
+
+// Mock chatbotService module
+jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     addMessageToSession: jest.fn(),
+    getChatSession: jest.fn(),
   },
 }));
 
@@ -48,6 +53,8 @@ jest.mock('../utils/secretsManager', () => ({
 }));
 
 const { DynamoDB } = require('aws-sdk');
+const { chatbotDb } = require('../services/chatbotService');
+const { userDb } = require('../services/db');
 
 describe('Agent Mode Service - GTM Plan Functions', () => {
   let agentModeService: AgentModeService;
@@ -56,6 +63,8 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
   let mockPut: jest.Mock;
 
   const mockUserId = 'user-123';
+  const mockSessionId = 'session-123';
+  const mockUserEmail = 'user@example.com';
   const mockPlanId = 'plan-123';
   const mockPlan = {
     planId: mockPlanId,
@@ -87,19 +96,31 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
-    
+
     mockQuery = jest.fn().mockReturnValue({ promise: jest.fn() });
     mockGet = jest.fn().mockReturnValue({ promise: jest.fn() });
     mockPut = jest.fn().mockReturnValue({ promise: jest.fn() });
-    
+
     const mockDynamoDB = {
       query: mockQuery,
       get: mockGet,
       put: mockPut,
     };
-    
+
     (DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => mockDynamoDB);
-    
+
+    // Mock chatbotDb.getChatSession to return a session without delegateInfo by default
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: mockSessionId,
+      userId: mockUserId,
+    });
+
+    // Mock userDb.getUserById to return user with email
+    (userDb.getUserById as jest.Mock).mockResolvedValue({
+      userId: mockUserId,
+      email: mockUserEmail,
+    });
+
     agentModeService = new AgentModeService();
   });
 
@@ -273,7 +294,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId, mockSessionId);
 
       expect(result.success).toBe(true);
       expect(result.message).toContain('created successfully');
@@ -315,7 +336,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId, mockSessionId);
 
       expect(result.success).toBe(true);
       expect(result.plan.title).toBe('Empty Plan');
@@ -434,7 +455,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId, mockSessionId);
 
       expect(result.success).toBe(true);
       expect(result.plan.phases[0].dri).toBe('phase-dri@example.com');
@@ -459,7 +480,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       const mockPromise = jest.fn().mockResolvedValue({});
       mockPut.mockReturnValue({ promise: mockPromise });
 
-      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId);
+      const result = await (agentModeService as any).createGTMPlan(title, description, undefined, phases, mockUserId, mockSessionId);
 
       expect(result.success).toBe(true);
       expect(result.plan.phases[0].workItems[0].dri).toBe('item-dri@example.com');
@@ -575,6 +596,335 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
       expect(result.success).toBe(true);
       expect(result.formattedContent).toContain('Status: completed');
       expect(result.formattedContent).toContain('Completed: 2024-01-02T12:00:00Z');
+    });
+  });
+
+  describe('createGTMPlan - Default DRI Logic', () => {
+    const mockAdminUserId = 'admin-456';
+    const mockAdminEmail = 'admin@example.com';
+
+    it('should use user email as default DRI when no delegateInfo present', async () => {
+      const title = 'Plan with Default User DRI';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session without delegateInfo
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+      });
+
+      // Mock user with email
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: mockUserId,
+        email: mockUserEmail,
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined, // No explicit DRI
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockUserEmail, // Should default to user email
+          }),
+        })
+      );
+    });
+
+    it('should use admin email as default DRI when delegateInfo present', async () => {
+      const title = 'Plan with Default Admin DRI';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session with delegateInfo
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        delegateInfo: {
+          adminUserId: mockAdminUserId,
+          adminEmail: mockAdminEmail,
+          isDelegated: true,
+        },
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined, // No explicit DRI
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockAdminEmail, // Should default to admin email
+          }),
+        })
+      );
+    });
+
+    it('should use explicit DRI when provided, overriding defaults', async () => {
+      const title = 'Plan with Explicit DRI';
+      const description = 'Test Description';
+      const explicitDri = 'explicit-dri@example.com';
+      const phases: any[] = [];
+
+      // Mock session with delegateInfo
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        delegateInfo: {
+          adminUserId: mockAdminUserId,
+          adminEmail: mockAdminEmail,
+          isDelegated: true,
+        },
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        explicitDri, // Explicit DRI provided
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: explicitDri, // Should use explicit DRI, not default
+          }),
+        })
+      );
+    });
+
+    it('should handle missing user email gracefully', async () => {
+      const title = 'Plan without User Email';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session without delegateInfo
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+      });
+
+      // Mock user without email
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: mockUserId,
+        email: undefined,
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined,
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: undefined, // Should be undefined when no email available
+          }),
+        })
+      );
+    });
+
+    it('should handle missing admin email in delegateInfo gracefully', async () => {
+      const title = 'Plan without Admin Email';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session with delegateInfo but no admin email
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        delegateInfo: {
+          adminUserId: mockAdminUserId,
+          adminEmail: undefined,
+          isDelegated: true,
+        },
+      });
+
+      // Mock user with email as fallback
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: mockUserId,
+        email: mockUserEmail,
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined,
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockUserEmail, // Should fall back to user email when admin email not available
+          }),
+        })
+      );
+    });
+
+    it('should not use admin email when isDelegated is false', async () => {
+      const title = 'Plan with Non-Delegated Session';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session with delegateInfo but isDelegated is false
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+        delegateInfo: {
+          adminUserId: mockAdminUserId,
+          adminEmail: mockAdminEmail,
+          isDelegated: false,
+        },
+      });
+
+      // Mock user with email
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: mockUserId,
+        email: mockUserEmail,
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined,
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockUserEmail, // Should use user email, not admin email
+          }),
+        })
+      );
+    });
+
+    it('should handle session fetch error gracefully', async () => {
+      const title = 'Plan with Session Fetch Error';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session fetch to return null (error case)
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(null);
+
+      // Mock user with email
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: mockUserId,
+        email: mockUserEmail,
+      });
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined,
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      // Should fall back to user email lookup
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: mockUserEmail,
+          }),
+        })
+      );
+    });
+
+    it('should handle user fetch error gracefully', async () => {
+      const title = 'Plan with User Fetch Error';
+      const description = 'Test Description';
+      const phases: any[] = [];
+
+      // Mock session without delegateInfo
+      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+        sessionId: mockSessionId,
+        userId: mockUserId,
+      });
+
+      // Mock user fetch to return null (error case)
+      (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+
+      const mockPromise = jest.fn().mockResolvedValue({});
+      mockPut.mockReturnValue({ promise: mockPromise });
+
+      const result = await (agentModeService as any).createGTMPlan(
+        title,
+        description,
+        undefined,
+        phases,
+        mockUserId,
+        mockSessionId
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Item: expect.objectContaining({
+            dri: undefined, // Should be undefined when user fetch fails
+          }),
+        })
+      );
     });
   });
 });

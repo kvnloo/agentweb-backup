@@ -19,7 +19,7 @@ export async function getSecret(secretName: string): Promise<string> {
     if (data.SecretString) {
       return data.SecretString;
     }
-    
+
     throw new Error('Secret string is empty');
   } catch (error) {
     console.error(`Error fetching secret ${secretName}:`, error);
@@ -59,11 +59,11 @@ export async function getMetaAccessToken(): Promise<string> {
   try {
     const secretName = process.env.META_SECRETS_NAME || 'dev/AgentWeb/Meta';
     const accessToken = await getSecret(secretName);
-    
+
     if (!accessToken || accessToken.trim() === '') {
       throw new Error('Meta access token is empty');
     }
-    
+
     return accessToken;
   } catch (error) {
     console.error('Error fetching Meta access token:', error);
@@ -78,16 +78,16 @@ export async function getMetaAccessToken(): Promise<string> {
 export async function getGCSPPrivateKey(): Promise<string> {
   try {
     const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production' 
-      ? 'prod/AgentWeb/GCS/PK' 
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/GCS/PK'
       : 'dev/AgentWeb/GCS/PK';
-    
+
     const privateKey = await getSecret(secretName);
-    
+
     if (!privateKey || privateKey.trim() === '') {
       throw new Error('GCS private key is empty');
     }
-    
+
     // Replace [NEWLINE] with actual newlines as done in the original code
     return privateKey.replace(/\[NEWLINE\]/g, '\n');
   } catch (error) {
@@ -106,71 +106,36 @@ export interface LinkedInCredentials {
 
 /**
  * Get LinkedIn OAuth credentials from AWS Secrets Manager
+ * This fetches credentials for the unified LinkedIn app that handles both
+ * personal and organization accounts with all required scopes.
+ * 
+ * Secret location: dev/AgentWeb/LinkedIn/Personal (or prod/... for production)
+ * 
  * @returns The LinkedIn client credentials (clientId and clientSecret)
  */
-export async function getLinkedInPersonalCredentials(): Promise<LinkedInCredentials> {
-  try {
-    const environment = process.env.NODE_ENV || 'development';
-    const secretName = environment === 'production'
-      ? 'prod/AgentWeb/LinkedIn/Personal'
-      : 'dev/AgentWeb/LinkedIn/Personal';
-    
-    const secretString = await getSecret(secretName);
-    
-    if (!secretString || secretString.trim() === '') {
-      throw new Error('LinkedIn credentials secret is empty');
-    }
-    
-    const credentials = JSON.parse(secretString) as LinkedInCredentials;
-    
-    if (!credentials.clientId || !credentials.clientSecret) {
-      throw new Error('LinkedIn credentials missing clientId or clientSecret');
-    }
-    
-    return credentials;
-  } catch (error) {
-    console.error('Error fetching LinkedIn credentials from Secrets Manager:', error);
-    throw new Error('Failed to fetch LinkedIn credentials from Secrets Manager');
-  }
-}
-
-/**
- * Interface for LinkedIn Organization App credentials
- * (Different app with organization scopes)
- */
-export interface LinkedInOrgCredentials {
-  clientId: string;
-  clientSecret: string;
-}
-
-/**
- * Get LinkedIn Organization App OAuth credentials from AWS Secrets Manager
- * This is a separate app with r_organization_admin, w_organization_social scopes
- * @returns The LinkedIn Organization App credentials (clientId and clientSecret)
- */
-export async function getLinkedInCompanyCredentials(): Promise<LinkedInOrgCredentials> {
+export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
       ? 'prod/AgentWeb/LinkedIn/Company'
       : 'dev/AgentWeb/LinkedIn/Company';
-    
+
     const secretString = await getSecret(secretName);
-    
+
     if (!secretString || secretString.trim() === '') {
-      throw new Error('LinkedIn Organization App credentials secret is empty');
+      throw new Error('LinkedIn credentials secret is empty');
     }
-    
-    const credentials = JSON.parse(secretString) as LinkedInOrgCredentials;
-    
+
+    const credentials = JSON.parse(secretString) as LinkedInCredentials;
+
     if (!credentials.clientId || !credentials.clientSecret) {
-      throw new Error('LinkedIn Organization App credentials missing clientId or clientSecret');
+      throw new Error('LinkedIn credentials missing clientId or clientSecret');
     }
-    
+
     return credentials;
   } catch (error) {
-    console.error('Error fetching LinkedIn Organization App credentials from Secrets Manager:', error);
-    throw new Error('Failed to fetch LinkedIn Organization App credentials from Secrets Manager');
+    console.error('Error fetching LinkedIn credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch LinkedIn credentials from Secrets Manager');
   }
 }
 

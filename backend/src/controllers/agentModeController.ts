@@ -1063,13 +1063,17 @@ export const agentModeController = {
   // Create new agent chat session
   async createSession(req: Request, res: Response) {
     try {
-      const user = req.user as User;
+      const authReq = req as AuthenticatedRequest;
+      const user = authReq.user as User;
       const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType } = req.body;
 
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
       // For ad video generation from Videos page, sessionType should be 'video-generation'
       const finalSessionType = sessionType || 'regular';
+
+      // Pass delegate info if this is a delegated access session
+      const delegateInfo = authReq.delegateInfo;
 
       const session = await chatbotDb.createChatSession(
         user.userId,
@@ -1080,7 +1084,8 @@ export const agentModeController = {
         undefined, // workflowId
         undefined, // executionId
         undefined, // emailCampaignTaskId
-        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"
+        finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
+        delegateInfo // Pass delegate info for admin delegation tracking
       );
 
       // Set default model for new sessions

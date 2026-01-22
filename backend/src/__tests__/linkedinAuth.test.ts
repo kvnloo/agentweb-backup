@@ -22,13 +22,13 @@ jest.mock('../services/linkedInService', () => ({
     getAdminOrganizations: jest.fn(),
     getOrganization: jest.fn(),
     getOrganizationFollowerCount: jest.fn(),
+    getAdminOrganizationDetails: jest.fn(),
   },
 }));
 
 // Mock integrations config
 jest.mock('../config/integrations', () => ({
   getLinkedInConfig: jest.fn(),
-  getLinkedInOrgConfig: jest.fn(),
 }));
 
 // Mock axios
@@ -46,7 +46,7 @@ jest.mock('../middleware/auth', () => ({
 import linkedinAuthRouter from '../routes/linkedinAuth';
 import { createAccount } from '../services/connectedAccountsDb';
 import { linkedInService } from '../services/linkedInService';
-import { getLinkedInConfig, getLinkedInOrgConfig } from '../config/integrations';
+import { getLinkedInConfig } from '../config/integrations';
 import axios from 'axios';
 
 // Create test app
@@ -64,7 +64,6 @@ describe('LinkedIn OAuth Routes', () => {
   const mockCreateAccount = createAccount as jest.MockedFunction<typeof createAccount>;
   const mockLinkedInService = linkedInService as jest.Mocked<typeof linkedInService>;
   const mockGetLinkedInConfig = getLinkedInConfig as jest.MockedFunction<typeof getLinkedInConfig>;
-  const mockGetLinkedInOrgConfig = getLinkedInOrgConfig as jest.MockedFunction<typeof getLinkedInOrgConfig>;
   const mockAxios = axios as jest.Mocked<typeof axios>;
 
   // Mock LinkedIn config
@@ -86,10 +85,6 @@ describe('LinkedIn OAuth Routes', () => {
 
     // Setup default mock returns
     mockGetLinkedInConfig.mockResolvedValue(mockLinkedInConfigData as any);
-    mockGetLinkedInOrgConfig.mockResolvedValue({
-      ...mockLinkedInConfigData,
-      scopes: ['r_organization_admin', 'w_organization_social'],
-    } as any);
   });
 
   afterAll(() => {
@@ -143,7 +138,7 @@ describe('LinkedIn OAuth Routes', () => {
           .expect(302);
 
         expect(response.headers.location).toBe(
-          'http://localhost:5174/oauth/linkedin/callback?linkedin_code=auth-code-123&state=state-token'
+          'http://localhost:5174/oauth/linkedin/callback?code=auth-code-123&state=state-token'
         );
       });
 
@@ -169,7 +164,7 @@ describe('LinkedIn OAuth Routes', () => {
     describe('POST /api/oauth/linkedin/connect', () => {
       it('should return 400 if code is missing', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect')
+          .post('/api/oauth/linkedin/finalize')
           .send({ state: 'valid-state' })
           .expect(400);
 
@@ -178,7 +173,7 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 400 if code is empty string', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect')
+          .post('/api/oauth/linkedin/finalize')
           .send({ code: '   ', state: 'valid-state' })
           .expect(400);
 
@@ -187,7 +182,7 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 400 if state is missing', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect')
+          .post('/api/oauth/linkedin/finalize')
           .send({ code: 'valid-code' })
           .expect(400);
 
@@ -196,7 +191,7 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 403 for invalid state (CSRF protection)', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect')
+          .post('/api/oauth/linkedin/finalize')
           .send({ code: 'valid-code', state: 'invalid-jwt-state' })
           .expect(403);
 
@@ -209,44 +204,12 @@ describe('LinkedIn OAuth Routes', () => {
   // Organization OAuth Flow Tests
   // ============================================
   describe('Organization OAuth Flow', () => {
-    describe('GET /api/oauth/linkedin/org/init', () => {
-      it('should return LinkedIn organization authorization URL', async () => {
-        const response = await request(app)
-          .get('/api/oauth/linkedin/org/init')
-          .expect(200);
 
-        expect(mockGetLinkedInOrgConfig).toHaveBeenCalled();
-        expect(response.body.success).toBe(true);
-        expect(response.body.url).toContain('https://www.linkedin.com/oauth/v2/authorization');
-      });
-
-      it('should include organization scopes in URL', async () => {
-        const response = await request(app)
-          .get('/api/oauth/linkedin/org/init')
-          .expect(200);
-
-        const url = new URL(response.body.url);
-        expect(url.searchParams.get('scope')).toBe('r_organization_admin w_organization_social');
-      });
-    });
-
-    describe('GET /api/oauth/linkedin/org/callback', () => {
-      it('should redirect with linkedin_org_code parameter', async () => {
-        const response = await request(app)
-          .get('/api/oauth/linkedin/org/callback')
-          .query({ code: 'org-auth-code', state: 'org-state' })
-          .expect(302);
-
-        expect(response.headers.location).toBe(
-          'http://localhost:5174/oauth/linkedin/callback?linkedin_org_code=org-auth-code&state=org-state'
-        );
-      });
-    });
 
     describe('POST /api/oauth/linkedin/organizations', () => {
       it('should return 400 if code is missing', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/organizations')
+          .post('/api/oauth/linkedin/finalize')
           .send({ state: 'valid-state' })
           .expect(400);
 
@@ -255,7 +218,7 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 400 if state is missing', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/organizations')
+          .post('/api/oauth/linkedin/finalize')
           .send({ code: 'valid-code' })
           .expect(400);
 
@@ -264,7 +227,7 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 403 for invalid state (CSRF protection)', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/organizations')
+          .post('/api/oauth/linkedin/finalize')
           .send({ code: 'valid-code', state: 'invalid-jwt-state' })
           .expect(403);
 
@@ -289,19 +252,21 @@ describe('LinkedIn OAuth Routes', () => {
         };
 
         (axios.post as jest.Mock).mockResolvedValue(mockTokenResponse);
-        mockLinkedInService.getAdminOrganizations.mockResolvedValue(mockOrganizations as any);
-        mockLinkedInService.getOrganization.mockResolvedValue({
-          id: '123',
-          name: 'Test Company',
-          vanityName: 'test-company',
-          logoUrl: 'https://example.com/logo.png'
-        });
-        mockLinkedInService.getOrganizationFollowerCount.mockResolvedValue(1000);
+        mockLinkedInService.getAdminOrganizationDetails.mockResolvedValue([
+          {
+            urn: 'urn:li:organization:123',
+            id: '123',
+            name: 'Test Company',
+            vanityName: 'test-company',
+            logoUrl: 'https://example.com/logo.png',
+            followerCount: 1000
+          }
+        ]);
 
         // Note: This will fail state validation unless we mock verifyState
         // For now, we test the structure
         const response = await request(app)
-          .post('/api/oauth/linkedin/organizations')
+          .post('/api/oauth/linkedin/finalize')
           .send({ code: 'valid-code', state: 'invalid-state' });
 
         // Should fail at state validation
@@ -338,34 +303,34 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 400 if organizations array is missing', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({ tokenSessionId: 'valid-session-id' })
           .expect(400);
 
-        expect(response.body.error).toBe('No organizations selected');
+        expect(response.body.error).toBe('No accounts selected');
       });
 
       it('should return 400 if organizations array is empty', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({ organizations: [], tokenSessionId: 'valid-session-id' })
           .expect(400);
 
-        expect(response.body.error).toBe('No organizations selected');
+        expect(response.body.error).toBe('No accounts selected');
       });
 
       it('should return 400 if organizations is not an array', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({ organizations: 'not-an-array', tokenSessionId: 'valid-session-id' })
           .expect(400);
 
-        expect(response.body.error).toBe('No organizations selected');
+        expect(response.body.error).toBe('No accounts selected');
       });
 
       it('should return 400 if tokenSessionId is missing', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({ organizations: mockOrganizations })
           .expect(400);
 
@@ -374,7 +339,7 @@ describe('LinkedIn OAuth Routes', () => {
 
       it('should return 401 if token session is invalid or expired', async () => {
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({
             organizations: mockOrganizations,
             tokenSessionId: 'nonexistent-session-id',
@@ -392,7 +357,7 @@ describe('LinkedIn OAuth Routes', () => {
         // This test would require mocking the internal token session store
         // which is not exported. We'll test the error cases and structure validation
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({
             organizations: mockOrganizations,
             tokenSessionId: 'valid-session-id',
@@ -409,7 +374,7 @@ describe('LinkedIn OAuth Routes', () => {
         ];
 
         const response = await request(app)
-          .post('/api/oauth/linkedin/connect-pages')
+          .post('/api/oauth/linkedin/connect-accounts')
           .send({
             organizations: invalidOrganizations,
             tokenSessionId: 'valid-session-id',
@@ -427,7 +392,7 @@ describe('LinkedIn OAuth Routes', () => {
   describe('Input Validation Edge Cases', () => {
     it('should reject null code', async () => {
       const response = await request(app)
-        .post('/api/oauth/linkedin/connect')
+        .post('/api/oauth/linkedin/finalize')
         .send({ code: null, state: 'valid-state' })
         .expect(400);
 
@@ -436,7 +401,7 @@ describe('LinkedIn OAuth Routes', () => {
 
     it('should reject non-string code', async () => {
       const response = await request(app)
-        .post('/api/oauth/linkedin/connect')
+        .post('/api/oauth/linkedin/finalize')
         .send({ code: 12345, state: 'valid-state' })
         .expect(400);
 
@@ -445,7 +410,7 @@ describe('LinkedIn OAuth Routes', () => {
 
     it('should reject whitespace-only state', async () => {
       const response = await request(app)
-        .post('/api/oauth/linkedin/connect')
+        .post('/api/oauth/linkedin/finalize')
         .send({ code: 'valid-code', state: '   ' })
         .expect(400);
 

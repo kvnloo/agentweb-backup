@@ -7,6 +7,24 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-21',
+    changes: [
+      'Supported fetching LinkedIn personal connected-account metrics in Agent Mode',
+      '- Use list_connected_account_posts to fetch posts and optionally include per-post metrics',
+      '- Use get_post_analytics to fetch detailed analytics for specific posts by URN',
+    ],
+  },
+  {
+    date: '2026-01-20',
+    changes: [
+      'Improved GTM Plan Default DRI Assignment',
+      '- GTM plans now automatically set the DRI (Directly Responsible Individual) based on who creates the plan',
+      '- When admins create plans via delegated access, the admin\'s email is used as the default DRI',
+      '- When users create their own plans, their email is used as the default DRI',
+      '- Explicit DRI values provided during plan creation always take precedence over defaults',
+    ],
+  },
+  {
     date: '2026-01-19',
     changes: [
       'Added Message Feedback System for Agent Mode',
