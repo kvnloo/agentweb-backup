@@ -75,7 +75,8 @@ class ResendService {
     subject,
     html,
     text,
-    inReplyTo
+    inReplyTo,
+    replyTo
   }: {
     from: string;
     to: string | string[];
@@ -83,9 +84,10 @@ class ResendService {
     html?: string;
     text?: string;
     inReplyTo?: string;
+    replyTo?: string;
   }) {
     await this.initializeResend();
-    
+
     if (!this.resend) {
       console.error('Resend service not initialized');
       return;
@@ -105,6 +107,11 @@ class ResendService {
       emailOptions.text = text;
     }
 
+    // Add reply-to if provided
+    if (replyTo) {
+      emailOptions.replyTo = replyTo; // Resend API uses 'replyTo' (camelCase), not 'reply_to'
+    }
+
     // Add reply headers if replying to an email
     if (inReplyTo) {
       emailOptions.headers = {
@@ -114,6 +121,9 @@ class ResendService {
 
     const recipient = Array.isArray(to) ? to.join(', ') : to;
     console.log(`Sending Resend email to: ${recipient}`);
+    if (replyTo) {
+      console.log(`  Reply-To: ${replyTo}`);
+    }
 
     // Add delay before attempting to send to respect rate limit (2 per second = 500ms minimum)
     // Using 600ms to provide a safety margin and account for processing time
