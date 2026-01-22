@@ -2382,8 +2382,8 @@ export const agentModeController = {
         // For hourly schedules with daily digest, send a daily digest email
         // Get all run results for the same date as the selected test entry
         const selectedResultDate = new Date(record.createdAt);
-        const startOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate());
-        const endOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate() + 1);
+        const startOfDay = new Date(Date.UTC(selectedResultDate.getUTCFullYear(), selectedResultDate.getUTCMonth(), selectedResultDate.getUTCDate()));
+        const endOfDay = new Date(Date.UTC(selectedResultDate.getUTCFullYear(), selectedResultDate.getUTCMonth(), selectedResultDate.getUTCDate() + 1));
 
         const sameDayResultsRaw = testHistory.filter((result: any) => {
           const resultDate = new Date(result.createdAt);

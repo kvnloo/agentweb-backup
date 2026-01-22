@@ -25,10 +25,37 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args) => {
-    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', args.userId, args.campaign_name);
+  execute: async (args, context) => {
+    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, args.campaign_name);
   }
 });
+
+mcpToolRegistry.register({
+  name: 'get_post_analytics',
+  definition: {
+    name: 'get_post_analytics',
+    description: 'Get detailed analytics for specific posts from a connected social media account. Returns engagement metrics including likes, comments, shares, impressions, and clicks.',
+    inputSchema: {
+            type: 'object',
+            properties: {
+              account_id: { 
+                type: 'string', 
+                description: 'The connected account ID (must belong to the authenticated user)' 
+              },
+              post_ids: { 
+                type: 'array', 
+                items: { type: 'string' },
+                description: 'Array of post IDs to fetch analytics for (e.g., LinkedIn URNs like "urn:li:share:123")'
+              }
+            },
+            required: ['account_id', 'post_ids']
+          }
+        },
+    execute: async (args, context) => {
+      return await agentModeService.getPostAnalytics(context?.userId, args.account_id, args.post_ids);
+    }
+  }
+);
 
 mcpToolRegistry.register({
   name: 'read_brand_guidelines',
@@ -42,8 +69,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args) => {
-    return await agentModeService.readBrandGuidelines(args.userId);
+  execute: async (args, context) => {
+    return await agentModeService.readBrandGuidelines(context?.userId);
   }
 });
 
@@ -111,8 +138,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args) => {
-    const { userId, ...data } = args;
+  execute: async (args, context) => {
+    const { ...data } = args; const userId = context?.userId;
     return await agentModeService.updateBrandGuidelines(data, userId);
   }
 });
@@ -129,8 +156,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args) => {
-    return await agentModeService.readMarketStrategy(args.userId);
+  execute: async (args, context) => {
+    return await agentModeService.readMarketStrategy(context?.userId);
   }
 });
 
@@ -176,8 +203,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args) => {
-    const { userId, ...data } = args;
+  execute: async (args, context) => {
+    const { ...data } = args; const userId = context?.userId;
     return await agentModeService.updateMarketStrategy(data, userId);
   }
 });
@@ -219,14 +246,14 @@ mcpToolRegistry.register({
       required: ['topic']
     }
   },
-  execute: async (args) => {
+  execute: async (args, context) => {
     return await agentModeService.performDeepResearchTool(
       args.topic, 
       args.prompt, 
       args.tone || 'professional', 
       args.depth || 'detailed', 
       args.focus_areas, 
-      args.userId
+      context?.userId
     );
   }
 });
@@ -254,8 +281,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.listBooks(args.userId, args.type, args.status);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listBooks(context?.userId, args.type, args.status);
   }
 });
 
@@ -275,8 +302,8 @@ mcpToolRegistry.register({
       required: ['book_id']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.getBookDetails(args.book_id, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getBookDetails(args.book_id, context?.userId);
   }
 });
 
@@ -304,8 +331,8 @@ mcpToolRegistry.register({
       required: ['book_id', 'section_id']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.getBookContent(args.book_id, args.section_id, args.chapter_id, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
   }
 });
 
@@ -337,7 +364,7 @@ mcpToolRegistry.register({
       required: ['book_id', 'section_id', 'replacement_json']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     // Parse replacement_json
     let bookReplacementInstructions = [];
     try {
@@ -356,7 +383,7 @@ mcpToolRegistry.register({
       args.section_id,
       args.chapter_id,
       bookReplacementInstructions,
-      args.userId
+      context?.userId
     );
   }
 });
@@ -404,7 +431,7 @@ mcpToolRegistry.register({
       required: ['book_id', 'section_id', 'chapter_id', 'content_description']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.generateBookContent(
       args.book_id,
       args.section_id,
@@ -412,7 +439,7 @@ mcpToolRegistry.register({
       args.content_description,
       args.length || 'medium',
       args.imagine !== undefined ? args.imagine : true,
-      args.userId,
+      context?.userId,
       args.research_url
     );
   }
@@ -462,8 +489,8 @@ mcpToolRegistry.register({
       required: ['title', 'description', 'type', 'author']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.createBook(args.title, args.description, args.type, args.author, args.language, args.genre, args.tags || [], args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createBook(args.title, args.description, args.type, args.author, args.language, args.genre, args.tags || [], context?.userId);
   }
 });
 
@@ -487,8 +514,8 @@ mcpToolRegistry.register({
       required: ['book_id', 'outline_json']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.createBookOutline(args.book_id, args.outline_json, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createBookOutline(args.book_id, args.outline_json, context?.userId);
   }
 });
 
@@ -512,8 +539,8 @@ mcpToolRegistry.register({
       required: ['book_id', 'characters_json']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.addCharacters(args.book_id, args.characters_json, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.addCharacters(args.book_id, args.characters_json, context?.userId);
   }
 });
 
@@ -564,15 +591,15 @@ mcpToolRegistry.register({
       required: ['title_draft', 'content_draft']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.createBlogArticle(
       args.title_draft, 
       args.content_draft, 
       args.length || 'medium', 
       args.researchContext || '', 
       args.requirements || '', 
-      args.userId, 
-      args.sessionId, 
+      context?.userId, 
+      context?.sessionId, 
       args.style || 'default', 
       args.deep_research || false
     );
@@ -607,14 +634,14 @@ mcpToolRegistry.register({
       required: ['title', 'description', 'hero_image_url', 'blog_html_url']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.publishBlogArticle(
       args.title, 
       args.description, 
       args.hero_image_url, 
       args.blog_html_url, 
-      args.userId, 
-      args.sessionId
+      context?.userId, 
+      context?.sessionId
     );
   }
 });
@@ -654,11 +681,11 @@ mcpToolRegistry.register({
       required: ['posts']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     // Note: The backend createSocialMediaPosts currently expects an array of posts.
     // If the tool is supposed to generate them first, we might need a middle layer.
     // For now, mirroring the existing (buggy?) behavior but ensuring we pass sessionId.
-    return await agentModeService.createSocialMediaPosts(args, args.userId, args.sessionId);
+    return await agentModeService.createSocialMediaPosts(args, context?.userId, context?.sessionId);
   }
 });
 
@@ -674,8 +701,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.listHtmlTemplates(args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listHtmlTemplates(context?.userId);
   }
 });
 
@@ -703,7 +730,7 @@ mcpToolRegistry.register({
       required: ['template_name', 'variable_values_json', 'array_variable_values_json']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     if (!args.template_name) {
       return {
         success: false,
@@ -739,7 +766,7 @@ mcpToolRegistry.register({
       };
     }
 
-    return await agentModeService.createHtmlFromTemplate(args.llmModel, args.template_name, variableValues, arrayVariableValues, args.userId, args.sessionId);
+    return await agentModeService.createHtmlFromTemplate(args.llmModel, args.template_name, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
   }
 });
 
@@ -768,7 +795,7 @@ mcpToolRegistry.register({
       required: ['file_url', 'update_type', 'replacement_json']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     // Ensure we have the required parameters
     if (!args.file_url) {
       return {
@@ -803,7 +830,7 @@ mcpToolRegistry.register({
       };
     }
 
-    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, args.userId, args.sessionId);
+    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, context?.userId, context?.sessionId);
   }
 });
 
@@ -820,8 +847,8 @@ mcpToolRegistry.register({
       required: [] 
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.listGTMPlans(args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listGTMPlans(context?.userId);
   }
 });
 
@@ -841,8 +868,8 @@ mcpToolRegistry.register({
       required: ['plan_id']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.readGTMPlan(args.plan_id, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.readGTMPlan(args.plan_id, context?.userId);
   }
 });
 
@@ -922,9 +949,9 @@ mcpToolRegistry.register({
       required: ['title']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.createGTMPlan(
-      args.title, args.description || '', args.dri || undefined, args.phases || [], args.userId
+      args.title, args.description || '', args.dri || undefined, args.phases || [], context?.userId, context?.sessionId
     );
   }
 });
@@ -940,8 +967,8 @@ mcpToolRegistry.register({
       } 
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.getLeadLists(args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadLists(context?.userId);
   }
 });
 
@@ -965,8 +992,8 @@ mcpToolRegistry.register({
       required: ['name']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.createLeadList(args.name, args.description || '', args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createLeadList(args.name, args.description || '', context?.userId);
   }
 });
 
@@ -1001,8 +1028,8 @@ mcpToolRegistry.register({
       required: ['list_id', 'leads']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.addLeadsToList(args.list_id, args.leads || [], context?.userId);
   }
 });
 
@@ -1035,13 +1062,13 @@ mcpToolRegistry.register({
       required: ['list_id', 'lead_id', 'instruction']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.updateEmailDraftForLead(
       args.list_id, 
       args.lead_id, 
       args.instruction, 
-      args.sessionId, 
-      args.userId, 
+      context?.sessionId, 
+      context?.userId, 
       args.email_format
     );
   }
@@ -1064,8 +1091,8 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.listConnectedAccounts(args.userId, args.platform);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listConnectedAccounts(context?.userId, args.platform);
   }
 });
 
@@ -1084,9 +1111,9 @@ mcpToolRegistry.register({
       required: ['account_id']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.loadConnectedAccountPosts(
-      args.userId, 
+      context?.userId, 
       args.account_id, 
       {
         limit: args.limit,
@@ -1112,8 +1139,8 @@ mcpToolRegistry.register({
       required: ['account_id']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.loadConnectedAccountMetrics(args.userId, args.account_id);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.loadConnectedAccountMetrics(context?.userId, args.account_id);
   }
 });
 
@@ -1136,8 +1163,8 @@ mcpToolRegistry.register({
       required: ['account_id', 'content']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.postOnConnectedAccount(args.userId, args.account_id, args.content, args.media_urls);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls);
   }
 });
 
@@ -1178,7 +1205,7 @@ mcpToolRegistry.register({
       required: ['template_id', 'parameters_json']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     let parameters = args.parameters_json;
     if (typeof parameters === 'string') {
       try { parameters = JSON.parse(args.parameters_json); } catch (e) {}
@@ -1186,8 +1213,8 @@ mcpToolRegistry.register({
     return await agentModeService.createTaskFromTemplate(
       args.template_id,
       parameters,
-      args.userId,
-      args.sessionId,
+      context?.userId,
+      context?.sessionId,
       args.attach_previous_task_results,
       args.attached_file_urls || [],
       args.async
@@ -1235,13 +1262,13 @@ mcpToolRegistry.register({
       required: ['task_name', 'prompt', 'category']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.createTaskFromPrompt(
       args.task_name,
       args.prompt,
       args.category,
-      args.userId,
-      args.sessionId,
+      context?.userId,
+      context?.sessionId,
       args.attach_previous_task_results,
       args.attached_file_urls || [],
       args.async
@@ -1279,13 +1306,13 @@ mcpToolRegistry.register({
       required: ['task_name', 'prompt']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.createImageTaskFromPrompt(
       args.task_name,
       args.prompt,
       args.category,
-      args.userId,
-      args.sessionId,
+      context?.userId,
+      context?.sessionId,
       args.attach_previous_task_results
     );
   }
@@ -1320,12 +1347,12 @@ mcpToolRegistry.register({
       required: ['task_id', 'execution_id', 'revision_prompt']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.createRevision(
       args.task_id,
       args.execution_id,
       args.revision_prompt,
-      args.userId,
+      context?.userId,
       args.target_result_name
     );
   }
@@ -1347,8 +1374,8 @@ mcpToolRegistry.register({
       required: ['task_id']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.getTaskSubscriberMetrics(args.task_id, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getTaskSubscriberMetrics(args.task_id, context?.userId);
   }
 });
 
@@ -1372,8 +1399,8 @@ mcpToolRegistry.register({
       required: ['task_id', 'email_subject']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, context?.userId);
   }
 });
 
@@ -1399,7 +1426,7 @@ mcpToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.describeImage(args.llmModel, args.image_url, args.prompt);
   }
 });
@@ -1425,7 +1452,7 @@ mcpToolRegistry.register({
       required: ["video_file_url"]
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.describeVideo(args.video_file_url, args.prompt);
   }
 });
@@ -1450,8 +1477,8 @@ mcpToolRegistry.register({
       required: ["image_url"]
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.removeC2PAFromImage(args.image_url, args.filename, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.removeC2PAFromImage(args.image_url, args.filename, context?.userId);
   }
 });
 
@@ -1498,15 +1525,15 @@ mcpToolRegistry.register({
       required: ['prompt', 'filename']
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.generateImage(
       args.prompt, 
       args.filename, 
       args.size || '1024x1024', 
       args.quality || 'medium', 
       args.inputImages || [], 
-      args.userId, 
-      args.sessionId, 
+      context?.userId, 
+      context?.sessionId, 
       args.imageModel
     );
   }
@@ -1545,8 +1572,8 @@ mcpToolRegistry.register({
       required: ['prompt', 'filename']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.generateVideo(args.prompt, args.filename, args.userId, args.sessionId, args.videoModel, args.startFrame, args.endFrame);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.generateVideo(args.prompt, args.filename, context?.userId, context?.sessionId, args.videoModel, args.startFrame, args.endFrame);
   }
 });
 
@@ -1572,7 +1599,7 @@ mcpToolRegistry.register({
       required: ["query"]
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.searchWeb(args.query, args.max_results || 10);
   }
 });
@@ -1598,8 +1625,8 @@ mcpToolRegistry.register({
       required: ["query"]
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.searchKnowledgeBase(args.query, args.max_results|| 5);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.searchKnowledgeBase(args.query, args.max_results || 5, context?.userId);
   }
 });
 
@@ -1614,7 +1641,7 @@ mcpToolRegistry.register({
       required: []
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.listKnowledgeBaseFiles(args.query);
   }
 });
@@ -1649,8 +1676,8 @@ mcpToolRegistry.register({
       required: ["files"]
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.readKnowledgeBaseFiles(args.files, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.readKnowledgeBaseFiles(args.files, context?.userId);
   }
 });
 
@@ -1670,7 +1697,7 @@ mcpToolRegistry.register({
       required: ["file_url"]
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.readFileContent(args.file_url);
   }
 });
@@ -1691,7 +1718,7 @@ mcpToolRegistry.register({
       required: ["url"]
     }
   },
-  execute: async (args: any) => {
+  execute: async (args: any, context?: any) => {
     return await agentModeService.readFileContent(args.url);
   }
 });
@@ -1718,8 +1745,8 @@ mcpToolRegistry.register({
       required: ['file_urls', 'analysis_instruction']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.performDataAnalysis(args.file_urls, args.analysis_instruction, args.userId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.performDataAnalysis(args.file_urls, args.analysis_instruction, context?.userId);
   }
 });
 
@@ -1738,8 +1765,8 @@ mcpToolRegistry.register({
       required: ["title", "content_draft"]
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements, args.userId, args.sessionId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createHtmlFile(args.title, args.content_draft, args.format_requirements || '', context?.userId, context?.sessionId);
   }
 });
 
@@ -1763,8 +1790,8 @@ mcpToolRegistry.register({
       required: ["file_name", "file_content"]
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.saveFile(args.file_name, args.file_content, args.userId, args.sessionId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.saveFile(args.file_name, args.file_content, context?.userId, context?.sessionId);
   }
 });
 
@@ -1814,8 +1841,8 @@ mcpToolRegistry.register({
       required: ['title', 'steps']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.createWorkPlan(args.title, args.steps, args.sessionId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createWorkPlan(args.title, args.steps, context?.sessionId);
   }
 });
 
@@ -1867,8 +1894,8 @@ mcpToolRegistry.register({
       required: ['steps']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], args.sessionId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.modifyWorkPlan(args.steps, args.removeStepCounts || [], context?.sessionId);
   }
 });
 
@@ -1907,8 +1934,8 @@ mcpToolRegistry.register({
       required: ['updates']
     }
   },
-  execute: async (args: any) => {
-    return await agentModeService.setWorkPlanStatus(args.stepStatuses, args.sessionId);
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.setWorkPlanStatus(args.stepStatuses, context?.sessionId);
   }
 });
 

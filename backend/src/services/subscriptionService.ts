@@ -134,7 +134,7 @@ export async function getAllowedFunctionCalls(
       subscriptionType.allowedFunctionCalls.includes("*") ||
       subscriptionType.allowedFunctionCalls.length === 0
     ) {
-      return ["*"];
+      return getAllAvailableFunctionCalls();
     }
 
     return subscriptionType.allowedFunctionCalls;

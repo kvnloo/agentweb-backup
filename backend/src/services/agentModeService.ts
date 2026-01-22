@@ -65,7 +65,7 @@ export class AgentModeService {
   }
 
   public async initialize() {
-    this.registerTools();
+    await this.registerTools();
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
     } else {
@@ -92,52 +92,49 @@ export class AgentModeService {
     }
   }
 
-  private registerTools() {
-    if (AgentModeService.toolsRegistered) return;
-    AgentModeService.toolsRegistered = true;
-
-    const toolsDir = path.join(__dirname, '../mcp/client/tools');
-    
-    try {
-      if (!fsSync.existsSync(toolsDir)) {
-        console.error('AgentMode: Tools directory not found:', toolsDir);
-        return;
+  private async registerTools() {
+    // 1. Ensure server tools are loaded into the global mcpToolRegistry (only needs to happen once)
+    if (!AgentModeService.toolsRegistered) {
+      try {
+        // Import the registry and the tools definitions (for side effects)
+        // Dynamic import to avoid circular dependencies
+        await import('../mcp/server/registry');
+        await import('../mcp/server/tools');
+        
+        AgentModeService.toolsRegistered = true;
+      } catch (error) {
+         console.error('AgentMode: Error loading server tools:', error);
       }
+    }
 
-      const files = fsSync.readdirSync(toolsDir);
+    // 2. Register tools from the global mcpToolRegistry into THIS instance's toolRegistry check
+    try {
+       const { mcpToolRegistry } = await import('../mcp/server/registry');
+       const toolNames = mcpToolRegistry.getToolNames();
       
-      for (const file of files) {
-        if (file.endsWith('.ts') || file.endsWith('.js')) {
-          const filePath = path.join(toolsDir, file);
-          const module = require(filePath);
-          
-          for (const key in module) {
-            const exported = module[key];
-            
-            // Check if it's a class and probably a tool
-            if (typeof exported === 'function' && exported.prototype) {
-              try {
-                const toolInstance = new exported();
-                
-                // Verify if it implements the AgentTool interface (has name and execute)
-                if (toolInstance.name && typeof toolInstance.execute === 'function' && toolInstance.definition) {
-                  this.toolRegistry.register(toolInstance);
-                  // console.log(`AgentMode: Registered tool ${toolInstance.name} from ${file}`);
-                }
-              } catch (e) {
-                // Not a class we can instantiate or not a tool, ignore
-              }
+      for (const name of toolNames) {
+        const toolHandler = mcpToolRegistry.getTool(name);
+        if (toolHandler) {
+          // Wrap MCP definition in OpenAI definition format
+          const mcpDef = toolHandler.definition;
+          const openAiDef = {
+            type: "function",
+            function: {
+              name: mcpDef.name,
+              description: mcpDef.description,
+              parameters: mcpDef.inputSchema
             }
-          }
+          };
+
+          this.toolRegistry.register({
+            name: toolHandler.name,
+            definition: openAiDef,
+            execute: toolHandler.execute
+          });
         }
       }
-      
-      if (!AgentModeService.toolsRegistered) {
-        console.log(`AgentMode: Automatically registered ${this.toolRegistry.getAllTools().length} tools from ${toolsDir}`);
-        AgentModeService.toolsRegistered = true;
-      }
     } catch (error) {
-      console.error('AgentMode: Error during automatic tool registration:', error);
+       console.error('AgentMode: Error registering tools to instance:', error);
     }
   }
 
@@ -3244,7 +3241,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create a new GTM plan
-  public async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string): Promise<any> {
+  public async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string, sessionId: string): Promise<any> {
     try {
       const { DynamoDB } = await import('aws-sdk');
       const dynamodb = new DynamoDB.DocumentClient({

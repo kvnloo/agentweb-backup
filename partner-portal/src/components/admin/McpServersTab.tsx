@@ -51,10 +51,7 @@ interface McpServer {
   discoveredTools?: string[];
 }
 
-interface DiscoveredTool {
-  name: string;
-  description?: string;
-}
+
 
 const McpServersTab: React.FC = () => {
   const [servers, setServers] = useState<McpServer[]>([]);
@@ -83,7 +80,7 @@ const McpServersTab: React.FC = () => {
   // Tool discovery state
   const [discoveryLoading, setDiscoveryLoading] = useState<string | null>(null);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
-  const [discoveredTools, setDiscoveredTools] = useState<Record<string, DiscoveredTool[]>>({});
+  // unused state removed
   
   const { token } = useAuth();
 
@@ -174,10 +171,7 @@ const McpServersTab: React.FC = () => {
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      setDiscoveredTools((prev) => ({
-        ...prev,
-        [serverName]: response.data.tools,
-      }));
+
       setExpandedServer(serverName);
       setSuccess(`Discovered ${response.data.count} tools from ${serverName}`);
       loadServers(); // Reload to get updated discoveredTools

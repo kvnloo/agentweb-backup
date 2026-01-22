@@ -2,7 +2,7 @@
 export interface McpToolHandler {
   name: string;
   definition: any;
-  execute: (args: any) => Promise<any>;
+  execute: (args: any, context?: any) => Promise<any>;
 }
 
 export class McpToolRegistry {
@@ -18,6 +18,10 @@ export class McpToolRegistry {
 
   getToolNames() {
     return Array.from(this.tools.keys());
+  }
+
+  getTool(name: string) {
+    return this.tools.get(name);
   }
 
   async execute(name: string, args: any) {
