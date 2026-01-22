@@ -30,6 +30,7 @@ import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
+import supportRoutes from "./routes/support";
 import { authenticateToken } from "./middleware/auth";
 
 const { version } = require('../package.json');
@@ -161,6 +162,7 @@ app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
+app.use("/api/support", supportRoutes);
 
 
 // Health check endpoint
