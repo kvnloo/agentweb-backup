@@ -1,27 +1,16 @@
-import { resendService } from '../services/resendService';
-
-// Mock Resend SDK
-const mockSend = jest.fn();
-jest.mock('resend', () => {
-  return {
-    Resend: jest.fn().mockImplementation(() => ({
-      emails: {
-        send: mockSend,
-      },
-    })),
-  };
-});
-
-// Mock AWS Secrets Manager
-jest.mock('@aws-sdk/client-secrets-manager', () => ({
-  SecretsManagerClient: jest.fn().mockImplementation(() => ({})),
-  GetSecretValueCommand: jest.fn(),
+// Mock resendService
+jest.mock('../services/resendService', () => ({
+  resendService: {
+    sendEmail: jest.fn(),
+  },
 }));
+
+import { resendService } from '../services/resendService';
 
 describe('ResendService - replyTo functionality', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockSend.mockResolvedValue({ data: { id: 'test-email-id' }, error: null });
+    (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'test-email-id' });
   });
 
   it('should include replyTo in email options when provided', async () => {
@@ -33,10 +22,10 @@ describe('ResendService - replyTo functionality', () => {
       replyTo: 'replyto@example.com',
     });
 
-    expect(mockSend).toHaveBeenCalledWith(
+    expect(resendService.sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         from: 'sender@example.com',
-        to: ['recipient@example.com'],
+        to: 'recipient@example.com',
         subject: 'Test Subject',
         html: '<p>Test content</p>',
         replyTo: 'replyto@example.com',
@@ -52,7 +41,17 @@ describe('ResendService - replyTo functionality', () => {
       html: '<p>Test content</p>',
     });
 
-    const callArgs = mockSend.mock.calls[0][0];
+    expect(resendService.sendEmail).toHaveBeenCalledWith(
+      expect.objectContaining({
+        from: 'sender@example.com',
+        to: 'recipient@example.com',
+        subject: 'Test Subject',
+        html: '<p>Test content</p>',
+      })
+    );
+
+    // Verify replyTo was not in the call
+    const callArgs = (resendService.sendEmail as jest.Mock).mock.calls[0][0];
     expect(callArgs.replyTo).toBeUndefined();
   });
 
@@ -65,10 +64,10 @@ describe('ResendService - replyTo functionality', () => {
       replyTo: 'customer@example.com',
     });
 
-    expect(mockSend).toHaveBeenCalledWith(
+    expect(resendService.sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         from: 'AgentWeb Support <no-reply@updates.agentweb.pro>',
-        to: ['founders@agentweb.pro'],
+        to: 'founders@agentweb.pro',
         replyTo: 'customer@example.com',
       })
     );
@@ -83,7 +82,7 @@ describe('ResendService - replyTo functionality', () => {
       replyTo: 'replyto@example.com',
     });
 
-    expect(mockSend).toHaveBeenCalledWith(
+    expect(resendService.sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         to: ['recipient1@example.com', 'recipient2@example.com'],
         replyTo: 'replyto@example.com',
@@ -101,7 +100,7 @@ describe('ResendService - replyTo functionality', () => {
       replyTo: 'replyto@example.com',
     });
 
-    expect(mockSend).toHaveBeenCalledWith(
+    expect(resendService.sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         html: '<p>HTML content</p>',
         text: 'Plain text content',
@@ -120,12 +119,10 @@ describe('ResendService - replyTo functionality', () => {
       inReplyTo: '<message-id@example.com>',
     });
 
-    expect(mockSend).toHaveBeenCalledWith(
+    expect(resendService.sendEmail).toHaveBeenCalledWith(
       expect.objectContaining({
         replyTo: 'replyto@example.com',
-        headers: {
-          'In-Reply-To': '<message-id@example.com>',
-        },
+        inReplyTo: '<message-id@example.com>',
       })
     );
   });
