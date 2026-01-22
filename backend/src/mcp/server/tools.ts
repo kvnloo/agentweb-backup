@@ -1,4 +1,4 @@
-import { agentModeService } from '../services/agentModeService';
+import { agentModeService } from '../../services/agentModeService';
 import { mcpToolRegistry } from './registry';
 
 // --- Tools from marketingTools.ts ---

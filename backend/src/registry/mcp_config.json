@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "agentweb-tools": {
+      "transport": "streamable-http",
       "url": "${BACKEND_URL}/mcp/server",
       "accessToken": "${MCP_ACCESS_TOKEN}",
       "isInternal": true

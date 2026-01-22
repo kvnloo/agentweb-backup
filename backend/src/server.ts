@@ -173,6 +173,41 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
+// Graceful shutdown handler
+const gracefulShutdown = async (signal: string) => {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+  
+  // Close Socket.IO connections
+  io.close((err) => {
+    if (err) {
+      console.error('Error closing Socket.IO:', err);
+    } else {
+      console.log('Socket.IO connections closed');
+    }
+  });
+
+  // Close HTTP server (stops accepting new connections)
+  server.close((err) => {
+    if (err) {
+      console.error('Error closing HTTP server:', err);
+    } else {
+      console.log('HTTP server closed');
+    }
+    
+    // Exit after cleanup
+    process.exit(0);
+  });
+
+  // Force exit if graceful shutdown takes too long
+  setTimeout(() => {
+    console.error('Forcing shutdown after timeout');
+    process.exit(1);
+  }, 5000);
+};
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
 // Create test account before starting the server
 createTestAccount().then(async () => {
 

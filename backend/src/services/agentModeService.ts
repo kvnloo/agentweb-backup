@@ -13,8 +13,8 @@ import { createWriteStream, promises as fs, default as fsSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { Readable } from 'stream';
-import { ToolRegistry } from '../registry/toolRegistry';
-import { McpClientService } from '../registry/mcpClientService';
+import { ToolRegistry } from '../mcp/client/toolRegistry';
+import { McpClientService } from '../mcp/client/mcpClientService';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
 // Used for updateEmailDraftForLead to match generateBlogContent pattern
@@ -96,7 +96,7 @@ export class AgentModeService {
     if (AgentModeService.toolsRegistered) return;
     AgentModeService.toolsRegistered = true;
 
-    const toolsDir = path.join(__dirname, '../registry/tools');
+    const toolsDir = path.join(__dirname, '../mcp/client/tools');
     
     try {
       if (!fsSync.existsSync(toolsDir)) {
