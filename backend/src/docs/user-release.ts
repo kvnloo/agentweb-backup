@@ -14,6 +14,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Support form allows users to describe their issue with auto-filled page URL for context',
       '- Support requests are sent via email to founders@agentweb.pro with HTML formatting',
       '- Reply-To automatically set to the customer\'s email for easy responses',
+      'Fixed Agent Mode Session Loading Bug with Delegate Access',
+      '- Agent Mode now clears all session state when token changes (delegate user switch)',
+      '- Plan session transfer now completes without auto-navigation to avoid race conditions',
     ],
   },
   {
