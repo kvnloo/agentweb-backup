@@ -7,6 +7,16 @@ import express, { Express, Request, Response, NextFunction } from 'express';
 import request from 'supertest';
 
 // Mock the MCP SDK modules
+jest.mock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
+  McpServer: jest.fn().mockImplementation(() => ({
+    server: {
+      setRequestHandler: jest.fn(),
+      connect: jest.fn().mockResolvedValue(undefined),
+      close: jest.fn().mockResolvedValue(undefined)
+    }
+  }))
+}));
+
 jest.mock('@modelcontextprotocol/sdk/server/index.js', () => ({
   Server: jest.fn().mockImplementation(() => ({
     setRequestHandler: jest.fn(),
@@ -53,6 +63,21 @@ jest.mock('../mcp/server/registry', () => ({
 // Mock tools import (it's a side-effect import)
 jest.mock('../mcp/server/tools', () => ({}));
 
+// Mock the shared core module
+jest.mock('../mcp/server/mcpServerCore', () => ({
+  createMcpServer: jest.fn().mockImplementation(() => ({
+    setRequestHandler: jest.fn(),
+    connect: jest.fn().mockResolvedValue(undefined),
+    close: jest.fn().mockResolvedValue(undefined)
+  })),
+  mcpToolRegistry: {
+    getToolDefinitions: jest.fn().mockReturnValue([
+      { name: 'test_tool', description: 'A test tool', inputSchema: { type: 'object' } }
+    ]),
+    execute: jest.fn().mockResolvedValue({ success: true })
+  }
+}));
+
 import { setupMcpServer } from '../mcp/server/mcpServer';
 import { mcpToolRegistry } from '../mcp/server/registry';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -65,6 +90,7 @@ describe('MCP Server', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env = { ...originalEnv };
+    process.env.MCP_HTTP_ENABLED = 'true'; // Enable HTTP server for tests
     delete process.env.MCP_ACCESS_TOKEN;
     
     app = express();
@@ -250,6 +276,7 @@ describe('MCP Server', () => {
 
     beforeEach(() => {
       jest.clearAllMocks();
+      process.env.MCP_HTTP_ENABLED = 'true'; // Enable HTTP server for tests
     });
 
     it('should create new session on initialization', async () => {
@@ -314,6 +341,7 @@ describe('Environment configuration', () => {
 
   beforeEach(() => {
     process.env = { ...originalEnv };
+    process.env.MCP_HTTP_ENABLED = 'true'; // Enable HTTP server for tests
   });
 
   afterEach(() => {

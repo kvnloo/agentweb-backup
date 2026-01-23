@@ -849,7 +849,7 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
 
     // Clean up on error
     req.on('error', (error) => {
-      console.error(`[SSE] Request error for session ${sessionId}:`, error);
+      // console.error(`[SSE] Request error for session ${sessionId}:`, error);
       clearInterval(pingInterval);
       cleanup();
       res.end();

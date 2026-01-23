@@ -1,16 +1,8 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import { mcpToolRegistry } from './registry';
 import express, { Request, Response, NextFunction } from "express";
 import { randomUUID } from "node:crypto";
-
-// Import all tools to register them
-import './tools';
+import { createMcpServer } from './mcpServerCore';
 
 // Session timeout in milliseconds (default: 5 minutes)
 const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '300000', 10);
@@ -87,7 +79,6 @@ export function setupMcpServer(app: express.Express) {
       if (session) {
         try {
           await session.transport.close();
-          console.log(`[MCP] Cleaned up stale session: ${sessionId} (inactive for ${Math.round((now - session.lastActivity) / 1000)}s)`);
         } catch (error) {
           console.error(`[MCP] Error closing stale session ${sessionId}:`, error);
         }
@@ -95,9 +86,6 @@ export function setupMcpServer(app: express.Express) {
       }
     }
 
-    if (staleSessionIds.length > 0) {
-      console.log(`[MCP] Cleaned up ${staleSessionIds.length} stale session(s). Active: ${sessions.size}`);
-    }
   };
 
   // Start periodic cleanup
@@ -107,21 +95,18 @@ export function setupMcpServer(app: express.Express) {
    * Gracefully shutdown all MCP sessions
    */
   const shutdownAllSessions = async () => {
-    console.log(`[MCP] Shutting down ${sessions.size} active session(s)...`);
     clearInterval(cleanupInterval);
     
     const closePromises: Promise<void>[] = [];
     for (const [sessionId, session] of sessions.entries()) {
       closePromises.push(
         session.transport.close()
-          .then(() => console.log(`[MCP] Session ${sessionId} closed`))
           .catch((err) => console.error(`[MCP] Error closing session ${sessionId}:`, err))
       );
     }
     
     await Promise.allSettled(closePromises);
     sessions.clear();
-    console.log('[MCP] All MCP sessions closed');
   };
 
   // Export shutdown function for use by main server
@@ -136,70 +121,8 @@ export function setupMcpServer(app: express.Express) {
   process.on('SIGTERM', () => handleShutdown('SIGTERM'));
   process.on('SIGINT', () => handleShutdown('SIGINT'));
 
-  // Factory function to create a new MCP server instance
-  const createServer = () => {
-    const server = new Server(
-      {
-        name: "agentweb-internal-server",
-        version: "1.0.0",
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
-
-    /**
-     * Handler for listing available tools.
-     */
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
-      return {
-        tools: mcpToolRegistry.getToolDefinitions(),
-      };
-    });
-
-    /**
-     * Handler for tool execution.
-     */
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
-      // Extract context fields from args (injected by internal MCP clients)
-      const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
-      const context = { userId, sessionId, llmModel };
-
-      try {
-        const result = await mcpToolRegistry.execute(name, toolArgs, context);
-        
-        if (result && typeof result === 'object' && 'content' in result) {
-          return result;
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
-            },
-          ],
-        };
-      } catch (error: any) {
-        console.error(`[MCP] Error executing tool ${name}:`, error);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error: ${error.message}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    });
-
-    return server;
-  };
+  // Use shared server factory from core module
+  const createServer = () => createMcpServer("agentweb-http-server");
 
   // POST handler - handles all JSON-RPC messages including initialization
   // Note: express.json() is added here because MCP routes are mounted before global body parser
@@ -220,7 +143,6 @@ export function setupMcpServer(app: express.Express) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
-            console.log(`[MCP] Session initialized: ${newSessionId}`);
             sessions.set(newSessionId, {
               transport,
               lastActivity: Date.now()
@@ -232,7 +154,6 @@ export function setupMcpServer(app: express.Express) {
         transport.onclose = () => {
           const sid = transport.sessionId;
           if (sid && sessions.has(sid)) {
-            console.log(`[MCP] Session ${sid} closed. Active: ${sessions.size - 1}`);
             sessions.delete(sid);
           }
         };
@@ -243,7 +164,6 @@ export function setupMcpServer(app: express.Express) {
         
         // Handle the initialization request
         await transport.handleRequest(req, res, req.body);
-        console.log(`[MCP] Session connected. Active: ${sessions.size}`);
         return;
       } else {
         // Invalid request - no session ID or not initialization request
@@ -292,13 +212,6 @@ export function setupMcpServer(app: express.Express) {
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true);
 
-    const lastEventId = req.headers['last-event-id'];
-    if (lastEventId) {
-      console.log(`[MCP] Client reconnecting with Last-Event-ID: ${lastEventId}`);
-    } else {
-      console.log(`[MCP] Establishing SSE stream for session ${sessionId}`);
-    }
-
     const transport = sessions.get(sessionId)!.transport;
     await transport.handleRequest(req, res);
   });
@@ -312,7 +225,6 @@ export function setupMcpServer(app: express.Express) {
       return;
     }
 
-    console.log(`[MCP] Session termination request: ${sessionId}`);
 
     try {
       const transport = sessions.get(sessionId)!.transport;
@@ -326,6 +238,5 @@ export function setupMcpServer(app: express.Express) {
   });
 
   const isSecured = !!process.env.MCP_ACCESS_TOKEN;
-  console.log(`[MCP] MCP Streamable HTTP routes mounted at /mcp/server (secured: ${isSecured})`);
-  console.log(`[MCP] Session timeout: ${SESSION_TIMEOUT_MS / 1000}s, cleanup interval: ${CLEANUP_INTERVAL_MS / 1000}s`);
+  console.log(`[MCP] HTTP Server initialized (secured: ${isSecured})`);
 }

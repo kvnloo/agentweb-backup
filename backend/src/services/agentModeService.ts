@@ -73,6 +73,19 @@ export class AgentModeService {
     }
   }
 
+  public async shutdown() {
+    try {
+      if ((AgentModeService as any).mcpInitialized) {
+        console.log('AgentMode: Shutting down MCP clients...');
+        await this.mcpClientService.shutdown();
+        (AgentModeService as any).mcpInitialized = false;
+        console.log('AgentMode: MCP clients shut down successfully');
+      }
+    } catch (error) {
+      console.error('AgentMode: Error during shutdown:', error);
+    }
+  }
+
   public async initializeMcp() {
     if ((AgentModeService as any).mcpInitialized) return;
     (AgentModeService as any).mcpInitialized = true;

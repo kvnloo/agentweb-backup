@@ -75,6 +75,8 @@ const McpServersTab: React.FC = () => {
     accessToken: "",
     isInternal: false,
   });
+  const [argsInput, setArgsInput] = useState("");
+  const [configInput, setConfigInput] = useState("");
   const [formLoading, setFormLoading] = useState(false);
   
   // Tool discovery state
@@ -107,7 +109,30 @@ const McpServersTab: React.FC = () => {
     try {
       setFormLoading(true);
       setError("");
-      await axios.post(buildApiUrl("/api/admin/mcp-servers"), formData, {
+      
+      let parsedArgs: string[] | undefined;
+      if (argsInput.trim()) {
+        parsedArgs = argsInput.split('\n').map(a => a.trim()).filter(a => a);
+      }
+      
+      let parsedConfig: Record<string, any> = {};
+      if (configInput.trim()) {
+        try {
+          parsedConfig = JSON.parse(configInput);
+        } catch (e) {
+          setError("Invalid JSON for Additional Configuration");
+          setFormLoading(false);
+          return;
+        }
+      }
+
+      const finalPayload = {
+          ...parsedConfig,
+          ...formData, // UI fields override
+          args: parsedArgs, // Args overrides
+      };
+
+      await axios.post(buildApiUrl("/api/admin/mcp-servers"), finalPayload, {
         headers: { Authorization: `Bearer ${token}` },
       });
       setSuccess("Server added successfully");
@@ -126,9 +151,31 @@ const McpServersTab: React.FC = () => {
     try {
       setFormLoading(true);
       setError("");
+      let parsedArgs: string[] | undefined;
+      if (argsInput.trim()) {
+        parsedArgs = argsInput.split('\n').map(a => a.trim()).filter(a => a);
+      }
+      
+      let parsedConfig: Record<string, any> = {};
+      if (configInput.trim()) {
+        try {
+          parsedConfig = JSON.parse(configInput);
+        } catch (e) {
+          setError("Invalid JSON for Additional Configuration");
+          setFormLoading(false);
+          return;
+        }
+      }
+
+      const payload = {
+        ...parsedConfig,
+        ...formData,
+        args: parsedArgs,
+      };
+
       await axios.put(
         buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverToEdit.name)}`),
-        formData,
+        payload,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSuccess("Server updated successfully");
@@ -191,6 +238,8 @@ const McpServersTab: React.FC = () => {
       accessToken: "",
       isInternal: false,
     });
+    setArgsInput("");
+    setConfigInput("");
     setServerToEdit(null);
   };
 
@@ -204,6 +253,17 @@ const McpServersTab: React.FC = () => {
       accessToken: server.accessToken || "",
       isInternal: server.isInternal || false,
     });
+    setArgsInput(server.args ? server.args.join('\n') : "");
+    
+    // Extract everything that ISN'T in the main form fields to populate configInput?
+    // Or just show env? User specifically asked for this to "make json complete".
+    // For now, let's just dump 'env' and any other unknown keys if we could know them.
+    // Given the type definition, we only really know 'env'.
+    // Let's just put 'env' in there for now as a default start.
+    const additionalConfig = {
+        env: server.env
+    };
+    setConfigInput(server.env ? JSON.stringify(additionalConfig, null, 2) : "");
     setEditDialogOpen(true);
   };
 
@@ -431,14 +491,35 @@ const McpServersTab: React.FC = () => {
               />
             )}
             {formData.transport === "stdio" && (
-              <TextField
-                label="Command"
-                value={formData.command}
-                onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-                fullWidth
-                required
-                placeholder="npx -y @modelcontextprotocol/server-example"
-              />
+              <>
+                <TextField
+                  label="Command"
+                  value={formData.command}
+                  onChange={(e) => setFormData({ ...formData, command: e.target.value })}
+                  fullWidth
+                  required
+                  placeholder="npx"
+                />
+                <TextField
+                  label="Arguments (one per line)"
+                  value={argsInput}
+                  onChange={(e) => setArgsInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={2}
+                  placeholder={"-y\n@modelcontextprotocol/server-example"}
+                />
+                <TextField
+                  label="Additional Configuration (JSON)"
+                  value={configInput}
+                  onChange={(e) => setConfigInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={2}
+                  placeholder={'{\n  "env": {\n    "PATH": "${PATH}"\n  }\n}'}
+                  helperText="Any JSON properties here will be merged into the server config (e.g. env)"
+                />
+              </>
             )}
             <TextField
               label="Access Token (optional)"
@@ -510,13 +591,32 @@ const McpServersTab: React.FC = () => {
               />
             )}
             {formData.transport === "stdio" && (
-              <TextField
-                label="Command"
-                value={formData.command}
-                onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-                fullWidth
-                required
-              />
+              <>
+                <TextField
+                  label="Command"
+                  value={formData.command}
+                  onChange={(e) => setFormData({ ...formData, command: e.target.value })}
+                  fullWidth
+                  required
+                />
+                <TextField
+                  label="Arguments (one per line)"
+                  value={argsInput}
+                  onChange={(e) => setArgsInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={2}
+                />
+                <TextField
+                  label="Additional Configuration (JSON)"
+                  value={configInput}
+                  onChange={(e) => setConfigInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={2}
+                  helperText="Any JSON properties here will be merged into the server config"
+                />
+              </>
             )}
             <TextField
               label="Access Token (optional)"

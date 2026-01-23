@@ -129,6 +129,31 @@ describe('McpClientService', () => {
       const urlArg = (SSEClientTransport as jest.Mock).mock.calls[0][0];
       expect(urlArg.href).toBe('http://localhost:4000/mcp');
     });
+    it('should resolve ${BACKEND_DIR} to backend root', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{
+          name: 'relative-server',
+          transport: 'stdio',
+          command: 'node',
+          args: ['${BACKEND_DIR}/dist/server.js']
+        }])
+      });
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+
+      expect(StdioClientTransport).toHaveBeenCalled();
+      const args = (StdioClientTransport as jest.Mock).mock.calls[0][0].args;
+      
+      const expectedPath = path.resolve(__dirname, '../..', 'dist/server.js');
+      expect(args[0]).toBe(expectedPath);
+    });
   });
 
   describe('initialize', () => {
@@ -535,7 +560,7 @@ describe('McpClientService', () => {
 
       const tools = service.getTools();
       expect(tools).toHaveLength(1);
-      expect(tools[0].name).toBe('discovered_tool');
+      expect(tools[0].name).toBe('test-server_discovered_tool');
     });
   });
 

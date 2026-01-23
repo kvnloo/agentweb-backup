@@ -52,6 +52,12 @@ interface McpConfig {
  */
 function resolveEnvPlaceholders(value: string): string {
   return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
+    // Special internal variables
+    if (varName === 'BACKEND_DIR') {
+      // Resolve to the root of the backend directory (3 levels up from src/mcp/client)
+      return path.resolve(__dirname, '../../..');
+    }
+    
     const envValue = process.env[varName];
     if (envValue) return envValue;
     // Fallback defaults
@@ -89,55 +95,44 @@ export class McpClientService {
    */
   async initialize(): Promise<void> {
     try {
-      let config: McpConfig | null = null;
-      
-      // Try to load from database first
-      try {
-        const setting = await settingsService.getSetting("mcp_servers");
-        if (setting && setting.settingValue) {
-          const servers = JSON.parse(setting.settingValue);
-          // Convert array format from DB to Record format expected by McpConfig if needed
-          // The DB stores array: [{name: "d", ...}]
-          // McpConfig expects: { mcpServers: { "serverName": {...} } }
-          
-          if (Array.isArray(servers)) {
-            const mcpServers: Record<string, McpServerConfig> = {};
-            servers.forEach((server: any) => {
-              if (server.name) {
-                mcpServers[server.name] = server;
-              }
-            });
-            config = { mcpServers };
-            console.log(`MCP: Loaded configuration from database (${Object.keys(mcpServers).length} servers)`);
-          }
-        }
-      } catch (dbError) {
-        console.warn("MCP: Failed to load config from DB, falling back to file:", dbError);
-      }
-      
-      // Fallback to file if no DB config or if DB config has no servers
-      if ((!config || Object.keys(config.mcpServers).length === 0) && fs.existsSync(this.configPath)) {
+      // 1. Load File Config (Internal/Core tools) - No Prefix
+      if (fs.existsSync(this.configPath)) {
         try {
-          config = JSON.parse(fs.readFileSync(this.configPath, "utf-8"));
-          console.log("MCP: Loaded configuration from file (fallback enabled)");
-          
-          // Optional: Auto-migrate to DB if needed, but maybe better to leave manual
+          const fileConfig = JSON.parse(fs.readFileSync(this.configPath, "utf-8"));
+          if (fileConfig && fileConfig.mcpServers) {
+             console.log(`MCP: Loading ${Object.keys(fileConfig.mcpServers).length} internal servers from file`);
+             for (const [serverName, serverConfig] of Object.entries(fileConfig.mcpServers)) {
+               // Internal tools don't get a prefix
+               await this.safeConnectToServer(serverName, serverConfig as McpServerConfig);
+             }
+          }
         } catch (fileError) {
           console.error("MCP: Error reading config file:", fileError);
         }
       }
-      
-      if (!config) {
-        console.log("MCP: No configuration found");
-        return;
-      }
-      
-      for (const [serverName, serverConfig] of Object.entries(config.mcpServers)) {
-        try {
-          await this.connectToServer(serverName, serverConfig);
-        } catch (error) {
-          console.error(`MCP: Failed to connect to server ${serverName}:`, error);
+
+      // 2. Load DB Config (External/Dynamic tools) - With Prefix
+      try {
+        const setting = await settingsService.getSetting("mcp_servers");
+        if (setting && setting.settingValue) {
+          const servers = JSON.parse(setting.settingValue);
+          if (Array.isArray(servers)) {
+            console.log(`MCP: Loading ${servers.length} external servers from database`);
+            for (const server of servers) {
+              if (server.name) {
+                // Check if already loaded (e.g. from file config)
+                if (this.clients.has(server.name)) {
+                  console.log(`MCP: Skipping DB server ${server.name} as it is already loaded from file config`);
+                  continue;
+                }
+                // External tools get prefixed with server name
+                await this.safeConnectToServer(server.name, server, server.name);
+              }
+            }
+          }
         }
+      } catch (dbError) {
+        console.warn("MCP: Failed to load config from DB:", dbError);
       }
 
       if (this.mcpTools.length > 0) {
@@ -146,6 +141,28 @@ export class McpClientService {
     } catch (error) {
       console.error("MCP: Initialization error:", error);
     }
+  }
+
+  private async safeConnectToServer(serverName: string, serverConfig: McpServerConfig, toolPrefix?: string) {
+      try {
+          // Skip self-referential connections
+          // if ('url' in serverConfig) {
+          //   const resolvedUrl = resolveEnvPlaceholders(serverConfig.url);
+          //   const backendPort = process.env.PORT || '3001';
+          //   const selfUrls = [
+          //     `http://localhost:${backendPort}/mcp/server`,
+          //     `http://127.0.0.1:${backendPort}/mcp/server`,
+          //   ];
+          //   if (selfUrls.some(selfUrl => resolvedUrl === selfUrl)) {
+          //     console.log(`MCP: Skipping self-referential server ${serverName} (internal tools already available)`);
+          //     return;
+          //   }
+          // }
+          
+          await this.connectToServer(serverName, serverConfig, toolPrefix);
+      } catch (error) {
+          console.error(`MCP: Failed to connect to server ${serverName}:`, error);
+      }
   }
 
   /**
@@ -246,7 +263,7 @@ export class McpClientService {
     return new StreamableHTTPClientTransport(new URL(resolvedUrl), { requestInit });
   }
 
-  private async connectToServer(name: string, config: McpServerConfig): Promise<void> {
+  private async connectToServer(name: string, config: McpServerConfig, toolPrefix?: string): Promise<void> {
     const transportType = getTransportType(config);
     
     // Validate config based on transport type
@@ -278,7 +295,18 @@ export class McpClientService {
     );
 
     transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
-    transport.onerror = (err: any) => console.error(`MCP: Transport error for ${name}:`, err);
+    transport.onerror = (err: any) => {
+      // Suppress expected errors during shutdown/reload
+      const errorMessage = err?.message || '';
+      if (
+        errorMessage.includes('AbortError') || 
+        errorMessage.includes('SSE stream disconnected') ||
+        errorMessage.includes('This operation was aborted')
+      ) {
+        return;
+      }
+      console.error(`MCP: Transport error for ${name}:`, err);
+    };
 
     await Promise.race([connectPromise, timeoutPromise]);
     this.clients.set(name, client);
@@ -288,12 +316,16 @@ export class McpClientService {
     const isInternal = 'isInternal' in config ? config.isInternal : false;
     
     for (const tool of response.tools) {
+      // If a prefix is provided, prepend it to the tool name
+      const exposedToolName = toolPrefix ? `${toolPrefix}_${tool.name}` : tool.name;
+      const originalToolName = tool.name; // Keep for execution
+
       const agentTool: AgentTool = {
-        name: tool.name,
+        name: exposedToolName,
         definition: {
           type: "function",
           function: {
-            name: tool.name,
+            name: exposedToolName, // Use prefixed name in definition
             description: tool.description,
             parameters: tool.inputSchema
           }
@@ -311,7 +343,7 @@ export class McpClientService {
             }
 
             const result = await client.callTool({
-              name: tool.name,
+              name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
               arguments: toolArgs
             });
             
@@ -334,7 +366,7 @@ export class McpClientService {
               raw: result
             };
           } catch (error) {
-            console.error(`MCP Tool Execution Error (${tool.name}):`, error);
+            console.error(`MCP Tool Execution Error (${exposedToolName}):`, error);
             throw error;
           }
         }

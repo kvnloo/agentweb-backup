@@ -177,6 +177,9 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
   
+  // Shutdown Agent Mode services (closes MCP clients)
+  await agentModeService.shutdown();
+  
   // Close Socket.IO connections
   io.close((err) => {
     if (err) {

@@ -20,7 +20,6 @@ module.exports = {
   transformIgnorePatterns: ['/node_modules/'],
   collectCoverageFrom: [
     'src/utils/**/*.ts',
-    'src/mcp/**/*.ts',
     '!src/**/*.d.ts',
     '!src/__tests__/**',
   ],

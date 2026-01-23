@@ -1,5 +1,6 @@
 import express from "express";
 import { settingsService } from "../services/settingsService";
+import path from "path";
 
 const router = express.Router();
 
@@ -227,6 +228,10 @@ router.post("/:name/discover-tools", async (req, res) => {
     // Helper to resolve environment variables
     const resolveEnv = (value: string) => {
       return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
+        if (varName === 'BACKEND_DIR') {
+           // Assuming we are in src/routes, getting to root (backend/) requires going up 2 levels
+           return path.resolve(__dirname, '../..');
+        }
         const envValue = process.env[varName];
         if (envValue) return envValue;
         if (varName === 'BACKEND_URL') {
@@ -242,6 +247,7 @@ router.post("/:name/discover-tools", async (req, res) => {
       const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
       const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
       const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
+      const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
       
       let transport;
       
@@ -272,7 +278,22 @@ router.post("/:name/discover-tools", async (req, res) => {
         
         transport = new SSEClientTransport(new URL(resolvedUrl), transportOptions);
       } else if (server.transport === 'stdio') {
-        return res.status(400).json({ message: "Tool discovery for Stdio transport is not supported in the admin UI" });
+        const resolvedCommand = resolveEnv(server.command || '');
+        const resolvedArgs = server.args?.map(resolveEnv) || [];
+        const resolvedEnv = server.env ? Object.fromEntries(
+          Object.entries(server.env).map(([k, v]) => [k, resolveEnv(v)])
+        ) : undefined;
+        
+        console.log(`[MCP Discovery] Stdio Config:`, { 
+          command: resolvedCommand, 
+          args: resolvedArgs 
+        });
+
+        transport = new StdioClientTransport({
+          command: resolvedCommand,
+          args: resolvedArgs,
+          env: { ...process.env, ...resolvedEnv } as Record<string, string>
+        });
       } else {
         return res.status(400).json({ message: "Invalid server configuration for tool discovery" });
       }
@@ -286,7 +307,7 @@ router.post("/:name/discover-tools", async (req, res) => {
       // Connect with timeout
       const connectPromise = client.connect(transport);
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error("Connection timeout")), 15000)
+        setTimeout(() => reject(new Error("Connection timeout")), 30000)
       );
       
       await Promise.race([connectPromise, timeoutPromise]);
