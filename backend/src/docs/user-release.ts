@@ -7,6 +7,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-22',
+    changes: [
+      'Added Get Support Feature',
+      '- Added "Get Support" button in customer portal header for easy access to help',
+      '- Support form allows users to describe their issue with auto-filled page URL for context',
+      '- Support requests are sent via email to founders@agentweb.pro with HTML formatting',
+      '- Reply-To automatically set to the customer\'s email for easy responses',
+      'Fixed Agent Mode Session Loading Bug with Delegate Access',
+      '- Agent Mode now clears all session state when token changes (delegate user switch)',
+      '- Plan session transfer now completes without auto-navigation to avoid race conditions',
+    ],
+  },
+  {
     date: '2026-01-21',
     changes: [
       'Supported fetching LinkedIn personal connected-account metrics in Agent Mode',
