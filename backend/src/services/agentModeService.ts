@@ -9024,12 +9024,31 @@ ${emailDraftFormat === 'text'
         }
 
         // Add categories - use fieldMapping or default to 'categories'
-        // Categories is a multi-reference field, expecting an array of IDs
+        // Detect if field is single reference (singular name) or multi-reference (plural name)
         // Convert category names to IDs using the mapping from secrets manager
         const categoryField = fieldMappings?.category || 'categories';
-        let categoryIds: string[] = [];
 
+        // Detect if this is a single reference or multi-reference field
+        // Single reference: field name is singular (e.g., "category", "tag")
+        // Multi-reference: field name is plural (e.g., "categories", "tags")
+        const isSingleReference = !categoryField.endsWith('ies') && !categoryField.endsWith('s');
+
+        console.log(`AgentMode: Category field "${categoryField}" detected as ${isSingleReference ? 'single reference' : 'multi-reference'}`);
+
+        let categoryIds: string[] = [];
         const invalidCategories: string[] = [];
+
+        // Check if category mapping is required but not configured
+        if (categories && categories.length > 0 && !categoryMapping) {
+          const availableCategories: string[] = [];
+          return {
+            success: false,
+            message: 'Category mapping is not configured in secrets manager. Please configure the "categories" field in your Webflow secrets with category name-to-ID mappings.',
+            error: 'Categories mapping required but not configured',
+            invalidCategories: categories,
+            availableCategories: availableCategories
+          };
+        }
 
         if (categories && categories.length > 0 && categoryMapping) {
           // Map category names to IDs
@@ -9044,13 +9063,31 @@ ${emailDraftFormat === 'text'
               return id;
             })
             .filter((id): id is string => id !== null);
-        } else if (categories && categories.length > 0 && !categoryMapping) {
-          // If no mapping provided, assume categories are already IDs
-          console.warn('AgentMode: No category mapping found in config, treating category values as IDs');
-          categoryIds = categories;
+
+          // If all provided categories are invalid, return error immediately
+          if (categories.length > 0 && categoryIds.length === 0) {
+            const availableCategories = Object.keys(categoryMapping);
+            return {
+              success: false,
+              message: `All provided category names are invalid: ${invalidCategories.join(', ')}. Available categories: ${availableCategories.join(', ')}`,
+              error: 'Invalid category names',
+              invalidCategories: invalidCategories,
+              availableCategories: availableCategories
+            };
+          }
         }
 
-        cmsItemData.fieldData[categoryField] = categoryIds;
+        // Set the field value based on reference type
+        if (isSingleReference) {
+          // Single reference: use only the first category ID
+          cmsItemData.fieldData[categoryField] = categoryIds.length > 0 ? categoryIds[0] : '';
+          if (categoryIds.length > 1) {
+            console.warn(`AgentMode: Field "${categoryField}" is a single reference but ${categoryIds.length} categories provided. Using only the first one: ${categoryIds[0]}`);
+          }
+        } else {
+          // Multi-reference: use array of category IDs
+          cmsItemData.fieldData[categoryField] = categoryIds;
+        }
 
         // Log warning if some categories were invalid but others were valid
         if (invalidCategories.length > 0 && categoryIds.length > 0) {
@@ -9062,7 +9099,8 @@ ${emailDraftFormat === 'text'
         if (status === 'published' && categoryIds.length === 0) {
           const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
 
-          let errorMessage = 'Cannot publish article without categories. Please provide at least one category when status is "published".';
+          const fieldType = isSingleReference ? 'category (single reference)' : 'categories (multi-reference)';
+          let errorMessage = `Cannot publish article without ${fieldType}. Please provide at least one category when status is "published".`;
 
           // If invalid categories were provided, mention them
           if (invalidCategories.length > 0) {
@@ -9076,12 +9114,18 @@ ${emailDraftFormat === 'text'
             errorMessage += ' No category mapping found in configuration.';
           }
 
+          // Add note about single reference if applicable
+          if (isSingleReference && categories.length > 1) {
+            errorMessage += ` Note: Field "${categoryField}" is a single reference - only the first valid category will be used.`;
+          }
+
           return {
             success: false,
             message: errorMessage,
             error: 'Categories required for published articles',
             invalidCategories: invalidCategories,
-            availableCategories: availableCategories
+            availableCategories: availableCategories,
+            fieldType: isSingleReference ? 'single-reference' : 'multi-reference'
           };
         }
 

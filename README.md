@@ -991,6 +991,42 @@ publish_blog_article({
 - If validation fails, the error message will include a list of available category names
 - The system automatically converts category names to IDs before sending to Webflow
 
+**Single Reference vs Multi-Reference Fields:**
+
+The system intelligently detects whether your Webflow category field is a single reference or multi-reference based on the field name:
+
+- **Single Reference** (singular field name like `"category"`, `"tag"`):
+  - Only accepts ONE category
+  - If multiple categories are provided, only the first one will be used
+  - Value sent to Webflow: `"categoryId123"` (string)
+  - Configure in fieldMappings: `"category": "category"`
+
+- **Multi-Reference** (plural field name like `"categories"`, `"tags"`):
+  - Accepts MULTIPLE categories
+  - All provided categories will be included
+  - Value sent to Webflow: `["categoryId123", "categoryId456"]` (array)
+  - Configure in fieldMappings: `"category": "categories"` (default)
+
+**Example configurations:**
+
+```json
+// Multi-reference (default) - accepts multiple categories
+{
+  "fieldMappings": {
+    "category": "categories"  // plural name = multi-reference
+  }
+}
+
+// Single reference - accepts only one category
+{
+  "fieldMappings": {
+    "category": "category"  // singular name = single reference
+  }
+}
+```
+
+The system automatically detects the field type based on whether the field name ends with "s" or "ies".
+
 **How to get Webflow credentials:**
 
 1. **Get Site API Token:**
