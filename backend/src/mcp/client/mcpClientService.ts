@@ -7,9 +7,10 @@ import { AgentTool, ToolContext } from "./toolRegistry";
 import fs from "fs";
 import path from "path";
 import { settingsService } from "../../services/settingsService";
+import { decryptPassword } from "../../routes/config";
 
 // SSE transport configuration
-interface SseTransportConfig {
+export interface SseTransportConfig {
   transport: "sse";
   url: string;
   accessToken?: string;
@@ -17,7 +18,7 @@ interface SseTransportConfig {
 }
 
 // Stdio transport configuration (for local subprocess servers)
-interface StdioTransportConfig {
+export interface StdioTransportConfig {
   transport: "stdio";
   command: string;
   args?: string[];
@@ -26,7 +27,7 @@ interface StdioTransportConfig {
 }
 
 // Streamable HTTP transport configuration (modern standard)
-interface StreamableHttpTransportConfig {
+export interface StreamableHttpTransportConfig {
   transport: "streamable-http";
   url: string;
   accessToken?: string;
@@ -34,13 +35,13 @@ interface StreamableHttpTransportConfig {
 }
 
 // Legacy config without explicit transport (defaults to SSE for backward compatibility)
-interface LegacyConfig {
+export interface LegacyConfig {
   url: string;
   accessToken?: string;
   isInternal?: boolean;
 }
 
-type McpServerConfig = SseTransportConfig | StdioTransportConfig | StreamableHttpTransportConfig | LegacyConfig;
+export type McpServerConfig = SseTransportConfig | StdioTransportConfig | StreamableHttpTransportConfig | LegacyConfig;
 
 interface McpConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -145,20 +146,6 @@ export class McpClientService {
 
   private async safeConnectToServer(serverName: string, serverConfig: McpServerConfig, toolPrefix?: string) {
       try {
-          // Skip self-referential connections
-          // if ('url' in serverConfig) {
-          //   const resolvedUrl = resolveEnvPlaceholders(serverConfig.url);
-          //   const backendPort = process.env.PORT || '3001';
-          //   const selfUrls = [
-          //     `http://localhost:${backendPort}/mcp/server`,
-          //     `http://127.0.0.1:${backendPort}/mcp/server`,
-          //   ];
-          //   if (selfUrls.some(selfUrl => resolvedUrl === selfUrl)) {
-          //     console.log(`MCP: Skipping self-referential server ${serverName} (internal tools already available)`);
-          //     return;
-          //   }
-          // }
-          
           await this.connectToServer(serverName, serverConfig, toolPrefix);
       } catch (error) {
           console.error(`MCP: Failed to connect to server ${serverName}:`, error);
@@ -168,7 +155,7 @@ export class McpClientService {
   /**
    * Creates the appropriate transport based on configuration
    */
-  private async createTransport(name: string, config: McpServerConfig): Promise<Transport> {
+  public async createTransport(name: string, config: McpServerConfig): Promise<Transport> {
     const transportType = getTransportType(config);
 
     switch (transportType) {
@@ -191,7 +178,19 @@ export class McpClientService {
    */
   private createSseTransport(name: string, config: SseTransportConfig | LegacyConfig): Transport {
     const resolvedUrl = resolveEnvPlaceholders(config.url);
-    const resolvedToken = config.accessToken ? resolveEnvPlaceholders(config.accessToken) : undefined;
+    let resolvedToken: string | undefined;
+
+    if (config.accessToken) {
+        try {
+            const resolved = resolveEnvPlaceholders(config.accessToken);
+            // Try to decrypt
+            const decrypted = decryptPassword(resolved);
+            resolvedToken = decrypted.password;
+        } catch (e) {
+            // Fallback to plain text (legacy or already plain)
+            resolvedToken = resolveEnvPlaceholders(config.accessToken);
+        }
+    }
     
     console.log(`MCP: Creating SSE transport for ${name} at ${resolvedUrl}`);
     
@@ -247,7 +246,19 @@ export class McpClientService {
    */
   private createStreamableHttpTransport(name: string, config: StreamableHttpTransportConfig): Transport {
     const resolvedUrl = resolveEnvPlaceholders(config.url);
-    const resolvedToken = config.accessToken ? resolveEnvPlaceholders(config.accessToken) : undefined;
+    let resolvedToken: string | undefined;
+
+    if (config.accessToken) {
+        try {
+            const resolved = resolveEnvPlaceholders(config.accessToken);
+            // Try to decrypt
+            const decrypted = decryptPassword(resolved);
+            resolvedToken = decrypted.password;
+        } catch (e) {
+            // Fallback to plain text (legacy or already plain)
+            resolvedToken = resolveEnvPlaceholders(config.accessToken);
+        }
+    }
     
     console.log(`MCP: Creating Streamable HTTP transport for ${name} at ${resolvedUrl}`);
     
@@ -381,6 +392,16 @@ export class McpClientService {
    */
   getTools(): AgentTool[] {
     return this.mcpTools;
+  }
+
+  /**
+   * Refresh MCP clients - reconnect to all servers and rediscover tools
+   */
+  async refresh(): Promise<void> {
+    console.log('MCP: Refreshing all connections...');
+    await this.shutdown();
+    await this.initialize();
+    console.log(`MCP: Refresh complete. ${this.mcpTools.length} tools available.`);
   }
 
   /**

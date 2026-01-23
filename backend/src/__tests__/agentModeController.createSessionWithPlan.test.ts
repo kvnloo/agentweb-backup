@@ -23,7 +23,8 @@ jest.mock('../services/settingsService', () => ({
 }));
 
 jest.mock('../middleware/auth', () => ({
-  getUserFromToken: jest.fn()
+  getUserFromToken: jest.fn(),
+  authenticateToken: jest.fn((req, res, next) => next())
 }));
 
 jest.mock('uuid', () => ({

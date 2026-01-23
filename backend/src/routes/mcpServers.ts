@@ -1,6 +1,10 @@
 import express from "express";
 import { settingsService } from "../services/settingsService";
 import path from "path";
+import { encryptPassword, decryptPassword } from "./config";
+import { McpClientService } from "../mcp/client/mcpClientService";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { agentModeService } from "../services/agentModeService";
 
 const router = express.Router();
 
@@ -78,7 +82,7 @@ router.post("/", async (req, res) => {
       ...(command && { command }),
       ...(args && { args }),
       ...(env && { env }),
-      ...(accessToken && { accessToken }),
+      ...(accessToken && { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
     };
     servers.push(newServer);
@@ -90,6 +94,11 @@ router.post("/", async (req, res) => {
       "MCP Server configurations",
       (req as any).user?.userId || "admin"
     );
+    
+    // Refresh MCP tools asynchronously (don't block response)
+    agentModeService.refreshMcpTools().catch(err => {
+      console.error('Error refreshing MCP tools after add:', err);
+    });
     
     res.status(201).json(newServer);
   } catch (error) {
@@ -136,7 +145,22 @@ router.put("/:name", async (req, res) => {
       ...(command !== undefined && { command }),
       ...(args !== undefined && { args }),
       ...(env !== undefined && { env }),
-      ...(accessToken !== undefined && { accessToken }),
+      ...(env !== undefined && { env }),
+      // Handle access token encryption
+      ...(accessToken !== undefined && (() => {
+        // If empty string, allow it (clearing token)
+        if (!accessToken) return { accessToken };
+        
+        // Try to decrypt to see if it's already encrypted
+        try {
+           decryptPassword(accessToken);
+           // If successful, it's already encrypted, allow as is
+           return { accessToken };
+        } catch (e) {
+           // If failed, it's plain text, encrypt it
+           return { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") };
+        }
+      })()),
       ...(typeof isInternal === 'boolean' && { isInternal }),
       discoveredTools: servers[serverIndex].discoveredTools,
     };
@@ -149,6 +173,11 @@ router.put("/:name", async (req, res) => {
       "MCP Server configurations",
       (req as any).user?.userId || "admin"
     );
+    
+    // Refresh MCP tools asynchronously (don't block response)
+    agentModeService.refreshMcpTools().catch(err => {
+      console.error('Error refreshing MCP tools after update:', err);
+    });
     
     res.json(updatedServer);
   } catch (error) {
@@ -191,6 +220,11 @@ router.delete("/:name", async (req, res) => {
       "MCP Server configurations",
       (req as any).user?.userId || "admin"
     );
+    
+    // Refresh MCP tools asynchronously (don't block response)
+    agentModeService.refreshMcpTools().catch(err => {
+      console.error('Error refreshing MCP tools after delete:', err);
+    });
     
     res.json({ message: "Server deleted successfully" });
   } catch (error) {
@@ -243,60 +277,13 @@ router.post("/:name/discover-tools", async (req, res) => {
     };
     
     try {
-      // Dynamic imports for MCP SDK
-      const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
-      const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
-      const { SSEClientTransport } = await import("@modelcontextprotocol/sdk/client/sse.js");
-      const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+      // Use McpClientService to create transport (handles decryption and env resolution)
+      const mcpService = new McpClientService();
       
-      let transport;
-      
-      if (server.transport === 'streamable-http' && server.url) {
-        const resolvedUrl = resolveEnv(server.url);
-        const resolvedToken = server.accessToken ? resolveEnv(server.accessToken) : undefined;
-        
-        const requestInit: RequestInit = {};
-        if (resolvedToken) {
-          requestInit.headers = { 'Authorization': `Bearer ${resolvedToken}` };
-        }
-        
-        transport = new StreamableHTTPClientTransport(new URL(resolvedUrl), { requestInit });
-      } else if ((server.transport === 'sse' || !server.transport) && server.url) {
-        const resolvedUrl = resolveEnv(server.url);
-        const resolvedToken = server.accessToken ? resolveEnv(server.accessToken) : undefined;
-        
-        const transportOptions: any = {};
-        if (resolvedToken) {
-          const authFetch = (url: string | URL | Request, init?: RequestInit) => {
-            const headers = new Headers(init?.headers);
-            headers.set('Authorization', `Bearer ${resolvedToken}`);
-            return fetch(url, { ...init, headers });
-          };
-          transportOptions.eventSourceInit = { fetch: authFetch };
-          transportOptions.requestInit = { headers: { 'Authorization': `Bearer ${resolvedToken}` } };
-        }
-        
-        transport = new SSEClientTransport(new URL(resolvedUrl), transportOptions);
-      } else if (server.transport === 'stdio') {
-        const resolvedCommand = resolveEnv(server.command || '');
-        const resolvedArgs = server.args?.map(resolveEnv) || [];
-        const resolvedEnv = server.env ? Object.fromEntries(
-          Object.entries(server.env).map(([k, v]) => [k, resolveEnv(v)])
-        ) : undefined;
-        
-        console.log(`[MCP Discovery] Stdio Config:`, { 
-          command: resolvedCommand, 
-          args: resolvedArgs 
-        });
-
-        transport = new StdioClientTransport({
-          command: resolvedCommand,
-          args: resolvedArgs,
-          env: { ...process.env, ...resolvedEnv } as Record<string, string>
-        });
-      } else {
-        return res.status(400).json({ message: "Invalid server configuration for tool discovery" });
-      }
+      // Cast server config to the exported type (assuming interface compatibility or simple object pass)
+      // The local McpServerConfig in the file is very similar to the one in McpClientService
+      // We can pass it directly as it matches the shape
+      const transport = await mcpService.createTransport(serverName, server as any);
       
       // Create client and connect
       const client = new Client(
@@ -314,7 +301,7 @@ router.post("/:name/discover-tools", async (req, res) => {
       
       // List tools
       const toolsResponse = await client.listTools();
-      const toolNames = toolsResponse.tools.map(tool => tool.name);
+      const toolNames = toolsResponse.tools.map((tool: any) => tool.name);
       
       // Close connection
       await client.close();
@@ -330,7 +317,7 @@ router.post("/:name/discover-tools", async (req, res) => {
       );
       
       res.json({ 
-        tools: toolsResponse.tools.map(tool => ({
+        tools: toolsResponse.tools.map((tool: any) => ({
           name: tool.name,
           description: tool.description
         })),

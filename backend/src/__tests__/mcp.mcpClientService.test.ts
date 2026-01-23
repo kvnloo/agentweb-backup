@@ -44,13 +44,20 @@ jest.mock('../services/settingsService', () => ({
   }
 }));
 
+// Mock decryptPassword
+jest.mock('../routes/config', () => ({
+  decryptPassword: jest.fn().mockImplementation((val) => ({ password: val, userId: 'test' }))
+}));
+
 jest.mock('fs');
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { settingsService } from '../services/settingsService';
+import { decryptPassword } from '../routes/config';
 
 describe('McpClientService', () => {
   let service: McpClientService;
@@ -389,6 +396,31 @@ describe('McpClientService', () => {
       await service.initialize();
 
       expect(StreamableHTTPClientTransport).toHaveBeenCalled();
+    });
+
+    it('should decrypt access token if present', async () => {
+      mockFs.readFileSync.mockReturnValue(JSON.stringify({
+        mcpServers: {
+          'encrypted-server': { 
+            transport: 'sse', 
+            url: 'http://enc.example.com/mcp',
+            accessToken: 'encrypted-token-123'
+          }
+        }
+      }));
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+
+      expect(decryptPassword).toHaveBeenCalledWith('encrypted-token-123');
+      const transportOptions = (SSEClientTransport as jest.Mock).mock.calls[0][1];
+      expect(transportOptions.requestInit.headers.Authorization).toBe('Bearer encrypted-token-123');
     });
 
     it('should default to SSE for legacy config without transport field', async () => {

@@ -105,6 +105,31 @@ export class AgentModeService {
     }
   }
 
+  /**
+   * Refresh MCP tools - reconnect to all MCP servers and update tool registry
+   * Call this when MCP server configurations change (add/update/delete)
+   */
+  public async refreshMcpTools(): Promise<void> {
+    console.log('AgentMode: Refreshing MCP tools...');
+    
+    // Clear existing MCP tools from registry
+    const existingTools = this.mcpClientService.getTools();
+    for (const tool of existingTools) {
+      this.toolRegistry.unregister(tool.name);
+    }
+    
+    // Refresh the MCP client service
+    await this.mcpClientService.refresh();
+    
+    // Re-register tools
+    const mcpTools = this.mcpClientService.getTools();
+    for (const tool of mcpTools) {
+      this.toolRegistry.register(tool);
+    }
+    
+    console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
+  }
+
   private async registerTools() {
     // 1. Ensure server tools are loaded into the global mcpToolRegistry (only needs to happen once)
     if (!AgentModeService.toolsRegistered) {

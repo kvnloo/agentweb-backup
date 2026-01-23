@@ -19,8 +19,7 @@ function deriveKey(secret: string): Buffer {
   return crypto.pbkdf2Sync(secretBuffer, 'salt', 100000, 32, 'sha256');
 }
 
-// Function to encrypt password
-function encryptPassword(password: string, userId: string): string {
+export function encryptPassword(password: string, userId: string): string {
   // First sign the password with userId
   const signedPassword = jwt.sign({ password, userId }, process.env.JWT_SECRET!);
   
@@ -46,6 +45,35 @@ function encryptPassword(password: string, userId: string): string {
   // Return as base64 string
   return combined.toString('base64');
 }
+
+export function decryptPassword(encryptedString: string): { password: string, userId: string } {
+    try {
+        const buffer = Buffer.from(encryptedString, 'base64');
+        
+        // Extract parts
+        // IV is 16 bytes
+        // AuthTag is 16 bytes (default for GCM)
+        const iv = buffer.slice(0, 16);
+        const authTag = buffer.slice(buffer.length - 16);
+        const encryptedText = buffer.slice(16, buffer.length - 16);
+        
+        const key = deriveKey(process.env.JWT_SECRET!);
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        
+        decipher.setAuthTag(authTag);
+        
+        let decrypted = decipher.update(encryptedText.toString('hex'), 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        
+        // Verify signature and extract content
+        const decoded = jwt.verify(decrypted, process.env.JWT_SECRET!) as { password: string, userId: string };
+        return decoded;
+    } catch (error) {
+        throw new Error('Failed to decrypt password');
+    }
+}
+
+
 
 // Get user's saved configurations
 router.get('/', authenticateToken, async (req, res) => {

@@ -24,8 +24,6 @@ import {
   Chip,
   IconButton,
   Collapse,
-  FormControlLabel,
-  Checkbox,
 } from "@mui/material";
 import {
   Add as AddIcon,
@@ -41,7 +39,7 @@ import { buildApiUrl } from "../../config";
 
 interface McpServer {
   name: string;
-  transport: "sse" | "stdio" | "streamable-http";
+  transport: "sse" | "streamable-http";
   url?: string;
   command?: string;
   args?: string[];
@@ -105,6 +103,26 @@ const McpServersTab: React.FC = () => {
     }
   };
 
+  const handleDiscoverTools = async (serverName: string) => {
+    try {
+      setDiscoveryLoading(serverName);
+      setError("");
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/discover-tools`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      setExpandedServer(serverName);
+      setSuccess(`Discovered ${response.data.count} tools from ${serverName}`);
+      loadServers(); // Reload to get updated discoveredTools
+    } catch (err: any) {
+      setError(err.response?.data?.message || `Failed to discover tools from ${serverName}`);
+    } finally {
+      setDiscoveryLoading(null);
+    }
+  };
+
   const handleAddServer = async () => {
     try {
       setFormLoading(true);
@@ -135,13 +153,23 @@ const McpServersTab: React.FC = () => {
       await axios.post(buildApiUrl("/api/admin/mcp-servers"), finalPayload, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      setSuccess("Server added successfully");
+      // Don't set success message here yet, wait for discovery
+      // setSuccess("Server added successfully"); 
       setAddDialogOpen(false);
+      const newServerName = formData.name!; // Name is required in form
       resetForm();
-      loadServers();
+      
+      // Auto-discover tools
+      // We keep formLoading true while discovering? Or maybe separate loading state?
+      // existing handleDiscoverTools sets discoveryLoading
+      setFormLoading(false); // Valid to clear form loading as dialog is closed
+      
+      await handleDiscoverTools(newServerName);
+      
+      // loadServers is called inside handleDiscoverTools
+    
     } catch (err: any) {
       setError(err.response?.data?.message || "Failed to add server");
-    } finally {
       setFormLoading(false);
     }
   };
@@ -209,25 +237,7 @@ const McpServersTab: React.FC = () => {
     }
   };
 
-  const handleDiscoverTools = async (serverName: string) => {
-    try {
-      setDiscoveryLoading(serverName);
-      setError("");
-      const response = await axios.post(
-        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/discover-tools`),
-        {},
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
 
-      setExpandedServer(serverName);
-      setSuccess(`Discovered ${response.data.count} tools from ${serverName}`);
-      loadServers(); // Reload to get updated discoveredTools
-    } catch (err: any) {
-      setError(err.response?.data?.message || `Failed to discover tools from ${serverName}`);
-    } finally {
-      setDiscoveryLoading(null);
-    }
-  };
 
   const resetForm = () => {
     setFormData({
@@ -326,14 +336,14 @@ const McpServersTab: React.FC = () => {
               <TableCell>Transport</TableCell>
               <TableCell>URL / Command</TableCell>
               <TableCell>Tools</TableCell>
-              <TableCell>Internal</TableCell>
+
               <TableCell>Actions</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {servers.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} align="center">
+                <TableCell colSpan={5} align="center">
                   <Typography color="textSecondary">
                     No MCP servers configured
                   </Typography>
@@ -391,13 +401,7 @@ const McpServersTab: React.FC = () => {
                         {server.discoveredTools?.length || 0} Tools
                       </Button>
                     </TableCell>
-                    <TableCell>
-                      {server.isInternal ? (
-                        <Chip label="Yes" size="small" color="info" />
-                      ) : (
-                        <Chip label="No" size="small" variant="outlined" />
-                      )}
-                    </TableCell>
+
                     <TableCell>
                       <IconButton
                         size="small"
@@ -417,7 +421,7 @@ const McpServersTab: React.FC = () => {
                     </TableCell>
                   </TableRow>
                   <TableRow>
-                    <TableCell colSpan={6} sx={{ py: 0 }}>
+                    <TableCell colSpan={5} sx={{ py: 0 }}>
                       <Collapse in={expandedServer === server.name}>
                         <Box sx={{ p: 2, bgcolor: "grey.50" }}>
                           <Typography variant="subtitle2" gutterBottom>
@@ -476,7 +480,6 @@ const McpServersTab: React.FC = () => {
               >
                 <MenuItem value="streamable-http">Streamable HTTP</MenuItem>
                 <MenuItem value="sse">SSE (Server-Sent Events)</MenuItem>
-                <MenuItem value="stdio">Stdio (Local Process)</MenuItem>
               </Select>
             </FormControl>
             {(formData.transport === "streamable-http" || formData.transport === "sse") && (
@@ -487,57 +490,18 @@ const McpServersTab: React.FC = () => {
                 fullWidth
                 required
                 placeholder="http://localhost:4000/mcp"
-                helperText="Supports ${BACKEND_URL} environment variable"
               />
             )}
-            {formData.transport === "stdio" && (
-              <>
-                <TextField
-                  label="Command"
-                  value={formData.command}
-                  onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-                  fullWidth
-                  required
-                  placeholder="npx"
-                />
-                <TextField
-                  label="Arguments (one per line)"
-                  value={argsInput}
-                  onChange={(e) => setArgsInput(e.target.value)}
-                  fullWidth
-                  multiline
-                  minRows={2}
-                  placeholder={"-y\n@modelcontextprotocol/server-example"}
-                />
-                <TextField
-                  label="Additional Configuration (JSON)"
-                  value={configInput}
-                  onChange={(e) => setConfigInput(e.target.value)}
-                  fullWidth
-                  multiline
-                  minRows={2}
-                  placeholder={'{\n  "env": {\n    "PATH": "${PATH}"\n  }\n}'}
-                  helperText="Any JSON properties here will be merged into the server config (e.g. env)"
-                />
-              </>
-            )}
+            {/* Stdio Removed */}
             <TextField
               label="Access Token (optional)"
               value={formData.accessToken}
               onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
               fullWidth
+              type="password"
               placeholder="${MCP_ACCESS_TOKEN}"
-              helperText="Supports ${ENV_VAR} syntax"
             />
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={formData.isInternal || false}
-                  onChange={(e) => setFormData({ ...formData, isInternal: e.target.checked })}
-                />
-              }
-              label="Internal Server (injects userId, sessionId, etc.)"
-            />
+
           </Box>
         </DialogContent>
         <DialogActions>
@@ -578,7 +542,6 @@ const McpServersTab: React.FC = () => {
               >
                 <MenuItem value="streamable-http">Streamable HTTP</MenuItem>
                 <MenuItem value="sse">SSE (Server-Sent Events)</MenuItem>
-                <MenuItem value="stdio">Stdio (Local Process)</MenuItem>
               </Select>
             </FormControl>
             {(formData.transport === "streamable-http" || formData.transport === "sse") && (
@@ -590,49 +553,15 @@ const McpServersTab: React.FC = () => {
                 required
               />
             )}
-            {formData.transport === "stdio" && (
-              <>
-                <TextField
-                  label="Command"
-                  value={formData.command}
-                  onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-                  fullWidth
-                  required
-                />
-                <TextField
-                  label="Arguments (one per line)"
-                  value={argsInput}
-                  onChange={(e) => setArgsInput(e.target.value)}
-                  fullWidth
-                  multiline
-                  minRows={2}
-                />
-                <TextField
-                  label="Additional Configuration (JSON)"
-                  value={configInput}
-                  onChange={(e) => setConfigInput(e.target.value)}
-                  fullWidth
-                  multiline
-                  minRows={2}
-                  helperText="Any JSON properties here will be merged into the server config"
-                />
-              </>
-            )}
+            {/* Stdio Removed */}
             <TextField
               label="Access Token (optional)"
               value={formData.accessToken}
               onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
               fullWidth
+              type="password"
             />
-            <FormControlLabel
-              control={
-                <Checkbox
-                  checked={formData.isInternal || false}
-                  onChange={(e) => setFormData({ ...formData, isInternal: e.target.checked })}
-                />
-              }
-              label="Internal Server"
-            />
+
           </Box>
         </DialogContent>
         <DialogActions>
