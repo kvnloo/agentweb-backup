@@ -149,6 +149,73 @@ Routes are in `backend/src/routes/` organized by feature area:
 
 ### Authentication
 
+#### Token Management
+
+**CRITICAL: Never use `localStorage.getItem("token")` directly in frontend code!**
+
+Always use the token from `useAuth()` context:
+
+```typescript
+// ❌ WRONG - Does not work with delegation
+const token = localStorage.getItem("token");
+
+// ✅ CORRECT - Works with both regular and delegated sessions
+const { token } = useAuth();
+```
+
+**Why:**
+- Regular sessions: Token stored in `localStorage` with key `"token"`
+- Delegated sessions: Token stored in `sessionStorage` with key `delegate_token_{email}`
+- The AuthContext handles getting the correct token automatically
+
+#### Delegation System
+
+Admins can access customer accounts via "delegate access":
+
+1. **Frontend Token Storage:**
+   - Regular login → `localStorage.getItem("token")`
+   - Delegated login → `sessionStorage.getItem("delegate_token_{customerEmail}")`
+   - Use `useAuth()` to get the correct token automatically
+
+2. **Backend Token Handling** (`middleware/auth.ts`):
+   - Regular token: `req.user` = logged-in user
+   - Delegated token: `req.user` = target customer (not admin!)
+   - `req.delegateInfo` contains admin info if delegated
+
+3. **Token Payload:**
+   ```typescript
+   // Regular token
+   { userId: "admin123", email: "admin@example.com", isAdmin: true }
+
+   // Delegated token
+   {
+     userId: "admin123",
+     delegateAccess: {
+       adminUserId: "admin123",
+       adminEmail: "admin@example.com",
+       targetUserId: "customer456",
+       targetEmail: "customer@example.com"
+     }
+   }
+   ```
+
+4. **Backend Request Object:**
+   ```typescript
+   // After authenticateToken middleware:
+   req.user = {
+     userId: "customer456",        // Always the target user!
+     email: "customer@example.com",
+     isAdmin: false
+   }
+   req.delegateInfo = {             // Only present if delegated
+     adminUserId: "admin123",
+     adminEmail: "admin@example.com",
+     isDelegated: true
+   }
+   ```
+
+#### Authentication Methods
+
 - JWT tokens for API authentication
 - Google OAuth supported (configure via `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`)
 - LinkedIn OAuth for social media integrations
