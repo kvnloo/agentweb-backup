@@ -1,4 +1,4 @@
-import React from 'react';
+
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import McpServersTab from '../McpServersTab';
@@ -105,7 +105,7 @@ describe('McpServersTab', () => {
 
         // Fill Form
         fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'new-server' } });
-        const transportCombobox = screen.getByRole('combobox', { hidden: true }); // MUI Select sometimes hides the input
+
         // Or simpler, try to find by label text effectively
         // Providing a more robust way for MUI v5 Select:
         fireEvent.mouseDown(screen.getByRole('combobox'));
