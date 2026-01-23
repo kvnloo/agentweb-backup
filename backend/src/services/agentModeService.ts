@@ -2051,7 +2051,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
         type: 'function' as const,
         function: {
           name: 'publish_blog_article',
-          description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS.',
+          description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS. Articles are published as draft by default unless status is set to "published". IMPORTANT: When status is "published", at least one category must be provided.',
           parameters: {
             type: 'object',
             properties: {
@@ -2070,6 +2070,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
               blog_html_url: {
                 type: 'string',
                 description: 'The URL of the HTML file created by create_blog_article function'
+              },
+              status: {
+                type: 'string',
+                description: 'Publication status of the article. Default is "draft". Set to "published" to publish immediately.',
+                enum: ['draft', 'published'],
+                default: 'draft'
+              },
+              author: {
+                type: 'string',
+                description: 'Optional author name or ID for the article'
+              },
+              categories: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional array of category names. Category names will be mapped to Webflow IDs using the "categories" mapping in secrets manager. Maps to multi-reference field "categories" by default. Defaults to empty array. REQUIRED when status is "published" - must provide at least one category.',
+                default: []
               }
             },
             required: ['title', 'description', 'hero_image_url', 'blog_html_url']
@@ -3676,7 +3692,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       case 'perform_deep_research':
         return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas, userId);
       case 'publish_blog_article':
-        return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId);
+        return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId, args.status, args.author, args.categories);
       case 'create_social_media_posts':
         return await this.createSocialMediaPosts(args.posts, userId, sessionId);
       case 'get_task_subscriber_metrics':
@@ -8883,10 +8899,13 @@ ${emailDraftFormat === 'text'
     heroImageUrl: string,
     blogHtmlUrl: string,
     userId: string,
-    sessionId: string
+    sessionId: string,
+    status: string = 'draft',
+    author?: string,
+    categories: string[] = []
   ): Promise<any> {
     try {
-      console.log('AgentMode: Publishing blog article - Title:', title);
+      console.log('AgentMode: Publishing blog article - Title:', title, 'Status:', status);
 
       // Step 1: Fetch HTML and extract body content
       const htmlResponse = await axios.get(blogHtmlUrl, {
@@ -8958,20 +8977,29 @@ ${emailDraftFormat === 'text'
       // Only Webflow is supported for publish_blog_article function
       if (cmsType === 'Webflow') {
         const { getWebflowConfig } = await import('../controllers/blog');
-        const { apiToken, siteId, collectionId, fieldMappings } = await getWebflowConfig(userId);
+        const { apiToken, siteId, collectionId, fieldMappings, categories: categoryMapping } = await getWebflowConfig(userId);
 
         // Call Webflow publishing
         const axios = (await import('axios')).default;
         const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
+        // Use different field names based on whether we're using live endpoint or draft endpoint
         const cmsItemData: any = {
           fieldData: {
             name: title,
             slug: slug,
-            _archived: false,
-            _draft: false,
           }
         };
+
+        // For draft endpoint, use _archived and _draft
+        // For live endpoint, use isArchived and isDraft
+        if (status === 'draft') {
+          cmsItemData.fieldData._archived = false;
+          cmsItemData.fieldData._draft = true;
+        } else {
+          cmsItemData.isArchived = false;
+          cmsItemData.isDraft = false;
+        }
 
         // Use body HTML directly for Webflow
         // Webflow API may strip HTML tags if newlines are present, so remove them
@@ -8989,20 +9017,97 @@ ${emailDraftFormat === 'text'
           cmsItemData.fieldData[fieldMappings.image] = heroImageUrl;
         }
 
+        // Add author if provided (use fieldMapping or default to 'author')
+        if (author) {
+          const authorField = fieldMappings?.author || 'author';
+          cmsItemData.fieldData[authorField] = author;
+        }
+
+        // Add categories - use fieldMapping or default to 'categories'
+        // Categories is a multi-reference field, expecting an array of IDs
+        // Convert category names to IDs using the mapping from secrets manager
+        const categoryField = fieldMappings?.category || 'categories';
+        let categoryIds: string[] = [];
+
+        const invalidCategories: string[] = [];
+
+        if (categories && categories.length > 0 && categoryMapping) {
+          // Map category names to IDs
+          categoryIds = categories
+            .map(name => {
+              const id = categoryMapping[name];
+              if (!id) {
+                console.warn(`AgentMode: Category name "${name}" not found in mapping, skipping`);
+                invalidCategories.push(name);
+                return null;
+              }
+              return id;
+            })
+            .filter((id): id is string => id !== null);
+        } else if (categories && categories.length > 0 && !categoryMapping) {
+          // If no mapping provided, assume categories are already IDs
+          console.warn('AgentMode: No category mapping found in config, treating category values as IDs');
+          categoryIds = categories;
+        }
+
+        cmsItemData.fieldData[categoryField] = categoryIds;
+
+        // Log warning if some categories were invalid but others were valid
+        if (invalidCategories.length > 0 && categoryIds.length > 0) {
+          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
+          console.warn(`AgentMode: Some invalid categories were skipped: ${invalidCategories.join(', ')}. Valid categories: ${availableCategories.join(', ')}`);
+        }
+
+        // Validate: if status is published, categories cannot be empty
+        if (status === 'published' && categoryIds.length === 0) {
+          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
+
+          let errorMessage = 'Cannot publish article without categories. Please provide at least one category when status is "published".';
+
+          // If invalid categories were provided, mention them
+          if (invalidCategories.length > 0) {
+            errorMessage = `Invalid category names provided: ${invalidCategories.join(', ')}.`;
+          }
+
+          // Add available categories to the message
+          if (availableCategories.length > 0) {
+            errorMessage += ` Available categories: ${availableCategories.join(', ')}`;
+          } else {
+            errorMessage += ' No category mapping found in configuration.';
+          }
+
+          return {
+            success: false,
+            message: errorMessage,
+            error: 'Categories required for published articles',
+            invalidCategories: invalidCategories,
+            availableCategories: availableCategories
+          };
+        }
+
         const headers = {
           Authorization: `Bearer ${apiToken}`,
           'Content-Type': 'application/json',
           'accept-version': '2.0.0'
         };
 
+        // Use /items/live endpoint for published articles, /items for drafts
+        // Note: The live endpoint uses /collections/{id}/items/live (without /sites/ prefix)
+        // while the draft endpoint uses /sites/{siteId}/collections/{id}/items
+        const endpoint = status === 'published'
+          ? `https://api.webflow.com/v2/collections/${collectionId}/items/live?skipInvalidFiles=true`
+          : `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`;
+
+        console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
+
         try {
           const response = await axios.post(
-            `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`,
+            endpoint,
             cmsItemData,
             { headers }
           );
 
-          console.log('AgentMode: Blog article published successfully to Webflow');
+          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}`);
 
           // Sanitize response to remove large content fields before sending to LLM
           const responseData = response.data as any;
@@ -9020,9 +9125,10 @@ ${emailDraftFormat === 'text'
 
           return {
             success: true,
-            message: 'Blog article published successfully to Webflow',
+            message: `Blog article published successfully to Webflow as ${status}`,
             data: {
               title,
+              status,
               cmsType: 'Webflow',
               cmsResponse: sanitizedResponse
             }
@@ -9053,6 +9159,13 @@ ${emailDraftFormat === 'text'
             }
           }
 
+          // Add available categories to error response so LLM knows what to use
+          const availableCategories = categoryMapping ? Object.keys(categoryMapping) : [];
+          if (availableCategories.length > 0) {
+            errorInfo.message = `${errorInfo.message || 'Webflow API error'}. Available categories: ${availableCategories.join(', ')}`;
+            errorInfo.availableCategories = availableCategories;
+          }
+
           // Log concise error summary
           if (errorInfo.details && errorInfo.details.length > 0) {
             const errorDetails = errorInfo.details
@@ -9063,9 +9176,13 @@ ${emailDraftFormat === 'text'
             console.error(`AgentMode: Webflow API error (${errorInfo.status}): ${errorInfo.message}`);
           }
 
-          // Create a more user-friendly error message
-          const errorMessage = errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`;
-          throw new Error(errorMessage);
+          // Return error response with available categories so LLM can retry with correct values
+          return {
+            success: false,
+            message: errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`,
+            error: 'Webflow API validation error',
+            availableCategories: errorInfo.availableCategories || []
+          };
         }
       } else if (cmsType === 'Basehub') {
         return {
