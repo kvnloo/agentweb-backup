@@ -181,7 +181,7 @@ describe('McpToolRegistry', () => {
       const args = { param1: 'value1', param2: 42, nested: { key: 'value' } };
       await registry.execute('args_tool', args);
 
-      expect(mockExecute).toHaveBeenCalledWith(args);
+      expect(mockExecute).toHaveBeenCalledWith(args, undefined);
     });
 
     it('should handle async execution correctly', async () => {

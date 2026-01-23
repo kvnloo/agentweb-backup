@@ -165,8 +165,12 @@ export function setupMcpServer(app: express.Express) {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
+      // Extract context fields from args (injected by internal MCP clients)
+      const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
+      const context = { userId, sessionId, llmModel };
+
       try {
-        const result = await mcpToolRegistry.execute(name, args || {});
+        const result = await mcpToolRegistry.execute(name, toolArgs, context);
         
         if (result && typeof result === 'object' && 'content' in result) {
           return result;

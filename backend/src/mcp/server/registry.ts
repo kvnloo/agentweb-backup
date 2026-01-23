@@ -24,12 +24,12 @@ export class McpToolRegistry {
     return this.tools.get(name);
   }
 
-  async execute(name: string, args: any) {
+  async execute(name: string, args: any, context?: any) {
     const handler = this.tools.get(name);
     if (!handler) {
       throw new Error(`Tool ${name} not found`);
     }
-    return await handler.execute(args);
+    return await handler.execute(args, context);
   }
 }
 
