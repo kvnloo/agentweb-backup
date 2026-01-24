@@ -2095,6 +2095,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
       {
         type: 'function' as const,
         function: {
+          name: 'repair_blog_article',
+          description: 'Repairs a blog article by creating a new version with optimized images. Automatically finds and resizes all images (including hero images with class="hero-image") that exceed file size limits. Creates a new HTML file with updated image URLs without modifying the original. Call this function when publish_blog_article fails due to image size errors. Returns a new article URL and hero image URL that can be used to retry publishing.',
+          parameters: {
+            type: 'object',
+            properties: {
+              article_url: {
+                type: 'string',
+                description: 'The URL of the HTML file created by create_blog_article function'
+              }
+            },
+            required: ['article_url']
+          }
+        }
+      },
+      {
+        type: 'function' as const,
+        function: {
           name: 'create_social_media_posts',
           description: 'Create a list of social media posts and generate an HTML file containing all posts. Each post includes type (linkedin, x/twitter, instagram, facebook, or custom), rich text content that can be transformed to HTML for display and copied for use, and optional image URL. The output is an HTML file stored in S3 with all posts formatted for easy viewing and copying.',
           parameters: {
@@ -3693,6 +3710,8 @@ Use the available tools to create tasks in the agent-engine when complex work is
         return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas, userId);
       case 'publish_blog_article':
         return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId, args.status, args.author, args.categories);
+      case 'repair_blog_article':
+        return await this.repairBlogArticle(args.article_url, userId, sessionId);
       case 'create_social_media_posts':
         return await this.createSocialMediaPosts(args.posts, userId, sessionId);
       case 'get_task_subscriber_metrics':
@@ -9210,6 +9229,16 @@ ${emailDraftFormat === 'text'
             errorInfo.availableCategories = availableCategories;
           }
 
+          // If error is related to file size, suggest using repair_blog_article
+          if (errorInfo.message && (
+            errorInfo.message.includes('File size limit') ||
+            errorInfo.message.includes('failed to import') ||
+            errorInfo.message.includes('image') && errorInfo.message.includes('too large')
+          )) {
+            errorInfo.message += '. SUGGESTION: Use repair_blog_article function to fix image size issues before retrying.';
+            errorInfo.repairSuggested = true;
+          }
+
           // Log concise error summary
           if (errorInfo.details && errorInfo.details.length > 0) {
             const errorDetails = errorInfo.details
@@ -9225,7 +9254,8 @@ ${emailDraftFormat === 'text'
             success: false,
             message: errorInfo.message || `Webflow API error: ${errorInfo.status} ${errorInfo.statusText}`,
             error: 'Webflow API validation error',
-            availableCategories: errorInfo.availableCategories || []
+            availableCategories: errorInfo.availableCategories || [],
+            repairSuggested: errorInfo.repairSuggested || false
           };
         }
       } else if (cmsType === 'Basehub') {
@@ -9273,6 +9303,284 @@ ${emailDraftFormat === 'text'
         message: errorMessage,
         error: error.message || 'Unknown error'
       };
+    }
+  }
+
+  /**
+   * Repair blog article by creating a new version with optimized images
+   * Takes only the article URL, finds and resizes all images, creates a new HTML file
+   */
+  private async repairBlogArticle(
+    articleUrl: string,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log('AgentMode: Repairing blog article...');
+      console.log('AgentMode: Article URL:', articleUrl);
+
+      const AWS = (await import('aws-sdk')).default;
+      const s3 = new AWS.S3({
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        region: process.env.AWS_REGION || 'us-west-2',
+      });
+
+      const repairResults = {
+        imagesRepaired: 0,
+        totalImagesChecked: 0,
+        originalArticleUrl: articleUrl,
+        repairedArticleUrl: articleUrl,
+      };
+
+      // Step 1: Download and parse HTML
+      console.log('AgentMode: Downloading HTML article...');
+      const htmlResponse = await axios.get(articleUrl, {
+        timeout: 30000,
+        responseType: 'text',
+        headers: {
+          'User-Agent': 'AgentWeb-Backend/1.0',
+        },
+      });
+
+      let htmlContent = htmlResponse.data as string;
+
+      // Step 2: Find all images in HTML
+      console.log('AgentMode: Looking for all images in HTML...');
+      const allImages = new Set<string>();
+
+      // Find all images with class="hero-image" - need to handle both src before/after class
+      const heroImageRegex1 = /<img[^>]+class="[^"]*hero-image[^"]*"[^>]+src="([^"]+)"[^>]*>/gi;
+      const heroImageRegex2 = /<img[^>]+src="([^"]+)"[^>]+class="[^"]*hero-image[^"]*"[^>]*>/gi;
+
+      let match;
+      while ((match = heroImageRegex1.exec(htmlContent)) !== null) {
+        const imgUrl = match[1];
+        if (imgUrl.includes('agentweb-user-files.s3')) {
+          allImages.add(imgUrl);
+          console.log(`AgentMode: Found hero image with class="hero-image": ${imgUrl}`);
+        }
+      }
+
+      while ((match = heroImageRegex2.exec(htmlContent)) !== null) {
+        const imgUrl = match[1];
+        if (imgUrl.includes('agentweb-user-files.s3')) {
+          allImages.add(imgUrl);
+          console.log(`AgentMode: Found hero image with class="hero-image": ${imgUrl}`);
+        }
+      }
+
+      // Also check for images in meta tags (og:image, twitter:image)
+      const ogImageMatch = htmlContent.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"[^>]*>/i);
+      if (ogImageMatch && ogImageMatch[1].includes('agentweb-user-files.s3')) {
+        allImages.add(ogImageMatch[1]);
+      }
+
+      const twitterImageMatch = htmlContent.match(/<meta[^>]+name="twitter:image"[^>]+content="([^"]+)"[^>]*>/i);
+      if (twitterImageMatch && twitterImageMatch[1].includes('agentweb-user-files.s3')) {
+        allImages.add(twitterImageMatch[1]);
+      }
+
+      // Find all other images in <img> tags
+      const imgRegex = /<img[^>]+src="([^"]+)"[^>]*>/gi;
+      while ((match = imgRegex.exec(htmlContent)) !== null) {
+        const imgUrl = match[1];
+        if (imgUrl.includes('agentweb-user-files.s3')) {
+          allImages.add(imgUrl);
+        }
+      }
+
+      const imagesToCheck = Array.from(allImages);
+      repairResults.totalImagesChecked = imagesToCheck.length;
+      console.log(`AgentMode: Found ${imagesToCheck.length} images to check`);
+
+      // Step 3: Check and resize each image if needed
+      for (const imgUrl of imagesToCheck) {
+        try {
+          console.log(`AgentMode: Checking image: ${imgUrl}`);
+          const imgResult = await this.checkAndResizeImage(imgUrl, userId);
+          if (imgResult.resized) {
+            // Replace all occurrences of this URL in HTML
+            const escapedUrl = imgUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            htmlContent = htmlContent.replace(new RegExp(escapedUrl, 'g'), imgResult.url);
+            repairResults.imagesRepaired++;
+            console.log(`AgentMode: Image repaired. Size reduced from ${(imgResult.originalSize / 1024 / 1024).toFixed(2)}MB to ${(imgResult.newSize! / 1024 / 1024).toFixed(2)}MB`);
+          } else {
+            console.log(`AgentMode: Image OK (${(imgResult.originalSize / 1024 / 1024).toFixed(2)}MB)`);
+          }
+        } catch (imgError) {
+          console.warn(`AgentMode: Failed to check/repair image ${imgUrl}:`, imgError);
+          // Continue with other images
+        }
+      }
+
+      // Step 4: Upload repaired HTML as a new file (always create new version, even if no changes)
+      console.log('AgentMode: Creating repaired article...');
+      const timestamp = Date.now();
+      const htmlKey = `users/${userId}/files/${timestamp}/blog-${timestamp}-repaired.html`;
+
+      await s3.putObject({
+        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+        Key: htmlKey,
+        Body: htmlContent,
+        ContentType: 'text/html',
+      }).promise();
+
+      repairResults.repairedArticleUrl = `https://${process.env.AWS_S3_BUCKET || 'agentweb-user-files'}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${htmlKey}`;
+      console.log('AgentMode: Repaired article uploaded:', repairResults.repairedArticleUrl);
+
+      // Step 6: Extract hero image URL from repaired HTML for convenience
+      let heroImageUrl = '';
+
+      // Try to find hero image with class="hero-image" (both attribute orders)
+      const heroMatch1 = htmlContent.match(/<img[^>]+class="[^"]*hero-image[^"]*"[^>]+src="([^"]+)"[^>]*>/i);
+      const heroMatch2 = htmlContent.match(/<img[^>]+src="([^"]+)"[^>]+class="[^"]*hero-image[^"]*"[^>]*>/i);
+
+      if (heroMatch1) {
+        heroImageUrl = heroMatch1[1];
+      } else if (heroMatch2) {
+        heroImageUrl = heroMatch2[1];
+      } else {
+        // Fallback to og:image meta tag
+        const ogImageMatchFinal = htmlContent.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"[^>]*>/i);
+        if (ogImageMatchFinal) {
+          heroImageUrl = ogImageMatchFinal[1];
+        }
+      }
+
+      // Step 5: Return repair results
+      const message = repairResults.imagesRepaired > 0
+        ? `Blog article repaired successfully. Fixed ${repairResults.imagesRepaired} of ${repairResults.totalImagesChecked} image(s) by resizing to meet file size limits. Use the repaired URLs to retry publishing.`
+        : `Blog article checked. All ${repairResults.totalImagesChecked} image(s) are within limits. A new article version has been created.`;
+
+      return {
+        success: true,
+        message,
+        repairedArticleUrl: repairResults.repairedArticleUrl,
+        heroImageUrl: heroImageUrl,
+        imagesRepaired: repairResults.imagesRepaired,
+        totalImagesChecked: repairResults.totalImagesChecked,
+        originalArticleUrl: repairResults.originalArticleUrl,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error repairing blog article:', error);
+      return {
+        success: false,
+        message: `Failed to repair blog article: ${error.message}`,
+        error: error.message || 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Check image size and resize if needed for Webflow compatibility
+   * Webflow has a 4MB file size limit for images
+   */
+  private async checkAndResizeImage(
+    imageUrl: string,
+    userId: string
+  ): Promise<{ url: string; resized: boolean; originalSize: number; newSize?: number }> {
+    const sharp = (await import('sharp')).default;
+    const AWS = (await import('aws-sdk')).default;
+
+    // Configure S3
+    const s3 = new AWS.S3({
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      region: process.env.AWS_REGION || 'us-west-2',
+    });
+
+    // Webflow's image size limit (4MB)
+    const MAX_FILE_SIZE = 4 * 1024 * 1024; // 4MB in bytes
+
+    try {
+      // Download image from S3
+      console.log('AgentMode: Downloading image from S3:', imageUrl);
+      const imageResponse = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+      });
+
+      const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+      const originalSize = imageBuffer.length;
+
+      console.log(`AgentMode: Original image size: ${originalSize} bytes (${(originalSize / 1024 / 1024).toFixed(2)} MB)`);
+
+      // If image is within size limit, return original URL
+      if (originalSize <= MAX_FILE_SIZE) {
+        return { url: imageUrl, resized: false, originalSize };
+      }
+
+      // Image is too large, resize it
+      console.log('AgentMode: Image exceeds 4MB limit, resizing...');
+
+      // Resize image to reduce file size
+      // Start with 80% quality and adjust if needed
+      let resizedBuffer: Buffer;
+      let quality = 80;
+      let width = 1920; // Max width for blog images
+
+      do {
+        const sharpInstance = sharp(imageBuffer).resize(width, null, {
+          fit: 'inside',
+          withoutEnlargement: true,
+        });
+
+        // Apply format-specific compression
+        const metadata = await sharp(imageBuffer).metadata();
+        if (metadata.format === 'png') {
+          resizedBuffer = await sharpInstance.png({ quality, compressionLevel: 9 }).toBuffer();
+        } else if (metadata.format === 'webp') {
+          resizedBuffer = await sharpInstance.webp({ quality }).toBuffer();
+        } else {
+          // Default to JPEG for other formats
+          resizedBuffer = await sharpInstance.jpeg({ quality }).toBuffer();
+        }
+
+        console.log(`AgentMode: Resized to ${width}px width, quality ${quality}, size: ${resizedBuffer.length} bytes`);
+
+        // If still too large, reduce quality further
+        if (resizedBuffer.length > MAX_FILE_SIZE && quality > 50) {
+          quality -= 10;
+        } else if (resizedBuffer.length > MAX_FILE_SIZE && width > 1280) {
+          width = 1280;
+          quality = 80;
+        } else {
+          break;
+        }
+      } while (resizedBuffer.length > MAX_FILE_SIZE && (quality >= 50 || width >= 1280));
+
+      // Generate new filename
+      const timestamp = Date.now();
+      const originalFilename = imageUrl.split('/').pop() || 'resized-image.jpg';
+      const extension = originalFilename.split('.').pop();
+      const filenameWithoutExt = originalFilename.replace(`.${extension}`, '');
+      const newFilename = `${filenameWithoutExt}-resized-${timestamp}.${extension}`;
+
+      // Upload resized image to S3
+      const s3Key = `users/${userId}/files/${timestamp}/${newFilename}`;
+      console.log('AgentMode: Uploading resized image to S3:', s3Key);
+
+      await s3.putObject({
+        Bucket: process.env.AWS_S3_BUCKET || 'agentweb-user-files',
+        Key: s3Key,
+        Body: resizedBuffer,
+        ContentType: `image/${extension}`,
+      }).promise();
+
+      const newImageUrl = `https://${process.env.AWS_S3_BUCKET || 'agentweb-user-files'}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${s3Key}`;
+
+      console.log(`AgentMode: Resized image uploaded successfully. New size: ${resizedBuffer.length} bytes (${(resizedBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+
+      return {
+        url: newImageUrl,
+        resized: true,
+        originalSize,
+        newSize: resizedBuffer.length,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error resizing image:', error);
+      throw error;
     }
   }
 
