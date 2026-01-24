@@ -111,7 +111,8 @@ describe('AgentModeService - publish_blog_article function', () => {
         mockHeroImageUrl,
         mockBlogHtmlUrl,
         mockUserId,
-        mockSessionId
+        mockSessionId,
+        'draft' // status
       );
 
       // Verify getWebflowConfig was called with userId
@@ -258,7 +259,7 @@ describe('AgentModeService - publish_blog_article function', () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain('Validation Error');
+      expect(result.error).toContain('Webflow API validation error');
     });
 
     it('should extract content from HTML correctly', async () => {
@@ -329,6 +330,374 @@ describe('AgentModeService - publish_blog_article function', () => {
       expect(fieldData['custom-summary']).toBe('Test description');
       expect(fieldData['custom-body']).toBeDefined();
       expect(fieldData['custom-image']).toBe(mockHeroImageUrl);
+    });
+  });
+
+  describe('Status parameter and live publishing', () => {
+    it('should use draft endpoint when status is "draft"', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft'
+      );
+
+      // Verify draft endpoint was used
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const endpoint = webflowCall[0];
+      expect(endpoint).toContain('/sites/');
+      expect(endpoint).toContain('/collections/');
+      expect(endpoint).toContain('/items');
+      expect(endpoint).not.toContain('/items/live');
+    });
+
+    it('should use live endpoint when status is "published"', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      const configWithCategories = {
+        ...mockWebflowConfig,
+        categories: {
+          'Technology': 'cat-id-123',
+          'Marketing': 'cat-id-456'
+        }
+      };
+
+      mockGetWebflowConfig.mockResolvedValue(configWithCategories);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'John Doe',
+        ['Technology']
+      );
+
+      // Verify live endpoint was used
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const endpoint = webflowCall[0];
+      expect(endpoint).toContain('/collections/');
+      expect(endpoint).toContain('/items/live');
+      expect(endpoint).toContain('skipInvalidFiles=true');
+      expect(endpoint).not.toContain('/sites/');
+    });
+
+    it('should default to "draft" when status is not provided', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId
+        // status not provided
+      );
+
+      // Verify draft endpoint was used
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const endpoint = webflowCall[0];
+      expect(endpoint).toContain('/sites/');
+      expect(endpoint).not.toContain('/items/live');
+    });
+  });
+
+  describe('Author and categories parameters', () => {
+    it('should include author field when author parameter is provided', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      const configWithAuthor = {
+        ...mockWebflowConfig,
+        fieldMappings: {
+          ...mockWebflowConfig.fieldMappings,
+          author: 'post-author'
+        }
+      };
+
+      mockGetWebflowConfig.mockResolvedValue(configWithAuthor);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft',
+        'Jane Smith' // author
+      );
+
+      // Verify author was included in field data
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const fieldData = webflowCall[1].fieldData;
+      expect(fieldData['post-author']).toBe('Jane Smith');
+    });
+
+    it('should convert category names to IDs using category mapping', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      const configWithCategories = {
+        ...mockWebflowConfig,
+        fieldMappings: {
+          ...mockWebflowConfig.fieldMappings,
+          category: 'post-categories'
+        },
+        categories: {
+          'Technology': 'cat-tech-123',
+          'Marketing': 'cat-mkt-456',
+          'Business': 'cat-biz-789'
+        }
+      };
+
+      mockGetWebflowConfig.mockResolvedValue(configWithCategories);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'John Doe',
+        ['Technology', 'Marketing'] // category names
+      );
+
+      // Verify category IDs were used
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const fieldData = webflowCall[1].fieldData;
+      expect(fieldData['post-categories']).toEqual(['cat-tech-123', 'cat-mkt-456']);
+    });
+
+    it('should handle empty categories for draft status', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft',
+        undefined,
+        [] // empty categories - OK for draft
+      );
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe('Category validation', () => {
+    it('should return error when published without categories', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      const configWithCategories = {
+        ...mockWebflowConfig,
+        categories: {
+          'Technology': 'cat-id-123'
+        }
+      };
+
+      mockGetWebflowConfig.mockResolvedValue(configWithCategories);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'John Doe',
+        [] // empty categories - NOT OK for published
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Cannot publish article without categories');
+      expect(result.message).toContain('Available categories');
+      expect(result.availableCategories).toEqual(['Technology']);
+    });
+
+    it('should return error when category mapping is not configured', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig); // no categories
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'John Doe',
+        ['Technology']
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Category mapping is not configured');
+      expect(result.invalidCategories).toEqual(['Technology']);
+      expect(result.availableCategories).toEqual([]);
+    });
+
+    it('should return error with available categories when invalid categories are provided', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      const configWithCategories = {
+        ...mockWebflowConfig,
+        categories: {
+          'Technology': 'cat-tech-123',
+          'Marketing': 'cat-mkt-456'
+        }
+      };
+
+      mockGetWebflowConfig.mockResolvedValue(configWithCategories);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'John Doe',
+        ['InvalidCategory', 'AnotherInvalid']
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('All provided category names are invalid');
+      expect(result.message).toContain('InvalidCategory, AnotherInvalid');
+      expect(result.message).toContain('Available categories: Technology, Marketing');
+      expect(result.invalidCategories).toEqual(['InvalidCategory', 'AnotherInvalid']);
+      expect(result.availableCategories).toEqual(['Technology', 'Marketing']);
+    });
+
+    it('should filter out invalid categories and use only valid ones', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+
+      const configWithCategories = {
+        ...mockWebflowConfig,
+        fieldMappings: {
+          ...mockWebflowConfig.fieldMappings,
+          category: 'post-categories'
+        },
+        categories: {
+          'Technology': 'cat-tech-123',
+          'Marketing': 'cat-mkt-456'
+        }
+      };
+
+      mockGetWebflowConfig.mockResolvedValue(configWithCategories);
+
+      mockAxiosGet.mockResolvedValue({
+        data: mockHtmlContent
+      });
+
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'published',
+        'John Doe',
+        ['Technology', 'InvalidCategory', 'Marketing'] // mixed valid and invalid
+      );
+
+      // Should succeed with valid categories only
+      expect(result.success).toBe(true);
+
+      // Verify only valid category IDs were used
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const fieldData = webflowCall[1].fieldData;
+      expect(fieldData['post-categories']).toEqual(['cat-tech-123', 'cat-mkt-456']);
     });
   });
 });

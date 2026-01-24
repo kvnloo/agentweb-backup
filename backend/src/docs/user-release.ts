@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-23',
+    changes: [
+      'Added Live Blog Article Publishing Support',
+      '- Blog articles can now be published directly as "published" status to Webflow CMS',
+      '- Published articles require at least one category to be provided',
+      '- Added optional author parameter for byline attribution',
+      '- Added optional categories parameter (array) with automatic name-to-ID mapping from secrets manager',
+      'Added repair_blog_article function for fixing image size issues',
+      '- Automatically detects and resizes all images that exceed Webflow\'s 4MB file size limit',
+    ],
+  },
+  {
     date: '2026-01-22',
     changes: [
       'Added Get Support Feature',

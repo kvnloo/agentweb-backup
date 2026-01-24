@@ -834,6 +834,130 @@ describe('Blog Controller - Image Quality Defaulting', () => {
 
       await expect(getWebflowConfig()).rejects.toThrow('Failed to fetch Webflow configuration from Secrets Manager');
     });
+
+    it('should include categories mapping when provided in secret', async () => {
+      const configWithCategories = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        categories: {
+          'Technology': 'cat-tech-123',
+          'Marketing': 'cat-mkt-456',
+          'Business': 'cat-biz-789'
+        }
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithCategories));
+
+      const config = await getWebflowConfig();
+
+      expect(config.categories).toEqual({
+        'Technology': 'cat-tech-123',
+        'Marketing': 'cat-mkt-456',
+        'Business': 'cat-biz-789'
+      });
+    });
+
+    it('should parse categories when stored as JSON string', async () => {
+      const configWithStringCategories = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        categories: JSON.stringify({
+          'AI': 'cat-ai-111',
+          'Product': 'cat-prod-222'
+        })
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithStringCategories));
+
+      const config = await getWebflowConfig();
+
+      expect(config.categories).toEqual({
+        'AI': 'cat-ai-111',
+        'Product': 'cat-prod-222'
+      });
+    });
+
+    it('should handle config without categories mapping', async () => {
+      const configWithoutCategories = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id'
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithoutCategories));
+
+      const config = await getWebflowConfig();
+
+      expect(config.categories).toBeUndefined();
+    });
+
+    it('should use categories as object when already parsed', async () => {
+      const configWithObjectCategories = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        categories: {
+          'Design': 'cat-design-333',
+          'Development': 'cat-dev-444'
+        }
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithObjectCategories));
+
+      const config = await getWebflowConfig();
+
+      expect(config.categories).toEqual({
+        'Design': 'cat-design-333',
+        'Development': 'cat-dev-444'
+      });
+    });
+
+    it('should handle invalid JSON in categories string', async () => {
+      const configWithInvalidCategories = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        categories: 'invalid json {'
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(configWithInvalidCategories));
+
+      const config = await getWebflowConfig();
+
+      // Should leave categories undefined when parsing fails
+      expect(config.categories).toBeUndefined();
+    });
+
+    it('should include both fieldMappings and categories when both are provided', async () => {
+      const fullConfig = {
+        apiToken: 'test-api-token',
+        siteId: 'test-site-id',
+        collectionId: 'test-collection-id',
+        fieldMappings: {
+          summary: 'post-summary',
+          body: 'post-body',
+          image: 'main-image',
+          author: 'post-author',
+          category: 'post-categories'
+        },
+        categories: {
+          'Technology': 'cat-tech-123',
+          'Marketing': 'cat-mkt-456'
+        }
+      };
+      mockGetSecret.mockResolvedValueOnce(JSON.stringify(fullConfig));
+
+      const config = await getWebflowConfig();
+
+      expect(config.fieldMappings).toEqual({
+        summary: 'post-summary',
+        body: 'post-body',
+        image: 'main-image',
+        author: 'post-author',
+        category: 'post-categories'
+      });
+      expect(config.categories).toEqual({
+        'Technology': 'cat-tech-123',
+        'Marketing': 'cat-mkt-456'
+      });
+    });
   });
 });
 
