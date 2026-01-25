@@ -222,11 +222,12 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       console.error('Failed to send api.lead_failed alert:', alertError);
     }
 
-    // Handle duplicate email error
+    // Handle duplicate email error - return success to prevent retries
     if (error.message?.includes('already exists') || error.message?.includes('duplicate')) {
-      return res.status(409).json({
-        success: false,
-        message: 'A lead with this email already exists in the list'
+      return res.status(200).json({
+        success: true,
+        message: 'Lead already exists in the list',
+        duplicate: true
       });
     }
 
