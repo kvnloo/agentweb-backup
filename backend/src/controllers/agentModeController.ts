@@ -1929,6 +1929,76 @@ export const agentModeController = {
     }
   },
 
+  // Submit message feedback for ishare sessions (public with conversable token)
+  async submitIShareMessageFeedback(req: Request, res: Response) {
+    try {
+      const { shareId, messageIndex } = req.params;
+      const { conversable } = req.query;
+      const { type, comment } = req.body;
+
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      // Validate feedback type
+      if (!type || (type !== 'like' && type !== 'dislike')) {
+        return res.status(400).json({ error: 'Invalid feedback type. Must be "like" or "dislike"' });
+      }
+
+      // Validate comment length if provided
+      if (comment && comment.length > 500) {
+        return res.status(400).json({ error: 'Comment too long. Maximum 500 characters' });
+      }
+
+      // Get session and verify conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Get all messages to verify the message exists and is an assistant message
+      const messages = await chatbotDb.getMessagesFromMessagesTable(shareId);
+      const messageIndexNum = parseInt(messageIndex, 10);
+
+      if (isNaN(messageIndexNum) || messageIndexNum < 0 || messageIndexNum >= messages.length) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      const message = messages[messageIndexNum];
+      if (message.role !== 'assistant') {
+        return res.status(400).json({ error: 'Can only rate assistant messages' });
+      }
+
+      // Create feedback object (use 'anonymous' as userId for ishare)
+      const feedback = {
+        type: type as 'like' | 'dislike',
+        comment: comment || undefined,
+        timestamp: new Date().toISOString(),
+        userId: 'anonymous-ishare',
+      };
+
+      // Update the message with feedback
+      const updatedMessage = await chatbotDb.updateMessageFeedback(
+        shareId,
+        messageIndexNum,
+        feedback
+      );
+
+      res.json({
+        success: true,
+        message: updatedMessage,
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit ishare message feedback error:', error);
+      res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
   // Upload file attachment for Agent Mode
   async uploadAttachment(req: Request, res: Response) {
     try {
