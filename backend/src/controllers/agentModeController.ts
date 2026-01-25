@@ -871,7 +871,7 @@ function hasActiveProgress(sessionId: string): boolean {
 
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-async function generateSessionResponse(
+export async function generateSessionResponse(
   sessionId: string,
   userMessage: string,
   userId: string,
@@ -1601,6 +1601,16 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
 
+      // Get user's supportNote if available
+      let supportNote: string | undefined;
+      try {
+        const user = await userDb.getUserById(session.userId);
+        supportNote = user?.supportNote;
+      } catch (error) {
+        console.error('Failed to fetch user supportNote:', error);
+        // Continue without supportNote if fetch fails
+      }
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1613,7 +1623,8 @@ export const agentModeController = {
           workPlan: session.workPlan,
           llmModel: modelToUse,
           isConversable: !!conversable,
-          hasActiveProgress: hasActiveProgress(session.sessionId)
+          hasActiveProgress: hasActiveProgress(session.sessionId),
+          supportNote: supportNote
         }
       });
     } catch (error) {
