@@ -106,4 +106,8 @@ OAI_CONFIG_LIST
 
 # Separate repositories (now independent)
 growth-chat/
-customer-portal/ 
+customer-portal/
+
+# Force include Claude Code settings for team
+!.claude/
+!.claude/settings.local.json 
