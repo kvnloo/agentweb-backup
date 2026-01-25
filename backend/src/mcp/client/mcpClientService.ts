@@ -4,10 +4,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { AgentTool, ToolContext } from "./toolRegistry";
-import fs from "fs";
-import path from "path";
 import { settingsService } from "../../services/settingsService";
 import { decryptPassword } from "../../routes/config";
+import { internalMcpServers } from "./mcp_config";
 
 // SSE transport configuration
 export interface SseTransportConfig {
@@ -54,10 +53,7 @@ interface McpConfig {
 function resolveEnvPlaceholders(value: string): string {
   return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
     // Special internal variables
-    if (varName === 'BACKEND_DIR') {
-      // Resolve to the root of the backend directory (3 levels up from src/mcp/client)
-      return path.resolve(__dirname, '../../..');
-    }
+
     
     const envValue = process.env[varName];
     if (envValue) return envValue;
@@ -85,32 +81,23 @@ function getTransportType(config: McpServerConfig): "sse" | "stdio" | "streamabl
 export class McpClientService {
   private clients: Map<string, Client> = new Map();
   private mcpTools: AgentTool[] = [];
-  private configPath: string;
 
   constructor() {
-    this.configPath = path.join(__dirname, "mcp_config.json");
   }
+
 
   /**
    * Initialize MCP clients and discover tools
    */
   async initialize(): Promise<void> {
     try {
-      // 1. Load File Config (Internal/Core tools) - No Prefix
-      if (fs.existsSync(this.configPath)) {
-        try {
-          const fileConfig = JSON.parse(fs.readFileSync(this.configPath, "utf-8"));
-          if (fileConfig && fileConfig.mcpServers) {
-             console.log(`MCP: Loading ${Object.keys(fileConfig.mcpServers).length} internal servers from file`);
-             for (const [serverName, serverConfig] of Object.entries(fileConfig.mcpServers)) {
-               // Internal tools don't get a prefix
-               await this.safeConnectToServer(serverName, serverConfig as McpServerConfig);
-             }
-          }
-        } catch (fileError) {
-          console.error("MCP: Error reading config file:", fileError);
-        }
+      // 1. Load Internal Config (from code)
+      console.log(`MCP: Loading ${Object.keys(internalMcpServers).length} internal servers from config`);
+      for (const [serverName, serverConfig] of Object.entries(internalMcpServers)) {
+        // Internal tools don't get a prefix
+        await this.safeConnectToServer(serverName, serverConfig);
       }
+
 
       // 2. Load DB Config (External/Dynamic tools) - With Prefix
       try {

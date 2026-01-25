@@ -958,6 +958,28 @@ If your collection doesn't have a publish date field:
 5. Name the secret according to your environment (`dev/AgentWeb/Webflow` or `prod/AgentWeb/Webflow`)
 6. Click "Store"
 
+### MCP Server Configuration
+
+The backend supports multiple Model Context Protocol (MCP) servers, which can be configured internally (via code) or externally (via database/UI).
+
+#### Internal MCP Servers (Core)
+
+Internal servers are configured in `src/mcp/client/mcp_config.ts`. These are hardcoded and loaded at startup. This is also where you configure `stdio` based servers (local subprocesses).
+
+- **Config File**: `src/mcp/client/mcp_config.ts`
+- **Supported Transports**: SSE, Streamable HTTP, Stdio
+- **Context Injection**: Internal servers (like `agentweb-tools`) automatically receive user context (`userId`, `sessionId`, `llmModel`) for tool execution.
+- **Authentication**: To secure the internal server endpoints (`/mcp/server`), you **must** set `MCP_ACCESS_TOKEN` in your `.env` file. This token is required for all connections to the internal server.
+
+
+#### External MCP Servers (Dynamic)
+
+External servers can be added dynamically via the Admin UI or configured in the database setting `mcp_servers`.
+
+- **Storage**: DynamoDB `Configs` table (key: `mcp_servers`)
+- **Management**: Admin Dashboard -> MCP Servers
+
+
 #### Configuring User CMS Type
 
 After setting up the CMS secrets, you need to configure which CMS each user should use:

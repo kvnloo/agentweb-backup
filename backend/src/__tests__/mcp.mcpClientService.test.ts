@@ -4,8 +4,6 @@
  */
 
 import { McpClientService } from '../mcp/client/mcpClientService';
-import fs from 'fs';
-import path from 'path';
 
 // Mock dependencies
 jest.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
@@ -49,8 +47,6 @@ jest.mock('../routes/config', () => ({
   decryptPassword: jest.fn().mockImplementation((val) => ({ password: val, userId: 'test' }))
 }));
 
-jest.mock('fs');
-
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -59,16 +55,25 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { settingsService } from '../services/settingsService';
 import { decryptPassword } from '../routes/config';
 
+// Mock mcp_config to allow tests to inject configurations
+jest.mock('../mcp/client/mcp_config', () => ({
+  internalMcpServers: {}
+}));
+import { internalMcpServers } from '../mcp/client/mcp_config';
+
+
+
 describe('McpClientService', () => {
   let service: McpClientService;
-  const mockFs = fs as jest.Mocked<typeof fs>;
+
 
   beforeEach(() => {
     jest.clearAllMocks();
     service = new McpClientService();
     
-    // Default mock for existsSync
-    mockFs.existsSync.mockReturnValue(false);
+    // Reset the internalMcpServers mock
+    Object.keys(internalMcpServers).forEach(key => delete internalMcpServers[key]);
+
   });
 
   describe('resolveEnvPlaceholders', () => {
@@ -136,31 +141,7 @@ describe('McpClientService', () => {
       const urlArg = (SSEClientTransport as jest.Mock).mock.calls[0][0];
       expect(urlArg.href).toBe('http://localhost:4000/mcp');
     });
-    it('should resolve ${BACKEND_DIR} to backend root', async () => {
-      (settingsService.getSetting as jest.Mock).mockResolvedValue({
-        settingValue: JSON.stringify([{
-          name: 'relative-server',
-          transport: 'stdio',
-          command: 'node',
-          args: ['${BACKEND_DIR}/dist/server.js']
-        }])
-      });
 
-      const mockClient = {
-        connect: jest.fn().mockResolvedValue(undefined),
-        listTools: jest.fn().mockResolvedValue({ tools: [] }),
-        close: jest.fn()
-      };
-      (Client as jest.Mock).mockImplementation(() => mockClient);
-
-      await service.initialize();
-
-      expect(StdioClientTransport).toHaveBeenCalled();
-      const args = (StdioClientTransport as jest.Mock).mock.calls[0][0].args;
-      
-      const expectedPath = path.resolve(__dirname, '../..', 'dist/server.js');
-      expect(args[0]).toBe(expectedPath);
-    });
   });
 
   describe('initialize', () => {
@@ -189,12 +170,10 @@ describe('McpClientService', () => {
     it('should fallback to file when DB config is empty', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
       
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'file-server': { transport: 'sse', url: 'http://file.example.com/mcp' }
-        }
-      }));
+      Object.assign(internalMcpServers, {
+        'file-server': { transport: 'sse', url: 'http://file.example.com/mcp' }
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -205,12 +184,13 @@ describe('McpClientService', () => {
 
       await service.initialize();
 
-      expect(mockFs.readFileSync).toHaveBeenCalled();
+
     });
 
     it('should handle no configuration gracefully', async () => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
-      mockFs.existsSync.mockReturnValue(false);
+      Object.keys(internalMcpServers).forEach(key => delete internalMcpServers[key]);
+
 
       await service.initialize();
 
@@ -221,12 +201,10 @@ describe('McpClientService', () => {
     it('should handle DB error and fallback to file', async () => {
       (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('DB error'));
       
-      mockFs.existsSync.mockReturnValue(true);
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'fallback-server': { transport: 'sse', url: 'http://fallback.example.com/mcp' }
-        }
-      }));
+      Object.assign(internalMcpServers, {
+        'fallback-server': { transport: 'sse', url: 'http://fallback.example.com/mcp' }
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -237,7 +215,7 @@ describe('McpClientService', () => {
 
       await service.initialize();
 
-      expect(mockFs.readFileSync).toHaveBeenCalled();
+
     });
 
     it('should connect to multiple servers', async () => {
@@ -295,19 +273,18 @@ describe('McpClientService', () => {
   describe('createTransport', () => {
     beforeEach(() => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
-      mockFs.existsSync.mockReturnValue(true);
     });
 
+
     it('should create SSE transport with auth token', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'sse-auth-server': { 
-            transport: 'sse', 
-            url: 'http://sse.example.com/mcp',
-            accessToken: 'test-token-123'
-          }
+      Object.assign(internalMcpServers, {
+        'sse-auth-server': { 
+          transport: 'sse', 
+          url: 'http://sse.example.com/mcp',
+          accessToken: 'test-token-123'
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -325,14 +302,13 @@ describe('McpClientService', () => {
     });
 
     it('should create SSE transport without auth', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'sse-noauth-server': { 
-            transport: 'sse', 
-            url: 'http://sse.example.com/mcp'
-          }
+      Object.assign(internalMcpServers, {
+        'sse-noauth-server': { 
+          transport: 'sse', 
+          url: 'http://sse.example.com/mcp'
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -347,16 +323,15 @@ describe('McpClientService', () => {
     });
 
     it('should create Stdio transport', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'stdio-server': { 
-            transport: 'stdio', 
-            command: 'node',
-            args: ['server.js', '--port', '3000'],
-            env: { NODE_ENV: 'production' }
-          }
+      Object.assign(internalMcpServers, {
+        'stdio-server': { 
+          transport: 'stdio', 
+          command: 'node',
+          args: ['server.js', '--port', '3000'],
+          env: { NODE_ENV: 'production' }
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -376,15 +351,14 @@ describe('McpClientService', () => {
     });
 
     it('should create Streamable HTTP transport with auth', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'streamable-server': { 
-            transport: 'streamable-http', 
-            url: 'http://streamable.example.com/mcp',
-            accessToken: 'stream-token'
-          }
+      Object.assign(internalMcpServers, {
+        'streamable-server': { 
+          transport: 'streamable-http', 
+          url: 'http://streamable.example.com/mcp',
+          accessToken: 'stream-token'
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -399,15 +373,14 @@ describe('McpClientService', () => {
     });
 
     it('should decrypt access token if present', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'encrypted-server': { 
-            transport: 'sse', 
-            url: 'http://enc.example.com/mcp',
-            accessToken: 'encrypted-token-123'
-          }
+      Object.assign(internalMcpServers, {
+        'encrypted-server': { 
+          transport: 'sse', 
+          url: 'http://enc.example.com/mcp',
+          accessToken: 'encrypted-token-123'
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -424,13 +397,12 @@ describe('McpClientService', () => {
     });
 
     it('should default to SSE for legacy config without transport field', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'legacy-server': { 
-            url: 'http://legacy.example.com/mcp'
-          }
+      Object.assign(internalMcpServers, {
+        'legacy-server': { 
+          url: 'http://legacy.example.com/mcp'
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -448,18 +420,17 @@ describe('McpClientService', () => {
   describe('connectToServer', () => {
     beforeEach(() => {
       (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
-      mockFs.existsSync.mockReturnValue(true);
     });
 
+
     it('should validate SSE config requires url', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'invalid-sse': { 
-            transport: 'sse'
-            // Missing url
-          }
+      Object.assign(internalMcpServers, {
+        'invalid-sse': { 
+          transport: 'sse'
+          // Missing url
         }
-      }));
+      });
+
 
       const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
 
@@ -474,14 +445,13 @@ describe('McpClientService', () => {
     });
 
     it('should validate stdio config requires command', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'invalid-stdio': { 
-            transport: 'stdio'
-            // Missing command
-          }
+      Object.assign(internalMcpServers, {
+        'invalid-stdio': { 
+          transport: 'stdio'
+          // Missing command
         }
-      }));
+      });
+
 
       const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
 
@@ -501,14 +471,13 @@ describe('McpClientService', () => {
         { name: 'tool_2', description: 'Second tool', inputSchema: { type: 'object' } }
       ];
 
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'tools-server': { 
-            transport: 'sse',
-            url: 'http://tools.example.com/mcp'
-          }
+      Object.assign(internalMcpServers, {
+        'tools-server': { 
+          transport: 'sse',
+          url: 'http://tools.example.com/mcp'
         }
-      }));
+      });
+
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
@@ -530,14 +499,13 @@ describe('McpClientService', () => {
     });
 
     it('should handle connection timeout', async () => {
-      mockFs.readFileSync.mockReturnValue(JSON.stringify({
-        mcpServers: {
-          'timeout-server': { 
-            transport: 'sse',
-            url: 'http://timeout.example.com/mcp'
-          }
+      Object.assign(internalMcpServers, {
+        'timeout-server': { 
+          transport: 'sse',
+          url: 'http://timeout.example.com/mcp'
         }
-      }));
+      });
+
 
       // Simulate a connection that times out by rejecting with timeout error
       const mockClient = {
