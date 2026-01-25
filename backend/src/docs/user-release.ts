@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-25',
+    changes: [
+      'Improved CRM Lead Forwarding API Reliability',
+      '- Lead forwarding API now returns success (200) instead of conflict (409) when duplicate leads are submitted',
+      '- Prevents API clients from retrying duplicate lead submissions',
+      '- Response includes "duplicate: true" flag to indicate the lead already existed',
+    ],
+  },
+  {
     date: '2026-01-23',
     changes: [
       'Added Live Blog Article Publishing Support',
