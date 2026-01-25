@@ -256,9 +256,18 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
           // Start the chat using the generate function
           const { generateSessionResponse } = await import('../controllers/agentModeController');
           const { agentModeService } = await import('../services/agentModeService');
+          const { emitProgress } = await import('../utils/sseProgress');
 
           // Get the default LLM model
           const llmModel = session.llmModel || agentModeService.default_model;
+
+          // Emit initial progress to indicate generation has started
+          emitProgress(session.sessionId, {
+            status: 'in_progress',
+            message: 'Starting Emma...',
+            currentStep: 0,
+            totalSteps: 1
+          });
 
           // Start generating response asynchronously (don't wait for it to complete)
           generateSessionResponse(
@@ -269,6 +278,13 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             [] // attachments
           ).catch(error => {
             console.error('❌ Error generating agent response for Slack session:', error);
+            // Emit error progress
+            emitProgress(session.sessionId, {
+              status: 'complete',
+              message: 'Error occurred',
+              currentStep: 1,
+              totalSteps: 1
+            });
           });
 
           console.log('✅ Started agent response generation for session:', session.sessionId);
