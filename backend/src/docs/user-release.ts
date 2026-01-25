@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-25',
+    changes: [
+      'Added Slack Integration for Agent Mode/Emma',
+      '- Users can now start chat sessions with Emma directly from Slack by mentioning the Emma bot',
+      '- Emma creates an interactive share link (ishare) and responds in Slack with a link to continue the conversation',
+      '- ishare sessions now show the company name in the chat interface',
+      '- Improved ishare loading experience with proper loading indicators and error handling',
+    ],
+  },
+  {
     date: '2026-01-23',
     changes: [
       'Added Live Blog Article Publishing Support',
