@@ -217,8 +217,9 @@ const filterMessagesForClient = (messages: any[]) => {
       return false;
     }
 
-    // Remove assistant messages that have tool calls
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+    // Remove assistant messages that have tool_calls (intermediate messages during tool execution)
+    // BUT keep assistant messages that have metadata.toolCalls (final messages with tool execution results)
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0 && !message.metadata?.toolCalls) {
       return false;
     }
 
