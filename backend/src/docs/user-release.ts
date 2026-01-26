@@ -12,6 +12,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improved Customer Portal Page Title Display',
       '- Browser tab now shows "Customer Portal - user@email.com" instead of "Customer Portal - Customer Portal"',
       '- Helps users identify which account they are viewing when multiple tabs are open',
+      'Added Custom Run Time Support for Scheduled Chats',
+      '- Users can now set a specific date and time for when scheduled chats should run',
+      '- Custom run times are preserved across all future recurring runs (hourly, daily, weekly, monthly)',
+      '- Weekly schedules maintain the same day of week (e.g., Monday at 2 PM → next Monday at 2 PM)',
+      '- Monthly schedules maintain the same weekday and week position (e.g., 2nd Tuesday at 10 AM → 2nd Tuesday of next month at 10 AM)',
+      '- Smart scheduling ensures next run time is always in the future to prevent duplicate runs',
     ],
   },
   {
