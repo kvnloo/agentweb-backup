@@ -263,10 +263,8 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           // Emit initial progress to indicate generation has started
           emitProgress(session.sessionId, {
-            status: 'in_progress',
-            message: 'Starting Emma...',
-            currentStep: 0,
-            totalSteps: 1
+            iteration: 0,
+            status: 'thinking'
           });
 
           // Start generating response asynchronously (don't wait for it to complete)
@@ -280,10 +278,8 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             console.error('❌ Error generating agent response for Slack session:', error);
             // Emit error progress
             emitProgress(session.sessionId, {
-              status: 'complete',
-              message: 'Error occurred',
-              currentStep: 1,
-              totalSteps: 1
+              iteration: 1,
+              status: 'complete'
             });
           });
 
