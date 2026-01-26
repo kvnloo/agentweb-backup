@@ -188,14 +188,11 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
 
       await agentModeController.updateScheduledChat(mockReq, mockRes);
 
-      // The update should include the existing nextRunTime (preserved)
-      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
-        mockScheduleId,
-        expect.objectContaining({
-          nextRunTime: existingSchedule.nextRunTime,
-        })
-      );
+      // The update should NOT include nextRunTime (so it stays unchanged in DB)
+      const updateCall = mockScheduleDb.updateSchedule.mock.calls[0][1];
+      expect(updateCall).not.toHaveProperty('nextRunTime');
 
+      // Response should still return the existing nextRunTime
       expect(mockRes.json).toHaveBeenCalledWith({
         message: 'Scheduled chat updated successfully',
         nextRunTime: existingSchedule.nextRunTime,

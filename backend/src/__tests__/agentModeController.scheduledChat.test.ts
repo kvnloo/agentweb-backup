@@ -91,6 +91,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     keywords: ['marketing', 'strategy'],
     requiredFunctionCalls: ['get_marketing_tips', 'analyze_competitors'],
     userId: mockUserId,
+    nextRunTime: new Date().toISOString(),
   };
 
   const mockSession = {

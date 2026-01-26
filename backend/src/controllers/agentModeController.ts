@@ -2296,16 +2296,18 @@ export const agentModeController = {
 
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
+      let shouldUpdateNextRunTime = false;
       if (nextRunTime) {
         const providedDate = new Date(nextRunTime);
         if (isNaN(providedDate.getTime())) {
           return res.status(400).json({ error: 'Invalid nextRunTime format' });
         }
         scheduledNextRunTime = providedDate.toISOString();
+        shouldUpdateNextRunTime = true;
       }
 
       // Update the schedule
-      const updates = {
+      const updates: any = {
         scheduleName,
         description: description || '',
         startingMessage,
@@ -2318,8 +2320,12 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId || null,
         llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
-        nextRunTime: scheduledNextRunTime
       };
+
+      // Only include nextRunTime in updates if it was explicitly provided
+      if (shouldUpdateNextRunTime) {
+        updates.nextRunTime = scheduledNextRunTime;
+      }
 
       await scheduleDb.updateSchedule(scheduleId, updates);
 
