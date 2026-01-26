@@ -37,14 +37,6 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-// Mock conversable middleware
-jest.mock('../middleware/conversable', () => ({
-  authenticateConversable: (req: any, res: any, next: any) => {
-    req.conversableSession = { sessionId: 'test-session' };
-    next();
-  },
-}));
-
 // Mock config
 jest.mock('../config', () => ({
   MAX_FILE_SIZE: 104857600, // 100MB
