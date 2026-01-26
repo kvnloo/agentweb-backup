@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-26',
+    changes: [
+      'Improved Customer Portal Page Title Display',
+      '- Browser tab now shows "Customer Portal - user@email.com" instead of "Customer Portal - Customer Portal"',
+      '- Helps users identify which account they are viewing when multiple tabs are open',
+    ],
+  },
+  {
     date: '2026-01-25',
     changes: [
       'Improved CRM Lead Forwarding API Reliability',
