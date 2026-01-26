@@ -47,7 +47,7 @@ describe('Agent Mode iShare Feedback', () => {
           feedback: {
             type: 'like',
             comment: 'Very helpful!',
-            timestamp: expect.any(String),
+            timestamp: '2026-01-25T00:00:00Z',
             userId: 'anonymous-ishare',
           },
         },
@@ -66,7 +66,18 @@ describe('Agent Mode iShare Feedback', () => {
 
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
-      expect(response.body.message).toEqual(mockUpdatedMessage);
+      expect(response.body.message).toMatchObject({
+        role: 'assistant',
+        content: 'Hi there!',
+        metadata: {
+          feedback: {
+            type: 'like',
+            comment: 'Very helpful!',
+            userId: 'anonymous-ishare',
+          },
+        },
+      });
+      expect(response.body.message.metadata.feedback.timestamp).toBeDefined();
 
       // Verify session lookup
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith('session-123');

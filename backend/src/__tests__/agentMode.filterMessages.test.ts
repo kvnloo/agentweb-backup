@@ -3,13 +3,19 @@
 
 import request from 'supertest';
 import express from 'express';
-import agentModeRouter from '../routes/agentMode';
 
-// Mock dependencies
+// Mock dependencies BEFORE importing the router
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, res: any, next: any) => {
     req.user = { userId: 'user-123', email: 'test@example.com', isAdmin: false };
     next();
+  },
+  requireAdmin: (req: any, res: any, next: any) => {
+    if (req.user?.isAdmin) {
+      next();
+    } else {
+      res.status(403).json({ error: 'Admin access required' });
+    }
   },
 }));
 
@@ -31,8 +37,34 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+// Mock conversable middleware
+jest.mock('../middleware/conversable', () => ({
+  authenticateConversable: (req: any, res: any, next: any) => {
+    req.conversableSession = { sessionId: 'test-session' };
+    next();
+  },
+}));
+
+// Mock config
+jest.mock('../config', () => ({
+  MAX_FILE_SIZE: 104857600, // 100MB
+}));
+
+// Mock multer
+jest.mock('multer', () => {
+  const multer = () => ({
+    single: () => (req: any, res: any, next: any) => next(),
+    array: () => (req: any, res: any, next: any) => next(),
+  });
+  multer.memoryStorage = () => ({});
+  return multer;
+});
+
 const { chatbotDb } = require('../services/chatbotService');
 const { userDb } = require('../services/db');
+
+// Import router AFTER all mocks
+import agentModeRouter from '../routes/agentMode';
 
 describe('filterMessagesForClient - Tool Calls Preservation', () => {
   let app: express.Application;

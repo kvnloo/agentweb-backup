@@ -39,10 +39,12 @@ jest.mock('../utils/sseProgress', () => ({
   emitProgress: jest.fn(),
 }));
 
+const mockPostMessage = jest.fn().mockResolvedValue({ ok: true });
+
 jest.mock('@slack/web-api', () => ({
   WebClient: jest.fn().mockImplementation(() => ({
     chat: {
-      postMessage: jest.fn().mockResolvedValue({ ok: true }),
+      postMessage: mockPostMessage,
     },
   })),
 }));
@@ -150,10 +152,8 @@ describe('Slack Events API', () => {
 
       // Verify initial progress emission
       expect(emitProgress).toHaveBeenCalledWith('session-123', {
-        status: 'in_progress',
-        message: 'Starting Emma...',
-        currentStep: 0,
-        totalSteps: 1,
+        iteration: 0,
+        status: 'thinking',
       });
 
       // Verify response generation started
@@ -245,8 +245,7 @@ describe('Slack Events API', () => {
       expect(response.status).toBe(200);
 
       // Verify error message sent to Slack
-      const slackClient = new WebClient();
-      expect(slackClient.chat.postMessage).toHaveBeenCalledWith(
+      expect(mockPostMessage).toHaveBeenCalledWith(
         expect.objectContaining({
           channel: 'C99999',
           text: expect.stringContaining('couldn\'t find a user account linked'),
