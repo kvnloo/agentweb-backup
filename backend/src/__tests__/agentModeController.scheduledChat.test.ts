@@ -1317,4 +1317,356 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
   });
+
+  describe('Run Count Feature', () => {
+    // Mock the scheduleDb.createSchedule to capture the schedule object
+    const mockCreateSchedule = jest.fn();
+
+    beforeEach(() => {
+      // Add mock for createSchedule
+      mockScheduleDb.createSchedule = mockCreateSchedule;
+      mockCreateSchedule.mockClear();
+    });
+
+    describe('createScheduledChat', () => {
+      it('should create schedule with default unlimited runCount when not provided', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Test Schedule',
+            startingMessage: 'Test message',
+            scheduleFrequency: 'daily',
+            keywords: [],
+            requiredFunctionCalls: [],
+            functionCallMinCalls: {},
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.objectContaining({
+            runCount: -1, // Should default to unlimited
+          })
+        );
+      });
+
+      it('should create schedule with specified limited runCount', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Test Schedule',
+            startingMessage: 'Test message',
+            scheduleFrequency: 'daily',
+            keywords: [],
+            requiredFunctionCalls: [],
+            functionCallMinCalls: {},
+            emailNotifications: [],
+            runCount: 5,
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.objectContaining({
+            runCount: 5,
+          })
+        );
+      });
+
+      it('should reject invalid runCount values', async () => {
+        const testCases = [
+          { runCount: 0, errorMsg: 'runCount must be -1 (unlimited) or a positive integer' },
+          { runCount: -5, errorMsg: 'runCount must be -1 (unlimited) or a positive integer' },
+          { runCount: 1.5, errorMsg: 'runCount must be -1 (unlimited) or a positive integer' },
+        ];
+
+        for (const testCase of testCases) {
+          const mockReq = {
+            user: { userId: mockUserId },
+            body: {
+              scheduleName: 'Test Schedule',
+              startingMessage: 'Test message',
+              scheduleFrequency: 'daily',
+              runCount: testCase.runCount,
+            },
+          } as unknown as Request;
+
+          const mockRes = {
+            json: jest.fn(),
+            status: jest.fn().mockReturnThis(),
+          } as unknown as Response;
+
+          await agentModeController.createScheduledChat(mockReq, mockRes);
+
+          expect(mockRes.status).toHaveBeenCalledWith(400);
+          expect(mockRes.json).toHaveBeenCalledWith(
+            expect.objectContaining({
+              error: testCase.errorMsg,
+            })
+          );
+        }
+      });
+    });
+
+    describe('updateScheduledChat', () => {
+      it('should update schedule with new runCount', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Updated message',
+            scheduleFrequency: 'daily',
+            keywords: [],
+            requiredFunctionCalls: [],
+            functionCallMinCalls: {},
+            emailNotifications: [],
+            runCount: 10,
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+          mockScheduleId,
+          expect.objectContaining({
+            runCount: 10,
+          })
+        );
+      });
+
+      it('should update schedule to unlimited runCount', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Updated message',
+            scheduleFrequency: 'daily',
+            keywords: [],
+            requiredFunctionCalls: [],
+            functionCallMinCalls: {},
+            emailNotifications: [],
+            runCount: -1,
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+          mockScheduleId,
+          expect.objectContaining({
+            runCount: -1,
+          })
+        );
+      });
+
+      it('should reject invalid runCount values in update', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Updated message',
+            scheduleFrequency: 'daily',
+            runCount: 0, // Invalid
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({
+            error: 'runCount must be -1 (unlimited) or a positive integer',
+          })
+        );
+      });
+    });
+  });
+
+  describe('getScheduledChats - Sorting', () => {
+    // Mock getSchedulesByUserId to return schedules
+    beforeEach(() => {
+      mockScheduleDb.getSchedulesByUserId = jest.fn();
+    });
+
+    it('should sort scheduled chats by createdAt descending (newest first)', async () => {
+      const oldSchedule = {
+        scheduleId: 'old-schedule',
+        scheduleName: 'Old Schedule',
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: '2026-01-01T10:00:00.000Z',
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      const newSchedule = {
+        scheduleId: 'new-schedule',
+        scheduleName: 'New Schedule',
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: '2026-01-26T10:00:00.000Z',
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      const middleSchedule = {
+        scheduleId: 'middle-schedule',
+        scheduleName: 'Middle Schedule',
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: '2026-01-15T10:00:00.000Z',
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      // Return schedules in random order
+      mockScheduleDb.getSchedulesByUserId.mockResolvedValue([
+        middleSchedule,
+        oldSchedule,
+        newSchedule,
+      ]);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.getScheduledChats(mockReq, mockRes);
+
+      // Verify the response is sorted by createdAt descending
+      expect(mockRes.json).toHaveBeenCalledWith([
+        newSchedule,    // 2026-01-26 (newest)
+        middleSchedule, // 2026-01-15
+        oldSchedule,    // 2026-01-01 (oldest)
+      ]);
+    });
+
+    it('should handle schedules without createdAt field', async () => {
+      const scheduleWithCreatedAt = {
+        scheduleId: 'schedule-1',
+        scheduleName: 'Schedule 1',
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: '2026-01-26T10:00:00.000Z',
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      const scheduleWithoutCreatedAt = {
+        scheduleId: 'schedule-2',
+        scheduleName: 'Schedule 2',
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        // No createdAt field
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      mockScheduleDb.getSchedulesByUserId.mockResolvedValue([
+        scheduleWithoutCreatedAt,
+        scheduleWithCreatedAt,
+      ]);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.getScheduledChats(mockReq, mockRes);
+
+      // Schedule with createdAt should come first (newest)
+      // Schedule without createdAt should be treated as epoch 0 (oldest)
+      expect(mockRes.json).toHaveBeenCalledWith([
+        scheduleWithCreatedAt,
+        scheduleWithoutCreatedAt,
+      ]);
+    });
+
+    it('should filter out non-scheduled_chat types before sorting', async () => {
+      const scheduledChat = {
+        scheduleId: 'scheduled-chat',
+        scheduleName: 'Scheduled Chat',
+        userId: mockUserId,
+        type: 'scheduled_chat',
+        createdAt: '2026-01-26T10:00:00.000Z',
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      const taskSchedule = {
+        scheduleId: 'task-schedule',
+        scheduleName: 'Task Schedule',
+        userId: mockUserId,
+        type: 'task',
+        createdAt: '2026-01-27T10:00:00.000Z', // Newer but wrong type
+        status: 'active',
+        frequency: 'daily',
+        nextRunTime: '2026-01-28T10:00:00.000Z',
+      };
+
+      mockScheduleDb.getSchedulesByUserId.mockResolvedValue([
+        taskSchedule,
+        scheduledChat,
+      ]);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.getScheduledChats(mockReq, mockRes);
+
+      // Should only return scheduled_chat type
+      expect(mockRes.json).toHaveBeenCalledWith([scheduledChat]);
+    });
+  });
 });
