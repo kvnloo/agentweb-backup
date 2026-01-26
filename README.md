@@ -266,6 +266,12 @@ ngrok http 3001
 
 This creates a public URL that Slack can use to send approval button interactions to your local backend. Then configure it in https://api.slack.com/apps for Emma dev.
 
+**Additional Slack Configuration** - Configure Event Subscriptions in your Slack app (https://api.slack.com/apps):
+- **Event Subscriptions** → Enable Events
+- **Request URL**: `https://your-backend-url.com/api/slack/events` (e.g., `https://abc123.ngrok.io/api/slack/events` for local dev)
+- **Subscribe to bot events** → Add `app_mention`
+- Set `SLACK_BOT_TOKEN` in your `.env` file
+
 ### Frontend Setup for Development
 
 **Note**: The frontend applications are now separate repositories:
