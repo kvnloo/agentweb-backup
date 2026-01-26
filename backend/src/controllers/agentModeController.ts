@@ -1002,29 +1002,76 @@ async function generateSessionResponse(
 
 // Helper function to calculate next run time based on frequency
 const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
-  const nextRun = new Date(fromDate);
+  const now = new Date();
+  let nextRun = new Date(fromDate);
 
   switch (frequency) {
     case 'hourly':
       nextRun.setHours(nextRun.getHours() + 1);
       nextRun.setMinutes(0, 0, 0); // Top of the hour
+
+      // If still in the past, keep adding hours until we're in the future
+      while (nextRun <= now) {
+        nextRun.setHours(nextRun.getHours() + 1);
+      }
       break;
     case 'daily':
       nextRun.setDate(nextRun.getDate() + 1);
-      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      // Preserve the time from fromDate
+
+      // If still in the past (schedule ran late), keep adding days until we're in the future
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
       break;
     case 'weekly':
+      // Add exactly 7 days (same day of week, one week later)
       nextRun.setDate(nextRun.getDate() + 7);
-      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      // Preserve the time from fromDate
+
+      // If still in the past, keep adding weeks until we're in the future
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 7);
+      }
       break;
     case 'monthly':
+      // Calculate same weekday of next month (e.g., 2nd Tuesday -> 2nd Tuesday of next month)
+      const currentDayOfWeek = nextRun.getDay(); // 0 = Sunday, 1 = Monday, etc.
+      const currentWeekOfMonth = Math.floor((nextRun.getDate() - 1) / 7); // 0-based week number
+
+      // Move to next month, 1st day
       nextRun.setMonth(nextRun.getMonth() + 1);
-      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      nextRun.setDate(1);
+
+      // Find the first occurrence of the target day of week in the new month
+      const firstDayOfMonth = nextRun.getDay();
+      let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
+
+      // Add weeks to get to the same week number
+      daysToAdd += currentWeekOfMonth * 7;
+
+      nextRun.setDate(1 + daysToAdd);
+      // Preserve the time from fromDate
+
+      // If still in the past, keep adding months until we're in the future
+      while (nextRun <= now) {
+        nextRun.setMonth(nextRun.getMonth() + 1);
+        nextRun.setDate(1);
+
+        const firstDayOfMonth = nextRun.getDay();
+        let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
+        daysToAdd += currentWeekOfMonth * 7;
+        nextRun.setDate(1 + daysToAdd);
+      }
       break;
     default:
       // Default to daily
       nextRun.setDate(nextRun.getDate() + 1);
-      nextRun.setHours(9, 0, 0, 0);
+      nextRun.setHours(9, 0, 0, 0); // Fallback to 9 AM UTC for unknown frequencies
+
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
   }
 
   return nextRun;
@@ -2121,6 +2168,7 @@ export const agentModeController = {
         description,
         startingMessage,
         scheduleFrequency,
+        nextRunTime,
         keywords,
         requiredFunctionCalls,
         functionCallMinCalls,
@@ -2144,7 +2192,21 @@ export const agentModeController = {
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
-      const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
+
+      // Use provided nextRunTime or calculate default
+      let scheduledNextRunTime: string;
+      if (nextRunTime) {
+        // Validate the provided nextRunTime
+        const providedDate = new Date(nextRunTime);
+        if (isNaN(providedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        }
+        scheduledNextRunTime = providedDate.toISOString();
+      } else {
+        // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
+        const calculatedTime = calculateNextRunTime(scheduleFrequency, now);
+        scheduledNextRunTime = calculatedTime.toISOString();
+      }
 
       const scheduledChat = {
         scheduleId,
@@ -2160,7 +2222,7 @@ export const agentModeController = {
         emailNotifications: emailNotifications || [],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         status: 'active',
-        nextRunTime: nextRunTime.toISOString(),
+        nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
@@ -2174,7 +2236,7 @@ export const agentModeController = {
       res.status(201).json({
         scheduleId,
         message: 'Scheduled chat created successfully',
-        nextRunTime: nextRunTime.toISOString()
+        nextRunTime: scheduledNextRunTime
       });
     } catch (error) {
       console.error('AgentMode: Create scheduled chat error:', error);
@@ -2200,7 +2262,7 @@ export const agentModeController = {
     }
   },
 
-  // Delete scheduled chat
+  // Update scheduled chat
   async updateScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -2210,6 +2272,7 @@ export const agentModeController = {
         description,
         startingMessage,
         scheduleFrequency,
+        nextRunTime,
         keywords,
         requiredFunctionCalls,
         functionCallMinCalls,
@@ -2229,9 +2292,17 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
-      // Update the schedule without modifying nextRunTime
-      // nextRunTime should only be updated when the schedule actually runs
       const now = new Date();
+
+      // Determine nextRunTime: use provided value or keep existing
+      let scheduledNextRunTime = existingSchedule.nextRunTime;
+      if (nextRunTime) {
+        const providedDate = new Date(nextRunTime);
+        if (isNaN(providedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        }
+        scheduledNextRunTime = providedDate.toISOString();
+      }
 
       // Update the schedule
       const updates = {
@@ -2246,15 +2317,15 @@ export const agentModeController = {
         dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
+        nextRunTime: scheduledNextRunTime
       };
 
       await scheduleDb.updateSchedule(scheduleId, updates);
 
-      // Return the existing nextRunTime from the schedule
       res.json({
         message: 'Scheduled chat updated successfully',
-        nextRunTime: existingSchedule.nextRunTime
+        nextRunTime: scheduledNextRunTime
       });
     } catch (error) {
       console.error('AgentMode: Update scheduled chat error:', error);
@@ -2516,7 +2587,9 @@ export const agentModeController = {
 
           // Update the schedule with next run time FIRST (synchronously)
           // This prevents agent-engine from repeatedly calling the same schedule
-          const nextRunTime = calculateNextRunTime(schedule.frequency, now);
+          // Calculate next run based on the current nextRunTime to preserve the scheduled time
+          const currentNextRun = new Date(schedule.nextRunTime);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
 
           await scheduleDb.updateScheduleAfterRun(
             schedule.scheduleId,
