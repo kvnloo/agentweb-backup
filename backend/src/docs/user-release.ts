@@ -18,6 +18,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Weekly schedules maintain the same day of week (e.g., Monday at 2 PM → next Monday at 2 PM)',
       '- Monthly schedules maintain the same weekday and week position (e.g., 2nd Tuesday at 10 AM → 2nd Tuesday of next month at 10 AM)',
       '- Smart scheduling ensures next run time is always in the future to prevent duplicate runs',
+      'Added Run Count Support for Scheduled Chats',
+      '- Users can now limit the number of times a scheduled chat will run before automatically pausing',
+      '- Set to "Unlimited" (default) for schedules that run indefinitely, or "Limited" to specify an exact run count',
+      '- When run count reaches 0, the schedule automatically pauses to prevent further executions',
+      '- Both successful and failed runs count toward the run limit',
+      '- Schedule list displays remaining runs with ∞ symbol for unlimited schedules',
+      '- Run count can be updated when editing existing schedules',
     ],
   },
   {

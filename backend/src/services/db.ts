@@ -1565,6 +1565,7 @@ export const scheduleDb = {
     sessionId?: string | null;
     type?: string;
     emailCampaignTaskId?: string;
+    runCount?: number; // -1 for unlimited, positive integer for limited runs
   }) {
     try {
       const params = {
@@ -1631,6 +1632,7 @@ export const scheduleDb = {
             dailyDigest: boolean;
             updatedAt: string;
             emailCampaignTaskId: string;
+            runCount: number;
           }>
         ) {
           try {
@@ -1735,24 +1737,57 @@ export const scheduleDb = {
           }
         },
 
-        async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string) {
+        async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true) {
           try {
+            // First, get the current schedule to check runCount
+            const getParams = {
+              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+              Key: { scheduleId },
+            };
+            const currentSchedule = await dynamodb.get(getParams).promise();
+            const runCount = currentSchedule.Item?.runCount;
+
+            // Determine if we should pause the schedule
+            // When runCount is 1, after decrementing it will be 0, so we should pause
+            const shouldPause = decrementRunCount && runCount !== undefined && runCount !== -1 && runCount === 1;
+
+            // Build update expression dynamically
+            const updateParts: string[] = [
+              '#lastRunTime = :lastRunTime',
+              '#nextRunTime = :nextRunTime',
+              '#updatedAt = :updatedAt',
+            ];
+            const attributeNames: { [key: string]: string } = {
+              '#lastRunTime': 'lastRunTime',
+              '#nextRunTime': 'nextRunTime',
+              '#updatedAt': 'updatedAt',
+            };
+            const attributeValues: { [key: string]: any } = {
+              ':lastRunTime': lastRunTime,
+              ':nextRunTime': nextRunTime,
+              ':updatedAt': new Date().toISOString(),
+            };
+
+            // Handle runCount decrement
+            if (decrementRunCount && runCount !== undefined && runCount !== -1) {
+              updateParts.push('#runCount = #runCount - :one');
+              attributeNames['#runCount'] = 'runCount';
+              attributeValues[':one'] = 1;
+            }
+
+            // Auto-pause if runCount reaches 0
+            if (shouldPause) {
+              updateParts.push('#status = :paused');
+              attributeNames['#status'] = 'status';
+              attributeValues[':paused'] = 'paused';
+            }
+
             const params = {
               TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              Key: {
-                scheduleId,
-              },
-              UpdateExpression: 'SET #lastRunTime = :lastRunTime, #nextRunTime = :nextRunTime, #updatedAt = :updatedAt',
-              ExpressionAttributeNames: {
-                '#lastRunTime': 'lastRunTime',
-                '#nextRunTime': 'nextRunTime',
-                '#updatedAt': 'updatedAt',
-              },
-              ExpressionAttributeValues: {
-                ':lastRunTime': lastRunTime,
-                ':nextRunTime': nextRunTime,
-                ':updatedAt': new Date().toISOString(),
-              },
+              Key: { scheduleId },
+              UpdateExpression: `SET ${updateParts.join(', ')}`,
+              ExpressionAttributeNames: attributeNames,
+              ExpressionAttributeValues: attributeValues,
               ReturnValues: 'ALL_NEW',
             };
 

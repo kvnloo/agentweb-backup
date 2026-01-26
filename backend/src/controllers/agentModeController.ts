@@ -2256,11 +2256,19 @@ export const agentModeController = {
         functionCallMinCalls,
         emailNotifications,
         emailCampaignTaskId,
-        llmModel
+        llmModel,
+        runCount
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Validate runCount if provided
+      if (runCount !== undefined) {
+        if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
+          return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
+        }
       }
 
       // If sessionId is provided, verify it exists and belongs to user
@@ -2310,7 +2318,8 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
+        runCount: runCount !== undefined ? runCount : -1 // Default to unlimited runs if not specified
       };
 
       await scheduleDb.createSchedule(scheduledChat);
@@ -2361,11 +2370,19 @@ export const agentModeController = {
         emailNotifications,
         dailyDigest,
         emailCampaignTaskId,
-        llmModel
+        llmModel,
+        runCount
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Validate runCount if provided
+      if (runCount !== undefined) {
+        if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
+          return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
+        }
       }
 
       // Verify schedule exists and belongs to user
@@ -2407,6 +2424,11 @@ export const agentModeController = {
       // Only include nextRunTime in updates if it was explicitly provided
       if (shouldUpdateNextRunTime) {
         updates.nextRunTime = scheduledNextRunTime;
+      }
+
+      // Only include runCount in updates if it was explicitly provided
+      if (runCount !== undefined) {
+        updates.runCount = runCount;
       }
 
       await scheduleDb.updateSchedule(scheduleId, updates);
@@ -2654,10 +2676,12 @@ export const agentModeController = {
             delayedRunTime.setMinutes(delayedRunTime.getMinutes() + 30);
 
             // Update the schedule with delayed run time
+            // Don't decrement runCount since this run hasn't actually happened
             await scheduleDb.updateScheduleAfterRun(
               schedule.scheduleId,
               schedule.lastRunTime || now.toISOString(),
-              delayedRunTime.toISOString()
+              delayedRunTime.toISOString(),
+              false // Don't decrement runCount for delayed runs
             );
 
             console.log(`Delayed scheduled chat ${schedule.scheduleName} for 30 minutes due to concurrent run limit (${maxConcurrentRuns})`);
@@ -2679,10 +2703,13 @@ export const agentModeController = {
           const currentNextRun = new Date(schedule.nextRunTime);
           const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
 
+          // Decrement runCount and auto-pause if it reaches 0
+          // Note: Both successful and failed runs count toward the run limit
           await scheduleDb.updateScheduleAfterRun(
             schedule.scheduleId,
             now.toISOString(),
-            nextRunTime.toISOString()
+            nextRunTime.toISOString(),
+            true // Decrement runCount (default behavior)
           );
 
           // Increment concurrent run counter
