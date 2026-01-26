@@ -2346,6 +2346,13 @@ export const agentModeController = {
         schedule.type === 'scheduled_chat'
       ) || [];
 
+      // Sort by creation time descending (newest first)
+      scheduledChats.sort((a, b) => {
+        const dateA = new Date(a.createdAt || 0).getTime();
+        const dateB = new Date(b.createdAt || 0).getTime();
+        return dateB - dateA;
+      });
+
       res.json(scheduledChats);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
