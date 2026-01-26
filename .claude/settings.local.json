@@ -19,8 +19,6 @@
       "Bash(npm run dev:*)",
       "Bash(grep:*)",
       "Bash(ls:*)",
-      "Bash(kill:*)",
-      "Bash(pkill:*)"
     ]
   }
 }
