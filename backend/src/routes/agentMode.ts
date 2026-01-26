@@ -51,6 +51,10 @@ router.patch('/ishare/:shareId/llm-model', asyncHandler(agentModeController.upda
 // SSE endpoint for progress updates (public, with conversable token)
 router.get('/ishare/:shareId/progress', asyncHandler(agentModeController.getProgressPublic));
 
+// PUT /api/agent-mode/ishare/:shareId/message/:messageIndex/feedback
+// Submit message feedback for ishare sessions (public, with conversable token)
+router.put('/ishare/:shareId/message/:messageIndex/feedback', asyncHandler(agentModeController.submitIShareMessageFeedback));
+
 // Note: Plan links also use ishare endpoint with conversable token, so they're covered by the above route
 
 // GET /api/agent-mode/public/welcome-message

@@ -44,7 +44,7 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
     // Don't send sensitive information
     const { password, ...userWithoutPassword } = user;
-    
+
     // Add delegation information if this is a delegate session
     const response: any = userWithoutPassword;
     if (authenticatedReq.delegateInfo) {
@@ -53,19 +53,19 @@ router.get('/me', authenticateToken, async (req, res) => {
         adminEmail: authenticatedReq.delegateInfo.adminEmail
       };
     }
-    
+
     // Add subscription type, allowed pages, and allowed function calls for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
         const { getUserSubscriptionType, getAllowedPages, getAllowedFunctionCalls } = await import('../services/subscriptionService');
-        
+
         const subscriptionTypeName = await getUserSubscriptionType(userId);
-        
+
         response.subscriptionType = subscriptionTypeName;
-        
+
         // Get allowed pages (expands "*" to actual list)
         response.allowedPages = await getAllowedPages(userId);
-        
+
         // Get allowed function calls (expands "*" to actual list)
         response.allowedFunctionCalls = await getAllowedFunctionCalls(userId);
       } catch (error) {
@@ -77,10 +77,52 @@ router.get('/me', authenticateToken, async (req, res) => {
         response.allowedFunctionCalls = await getAllowedFunctionCalls(userId);
       }
     }
-    
+
     res.json(response);
   } catch (error) {
     console.error('Error fetching current user:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get Slack channel name for support
+router.get('/slack-channel-name', authenticateToken, async (req, res) => {
+  try {
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'User not authenticated' });
+    }
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // If no Slack channel configured, return null
+    if (!user.slackChannel) {
+      return res.json({ slackChannelName: null });
+    }
+
+    // Resolve Slack channel ID to name
+    try {
+      const { getSlackChannelInfo } = await import('../services/slackService');
+      const channelInfo = await getSlackChannelInfo(user.slackChannel);
+      if (channelInfo) {
+        // Generate Slack deep link (works on web and desktop app)
+        const slackUrl = `https://slack.com/app_redirect?channel=${user.slackChannel}`;
+        return res.json({
+          slackChannelName: channelInfo.name,
+          slackChannelUrl: slackUrl
+        });
+      } else {
+        return res.json({ slackChannelName: null });
+      }
+    } catch (error) {
+      console.error('Error resolving Slack channel name:', error);
+      return res.json({ slackChannelName: null });
+    }
+  } catch (error) {
+    console.error('Error fetching Slack channel name:', error);
     res.status(500).json({ message: 'Server error' });
   }
 });

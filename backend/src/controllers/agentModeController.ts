@@ -217,8 +217,9 @@ const filterMessagesForClient = (messages: any[]) => {
       return false;
     }
 
-    // Remove assistant messages that have tool calls
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+    // Remove assistant messages that have tool_calls (intermediate messages during tool execution)
+    // BUT keep assistant messages that have metadata.toolCalls (final messages with tool execution results)
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0 && !message.metadata?.toolCalls) {
       return false;
     }
 
@@ -871,7 +872,7 @@ function hasActiveProgress(sessionId: string): boolean {
 
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-async function generateSessionResponse(
+export async function generateSessionResponse(
   sessionId: string,
   userMessage: string,
   userId: string,
@@ -1648,6 +1649,16 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
 
+      // Get user's supportNote if available
+      let supportNote: string | undefined;
+      try {
+        const user = await userDb.getUserById(session.userId);
+        supportNote = user?.supportNote;
+      } catch (error) {
+        console.error('Failed to fetch user supportNote:', error);
+        // Continue without supportNote if fetch fails
+      }
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1660,7 +1671,8 @@ export const agentModeController = {
           workPlan: session.workPlan,
           llmModel: modelToUse,
           isConversable: !!conversable,
-          hasActiveProgress: hasActiveProgress(session.sessionId)
+          hasActiveProgress: hasActiveProgress(session.sessionId),
+          supportNote: supportNote
         }
       });
     } catch (error) {
@@ -1960,6 +1972,76 @@ export const agentModeController = {
       });
     } catch (error) {
       console.error('AgentMode: Submit message feedback error:', error);
+      res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
+  // Submit message feedback for ishare sessions (public with conversable token)
+  async submitIShareMessageFeedback(req: Request, res: Response) {
+    try {
+      const { shareId, messageIndex } = req.params;
+      const { conversable } = req.query;
+      const { type, comment } = req.body;
+
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      // Validate feedback type
+      if (!type || (type !== 'like' && type !== 'dislike')) {
+        return res.status(400).json({ error: 'Invalid feedback type. Must be "like" or "dislike"' });
+      }
+
+      // Validate comment length if provided
+      if (comment && comment.length > 500) {
+        return res.status(400).json({ error: 'Comment too long. Maximum 500 characters' });
+      }
+
+      // Get session and verify conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Get all messages to verify the message exists and is an assistant message
+      const messages = await chatbotDb.getMessagesFromMessagesTable(shareId);
+      const messageIndexNum = parseInt(messageIndex, 10);
+
+      if (isNaN(messageIndexNum) || messageIndexNum < 0 || messageIndexNum >= messages.length) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      const message = messages[messageIndexNum];
+      if (message.role !== 'assistant') {
+        return res.status(400).json({ error: 'Can only rate assistant messages' });
+      }
+
+      // Create feedback object (use 'anonymous' as userId for ishare)
+      const feedback = {
+        type: type as 'like' | 'dislike',
+        comment: comment || undefined,
+        timestamp: new Date().toISOString(),
+        userId: 'anonymous-ishare',
+      };
+
+      // Update the message with feedback
+      const updatedMessage = await chatbotDb.updateMessageFeedback(
+        shareId,
+        messageIndexNum,
+        feedback
+      );
+
+      res.json({
+        success: true,
+        message: updatedMessage,
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit ishare message feedback error:', error);
       res.status(500).json({ error: 'Failed to submit feedback' });
     }
   },

@@ -29,6 +29,39 @@ export interface ApprovalRequest {
 }
 
 /**
+ * Get channel info by ID
+ */
+export async function getSlackChannelInfo(channelId: string): Promise<SlackChannel | null> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  try {
+    console.log(`🔍 Fetching Slack channel info for: ${channelId}`);
+
+    const result = await slackClient.conversations.info({
+      channel: channelId,
+    });
+
+    if (!result.ok || !result.channel) {
+      console.log(`❌ Could not fetch channel info for: ${channelId}`);
+      return null;
+    }
+
+    const channel = result.channel;
+    return {
+      id: channel.id!,
+      name: channel.name!,
+      displayName: `#${channel.name}`,
+      isPrivate: channel.is_private || false,
+    };
+  } catch (error) {
+    console.error(`❌ Error fetching Slack channel info for ${channelId}:`, error);
+    return null;
+  }
+}
+
+/**
  * Get list of Slack channels the bot is a member of
  */
 export async function getSlackChannels(): Promise<SlackChannel[]> {
