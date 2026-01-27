@@ -266,6 +266,12 @@ ngrok http 3001
 
 This creates a public URL that Slack can use to send approval button interactions to your local backend. Then configure it in https://api.slack.com/apps for Emma dev.
 
+**Additional Slack Configuration** - Configure Event Subscriptions in your Slack app (https://api.slack.com/apps):
+- **Event Subscriptions** → Enable Events
+- **Request URL**: `https://your-backend-url.com/api/slack/events` (e.g., `https://abc123.ngrok.io/api/slack/events` for local dev)
+- **Subscribe to bot events** → Add `app_mention`
+- Set `SLACK_BOT_TOKEN` in your `.env` file
+
 ### Frontend Setup for Development
 
 **Note**: The frontend applications are now separate repositories:
@@ -926,6 +932,106 @@ If your collection doesn't have a publish date field:
 - You can configure `fieldMappings` in both global and per-user secrets
 - When a `userId` is provided, the backend will **only** read from `dev/AgentWeb/Webflow/<user_id>` or `prod/AgentWeb/Webflow/<user_id>` and will **not** fall back to the global secret.
 - When no `userId` is provided (legacy flows), the global secret (`dev/AgentWeb/Webflow` or `prod/AgentWeb/Webflow`) is used.
+
+**Configuring Categories Mapping:**
+
+The `categories` field in the Webflow configuration maps human-readable category names to Webflow category reference IDs. This allows the agent to use friendly category names (e.g., "Technology", "Marketing") instead of cryptic IDs when publishing blog posts.
+
+**How to configure categories:**
+
+1. **Find your Webflow category IDs:**
+   - Go to your Webflow CMS Collections
+   - Navigate to your Categories collection (if you have one)
+   - Note down the category names and their corresponding IDs
+   - Or use the Webflow API to list category items:
+     ```bash
+     curl -X GET "https://api.webflow.com/v2/collections/{categoriesCollectionId}/items" \
+       -H "Authorization: Bearer {apiToken}" \
+       -H "accept-version: 2.0.0"
+     ```
+
+2. **Add categories mapping to your Webflow secret:**
+
+```json
+{
+  "apiToken": "your_webflow_api_token",
+  "siteId": "your_webflow_site_id",
+  "collectionId": "your_webflow_collection_id",
+  "fieldMappings": {
+    "summary": "post-summary",
+    "body": "post-body",
+    "image": "main-image",
+    "publishDate": null,
+    "author": "author",
+    "category": "categories"
+  },
+  "categories": {
+    "Technology": "64f2a3b1c8d9e7f6a5b4c3d2",
+    "Marketing": "54e1b2c3d4e5f6a7b8c9d0e1",
+    "Product": "74g3c4d5e6f7g8h9i0j1k2l3",
+    "Design": "84h4d5e6f7g8h9i0j1k2l3m4"
+  }
+}
+```
+
+**Usage in Agent Mode:**
+
+When publishing blog articles, the agent can now use category names instead of IDs:
+
+```javascript
+// Agent uses human-readable names
+publish_blog_article({
+  title: "Article Title",
+  description: "Description",
+  hero_image_url: "https://...",
+  blog_html_url: "https://...",
+  status: "published",
+  categories: ["Technology", "Marketing"]  // Uses names, not IDs
+})
+```
+
+**Important Notes:**
+- Category names in the mapping must match exactly (case-sensitive)
+- If a category name is not found in the mapping, it will be skipped with a warning
+- If publishing with `status: "published"`, at least one valid category is required
+- If validation fails, the error message will include a list of available category names
+- The system automatically converts category names to IDs before sending to Webflow
+
+**Single Reference vs Multi-Reference Fields:**
+
+The system intelligently detects whether your Webflow category field is a single reference or multi-reference based on the field name:
+
+- **Single Reference** (singular field name like `"category"`, `"tag"`):
+  - Only accepts ONE category
+  - If multiple categories are provided, only the first one will be used
+  - Value sent to Webflow: `"categoryId123"` (string)
+  - Configure in fieldMappings: `"category": "category"`
+
+- **Multi-Reference** (plural field name like `"categories"`, `"tags"`):
+  - Accepts MULTIPLE categories
+  - All provided categories will be included
+  - Value sent to Webflow: `["categoryId123", "categoryId456"]` (array)
+  - Configure in fieldMappings: `"category": "categories"` (default)
+
+**Example configurations:**
+
+```json
+// Multi-reference (default) - accepts multiple categories
+{
+  "fieldMappings": {
+    "category": "categories"  // plural name = multi-reference
+  }
+}
+
+// Single reference - accepts only one category
+{
+  "fieldMappings": {
+    "category": "category"  // singular name = single reference
+  }
+}
+```
+
+The system automatically detects the field type based on whether the field name ends with "s" or "ies".
 
 **How to get Webflow credentials:**
 

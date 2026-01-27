@@ -7,6 +7,53 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-26',
+    changes: [
+      'Improved Customer Portal Page Title Display',
+      '- Browser tab now shows "Customer Portal - user@email.com" instead of "Customer Portal - Customer Portal"',
+      '- Helps users identify which account they are viewing when multiple tabs are open',
+      'Added Custom Run Time Support for Scheduled Chats',
+      '- Users can now set a specific date and time for when scheduled chats should run',
+      '- Custom run times are preserved across all future recurring runs (hourly, daily, weekly, monthly)',
+      '- Weekly schedules maintain the same day of week (e.g., Monday at 2 PM → next Monday at 2 PM)',
+      '- Monthly schedules maintain the same weekday and week position (e.g., 2nd Tuesday at 10 AM → 2nd Tuesday of next month at 10 AM)',
+      '- Smart scheduling ensures next run time is always in the future to prevent duplicate runs',
+      'Added Run Count Support for Scheduled Chats',
+      '- Users can now limit the number of times a scheduled chat will run before automatically pausing',
+      '- Set to "Unlimited" (default) for schedules that run indefinitely, or "Limited" to specify an exact run count',
+      '- When run count reaches 0, the schedule automatically pauses to prevent further executions',
+      '- Both successful and failed runs count toward the run limit',
+      '- Schedule list displays remaining runs with ∞ symbol for unlimited schedules',
+      '- Run count can be updated when editing existing schedules',
+    ],
+  },
+  {
+    date: '2026-01-25',
+    changes: [
+      'Added Slack Integration for Agent Mode/Emma',
+      '- Users can now start chat sessions with Emma directly from Slack by mentioning the Emma bot',
+      '- Emma creates an interactive share link (ishare) and responds in Slack with a link to continue the conversation',
+      '- ishare sessions now show the company name in the chat interface',
+      '- Improved ishare loading experience with proper loading indicators and error handling',
+      'Improved CRM Lead Forwarding API Reliability',
+      '- Lead forwarding API now returns success (200) instead of conflict (409) when duplicate leads are submitted',
+      '- Prevents API clients from retrying duplicate lead submissions',
+      '- Response includes "duplicate: true" flag to indicate the lead already existed',
+    ],
+  },
+  {
+    date: '2026-01-23',
+    changes: [
+      'Added Live Blog Article Publishing Support',
+      '- Blog articles can now be published directly as "published" status to Webflow CMS',
+      '- Published articles require at least one category to be provided',
+      '- Added optional author parameter for byline attribution',
+      '- Added optional categories parameter (array) with automatic name-to-ID mapping from secrets manager',
+      'Added repair_blog_article function for fixing image size issues',
+      '- Automatically detects and resizes all images that exceed Webflow\'s 4MB file size limit',
+    ],
+  },
+  {
     date: '2026-01-22',
     changes: [
       'Added Get Support Feature',

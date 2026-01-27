@@ -289,9 +289,29 @@ describe('Lead Forwarding API', () => {
           lastName: 'Doe',
         });
 
-      expect(response.status).toBe(409);
-      expect(response.body.success).toBe(false);
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.duplicate).toBe(true);
       expect(response.body.message).toContain('already exists');
+    });
+
+    it('should return success for duplicate with "duplicate" keyword in error', async () => {
+      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockRejectedValue(
+        new Error('duplicate email detected')
+      );
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .set('X-API-Key', validApiKey)
+        .send({
+          email: 'duplicate@example.com',
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.duplicate).toBe(true);
+      expect(response.body.message).toBe('Lead already exists in the list');
     });
 
     it('should accept API key in request body', async () => {

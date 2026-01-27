@@ -75,7 +75,10 @@ export async function getWebflowConfig(userId?: string): Promise<{
     body?: string;
     image?: string;
     publishDate?: string;
+    author?: string;
+    category?: string;
   };
+  categories?: Record<string, string>;
 }> {
   try {
     console.log('getWebflowConfig called with userId:', userId);
@@ -123,7 +126,18 @@ export async function getWebflowConfig(userId?: string): Promise<{
         fieldMappings = undefined;
       }
     }
-    
+
+    // Handle categories mapping - it might be a string (JSON) or an object
+    let categories = config.categories;
+    if (typeof categories === 'string') {
+      try {
+        categories = JSON.parse(categories);
+      } catch (parseError) {
+        console.warn('Failed to parse categories as JSON string:', parseError);
+        categories = undefined;
+      }
+    }
+
     return {
       apiToken: config.apiToken,
       siteId: config.siteId,
@@ -133,7 +147,8 @@ export async function getWebflowConfig(userId?: string): Promise<{
         body: "post-body",
         image: "main-image",
         publishDate: undefined, // Optional - only include if field exists in collection
-      }
+      },
+      categories: categories || undefined
     };
   } catch (error: any) {
     // IMPORTANT: use console.log so it shows up in the same stream as other logs

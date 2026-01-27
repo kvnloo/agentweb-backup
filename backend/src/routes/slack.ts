@@ -129,6 +129,202 @@ router.post("/send-approval", authenticateToken, async (req: Request, res: Respo
 });
 
 /**
+ * @route POST /api/slack/events
+ * @desc Handle Slack events (app mentions, etc.)
+ * @access Public (Slack webhook)
+ */
+router.post("/events", express.json(), async (req: Request, res: Response) => {
+  try {
+    console.log('📥 Slack event received:', JSON.stringify(req.body, null, 2));
+    console.log('📥 Request headers:', JSON.stringify(req.headers, null, 2));
+    const { type, challenge, event } = req.body;
+
+    // Handle URL verification challenge
+    if (type === 'url_verification') {
+      console.log('✅ Slack URL verification challenge received');
+      return res.status(200).json({ challenge });
+    }
+
+    // Handle event callbacks
+    if (type === 'event_callback' && event) {
+      console.log('🔔 Event callback received, event type:', event.type);
+      // Acknowledge the event immediately (Slack requires response within 3 seconds)
+      res.status(200).send();
+
+      // Handle app mention events
+      if (event.type === 'app_mention') {
+        const { text, user: slackUserId, channel, ts } = event;
+
+        console.log('👋 Emma bot mentioned in Slack:', {
+          channel,
+          user: slackUserId,
+          text
+        });
+
+        try {
+          // Find user by slack channel using AW-Settings cache
+          const { settingsService } = await import('../services/settingsService');
+          const { userDb } = await import('../services/db');
+
+          const mappingKey = `slack_channel_mapping_${channel}`;
+          let user = null;
+
+          // Try to get userId from AW-Settings cache
+          const cachedMapping = await settingsService.getSetting(mappingKey);
+          if (cachedMapping?.settingValue) {
+            console.log(`✅ Found cached userId for Slack channel ${channel}: ${cachedMapping.settingValue}`);
+            user = await userDb.getUserById(cachedMapping.settingValue);
+          }
+
+          // If not found in cache, scan all users and save mapping
+          if (!user) {
+            console.log(`🔍 No cached mapping found for channel ${channel}, scanning all users...`);
+            const allUsers = await userDb.getAllUsers();
+            user = allUsers.find(u => u.slackChannel === channel);
+
+            // Save mapping to cache if user found
+            if (user) {
+              console.log(`💾 Saving Slack channel mapping: ${channel} -> ${user.userId}`);
+              await settingsService.setSetting(
+                mappingKey,
+                user.userId,
+                `Slack channel to userId mapping for channel ${channel}`,
+                'system'
+              );
+            }
+          }
+
+          if (!user) {
+            console.log(`❌ No user found with slackChannel: ${channel}`);
+            // Send error message to Slack
+            const { WebClient } = await import('@slack/web-api');
+            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+            await slackClient.chat.postMessage({
+              channel,
+              text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
+              thread_ts: ts
+            });
+            return;
+          }
+
+          // Extract the user's message (remove the bot mention)
+          const botMentionPattern = /<@[A-Z0-9]+>/g;
+          const userMessage = text.replace(botMentionPattern, '').trim();
+
+          if (!userMessage) {
+            console.log('❌ No message content after removing bot mention');
+            const { WebClient } = await import('@slack/web-api');
+            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+            await slackClient.chat.postMessage({
+              channel,
+              text: '👋 Hi! Please include a message after mentioning me. For example: @Emma help me create a social media post',
+              thread_ts: ts
+            });
+            return;
+          }
+
+          console.log('📝 Creating Agent Mode session for user:', user.userId);
+
+          // Create Agent Mode session
+          const { chatbotDb } = await import('../services/chatbotService');
+          const session = await chatbotDb.createChatSession(
+            user.userId,
+            undefined, // pageContent
+            'agent', // portalType
+            'slack-bot', // pageIdentifier
+            undefined, // selectedStartupId
+            undefined, // workflowId
+            undefined, // executionId
+            undefined, // emailCampaignTaskId
+            'regular', // sessionType
+            undefined // delegateInfo
+          );
+
+          console.log('✅ Agent Mode session created:', session.sessionId);
+
+          // Set session title based on user message
+          const sessionTitle = userMessage.length > 50
+            ? userMessage.substring(0, 47) + '...'
+            : userMessage;
+          await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
+
+          // Create interactive share link (ishare)
+          const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
+
+          console.log('🔗 iShare link created:', ishareLink);
+
+          // Start the chat using the generate function
+          const { generateSessionResponse } = await import('../controllers/agentModeController');
+          const { agentModeService } = await import('../services/agentModeService');
+          const { emitProgress } = await import('../utils/sseProgress');
+
+          // Get the default LLM model
+          const llmModel = session.llmModel || agentModeService.default_model;
+
+          // Emit initial progress to indicate generation has started
+          emitProgress(session.sessionId, {
+            iteration: 0,
+            status: 'thinking'
+          });
+
+          // Start generating response asynchronously (don't wait for it to complete)
+          generateSessionResponse(
+            session.sessionId,
+            userMessage,
+            user.userId,
+            llmModel,
+            [] // attachments
+          ).catch(error => {
+            console.error('❌ Error generating agent response for Slack session:', error);
+            // Emit error progress
+            emitProgress(session.sessionId, {
+              iteration: 1,
+              status: 'complete'
+            });
+          });
+
+          console.log('✅ Started agent response generation for session:', session.sessionId);
+
+          // Send the ishare link back to Slack
+          const { WebClient } = await import('@slack/web-api');
+          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+          await slackClient.chat.postMessage({
+            channel,
+            text: `✨ I've started a conversation for you! Continue our chat here:\n\n${ishareLink}`,
+            thread_ts: ts
+          });
+
+          console.log('✅ Emma bot mention handled successfully');
+        } catch (error) {
+          console.error('❌ Error handling Emma bot mention:', error);
+          // Send error message to Slack
+          try {
+            const { WebClient } = await import('@slack/web-api');
+            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+            await slackClient.chat.postMessage({
+              channel,
+              text: '❌ Sorry, something went wrong while processing your request. Please try again or contact support.',
+              thread_ts: ts
+            });
+          } catch (slackError) {
+            console.error('❌ Error sending error message to Slack:', slackError);
+          }
+        }
+      }
+
+      return;
+    }
+
+    // Unknown event type
+    console.log('⚠️ Unknown Slack event type:', type);
+    res.status(200).send();
+  } catch (error: any) {
+    console.error('❌ Error handling Slack event:', error);
+    res.status(500).json({ error: 'Failed to handle Slack event' });
+  }
+});
+
+/**
  * @route POST /api/slack/interactions
  * @desc Handle Slack button interactions and modal submissions
  * @access Public (Slack webhook)

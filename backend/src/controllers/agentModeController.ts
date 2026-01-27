@@ -217,8 +217,9 @@ const filterMessagesForClient = (messages: any[]) => {
       return false;
     }
 
-    // Remove assistant messages that have tool calls
-    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
+    // Remove assistant messages that have tool_calls (intermediate messages during tool execution)
+    // BUT keep assistant messages that have metadata.toolCalls (final messages with tool execution results)
+    if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0 && !message.metadata?.toolCalls) {
       return false;
     }
 
@@ -871,7 +872,7 @@ function hasActiveProgress(sessionId: string): boolean {
 
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
-async function generateSessionResponse(
+export async function generateSessionResponse(
   sessionId: string,
   userMessage: string,
   userId: string,
@@ -1002,29 +1003,76 @@ async function generateSessionResponse(
 
 // Helper function to calculate next run time based on frequency
 const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
-  const nextRun = new Date(fromDate);
+  const now = new Date();
+  let nextRun = new Date(fromDate);
 
   switch (frequency) {
     case 'hourly':
       nextRun.setHours(nextRun.getHours() + 1);
       nextRun.setMinutes(0, 0, 0); // Top of the hour
+
+      // If still in the past, keep adding hours until we're in the future
+      while (nextRun <= now) {
+        nextRun.setHours(nextRun.getHours() + 1);
+      }
       break;
     case 'daily':
       nextRun.setDate(nextRun.getDate() + 1);
-      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      // Preserve the time from fromDate
+
+      // If still in the past (schedule ran late), keep adding days until we're in the future
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
       break;
     case 'weekly':
+      // Add exactly 7 days (same day of week, one week later)
       nextRun.setDate(nextRun.getDate() + 7);
-      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      // Preserve the time from fromDate
+
+      // If still in the past, keep adding weeks until we're in the future
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 7);
+      }
       break;
     case 'monthly':
+      // Calculate same weekday of next month (e.g., 2nd Tuesday -> 2nd Tuesday of next month)
+      const currentDayOfWeek = nextRun.getDay(); // 0 = Sunday, 1 = Monday, etc.
+      const currentWeekOfMonth = Math.floor((nextRun.getDate() - 1) / 7); // 0-based week number
+
+      // Move to next month, 1st day
       nextRun.setMonth(nextRun.getMonth() + 1);
-      nextRun.setHours(9, 0, 0, 0); // 9 AM
+      nextRun.setDate(1);
+
+      // Find the first occurrence of the target day of week in the new month
+      const firstDayOfMonth = nextRun.getDay();
+      let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
+
+      // Add weeks to get to the same week number
+      daysToAdd += currentWeekOfMonth * 7;
+
+      nextRun.setDate(1 + daysToAdd);
+      // Preserve the time from fromDate
+
+      // If still in the past, keep adding months until we're in the future
+      while (nextRun <= now) {
+        nextRun.setMonth(nextRun.getMonth() + 1);
+        nextRun.setDate(1);
+
+        const firstDayOfMonth = nextRun.getDay();
+        let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
+        daysToAdd += currentWeekOfMonth * 7;
+        nextRun.setDate(1 + daysToAdd);
+      }
       break;
     default:
       // Default to daily
       nextRun.setDate(nextRun.getDate() + 1);
-      nextRun.setHours(9, 0, 0, 0);
+      nextRun.setHours(9, 0, 0, 0); // Fallback to 9 AM UTC for unknown frequencies
+
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
   }
 
   return nextRun;
@@ -1599,6 +1647,16 @@ export const agentModeController = {
       const defaultModel = await agentModeService.getDefaultModel();
       const modelToUse = session.llmModel || defaultModel;
 
+      // Get user's supportNote if available
+      let supportNote: string | undefined;
+      try {
+        const user = await userDb.getUserById(session.userId);
+        supportNote = user?.supportNote;
+      } catch (error) {
+        console.error('Failed to fetch user supportNote:', error);
+        // Continue without supportNote if fetch fails
+      }
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1611,7 +1669,8 @@ export const agentModeController = {
           workPlan: session.workPlan,
           llmModel: modelToUse,
           isConversable: !!conversable,
-          hasActiveProgress: hasActiveProgress(session.sessionId)
+          hasActiveProgress: hasActiveProgress(session.sessionId),
+          supportNote: supportNote
         }
       });
     } catch (error) {
@@ -1915,6 +1974,76 @@ export const agentModeController = {
     }
   },
 
+  // Submit message feedback for ishare sessions (public with conversable token)
+  async submitIShareMessageFeedback(req: Request, res: Response) {
+    try {
+      const { shareId, messageIndex } = req.params;
+      const { conversable } = req.query;
+      const { type, comment } = req.body;
+
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      // Validate feedback type
+      if (!type || (type !== 'like' && type !== 'dislike')) {
+        return res.status(400).json({ error: 'Invalid feedback type. Must be "like" or "dislike"' });
+      }
+
+      // Validate comment length if provided
+      if (comment && comment.length > 500) {
+        return res.status(400).json({ error: 'Comment too long. Maximum 500 characters' });
+      }
+
+      // Get session and verify conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Get all messages to verify the message exists and is an assistant message
+      const messages = await chatbotDb.getMessagesFromMessagesTable(shareId);
+      const messageIndexNum = parseInt(messageIndex, 10);
+
+      if (isNaN(messageIndexNum) || messageIndexNum < 0 || messageIndexNum >= messages.length) {
+        return res.status(404).json({ error: 'Message not found' });
+      }
+
+      const message = messages[messageIndexNum];
+      if (message.role !== 'assistant') {
+        return res.status(400).json({ error: 'Can only rate assistant messages' });
+      }
+
+      // Create feedback object (use 'anonymous' as userId for ishare)
+      const feedback = {
+        type: type as 'like' | 'dislike',
+        comment: comment || undefined,
+        timestamp: new Date().toISOString(),
+        userId: 'anonymous-ishare',
+      };
+
+      // Update the message with feedback
+      const updatedMessage = await chatbotDb.updateMessageFeedback(
+        shareId,
+        messageIndexNum,
+        feedback
+      );
+
+      res.json({
+        success: true,
+        message: updatedMessage,
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit ishare message feedback error:', error);
+      res.status(500).json({ error: 'Failed to submit feedback' });
+    }
+  },
+
   // Upload file attachment for Agent Mode
   async uploadAttachment(req: Request, res: Response) {
     try {
@@ -2119,16 +2248,25 @@ export const agentModeController = {
         description,
         startingMessage,
         scheduleFrequency,
+        nextRunTime,
         keywords,
         requiredFunctionCalls,
         functionCallMinCalls,
         emailNotifications,
         emailCampaignTaskId,
-        llmModel
+        llmModel,
+        runCount
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Validate runCount if provided
+      if (runCount !== undefined) {
+        if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
+          return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
+        }
       }
 
       // If sessionId is provided, verify it exists and belongs to user
@@ -2142,7 +2280,21 @@ export const agentModeController = {
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
-      const nextRunTime = calculateNextRunTime(scheduleFrequency, now);
+
+      // Use provided nextRunTime or calculate default
+      let scheduledNextRunTime: string;
+      if (nextRunTime) {
+        // Validate the provided nextRunTime
+        const providedDate = new Date(nextRunTime);
+        if (isNaN(providedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        }
+        scheduledNextRunTime = providedDate.toISOString();
+      } else {
+        // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
+        const calculatedTime = calculateNextRunTime(scheduleFrequency, now);
+        scheduledNextRunTime = calculatedTime.toISOString();
+      }
 
       const scheduledChat = {
         scheduleId,
@@ -2158,13 +2310,14 @@ export const agentModeController = {
         emailNotifications: emailNotifications || [],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         status: 'active',
-        nextRunTime: nextRunTime.toISOString(),
+        nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
+        runCount: runCount !== undefined ? runCount : -1 // Default to unlimited runs if not specified
       };
 
       await scheduleDb.createSchedule(scheduledChat);
@@ -2172,7 +2325,7 @@ export const agentModeController = {
       res.status(201).json({
         scheduleId,
         message: 'Scheduled chat created successfully',
-        nextRunTime: nextRunTime.toISOString()
+        nextRunTime: scheduledNextRunTime
       });
     } catch (error) {
       console.error('AgentMode: Create scheduled chat error:', error);
@@ -2191,6 +2344,13 @@ export const agentModeController = {
         schedule.type === 'scheduled_chat'
       ) || [];
 
+      // Sort by creation time descending (newest first)
+      scheduledChats.sort((a, b) => {
+        const dateA = new Date(a.createdAt || 0).getTime();
+        const dateB = new Date(b.createdAt || 0).getTime();
+        return dateB - dateA;
+      });
+
       res.json(scheduledChats);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
@@ -2198,7 +2358,7 @@ export const agentModeController = {
     }
   },
 
-  // Delete scheduled chat
+  // Update scheduled chat
   async updateScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -2208,17 +2368,26 @@ export const agentModeController = {
         description,
         startingMessage,
         scheduleFrequency,
+        nextRunTime,
         keywords,
         requiredFunctionCalls,
         functionCallMinCalls,
         emailNotifications,
         dailyDigest,
         emailCampaignTaskId,
-        llmModel
+        llmModel,
+        runCount
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Validate runCount if provided
+      if (runCount !== undefined) {
+        if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
+          return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
+        }
       }
 
       // Verify schedule exists and belongs to user
@@ -2227,12 +2396,22 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
-      // Update the schedule without modifying nextRunTime
-      // nextRunTime should only be updated when the schedule actually runs
       const now = new Date();
 
+      // Determine nextRunTime: use provided value or keep existing
+      let scheduledNextRunTime = existingSchedule.nextRunTime;
+      let shouldUpdateNextRunTime = false;
+      if (nextRunTime) {
+        const providedDate = new Date(nextRunTime);
+        if (isNaN(providedDate.getTime())) {
+          return res.status(400).json({ error: 'Invalid nextRunTime format' });
+        }
+        scheduledNextRunTime = providedDate.toISOString();
+        shouldUpdateNextRunTime = true;
+      }
+
       // Update the schedule
-      const updates = {
+      const updates: any = {
         scheduleName,
         description: description || '',
         startingMessage,
@@ -2244,15 +2423,24 @@ export const agentModeController = {
         dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || await agentModeService.getDefaultModel() // Use provided model or default
+        llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
       };
+
+      // Only include nextRunTime in updates if it was explicitly provided
+      if (shouldUpdateNextRunTime) {
+        updates.nextRunTime = scheduledNextRunTime;
+      }
+
+      // Only include runCount in updates if it was explicitly provided
+      if (runCount !== undefined) {
+        updates.runCount = runCount;
+      }
 
       await scheduleDb.updateSchedule(scheduleId, updates);
 
-      // Return the existing nextRunTime from the schedule
       res.json({
         message: 'Scheduled chat updated successfully',
-        nextRunTime: existingSchedule.nextRunTime
+        nextRunTime: scheduledNextRunTime
       });
     } catch (error) {
       console.error('AgentMode: Update scheduled chat error:', error);
@@ -2493,10 +2681,12 @@ export const agentModeController = {
             delayedRunTime.setMinutes(delayedRunTime.getMinutes() + 30);
 
             // Update the schedule with delayed run time
+            // Don't decrement runCount since this run hasn't actually happened
             await scheduleDb.updateScheduleAfterRun(
               schedule.scheduleId,
               schedule.lastRunTime || now.toISOString(),
-              delayedRunTime.toISOString()
+              delayedRunTime.toISOString(),
+              false // Don't decrement runCount for delayed runs
             );
 
             console.log(`Delayed scheduled chat ${schedule.scheduleName} for 30 minutes due to concurrent run limit (${maxConcurrentRuns})`);
@@ -2514,12 +2704,17 @@ export const agentModeController = {
 
           // Update the schedule with next run time FIRST (synchronously)
           // This prevents agent-engine from repeatedly calling the same schedule
-          const nextRunTime = calculateNextRunTime(schedule.frequency, now);
+          // Calculate next run based on the current nextRunTime to preserve the scheduled time
+          const currentNextRun = new Date(schedule.nextRunTime);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
 
+          // Decrement runCount and auto-pause if it reaches 0
+          // Note: Both successful and failed runs count toward the run limit
           await scheduleDb.updateScheduleAfterRun(
             schedule.scheduleId,
             now.toISOString(),
-            nextRunTime.toISOString()
+            nextRunTime.toISOString(),
+            true // Decrement runCount (default behavior)
           );
 
           // Increment concurrent run counter

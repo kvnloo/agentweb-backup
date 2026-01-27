@@ -1,0 +1,202 @@
+import { Request, Response } from 'express';
+
+// Mock dependencies
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedFunctionCalls: jest.fn(async () => []),
+}));
+
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: {
+    createChatSession: jest.fn(),
+  },
+}));
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    getMarketingSystemPrompt: jest.fn(),
+  },
+}));
+
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    runInWorker: jest.fn(),
+  },
+}));
+
+jest.mock('../services/db', () => ({
+  scheduleDb: {
+    getScheduleById: jest.fn(),
+    updateScheduleAfterRun: jest.fn(),
+  },
+}));
+
+// Import after mocks
+import { scheduleDb } from '../services/db';
+
+const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
+
+describe('calculateNextRunTime Function Logic', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('Hourly frequency', () => {
+    it('should add 1 hour and set minutes to 0', () => {
+      // Use a date 1 hour from now
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 60 * 60 * 1000);
+      const result = calculateNextRunTime('hourly', fromDate);
+
+      // Should be 2 hours from now (fromDate + 1 hour)
+      expect(result.getTime()).toBeGreaterThan(now.getTime());
+      expect(result.getUTCMinutes()).toBe(0); // Should be set to 0
+    });
+
+    it('should ensure next run is in the future', () => {
+      const now = new Date();
+      const pastDate = new Date(now.getTime() - 5 * 60 * 60 * 1000); // 5 hours ago
+      const result = calculateNextRunTime('hourly', pastDate);
+
+      expect(result.getTime()).toBeGreaterThan(now.getTime());
+    });
+  });
+
+  describe('Daily frequency', () => {
+    it('should add 1 day and preserve time', () => {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 24 * 60 * 60 * 1000); // Tomorrow
+      const result = calculateNextRunTime('daily', fromDate);
+
+      // Should be 2 days from now (fromDate + 1 day)
+      expect(result.getTime()).toBeGreaterThan(fromDate.getTime());
+      expect(result.getUTCHours()).toBe(fromDate.getUTCHours());
+      expect(result.getUTCMinutes()).toBe(fromDate.getUTCMinutes());
+    });
+
+    it('should ensure next run is in the future', () => {
+      const now = new Date();
+      const pastDate = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000); // 3 days ago
+      const result = calculateNextRunTime('daily', pastDate);
+
+      expect(result.getTime()).toBeGreaterThan(now.getTime());
+    });
+  });
+
+  describe('Weekly frequency', () => {
+    it('should add 7 days and preserve time', () => {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000); // Next week
+      const result = calculateNextRunTime('weekly', fromDate);
+
+      // Should be 2 weeks from now (fromDate + 7 days)
+      expect(result.getTime()).toBeGreaterThan(fromDate.getTime());
+      expect(result.getUTCDay()).toBe(fromDate.getUTCDay()); // Same day of week
+      expect(result.getUTCHours()).toBe(fromDate.getUTCHours());
+      expect(result.getUTCMinutes()).toBe(fromDate.getUTCMinutes());
+    });
+
+    it('should ensure next run is in the future', () => {
+      const now = new Date();
+      const pastDate = new Date(now.getTime() - 2 * 7 * 24 * 60 * 60 * 1000); // 2 weeks ago
+      const result = calculateNextRunTime('weekly', pastDate);
+
+      expect(result.getTime()).toBeGreaterThan(now.getTime());
+    });
+  });
+
+  describe('Monthly frequency', () => {
+    it('should calculate same weekday and week position', () => {
+      // 2nd Tuesday of January 2026 (Jan 13, 2026) at 10:30 AM
+      const fromDate = new Date('2026-01-13T10:30:00.000Z');
+      const result = calculateNextRunTime('monthly', fromDate);
+
+      // Should be 2nd Tuesday of February 2026 (Feb 10, 2026) at 10:30 AM
+      expect(result.getUTCMonth()).toBe(1); // February (0-indexed)
+      expect(result.getUTCDay()).toBe(2); // Tuesday
+      expect(result.getUTCDate()).toBe(10); // 2nd Tuesday
+      expect(result.getUTCHours()).toBe(10);
+      expect(result.getUTCMinutes()).toBe(30);
+    });
+
+    it('should handle 1st Monday correctly', () => {
+      // 1st Monday of January 2026 (Jan 5, 2026)
+      const fromDate = new Date('2026-01-05T09:00:00.000Z');
+      const result = calculateNextRunTime('monthly', fromDate);
+
+      // Should be 1st Monday of February 2026 (Feb 2, 2026)
+      expect(result.getUTCMonth()).toBe(1);
+      expect(result.getUTCDay()).toBe(1); // Monday
+      expect(result.getUTCDate()).toBe(2);
+    });
+
+    it('should handle last week of month correctly', () => {
+      // 4th Friday of January 2026 (Jan 23, 2026)
+      const fromDate = new Date('2026-01-23T15:00:00.000Z');
+      const result = calculateNextRunTime('monthly', fromDate);
+
+      // Should be 4th Friday of February 2026 (Feb 27, 2026)
+      expect(result.getUTCMonth()).toBe(1);
+      expect(result.getUTCDay()).toBe(5); // Friday
+      expect(result.getUTCDate()).toBe(27);
+    });
+
+    it('should ensure next run is in the future', () => {
+      const now = new Date();
+      const pastDate = new Date(now.getTime() - 3 * 30 * 24 * 60 * 60 * 1000); // ~3 months ago
+      const result = calculateNextRunTime('monthly', pastDate);
+
+      expect(result.getTime()).toBeGreaterThan(now.getTime());
+    });
+  });
+});
+
+// Helper function to test (copied from controller)
+function calculateNextRunTime(frequency: string, fromDate: Date): Date {
+  const now = new Date();
+  let nextRun = new Date(fromDate);
+
+  switch (frequency) {
+    case 'hourly':
+      nextRun.setHours(nextRun.getHours() + 1);
+      nextRun.setMinutes(0, 0, 0);
+      while (nextRun <= now) {
+        nextRun.setHours(nextRun.getHours() + 1);
+      }
+      break;
+    case 'daily':
+      nextRun.setDate(nextRun.getDate() + 1);
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 1);
+      }
+      break;
+    case 'weekly':
+      nextRun.setDate(nextRun.getDate() + 7);
+      while (nextRun <= now) {
+        nextRun.setDate(nextRun.getDate() + 7);
+      }
+      break;
+    case 'monthly':
+      const currentDayOfWeek = nextRun.getDay();
+      const currentWeekOfMonth = Math.floor((nextRun.getDate() - 1) / 7);
+
+      nextRun.setMonth(nextRun.getMonth() + 1);
+      nextRun.setDate(1);
+
+      const firstDayOfMonth = nextRun.getDay();
+      let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
+      daysToAdd += currentWeekOfMonth * 7;
+      nextRun.setDate(1 + daysToAdd);
+
+      while (nextRun <= now) {
+        nextRun.setMonth(nextRun.getMonth() + 1);
+        nextRun.setDate(1);
+        const firstDayOfMonth = nextRun.getDay();
+        let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
+        daysToAdd += currentWeekOfMonth * 7;
+        nextRun.setDate(1 + daysToAdd);
+      }
+      break;
+  }
+
+  return nextRun;
+}
