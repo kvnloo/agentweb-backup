@@ -647,6 +647,31 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'repair_blog_article',
+  definition: {
+    name: 'repair_blog_article',
+    description: 'Repairs a blog article by creating a new version with optimized images. Automatically finds and resizes all images (including hero images with class="hero-image") that exceed file size limits. Creates a new HTML file with updated image URLs without modifying the original. Call this function when publish_blog_article fails due to image size errors. Returns a new article URL and hero image URL that can be used to retry publishing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        article_url: {
+          type: 'string',
+          description: 'The URL of the HTML file created by create_blog_article function'
+        }
+      },
+      required: ['article_url']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.repairBlogArticle(
+      args.article_url, 
+      context?.userId, 
+      context?.sessionId
+    );
+  }
+});
+
+mcpToolRegistry.register({
   name: 'create_social_media_posts',
   definition: {
     name: 'create_social_media_posts',

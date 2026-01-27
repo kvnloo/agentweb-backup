@@ -1031,26 +1031,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   public getAvailableTools() {
-    // Manually add repair_blog_article from main until it's migrated
-    const registryTools = this.toolRegistry.getToolDefinitions();
-    const repairBlogArticleTool = {
-      type: 'function' as const,
-      function: {
-        name: 'repair_blog_article',
-        description: 'Repairs a blog article by creating a new version with optimized images. Automatically finds and resizes all images (including hero images with class="hero-image") that exceed file size limits. Creates a new HTML file with updated image URLs without modifying the original. Call this function when publish_blog_article fails due to image size errors. Returns a new article URL and hero image URL that can be used to retry publishing.',
-        parameters: {
-          type: 'object',
-          properties: {
-            article_url: {
-              type: 'string',
-              description: 'The URL of the HTML file created by create_blog_article function'
-            }
-          },
-          required: ['article_url']
-        }
-      }
-    };
-    return [...registryTools, repairBlogArticleTool];
+    return this.toolRegistry.getToolDefinitions();
   }
 
   // Get filtered tools based on user's subscription type
@@ -2165,12 +2146,6 @@ Use the available tools to create tasks in the agent-engine when complex work is
     // Return mock data if in mock mode
     if (mockMode) {
       return this.getMockToolResult(toolName, args);
-    }
-
-    // Handle repair_blog_article explicitly until migrated
-    if (toolName === 'repair_blog_article') {
-       const articleUrl = args.article_url || args.articleUrl; // Handle snake_case or camelCase
-       return await this.repairBlogArticle(articleUrl, userId, sessionId);
     }
 
     try {
@@ -7637,7 +7612,7 @@ ${emailDraftFormat === 'text'
    * Repair blog article by creating a new version with optimized images
    * Takes only the article URL, finds and resizes all images, creates a new HTML file
    */
-  private async repairBlogArticle(
+  public async repairBlogArticle(
     articleUrl: string,
     userId: string,
     sessionId: string
