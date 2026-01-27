@@ -227,6 +227,115 @@ const filterMessagesForClient = (messages: any[]) => {
   });
 };
 
+// Extract URL data from tool message content (parse as JSON first, then extract URLs)
+const extractUrlDataFromToolContent = (content: string): any | null => {
+  try {
+    // Try to parse as JSON first
+    const parsed = JSON.parse(content);
+
+    // Look for URL fields in the parsed JSON
+    const urlFields = ['htmlUrl', 's3_url', 'file_url', 'blog_html_url', 'url'];
+    for (const field of urlFields) {
+      if (parsed[field] && typeof parsed[field] === 'string' &&
+          (parsed[field].endsWith('.html') || parsed[field].endsWith('.htm'))) {
+        return {
+          success: true,
+          htmlUrl: parsed[field],
+          filename: parsed[field].split('/').pop() || 'report.html',
+          backfilled: true
+        };
+      }
+    }
+
+    // Check nested data object
+    if (parsed.data) {
+      for (const field of urlFields) {
+        if (parsed.data[field] && typeof parsed.data[field] === 'string' &&
+            (parsed.data[field].endsWith('.html') || parsed.data[field].endsWith('.htm'))) {
+          return {
+            success: true,
+            htmlUrl: parsed.data[field],
+            filename: parsed.data[field].split('/').pop() || 'report.html',
+            backfilled: true
+          };
+        }
+      }
+    }
+  } catch (e) {
+    // If JSON parsing fails, try regex as fallback
+    const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/i;
+    const match = htmlUrlRegex.exec(content);
+    if (match) {
+      return {
+        success: true,
+        htmlUrl: match[1],
+        filename: match[1].split('/').pop() || 'report.html',
+        backfilled: true
+      };
+    }
+  }
+
+  return null;
+};
+
+// Build tool_call_id to result mapping from tool messages
+const buildToolCallResultMapping = (messages: any[]): Record<string, any> => {
+  const mapping: Record<string, any> = {};
+
+  messages.forEach(msg => {
+    if (msg.role === 'tool' && msg.tool_call_id && typeof msg.content === 'string') {
+      const urlData = extractUrlDataFromToolContent(msg.content);
+      if (urlData) {
+        mapping[msg.tool_call_id] = urlData;
+      }
+    }
+  });
+
+  return mapping;
+};
+
+// Enrich filtered messages with tool call results
+const enrichMessagesWithToolCallResults = (messages: any[], toolCallResultMapping: Record<string, any>): any[] => {
+  if (!toolCallResultMapping || Object.keys(toolCallResultMapping).length === 0) {
+    return messages;
+  }
+
+  return messages.map(message => {
+    if (message.role === 'assistant' && message.metadata?.toolCalls) {
+      const enrichedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
+        // Get the tool call id (can be either 'id' or 'tool_call_id')
+        const toolCallId = toolCall.id || toolCall.tool_call_id;
+
+        // Skip if already has result or no tool call id
+        if (!toolCallId || (toolCall.result && Object.keys(toolCall.result).length > 0)) {
+          return toolCall;
+        }
+
+        // Check if we have a result for this tool call id
+        const result = toolCallResultMapping[toolCallId];
+        if (result) {
+          return {
+            ...toolCall,
+            result: result
+          };
+        }
+
+        return toolCall;
+      });
+
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          toolCalls: enrichedToolCalls
+        }
+      };
+    }
+
+    return message;
+  });
+};
+
 // Helper function to check if this is the last run of the day for an hourly schedule
 function isLastRunOfDayForHourlySchedule(currentTime: Date, nextRunTime: Date): boolean {
   const currentDay = currentTime.getDate();
@@ -1174,10 +1283,18 @@ export const agentModeController = {
 
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
+      // Build tool call result mapping from tool messages
+      const toolCallResultMapping = buildToolCallResultMapping(session.messages);
+
       // Filter out tool messages and assistant messages with tool calls for user display
+      let filteredMessages = filterMessagesForClient(session.messages);
+
+      // Enrich filtered messages with tool call results
+      filteredMessages = enrichMessagesWithToolCallResults(filteredMessages, toolCallResultMapping);
+
       const filteredSession = {
         ...session,
-        messages: filterMessagesForClient(session.messages),
+        messages: filteredMessages,
         hasActiveProgress: progressActive
       };
 
