@@ -1,12 +1,22 @@
 import express from "express";
 import { settingsService } from "../services/settingsService";
-import path from "path";
 import { encryptPassword, decryptPassword } from "./config";
 import { McpClientService } from "../mcp/client/mcpClientService";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { agentModeService } from "../services/agentModeService";
 
 const router = express.Router();
+
+// Validation constants
+const NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+const isValidUrl = (urlString: string): boolean => {
+  try {
+    const url = new URL(urlString);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
 
 // Interface for MCP Server configuration
 interface McpServerConfig {
@@ -48,11 +58,17 @@ router.post("/", async (req, res) => {
     if (!name || typeof name !== 'string') {
       return res.status(400).json({ message: "Server name is required" });
     }
+    if (!NAME_REGEX.test(name)) {
+      return res.status(400).json({ message: "Server name must be 1-64 characters and contain only alphanumeric characters, underscores, or hyphens" });
+    }
     if (!transport || !['sse', 'stdio', 'streamable-http'].includes(transport)) {
       return res.status(400).json({ message: "Valid transport type is required (sse, stdio, or streamable-http)" });
     }
     if ((transport === 'sse' || transport === 'streamable-http') && !url) {
       return res.status(400).json({ message: "URL is required for SSE and Streamable HTTP transports" });
+    }
+    if ((transport === 'sse' || transport === 'streamable-http') && url && !isValidUrl(url)) {
+      return res.status(400).json({ message: "URL must be a valid http or https URL" });
     }
     if (transport === 'stdio' && !command) {
       return res.status(400).json({ message: "Command is required for Stdio transport" });
@@ -132,19 +148,27 @@ router.put("/:name", async (req, res) => {
       return res.status(404).json({ message: "Server not found" });
     }
     
+    // If renaming, validate new name format
+    if (newName && !NAME_REGEX.test(newName)) {
+      return res.status(400).json({ message: "Server name must be 1-64 characters and contain only alphanumeric characters, underscores, or hyphens" });
+    }
     // If renaming, check for duplicate
     if (newName && newName !== serverName && servers.some(s => s.name === newName)) {
       return res.status(409).json({ message: "Server with this name already exists" });
+    }
+    // Validate URL if provided
+    const effectiveTransport = transport || servers[serverIndex].transport;
+    if ((effectiveTransport === 'sse' || effectiveTransport === 'streamable-http') && url && !isValidUrl(url)) {
+      return res.status(400).json({ message: "URL must be a valid http or https URL" });
     }
     
     // Update server config
     const updatedServer: McpServerConfig = {
       name: newName || serverName,
-      transport: transport || servers[serverIndex].transport,
+      transport: effectiveTransport,
       ...(url !== undefined && { url }),
       ...(command !== undefined && { command }),
       ...(args !== undefined && { args }),
-      ...(env !== undefined && { env }),
       ...(env !== undefined && { env }),
       // Handle access token encryption
       ...(accessToken !== undefined && (() => {
@@ -262,10 +286,6 @@ router.post("/:name/discover-tools", async (req, res) => {
     // Helper to resolve environment variables
     const resolveEnv = (value: string) => {
       return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
-        if (varName === 'BACKEND_DIR') {
-           // Assuming we are in src/routes, getting to root (backend/) requires going up 2 levels
-           return path.resolve(__dirname, '../..');
-        }
         const envValue = process.env[varName];
         if (envValue) return envValue;
         if (varName === 'BACKEND_URL') {

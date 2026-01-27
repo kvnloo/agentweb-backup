@@ -139,8 +139,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    const { ...data } = args; const userId = context?.userId;
-    return await agentModeService.updateBrandGuidelines(data, userId);
+    return await agentModeService.updateBrandGuidelines(args, context?.userId);
   }
 });
 
@@ -204,8 +203,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    const { ...data } = args; const userId = context?.userId;
-    return await agentModeService.updateMarketStrategy(data, userId);
+    return await agentModeService.updateMarketStrategy(args, context?.userId);
   }
 });
 

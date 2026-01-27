@@ -243,4 +243,76 @@ describe('McpServersTab', () => {
         );
     });
 
+    describe('Validation', () => {
+        it('shows error for invalid server name with special characters', async () => {
+            mockedAxios.get.mockResolvedValueOnce({ data: [] });
+
+            render(<McpServersTab />);
+            await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+            // Open Dialog
+            fireEvent.click(screen.getByText('Add Server'));
+
+            // Enter invalid name
+            fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'invalid name!' } });
+
+            // Check for error message
+            expect(screen.getByText(/alphanumeric/i)).toBeInTheDocument();
+        });
+
+        it('shows error for invalid URL', async () => {
+            mockedAxios.get.mockResolvedValueOnce({ data: [] });
+
+            render(<McpServersTab />);
+            await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+            // Open Dialog
+            fireEvent.click(screen.getByText('Add Server'));
+
+            // Enter valid name
+            fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'valid-name' } });
+
+            // Enter invalid URL
+            fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'not-a-url' } });
+
+            // Check for error message
+            expect(screen.getByText(/valid http or https URL/i)).toBeInTheDocument();
+        });
+
+        it('disables Add button when validation fails', async () => {
+            mockedAxios.get.mockResolvedValueOnce({ data: [] });
+
+            render(<McpServersTab />);
+            await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+            // Open Dialog
+            fireEvent.click(screen.getByText('Add Server'));
+
+            // Enter invalid name
+            fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'invalid!' } });
+
+            // Add button should be disabled
+            expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
+        });
+
+        it('enables Add button when validation passes', async () => {
+            mockedAxios.get.mockResolvedValueOnce({ data: [] });
+
+            render(<McpServersTab />);
+            await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+            // Open Dialog
+            fireEvent.click(screen.getByText('Add Server'));
+
+            // Enter valid name
+            fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'valid-name' } });
+
+            // Enter valid URL
+            fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'http://valid-url.com' } });
+
+            // Add button should be enabled
+            expect(screen.getByRole('button', { name: 'Add' })).not.toBeDisabled();
+        });
+    });
+
 });

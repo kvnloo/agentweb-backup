@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { Component, useEffect, useState } from "react";
 import {
   Box,
   Typography,
@@ -36,6 +36,49 @@ import {
 import axios from "axios";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
+
+// Validation constants
+const NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+const isValidServerName = (name: string): boolean => NAME_REGEX.test(name);
+const isValidUrl = (urlString: string): boolean => {
+  if (!urlString) return true; // Empty is handled by required check
+  try {
+    const url = new URL(urlString);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+// Error Boundary
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class McpServersErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Box p={4}>
+          <Alert severity="error">
+            Something went wrong loading MCP Servers. Please refresh the page.
+          </Alert>
+        </Box>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 interface McpServer {
   name: string;
@@ -465,6 +508,8 @@ const McpServersTab: React.FC = () => {
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               fullWidth
               required
+              error={!!formData.name && !isValidServerName(formData.name)}
+              helperText={formData.name && !isValidServerName(formData.name) ? "Name must be 1-64 characters, alphanumeric, underscores, or hyphens only" : ""}
             />
             <FormControl fullWidth>
               <InputLabel>Transport Type</InputLabel>
@@ -490,6 +535,8 @@ const McpServersTab: React.FC = () => {
                 fullWidth
                 required
                 placeholder="http://localhost:4000/mcp"
+                error={!!formData.url && !isValidUrl(formData.url)}
+                helperText={formData.url && !isValidUrl(formData.url) ? "Must be a valid http or https URL" : ""}
               />
             )}
             {/* Stdio Removed */}
@@ -509,7 +556,7 @@ const McpServersTab: React.FC = () => {
           <Button
             onClick={handleAddServer}
             variant="contained"
-            disabled={formLoading || !formData.name}
+            disabled={formLoading || !formData.name || !isValidServerName(formData.name) || (formData.url && !isValidUrl(formData.url))}
           >
             {formLoading ? <CircularProgress size={24} /> : "Add"}
           </Button>
@@ -527,6 +574,8 @@ const McpServersTab: React.FC = () => {
               onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               fullWidth
               required
+              error={!!formData.name && !isValidServerName(formData.name)}
+              helperText={formData.name && !isValidServerName(formData.name) ? "Name must be 1-64 characters, alphanumeric, underscores, or hyphens only" : ""}
             />
             <FormControl fullWidth>
               <InputLabel>Transport Type</InputLabel>
@@ -551,6 +600,8 @@ const McpServersTab: React.FC = () => {
                 onChange={(e) => setFormData({ ...formData, url: e.target.value })}
                 fullWidth
                 required
+                error={!!formData.url && !isValidUrl(formData.url)}
+                helperText={formData.url && !isValidUrl(formData.url) ? "Must be a valid http or https URL" : ""}
               />
             )}
             {/* Stdio Removed */}
@@ -569,7 +620,7 @@ const McpServersTab: React.FC = () => {
           <Button
             onClick={handleEditServer}
             variant="contained"
-            disabled={formLoading}
+            disabled={formLoading || (formData.name && !isValidServerName(formData.name)) || (formData.url && !isValidUrl(formData.url))}
           >
             {formLoading ? <CircularProgress size={24} /> : "Save"}
           </Button>
@@ -600,4 +651,11 @@ const McpServersTab: React.FC = () => {
   );
 };
 
-export default McpServersTab;
+// Wrap with Error Boundary
+const McpServersTabWithErrorBoundary: React.FC = () => (
+  <McpServersErrorBoundary>
+    <McpServersTab />
+  </McpServersErrorBoundary>
+);
+
+export default McpServersTabWithErrorBoundary;
