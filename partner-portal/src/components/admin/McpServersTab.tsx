@@ -556,7 +556,7 @@ const McpServersTab: React.FC = () => {
           <Button
             onClick={handleAddServer}
             variant="contained"
-            disabled={formLoading || !formData.name || !isValidServerName(formData.name) || (formData.url && !isValidUrl(formData.url))}
+            disabled={formLoading || !formData.name || !isValidServerName(formData.name!) || (!!formData.url && !isValidUrl(formData.url))}
           >
             {formLoading ? <CircularProgress size={24} /> : "Add"}
           </Button>
@@ -620,7 +620,7 @@ const McpServersTab: React.FC = () => {
           <Button
             onClick={handleEditServer}
             variant="contained"
-            disabled={formLoading || (formData.name && !isValidServerName(formData.name)) || (formData.url && !isValidUrl(formData.url))}
+            disabled={formLoading || (!!formData.name && !isValidServerName(formData.name!)) || (!!formData.url && !isValidUrl(formData.url))}
           >
             {formLoading ? <CircularProgress size={24} /> : "Save"}
           </Button>
