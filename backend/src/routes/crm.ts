@@ -1116,6 +1116,10 @@ router.put('/lists/:listId/public-access', async (req: Request, res: Response) =
       publicAccessEnabled: enabled
     });
 
+    if (!updatedList) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
     res.json({
       success: true,
       publicAccessEnabled: updatedList.publicAccessEnabled,
