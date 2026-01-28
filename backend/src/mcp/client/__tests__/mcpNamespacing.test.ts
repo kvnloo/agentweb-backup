@@ -95,7 +95,7 @@ describe('McpClientService Tool Namespacing', () => {
     await internalTool?.execute({}, { userId: '1', sessionId: '1', llmModel: 'gpt' } as any);
     expect(mockCallTool).toHaveBeenCalledWith(expect.objectContaining({
       name: 'search'
-    }));
+    }), undefined, { timeout: 3600000 });
 
     mockCallTool.mockClear();
 
@@ -103,6 +103,6 @@ describe('McpClientService Tool Namespacing', () => {
     await externalTool?.execute({}, { userId: '1', sessionId: '1', llmModel: 'gpt' } as any);
     expect(mockCallTool).toHaveBeenCalledWith(expect.objectContaining({
       name: 'search' // SHOULD be original name, NOT prefixed
-    }));
+    }), undefined, { timeout: 3600000 });
   });
 });
