@@ -5,7 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { AgentTool, ToolContext } from "./toolRegistry";
 import { settingsService } from "../../services/settingsService";
-import { decryptPassword } from "../../routes/config";
+import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
 
 // SSE transport configuration

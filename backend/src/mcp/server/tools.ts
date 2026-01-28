@@ -1665,7 +1665,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listKnowledgeBaseFiles(args.query);
+    return await agentModeService.listKnowledgeBaseFiles(context?.userId);
   }
 });
 

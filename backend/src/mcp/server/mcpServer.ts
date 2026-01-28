@@ -5,9 +5,9 @@ import { randomUUID } from "node:crypto";
 import { createMcpServer } from './mcpServerCore';
 
 // Session timeout in milliseconds (default: 5 minutes)
-const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '300000', 10);
+const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '3000000', 10);
 // Cleanup interval (default: 1 minute)
-const CLEANUP_INTERVAL_MS = parseInt(process.env.MCP_CLEANUP_INTERVAL_MS || '60000', 10);
+const CLEANUP_INTERVAL_MS = parseInt(process.env.MCP_CLEANUP_INTERVAL_MS || '600000', 10);
 
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;

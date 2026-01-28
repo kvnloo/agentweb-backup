@@ -43,7 +43,7 @@ jest.mock('../services/settingsService', () => ({
 }));
 
 // Mock decryptPassword
-jest.mock('../routes/config', () => ({
+jest.mock('../utils/crypto', () => ({
   decryptPassword: jest.fn().mockImplementation((val) => ({ password: val, userId: 'test' }))
 }));
 
@@ -53,7 +53,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 import { settingsService } from '../services/settingsService';
-import { decryptPassword } from '../routes/config';
+import { decryptPassword } from '../utils/crypto';
 
 // Mock mcp_config to allow tests to inject configurations
 jest.mock('../mcp/client/mcp_config', () => ({
