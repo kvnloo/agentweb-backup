@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-28',
+    changes: [
+      'Added Public API Integration for CRM Lead Lists',
+      '- Lead lists now have a Public Access toggle that can be enabled/disabled in the API Integration settings',
+      '- When enabled, external forms and applications can submit leads directly using the list ID',
+      'Added Lead Form Subdomain Support',
+      '- Lead forms can now be hosted on custom subdomains under agentwebforms.com (e.g., clientname.agentwebforms.com)',
+      '- Infrastructure setup includes CloudFront distribution with HTTPS, Route 53 DNS, and S3 file storage',
+      '- CloudFront Functions handle URL rewriting to map subdomains to S3 object paths',
+    ],
+  },
+  {
     date: '2026-01-26',
     changes: [
       'Improved Customer Portal Page Title Display',
