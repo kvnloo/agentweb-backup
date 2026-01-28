@@ -18,7 +18,21 @@
       "Bash(cd *)",
       "Bash(npm run dev:*)",
       "Bash(grep:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(curl:*)",
+      "Bash(aws apigatewayv2 get-apis:*)",
+      "Bash(aws lambda list-functions:*)",
+      "Bash(aws lambda get-function-configuration:*)",
+      "Bash(aws logs describe-log-groups:*)",
+      "Bash(aws logs describe-log-streams:*)",
+      "Bash(aws logs get-log-events:*)",
+      "Bash(aws lambda invoke:*)",
+      "Bash(aws lambda get-function:*)",
+      "Bash(zip:*)",
+      "Bash(aws lambda update-function-code:*)",
+      "Bash(aws lambda update-function-configuration:*)",
+      "Bash(aws lambda create-function:*)",
+      "Bash(aws iam list-roles:*)"
     ]
   }
 }
