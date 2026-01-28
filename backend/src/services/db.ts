@@ -2707,6 +2707,7 @@ export const crmDb = {
           sortConfig: null,
           alertEvents: normalizedAlertEvents,
           listSenderId: listSenderId ?? null,
+          publicAccessEnabled: false, // Default: public access disabled
         },
       };
 
@@ -2793,6 +2794,7 @@ export const crmDb = {
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
       listSenderId?: string | null;
+      publicAccessEnabled?: boolean;
     }
   ) {
     try {
@@ -2834,6 +2836,12 @@ export const crmDb = {
         expressionAttributeNames['#listSenderId'] = 'listSenderId';
         updateExpressions.push('#listSenderId = :listSenderId');
         expressionAttributeValues[':listSenderId'] = updates.listSenderId;
+      }
+
+      if (updates.publicAccessEnabled !== undefined) {
+        expressionAttributeNames['#publicAccessEnabled'] = 'publicAccessEnabled';
+        updateExpressions.push('#publicAccessEnabled = :publicAccessEnabled');
+        expressionAttributeValues[':publicAccessEnabled'] = updates.publicAccessEnabled;
       }
 
       if (updateExpressions.length === 0) {

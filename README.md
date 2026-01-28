@@ -1086,6 +1086,236 @@ After setting up the CMS secrets, you need to configure which CMS each user shou
 
 **Note:** Users must have a CMS Type configured to publish blog posts. If not configured, the "Publish" button will show an error when attempting to publish.
 
+### Client Subdomain Setup for Lead Forms
+
+AgentWeb supports hosting client lead forms on custom subdomains under `agentwebforms.com` (e.g., `clientname.agentwebforms.com`). This section describes how to configure the infrastructure to serve HTML files from S3 through CloudFront with proper caching and domain configuration.
+
+#### Overview
+
+The setup involves four main components:
+
+1. **S3 File Storage**: HTML lead forms stored in the `agentweb-user-files` bucket with proper metadata
+2. **CloudFront Distribution**: CDN to serve the files with caching and HTTPS
+3. **CloudFront Functions**: URL rewriting to map subdomain paths to S3 object keys
+4. **Route 53**: DNS configuration to point subdomains to CloudFront
+
+#### 1. S3 File Configuration
+
+When uploading lead form HTML files to S3, ensure the following metadata is set:
+
+**Required System-Defined Metadata:**
+- `Content-Type`: `text/html` (ensures browser displays HTML instead of downloading)
+- `Cache-Control`: `max-age=60` (CloudFront caches for 60 seconds)
+
+**Required User-Defined Metadata:**
+- `x-amz-meta-original-filename`: Original filename (e.g., `html_1769547083048_AgentWeb_Lead_Generation_Form_v4.html`)
+- `x-amz-meta-upload-timestamp`: Upload timestamp (e.g., `2026-01-27T20:58:03.052Z`)
+- `x-amz-meta-uploaded-by`: Source of upload (e.g., `agent-mode`)
+
+**Setting metadata via AWS CLI:**
+
+```bash
+aws s3api copy-object \
+  --region us-west-2 \
+  --bucket agentweb-user-files \
+  --key "users/{userId}/files/{timestamp}/{token}/{filename}.html" \
+  --copy-source "agentweb-user-files/users/{userId}/files/{timestamp}/{token}/{filename}.html" \
+  --content-type "text/html" \
+  --cache-control "max-age=60" \
+  --metadata "original-filename={filename}.html,upload-timestamp={timestamp},uploaded-by=agent-mode" \
+  --metadata-directive REPLACE
+```
+
+**Important Notes:**
+- Do NOT set `Content-Disposition: attachment` as this will trigger downloads instead of displaying the file
+- The `Cache-Control` header tells CloudFront to only cache for 60 seconds, allowing relatively quick updates to the forms
+
+#### 2. CloudFront Distribution Setup
+
+Create or configure a CloudFront distribution to serve files from the S3 bucket:
+
+**Distribution Configuration:**
+
+1. **Origin Settings:**
+   - Origin Domain: `agentweb-user-files.s3.us-west-2.amazonaws.com`
+   - Origin Path: Leave empty (or set to specific path if needed)
+   - Origin Access: Use OAI (Origin Access Identity) or CloudFront Origin Access Control for security
+
+2. **Default Cache Behavior:**
+   - Viewer Protocol Policy: `Redirect HTTP to HTTPS`
+   - Allowed HTTP Methods: `GET, HEAD`
+   - Cache Policy: Create custom policy or use managed policy
+   - Cache TTL: Respect origin headers (max-age=60 from S3)
+
+3. **Alternate Domain Names (CNAMEs):**
+   - Add wildcard domain: `*.agentwebforms.com`
+   - This allows all client subdomains to use the same distribution
+
+4. **SSL Certificate:**
+   - Use AWS Certificate Manager (ACM) to create/import a wildcard certificate for `*.agentwebforms.com`
+   - Certificate must be in `us-east-1` region for CloudFront
+   - Attach the certificate to the distribution
+
+5. **CloudFront Function Association:**
+   - Create a function to rewrite URLs (see next section)
+   - Associate the function with the `Viewer Request` event
+
+#### 3. CloudFront Function for URL Rewriting
+
+Create a CloudFront Function to redirect root path requests to the specific lead form HTML file:
+
+```javascript
+function handler(event) {
+    var request = event.request;
+    var uri = request.uri;
+
+    // If the request is for the root (/) or is empty,
+    // force it to your specific file.
+    if (uri === '/' || uri === '') {
+        request.uri = '/users/{userId}/files/{timestamp}/{token}/html_{timestamp}_ClientName_Lead_Generation_Form.html';
+    }
+
+    return request;
+}
+```
+
+**Notes:**
+- Replace the placeholders in `request.uri`:
+  - `{userId}`: The client's user ID (e.g., `be754b6c-767e-44ec-b181-4042cfe45ea9`)
+  - `{timestamp}`: File upload timestamp (e.g., `1769547083052`)
+  - `{token}`: Random access token (e.g., `01c6bd804e771114d26a14cb13129be7`)
+  - `ClientName`: The actual client name in the filename
+- This redirects `clientname.agentwebforms.com/` to the specific S3 object path
+- Each client subdomain typically needs its own CloudFront Function with their specific file path
+- For more advanced routing (multiple forms per subdomain, dynamic client mapping), you can use request headers or query parameters to determine which file to serve
+
+**To create and deploy the function:**
+
+1. Go to CloudFront > Functions in AWS Console
+2. Click "Create function"
+3. Name: `lead-form-url-rewriter`
+4. Add the function code above (customize as needed)
+5. Test the function with sample events
+6. Publish the function
+7. Associate it with your CloudFront distribution (Viewer Request event)
+
+#### 4. Route 53 DNS Configuration
+
+Configure DNS to point client subdomains to the CloudFront distribution:
+
+**Option A: Wildcard Record (Recommended for multiple clients)**
+
+1. Go to Route 53 > Hosted zones
+2. Select your hosted zone for `agentwebforms.com`
+3. Click "Create record"
+4. Record configuration:
+   - Record name: `*` (wildcard for all subdomains)
+   - Record type: `A - IPv4 address`
+   - Alias: Yes
+   - Route traffic to: `Alias to CloudFront distribution`
+   - Choose your CloudFront distribution
+   - Routing policy: Simple routing
+5. Click "Create records"
+
+**Option B: Individual Client Records (More granular control)**
+
+For each client, create a separate record:
+
+1. Go to Route 53 > Hosted zones
+2. Select your hosted zone for `agentwebforms.com`
+3. Click "Create record"
+4. Record configuration:
+   - Record name: `clientname` (e.g., `acme`)
+   - Record type: `A - IPv4 address`
+   - Alias: Yes
+   - Route traffic to: `Alias to CloudFront distribution`
+   - Choose your CloudFront distribution
+5. Click "Create records"
+
+#### 5. Testing the Setup
+
+After configuration, test the setup:
+
+1. **DNS Propagation:**
+   ```bash
+   dig clientname.agentwebforms.com
+   nslookup clientname.agentwebforms.com
+   ```
+
+2. **HTTPS Access:**
+   ```bash
+   curl -I https://clientname.agentwebforms.com
+   ```
+
+   Should return:
+   - Status: `200 OK`
+   - `Content-Type: text/html`
+   - `Cache-Control: max-age=60`
+   - `X-Cache: Hit from cloudfront` (on subsequent requests)
+
+3. **Browser Test:**
+   - Open `https://clientname.agentwebforms.com/form.html` in a browser
+   - Verify the HTML renders correctly (not downloaded)
+   - Check SSL certificate is valid
+
+#### 6. Troubleshooting
+
+**Common Issues:**
+
+1. **File downloads instead of displaying:**
+   - Check `Content-Type` is set to `text/html` on S3 object
+   - Verify no `Content-Disposition: attachment` header
+
+2. **403 Forbidden errors:**
+   - Check CloudFront OAI has permission to read from S3 bucket
+   - Verify S3 bucket policy allows CloudFront access
+
+3. **404 Not Found errors:**
+   - Verify CloudFront Function is correctly rewriting URLs
+   - Check S3 object key matches the rewritten path
+   - Test function with CloudFront Function test console
+
+4. **SSL certificate errors:**
+   - Ensure wildcard certificate (`*.agentwebforms.com`) is created in `us-east-1`
+   - Verify certificate is attached to CloudFront distribution
+   - Check certificate includes the subdomain being accessed
+
+5. **Caching issues (stale content):**
+   - Cache-Control is set to 60 seconds, wait up to 1 minute for updates
+   - Create CloudFront invalidation for immediate updates: `/*` or specific paths
+   - Check CloudFront cache statistics in CloudFront console
+
+6. **DNS not resolving:**
+   - Wait for DNS propagation (can take up to 48 hours)
+   - Use `dig` or `nslookup` to verify DNS records
+   - Check Route 53 hosted zone has correct NS records
+
+#### 7. Maintenance and Updates
+
+**Updating Lead Form HTML:**
+
+1. Upload new version to S3 with proper metadata
+2. Wait up to 60 seconds for CloudFront cache to expire, or
+3. Create CloudFront invalidation for immediate update:
+   ```bash
+   aws cloudfront create-invalidation \
+     --distribution-id E1234567890ABC \
+     --paths "/users/clientid/files/*/form.html"
+   ```
+
+**Adding New Clients:**
+
+1. Upload client's lead form HTML to S3 with proper metadata
+2. If using individual DNS records (Option B), create new Route 53 record
+3. Update CloudFront Function if custom mapping is needed
+4. Test the new subdomain
+
+**Monitoring:**
+
+- Monitor CloudFront access logs for usage patterns
+- Set up CloudWatch alarms for 4xx/5xx error rates
+- Track cache hit ratios to optimize performance
+
 ## Testing
 
 ### Running Backend Unit Tests

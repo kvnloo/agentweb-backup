@@ -102,22 +102,41 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
 
 // Public endpoint for forwarding leads to CRM
 router.post('/forward-lead', async (req: express.Request, res: express.Response) => {
-  // Extract API key from header or body
-  const apiKey = req.headers['x-api-key'] as string || req.body.apiKey;
+  // Set CORS headers to allow all origins for this endpoint
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
 
-  if (!apiKey) {
-    return res.status(401).json({
+  // Handle preflight OPTIONS request
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
+  // Extract listId from body
+  const { listId } = req.body;
+
+  if (!listId) {
+    return res.status(400).json({
       success: false,
-      message: 'API key is required. Provide it in X-API-Key header or apiKey field in request body.'
+      message: 'listId is required in request body'
     });
   }
 
-  // Verify API key and get lead list
-  const leadList = await crmDb.getLeadListByApiKey(apiKey);
+  // Get lead list and verify public access is enabled
+  const leadList = await crmDb.getLeadListById(listId);
   if (!leadList) {
-    return res.status(401).json({
+    return res.status(404).json({
       success: false,
-      message: 'Invalid API key'
+      message: 'Lead list not found'
+    });
+  }
+
+  // Public access must be explicitly enabled (true)
+  // Default behavior: disabled
+  if (leadList.publicAccessEnabled !== true) {
+    return res.status(403).json({
+      success: false,
+      message: 'Public access is not enabled for this lead list. Please enable it in the CRM settings.'
     });
   }
 
