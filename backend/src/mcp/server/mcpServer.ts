@@ -4,9 +4,9 @@ import express, { Request, Response, NextFunction } from "express";
 import { randomUUID } from "node:crypto";
 import { createMcpServer } from './mcpServerCore';
 
-// Session timeout in milliseconds (default: 5 minutes)
-const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '3000000', 10);
-// Cleanup interval (default: 1 minute)
+// Session timeout in milliseconds (default: 1 hour)
+const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '3600000', 10);
+// Cleanup interval (default: 10 minutes)
 const CLEANUP_INTERVAL_MS = parseInt(process.env.MCP_CLEANUP_INTERVAL_MS || '600000', 10);
 
 interface SessionEntry {

@@ -343,7 +343,7 @@ export class McpClientService {
             const result = await client.callTool({
               name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
               arguments: toolArgs
-            });
+            }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
             
             // Cast content to any to access properties safely
             const contentArray = (result.content as any[]) || [];

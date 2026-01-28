@@ -693,7 +693,7 @@ describe('McpClientService', () => {
           sessionId: 'session-456',
           llmModel: 'gpt-4'
         })
-      });
+      }, undefined, { timeout: 3600000 });
     });
 
     it('should NOT inject context for external servers', async () => {
@@ -740,7 +740,7 @@ describe('McpClientService', () => {
         arguments: {
           customArg: 'value'
         }
-      });
+      }, undefined, { timeout: 3600000 });
     });
 
     it('should handle tool execution errors', async () => {
