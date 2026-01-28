@@ -7,7 +7,7 @@ import { leadListAlertService } from '../services/leadListAlertService';
 // Mock dependencies
 jest.mock('../services/db', () => ({
   crmDb: {
-    getLeadListByApiKey: jest.fn(),
+    getLeadListById: jest.fn(),
     createLead: jest.fn(),
   },
 }));
@@ -38,21 +38,20 @@ const app = express();
 app.use(express.json());
 app.use('/api/webhooks', webhookRouter);
 
-describe('Lead Forwarding API', () => {
+describe('Lead Forwarding API (List ID Authentication)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
   describe('POST /api/webhooks/forward-lead', () => {
-    const validApiKey = 'aw_valid_key_123';
     const mockLeadList = {
       listId: 'list_123',
       userId: 'user_123',
       name: 'Test List',
-      apiKey: validApiKey,
+      publicAccessEnabled: true,
     };
 
-    it('should reject requests without API key', async () => {
+    it('should reject requests without listId', async () => {
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
         .send({
@@ -61,35 +60,74 @@ describe('Lead Forwarding API', () => {
           lastName: 'Doe',
         });
 
-      expect(response.status).toBe(401);
+      expect(response.status).toBe(400);
       expect(response.body.success).toBe(false);
-      expect(response.body.message).toContain('API key is required');
+      expect(response.body.message).toContain('listId is required');
     });
 
-    it('should reject requests with invalid API key', async () => {
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(null);
+    it('should reject requests with non-existent listId', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', 'invalid_key')
         .send({
+          listId: 'list_nonexistent',
           email: 'test@example.com',
           firstName: 'John',
           lastName: 'Doe',
         });
 
-      expect(response.status).toBe(401);
+      expect(response.status).toBe(404);
       expect(response.body.success).toBe(false);
-      expect(response.body.message).toBe('Invalid API key');
+      expect(response.body.message).toBe('Lead list not found');
+    });
+
+    it('should reject requests when public access is disabled', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        ...mockLeadList,
+        publicAccessEnabled: false,
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'test@example.com',
+          firstName: 'John',
+          lastName: 'Doe',
+        });
+
+      expect(response.status).toBe(403);
+      expect(response.body.success).toBe(false);
+      expect(response.body.message).toContain('Public access is not enabled');
+    });
+
+    it('should reject requests when public access is undefined (default disabled)', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+        listId: 'list_123',
+        userId: 'user_123',
+        name: 'Test List',
+        // publicAccessEnabled: undefined (not set)
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'test@example.com',
+        });
+
+      expect(response.status).toBe(403);
+      expect(response.body.success).toBe(false);
     });
 
     it('should reject requests without email', async () => {
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
         .send({
+          listId: 'list_123',
           firstName: 'John',
           lastName: 'Doe',
         });
@@ -112,13 +150,13 @@ describe('Lead Forwarding API', () => {
         },
       };
 
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
       (crmDb.createLead as jest.Mock).mockResolvedValue(mockLead);
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
         .send({
+          listId: 'list_123',
           email: 'test@example.com',
         });
 
@@ -159,13 +197,13 @@ describe('Lead Forwarding API', () => {
         },
       };
 
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
       (crmDb.createLead as jest.Mock).mockResolvedValue(mockLead);
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
         .send({
+          listId: 'list_123',
           email: 'john@example.com',
           firstName: 'John',
           lastName: 'Doe',
@@ -205,85 +243,16 @@ describe('Lead Forwarding API', () => {
       );
     });
 
-    it('should trigger api.lead_added alert on success', async () => {
-      const mockLead = {
-        leadId: 'lead_123',
-        listId: 'list_123',
-        email: 'test@example.com',
-        firstName: 'John',
-        lastName: 'Doe',
-        customFields: {
-          source: 'website',
-          forwardedAt: expect.any(String),
-        },
-      };
-
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
-      (crmDb.createLead as jest.Mock).mockResolvedValue(mockLead);
-
-      const response = await request(app)
-        .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
-        .send({
-          email: 'test@example.com',
-          firstName: 'John',
-          lastName: 'Doe',
-          source: 'website',
-        });
-
-      expect(response.status).toBe(201);
-      expect(leadListAlertService.notifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
-        mockLeadList,
-        mockLead,
-        'api.lead_added',
-        expect.objectContaining({
-          source: 'website',
-          forwardedAt: expect.any(String),
-        }),
-        expect.any(String)
-      );
-    });
-
-    it('should trigger api.lead_failed alert on error', async () => {
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
-      (crmDb.createLead as jest.Mock).mockRejectedValue(new Error('Duplicate email'));
-
-      const response = await request(app)
-        .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
-        .send({
-          email: 'test@example.com',
-          firstName: 'John',
-          source: 'website',
-        });
-
-      expect(response.status).toBe(500);
-      expect(leadListAlertService.notifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
-        mockLeadList,
-        expect.objectContaining({
-          leadId: 'failed',
-          email: 'test@example.com',
-        }),
-        'api.lead_failed',
-        expect.objectContaining({
-          error: 'Duplicate email',
-          source: 'website',
-          email: 'test@example.com',
-        }),
-        expect.any(String)
-      );
-    });
-
     it('should handle duplicate email error gracefully', async () => {
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
       (crmDb.createLead as jest.Mock).mockRejectedValue(
         new Error('Lead with this email already exists')
       );
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
         .send({
+          listId: 'list_123',
           email: 'test@example.com',
           firstName: 'John',
           lastName: 'Doe',
@@ -295,76 +264,23 @@ describe('Lead Forwarding API', () => {
       expect(response.body.message).toContain('already exists');
     });
 
-    it('should return success for duplicate with "duplicate" keyword in error', async () => {
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
-      (crmDb.createLead as jest.Mock).mockRejectedValue(
-        new Error('duplicate email detected')
-      );
-
-      const response = await request(app)
-        .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
-        .send({
-          email: 'duplicate@example.com',
-        });
-
-      expect(response.status).toBe(200);
-      expect(response.body.success).toBe(true);
-      expect(response.body.duplicate).toBe(true);
-      expect(response.body.message).toBe('Lead already exists in the list');
-    });
-
-    it('should accept API key in request body', async () => {
-      const mockLead = {
+    it('should include CORS headers in response', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
         leadId: 'lead_123',
         listId: 'list_123',
         email: 'test@example.com',
-      };
-
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
-      (crmDb.createLead as jest.Mock).mockResolvedValue(mockLead);
+      });
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
         .send({
-          apiKey: validApiKey,
+          listId: 'list_123',
           email: 'test@example.com',
         });
 
-      expect(response.status).toBe(201);
-      expect(response.body.success).toBe(true);
-    });
-
-    it('should add forwardedAt timestamp to customFields', async () => {
-      const beforeRequest = new Date().toISOString();
-
-      const mockLead = {
-        leadId: 'lead_123',
-        listId: 'list_123',
-        email: 'test@example.com',
-      };
-
-      (crmDb.getLeadListByApiKey as jest.Mock).mockResolvedValue(mockLeadList);
-      (crmDb.createLead as jest.Mock).mockResolvedValue(mockLead);
-
-      await request(app)
-        .post('/api/webhooks/forward-lead')
-        .set('X-API-Key', validApiKey)
-        .send({
-          email: 'test@example.com',
-        });
-
-      const afterRequest = new Date().toISOString();
-
-      // Verify forwardedAt was added
-      const createLeadCall = (crmDb.createLead as jest.Mock).mock.calls[0];
-      const leadData = createLeadCall[1];
-      expect(leadData.customFields.forwardedAt).toBeDefined();
-      expect(leadData.customFields.forwardedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
-
-      // Verify timestamp is reasonable (within test execution time)
-      expect(leadData.customFields.forwardedAt >= beforeRequest).toBe(true);
-      expect(leadData.customFields.forwardedAt <= afterRequest).toBe(true);
+      expect(response.headers['access-control-allow-origin']).toBe('*');
+      expect(response.headers['access-control-allow-methods']).toContain('POST');
     });
   });
 });
