@@ -257,8 +257,64 @@ export class McpClientService {
       };
       console.log(`MCP: Using access token authentication for ${name}`);
     }
+
+    // Use axios as a fetch replacement to support long timeouts
+    const axios = require('axios');
+    const axiosFetch = async (url: string | URL, init?: RequestInit): Promise<Response> => {
+      // Convert Headers, Array, or Record to plain object
+      const plainHeaders: Record<string, string> = {};
+      if (init?.headers) {
+        if (init.headers instanceof Headers) {
+          init.headers.forEach((value, key) => plainHeaders[key] = value);
+        } else if (Array.isArray(init.headers)) {
+          init.headers.forEach(([key, value]) => plainHeaders[key] = value);
+        } else {
+          // Normalize standard object headers
+          Object.entries(init.headers as Record<string, string>).forEach(([key, value]) => {
+            if (value !== undefined && value !== null) {
+              plainHeaders[key] = String(value);
+            }
+          });
+        }
+      }
+
+      // Convert RequestInit to Axios config
+      const axiosConfig: any = {
+        method: init?.method || 'GET',
+        url: url.toString(),
+        headers: plainHeaders,
+        data: init?.body,
+        // CRITICAL: Disable timeout for long-running tools (e.g. 15+ minutes)
+        timeout: 0, 
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        responseType: 'arraybuffer', // Get raw buffer to construct Response
+        validateStatus: () => true // Don't throw on error status, let Response handle it
+      };
+
+      try {
+        const response = await axios(axiosConfig);
+        
+        // Convert Axios response back to Fetch Response
+        return new Response(response.data, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: new Headers(response.headers as Record<string, string>)
+        });
+      } catch (error: any) {
+        // Handle network errors
+        if (axios.isAxiosError(error) && error.code) {
+          throw new TypeError(`Network error: ${error.code} - ${error.message}`);
+        }
+        throw error;
+      }
+    };
     
-    return new StreamableHTTPClientTransport(new URL(resolvedUrl), { requestInit });
+    // Pass custom fetch to transport
+    return new StreamableHTTPClientTransport(new URL(resolvedUrl), { 
+      requestInit, 
+      fetch: axiosFetch as any // Cast explicitly to match expected type
+    });
   }
 
   private async connectToServer(name: string, config: McpServerConfig, toolPrefix?: string): Promise<void> {

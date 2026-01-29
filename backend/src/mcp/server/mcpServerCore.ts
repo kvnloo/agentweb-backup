@@ -42,6 +42,11 @@ export function createMcpServer(serverName: string = "agentweb-mcp-server"): Ser
   // This allows us to continue using our mcpToolRegistry pattern
   const server = mcpServer.server;
 
+  // Add error handler for transport-level errors (e.g. connection drops)
+  server.onerror = (error) => {
+    console.error('[MCP Error] Transport error:', error);
+  };
+
   /**
    * Handler for listing available tools.
    */
