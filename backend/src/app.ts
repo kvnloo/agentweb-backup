@@ -31,13 +31,15 @@ import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
+import mcpServersRoutes from "./routes/mcpServers";
 import supportRoutes from "./routes/support";
 import { authenticateToken } from "./middleware/auth";
+import { isAdmin } from "./middleware/admin";
 
 const { version } = require('../package.json');
 
 
-// Import the new controller
+import { setupMcpServer } from "./mcp/server/mcpServer";
 import {
   viewExternalFile,
   getFileContent,
@@ -45,6 +47,9 @@ import {
 } from "./controllers/filesController";
 
 const app = express();
+
+// Initialize MCP Server routes BEFORE glocal body parsers
+setupMcpServer(app);
 
 // CORS configuration
 const corsOptions = {
@@ -166,7 +171,9 @@ app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
+app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/support", supportRoutes);
+
 
 
 // Health check endpoint

@@ -45,7 +45,7 @@ describe('tokenUtils', () => {
     });
 
     it('should return hours format for timestamps hours away', () => {
-      const fiveHoursFromNow = Date.now() + 5 * 60 * 60 * 1000;
+      const fiveHoursFromNow = Date.now() + 5 * 60 * 60 * 1000 + 1000;
       expect(formatExpiryMessage(fiveHoursFromNow)).toBe('Expires in 5 hours');
     });
 

@@ -93,7 +93,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
     updatedAt: '2024-01-01T00:00:00Z',
   };
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
 
@@ -122,6 +122,7 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
     });
 
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
   });
 
   describe('Tool Definition', () => {

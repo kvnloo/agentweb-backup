@@ -41,8 +41,9 @@ describe('AgentModeService - search_knowledge_base', () => {
   let agentModeService: AgentModeService;
   const mockSearchPlatformKnowledgeBase = searchPlatformKnowledgeBase as jest.MockedFunction<typeof searchPlatformKnowledgeBase>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
     jest.clearAllMocks();
   });
 

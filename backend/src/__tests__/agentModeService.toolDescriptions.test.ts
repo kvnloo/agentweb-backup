@@ -28,11 +28,19 @@ jest.mock('../services/chatbotService');
 jest.mock('../services/settingsService');
 jest.mock('../utils/secretsManager');
 
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn().mockImplementation(() => ({
+    initialize: jest.fn(),
+    getTools: jest.fn().mockReturnValue([]),
+  })),
+}));
+
 describe('AgentModeService - Tool Descriptions', () => {
   let agentModeService: AgentModeService;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
     jest.clearAllMocks();
   });
 

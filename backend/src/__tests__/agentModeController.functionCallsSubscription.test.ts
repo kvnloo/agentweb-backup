@@ -10,7 +10,13 @@ jest.mock('../services/agentModeService', () => ({
     ],
   })),
   // Some tests import the singleton, keep a minimal stub
-  agentModeService: {},
+  agentModeService: {
+    getAvailableTools: () => [
+      { type: 'function', function: { name: 'generate_image', description: 'Generate images' } },
+      { type: 'function', function: { name: 'generate_video', description: 'Generate videos' } },
+      { type: 'non-function', other: true },
+    ],
+  },
 }));
 
 // Mock subscriptionService used by getAvailableFunctionCalls
