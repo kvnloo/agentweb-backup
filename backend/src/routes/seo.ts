@@ -696,45 +696,61 @@ router.get("/metrics", async (req, res) => {
       }
     }
 
-    // Calculate funnel metrics if GA4 is configured
+    // Calculate funnel metrics if GA4 is configured and funnelId provided
     let funnelMetrics: any = null;
-    if (user.googleAnalyticsPropertyId) {
+    const funnelId = req.query.funnelId as string;
+
+    if (user.googleAnalyticsPropertyId && funnelId) {
       try {
-        const gaClient = await getGoogleAnalyticsDataClient();
-        if (gaClient) {
-          // Use same date range as GA metrics
-          const now = new Date();
-          const endDate = new Date(now);
-          endDate.setUTCHours(0, 0, 0, 0);
+        // Fetch funnel config from AW-Settings
+        const AWS = require("aws-sdk");
+        const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
+        const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
 
-          const startDate = new Date(endDate);
-          const timeframe = (req.query.timeframe as string) || "30d";
+        const funnelResult = await dynamodb.get({
+          TableName: `${TABLE_PREFIX}AW-Settings`,
+          Key: { settingName: `funnels_${(req as any).user.userId}` },
+        }).promise();
 
-          if (timeframe === "7d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 6);
-          } else if (timeframe === "14d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 13);
-          } else if (timeframe === "30d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 29);
-          } else if (timeframe === "90d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 89);
-          } else {
-            startDate.setUTCDate(endDate.getUTCDate() - 29);
+        const funnel = funnelResult.Item?.funnels?.[funnelId];
+
+        if (funnel && funnel.stages) {
+          const gaClient = await getGoogleAnalyticsDataClient();
+          if (gaClient) {
+            // Use same date range as GA metrics
+            const now = new Date();
+            const endDate = new Date(now);
+            endDate.setUTCHours(0, 0, 0, 0);
+
+            const startDate = new Date(endDate);
+            const timeframe = (req.query.timeframe as string) || "30d";
+
+            if (timeframe === "7d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 6);
+            } else if (timeframe === "14d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 13);
+            } else if (timeframe === "30d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 29);
+            } else if (timeframe === "90d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 89);
+            } else {
+              startDate.setUTCDate(endDate.getUTCDate() - 29);
+            }
+            startDate.setUTCHours(0, 0, 0, 0);
+
+            const startDateStr = startDate.toISOString().split("T")[0];
+            const endDateStr = endDate.toISOString().split("T")[0];
+
+            funnelMetrics = await calculateFunnelMetrics(
+              gaClient,
+              user.googleAnalyticsPropertyId,
+              { startDate: startDateStr, endDate: endDateStr },
+              funnel.stages
+            );
+
+            // Add funnel name to metrics
+            funnelMetrics.funnelName = funnel.name;
           }
-          startDate.setUTCHours(0, 0, 0, 0);
-
-          const startDateStr = startDate.toISOString().split("T")[0];
-          const endDateStr = endDate.toISOString().split("T")[0];
-
-          // Use user's custom funnel config or default stages
-          const funnelStages = user.funnelConfig?.stages || DEFAULT_FUNNEL_STAGES;
-
-          funnelMetrics = await calculateFunnelMetrics(
-            gaClient,
-            user.googleAnalyticsPropertyId,
-            { startDate: startDateStr, endDate: endDateStr },
-            funnelStages
-          );
         }
       } catch (error: any) {
         console.error("Error calculating funnel metrics:", error);

@@ -10,7 +10,10 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage --forceExit",
     "create-tables": "ts-node scripts/create-tables.ts",
-    "create-admin": "ts-node src/scripts/create-admin.ts"
+    "create-admin": "ts-node src/scripts/create-admin.ts",
+    "migrate-funnels": "ts-node src/scripts/migrate-funnels.ts",
+    "clean-old-funnels": "ts-node src/scripts/clean-old-funnels.ts",
+    "clean-old-funnels-force": "ts-node src/scripts/clean-old-funnels-force.ts"
   },
   "keywords": [],
   "author": "",

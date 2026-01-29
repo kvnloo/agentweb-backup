@@ -98,6 +98,9 @@ prompts/
 */.cache/
 **/.cache/
 
+# Playwright browser automation
+.playwright-mcp/
+
 # Environment variables
 .env
 .env.local
