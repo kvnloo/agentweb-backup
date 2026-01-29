@@ -6884,6 +6884,17 @@ ${emailDraftFormat === 'text'
     focus_areas?: string[],
     userId?: string
   ): Promise<any> {
+    return {
+        success: true,
+        message: `Deep research completed successfully. Generated ${wordCount} words of content and saved to S3.`,
+        data: {
+          research_url: uploadResult.url,
+          title: researchResult.title,
+          summary: researchResult.researchSummary,
+          word_count: wordCount,
+          research_depth: depth,
+          topic: topic
+        }
     try {
       console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
 
