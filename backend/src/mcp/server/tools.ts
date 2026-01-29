@@ -708,7 +708,7 @@ mcpToolRegistry.register({
     // Note: The backend createSocialMediaPosts currently expects an array of posts.
     // If the tool is supposed to generate them first, we might need a middle layer.
     // For now, mirroring the existing (buggy?) behavior but ensuring we pass sessionId.
-    return await agentModeService.createSocialMediaPosts(args, context?.userId, context?.sessionId);
+    return await agentModeService.createSocialMediaPosts(args.posts, context?.userId, context?.sessionId);
   }
 });
 
@@ -1958,7 +1958,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.setWorkPlanStatus(args.stepStatuses, context?.sessionId);
+    return await agentModeService.setWorkPlanStatus(args.updates, context?.sessionId);
   }
 });
 
