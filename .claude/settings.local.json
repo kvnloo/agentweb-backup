@@ -33,6 +33,18 @@
       "Bash(aws lambda update-function-configuration:*)",
       "Bash(aws lambda create-function:*)",
       "Bash(aws iam list-roles:*)",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_type",
+      "mcp__playwright__browser_wait_for",
+      "mcp__playwright__browser_run_code",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_press_key",
+      "mcp__playwright__browser_console_messages",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_close",
+      "Bash(npm run migrate-funnels:*)",
+      "mcp__playwright__browser_network_requests",
       "Bash(gh pr list:*)"
     ]
   }

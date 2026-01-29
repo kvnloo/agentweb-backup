@@ -87,6 +87,8 @@ agent-engine/downloads/**/*
 # Security files
 *.pem
 agentweb-*.json
+service-account.json
+**/service-account.json
 
 # Ignore prompts directory
 prompts/
@@ -95,6 +97,9 @@ prompts/
 .cache/
 */.cache/
 **/.cache/
+
+# Playwright browser automation
+.playwright-mcp/
 
 # Environment variables
 .env

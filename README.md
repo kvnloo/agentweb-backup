@@ -2484,3 +2484,6 @@ permissions:
 ```
 
 No additional configuration is needed in most cases.
+
+# How to kill backend
+lsof -ti:3001 | xargs kill -9 2>/dev/null && echo "✅ Backend killed" || echo "ℹ️ No backend process running on port 3001"

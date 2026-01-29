@@ -4,6 +4,7 @@ import { userDb } from "../services/db";
 import { getSecret } from "../utils/secretsManager";
 import { JWT } from "google-auth-library";
 import { BetaAnalyticsDataClient } from "@google-analytics/data";
+import { calculateFunnelMetrics, DEFAULT_FUNNEL_STAGES, validateFunnelStages } from "../services/funnelService";
 
 const router = express.Router();
 const pageSpeedStrategy = "mobile";
@@ -695,9 +696,77 @@ router.get("/metrics", async (req, res) => {
       }
     }
 
+    // Calculate funnel metrics if GA4 is configured and funnelId provided
+    let funnelMetrics: any = null;
+    const funnelId = req.query.funnelId as string;
+
+    if (user.googleAnalyticsPropertyId && funnelId) {
+      try {
+        // Fetch funnel config from AW-Settings
+        const AWS = require("aws-sdk");
+        const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
+        const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
+
+        const funnelResult = await dynamodb.get({
+          TableName: `${TABLE_PREFIX}AW-Settings`,
+          Key: { settingName: `funnels_${(req as any).user.userId}` },
+        }).promise();
+
+        const funnel = funnelResult.Item?.funnels?.[funnelId];
+
+        if (funnel && funnel.stages) {
+          const gaClient = await getGoogleAnalyticsDataClient();
+          if (gaClient) {
+            // Use same date range as GA metrics
+            const now = new Date();
+            const endDate = new Date(now);
+            endDate.setUTCHours(0, 0, 0, 0);
+
+            const startDate = new Date(endDate);
+            const timeframe = (req.query.timeframe as string) || "30d";
+
+            if (timeframe === "7d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 6);
+            } else if (timeframe === "14d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 13);
+            } else if (timeframe === "30d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 29);
+            } else if (timeframe === "90d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 89);
+            } else {
+              startDate.setUTCDate(endDate.getUTCDate() - 29);
+            }
+            startDate.setUTCHours(0, 0, 0, 0);
+
+            const startDateStr = startDate.toISOString().split("T")[0];
+            const endDateStr = endDate.toISOString().split("T")[0];
+
+            funnelMetrics = await calculateFunnelMetrics(
+              gaClient,
+              user.googleAnalyticsPropertyId,
+              { startDate: startDateStr, endDate: endDateStr },
+              funnel.stages
+            );
+
+            // Add funnel name to metrics
+            funnelMetrics.funnelName = funnel.name;
+          }
+        }
+      } catch (error: any) {
+        console.error("Error calculating funnel metrics:", error);
+        funnelMetrics = {
+          stages: [],
+          totalSessions: 0,
+          completionRate: 0,
+          error: error.message || "Failed to calculate funnel metrics",
+        };
+      }
+    }
+
     res.json({
       metrics,
       gaMetrics,
+      funnelMetrics,
       timestamp: new Date().toISOString(),
     });
   } catch (error: any) {
@@ -705,6 +774,78 @@ router.get("/metrics", async (req, res) => {
     res.status(500).json({ 
       message: "Error fetching SEO metrics",
       error: error.message || "Unknown error"
+    });
+  }
+});
+
+// Get user's funnel configuration
+router.get("/funnel-config", async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const user = await userDb.getUserById(userId);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Return user's custom config or defaults
+    const funnelConfig = user.funnelConfig || { stages: DEFAULT_FUNNEL_STAGES };
+
+    res.json({
+      success: true,
+      funnelConfig,
+      isDefault: !user.funnelConfig,
+    });
+  } catch (error: any) {
+    console.error("Error fetching funnel config:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching funnel configuration",
+      error: error.message || "Unknown error",
+    });
+  }
+});
+
+// Update user's funnel configuration
+router.put("/funnel-config", async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const { stages } = req.body;
+
+    // Validate stages
+    if (!stages || !Array.isArray(stages)) {
+      return res.status(400).json({
+        success: false,
+        message: "Stages array is required",
+      });
+    }
+
+    // Validate funnel stages
+    const validationErrors = validateFunnelStages(stages);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid funnel configuration",
+        errors: validationErrors,
+      });
+    }
+
+    // Update user's funnel config
+    await userDb.updateUser(userId, {
+      funnelConfig: { stages },
+    });
+
+    res.json({
+      success: true,
+      message: "Funnel configuration updated successfully",
+      funnelConfig: { stages },
+    });
+  } catch (error: any) {
+    console.error("Error updating funnel config:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error updating funnel configuration",
+      error: error.message || "Unknown error",
     });
   }
 });
