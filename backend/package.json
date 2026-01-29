@@ -4,16 +4,14 @@
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev": "ts-node-dev --respawn --exit-child --transpile-only src/server.ts",
     "build": "npx tsc",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage --forceExit",
     "create-tables": "ts-node scripts/create-tables.ts",
     "create-admin": "ts-node src/scripts/create-admin.ts",
-    "migrate-funnels": "ts-node src/scripts/migrate-funnels.ts",
-    "clean-old-funnels": "ts-node src/scripts/clean-old-funnels.ts",
-    "clean-old-funnels-force": "ts-node src/scripts/clean-old-funnels-force.ts"
+    "mcp:inspector": "PORT=5180 npx @modelcontextprotocol/inspector --transport sse --server-url http://localhost:3001/mcp/server"
   },
   "keywords": [],
   "author": "",
@@ -29,6 +27,7 @@
     "@langchain/aws": "^1.1.0",
     "@langchain/core": "^1.1.5",
     "@langchain/openai": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.25.2",
     "@reactflow/core": "^11.11.4",
     "@runwayml/sdk": "^3.7.0",
     "@slack/web-api": "^7.9.3",

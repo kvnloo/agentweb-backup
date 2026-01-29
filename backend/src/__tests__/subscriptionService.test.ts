@@ -40,7 +40,13 @@ jest.mock('../services/agentModeService', () => ({
       { type: 'plain', other: true },
     ],
   })),
-  agentModeService: {},
+  agentModeService: {
+    getAvailableTools: () => [
+      { type: 'function', function: { name: 'generate_image' } },
+      { type: 'function', function: { name: 'generate_video' } },
+      { type: 'plain', other: true },
+    ],
+  },
 }));
 
 const mockedSettingsService = settingsService as jest.Mocked<typeof settingsService>;

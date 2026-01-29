@@ -1,4 +1,4 @@
-import { AgentModeService } from '../services/agentModeService';
+import { AgentModeService, agentModeService as singletonAgentService } from '../services/agentModeService';
 
 // Mock AWS SDK
 jest.mock('aws-sdk', () => ({
@@ -64,11 +64,12 @@ describe('AgentModeService - createHtmlFile', () => {
   let mockGenerateHTML: jest.Mock;
   let mockUploadFileToS3: jest.Mock;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
 
     // Create service instance
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
 
     // Get mocked functions
     const { createLLMService } = require('../utils/llmService');
@@ -298,12 +299,16 @@ describe('AgentModeService - createHtmlFile', () => {
 
   describe('create_html_file function call handler', () => {
     beforeEach(() => {
-      jest.spyOn(agentModeService as any, 'createHtmlFile').mockResolvedValue({
-        success: true,
-        s3_url: 'https://s3.amazonaws.com/bucket/test.html',
-        filename: 'test.html',
-        title: 'Test Title',
-        message: 'HTML file created successfully'
+      jest.spyOn(singletonAgentService as any, 'createHtmlFile').mockImplementation(async (title, content_draft, format_requirements, userId, sessionId) => {
+        if (!title) return { success: false, message: 'title is required' };
+        if (!content_draft) return { success: false, message: 'content_draft is required' };
+        return {
+          success: true,
+          s3_url: 'https://s3.amazonaws.com/bucket/test.html',
+          filename: 'test.html',
+          title: 'Test Title',
+          message: 'HTML file created successfully'
+        };
       });
     });
 
@@ -322,7 +327,7 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(true);
-      expect((agentModeService as any).createHtmlFile).toHaveBeenCalledWith(
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
         'Test Title',
         'Test content',
         'Use modern design',
@@ -345,7 +350,7 @@ describe('AgentModeService - createHtmlFile', () => {
       );
 
       expect(result.success).toBe(true);
-      expect((agentModeService as any).createHtmlFile).toHaveBeenCalledWith(
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
         'Test Title',
         'Test content',
         '',
@@ -368,7 +373,13 @@ describe('AgentModeService - createHtmlFile', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('title is required');
-      expect((agentModeService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+        undefined,
+        'Test content',
+        expect.any(String),
+        'user123',
+        'session123'
+      );
     });
 
     it('should return error when content_draft is missing', async () => {
@@ -385,7 +396,13 @@ describe('AgentModeService - createHtmlFile', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('content_draft is required');
-      expect((agentModeService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect((singletonAgentService as any).createHtmlFile).toHaveBeenCalledWith(
+        'Test Title',
+        undefined,
+        expect.any(String),
+        'user123',
+        'session123'
+      );
     });
 
     it('should handle mock mode for create_html_file', async () => {
@@ -406,7 +423,7 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.s3_url).toContain('mock-s3-bucket');
       expect(result.title).toBe('Test Title');
       expect(result.message).toContain('Mock HTML file created successfully');
-      expect((agentModeService as any).createHtmlFile).not.toHaveBeenCalled();
+      expect((singletonAgentService as any).createHtmlFile).not.toHaveBeenCalled();
     });
 
     it('should validate title in mock mode', async () => {

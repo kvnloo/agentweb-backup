@@ -19,4 +19,8 @@ declare global {
 export interface AuthRequest extends Request {
   user?: Express.User;
   authInfo?: Express.AuthInfo;
-} 
+}
+
+// This empty export is required for TypeScript to treat this as a module
+// and properly apply the global augmentation
+export {}; 

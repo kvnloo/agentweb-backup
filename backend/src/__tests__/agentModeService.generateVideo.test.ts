@@ -11,11 +11,18 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn().mockImplementation(() => ({
+    initialize: jest.fn(),
+    getTools: jest.fn().mockReturnValue([]),
+  })),
+}));
+
 describe('AgentModeService - generate_video function', () => {
   let agentModeService: AgentModeService;
   let mockVideoService: any;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
     
     // Mock videoService
@@ -29,6 +36,7 @@ describe('AgentModeService - generate_video function', () => {
 
     // Create AgentModeService instance
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
   });
 
   describe('Basic Video Generation', () => {

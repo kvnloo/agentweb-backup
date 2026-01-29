@@ -44,7 +44,8 @@
       "mcp__playwright__browser_take_screenshot",
       "mcp__playwright__browser_close",
       "Bash(npm run migrate-funnels:*)",
-      "mcp__playwright__browser_network_requests"
+      "mcp__playwright__browser_network_requests",
+      "Bash(gh pr list:*)"
     ]
   }
 }

@@ -12,6 +12,9 @@ const agentModeService = new AgentModeService();
 process.on('message', async (message: any) => {
   try {
     if (message.type === 'generateMarketingResponse') {
+      // Initialize the service (loads tools, connects to MCP)
+      await agentModeService.initialize();
+
       const { messageContent, sessionHistory, userId,llmModel, sessionId, mockMode } = message.params;
       
       // Progress callback to forward progress updates to parent process

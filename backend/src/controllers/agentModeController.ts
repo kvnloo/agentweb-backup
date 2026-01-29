@@ -850,7 +850,7 @@ function setupSSEConnectionForSession(sessionId: string, res: Response, req: Req
 
     // Clean up on error
     req.on('error', (error) => {
-      console.error(`[SSE] Request error for session ${sessionId}:`, error);
+      // console.error(`[SSE] Request error for session ${sessionId}:`, error);
       clearInterval(pingInterval);
       cleanup();
       res.end();
@@ -1008,70 +1008,70 @@ const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
 
   switch (frequency) {
     case 'hourly':
-      nextRun.setHours(nextRun.getHours() + 1);
-      nextRun.setMinutes(0, 0, 0); // Top of the hour
+      nextRun.setUTCHours(nextRun.getUTCHours() + 1);
+      nextRun.setUTCMinutes(0, 0, 0); // Top of the hour
 
       // If still in the past, keep adding hours until we're in the future
       while (nextRun <= now) {
-        nextRun.setHours(nextRun.getHours() + 1);
+        nextRun.setUTCHours(nextRun.getUTCHours() + 1);
       }
       break;
     case 'daily':
-      nextRun.setDate(nextRun.getDate() + 1);
+      nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       // Preserve the time from fromDate
 
       // If still in the past (schedule ran late), keep adding days until we're in the future
       while (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 1);
+        nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       }
       break;
     case 'weekly':
       // Add exactly 7 days (same day of week, one week later)
-      nextRun.setDate(nextRun.getDate() + 7);
+      nextRun.setUTCDate(nextRun.getUTCDate() + 7);
       // Preserve the time from fromDate
 
       // If still in the past, keep adding weeks until we're in the future
       while (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 7);
+        nextRun.setUTCDate(nextRun.getUTCDate() + 7);
       }
       break;
     case 'monthly':
       // Calculate same weekday of next month (e.g., 2nd Tuesday -> 2nd Tuesday of next month)
-      const currentDayOfWeek = nextRun.getDay(); // 0 = Sunday, 1 = Monday, etc.
-      const currentWeekOfMonth = Math.floor((nextRun.getDate() - 1) / 7); // 0-based week number
+      const currentDayOfWeek = nextRun.getUTCDay(); // 0 = Sunday, 1 = Monday, etc.
+      const currentWeekOfMonth = Math.floor((nextRun.getUTCDate() - 1) / 7); // 0-based week number
 
       // Move to next month, 1st day
-      nextRun.setMonth(nextRun.getMonth() + 1);
-      nextRun.setDate(1);
+      nextRun.setUTCMonth(nextRun.getUTCMonth() + 1);
+      nextRun.setUTCDate(1);
 
       // Find the first occurrence of the target day of week in the new month
-      const firstDayOfMonth = nextRun.getDay();
+      const firstDayOfMonth = nextRun.getUTCDay();
       let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
 
       // Add weeks to get to the same week number
       daysToAdd += currentWeekOfMonth * 7;
 
-      nextRun.setDate(1 + daysToAdd);
+      nextRun.setUTCDate(1 + daysToAdd);
       // Preserve the time from fromDate
 
       // If still in the past, keep adding months until we're in the future
       while (nextRun <= now) {
-        nextRun.setMonth(nextRun.getMonth() + 1);
-        nextRun.setDate(1);
+        nextRun.setUTCMonth(nextRun.getUTCMonth() + 1);
+        nextRun.setUTCDate(1);
 
-        const firstDayOfMonth = nextRun.getDay();
+        const firstDayOfMonth = nextRun.getUTCDay();
         let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
         daysToAdd += currentWeekOfMonth * 7;
-        nextRun.setDate(1 + daysToAdd);
+        nextRun.setUTCDate(1 + daysToAdd);
       }
       break;
     default:
       // Default to daily
-      nextRun.setDate(nextRun.getDate() + 1);
-      nextRun.setHours(9, 0, 0, 0); // Fallback to 9 AM UTC for unknown frequencies
+      nextRun.setUTCDate(nextRun.getUTCDate() + 1);
+      nextRun.setUTCHours(9, 0, 0, 0); // Fallback to 9 AM UTC for unknown frequencies
 
       while (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 1);
+        nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       }
   }
 
@@ -1192,17 +1192,16 @@ export const agentModeController = {
   async getAvailableFunctionCalls(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const agentModeService = new AgentModeService();
-      const allTools = agentModeService.getAvailableTools();
+      const tools = agentModeService.getAvailableTools();
       
       // For admin users, return all function calls without filtering
       // For regular users, filter tools based on subscription
-      let toolsToReturn = allTools;
+      let toolsToReturn = tools;
       if (!user.isAdmin) {
         const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
         const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
         // getAllowedFunctionCalls now always returns an array (never null)
-        toolsToReturn = filterFunctionCalls(allTools, allowedFunctionCalls);
+        toolsToReturn = filterFunctionCalls(tools, allowedFunctionCalls);
       }
 
       // Extract function names and descriptions
@@ -1402,7 +1401,6 @@ export const agentModeController = {
 
   async getSupportedModels(req: Request, res: Response) {
     try {
-      const agentModeService = new AgentModeService();
       const models = await agentModeService.getSupportedModels();
       res.json(models);
     } catch (error) {
@@ -2572,8 +2570,8 @@ export const agentModeController = {
         // For hourly schedules with daily digest, send a daily digest email
         // Get all run results for the same date as the selected test entry
         const selectedResultDate = new Date(record.createdAt);
-        const startOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate());
-        const endOfDay = new Date(selectedResultDate.getFullYear(), selectedResultDate.getMonth(), selectedResultDate.getDate() + 1);
+        const startOfDay = new Date(Date.UTC(selectedResultDate.getUTCFullYear(), selectedResultDate.getUTCMonth(), selectedResultDate.getUTCDate()));
+        const endOfDay = new Date(Date.UTC(selectedResultDate.getUTCFullYear(), selectedResultDate.getUTCMonth(), selectedResultDate.getUTCDate() + 1));
 
         const sameDayResultsRaw = testHistory.filter((result: any) => {
           const resultDate = new Date(result.createdAt);
