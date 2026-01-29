@@ -8,6 +8,23 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-01-29",
+    changes: [
+      "Added Model Context Protocol (MCP) Support for Dynamic Agent Tool Management",
+      "- MCP Server exposes agent tools as MCP-compatible endpoints with SSE (Server-Sent Events) transport support",
+      "- External clients can now discover and invoke agent capabilities through standardized MCP protocol",
+      "- Supports dynamic refresh when MCP server configurations change for hot-reloading capabilities",
+      "Added MCP Servers Management UI in Partner Portal",
+      "- New MCP Servers Tab in Admin section for adding, editing, and deleting MCP server configurations",
+      "- Discover and test tools from connected MCP servers before deployment",
+      "- Configure SSE transport settings and access token authentication",
+      "- REST API endpoints for CRUD operations on MCP server configurations",
+      "Enhanced Security for MCP Integration",
+      "- Access token encryption for MCP server configurations stored in database",
+      "- Token-based authentication (MCP_ACCESS_TOKEN) for securing MCP server endpoints",
+    ],
+  },
+  {
     date: "2026-01-14",
     changes: [
       "Added showInAgentMode configuration for predefined work plans",

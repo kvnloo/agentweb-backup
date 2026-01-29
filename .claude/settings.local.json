@@ -32,7 +32,8 @@
       "Bash(aws lambda update-function-code:*)",
       "Bash(aws lambda update-function-configuration:*)",
       "Bash(aws lambda create-function:*)",
-      "Bash(aws iam list-roles:*)"
+      "Bash(aws iam list-roles:*)",
+      "Bash(gh pr list:*)"
     ]
   }
 }
