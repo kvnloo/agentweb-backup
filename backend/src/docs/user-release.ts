@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-29',
+    changes: [
+      'Added User Journey Funnel Support to SEO/GEO Page',
+      '- Users can now visualize and track conversion funnels through multiple stages of their website journey',
+      '- Create unlimited funnels with custom stages based on GA4 events (page_view, click, form_submit, etc.)',
+    ],
+  },
+  {
     date: '2026-01-28',
     changes: [
       'Added Public API Integration for CRM Lead Lists',
