@@ -330,7 +330,26 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
+    const result = await agentModeService.getBookContent(args.book_id, args.section_id, args.chapter_id, context?.userId);
+    if (result.success === false) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${result.message}\n${result.error || ''}`
+          }
+        ],
+        isError: true
+      };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: result.content
+        }
+      ]
+    };
   }
 });
 
@@ -1721,7 +1740,26 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.readFileContent(args.file_url);
+    const result = await agentModeService.readFileContent(args.file_url);
+    if (result.success === false) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${result.message}\n${result.error || ''}`
+          }
+        ],
+        isError: true
+      };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: result.content
+        }
+      ]
+    };
   }
 });
 
@@ -1742,7 +1780,26 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.readFileContent(args.url);
+    const result = await agentModeService.readFileContent(args.url);
+    if (result.success === false) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error: ${result.message}\n${result.error || ''}`
+          }
+        ],
+        isError: true
+      };
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: result.content
+        }
+      ]
+    };
   }
 });
 
