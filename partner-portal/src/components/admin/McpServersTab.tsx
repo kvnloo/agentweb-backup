@@ -353,7 +353,10 @@ const McpServersTab: React.FC = () => {
           <Button
             variant="contained"
             startIcon={<AddIcon />}
-            onClick={() => setAddDialogOpen(true)}
+            onClick={() => {
+              resetForm();
+              setAddDialogOpen(true);
+            }}
           >
             Add Server
           </Button>
