@@ -5,6 +5,10 @@ import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
 import crypto from 'crypto';
+// Re-export crypto functions from utility file for backwards compatibility
+export { encryptPassword, decryptPassword } from '../utils/crypto';
+// Import for local use
+import { encryptPassword } from '../utils/crypto';
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -12,40 +16,7 @@ const dynamodb = new DynamoDB.DocumentClient();
 // Get table prefix based on NODE_ENV
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
-// Function to derive a 32-byte key from JWT_SECRET
-function deriveKey(secret: string): Buffer {
-  // Convert JWT_SECRET to Buffer if it's not already
-  const secretBuffer = Buffer.from(secret, 'utf8');
-  return crypto.pbkdf2Sync(secretBuffer, 'salt', 100000, 32, 'sha256');
-}
 
-// Function to encrypt password
-function encryptPassword(password: string, userId: string): string {
-  // First sign the password with userId
-  const signedPassword = jwt.sign({ password, userId }, process.env.JWT_SECRET!);
-  
-  // Generate a random IV
-  const iv = crypto.randomBytes(16);
-  
-  // Derive a 32-byte key from JWT_SECRET
-  const key = deriveKey(process.env.JWT_SECRET!);
-  
-  // Create cipher using derived key
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  
-  // Encrypt the signed password
-  let encrypted = cipher.update(signedPassword, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  
-  // Get the auth tag
-  const authTag = cipher.getAuthTag();
-  
-  // Combine IV, encrypted data, and auth tag
-  const combined = Buffer.concat([iv, Buffer.from(encrypted, 'hex'), authTag]);
-  
-  // Return as base64 string
-  return combined.toString('base64');
-}
 
 // Get user's saved configurations
 router.get('/', authenticateToken, async (req, res) => {

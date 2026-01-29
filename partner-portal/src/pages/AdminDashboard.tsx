@@ -47,6 +47,7 @@ import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
+import McpServersTab from "../components/admin/McpServersTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -573,6 +574,7 @@ export default function AdminDashboard() {
     'default-prompts': 10,
     'benchmarks': 11,
     'subscriptions': 12,
+    'mcp-servers': 13,
   };
   
   // Get initial tab value from URL or default to Users
@@ -2035,6 +2037,7 @@ export default function AdminDashboard() {
             <Tab label="Default Prompts" {...a11yProps(10)} />
             <Tab label="Benchmarks" {...a11yProps(11)} />
             <Tab label="Subscriptions" {...a11yProps(12)} />
+            <Tab label="MCP Servers" {...a11yProps(13)} />
           </Tabs>
         </Box>
 
@@ -4385,6 +4388,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={12}>
           <SubscriptionTypesTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={13}>
+          <McpServersTab />
         </TabPanel>
       </Paper>
 

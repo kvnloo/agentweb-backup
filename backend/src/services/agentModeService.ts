@@ -9,10 +9,12 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
-import { createWriteStream, promises as fs } from 'fs';
+import { createWriteStream, promises as fs, default as fsSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { Readable } from 'stream';
+import { ToolRegistry } from '../mcp/client/toolRegistry';
+import { McpClientService } from '../mcp/client/mcpClientService';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
 // Used for updateEmailDraftForLead to match generateBlogContent pattern
@@ -51,8 +53,128 @@ interface LLMCallOptions {
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
+  private toolRegistry: ToolRegistry;
+  private mcpClientService: McpClientService;
+  private static toolsRegistered: boolean = false;
   default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
   private defaultModelSettingName = 'agent_mode_default_model';
+
+  constructor() {
+    this.toolRegistry = new ToolRegistry();
+    this.mcpClientService = new McpClientService();
+  }
+
+  public async initialize() {
+    await this.registerTools();
+    if (process.env.IS_MCP_SERVER !== 'true') {
+      await this.initializeMcp();
+    } else {
+      console.log('AgentMode: Skipping MCP initialization in server mode');
+    }
+  }
+
+  public async shutdown() {
+    try {
+      if ((AgentModeService as any).mcpInitialized) {
+        console.log('AgentMode: Shutting down MCP clients...');
+        await this.mcpClientService.shutdown();
+        (AgentModeService as any).mcpInitialized = false;
+        console.log('AgentMode: MCP clients shut down successfully');
+      }
+    } catch (error) {
+      console.error('AgentMode: Error during shutdown:', error);
+    }
+  }
+
+  public async initializeMcp() {
+    if ((AgentModeService as any).mcpInitialized) return;
+    (AgentModeService as any).mcpInitialized = true;
+
+    try {
+      await this.mcpClientService.initialize();
+      const mcpTools = this.mcpClientService.getTools();
+      for (const tool of mcpTools) {
+        this.toolRegistry.register(tool);
+      }
+      if (mcpTools.length > 0) {
+        // console.log(`AgentMode: Registered ${mcpTools.length} tools from MCP servers`); // Removed temporary log
+      }
+    } catch (error) {
+      console.error('AgentMode: Error initializing MCP:', error);
+      (AgentModeService as any).mcpInitialized = false;
+    }
+  }
+
+  /**
+   * Refresh MCP tools - reconnect to all MCP servers and update tool registry
+   * Call this when MCP server configurations change (add/update/delete)
+   */
+  public async refreshMcpTools(): Promise<void> {
+    console.log('AgentMode: Refreshing MCP tools...');
+    
+    // Clear existing MCP tools from registry
+    const existingTools = this.mcpClientService.getTools();
+    for (const tool of existingTools) {
+      this.toolRegistry.unregister(tool.name);
+    }
+    
+    // Refresh the MCP client service
+    await this.mcpClientService.refresh();
+    
+    // Re-register tools
+    const mcpTools = this.mcpClientService.getTools();
+    for (const tool of mcpTools) {
+      this.toolRegistry.register(tool);
+    }
+    
+    console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
+  }
+
+  private async registerTools() {
+    // 1. Ensure server tools are loaded into the global mcpToolRegistry (only needs to happen once)
+    if (!AgentModeService.toolsRegistered) {
+      try {
+        // Import the registry and the tools definitions (for side effects)
+        // Dynamic import to avoid circular dependencies
+        await import('../mcp/server/registry');
+        await import('../mcp/server/tools');
+        
+        AgentModeService.toolsRegistered = true;
+      } catch (error) {
+         console.error('AgentMode: Error loading server tools:', error);
+      }
+    }
+
+    // 2. Register tools from the global mcpToolRegistry into THIS instance's toolRegistry check
+    try {
+       const { mcpToolRegistry } = await import('../mcp/server/registry');
+       const toolNames = mcpToolRegistry.getToolNames();
+      
+      for (const name of toolNames) {
+        const toolHandler = mcpToolRegistry.getTool(name);
+        if (toolHandler) {
+          // Wrap MCP definition in OpenAI definition format
+          const mcpDef = toolHandler.definition;
+          const openAiDef = {
+            type: "function",
+            function: {
+              name: mcpDef.name,
+              description: mcpDef.description,
+              parameters: mcpDef.inputSchema
+            }
+          };
+
+          this.toolRegistry.register({
+            name: toolHandler.name,
+            definition: openAiDef,
+            execute: toolHandler.execute
+          });
+        }
+      }
+    } catch (error) {
+       console.error('AgentMode: Error registering tools to instance:', error);
+    }
+  }
 
   async getDefaultModel(): Promise<string> {
     const fallbackModel = this.default_model;
@@ -104,7 +226,7 @@ export class AgentModeService {
   private gemini_client_promise: Promise<OpenAI> | null = null;
 
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
-  private async getGeminiClient(): Promise<OpenAI> {
+  public async getGeminiClient(): Promise<OpenAI> {
     // Return cached client if available
     if (this.gemini_client) {
       return this.gemini_client;
@@ -118,12 +240,16 @@ export class AgentModeService {
     // Initialize client
     this.gemini_client_promise = (async () => {
       try {
-        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-        const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
-        const geminiApiKey = await getSecret(geminiSecretName);
+        let geminiApiKey = process.env.GEMINI_API_KEY;
+
+        if (!geminiApiKey) {
+          const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+          const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
+          geminiApiKey = await getSecret(geminiSecretName);
+        }
 
         if (!geminiApiKey || !geminiApiKey.trim()) {
-          throw new Error('Gemini API key is empty');
+          throw new Error('Gemini API key is empty or not found in env/secrets');
         }
 
         this.gemini_client = new OpenAI({
@@ -905,1574 +1031,11 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   public getAvailableTools() {
-    return [
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_task_from_template',
-          description: 'Create a web automation task using a specific template with the provided parameters',
-          parameters: {
-            type: 'object',
-            properties: {
-              template_id: {
-                type: 'string',
-                description: 'The ID of the template to use for creating the task'
-              },
-              parameters_json: {
-                type: 'string',
-                description: 'JSON string containing parameter values where keys are parameter names and values are the actual values. Example: {"site_url": "example.com", "business_area": "e-commerce"}'
-              },
-              attach_previous_task_results: {
-                type: 'boolean',
-                description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
-                default: true
-              },
-              attached_file_urls: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
-                default: []
-              },
-              async: {
-                type: 'boolean',
-                description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
-                default: false
-              }
-            },
-            required: ['template_id', 'parameters_json']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'read_brand_guidelines',
-          description: 'Read the current user\'s brand guidelines (brand data and attachments). Returns exists=false if not set.',
-          parameters: {
-            type: 'object',
-            properties: {},
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'update_brand_guidelines',
-          description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.).',
-          parameters: {
-            type: 'object',
-            properties: {
-              brandData: {
-                type: 'object',
-                description: 'Brand data object with only the fields that need to be updated',
-                properties: {
-                  brandName: { type: 'string', description: 'Brand name' },
-                  tagline: { type: 'string', description: 'Brand tagline or slogan' },
-                  primaryColor: { type: 'string', description: 'Primary brand color (hex code)' },
-                  primaryColorEnd: { type: 'string', description: 'End color for gradient (hex code)' },
-                  secondaryColor: { type: 'string', description: 'Secondary brand color (hex code)' },
-                  fontFamily: { type: 'string', description: 'Primary font family' },
-                  toneOfVoice: { type: 'string', description: 'Brand tone of voice' },
-                  brandPersonality: { type: 'string', description: 'Brand personality description' },
-                  targetAudience: { type: 'string', description: 'Target audience description' },
-                  keyMessages: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Array of key brand messages'
-                  },
-                  brandValues: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Array of brand values'
-                  },
-                  isGradient: { type: 'boolean', description: 'Whether primary color uses gradient' },
-                  founders: {
-                    type: 'array',
-                    items: {
-                      type: 'object',
-                      properties: {
-                        name: { type: 'string', description: 'Founder name' },
-                        jobTitle: { type: 'string', description: 'Founder job title' },
-                        styleTone: { type: 'string', description: 'Founder communication style and tone' },
-                        signaturePosts: { type: 'string', description: 'Notable posts or content the founder is known for' }
-                      },
-                      required: ['name']
-                    },
-                    description: 'Array of founder profiles'
-                  }
-                }
-              },
-              brandAssets: {
-                type: 'array',
-                description: 'Brand assets to update (logos, brand guides, etc.) - array of asset objects with type, url, filename',
-                items: {
-                  type: 'object',
-                  properties: {
-                    type: { type: 'string', enum: ['logo', 'secondaryLogo', 'brandGuide', 'additionalAsset'], description: 'Type of brand asset' },
-                    url: { type: 'string', description: 'URL of the brand asset' },
-                    filename: { type: 'string', description: 'Original filename of the brand asset' }
-                  }
-                }
-              }
-            },
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'read_market_strategy',
-          description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
-          parameters: {
-            type: 'object',
-            properties: {},
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'update_market_strategy',
-          description: 'Update the user\'s market strategy. IMPORTANT: Use read_market_strategy first to fetch the latest data, then only update the fields that need to be changed. Can update business overview, competitors, and ideal customer profiles.',
-          parameters: {
-            type: 'object',
-            properties: {
-              businessOverview: {
-                type: 'string',
-                description: 'Comprehensive business overview including mission, vision, and value propositions'
-              },
-              competitors: {
-                type: 'array',
-                description: 'Array of competitor objects with name and description',
-                items: {
-                  type: 'object',
-                  properties: {
-                    name: { type: 'string', description: 'Competitor name' },
-                    description: { type: 'string', description: 'Competitor description or analysis' }
-                  },
-                  required: ['name']
-                }
-              },
-              icp: {
-                type: 'array',
-                description: 'Array of Ideal Customer Profile objects with title, description, value proposition, and buyer personas',
-                items: {
-                  type: 'object',
-                  properties: {
-                    title: { type: 'string', description: 'ICP title or name' },
-                    description: { type: 'string', description: 'ICP description or characteristics' },
-                    valueProposition: { type: 'string', description: 'Value proposition for this customer type' },
-                    buyerPersonas: { type: 'array', description: 'List of buyer personas for this customer type', items: { type: 'string' } }
-                  },
-                  required: ['title']
-                }
-              }
-            },
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_task_from_prompt',
-          description: 'Create a web automation task using a raw prompt when no suitable template is available',
-          parameters: {
-            type: 'object',
-            properties: {
-              task_name: {
-                type: 'string',
-                description: 'Name for the task'
-              },
-              prompt: {
-                type: 'string',
-                description: 'The raw prompt/instructions for the task'
-              },
-              category: {
-                type: 'string',
-                description: 'Category for the task (e.g., Research, Marketing, Analysis)'
-              },
-              attach_previous_task_results: {
-                type: 'boolean',
-                description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
-                default: true
-              },
-              attached_file_urls: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Array of file URLs to attach to this task. These should be URLs from files uploaded in the current conversation.',
-                default: []
-              },
-              async: {
-                type: 'boolean',
-                description: 'Whether to execute the task asynchronously. If false, the function will wait for task completion before returning the final result.',
-                default: false
-              }
-            },
-            required: ['task_name', 'prompt', 'category']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_image_task_from_prompt',
-          description: '[DEPRECATED] Create an image generation task using a raw prompt for creating visual content. Use \'generate_image\' instead for creating and revising images.',
-          parameters: {
-            type: 'object',
-            properties: {
-              task_name: {
-                type: 'string',
-                description: 'Name for the image generation task'
-              },
-              prompt: {
-                type: 'string',
-                description: 'The detailed prompt describing what images to generate, including style, content, and specifications'
-              },
-              category: {
-                type: 'string',
-                description: 'Category for the task (e.g., Creatives, Marketing, Social Media)',
-                default: 'Creatives'
-              },
-              attach_previous_task_results: {
-                type: 'boolean',
-                description: 'Whether to attach previous task results to this task. Set to true for follow-up tasks that need to reference previous work.',
-                default: true
-              }
-            },
-            required: ['task_name', 'prompt']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_meta_ads_metrics',
-          description: 'Get Meta ad performance metrics and campaign data',
-          parameters: {
-            type: 'object',
-            properties: {
-              timeframe: {
-                type: 'string',
-                description: 'Time period for metrics (7d, 14d, 30d, 90d)',
-                enum: ['7d', '14d', '30d', '90d'],
-                default: '7d'
-              },
-              campaign_name: {
-                type: 'string',
-                description: 'Optional campaign name to filter metrics by. If provided, only data from campaigns matching this name will be returned.',
-                default: null
-              }
-            },
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_revision',
-          description: '[DEPRECATED] Create a revision of an existing completed task execution (supports both reports and images). For image revision, use \'generate_image\' instead. For HTML report revision, use \'update_html_file\' instead.',
-          parameters: {
-            type: 'object',
-            properties: {
-              task_id: {
-                type: 'string',
-                description: 'The ID of the task to revise'
-              },
-              execution_id: {
-                type: 'string',
-                description: 'The ID of the execution to revise'
-              },
-              revision_prompt: {
-                type: 'string',
-                description: 'Detailed instructions for the revision'
-              },
-              target_result_name: {
-                type: 'string',
-                description: 'Name of the specific result file to revise (if execution has multiple results). If not provided, will use the first available result.',
-                default: null
-              }
-            },
-            required: ['task_id', 'execution_id', 'revision_prompt']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'search_web',
-          description: 'Search the web for information from the internet',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: {
-                type: 'string',
-                description: 'The search query to find relevant information on the web'
-              },
-              max_results: {
-                type: 'number',
-                description: 'Maximum number of search results to return (default: 5, max: 10)',
-                default: 5
-              }
-            },
-            required: ['query']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'search_knowledge_base',
-          description: 'Search the knowledge base for relevant information. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet.',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: {
-                type: 'string',
-                description: 'The search query to find relevant information in the knowledge base'
-              },
-              max_results: {
-                type: 'number',
-                description: 'Maximum number of search results to return (default: 5, max: 10)',
-                default: 5
-              }
-            },
-            required: ['query']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'list_knowledge_base_files',
-          description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, URLs, types (public/private), and last updated timestamps.',
-          parameters: {
-            type: 'object',
-            properties: {},
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'read_knowledge_base_files',
-          description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). Returns the content for each requested file.',
-          parameters: {
-            type: 'object',
-            properties: {
-              files: {
-                type: 'array',
-                description: 'List of files to read',
-                items: {
-                  type: 'object',
-                  properties: {
-                    kb_identifier: {
-                      type: 'string',
-                      description: 'Knowledge base identifier (taskId)'
-                    },
-                    file_name: {
-                      type: 'string',
-                      description: 'Name of the file to read (e.g., knowledge-base.txt or uploaded filename)'
-                    }
-                  },
-                  required: ['kb_identifier', 'file_name']
-                }
-              }
-            },
-            required: ['files']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'list_books',
-          description: 'List all books and white papers for the current user. Returns a list of books with their IDs, titles, types, authors, status, and creation dates.',
-          parameters: {
-            type: 'object',
-            properties: {
-              type: {
-                type: 'string',
-                enum: ['book', 'whitepaper'],
-                description: 'Optional filter by type: "book" or "whitepaper". If not provided, returns all types.'
-              },
-              status: {
-                type: 'string',
-                enum: ['draft', 'published', 'archived'],
-                description: 'Optional filter by status: "draft", "published", or "archived". If not provided, returns all statuses.'
-              }
-            },
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_book_details',
-          description: 'Get detailed information about a specific book or white paper including its outline (sections and chapters structure), characters (for books), and other metadata. Returns book metadata, characters, and the complete outline hierarchy.',
-          parameters: {
-            type: 'object',
-            properties: {
-              book_id: {
-                type: 'string',
-                description: 'The unique identifier (bookId) of the book to retrieve'
-              }
-            },
-            required: ['book_id']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_book_content',
-          description: 'Get the markdown content for a specific section or chapter in a book. If chapter_id is provided, returns chapter content. Otherwise, returns section content.',
-          parameters: {
-            type: 'object',
-            properties: {
-              book_id: {
-                type: 'string',
-                description: 'The unique identifier (bookId) of the book'
-              },
-              section_id: {
-                type: 'string',
-                description: 'The unique identifier (sectionId) of the section'
-              },
-              chapter_id: {
-                type: 'string',
-                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, returns chapter content. If not provided, returns section content.'
-              }
-            },
-            required: ['book_id', 'section_id']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'update_book_content',
-          description: 'Update the markdown content for a specific section or chapter in a book using partial replacements. This function performs partial content updates only. For generating full content, use generate_book_content instead. IMPORTANT: Always use get_book_content first to retrieve the current content, then provide the exact old_content to replace. Note: Full content replacement will not work if the current content is empty - use generate_book_content to create new content instead.',
-          parameters: {
-            type: 'object',
-            properties: {
-              book_id: {
-                type: 'string',
-                description: 'The unique identifier (bookId) of the book'
-              },
-              section_id: {
-                type: 'string',
-                description: 'The unique identifier (sectionId) of the section'
-              },
-              chapter_id: {
-                type: 'string',
-                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, updates chapter content. If not provided, updates section content.'
-              },
-              replacement_json: {
-                type: 'string',
-                description: 'JSON string containing a list of replacement instructions: [{"old_content": "## Old Heading\\n\\nOld text...", "new_content": "## New Heading\\n\\nNew text...", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
-              }
-            },
-            required: ['book_id', 'section_id', 'replacement_json']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'generate_book_content',
-          description: 'Generate content for a book section/chapter. For BOOKS: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words). For WHITEPAPERS: short (300-600 words, ~1 page), medium (600-1000 words, ~2 pages), long (1000-1500 words, ~3 pages). IMPORTANT for whitepapers: Pass the relevant deep research content in content_description - the AI will reformat it for that section rather than generating new content. If existing content exists, it will be used as a base.',
-          parameters: {
-            type: 'object',
-            properties: {
-              book_id: {
-                type: 'string',
-                description: 'The unique identifier (bookId) of the book'
-              },
-              section_id: {
-                type: 'string',
-                description: 'The unique identifier (sectionId) of the section'
-              },
-              chapter_id: {
-                type: 'string',
-                description: 'Optional: The unique identifier (chapterId) of the chapter. If provided, generates chapter content. If not provided, generates section content.'
-              },
-              content_description: {
-                type: 'string',
-                description: 'Detailed description of what content should be generated for this section or chapter. Be as detailed as possible about the topics, themes, key points, and structure that should be included. IMPORTANT: Content from other sections of the book is not available to this function, so any relevant context, information, or details from other sections that should be referenced or built upon must be explicitly included in this description.'
-              },
-              length: {
-                type: 'string',
-                enum: ['short', 'medium', 'long'],
-                description: 'Desired length of the content: short (1000-2000 words), medium (2000-3000 words), long (3000-4000 words)',
-                default: 'medium'
-              },
-              imagine: {
-                type: 'boolean',
-                description: 'Whether to allow creative imagination and details that do not exist. Defaults to true. When false, the AI will stick strictly to facts and avoid inventing details.',
-                default: true
-              },
-              research_url: {
-                type: 'string',
-                description: 'Optional S3 URL to deep research content (from perform_deep_research). For WHITEPAPERS: pass the research_url here instead of copying full content into content_description. The function will fetch the research and use it as context. When using this, content_description should focus on section-specific instructions (e.g., "Write the Executive Summary focusing on key strategic implications").'
-              }
-            },
-            required: ['book_id', 'section_id', 'content_description']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_book',
-          description: 'Create a new book or white paper with metadata. Returns the created book with bookId for use in other operations.',
-          parameters: {
-            type: 'object',
-            properties: {
-              title: {
-                type: 'string',
-                description: 'Title of the book or white paper'
-              },
-              description: {
-                type: 'string',
-                description: 'Description or summary of the book'
-              },
-              type: {
-                type: 'string',
-                enum: ['book', 'whitepaper'],
-                description: 'Type: "book" or "whitepaper"'
-              },
-              author: {
-                type: 'string',
-                description: 'Author name'
-              },
-              language: {
-                type: 'string',
-                description: 'Language of the book (e.g., "English", "中文")',
-                default: 'English'
-              },
-              genre: {
-                type: 'string',
-                description: 'Genre of the book (only applicable when type is "book"). Can be one of the predefined genres (Fiction, Non-Fiction, Science Fiction, Fantasy, Mystery, Thriller, Romance, Horror, Biography, Autobiography, History, Self-Help, Business, Technology, Science, Philosophy, Religion, Health & Fitness, Travel, Cooking, Art, Music, Poetry, Drama, Comedy, Education, Reference, Children\'s, Young Adult, Other) or a custom genre string. If not provided and type is "book", defaults to "Other".'
-              },
-              tags: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Optional array of tags for categorization',
-                default: []
-              }
-            },
-            required: ['title', 'description', 'type', 'author']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_book_outline',
-          description: 'Create the complete outline structure (sections and chapters) for a book. This replaces any existing outline. Each section can have multiple chapters. Sections and chapters will be ordered by their order field.',
-          parameters: {
-            type: 'object',
-            properties: {
-              book_id: {
-                type: 'string',
-                description: 'The unique identifier (bookId) of the book to create outline for'
-              },
-              outline_json: {
-                type: 'string',
-                description: 'JSON string containing the outline structure: [{"title": "Section Title", "description": "Optional section description", "order": 1, "chapters": [{"title": "Chapter Title", "description": "Optional chapter description", "order": 1}]}]'
-              }
-            },
-            required: ['book_id', 'outline_json']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'add_characters',
-          description: 'Add one or more characters to a book. Each character must have a name and description. Characters are appended to the existing list of characters for the book.',
-          parameters: {
-            type: 'object',
-            properties: {
-              book_id: {
-                type: 'string',
-                description: 'The unique identifier (bookId) of the book to add characters to'
-              },
-              characters_json: {
-                type: 'string',
-                description: 'JSON string containing an array of characters: [{"name": "Character Name", "description": "Character description"}]'
-              }
-            },
-            required: ['book_id', 'characters_json']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'save_file',
-          description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
-          parameters: {
-            type: 'object',
-            properties: {
-              file_name: {
-                type: 'string',
-                description: 'Name of the file to create (include appropriate extension like .txt, .md, .json, .csv, etc.)'
-              },
-              file_content: {
-                type: 'string',
-                description: 'Content of the file to save.'
-              }
-            },
-            required: ['file_name', 'file_content']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'list_gtm_plans',
-          description: 'List all Go-To-Market (GTM) plans for the current user. Returns a list of plans with their IDs, titles, descriptions, phase counts, and creation dates.',
-          parameters: {
-            type: 'object',
-            properties: {},
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'read_gtm_plan',
-          description: 'Read a specific GTM plan by its plan ID. Returns the complete plan details including all phases and work items with their statuses, durations, and completion times.',
-          parameters: {
-            type: 'object',
-            properties: {
-              plan_id: {
-                type: 'string',
-                description: 'The unique identifier (planId) of the GTM plan to read'
-              }
-            },
-            required: ['plan_id']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_gtm_plan',
-          description: 'Create a new Go-To-Market (GTM) plan with a title, optional description, optional DRI (Directly Responsible Individual) email, and optional phases with work items. Each phase can have multiple work items. DRI can be specified at plan level, phase level, or item level. Returns the created plan with its unique identifier.',
-          parameters: {
-            type: 'object',
-            properties: {
-              title: {
-                type: 'string',
-                description: 'The title of the GTM plan (e.g., "Q1 2024 Launch Plan")'
-              },
-              description: {
-                type: 'string',
-                description: 'Optional description of the GTM plan'
-              },
-              dri: {
-                type: 'string',
-                description: 'Optional DRI (Directly Responsible Individual) email address at the plan level'
-              },
-              phases: {
-                type: 'array',
-                description: 'Optional array of phases to include in the plan. Each phase should have a title, description, duration (in days), optional DRI email, and workItems array.',
-                items: {
-                  type: 'object',
-                  properties: {
-                    title: {
-                      type: 'string',
-                      description: 'The title of the phase (e.g., "Pre-Launch", "Launch", "Post-Launch")'
-                    },
-                    description: {
-                      type: 'string',
-                      description: 'Optional description of the phase'
-                    },
-                    duration: {
-                      type: 'number',
-                      description: 'Duration of the phase in days'
-                    },
-                    dri: {
-                      type: 'string',
-                      description: 'Optional DRI (Directly Responsible Individual) email address at the phase level'
-                    },
-                    workItems: {
-                      type: 'array',
-                      description: 'Array of work items for this phase',
-                      items: {
-                        type: 'object',
-                        properties: {
-                          title: {
-                            type: 'string',
-                            description: 'Title of the work item'
-                          },
-                          description: {
-                            type: 'string',
-                            description: 'Optional description of the work item'
-                          },
-                          duration: {
-                            type: 'number',
-                            description: 'Optional duration of the work item in days'
-                          },
-                          dri: {
-                            type: 'string',
-                            description: 'Optional DRI (Directly Responsible Individual) email address at the work item level'
-                          }
-                        },
-                        required: ['title']
-                      }
-                    }
-                  },
-                  required: ['title', 'duration']
-                }
-              }
-            },
-            required: ['title']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_lead_lists',
-          description: 'Get all lead lists for the current user. Returns a list of lead lists with their IDs, names, descriptions, lead counts, and creation dates.',
-          parameters: {
-            type: 'object',
-            properties: {},
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_lead_list',
-          description: 'Create a new lead list with a name and optional description. Returns the created lead list with its ID.',
-          parameters: {
-            type: 'object',
-            properties: {
-              name: {
-                type: 'string',
-                description: 'Name of the lead list'
-              },
-              description: {
-                type: 'string',
-                description: 'Optional description of the lead list'
-              }
-            },
-            required: ['name']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'add_leads_to_list',
-          description: 'Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors.',
-          parameters: {
-            type: 'object',
-            properties: {
-              list_id: {
-                type: 'string',
-                description: 'The ID of the lead list to add leads to'
-              },
-              leads: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  description: 'A lead object with any fields you want to store. Use field names that make sense for your data. The email field (if provided) is used for deduplication and merging.',
-                  additionalProperties: true,
-                  properties: {
-                    email: {
-                      type: 'string',
-                      description: 'Email address (optional, but recommended for deduplication and merging existing leads)'
-                    }
-                  }
-                },
-                description: 'Array of lead objects to add to the list. Each lead can have any fields you want to store.'
-              }
-            },
-            required: ['list_id', 'leads']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'update_email_draft_for_lead',
-          description: 'Create or update an email draft for a specific lead. This function loads the lead record, engagement history, brand guidelines, and market strategy, then uses AI to generate a personalized email draft (subject and HTML content) based on the instruction provided. If a draft already exists, it will be included in the prompt for refinement. The draft is saved to the lead record along with the current session ID for future updates.',
-          parameters: {
-            type: 'object',
-            properties: {
-              list_id: {
-                type: 'string',
-                description: 'The ID of the lead list containing the lead'
-              },
-              lead_id: {
-                type: 'string',
-                description: 'The ID of the lead to create/update email draft for'
-              },
-              instruction: {
-                type: 'string',
-                description: 'Instructions for creating the email draft (e.g., "welcome email", "follow-up on their interest in our product", "introduce our new feature"). The AI will use this along with lead data, engagement history, brand guidelines, and market strategy to create a personalized email.'
-              },
-              email_format: {
-                type: 'string',
-                enum: ['text', 'html'],
-                description: 'Optional. The format for the email draft: "text" for plain text or "html" for HTML. If not provided, uses the lead\'s saved format preference (defaults to "text").'
-              }
-            },
-            required: ['list_id', 'lead_id', 'instruction']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'list_connected_accounts',
-          description: 'Returns list of social media accounts connected by the user',
-          parameters: {
-            type: 'object',
-            properties: {
-              platform: {
-                type: 'string',
-                description: 'Filter by platform (e.g., "linkedin", "facebook", "twitter"), or "all" for all platforms',
-                default: 'all'
-              }
-            },
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'load_connected_account_metrics',
-          description: 'Load performance metrics for a specific connected account (e.g., page statistics, follower counts, engagement). Includes time-series data for trend analysis.',
-          parameters: {
-            type: 'object',
-            properties: {
-              account_id: {
-                type: 'string',
-                description: 'The unique identifier (id) of the connected account to load metrics for'
-              }
-            },
-            required: ['account_id']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'post_on_connected_account',
-          description: 'Create a post on a connected social media account',
-          parameters: {
-            type: 'object',
-            properties: {
-              account_id: { type: 'string', description: 'The connected account ID' },
-              content: { type: 'string', description: 'Post text content. Length limits depend on the specific platform.' },
-              media_urls: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Optional URLs of images/videos to attach'
-              }
-            },
-            required: ['account_id', 'content']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'list_connected_account_posts',
-          description: 'List posts from a connected social media account with optional metrics',
-          parameters: {
-            type: 'object',
-            properties: {
-              account_id: { type: 'string', description: 'The connected account ID' },
-              limit: { type: 'number', description: 'Maximum number of posts to return', default: 10 },
-              include_metrics: { type: 'boolean', description: 'Whether to include per-post metrics (likes, comments, etc.)', default: false }
-            },
-            required: ['account_id']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_post_analytics',
-          description: 'Get detailed analytics for specific posts from a connected social media account. Returns engagement metrics including likes, comments, shares, impressions, and clicks.',
-          parameters: {
-            type: 'object',
-            properties: {
-              account_id: { 
-                type: 'string', 
-                description: 'The connected account ID (must belong to the authenticated user)' 
-              },
-              post_ids: { 
-                type: 'array', 
-                items: { type: 'string' },
-                description: 'Array of post IDs to fetch analytics for (e.g., LinkedIn URNs like "urn:li:share:123")'
-              }
-            },
-            required: ['account_id', 'post_ids']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'read_file_content',
-          description: 'Read and extract content from a file URL. Supports text files, PDFs, HTML, Markdown, CSV, and other common formats. Returns the raw text content for analysis.',
-          parameters: {
-            type: 'object',
-            properties: {
-              file_url: {
-                type: 'string',
-                description: 'The URL of the file to read and extract content from'
-              }
-            },
-            required: ['file_url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'read_page_source',
-          description: 'Read and extract the HTML source code from any webpage URL. This is an alternative to read_file_content but specifically designed for web pages. Returns the raw HTML source for analysis.',
-          parameters: {
-            type: 'object',
-            properties: {
-              url: {
-                type: 'string',
-                description: 'The URL of the webpage to read and extract HTML source from'
-              }
-            },
-            required: ['url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'generate_image',
-          description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
-          parameters: {
-            type: 'object',
-            properties: {
-              prompt: {
-                type: 'string',
-                description: 'Detailed description of the image to generate or edit, including style, content, and visual specifications'
-              },
-              filename: {
-                type: 'string',
-                description: 'Name for the generated image file (should include .png extension)'
-              },
-              size: {
-                type: 'string',
-                description: 'Image size or ratio. For GPT models: 1024x1024, 1536x1024, 1024x1536, or auto. For Runway models: use ratio format like 1344:768, 768:1344, 1024:1024, 832x1248, etc. For Gemini 3 Pro Image (gemini-3-pro-image-preview): use ratio format like 1:1, 9:16, 16:9, 3:4, 4:3, 3:2, 2:3, 5:4, 4:5, 21:9, or auto. Use "auto" for automatic sizing.',
-                default: 'auto'
-              },
-              quality: {
-                type: 'string',
-                description: 'Image quality setting (low, medium, high). Defaults to medium if not specified.',
-                enum: ['low', 'medium', 'high'],
-                default: 'medium'
-              },
-              inputImages: {
-                type: 'array',
-                description: 'List of input image URLs to use for image editing. Leave empty for text-to-image generation.',
-                items: {
-                  type: 'string'
-                }
-              },
-              imageModel: {
-                type: 'string',
-                description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-                enum: ['gpt-image-1', 'gemini-2.5-flash-image', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
-              }
-            },
-            required: ['prompt', 'filename']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'remove_c2pa_from_image',
-          description: 'Remove C2PA metadata from an image by downloading it from a URL, stripping metadata, and uploading the cleaned image to S3. Returns the new S3 URL.',
-          parameters: {
-            type: 'object',
-            properties: {
-              image_url: {
-                type: 'string',
-                description: 'URL of the image to process (can be S3 URL, data URL, or any accessible image URL)'
-              },
-              filename: {
-                type: 'string',
-                description: 'Optional filename for the cleaned image. If not provided, will generate a filename based on the original URL'
-              }
-            },
-            required: ['image_url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'generate_video',
-          description: 'Generate videos using AI video generation models. Supports text-to-video generation and video generation with optional start and end frames for interpolation.',
-          parameters: {
-            type: 'object',
-            properties: {
-              prompt: {
-                type: 'string',
-                description: 'Detailed description of the video to generate, including style, content, motion, and visual specifications'
-              },
-              filename: {
-                type: 'string',
-                description: 'Name for the generated video file (should include .mp4 extension, will be added automatically if missing)'
-              },
-              videoModel: {
-                type: 'string',
-                description: 'Optional: Specific video generation model to use. Currently supports: veo-3.1-generate-preview (by Google). Defaults to veo-3.1-generate-preview if not specified.',
-                enum: ['veo-3.1-generate-preview']
-              },
-              startFrame: {
-                type: 'string',
-                description: 'Optional: URL of the first frame image to use as the starting point for video generation. If provided, the video will start from this frame.'
-              },
-              endFrame: {
-                type: 'string',
-                description: 'Optional: URL of the last frame image to use as the ending point for video generation. If provided, the video will end at this frame. Can be used together with startFrame for interpolation between two frames.'
-              }
-            },
-            required: ['prompt', 'filename']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_blog_article',
-          description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3. The final title will be generated from the drafts.',
-          parameters: {
-            type: 'object',
-            properties: {
-              title_draft: {
-                type: 'string',
-                description: 'A draft title for the blog article. The final title will be generated and optimized from this draft.'
-              },
-              content_draft: {
-                type: 'string',
-                description: 'The blog article content in markdown format'
-              },
-              length: {
-                type: 'string',
-                description: 'The desired length of the article',
-                enum: ['short', 'medium', 'long'],
-                default: 'medium'
-              },
-              researchContext: {
-                type: 'string',
-                description: 'Optional research context or background information to include in the article',
-                default: ''
-              },
-              requirements: {
-                type: 'string',
-                description: 'Specific requirements for the blog article (e.g., internal links, CTAs, branding guidelines)',
-                default: ''
-              },
-              style: {
-                type: 'string',
-                description: 'The writing style of the blog article. Use "substack" for a personal, newsletter-like writing style with first-person perspective, engaging hooks, and conversational tone. Use "default" for standard blog post style.',
-                enum: ['default', 'substack'],
-                default: 'default'
-              },
-              deep_research: {
-                type: 'boolean',
-                description: 'When true, performs Gemini Deep Research for comprehensive information and includes 3-5 inline images. When false, uses standard content generation with hero image only. Takes several minutes when enabled.',
-                default: false
-              }
-            },
-            required: ['title_draft', 'content_draft']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'perform_deep_research',
-          description: 'Perform comprehensive deep research on any topic using Gemini Deep Research. Uploads the research content to S3 and returns a URL to the markdown file. Use this for whitepapers, reports, executive summaries, or research documents. NOT for blog articles - use create_blog_article with deep_research=true instead. Takes several minutes to complete. The response includes research_url (S3 URL), title, summary, and word_count.',
-          parameters: {
-            type: 'object',
-            properties: {
-              topic: {
-                type: 'string',
-                description: 'The main topic or subject to research'
-              },
-              prompt: {
-                type: 'string',
-                description: 'Additional instructions for the research (e.g., "Include executive summary", "Focus on competitive analysis", "Structure as a whitepaper")'
-              },
-              tone: {
-                type: 'string',
-                description: 'The tone of the research output',
-                enum: ['professional', 'casual', 'technical', 'executive'],
-                default: 'professional'
-              },
-              depth: {
-                type: 'string',
-                description: 'How thorough the research should be. "overview" for 1-2 pages, "detailed" for 3-5 pages, "comprehensive" for 5-10 pages.',
-                enum: ['overview', 'detailed', 'comprehensive'],
-                default: 'detailed'
-              },
-              focus_areas: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Specific areas to focus on in the research (e.g., ["market trends", "competitor analysis", "implementation strategies"])'
-              }
-            },
-            required: ['topic']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'publish_blog_article',
-          description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS. Articles are published as draft by default unless status is set to "published". IMPORTANT: When status is "published", at least one category must be provided.',
-          parameters: {
-            type: 'object',
-            properties: {
-              title: {
-                type: 'string',
-                description: 'The title of the blog article'
-              },
-              description: {
-                type: 'string',
-                description: 'The description/meta description of the blog article'
-              },
-              hero_image_url: {
-                type: 'string',
-                description: 'The URL of the hero image for the blog article'
-              },
-              blog_html_url: {
-                type: 'string',
-                description: 'The URL of the HTML file created by create_blog_article function'
-              },
-              status: {
-                type: 'string',
-                description: 'Publication status of the article. Default is "draft". Set to "published" to publish immediately.',
-                enum: ['draft', 'published'],
-                default: 'draft'
-              },
-              author: {
-                type: 'string',
-                description: 'Optional author name or ID for the article'
-              },
-              categories: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Optional array of category names. Category names will be mapped to Webflow IDs using the "categories" mapping in secrets manager. Maps to multi-reference field "categories" by default. Defaults to empty array. REQUIRED when status is "published" - must provide at least one category.',
-                default: []
-              }
-            },
-            required: ['title', 'description', 'hero_image_url', 'blog_html_url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'repair_blog_article',
-          description: 'Repairs a blog article by creating a new version with optimized images. Automatically finds and resizes all images (including hero images with class="hero-image") that exceed file size limits. Creates a new HTML file with updated image URLs without modifying the original. Call this function when publish_blog_article fails due to image size errors. Returns a new article URL and hero image URL that can be used to retry publishing.',
-          parameters: {
-            type: 'object',
-            properties: {
-              article_url: {
-                type: 'string',
-                description: 'The URL of the HTML file created by create_blog_article function'
-              }
-            },
-            required: ['article_url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_social_media_posts',
-          description: 'Create a list of social media posts and generate an HTML file containing all posts. Each post includes type (linkedin, x/twitter, instagram, facebook, or custom), rich text content that can be transformed to HTML for display and copied for use, and optional image URL. The output is an HTML file stored in S3 with all posts formatted for easy viewing and copying.',
-          parameters: {
-            type: 'object',
-            properties: {
-              posts: {
-                type: 'array',
-                description: 'Array of social media posts to create',
-                items: {
-                  type: 'object',
-                  properties: {
-                    type: {
-                      type: 'string',
-                      enum: ['linkedin', 'x/twitter', 'instagram', 'facebook', 'custom'],
-                      description: 'The social media platform type for this post'
-                    },
-                    content: {
-                      type: 'string',
-                      description: 'Rich text content for the post (supports markdown formatting). IMPORTANT: Do not include image URLs in the content text as the format will not look good. Use the image_url parameter separately for images.'
-                    },
-                    image_url: {
-                      type: 'string',
-                      description: 'Optional image URL for posts that include images'
-                    }
-                  },
-                  required: ['type', 'content']
-                }
-              }
-            },
-            required: ['posts']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_task_subscriber_metrics',
-          description: 'Get comprehensive email metrics for all subscribers of a specific task, including open rates, click-through rates, and engagement data',
-          parameters: {
-            type: 'object',
-            properties: {
-              task_id: {
-                type: 'string',
-                description: 'The ID of the task to get subscriber metrics for'
-              }
-            },
-            required: ['task_id']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'get_task_subscriber_engagement_events',
-          description: 'Get email engagement events for a specific task and email subject, showing detailed event history like delivered, opened, clicked, bounced, etc.',
-          parameters: {
-            type: 'object',
-            properties: {
-              task_id: {
-                type: 'string',
-                description: 'The ID of the task to get engagement events for'
-              },
-              email_subject: {
-                type: 'string',
-                description: 'The email subject line to filter events by'
-              }
-            },
-            required: ['task_id', 'email_subject']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'describe_image',
-          description: 'Analyze and describe an image from a URL. Use this when the user mentions an image or when you need to understand visual content.',
-          parameters: {
-            type: 'object',
-            properties: {
-              image_url: {
-                type: 'string',
-                description: 'Image URL to analyze and describe. Include the complete file URL in request.'
-              },
-              prompt: {
-                type: 'string',
-                description: 'Custom prompt/instructions for analyzing the image. Specify what aspects to focus on (e.g., colors, composition, text, branding, marketing elements, etc.)',
-                default: 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.'
-              }
-            },
-            required: ['image_url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'describe_video',
-          description: 'Analyze and describe a video from a URL using Gemini. Use this when the user mentions a video or when you need to understand video content.',
-          parameters: {
-            type: 'object',
-            properties: {
-              video_file_url: {
-                type: 'string',
-                description: 'Video URL to analyze and describe. Include the complete file URL in request.'
-              },
-              prompt: {
-                type: 'string',
-                description: 'Custom prompt/instructions for analyzing the video. Specify what aspects to focus on (e.g., key events, narration, visual details, or timing).',
-                default: 'Please describe this video in detail. Focus on key events, visual elements, and any spoken content.'
-              }
-            },
-            required: ['video_file_url']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'perform_data_analysis',
-          description: 'Perform data analysis with code execution on files from URLs. If no files are attached, treat the information in the instruction as the complete dataset.',
-          parameters: {
-            type: 'object',
-            properties: {
-              file_urls: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'List of file URLs to analyze (URLs from uploaded files or previous task results)'
-              },
-              analysis_instruction: {
-                type: 'string',
-                description: 'Description of the analysis task to perform on the provided files'
-              }
-            },
-            required: ['file_urls', 'analysis_instruction']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'list_html_templates',
-          description: 'Get a list of all available HTML templates for the user (including email templates)',
-          parameters: {
-            type: 'object',
-            properties: {},
-            required: []
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_html_from_template',
-          description: 'Create final HTML from a template by providing variable values and array variable values as JSON strings, then upload to S3',
-          parameters: {
-            type: 'object',
-            properties: {
-              template_name: {
-                type: 'string',
-                description: 'Name of the HTML template to use'
-              },
-              variable_values_json: {
-                type: 'string',
-                description: 'JSON string containing regular variable values where keys are variable names and values are the actual values. Example: {"title": "Hello", "company_name": "Acme Corp"}'
-              },
-              array_variable_values_json: {
-                type: 'string',
-                description: 'JSON string containing array variable values where keys are array variable names and values are arrays of strings. If there is no data for an array variable, provide an empty array for that variable. Example: {"features_n": ["Feature 1", "Feature 2"], "links_n": []} for when links_n has no data.'
-              }
-            },
-            required: ['template_name', 'variable_values_json', 'array_variable_values_json']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'update_html_file',
-          description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_content_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
-          parameters: {
-            type: 'object',
-            properties: {
-              file_url: {
-                type: 'string',
-                description: 'URL of the HTML file to update (S3 URL or file path)'
-              },
-              update_type: {
-                type: 'string',
-                enum: ['part', 'full'],
-                description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_content_hash'
-              },
-              replacement_json: {
-                type: 'string',
-                description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
-              }
-            },
-            required: ['file_url', 'update_type', 'replacement_json']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_html_file',
-          description: 'Create a well-formatted HTML file from a title, content draft, and format requirements. Uses LLM to generate professional HTML with proper structure, styling, and formatting.',
-          parameters: {
-            type: 'object',
-            properties: {
-              title: {
-                type: 'string',
-                description: 'Title of the HTML document/page'
-              },
-              content_draft: {
-                type: 'string',
-                description: 'The draft content to be formatted into HTML. This can be plain text, markdown, or unstructured content.'
-              },
-              format_requirements: {
-                type: 'string',
-                description: 'Optional specific formatting requirements, styling preferences, or design guidelines for the HTML output. Examples: "modern minimalist design", "include responsive CSS", "use dark theme", etc.'
-              }
-            },
-            required: ['title', 'content_draft']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'create_work_plan',
-          description: 'Create a multi-step work plan for the current chat session. Use this to organize complex projects like client onboarding, campaign planning, or content creation workflows. IMPORTANT: Check if a work plan already exists in the session context before creating a new one. If a work plan already exists, use modify_work_plan instead to add or update steps.',
-          parameters: {
-            type: 'object',
-            properties: {
-              title: {
-                type: 'string',
-                description: 'Title of the work plan (e.g., "Client Onboarding", "Q1 Campaign")'
-              },
-              steps: {
-                type: 'array',
-                description: 'Array of steps in the plan, each with stepCount (starting from 1), title, and optional description',
-                items: {
-                  type: 'object',
-                  properties: {
-                    stepCount: {
-                      type: 'number',
-                      description: 'Step number starting from 1'
-                    },
-                    title: {
-                      type: 'string',
-                      description: 'Step title'
-                    },
-                    description: {
-                      type: 'string',
-                      description: 'Optional detailed description of the step'
-                    },
-                    requiredFunctionCalls: {
-                      type: 'array',
-                      description: 'Optional array of function names that must be called before marking this step as completed',
-                      items: {
-                        type: 'string'
-                      }
-                    }
-                  },
-                  required: ['stepCount', 'title']
-                }
-              }
-            },
-            required: ['title', 'steps']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'modify_work_plan',
-          description: 'Add new steps or modify existing step details in the current work plan. Does not change step status - use set_work_plan_status for that.',
-          parameters: {
-            type: 'object',
-            properties: {
-              steps: {
-                type: 'array',
-                description: 'Array of steps to add or update',
-                items: {
-                  type: 'object',
-                  properties: {
-                    stepCount: {
-                      type: 'number',
-                      description: 'Step number'
-                    },
-                    title: {
-                      type: 'string',
-                      description: 'Step title'
-                    },
-                    description: {
-                      type: 'string',
-                      description: 'Optional detailed description'
-                    },
-                    requiredFunctionCalls: {
-                      type: 'array',
-                      description: 'Optional array of function names that must be called before marking this step as completed',
-                      items: {
-                        type: 'string'
-                      }
-                    }
-                  },
-                  required: ['stepCount', 'title']
-                }
-              },
-              removeStepCounts: {
-                type: 'array',
-                description: 'Optional array of step numbers to remove',
-                items: {
-                  type: 'number'
-                }
-              }
-            },
-            required: ['steps']
-          }
-        }
-      },
-      {
-        type: 'function' as const,
-        function: {
-          name: 'set_work_plan_status',
-          description: 'Update the status of one or more steps in the work plan. Use this to track progress as you complete steps. You can update multiple steps at once.',
-          parameters: {
-            type: 'object',
-            properties: {
-              updates: {
-                type: 'array',
-                description: 'Array of step status updates',
-                items: {
-                  type: 'object',
-                  properties: {
-                    stepCount: {
-                      type: 'number',
-                      description: 'Step number to update (1, 2, 3, etc.)'
-                    },
-                    status: {
-                      type: 'string',
-                      enum: ['pending', 'completed', 'skipped'],
-                      description: 'New status for the step'
-                    },
-                    notes: {
-                      type: 'string',
-                      description: 'Optional notes about what was accomplished or why the step was skipped'
-                    }
-                  },
-                  required: ['stepCount', 'status']
-                }
-              }
-            },
-            required: ['updates']
-          }
-        }
-      }
-    ];
+    return this.toolRegistry.getToolDefinitions();
   }
 
   // Get filtered tools based on user's subscription type
-  private async getFilteredTools(userId: string, allTools: any[]): Promise<any[]> {
+  public async getFilteredTools(userId: string, allTools: any[]): Promise<any[]> {
     try {
       const { getAllowedFunctionCalls, filterFunctionCalls } = await import('./subscriptionService');
       const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
@@ -3576,290 +2139,29 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
+  public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
     const argsStr = JSON.stringify(args, null, 2);
-    const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + '...' : argsStr;
+    const truncatedArgs = argsStr.length > 500 ? argsStr.substring(0, 500) + "... " : argsStr;
 
     // Return mock data if in mock mode
     if (mockMode) {
       return this.getMockToolResult(toolName, args);
     }
 
-    switch (toolName) {
-      case 'create_task_from_template':
-        try {
-          const parameters = JSON.parse(args.parameters_json || '{}');
-          const attachPreviousTaskResults = args.attach_previous_task_results !== false;
-          const attachedFileUrls = args.attached_file_urls || [];
-          const async = args.async ?? false; // Default to false
-          return await this.createTaskFromTemplate(args.template_id, parameters, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
-        } catch (parseError) {
-          console.error('AgentMode: Error parsing parameters JSON:', parseError);
-          return {
-            success: false,
-            message: 'Invalid parameters JSON format. Please provide a valid JSON string.',
-            status: 'invalid_json'
-          };
-        }
-      case 'create_task_from_prompt':
-        const attachPreviousTaskResults = args.attach_previous_task_results !== false;
-        const attachedFileUrls = args.attached_file_urls || [];
-        const async = args.async ?? false; // Default to false
-        return await this.createTaskFromPrompt(args.task_name, args.prompt, args.category, userId, sessionId, attachPreviousTaskResults, attachedFileUrls, async);
-      case 'create_image_task_from_prompt':
-        const attachPreviousTaskResultsForImage = args.attach_previous_task_results !== false;
-        return await this.createImageTaskFromPrompt(args.task_name, args.prompt, args.category || 'Creatives', userId, sessionId, attachPreviousTaskResultsForImage);
-      case 'get_meta_ads_metrics':
-        return await this.getMetaAdsMetrics(args.timeframe || '7d', userId, args.campaign_name);
-      case 'create_revision':
-        return await this.createRevision(args.task_id, args.execution_id, args.revision_prompt, userId, args.target_result_name);
-      case 'search_web':
-        return await this.searchWeb(args.query, args.max_results || 10);
-      case 'search_knowledge_base':
-        return await this.searchKnowledgeBase(args.query, args.max_results || 5, userId);
-      case 'list_knowledge_base_files':
-        return await this.listKnowledgeBaseFiles(userId);
-      case 'read_knowledge_base_files':
-        return await this.readKnowledgeBaseFiles(args.files, userId);
-      case 'read_knowledge_base_file':
-        return await this.readKnowledgeBaseFile(args.file_identifier, userId);
-      case 'list_books':
-        return await this.listBooks(userId, args.type, args.status);
-      case 'get_book_details':
-        return await this.getBookDetails(args.book_id, userId);
-      case 'get_book_content':
-        return await this.getBookContent(args.book_id, args.section_id, args.chapter_id, userId);
-      case 'update_book_content':
-        // Parse replacement_json
-        let bookReplacementInstructions = [];
-        try {
-          if (args.replacement_json) {
-            bookReplacementInstructions = JSON.parse(args.replacement_json);
-          }
-        } catch (error) {
-          return {
-            success: false,
-            message: 'Invalid JSON in replacement_json',
-            error: error instanceof Error ? error.message : 'Unknown error'
-          };
-        }
-        return await this.updateBookContent(
-          args.book_id,
-          args.section_id,
-          args.chapter_id,
-          bookReplacementInstructions,
-          userId
-        );
-      case 'generate_book_content':
-        return await this.generateBookContent(
-          args.book_id,
-          args.section_id,
-          args.chapter_id,
-          args.content_description,
-          args.length || 'medium',
-          args.imagine !== undefined ? args.imagine : true,
-          userId,
-          args.research_url
-        );
-      case 'create_book':
-        return await this.createBook(
-          args.title,
-          args.description,
-          args.type,
-          args.author,
-          args.language || 'English',
-          args.genre,
-          args.tags || [],
-          userId
-        );
-      case 'create_book_outline':
-        return await this.createBookOutline(
-          args.book_id,
-          args.outline_json,
-          userId
-        );
-      case 'add_characters':
-        return await this.addCharacters(
-          args.book_id,
-          args.characters_json,
-          userId
-        );
-      case 'read_brand_guidelines':
-        return await this.readBrandGuidelines(userId);
-      case 'update_brand_guidelines':
-        return await this.updateBrandGuidelines(args, userId);
-      case 'read_market_strategy':
-        return await this.readMarketStrategy(userId);
-      case 'update_market_strategy':
-        return await this.updateMarketStrategy(args, userId);
-      case 'save_file':
-        return await this.saveFile(args.file_name, args.file_content, userId, sessionId);
-      case 'read_file_content':
-        return await this.readFileContent(args.file_url);
-      case 'read_page_source':
-        return await this.readFileContent(args.url);
-      case 'generate_image':
-        return await this.generateImage(args.prompt, args.filename, args.size || '1024x1024', args.quality || 'medium', args.inputImages || [], userId, sessionId, args.imageModel);
-      case 'generate_video':
-        return await this.generateVideo(args.prompt, args.filename, userId, sessionId, args.videoModel, args.startFrame, args.endFrame);
-      case 'remove_c2pa_from_image':
-        return await this.removeC2PAFromImage(args.image_url, args.filename, userId);
-      case 'create_blog_article':
-        return await this.createBlogArticle(args.title_draft, args.content_draft, args.length || 'medium', args.researchContext || '', args.requirements || '', userId, sessionId, args.style || 'default', args.deep_research || false);
-      case 'perform_deep_research':
-        return await this.performDeepResearchTool(args.topic, args.prompt, args.tone || 'professional', args.depth || 'detailed', args.focus_areas, userId);
-      case 'publish_blog_article':
-        return await this.publishBlogArticle(args.title, args.description, args.hero_image_url, args.blog_html_url, userId, sessionId, args.status, args.author, args.categories);
-      case 'repair_blog_article':
-        return await this.repairBlogArticle(args.article_url, userId, sessionId);
-      case 'create_social_media_posts':
-        return await this.createSocialMediaPosts(args.posts, userId, sessionId);
-      case 'get_task_subscriber_metrics':
-        return await this.getTaskSubscriberMetrics(args.task_id, userId);
-      case 'get_task_subscriber_engagement_events':
-        return await this.getTaskSubscriberEngagementEvents(args.task_id, args.email_subject, userId);
-      case 'describe_image':
-        return await this.describeImage(llmModel, args.image_url, args.prompt);
-      case 'describe_video':
-        return await this.describeVideo(args.video_file_url, args.prompt);
-      case 'perform_data_analysis':
-        return await this.performDataAnalysis(args.file_urls, args.analysis_instruction, userId);
-      case 'list_html_templates':
-        return await this.listHtmlTemplates(userId);
-      case 'create_html_from_template':
-        // Ensure we have the required parameters
-        if (!args.template_name) {
-          return {
-            success: false,
-            message: 'template_name is required'
-          };
-        }
-
-        // Parse JSON strings
-        let variableValues = {};
-        let arrayVariableValues = {};
-
-        try {
-          if (args.variable_values_json) {
-            variableValues = JSON.parse(args.variable_values_json);
-          }
-        } catch (error) {
-          return {
-            success: false,
-            message: 'Invalid JSON in variable_values_json',
-            error: error instanceof Error ? error.message : 'Unknown error'
-          };
-        }
-
-        try {
-          if (args.array_variable_values_json) {
-            arrayVariableValues = JSON.parse(args.array_variable_values_json);
-          }
-        } catch (error) {
-          return {
-            success: false,
-            message: 'Invalid JSON in array_variable_values_json',
-            error: error instanceof Error ? error.message : 'Unknown error'
-          };
-        }
-
-        return await this.createHtmlFromTemplate(llmModel, args.template_name, variableValues, arrayVariableValues, userId, sessionId);
-      case 'update_html_file':
-        // Ensure we have the required parameters
-        if (!args.file_url) {
-          return {
-            success: false,
-            message: 'file_url is required'
-          };
-        }
-
-        if (!args.update_type) {
-          return {
-            success: false,
-            message: 'update_type is required'
-          };
-        }
-
-        if (!args.replacement_json) {
-          return {
-            success: false,
-            message: 'replacement_json is required'
-          };
-        }
-
-        // Parse replacement instructions
-        let replacementInstructions;
-        try {
-          replacementInstructions = JSON.parse(args.replacement_json);
-        } catch (error) {
-          return {
-            success: false,
-            message: 'Invalid JSON in replacement_json',
-            error: error instanceof Error ? error.message : 'Unknown error'
-          };
-        }
-
-        return await this.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, userId, sessionId);
-      case 'create_html_file':
-        // Ensure we have the required parameters
-        if (!args.title) {
-          return {
-            success: false,
-            message: 'title is required'
-          };
-        }
-        if (!args.content_draft) {
-          return {
-            success: false,
-            message: 'content_draft is required'
-          };
-        }
-        return await this.createHtmlFile(
-          args.title,
-          args.content_draft,
-          args.format_requirements || '',
-          userId,
-          sessionId
-        );
-      case 'create_work_plan':
-        return await this.createWorkPlan(args.title, args.steps, sessionId);
-      case 'modify_work_plan':
-        return await this.modifyWorkPlan(args.steps, args.removeStepCounts || [], sessionId);
-      case 'set_work_plan_status':
-        return await this.setWorkPlanStatus(args.updates, sessionId);
-      case 'list_gtm_plans':
-        return await this.listGTMPlans(userId);
-      case 'read_gtm_plan':
-        return await this.readGTMPlan(args.plan_id, userId);
-      case 'create_gtm_plan':
-        return await this.createGTMPlan(args.title, args.description || '', args.dri || undefined, args.phases || [], userId, sessionId);
-      case 'get_lead_lists':
-        return await this.getLeadLists(userId);
-      case 'create_lead_list':
-        return await this.createLeadList(args.name, args.description || '', userId);
-      case 'add_leads_to_list':
-        return await this.addLeadsToList(args.list_id, args.leads || [], userId);
-      case 'update_email_draft_for_lead':
-        return await this.updateEmailDraftForLead(args.list_id, args.lead_id, args.instruction, sessionId, userId, args.email_format);
-      case 'list_connected_accounts':
-        return await this.listConnectedAccounts(userId, args.platform);
-      case 'list_connected_account_posts':
-        return await this.loadConnectedAccountPosts(userId, args.account_id, {
-          limit: args.limit,
-          include_metrics: args.include_metrics
-        });
-      case 'load_connected_account_metrics':
-        return await this.loadConnectedAccountMetrics(userId, args.account_id);
-      case 'post_on_connected_account':
-        return await this.postOnConnectedAccount(userId, args.account_id, args.content, args.media_urls);
-      case 'get_post_analytics':
-        return await this.getPostAnalytics(userId, args.account_id, args.post_ids);
-      default:
-        throw new Error(`Unknown tool: ${toolName}`);
+    try {
+      return await this.toolRegistry.execute(toolName, args, {
+        userId,
+        sessionId,
+        llmModel,
+        service: this,
+      });
+    } catch (error) {
+      console.error(`AgentMode: Error executing tool ${toolName}:`, error);
+      throw error;
     }
   }
 
-  private async describeImage(llmModel: string, imageUrl: string, prompt?: string): Promise<any> {
+  public async describeImage(llmModel: string, imageUrl: string, prompt?: string): Promise<any> {
     try {
       if (!imageUrl) {
         return {
@@ -3913,7 +2215,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async describeVideo(videoFileUrl: string, prompt?: string): Promise<any> {
+  public async describeVideo(videoFileUrl: string, prompt?: string): Promise<any> {
     let tempDirPath: string | null = null;
     let uploadedFileName: string | null = null;
     let aiClient: any = null;
@@ -4108,7 +2410,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async waitForGeminiFileActive(aiClient: any, fileName: string): Promise<void> {
+  public async waitForGeminiFileActive(aiClient: any, fileName: string): Promise<void> {
     const maxAttempts = 30;
     const delayMs = 2000;
 
@@ -4139,7 +2441,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
+  public async performDataAnalysis(fileUrls: string[], analysisInstruction: string, userId: string): Promise<any> {
     try {
       const urlsToProcess = Array.isArray(fileUrls) ? fileUrls.filter(url => !!url) : [];
 
@@ -4387,7 +2689,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async getPreviousTaskResults(userId: string, sessionId: string): Promise<string> {
+  public async getPreviousTaskResults(userId: string, sessionId: string): Promise<string> {
     try {
       // Get the current conversation to find previous task executions
       const session = await chatbotDb.getChatSession(sessionId);
@@ -4469,7 +2771,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Read current user's brand guidelines
-  private async readBrandGuidelines(userId: string): Promise<any> {
+  public async readBrandGuidelines(userId: string): Promise<any> {
     try {
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -4522,7 +2824,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Get CRM sender emails configuration
-  private async getCrmSenders(userId: string): Promise<{
+  public async getCrmSenders(userId: string): Promise<{
     success: boolean;
     senders: Array<{ id: string; email: string; fromName: string; notes?: string }>;
     defaultSenderId: string | null;
@@ -4559,7 +2861,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Get sender information for a lead (from lead record, list default, or account default sender)
-  private async getSenderForLead(
+  public async getSenderForLead(
     userId: string,
     leadSelectedSenderId?: string | null,
     listSenderId?: string | null
@@ -4603,7 +2905,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Read current user's market strategy
-  private async readMarketStrategy(userId: string): Promise<any> {
+  public async readMarketStrategy(userId: string): Promise<any> {
     try {
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -4657,7 +2959,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Update user's market strategy
-  private async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
+  public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -4793,7 +3095,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // List all GTM plans for user
-  private async listGTMPlans(userId: string): Promise<any> {
+  public async listGTMPlans(userId: string): Promise<any> {
     try {
       const { DynamoDB } = await import('aws-sdk');
       const dynamodb = new DynamoDB.DocumentClient({
@@ -4849,7 +3151,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Read a specific GTM plan
-  private async readGTMPlan(planId: string, userId: string): Promise<any> {
+  public async readGTMPlan(planId: string, userId: string): Promise<any> {
     try {
       const { DynamoDB } = await import('aws-sdk');
       const dynamodb = new DynamoDB.DocumentClient({
@@ -4977,7 +3279,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
   }
 
   // Create a new GTM plan
-  private async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string, sessionId: string): Promise<any> {
+  public async createGTMPlan(title: string, description: string, dri: string | undefined, phases: any[], userId: string, sessionId: string): Promise<any> {
     try {
       const { DynamoDB } = await import('aws-sdk');
       const dynamodb = new DynamoDB.DocumentClient({
@@ -5091,7 +3393,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async getLeadLists(userId: string): Promise<any> {
+  public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
       const lists = await crmDb.getLeadListsByUserId(userId);
@@ -5118,7 +3420,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async createLeadList(name: string, description: string, userId: string): Promise<any> {
+  public async createLeadList(name: string, description: string, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
       const list = await crmDb.createLeadList(userId, name, description);
@@ -5144,7 +3446,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
+  public async addLeadsToList(listId: string, leads: any[], userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
 
@@ -5228,7 +3530,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
     }
   }
 
-  private async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string, emailFormat?: 'text' | 'html'): Promise<any> {
+  public async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string, emailFormat?: 'text' | 'html'): Promise<any> {
     try {
       const { crmDb } = await import('./db');
 
@@ -5490,7 +3792,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Update user's brand guidelines (supports both brandData and attachments)
-  private async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
+  public async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
       const { userDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -5698,7 +4000,7 @@ ${emailDraftFormat === 'text'
     }
   }
 
-  private async getCurrentTaskStatuses(userId: string): Promise<any[]> {
+  public async getCurrentTaskStatuses(userId: string): Promise<any[]> {
     try {
       // Get recent task executions for this user
       const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId);
@@ -5721,7 +4023,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Get available templates
-  private async getAvailableTemplates(): Promise<any[]> {
+  public async getAvailableTemplates(): Promise<any[]> {
     try {
       const templates = await taskTemplateDb.getPublishedTemplates();
       return templates
@@ -5768,7 +4070,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Helper function to wait for task completion
-  private async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}, pollInterval: number = 2000): Promise<any> {
+  public async waitForTaskCompletion(taskId: string, executionId: string, userId: string, maxWaitTime: number = 300000, additionalFields: any = {}, pollInterval: number = 2000): Promise<any> {
     const startTime = Date.now();
 
     while (Date.now() - startTime < maxWaitTime) {
@@ -5809,7 +4111,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Create task from template
-  private async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
+  public async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
     try {
 
       // Validate parameters
@@ -5982,7 +4284,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Create task from raw prompt
-  private async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
+  public async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
     try {
 
       // Attach previous task results if requested
@@ -6064,7 +4366,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Create image generation task from raw prompt
-  private async createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
+  public async createImageTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true): Promise<any> {
     try {
 
       // Format the prompt using the same format as handleCreateAdImageTask
@@ -6165,7 +4467,7 @@ ${emailDraftFormat === 'text'
 
 
 
-  private async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
+  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
     try {
 
       // Import the Meta API functions directly to reuse the same logic
@@ -6386,7 +4688,7 @@ ${emailDraftFormat === 'text'
     }
   }
 
-  private async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string, targetResultName?: string): Promise<any> {
+  public async createRevision(taskId: string, executionId: string, revisionPrompt: string, userId: string, targetResultName?: string): Promise<any> {
     try {
       console.log('AgentMode: Creating revision for task:', taskId, 'execution:', executionId, 'targetResultName:', targetResultName);
 
@@ -6963,7 +5265,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Helper function to format metrics summary for AI analysis
-  private async formatMetricsSummary(data: any, userId: string): Promise<string> {
+  public async formatMetricsSummary(data: any, userId: string): Promise<string> {
     const { adPerformance, adSetsData, adsData, campaignSummary, demographicsBreakdown, placementBreakdown, deviceBreakdown, attributionWindow } = data;
 
     try {
@@ -7325,7 +5627,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Knowledge base search functionality
-  private async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
+  public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
     try {
       console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
 
@@ -7366,7 +5668,7 @@ ${emailDraftFormat === 'text'
   }
 
   // List all knowledge base files for a user
-  private async listKnowledgeBaseFiles(userId: string): Promise<any> {
+  public async listKnowledgeBaseFiles(userId: string): Promise<any> {
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId);
 
@@ -7434,7 +5736,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Read multiple knowledge base files; each entry must include kb_identifier (taskId) and file_name
-  private async readKnowledgeBaseFiles(files: Array<{ kb_identifier: string; file_name: string }>, userId: string): Promise<any> {
+  public async readKnowledgeBaseFiles(files: Array<{ kb_identifier: string; file_name: string }>, userId: string): Promise<any> {
     try {
       if (!Array.isArray(files) || files.length === 0) {
         return {
@@ -7484,7 +5786,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Read a single knowledge base file; file_identifier can be "kb_identifier::file_name" or an object.
-  private async readKnowledgeBaseFile(fileIdentifier: any, userId: string): Promise<any> {
+  public async readKnowledgeBaseFile(fileIdentifier: any, userId: string): Promise<any> {
     let kbIdentifier: string | undefined;
     let fileName: string | undefined;
 
@@ -7514,7 +5816,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Helper: read a single knowledge base file
-  private async readSingleKnowledgeBaseFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+  public async readSingleKnowledgeBaseFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
     // Get the task
     const task = await taskDb.getTaskById(kbIdentifier);
     if (!task) {
@@ -7606,7 +5908,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Web search functionality
-  private async searchWeb(query: string, maxResults: number = 10): Promise<any> {
+  public async searchWeb(query: string, maxResults: number = 10): Promise<any> {
     try {
       console.log('AgentMode: Searching web for query:', query, 'maxResults:', maxResults);
 
@@ -7645,7 +5947,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Get Google Search API credentials from AWS Secrets Manager
-  private async getGoogleSearchCredentials(): Promise<{ apiKey: string; searchEngineId: string } | null> {
+  public async getGoogleSearchCredentials(): Promise<{ apiKey: string; searchEngineId: string } | null> {
     try {
       const secretName = process.env.NODE_ENV === 'development'
         ? 'dev/AgentWeb/Google/Search'
@@ -7670,7 +5972,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Perform actual web search using Google Custom Search API
-  private async performWebSearch(query: string, maxResults: number): Promise<any[]> {
+  public async performWebSearch(query: string, maxResults: number): Promise<any[]> {
     try {
       // Get credentials from Secrets Manager
       const credentials = await this.getGoogleSearchCredentials();
@@ -8052,7 +6354,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Save file to S3 and return URL with content-based deduplication
-  private async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
+  public async saveFile(fileName: string, fileContent: string, userId: string, sessionId: string): Promise<any> {
     try {
       console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
 
@@ -8144,7 +6446,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Read file content from URL with support for various file types
-  private async readFileContent(fileUrl: string): Promise<any> {
+  public async readFileContent(fileUrl: string): Promise<any> {
     try {
       console.log('AgentMode: Reading file content from URL:', fileUrl);
 
@@ -8287,7 +6589,7 @@ ${emailDraftFormat === 'text'
   /**
    * Generate an image using AI image generation models
    */
-  private async generateImage(
+  public async generateImage(
     prompt: string,
     filename: string,
     size: string,
@@ -8376,7 +6678,7 @@ ${emailDraftFormat === 'text'
   /**
    * Generate a video using AI video generation models
    */
-  private async generateVideo(
+  public async generateVideo(
     prompt: string,
     filename: string,
     userId: string,
@@ -8463,7 +6765,7 @@ ${emailDraftFormat === 'text'
   /**
    * Remove C2PA metadata from an image by downloading it, stripping metadata, and uploading to S3
    */
-  private async removeC2PAFromImage(
+  public async removeC2PAFromImage(
     imageUrl: string,
     filename?: string,
     userId?: string
@@ -8574,7 +6876,7 @@ ${emailDraftFormat === 'text'
   /**
    * Perform deep research on a topic and upload to S3, returning the S3 URL
    */
-  private async performDeepResearchTool(
+  public async performDeepResearchTool(
     topic: string,
     prompt?: string,
     tone: string = 'professional',
@@ -8582,6 +6884,7 @@ ${emailDraftFormat === 'text'
     focus_areas?: string[],
     userId?: string
   ): Promise<any> {
+
     try {
       console.log('AgentMode: Performing deep research on topic:', topic, 'tone:', tone, 'depth:', depth, 'focus_areas:', focus_areas);
 
@@ -8663,7 +6966,7 @@ ${emailDraftFormat === 'text'
     }
   }
 
-  private async createBlogArticle(
+  public async createBlogArticle(
     titleDraft: string,
     contentDraft: string,
     length: string,
@@ -8912,7 +7215,7 @@ ${emailDraftFormat === 'text'
     return result;
   }
 
-  private async publishBlogArticle(
+  public async publishBlogArticle(
     title: string,
     description: string,
     heroImageUrl: string,
@@ -9310,7 +7613,7 @@ ${emailDraftFormat === 'text'
    * Repair blog article by creating a new version with optimized images
    * Takes only the article URL, finds and resizes all images, creates a new HTML file
    */
-  private async repairBlogArticle(
+  public async repairBlogArticle(
     articleUrl: string,
     userId: string,
     sessionId: string
@@ -9584,7 +7887,7 @@ ${emailDraftFormat === 'text'
     }
   }
 
-  private async createSocialMediaPosts(
+  public async createSocialMediaPosts(
     posts: Array<{ type: string; content: string; image_url?: string }>,
     userId: string,
     sessionId: string
@@ -9898,7 +8201,7 @@ ${emailDraftFormat === 'text'
   /**
    * Get task subscriber metrics for Agent Mode function calls
    */
-  private async getTaskSubscriberMetrics(taskId: string, userId: string): Promise<any> {
+  public async getTaskSubscriberMetrics(taskId: string, userId: string): Promise<any> {
     try {
       const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
       const metrics = await TaskSubscriberMetricsService.getTaskSubscriberMetrics(taskId, userId);
@@ -9938,7 +8241,7 @@ ${emailDraftFormat === 'text'
    * Get task subscriber engagement events for Agent Mode function calls
    * Returns engagement metrics instead of raw events for better agent processing
    */
-  private async getTaskSubscriberEngagementEvents(taskId: string, emailSubject: string, userId: string): Promise<any> {
+  public async getTaskSubscriberEngagementEvents(taskId: string, emailSubject: string, userId: string): Promise<any> {
     try {
       const { TaskSubscriberMetricsService } = await import('./taskSubscriberMetricsService');
       const events = await TaskSubscriberMetricsService.getTaskSubscriberEngagementEvents(taskId, emailSubject, userId);
@@ -10113,7 +8416,7 @@ ${emailDraftFormat === 'text'
   }
 
   // List all HTML templates for the user (including email templates)
-  private async listHtmlTemplates(userId: string): Promise<any> {
+  public async listHtmlTemplates(userId: string): Promise<any> {
     try {
       const settingName = `email_templates_${userId}`;
       const setting = await settingsService.getSetting(settingName);
@@ -10150,7 +8453,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Update HTML file with direct content replacement
-  private async updateHtmlFile(
+  public async updateHtmlFile(
     fileUrl: string,
     updateType: string,
     replacementInstructions: any,
@@ -10243,7 +8546,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Fetch file content from URL
-  private async fetchFileContent(fileUrl: string): Promise<string> {
+  public async fetchFileContent(fileUrl: string): Promise<string> {
     try {
       const response = await fetch(fileUrl);
       if (!response.ok) {
@@ -10583,7 +8886,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Upload updated file content
-  private async uploadUpdatedFile(
+  public async uploadUpdatedFile(
     content: string,
     filename: string,
     path: string
@@ -10605,7 +8908,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Create HTML from template with variable substitution
-  private async createHtmlFromTemplate(
+  public async createHtmlFromTemplate(
     llmModel: string,
     templateName: string,
     variableValues: Record<string, string> | undefined,
@@ -10868,7 +9171,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     }
   }
 
-  private async createHtmlFile(
+  public async createHtmlFile(
     title: string,
     contentDraft: string,
     formatRequirements: string,
@@ -11034,7 +9337,7 @@ Please generate a complete, professional HTML document that properly formats and
 
   // Work Plan Management Methods
 
-  private async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -11080,7 +9383,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -11145,7 +9448,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async setWorkPlanStatus(
+  public async setWorkPlanStatus(
     updates: Array<{ stepCount: number; status: 'pending' | 'completed' | 'skipped'; notes?: string }>,
     sessionId: string
   ): Promise<any> {
@@ -11287,7 +9590,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async listBooks(userId: string, type?: string, status?: string): Promise<any> {
+  public async listBooks(userId: string, type?: string, status?: string): Promise<any> {
     try {
       console.log('AgentMode: Listing books for user:', userId);
 
@@ -11348,7 +9651,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async getBookDetails(bookId: string, userId: string): Promise<any> {
+  public async getBookDetails(bookId: string, userId: string): Promise<any> {
     try {
       console.log('AgentMode: Getting book details for:', bookId);
 
@@ -11436,7 +9739,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async getBookContent(
+  public async getBookContent(
     bookId: string,
     sectionId: string,
     chapterId: string | undefined,
@@ -11521,7 +9824,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async updateBookContent(
+  public async updateBookContent(
     bookId: string,
     sectionId: string,
     chapterId: string | undefined,
@@ -11654,7 +9957,7 @@ Please generate a complete, professional HTML document that properly formats and
     }
   }
 
-  private async generateBookContent(
+  public async generateBookContent(
     bookId: string,
     sectionId: string,
     chapterId: string | undefined,
@@ -11916,7 +10219,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  private async createBook(
+  public async createBook(
     title: string,
     description: string,
     type: string,
@@ -12009,7 +10312,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  private async createBookOutline(
+  public async createBookOutline(
     bookId: string,
     outlineJson: string,
     userId: string
@@ -12114,7 +10417,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  private async addCharacters(
+  public async addCharacters(
     bookId: string,
     charactersJson: string,
     userId: string

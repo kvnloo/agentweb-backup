@@ -91,8 +91,7 @@ export async function getSubscriptionTypeConfig(
  */
 export async function getAllAvailableFunctionCalls(): Promise<string[]> {
   try {
-    const { AgentModeService } = await import("./agentModeService");
-    const agentModeService = new AgentModeService();
+    const { agentModeService } = await import("./agentModeService");
     const tools = agentModeService.getAvailableTools();
     return tools
       .filter((tool: any) => tool.type === "function")
@@ -116,7 +115,7 @@ export function getAllAvailablePages(): string[] {
 
 /**
  * Get allowed function calls for a user based on their subscription type
- * Returns the actual list of function calls (expands "*" to all available)
+ * Returns the actual list of function calls or ["*"] for all
  */
 export async function getAllowedFunctionCalls(
   userId: string
@@ -126,23 +125,23 @@ export async function getAllowedFunctionCalls(
     const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
 
     if (!subscriptionType) {
-      // If subscription type not found, return all available functions
-      return await getAllAvailableFunctionCalls();
+      // If subscription type not found, return wildcard for all
+      return ["*"];
     }
 
-    // If all functions are allowed, return all available functions
+    // If all functions are allowed, return wildcard
     if (
       subscriptionType.allowedFunctionCalls.includes("*") ||
       subscriptionType.allowedFunctionCalls.length === 0
     ) {
-      return await getAllAvailableFunctionCalls();
+      return getAllAvailableFunctionCalls();
     }
 
     return subscriptionType.allowedFunctionCalls;
   } catch (error) {
     console.error("Error getting allowed function calls:", error);
     // Default to allowing all functions on error
-    return await getAllAvailableFunctionCalls();
+    return ["*"];
   }
 }
 
@@ -189,6 +188,11 @@ export function filterFunctionCalls(
   allFunctionCalls: any[],
   allowedFunctionCalls: string[]
 ): any[] {
+  // If wildcard is present, return all tools
+  if (allowedFunctionCalls.includes("*")) {
+    return allFunctionCalls;
+  }
+
   // Filter function calls
   return allFunctionCalls.filter((tool) => {
     if (tool.type !== "function") return true;

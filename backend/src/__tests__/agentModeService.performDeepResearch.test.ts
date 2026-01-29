@@ -23,9 +23,10 @@ describe('AgentModeService - perform_deep_research tool', () => {
   };
   let mockUploadFileToS3: jest.Mock;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
     
     const deepResearchModule = require('../services/deepResearchService');
     mockDeepResearchService = deepResearchModule.deepResearchService;

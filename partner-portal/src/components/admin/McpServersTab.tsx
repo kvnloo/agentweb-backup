@@ -1,0 +1,664 @@
+import React, { Component, useEffect, useState } from "react";
+import {
+  Box,
+  Typography,
+  Paper,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Button,
+  CircularProgress,
+  Alert,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  TextField,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  Chip,
+  IconButton,
+  Collapse,
+} from "@mui/material";
+import {
+  Add as AddIcon,
+  Edit as EditIcon,
+  Delete as DeleteIcon,
+  Refresh as RefreshIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+} from "@mui/icons-material";
+import axios from "axios";
+import { useAuth } from "../../contexts/AuthContext";
+import { buildApiUrl } from "../../config";
+
+// Validation constants
+const NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
+const isValidServerName = (name: string): boolean => NAME_REGEX.test(name);
+const isValidUrl = (urlString: string): boolean => {
+  if (!urlString) return true; // Empty is handled by required check
+  try {
+    const url = new URL(urlString);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+
+// Error Boundary
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class McpServersErrorBoundary extends Component<{ children: React.ReactNode }, ErrorBoundaryState> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Box p={4}>
+          <Alert severity="error">
+            Something went wrong loading MCP Servers. Please refresh the page.
+          </Alert>
+        </Box>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+interface McpServer {
+  name: string;
+  transport: "sse" | "streamable-http";
+  url?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  accessToken?: string;
+  isInternal?: boolean;
+  discoveredTools?: string[];
+}
+
+
+
+const McpServersTab: React.FC = () => {
+  const [servers, setServers] = useState<McpServer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  
+  // Dialog states
+  const [addDialogOpen, setAddDialogOpen] = useState(false);
+  const [editDialogOpen, setEditDialogOpen] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [serverToEdit, setServerToEdit] = useState<McpServer | null>(null);
+  const [serverToDelete, setServerToDelete] = useState<string | null>(null);
+  
+  // Form state
+  const [formData, setFormData] = useState<Partial<McpServer>>({
+    name: "",
+    transport: "streamable-http",
+    url: "",
+    command: "",
+    accessToken: "",
+    isInternal: false,
+  });
+  const [argsInput, setArgsInput] = useState("");
+  const [configInput, setConfigInput] = useState("");
+  const [formLoading, setFormLoading] = useState(false);
+  
+  // Tool discovery state
+  const [discoveryLoading, setDiscoveryLoading] = useState<string | null>(null);
+  const [expandedServer, setExpandedServer] = useState<string | null>(null);
+  // unused state removed
+  
+  const { token } = useAuth();
+
+  useEffect(() => {
+    loadServers();
+  }, []);
+
+  const loadServers = async () => {
+    try {
+      setLoading(true);
+      setError("");
+      const response = await axios.get(buildApiUrl("/api/admin/mcp-servers"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setServers(response.data);
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to load MCP servers");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDiscoverTools = async (serverName: string) => {
+    try {
+      setDiscoveryLoading(serverName);
+      setError("");
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverName)}/discover-tools`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      setExpandedServer(serverName);
+      setSuccess(`Discovered ${response.data.count} tools from ${serverName}`);
+      loadServers(); // Reload to get updated discoveredTools
+    } catch (err: any) {
+      setError(err.response?.data?.message || `Failed to discover tools from ${serverName}`);
+    } finally {
+      setDiscoveryLoading(null);
+    }
+  };
+
+  const handleAddServer = async () => {
+    try {
+      setFormLoading(true);
+      setError("");
+      
+      let parsedArgs: string[] | undefined;
+      if (argsInput.trim()) {
+        parsedArgs = argsInput.split('\n').map(a => a.trim()).filter(a => a);
+      }
+      
+      let parsedConfig: Record<string, any> = {};
+      if (configInput.trim()) {
+        try {
+          parsedConfig = JSON.parse(configInput);
+        } catch (e) {
+          setError("Invalid JSON for Additional Configuration");
+          setFormLoading(false);
+          return;
+        }
+      }
+
+      const finalPayload = {
+          ...parsedConfig,
+          ...formData, // UI fields override
+          args: parsedArgs, // Args overrides
+      };
+
+      await axios.post(buildApiUrl("/api/admin/mcp-servers"), finalPayload, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      // Don't set success message here yet, wait for discovery
+      // setSuccess("Server added successfully"); 
+      setAddDialogOpen(false);
+      const newServerName = formData.name!; // Name is required in form
+      resetForm();
+      
+      // Auto-discover tools
+      // We keep formLoading true while discovering? Or maybe separate loading state?
+      // existing handleDiscoverTools sets discoveryLoading
+      setFormLoading(false); // Valid to clear form loading as dialog is closed
+      
+      await handleDiscoverTools(newServerName);
+      
+      // loadServers is called inside handleDiscoverTools
+    
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to add server");
+      setFormLoading(false);
+    }
+  };
+
+  const handleEditServer = async () => {
+    if (!serverToEdit) return;
+    try {
+      setFormLoading(true);
+      setError("");
+      let parsedArgs: string[] | undefined;
+      if (argsInput.trim()) {
+        parsedArgs = argsInput.split('\n').map(a => a.trim()).filter(a => a);
+      }
+      
+      let parsedConfig: Record<string, any> = {};
+      if (configInput.trim()) {
+        try {
+          parsedConfig = JSON.parse(configInput);
+        } catch (e) {
+          setError("Invalid JSON for Additional Configuration");
+          setFormLoading(false);
+          return;
+        }
+      }
+
+      const payload = {
+        ...parsedConfig,
+        ...formData,
+        args: parsedArgs,
+      };
+
+      await axios.put(
+        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverToEdit.name)}`),
+        payload,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSuccess("Server updated successfully");
+      setEditDialogOpen(false);
+      resetForm();
+      loadServers();
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to update server");
+    } finally {
+      setFormLoading(false);
+    }
+  };
+
+  const handleDeleteServer = async () => {
+    if (!serverToDelete) return;
+    try {
+      setFormLoading(true);
+      setError("");
+      await axios.delete(
+        buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverToDelete)}`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSuccess("Server deleted successfully");
+      setDeleteDialogOpen(false);
+      setServerToDelete(null);
+      loadServers();
+    } catch (err: any) {
+      setError(err.response?.data?.message || "Failed to delete server");
+    } finally {
+      setFormLoading(false);
+    }
+  };
+
+
+
+  const resetForm = () => {
+    setFormData({
+      name: "",
+      transport: "streamable-http",
+      url: "",
+      command: "",
+      accessToken: "",
+      isInternal: false,
+    });
+    setArgsInput("");
+    setConfigInput("");
+    setServerToEdit(null);
+  };
+
+  const openEditDialog = (server: McpServer) => {
+    setServerToEdit(server);
+    setFormData({
+      name: server.name,
+      transport: server.transport,
+      url: server.url || "",
+      command: server.command || "",
+      accessToken: server.accessToken || "",
+      isInternal: server.isInternal || false,
+    });
+    setArgsInput(server.args ? server.args.join('\n') : "");
+    
+    // Extract everything that ISN'T in the main form fields to populate configInput?
+    // Or just show env? User specifically asked for this to "make json complete".
+    // For now, let's just dump 'env' and any other unknown keys if we could know them.
+    // Given the type definition, we only really know 'env'.
+    // Let's just put 'env' in there for now as a default start.
+    const additionalConfig = {
+        env: server.env
+    };
+    setConfigInput(server.env ? JSON.stringify(additionalConfig, null, 2) : "");
+    setEditDialogOpen(true);
+  };
+
+  const openDeleteDialog = (serverName: string) => {
+    setServerToDelete(serverName);
+    setDeleteDialogOpen(true);
+  };
+
+  const toggleExpand = (serverName: string) => {
+    setExpandedServer(expandedServer === serverName ? null : serverName);
+  };
+
+  if (loading) {
+    return (
+      <Box display="flex" justifyContent="center" p={4}>
+        <CircularProgress />
+      </Box>
+    );
+  }
+
+  return (
+    <Box>
+      <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+        <Typography variant="h6">MCP Servers</Typography>
+        <Box>
+          <Button
+            variant="outlined"
+            startIcon={<RefreshIcon />}
+            onClick={loadServers}
+            sx={{ mr: 1 }}
+          >
+            Refresh
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={() => {
+              resetForm();
+              setAddDialogOpen(true);
+            }}
+          >
+            Add Server
+          </Button>
+        </Box>
+      </Box>
+
+      {error && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError("")}>
+          {error}
+        </Alert>
+      )}
+      {success && (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess("")}>
+          {success}
+        </Alert>
+      )}
+
+      <TableContainer component={Paper}>
+        <Table>
+          <TableHead>
+            <TableRow>
+              <TableCell>Name</TableCell>
+              <TableCell>Transport</TableCell>
+              <TableCell>URL / Command</TableCell>
+              <TableCell>Tools</TableCell>
+
+              <TableCell>Actions</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {servers.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={5} align="center">
+                  <Typography color="textSecondary">
+                    No MCP servers configured
+                  </Typography>
+                </TableCell>
+              </TableRow>
+            ) : (
+              servers.map((server) => (
+                <React.Fragment key={server.name}>
+                  <TableRow>
+                    <TableCell>
+                      <Box display="flex" alignItems="center">
+                        <IconButton
+                          size="small"
+                          onClick={() => toggleExpand(server.name)}
+                        >
+                          {expandedServer === server.name ? (
+                            <ExpandLessIcon />
+                          ) : (
+                            <ExpandMoreIcon />
+                          )}
+                        </IconButton>
+                        <Typography sx={{ ml: 1 }}>{server.name}</Typography>
+                      </Box>
+                    </TableCell>
+                    <TableCell>
+                      <Chip
+                        label={server.transport}
+                        size="small"
+                        color={
+                          server.transport === "streamable-http"
+                            ? "primary"
+                            : server.transport === "sse"
+                            ? "secondary"
+                            : "default"
+                        }
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2" sx={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {server.url || server.command || "-"}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        onClick={() => handleDiscoverTools(server.name)}
+                        disabled={discoveryLoading === server.name}
+                        startIcon={
+                          discoveryLoading === server.name ? (
+                            <CircularProgress size={16} />
+                          ) : null
+                        }
+                      >
+                        {server.discoveredTools?.length || 0} Tools
+                      </Button>
+                    </TableCell>
+
+                    <TableCell>
+                      <IconButton
+                        size="small"
+                        onClick={() => openEditDialog(server)}
+                        title="Edit"
+                      >
+                        <EditIcon />
+                      </IconButton>
+                      <IconButton
+                        size="small"
+                        onClick={() => openDeleteDialog(server.name)}
+                        title="Delete"
+                        color="error"
+                      >
+                        <DeleteIcon />
+                      </IconButton>
+                    </TableCell>
+                  </TableRow>
+                  <TableRow>
+                    <TableCell colSpan={5} sx={{ py: 0 }}>
+                      <Collapse in={expandedServer === server.name}>
+                        <Box sx={{ p: 2, bgcolor: "grey.50" }}>
+                          <Typography variant="subtitle2" gutterBottom>
+                            Discovered Tools ({server.discoveredTools?.length || 0})
+                          </Typography>
+                          {server.discoveredTools && server.discoveredTools.length > 0 ? (
+                            <Box display="flex" flexWrap="wrap" gap={1}>
+                              {server.discoveredTools.map((tool) => (
+                                <Chip
+                                  key={tool}
+                                  label={tool}
+                                  size="small"
+                                  variant="outlined"
+                                />
+                              ))}
+                            </Box>
+                          ) : (
+                            <Typography color="textSecondary" variant="body2">
+                              Click "Tools" button to discover available tools
+                            </Typography>
+                          )}
+                        </Box>
+                      </Collapse>
+                    </TableCell>
+                  </TableRow>
+                </React.Fragment>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </TableContainer>
+
+      {/* Add Server Dialog */}
+      <Dialog open={addDialogOpen} onClose={() => setAddDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Add MCP Server</DialogTitle>
+        <DialogContent>
+          <Box display="flex" flexDirection="column" gap={2} mt={1}>
+            <TextField
+              label="Server Name"
+              value={formData.name}
+              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              fullWidth
+              required
+              error={!!formData.name && !isValidServerName(formData.name)}
+              helperText={formData.name && !isValidServerName(formData.name) ? "Name must be 1-64 characters, alphanumeric, underscores, or hyphens only" : ""}
+            />
+            <FormControl fullWidth>
+              <InputLabel>Transport Type</InputLabel>
+              <Select
+                value={formData.transport}
+                label="Transport Type"
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    transport: e.target.value as McpServer["transport"],
+                  })
+                }
+              >
+                <MenuItem value="streamable-http">Streamable HTTP</MenuItem>
+                <MenuItem value="sse">SSE (Server-Sent Events)</MenuItem>
+              </Select>
+            </FormControl>
+            {(formData.transport === "streamable-http" || formData.transport === "sse") && (
+              <TextField
+                label="URL"
+                value={formData.url}
+                onChange={(e) => setFormData({ ...formData, url: e.target.value })}
+                fullWidth
+                required
+                placeholder="http://localhost:4000/mcp"
+                error={!!formData.url && !isValidUrl(formData.url)}
+                helperText={formData.url && !isValidUrl(formData.url) ? "Must be a valid http or https URL" : ""}
+              />
+            )}
+            {/* Stdio Removed */}
+            <TextField
+              label="Access Token (optional)"
+              value={formData.accessToken}
+              onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
+              fullWidth
+              type="password"
+              placeholder="${MCP_ACCESS_TOKEN}"
+            />
+
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddDialogOpen(false)}>Cancel</Button>
+          <Button
+            onClick={handleAddServer}
+            variant="contained"
+            disabled={formLoading || !formData.name || !isValidServerName(formData.name!) || (!!formData.url && !isValidUrl(formData.url))}
+          >
+            {formLoading ? <CircularProgress size={24} /> : "Add"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Edit Server Dialog */}
+      <Dialog open={editDialogOpen} onClose={() => setEditDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Edit MCP Server</DialogTitle>
+        <DialogContent>
+          <Box display="flex" flexDirection="column" gap={2} mt={1}>
+            <TextField
+              label="Server Name"
+              value={formData.name}
+              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              fullWidth
+              required
+              error={!!formData.name && !isValidServerName(formData.name)}
+              helperText={formData.name && !isValidServerName(formData.name) ? "Name must be 1-64 characters, alphanumeric, underscores, or hyphens only" : ""}
+            />
+            <FormControl fullWidth>
+              <InputLabel>Transport Type</InputLabel>
+              <Select
+                value={formData.transport}
+                label="Transport Type"
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    transport: e.target.value as McpServer["transport"],
+                  })
+                }
+              >
+                <MenuItem value="streamable-http">Streamable HTTP</MenuItem>
+                <MenuItem value="sse">SSE (Server-Sent Events)</MenuItem>
+              </Select>
+            </FormControl>
+            {(formData.transport === "streamable-http" || formData.transport === "sse") && (
+              <TextField
+                label="URL"
+                value={formData.url}
+                onChange={(e) => setFormData({ ...formData, url: e.target.value })}
+                fullWidth
+                required
+                error={!!formData.url && !isValidUrl(formData.url)}
+                helperText={formData.url && !isValidUrl(formData.url) ? "Must be a valid http or https URL" : ""}
+              />
+            )}
+            {/* Stdio Removed */}
+            <TextField
+              label="Access Token (optional)"
+              value={formData.accessToken}
+              onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
+              fullWidth
+              type="password"
+            />
+
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setEditDialogOpen(false)}>Cancel</Button>
+          <Button
+            onClick={handleEditServer}
+            variant="contained"
+            disabled={formLoading || (!!formData.name && !isValidServerName(formData.name!)) || (!!formData.url && !isValidUrl(formData.url))}
+          >
+            {formLoading ? <CircularProgress size={24} /> : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)}>
+        <DialogTitle>Delete MCP Server</DialogTitle>
+        <DialogContent>
+          <Typography>
+            Are you sure you want to delete the server "{serverToDelete}"?
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDeleteDialogOpen(false)}>Cancel</Button>
+          <Button
+            onClick={handleDeleteServer}
+            color="error"
+            variant="contained"
+            disabled={formLoading}
+          >
+            {formLoading ? <CircularProgress size={24} /> : "Delete"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+};
+
+// Wrap with Error Boundary
+const McpServersTabWithErrorBoundary: React.FC = () => (
+  <McpServersErrorBoundary>
+    <McpServersTab />
+  </McpServersErrorBoundary>
+);
+
+export default McpServersTabWithErrorBoundary;

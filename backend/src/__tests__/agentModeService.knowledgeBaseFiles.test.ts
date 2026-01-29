@@ -17,9 +17,10 @@ describe('AgentModeService - Knowledge Base Files', () => {
   let mockBucket: any;
   let mockFile: any;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
     agentModeService = new AgentModeService();
+    await agentModeService.initialize();
 
     // Setup Storage mocks
     mockFile = {
