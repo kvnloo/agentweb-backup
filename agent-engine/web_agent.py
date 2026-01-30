@@ -896,15 +896,7 @@ class WebAgent:
                 
                 header_comment = "\n".join(header_parts).strip()
                 
-                # Execute the Python code in a sandboxed environment using the utility function
-                return run_python_code_in_sandbox(
-                    python_code=params.python_code,
-                    execution_id=self.current_execution_id,
-                    user_id=self.user_id,
-                    script_type="integration",
-                    header_comment=header_comment,
-                    additional_env_vars=env_vars
-                )
+                return ActionResult(error="Deprecated: execution of arbitrary code has been disabled.")
 
             except Exception as e:
                 logger.error(f"Error during API integration setup: {str(e)}")
@@ -1221,15 +1213,7 @@ class WebAgent:
                     # Create a header comment for the script
                     header_comment = "\n".join(header_parts)
 
-                    # Execute the Python code in a sandboxed environment using the utility function
-                    return run_python_code_in_sandbox(
-                        python_code=python_code,
-                        execution_id=self.current_execution_id,
-                        user_id=self.user_id,
-                        script_type="approved",
-                        header_comment=header_comment,
-                        additional_env_vars=env_vars
-                    )
+                    return ActionResult(error="Deprecated: execution of arbitrary code has been disabled.")
                     
                 except Exception as e:
                     logger.error(f"Error running Python code: {str(e)}")

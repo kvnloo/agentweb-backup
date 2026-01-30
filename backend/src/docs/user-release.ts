@@ -12,6 +12,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Added User Journey Funnel Support to SEO/GEO Page',
       '- Users can now visualize and track conversion funnels through multiple stages of their website journey',
       '- Create unlimited funnels with custom stages based on GA4 events (page_view, click, form_submit, etc.)',
+      'Security: Completed a codebase security audit (~1.8M lines) and fixed critical and high-severity issues',
     ],
   },
   {

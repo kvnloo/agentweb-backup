@@ -47,6 +47,46 @@ describe('OAuth Callback - Customer Role Addition for Invited Users', () => {
     return doneFn;
   };
 
+  it('should sign OAuth token with 90d expiration', async () => {
+    const email = 'partner@example.com';
+    const existingUser = {
+      userId: 'user-000',
+      email,
+      roles: ['partner'],
+      isOAuthUser: true,
+      isAdmin: false,
+      password: 'placeholder',
+      isActive: true,
+      createdAt: new Date().toISOString()
+    };
+
+    mockUserDb.getUserByEmail.mockResolvedValue(existingUser);
+    mockWaitlistDb.getByEmail.mockResolvedValue(null as any);
+    (mockUserDb as any).updateUser.mockResolvedValue(undefined);
+
+    const profile = createMockProfile(email);
+    const req = createMockRequest('partner');
+    const done = createMockDone();
+
+    await googleCallback(
+      req as Request,
+      'access-token',
+      'refresh-token',
+      profile,
+      done
+    );
+
+    expect(mockJwt.sign).toHaveBeenCalledWith(
+      expect.objectContaining({
+        email,
+        roles: ['partner'],
+        isAdmin: false
+      }),
+      expect.any(String),
+      { expiresIn: '90d' }
+    );
+  });
+
   describe('Existing user with invited waitlist entry', () => {
     it('should add customer role to existing free user when they have invited waitlist entry', async () => {
       const email = 'freeuser@example.com';
