@@ -12,6 +12,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Allow Listing and Reading Public Knowledge Base Files for all users',
       '- The list_knowledge_base_files function now returns both private (user-specific) and public (shared) knowledge bases',
       '- The read_knowledge_base_files function allows reading public knowledge bases from any user without ownership verification',
+      'Security: Restored /api/files/content endpoint with enhanced security controls',
+      '- Re-added file content fetching API that was removed in security audit',
+      '- Now requires authentication (JWT token) for all requests',
+      '- Implemented strict domain allowlist (only agentweb-user-files S3 bucket)',
+      '- Prevents SSRF attacks while maintaining legitimate file access functionality',
     ],
   },
   {
