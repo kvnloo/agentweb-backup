@@ -11,7 +11,8 @@ jest.mock('jsonwebtoken');
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
-const mockBcrypt = bcrypt as jest.Mocked<typeof bcrypt>;
+const mockBcryptHash = bcrypt.hash as jest.MockedFunction<typeof bcrypt.hash>;
+const mockBcryptCompare = bcrypt.compare as jest.MockedFunction<typeof bcrypt.compare>;
 const mockJwt = jwt as jest.Mocked<typeof jwt>;
 
 const createRes = () => {
@@ -38,7 +39,7 @@ describe('Auth token expiration', () => {
     const res = createRes();
 
     mockUserDb.getUserByEmail.mockResolvedValue(undefined);
-    mockBcrypt.hash.mockResolvedValue('hashed-password');
+    mockBcryptHash.mockResolvedValue('hashed-password' as any);
     mockUserDb.createUser.mockResolvedValue({
       userId: 'user-123',
       email: 'freeuser@example.com',
@@ -80,7 +81,7 @@ describe('Auth token expiration', () => {
       isActive: true
     } as any);
     (mockUserDb as any).updateUser.mockResolvedValue(undefined);
-    mockBcrypt.compare.mockResolvedValue(true);
+    mockBcryptCompare.mockResolvedValue(true as any);
 
     await login(req, res);
 
