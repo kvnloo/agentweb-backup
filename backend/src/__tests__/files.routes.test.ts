@@ -9,4 +9,12 @@ describe('Files routes', () => {
 
     expect(response.status).toBe(404);
   });
+
+  it('should not expose /api/files/content', async () => {
+    const response = await request(app)
+      .get('/api/files/content')
+      .query({ url: 'https://example.com' });
+
+    expect(response.status).toBe(404);
+  });
 });
