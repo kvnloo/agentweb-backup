@@ -25,6 +25,8 @@ process.env.AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT = process.env.AZURE_OPENAI_EMBEDD
 // Set Google OAuth environment variables for tests (required by passport-google-oauth20)
 process.env.GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || 'test-google-client-id';
 process.env.GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'test-google-client-secret';
+// Set JWT_SECRET for modules that require it during import (e.g., OAuth state verification)
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret';
 
 // Suppress console.log during tests unless explicitly needed
 const originalConsoleLog = console.log;
