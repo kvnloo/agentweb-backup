@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-30',
+    changes: [
+      'Allow Listing and Reading Public Knowledge Base Files for all users',
+      '- The list_knowledge_base_files function now returns both private (user-specific) and public (shared) knowledge bases',
+      '- The read_knowledge_base_files function allows reading public knowledge bases from any user without ownership verification',
+    ],
+  },
+  {
     date: '2026-01-29',
     changes: [
       'Added User Journey Funnel Support to SEO/GEO Page',

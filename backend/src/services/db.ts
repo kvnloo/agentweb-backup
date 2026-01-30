@@ -1496,6 +1496,55 @@ export const taskDb = {
       return [];
     }
   },
+
+  async getAllPublicKnowledgeBaseTasks() {
+    try {
+      // Query using the KnowledgeBaseTypeIndex GSI for efficient retrieval
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
+        IndexName: 'KnowledgeBaseTypeIndex',
+        KeyConditionExpression: 'knowledgeBaseType = :publicType',
+        FilterExpression: 'knowledgeBaseSize > :zero',
+        ExpressionAttributeValues: {
+          ':publicType': 'public',
+          ':zero': 0
+        },
+        ScanIndexForward: false // Sort by knowledgeBaseUpdatedAt descending (most recent first)
+      };
+
+      const result = await dynamodb.query(params).promise();
+
+      if (!result.Items || result.Items.length === 0) {
+        return [];
+      }
+
+      // Map to return standardized fields
+      const knowledgeBaseTasks = result.Items.map((task: any) => {
+        const size = typeof task.knowledgeBaseSize === 'string'
+          ? parseInt(task.knowledgeBaseSize)
+          : task.knowledgeBaseSize || 0;
+
+        return {
+          taskId: task.taskId,
+          userId: task.userId,
+          name: task.name,
+          knowledgeBaseSize: size,
+          knowledgeBaseType: 'public',
+          knowledgeBaseFiles: task.knowledgeBaseFiles || [],
+          knowledgeBaseUpdatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt,
+          knowledgeBase: task.knowledgeBase,
+          updatedAt: task.updatedAt || task.createdAt,
+          createdAt: task.createdAt
+        };
+      });
+
+      // Results are already sorted by knowledgeBaseUpdatedAt descending due to ScanIndexForward: false
+      return knowledgeBaseTasks;
+    } catch (error) {
+      handleDynamoDbError(error, "getAllPublicKnowledgeBaseTasks");
+      return [];
+    }
+  },
 };
 
 export const waitlistDb = {

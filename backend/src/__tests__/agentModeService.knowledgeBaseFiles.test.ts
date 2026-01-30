@@ -71,6 +71,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
     describe('listKnowledgeBaseFiles method', () => {
       it('should return empty list when user has no knowledge bases', async () => {
         mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
 
         const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
 
@@ -83,7 +84,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
       });
 
       it('should return list of knowledge bases with files', async () => {
-        const mockTasks = [
+        const mockUserTasks = [
           {
             taskId: 'task-1',
             name: 'Task 1',
@@ -92,7 +93,10 @@ describe('AgentModeService - Knowledge Base Files', () => {
             knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z',
             knowledgeBase: 'https://example.com/knowledge-base.txt',
             knowledgeBaseFiles: [{ filename: 'file1.pdf', size: 256, url: 'https://example.com/file1.pdf' }]
-          },
+          }
+        ];
+
+        const mockPublicTasks = [
           {
             taskId: 'task-2',
             name: 'Task 2',
@@ -104,7 +108,8 @@ describe('AgentModeService - Knowledge Base Files', () => {
           }
         ];
 
-        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockTasks as any);
+        mockedTaskDb.getTasksWithKnowledgeBase.mockResolvedValue(mockUserTasks as any);
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue(mockPublicTasks as any);
 
         const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
 
@@ -129,6 +134,7 @@ describe('AgentModeService - Knowledge Base Files', () => {
 
       it('should handle errors gracefully', async () => {
         mockedTaskDb.getTasksWithKnowledgeBase.mockRejectedValue(new Error('Database error'));
+        mockedTaskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
 
         const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
 
@@ -190,8 +196,8 @@ describe('AgentModeService - Knowledge Base Files', () => {
         expect(mockedTaskDb.getTaskById).toHaveBeenCalledWith('invalid-id');
       });
 
-      it('should return error when user is not authorized', async () => {
-        const mockTask = { taskId: 'task-1', userId: 'other-user', name: 'Task 1', knowledgeBaseSize: 1024 };
+      it('should return error when user is not authorized for private knowledge base', async () => {
+        const mockTask = { taskId: 'task-1', userId: 'other-user', name: 'Task 1', knowledgeBaseSize: 1024, knowledgeBaseType: 'private' };
         mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
 
         const result = await (agentModeService as any).readKnowledgeBaseFiles(
@@ -200,6 +206,31 @@ describe('AgentModeService - Knowledge Base Files', () => {
         );
         expect(result.files[0].success).toBe(false);
         expect(result.files[0].message).toBe('Not authorized to access this knowledge base file');
+      });
+
+      it('should allow reading public knowledge base from other users', async () => {
+        const mockTask = {
+          taskId: 'task-1',
+          userId: 'other-user',
+          name: 'Task 1',
+          knowledgeBaseSize: 1024,
+          knowledgeBaseType: 'public',
+          knowledgeBaseUpdatedAt: '2024-01-01T00:00:00Z'
+        };
+        const mockContent = Buffer.from('Public knowledge base content');
+        mockedTaskDb.getTaskById.mockResolvedValue(mockTask as any);
+        mockFile.exists.mockResolvedValue([true]);
+        mockFile.download.mockResolvedValue([mockContent]);
+        mockFile.getMetadata = jest.fn().mockResolvedValue([{ contentType: 'text/plain' }]);
+
+        const result = await (agentModeService as any).readKnowledgeBaseFiles(
+          [{ kb_identifier: 'task-1', file_name: 'knowledge-base.txt' }],
+          'user-123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.files[0].success).toBe(true);
+        expect(result.files[0].content).toBe('Public knowledge base content');
       });
 
       it('should return error when knowledge base is empty', async () => {

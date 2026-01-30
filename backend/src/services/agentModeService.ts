@@ -5672,10 +5672,31 @@ ${emailDraftFormat === 'text'
     try {
       console.log('AgentMode: Listing knowledge base files for user:', userId);
 
-      // Use the common function to get tasks with knowledge base
-      const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
+      // Get user's private knowledge bases
+      const userKnowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
 
-      if (!knowledgeBaseTasks || knowledgeBaseTasks.length === 0) {
+      // Get all public knowledge bases from all users
+      const publicKnowledgeBaseTasks = await taskDb.getAllPublicKnowledgeBaseTasks();
+
+      // Combine both lists, removing duplicates (in case user has public KBs)
+      const taskIdSet = new Set<string>();
+
+      // Add user's task IDs to set first
+      for (const task of userKnowledgeBaseTasks || []) {
+        taskIdSet.add(task.taskId);
+      }
+
+      const allKnowledgeBaseTasks = [...(userKnowledgeBaseTasks || [])];
+
+      // Add public knowledge bases that are not already in the user's list
+      for (const publicTask of publicKnowledgeBaseTasks || []) {
+        if (!taskIdSet.has(publicTask.taskId)) {
+          taskIdSet.add(publicTask.taskId);
+          allKnowledgeBaseTasks.push(publicTask);
+        }
+      }
+
+      if (!allKnowledgeBaseTasks || allKnowledgeBaseTasks.length === 0) {
         return {
           success: true,
           message: 'No knowledge bases found',
@@ -5685,7 +5706,7 @@ ${emailDraftFormat === 'text'
         };
       }
 
-      const knowledgeBases = knowledgeBaseTasks.map((task: any) => {
+      const knowledgeBases = allKnowledgeBaseTasks.map((task: any) => {
         const taskId = task.taskId;
         const taskName = task.name;
         const kbType = task.knowledgeBaseType || 'private';
@@ -5823,8 +5844,9 @@ ${emailDraftFormat === 'text'
       return { success: false, message: `Knowledge base "${kbIdentifier}" not found` };
     }
 
-    // Auth check
-    if (task.userId !== userId) {
+    // Auth check: allow access if the knowledge base is public, otherwise check ownership
+    const isPublic = task.knowledgeBaseType === 'public';
+    if (!isPublic && task.userId !== userId) {
       return { success: false, message: 'Not authorized to access this knowledge base file' };
     }
 

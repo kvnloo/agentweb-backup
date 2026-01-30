@@ -1676,7 +1676,7 @@ mcpToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List all available knowledge base files for the current user. Returns a list of files with their unique identifiers, names, sizes, URLs, types (public/private), and last updated timestamps.',
+    description: 'List all available knowledge base files for the current user, including private (user-specific) and public (shared by all users) knowledge bases. Returns a list of files with their unique identifiers, names, sizes, URLs, types (public/private), and last updated timestamps.',
     inputSchema: {
       type: "object",
       properties: {},
@@ -1692,7 +1692,7 @@ mcpToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
-    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). Returns the content for each requested file.',
+    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
     inputSchema: {
       type: "object",
       properties: {

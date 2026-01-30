@@ -88,7 +88,9 @@ const createTasksTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'taskId', AttributeType: 'S' },
       { AttributeName: 'userId', AttributeType: 'S' },
-      { AttributeName: 'createdAt', AttributeType: 'S' }
+      { AttributeName: 'createdAt', AttributeType: 'S' },
+      { AttributeName: 'knowledgeBaseType', AttributeType: 'S' },
+      { AttributeName: 'knowledgeBaseUpdatedAt', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'taskId', KeyType: 'HASH' }
@@ -108,6 +110,16 @@ const createTasksTable = async () => {
         IndexName: 'UserTasksIndex',
         KeySchema: [
           { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'KnowledgeBaseTypeIndex',
+        KeySchema: [
+          { AttributeName: 'knowledgeBaseType', KeyType: 'HASH' },
+          { AttributeName: 'knowledgeBaseUpdatedAt', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'
