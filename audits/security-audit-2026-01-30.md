@@ -78,13 +78,13 @@ Auditor: Codex (static review)
 
 ### 3) Public SSRF-capable endpoints for arbitrary URL fetching
 **Severity:** High
-**Status:** Partially resolved (removed `/api/files/view-external`; `/api/files/content` remains public)
+**Status:** Resolved (removed `/api/files/view-external` and `/api/files/content` routes)
 
 **Evidence:**
 - `backend/src/controllers/filesController.ts:30-160`
-- `backend/src/app.ts:136-140` (public routes)
+- `backend/src/app.ts:136-140` (public routes, removed)
 
-**Description:** `/api/files/view-external` and `/api/files/content` accept arbitrary `http(s)` URLs and fetch them server-side without authentication or allowlisting. This is a classic SSRF pattern (e.g., metadata services, internal hosts, or private APIs). There are no IP/hostname blocklists or size limits for responses.
+**Description:** `/api/files/view-external` and `/api/files/content` accepted arbitrary `http(s)` URLs and fetched them server-side without authentication or allowlisting. This is a classic SSRF pattern (e.g., metadata services, internal hosts, or private APIs). There were no IP/hostname blocklists or size limits for responses.
 
 **Impact:** Potential data exfiltration from internal services, lateral movement, or abuse of server network access.
 
@@ -197,6 +197,7 @@ Auditor: Codex (static review)
 
 ### 10) Agent-engine “sandbox” is not OS‑level isolation for arbitrary code
 **Severity:** High
+**Status:** Resolved (code execution paths disabled with deprecation error)
 
 **Evidence:**
 - `agent-engine/task_utils.py:1535-1642`
