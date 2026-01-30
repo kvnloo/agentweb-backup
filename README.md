@@ -81,6 +81,14 @@ npm run dev
 3. Monitor task execution and results
 4. Set up alerts for task completion or failures
 
+## Audit Report PDF
+
+To convert the security audit markdown to PDF, use `pandoc`:
+
+```bash
+pandoc audits/security-audit-2026-01-30.md -o audits/security-audit-2026-01-30.pdf
+```
+
 ### API Integrations
 
 AgentWeb supports integrating with external APIs by securely storing API credentials:
