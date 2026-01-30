@@ -39,7 +39,7 @@ describe('Auth token expiration', () => {
     const res = createRes();
 
     mockUserDb.getUserByEmail.mockResolvedValue(undefined);
-    mockBcryptHash.mockResolvedValue('hashed-password' as any);
+    (mockBcryptHash as unknown as jest.Mock).mockResolvedValue('hashed-password');
     mockUserDb.createUser.mockResolvedValue({
       userId: 'user-123',
       email: 'freeuser@example.com',
@@ -81,7 +81,7 @@ describe('Auth token expiration', () => {
       isActive: true
     } as any);
     (mockUserDb as any).updateUser.mockResolvedValue(undefined);
-    mockBcryptCompare.mockResolvedValue(true as any);
+    (mockBcryptCompare as unknown as jest.Mock).mockResolvedValue(true);
 
     await login(req, res);
 
