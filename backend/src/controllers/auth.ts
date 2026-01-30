@@ -95,7 +95,8 @@ export const register = async (req: Request, res: Response) => {
     // JWT includes roles array
     const token = jwt.sign(
       { userId, email, roles: finalRoles, isAdmin: false }, // Include isAdmin=false for clarity
-      process.env.JWT_SECRET || "your-secret-key"
+      process.env.JWT_SECRET || "your-secret-key",
+      { expiresIn: "90d" }
     );
 
     res.status(201).json({
@@ -167,7 +168,8 @@ export const login = async (req: Request, res: Response) => {
     };
     const token = jwt.sign(
       jwtPayload,
-      process.env.JWT_SECRET || "your-secret-key"
+      process.env.JWT_SECRET || "your-secret-key",
+      { expiresIn: "90d" }
     );
 
     const { password: _, ...userWithoutPassword } = user;
@@ -372,7 +374,8 @@ export const googleCallback = async (
     };
     const token = jwt.sign(
       tokenPayload,
-      process.env.JWT_SECRET || "your-secret-key"
+      process.env.JWT_SECRET || "your-secret-key",
+      { expiresIn: "90d" }
     );
 
     const resultUserObject = {

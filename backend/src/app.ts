@@ -135,7 +135,6 @@ app.use(passport.initialize());
 
 // Create a new router for file-related routes
 const fileRoutes = express.Router();
-fileRoutes.get("/view-external", viewExternalFile);
 fileRoutes.get("/content", getFileContent);
 fileRoutes.post("/html", authenticateToken, saveHtmlContent);
 

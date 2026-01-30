@@ -45,7 +45,9 @@
       "mcp__playwright__browser_close",
       "Bash(npm run migrate-funnels:*)",
       "mcp__playwright__browser_network_requests",
-      "Bash(gh pr list:*)"
+      "Bash(gh pr list:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)"
     ]
   }
 }
