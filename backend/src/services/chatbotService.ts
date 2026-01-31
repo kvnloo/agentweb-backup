@@ -21,6 +21,12 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+// Tool calls that require repair for empty results (MCP PR #433 bug)
+const REPAIRABLE_TOOL_CALLS = [
+  'generate_image',
+  'generate_video'
+];
+
 // Make sure we have a DynamoDB instance
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -684,13 +690,33 @@ export class ChatbotDB {
       if (!result.Items || result.Items.length === 0) {
         return [];
       }
-      // Sort by messageIndex and extract messages, including messageIndex in each message
-      const messages = result.Items
-        .sort((a, b) => a.messageIndex - b.messageIndex)
-        .map((item) => ({
-          ...(item.message as ChatMessage),
-          messageIndex: item.messageIndex, // Include the database messageIndex
-        }));
+      // Extract messages and check if repair is needed in ONE pass (items already sorted asc by messageIndex)
+      let shouldRepair = false;
+      const messages = result.Items.map((item) => {
+          const msg = item.message;
+
+          // Check if this message has broken tool results (during the same map iteration)
+          // Only check repairable tool types to avoid unnecessary processing
+          // Must match the detection logic in repairBrokenToolResults
+          if (!shouldRepair && msg.role === 'assistant' && msg.metadata?.toolCalls) {
+            shouldRepair = msg.metadata.toolCalls.some((tc: any) =>
+              REPAIRABLE_TOOL_CALLS.includes(tc.name) &&
+              (!tc.result || Object.keys(tc.result).length === 0 ||
+               (!tc.result.imageUrl && !tc.result.videoUrl && tc.result.success === undefined))
+            );
+          }
+
+          return {
+            ...(msg as ChatMessage),
+            messageIndex: item.messageIndex
+          };
+        });
+
+      // Only repair if needed (no cost if messages are fine)
+      if (shouldRepair) {
+        await this.repairBrokenToolResults(sessionId, messages);
+      }
+
       return messages;
     } catch (error) {
       // If table doesn't exist yet, return empty array
@@ -742,6 +768,281 @@ export class ChatbotDB {
       console.error(`Error migrating messages for session ${sessionId}:`, error);
       throw error;
     }
+  }
+
+  /**
+   * Repair broken tool results (from MCP PR #433 bug)
+   * Assumes broken results have already been detected - updates the database to fix permanently
+   */
+  private async repairBrokenToolResults(sessionId: string, messages: ChatMessage[]): Promise<void> {
+    console.log(`🔧 Repairing tool results for session ${sessionId}...`);
+
+    // First, build a map of tool_call_id -> tool_name from assistant messages (only for repairable tools)
+    const repairableToolCallIds = new Set<string>();
+    messages.forEach((msg: any) => {
+      if (msg.role === 'assistant' && msg.metadata?.toolCalls) {
+        msg.metadata.toolCalls.forEach((tc: any) => {
+          if (REPAIRABLE_TOOL_CALLS.includes(tc.name) && tc.id) {
+            repairableToolCallIds.add(tc.id);
+          }
+        });
+      }
+    });
+
+    // Build map of tool message content by tool_call_id (ONLY for repairable tools)
+    // Extract URLs directly from content (HTML or text) instead of parsing JSON
+    const toolMessageMap = new Map<string, string>();
+    messages.forEach((message: any) => {
+      if (message.role === 'tool' && message.tool_call_id && message.content) {
+        // Skip tool messages that don't correspond to repairable tools
+        if (!repairableToolCallIds.has(message.tool_call_id)) {
+          return;
+        }
+
+        let contentStr = message.content;
+
+        // If content is not a string, try to extract it
+        if (typeof contentStr !== 'string') {
+          if (contentStr.content && typeof contentStr.content === 'string') {
+            contentStr = contentStr.content;
+          } else {
+            contentStr = JSON.stringify(contentStr);
+          }
+        }
+
+        // Extract URL from content (supports both JSON strings and HTML)
+        // Look for image/video URLs (S3, GCS, or other hosting)
+        const urlRegex = /https?:\/\/[^\s<>"]+?\.(png|jpg|jpeg|gif|webp|mp4|mov|avi|webm)/gi;
+        const matches = contentStr.match(urlRegex);
+
+        if (matches && matches.length > 0) {
+          // Use the first URL found
+          toolMessageMap.set(message.tool_call_id, matches[0]);
+        }
+      }
+    });
+
+    // Track which messages need updating
+    const messagesToUpdate: Array<{ messageIndex: number; message: ChatMessage }> = [];
+
+    // Count broken tool calls (must match isEmpty logic below)
+    let brokenToolCallCount = 0;
+    messages.forEach((msg: any) => {
+      if (msg.role === 'assistant' && msg.metadata?.toolCalls) {
+        msg.metadata.toolCalls.forEach((tc: any) => {
+          if (REPAIRABLE_TOOL_CALLS.includes(tc.name) &&
+              (!tc.result || Object.keys(tc.result).length === 0 ||
+               (!tc.result.imageUrl && !tc.result.videoUrl && tc.result.success === undefined))) {
+            brokenToolCallCount++;
+          }
+        });
+      }
+    });
+    console.log(`  Found ${brokenToolCallCount} broken tool call(s) to repair`);
+
+    // Process each message and recover empty tool results
+    messages.forEach((message: any, index: number) => {
+      if (!message.metadata?.toolCalls || message.metadata.toolCalls.length === 0) {
+        return;
+      }
+
+      let hasChanges = false;
+      const updatedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
+        // Skip tool calls that aren't in the repairable list
+        if (!REPAIRABLE_TOOL_CALLS.includes(toolCall.name)) {
+          return toolCall;
+        }
+
+        // Check if result is empty or missing imageUrl/videoUrl (must match detection logic)
+        // Don't repair tool calls with success=false (they genuinely failed)
+        const isEmpty = !toolCall.result ||
+          Object.keys(toolCall.result).length === 0 ||
+          (!toolCall.result.imageUrl && !toolCall.result.videoUrl && toolCall.result.success === undefined);
+
+        if (isEmpty) {
+          if (!toolCall.id || !toolMessageMap.has(toolCall.id)) {
+            return toolCall;
+          }
+
+          const extractedUrl = toolMessageMap.get(toolCall.id);
+          if (!extractedUrl) {
+            return toolCall;
+          }
+
+          // Build minimal result with extracted URL
+          const minimalResult: any = { success: true };
+
+          if (toolCall.name === 'generate_image') {
+            minimalResult.imageUrl = extractedUrl;
+            // Extract filename from URL
+            const urlParts = extractedUrl.split('/');
+            minimalResult.filename = urlParts[urlParts.length - 1];
+          } else if (toolCall.name === 'generate_video') {
+            minimalResult.videoUrl = extractedUrl;
+            // Extract filename from URL
+            const urlParts = extractedUrl.split('/');
+            minimalResult.filename = urlParts[urlParts.length - 1];
+          } else {
+            // This shouldn't happen since we filter by REPAIRABLE_TOOL_CALLS, but log just in case
+            console.log(`  ⚠️  Tool type in whitelist but not handled: ${toolCall.name} (${toolCall.id})`);
+            return toolCall;
+          }
+
+          hasChanges = true;
+          return { ...toolCall, result: minimalResult };
+        }
+
+        return toolCall;
+      });
+
+      if (hasChanges) {
+        // Update the message in place
+        message.metadata.toolCalls = updatedToolCalls;
+
+        // Track this message for database update (only if messageIndex is valid)
+        if (message.messageIndex === undefined || message.messageIndex === null) {
+          return;
+        }
+
+        const { messageIndex: _, ...messageWithoutIndex } = message;
+        messagesToUpdate.push({
+          messageIndex: message.messageIndex,
+          message: messageWithoutIndex as ChatMessage
+        });
+      }
+    });
+
+    // Update the database with fixed messages (batch write)
+    if (messagesToUpdate.length > 0) {
+      // Deduplicate by messageIndex (keep the last occurrence)
+      const dedupMap = new Map<number, { messageIndex: number; message: ChatMessage }>();
+      messagesToUpdate.forEach(item => {
+        dedupMap.set(item.messageIndex, item);
+      });
+      const deduplicatedMessages = Array.from(dedupMap.values());
+
+      await this.updateMessagesInDatabase(sessionId, deduplicatedMessages);
+      console.log(`  ✅ Repaired and saved ${deduplicatedMessages.length} message(s)`);
+    }
+  }
+
+  /**
+   * Update specific messages in the database (batch write)
+   */
+  private async updateMessagesInDatabase(
+    sessionId: string,
+    messages: Array<{ messageIndex: number; message: ChatMessage }>
+  ): Promise<void> {
+    if (messages.length === 0) {
+      return;
+    }
+
+    // Batch write in chunks of 25 (DynamoDB limit)
+    const batchSize = 25;
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize);
+
+      const writeRequests = batch.map(({ messageIndex, message }) => ({
+        PutRequest: {
+          Item: {
+            sessionId,
+            messageIndex,
+            message
+          }
+        }
+      }));
+
+      await dynamodb.batchWrite({
+        RequestItems: {
+          [this.messagesTableName]: writeRequests
+        }
+      }).promise();
+    }
+  }
+
+  /**
+   * Recover tool call results from tool messages when result is empty
+   * This fixes the issue introduced in PR #433 (MCP implementation) where tool results
+   * are stored in a nested format {content: ..., raw: ...} instead of directly
+   * @deprecated Use repairBrokenToolResults instead (which also updates the database)
+   */
+  private recoverToolResultsFromMessages(messages: ChatMessage[]): ChatMessage[] {
+    // Build a map of tool message content by tool_call_id
+    const toolMessageMap = new Map<string, any>();
+
+    messages.forEach((message: any) => {
+      if (message.role === 'tool' && message.tool_call_id && message.content) {
+        try {
+          let toolResult = typeof message.content === 'string'
+            ? JSON.parse(message.content)
+            : message.content;
+
+          // Handle nested structure from MCP: {content: "stringified JSON", raw: {...}}
+          if (toolResult.content && typeof toolResult.content === 'string') {
+            try {
+              toolResult = JSON.parse(toolResult.content);
+            } catch {
+              // If parsing inner content fails, keep the outer result
+            }
+          }
+
+          toolMessageMap.set(message.tool_call_id, toolResult);
+        } catch {
+          // If parsing fails, skip this tool message
+        }
+      }
+    });
+
+    // Process messages and recover empty tool results
+    return messages.map((message: any) => {
+      if (!message.metadata?.toolCalls || message.metadata.toolCalls.length === 0) {
+        return message;
+      }
+
+      const updatedToolCalls = message.metadata.toolCalls.map((toolCall: any) => {
+        // Check if result is empty or missing imageUrl/videoUrl
+        // Don't repair tool calls with success=false (they genuinely failed)
+        const isEmpty = !toolCall.result ||
+          Object.keys(toolCall.result).length === 0 ||
+          (!toolCall.result.imageUrl && !toolCall.result.videoUrl && toolCall.result.success === undefined);
+
+        if (isEmpty && toolCall.id && toolMessageMap.has(toolCall.id)) {
+          const toolResult = toolMessageMap.get(toolCall.id);
+
+          // Extract only URL data to keep it minimal
+          const minimalResult: any = {};
+
+          if (toolCall.name === 'generate_image' || toolCall.name === 'upload_image') {
+            if (toolResult.imageUrl) {
+              minimalResult.success = toolResult.success !== false;
+              minimalResult.imageUrl = toolResult.imageUrl;
+              minimalResult.filename = toolResult.filename;
+            }
+          } else if (toolCall.name === 'generate_video' || toolCall.name === 'upload_video') {
+            if (toolResult.videoUrl) {
+              minimalResult.success = toolResult.success !== false;
+              minimalResult.videoUrl = toolResult.videoUrl;
+              minimalResult.filename = toolResult.filename;
+            }
+          }
+
+          if (Object.keys(minimalResult).length > 0) {
+            console.log(`Recovered empty tool result for ${toolCall.name} (${toolCall.id})`);
+            return { ...toolCall, result: minimalResult };
+          }
+        }
+
+        return toolCall;
+      });
+
+      return {
+        ...message,
+        metadata: {
+          ...message.metadata,
+          toolCalls: updatedToolCalls
+        }
+      };
+    });
   }
 
   async getChatSession(sessionId: string): Promise<ChatSession | null> {

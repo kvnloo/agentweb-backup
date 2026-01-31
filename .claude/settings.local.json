@@ -47,7 +47,10 @@
       "mcp__playwright__browser_network_requests",
       "Bash(gh pr list:*)",
       "Bash(wc:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "mcp__playwright__browser_evaluate",
+      "Bash(NODE_ENV=development node:*)",
+      "Bash(gh pr diff:*)"
     ]
   }
 }
