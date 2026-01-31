@@ -136,6 +136,32 @@ export const getFileContent = async (req: Request, res: Response) => {
         .json({ message: "Invalid URL format. Must be HTTP or HTTPS." });
     }
 
+    // Security: Allowlist of permitted domains to prevent SSRF
+    const allowedDomains = [
+      "agentweb-user-files.s3.us-west-2.amazonaws.com",
+      "agentweb-user-files.s3.amazonaws.com",
+    ];
+
+    try {
+      const parsedUrl = new URL(url);
+      const hostname = parsedUrl.hostname.toLowerCase();
+
+      const isAllowed = allowedDomains.some(domain => hostname === domain.toLowerCase());
+
+      if (!isAllowed) {
+        console.log(`🚫 Blocked request to unauthorized domain: ${hostname}`);
+        return res.status(403).json({
+          success: false,
+          message: "Access denied: URL domain not in allowlist",
+        });
+      }
+    } catch (urlError) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid URL format",
+      });
+    }
+
     console.log(`🔽 Fetching file content from: ${url}`);
 
     // Fetch the file content using axios
