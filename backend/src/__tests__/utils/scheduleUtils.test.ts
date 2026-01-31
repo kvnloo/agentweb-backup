@@ -42,7 +42,13 @@ describe('scheduleUtils', () => {
 
       // Should be the next day at 9 AM local time
       expect(date.getHours()).toBe(9);
-      expect(date.getDate()).toBe(now.getDate() + 1);
+
+      // Compare the full date to handle month rollovers (e.g., Jan 31 -> Feb 1)
+      const expectedDate = new Date(now);
+      expectedDate.setDate(expectedDate.getDate() + 1);
+      expectedDate.setHours(9, 0, 0, 0);
+
+      expect(date.getTime()).toBe(expectedDate.getTime());
 
       jest.useRealTimers();
     });
