@@ -48,6 +48,11 @@
       "Bash(gh pr list:*)",
       "Bash(wc:*)",
       "Bash(find:*)",
+      "mcp__playwright__browser_evaluate",
+      "Bash(NODE_ENV=development node:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(npm run test:unit:*)",
+      "Bash(npm run:*)",
       "Bash(gh pr diff:*)"
     ]
   }

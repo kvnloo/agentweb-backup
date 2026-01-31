@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-01-31',
+    changes: [
+      'Fixed missing images from Agent Mode in Images page',
+      '- Implemented automatic repair for broken tool result metadata caused by MCP implementation bug',
+      '- Lazy repair system detects and fixes empty results on read, then persists to database',
+      'Performance improvements for Images, Videos, and Reports pages',
+      '- Implemented lazy loading for UserActivityContext and TemplateContext to reduce unnecessary API calls',
+    ],
+  },
+  {
     date: '2026-01-30',
     changes: [
       'Allow Listing and Reading Public Knowledge Base Files for all users',
