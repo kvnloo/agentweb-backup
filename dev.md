@@ -527,3 +527,86 @@ Configured Claude Code and use AWS Bedrock for the LLM: https://code.claude.com/
 ## Jan 29, 2026
 Install playwright mcp for claude
 claude mcp add playwright -- npx -y @playwright/mcp@latest
+
+## Feb 2, 2026
+### Google Analytics Not Receiving Data from app.agentweb.pro
+
+#### Problem
+After publishing GTM container updates to add tracking for app.agentweb.pro, no data was appearing in Google Analytics property 489864500. The Product Analytics API endpoint (`/api/seo/product-metrics`) returned zero data for app.agentweb.pro despite tracking being configured.
+
+#### Initial Investigation
+- GTM Preview showed events firing (page_view, scroll, user_engagement) ✅
+- Network requests showed GA4 events being sent to `server-side-tagging-50006506707.us-central1.run.app/g/collect` ✅
+- BUT no data appeared in GA4 Realtime reports or historical data ❌
+- Even www.agentweb.pro stopped receiving data on Feb 2 (had data on Feb 1)
+
+#### Root Cause Analysis
+
+**Issue 1: Domain Configuration**
+- GA4 data stream was configured with "exact match" for `agentweb.pro`
+- This blocked app.agentweb.pro subdomain from being accepted
+- **Fix**: Changed domain matching from "exact match" to "contains" with entries:
+  - `agentweb.pro`
+  - `withsurface.com`
+  - `agentwebforms.com`
+  - `app.agentweb.pro`
+
+**Issue 2: GTM Tag Configuration (Primary Issue)**
+- GTM had two GA4-related tags:
+  1. `FB_CONVERSIONS_API-1430870751246428-Web-Tag-GA4_Config` (Type: "Google Tag")
+  2. `FB_CONVERSIONS_API-1430870751246428-Web-Tag-GA4_Event` (Type: "Google Analytics: GA4 Event")
+- The GA4_Event tag referenced a Google Tag named **"AgentWeb"** that didn't exist
+- The GA4_Config tag was named differently and wasn't firing in GTM Preview
+- Without the Config tag firing, Event tags had no configuration to send data to
+
+**Issue 3: Incorrect Trigger**
+- GA4_Config tag was using "DOM Ready" trigger
+- "Google Tag" type must fire on "Initialization - All Pages" to load gtag.js before other tags
+
+#### Debugging Process
+
+1. **Verified tracking firing**: Used browser DevTools to confirm GA4 events in network tab
+2. **Checked GA4 real-time data**: No activity showing for app.agentweb.pro
+3. **Analyzed GTM Preview**: Found GA4_Config tag in "Tags Not Fired" section
+4. **Discovered tag reference mismatch**: GA4_Event looking for "AgentWeb" tag that didn't exist
+5. **Tested historical data**: Confirmed all tracking (even www.agentweb.pro) stopped on Feb 2
+
+#### Solution
+
+1. **Renamed GTM Tag**:
+   - Changed `FB_CONVERSIONS_API-1430870751246428-Web-Tag-GA4_Config` to `AgentWeb`
+   - This allowed GA4_Event tag to find and reference the correct config tag
+
+2. **Fixed Trigger**:
+   - Changed AgentWeb tag trigger from "DOM Ready" to **"Initialization - All Pages"**
+   - "Google Tag" type must fire early to initialize gtag.js
+
+3. **Updated GA4 Domain Settings**:
+   - In GA4 Admin → Data Streams → Configure tag settings
+   - Changed domain matching to "contains" instead of "exact match"
+   - Added app.agentweb.pro to allowed domains list
+
+4. **Published GTM Container**:
+   - Saved all changes
+   - Published new container version
+   - Verified in GTM Preview that AgentWeb tag now fires at Initialization
+
+#### Verification
+
+**Immediate Results**:
+- ✅ GTM Preview shows "AgentWeb" tag firing at Initialization
+- ✅ GA4_Event tags firing successfully with configuration
+- ✅ GA4 Realtime report shows activity from app.agentweb.pro
+- ✅ Page titles like "AgentWeb - Marketing Operations" appearing in real-time data
+
+**Expected Timeline**:
+- Real-time data: Available immediately ✅
+- Historical data (Product API): 24-48 hours for data to populate
+- Full metrics backfill: Up to 72 hours
+
+#### Configuration Details
+
+**GA4 Property**:
+- Property ID: `489864500`
+- Measurement ID: `G-KKJE0Q33LF`
+- Data Stream: "AgentWeb" (https://www.agentweb.pro)

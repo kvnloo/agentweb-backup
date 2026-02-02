@@ -911,4 +911,221 @@ router.get("/debug", async (req, res) => {
   }
 });
 
+// Get product feature usage metrics from Google Analytics
+router.get("/product-metrics", async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+
+    // Get user from database
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check if user has product domain and GA Property ID configured
+    if (!user.productDomain || !user.googleAnalyticsPropertyId) {
+      return res.status(400).json({
+        message: "Product domain or Google Analytics Property ID not configured. Please configure in the admin panel."
+      });
+    }
+
+    // Get Google Analytics Data API client
+    const gaClient = await getGoogleAnalyticsDataClient();
+    if (!gaClient) {
+      return res.status(500).json({
+        message: "Google Analytics API not configured. Please contact support."
+      });
+    }
+
+    // Get timeframe from query parameter (default to 30d)
+    const timeframe = (req.query.timeframe as string) || "30d";
+
+    // Calculate date range
+    const now = new Date();
+    const endDate = new Date(now);
+    endDate.setUTCHours(0, 0, 0, 0);
+
+    const startDate = new Date(endDate);
+    if (timeframe === "7d") {
+      startDate.setUTCDate(endDate.getUTCDate() - 6);
+    } else if (timeframe === "14d") {
+      startDate.setUTCDate(endDate.getUTCDate() - 13);
+    } else if (timeframe === "30d") {
+      startDate.setUTCDate(endDate.getUTCDate() - 29);
+    } else if (timeframe === "90d") {
+      startDate.setUTCDate(endDate.getUTCDate() - 89);
+    } else {
+      startDate.setUTCDate(endDate.getUTCDate() - 29);
+    }
+    startDate.setUTCHours(0, 0, 0, 0);
+
+    const startDateStr = startDate.toISOString().split("T")[0];
+    const endDateStr = endDate.toISOString().split("T")[0];
+
+    const propertyId = user.googleAnalyticsPropertyId;
+
+    // Fetch overall product metrics
+    const [overallResponse] = await gaClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [
+        {
+          startDate: startDateStr,
+          endDate: endDateStr,
+        },
+      ],
+      dimensionFilter: {
+        filter: {
+          fieldName: "hostName",
+          stringFilter: {
+            matchType: "CONTAINS" as const,
+            value: user.productDomain,
+          },
+        },
+      },
+      metrics: [
+        { name: "activeUsers" },
+        { name: "sessions" },
+        { name: "screenPageViews" },
+        { name: "eventCount" },
+        { name: "engagementRate" },
+        { name: "averageSessionDuration" },
+      ],
+    });
+
+    const overallMetrics = overallResponse.rows?.[0]?.metricValues || [];
+    const activeUsers = parseInt(overallMetrics[0]?.value || "0");
+    const sessions = parseInt(overallMetrics[1]?.value || "0");
+    const pageViews = parseInt(overallMetrics[2]?.value || "0");
+    const totalEvents = parseInt(overallMetrics[3]?.value || "0");
+    const engagementRate = parseFloat(overallMetrics[4]?.value || "0");
+    const avgSessionDuration = parseFloat(overallMetrics[5]?.value || "0");
+
+    // Fetch daily trend data
+    const [dailyResponse] = await gaClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [
+        {
+          startDate: startDateStr,
+          endDate: endDateStr,
+        },
+      ],
+      dimensionFilter: {
+        filter: {
+          fieldName: "hostName",
+          stringFilter: {
+            matchType: "CONTAINS" as const,
+            value: user.productDomain,
+          },
+        },
+      },
+      dimensions: [{ name: "date" }],
+      metrics: [
+        { name: "activeUsers" },
+        { name: "sessions" },
+        { name: "eventCount" },
+      ],
+      orderBys: [
+        {
+          dimension: {
+            dimensionName: "date",
+          },
+        },
+      ],
+    });
+
+    const dailyData = (dailyResponse.rows || []).map((row: any) => {
+      const dateStr = row.dimensionValues?.[0]?.value || "";
+      const formattedDate = dateStr.length === 8
+        ? `${dateStr.substring(0, 4)}-${dateStr.substring(4, 6)}-${dateStr.substring(6, 8)}`
+        : dateStr;
+
+      return {
+        date: formattedDate,
+        users: parseInt(row.metricValues?.[0]?.value || "0"),
+        sessions: parseInt(row.metricValues?.[1]?.value || "0"),
+        events: parseInt(row.metricValues?.[2]?.value || "0"),
+      };
+    });
+
+    // Fetch feature usage by page path (product features)
+    const [featureResponse] = await gaClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [
+        {
+          startDate: startDateStr,
+          endDate: endDateStr,
+        },
+      ],
+      dimensionFilter: {
+        filter: {
+          fieldName: "hostName",
+          stringFilter: {
+            matchType: "CONTAINS" as const,
+            value: user.productDomain,
+          },
+        },
+      },
+      dimensions: [
+        { name: "pagePath" },
+        { name: "pageTitle" },
+      ],
+      metrics: [
+        { name: "screenPageViews" },
+        { name: "activeUsers" },
+        { name: "userEngagementDuration" }, // Total duration in seconds
+      ],
+      orderBys: [
+        {
+          metric: {
+            metricName: "userEngagementDuration",
+          },
+          desc: true,
+        },
+      ],
+      limit: 50,
+    });
+
+    const featureUsage = (featureResponse.rows || []).map((row: any) => {
+      const pageViews = parseInt(row.metricValues?.[0]?.value || "0");
+      const users = parseInt(row.metricValues?.[1]?.value || "0");
+      const totalDuration = parseFloat(row.metricValues?.[2]?.value || "0");
+      const avgDuration = pageViews > 0 ? totalDuration / pageViews : 0;
+
+      return {
+        pagePath: row.dimensionValues?.[0]?.value || "/",
+        pageTitle: row.dimensionValues?.[1]?.value || "Unknown",
+        users,
+        pageViews,
+        avgDuration: Math.round(avgDuration * 100) / 100, // Round to 2 decimals
+        totalDuration: Math.round(totalDuration * 100) / 100, // Round to 2 decimals
+      };
+    });
+
+    res.json({
+      productDomain: user.productDomain,
+      metrics: {
+        activeUsers,
+        sessions,
+        pageViews,
+        totalEvents,
+        engagementRate,
+        avgSessionDuration,
+      },
+      dailyData,
+      featureUsage,
+      dateRange: {
+        startDate: startDateStr,
+        endDate: endDateStr,
+      },
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error("Error fetching product metrics:", error);
+    res.status(500).json({
+      message: "Error fetching product metrics",
+      error: error.message || "Unknown error"
+    });
+  }
+});
+
 export default router;

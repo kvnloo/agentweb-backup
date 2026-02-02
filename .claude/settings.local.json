@@ -53,7 +53,9 @@
       "Bash(gh pr diff:*)",
       "Bash(npm run test:unit:*)",
       "Bash(npm run:*)",
-      "Bash(gh pr diff:*)"
+      "Bash(gh pr diff:*)",
+      "Bash(node:*)",
+      "Bash(echo:*)"
     ]
   }
 }

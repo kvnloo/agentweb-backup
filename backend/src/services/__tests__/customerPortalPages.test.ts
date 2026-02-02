@@ -21,6 +21,7 @@ describe('customerPortalPages', () => {
       expect(pagePaths).toContain('/paid-social');
       expect(pagePaths).toContain('/newsletter');
       expect(pagePaths).toContain('/seo');
+      expect(pagePaths).toContain('/product');
     });
 
     it('should have Paid Social page with correct label and description', () => {
@@ -33,10 +34,18 @@ describe('customerPortalPages', () => {
 
     it('should have Newsletter page with correct label and description', () => {
       const newsletterPage = CUSTOMER_PORTAL_PAGES.find(page => page.path === '/newsletter');
-      
+
       expect(newsletterPage).toBeDefined();
       expect(newsletterPage?.label).toBe('Newsletter');
       expect(newsletterPage?.description).toBe('View newsletter campaign performance');
+    });
+
+    it('should have Product page with correct label and description', () => {
+      const productPage = CUSTOMER_PORTAL_PAGES.find(page => page.path === '/product');
+
+      expect(productPage).toBeDefined();
+      expect(productPage?.label).toBe('Product');
+      expect(productPage?.description).toBe('Product feature usage and analytics');
     });
 
     it('should have Reports page (renamed from Research Reports)', () => {
@@ -102,6 +111,11 @@ describe('customerPortalPages', () => {
       expect(label).toBe('SEO/GEO');
     });
 
+    it('should return correct label for Product page', () => {
+      const label = getPageLabel('/product');
+      expect(label).toBe('Product');
+    });
+
     it('should return path for unknown pages', () => {
       const label = getPageLabel('/unknown-page');
       expect(label).toBe('/unknown-page');
@@ -121,6 +135,7 @@ describe('customerPortalPages', () => {
         '/paid-social',
         '/newsletter',
         '/seo',
+        '/product',
       ];
 
       const pagePaths = CUSTOMER_PORTAL_PAGES.map(page => page.path);

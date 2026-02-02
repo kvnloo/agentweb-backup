@@ -209,7 +209,7 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
 router.put("/users/:userId/seo-aeo", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { seoDomains, googleAnalyticsPropertyId, clarityProjectId } = req.body;
+    const { seoDomains, googleAnalyticsPropertyId, clarityProjectId, productDomain } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -251,8 +251,19 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
       const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
       const trimmedId = clarityProjectId.trim();
       if (typeof clarityProjectId !== 'string' || !clarityIdRegex.test(trimmedId)) {
-        return res.status(400).json({ 
-          message: `Invalid Microsoft Clarity Project ID format: ${clarityProjectId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.` 
+        return res.status(400).json({
+          message: `Invalid Microsoft Clarity Project ID format: ${clarityProjectId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`
+        });
+      }
+    }
+
+    // Validate productDomain format if provided
+    if (productDomain !== undefined && productDomain !== null && productDomain !== "") {
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      const trimmedDomain = productDomain.trim();
+      if (typeof productDomain !== 'string' || !domainRegex.test(trimmedDomain)) {
+        return res.status(400).json({
+          message: `Invalid product domain format: ${productDomain}. Please use format like app.example.com`
         });
       }
     }
@@ -267,6 +278,9 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
     }
     if (clarityProjectId !== undefined) {
       updateData.clarityProjectId = clarityProjectId?.trim() || null;
+    }
+    if (productDomain !== undefined) {
+      updateData.productDomain = productDomain?.trim() || null;
     }
 
     // Update the user's SEO/AEO configuration

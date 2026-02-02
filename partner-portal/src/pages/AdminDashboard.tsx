@@ -177,6 +177,7 @@ interface User {
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   clarityProjectId?: string; // Microsoft Clarity Project ID
+  productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
 }
@@ -645,6 +646,7 @@ export default function AdminDashboard() {
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
   const [clarityProjectId, setClarityProjectId] = useState("");
+  const [productDomain, setProductDomain] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
   const [currentCmsType, setCurrentCmsType] = useState<"Basehub" | "Webflow" | "">("");
@@ -1764,13 +1766,24 @@ export default function AdminDashboard() {
         setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
         return;
       }
-      
+
+      // Validate product domain format if provided
+      const prodDomain = productDomain.trim();
+      if (prodDomain) {
+        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+        if (!domainRegex.test(prodDomain)) {
+          setError(`Invalid product domain format: ${prodDomain}. Please use format like app.example.com`);
+          return;
+        }
+      }
+
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
-        { 
+        {
           seoDomains: domains,
           googleAnalyticsPropertyId: gaId || null,
-          clarityProjectId: clarityId || null
+          clarityProjectId: clarityId || null,
+          productDomain: prodDomain || null
         },
         {
           headers: { Authorization: `Bearer ${token}` }
@@ -1779,14 +1792,15 @@ export default function AdminDashboard() {
 
       if (response.status === 200) {
         // Update the user in the local state without reloading
-        setUsers((prevUsers: User[]) => 
-          prevUsers.map((user: User) => 
-            user.userId === editingSeoDomainsUserId 
-              ? { 
-                  ...user, 
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === editingSeoDomainsUserId
+              ? {
+                  ...user,
                   seoDomains: response.data.seoDomains || [],
                   googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined,
-                  clarityProjectId: response.data.clarityProjectId || undefined
+                  clarityProjectId: response.data.clarityProjectId || undefined,
+                  productDomain: response.data.productDomain || undefined
                 }
               : user
           )
@@ -1797,6 +1811,7 @@ export default function AdminDashboard() {
         setSeoDomainsText("");
         setGoogleAnalyticsPropertyId("");
         setClarityProjectId("");
+        setProductDomain("");
       }
     } catch (error: any) {
       console.error("Error updating SEO/AEO configuration:", error);
@@ -2908,6 +2923,7 @@ export default function AdminDashboard() {
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
                                 setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
                                 setClarityProjectId(user.clarityProjectId || "");
+                                setProductDomain(user.productDomain || "");
                                 setSeoDomainsDialogOpen(true);
                               }}
                               disabled={seoDomainsEditLoading}
@@ -5078,6 +5094,17 @@ export default function AdminDashboard() {
                 disabled={seoDomainsEditLoading}
               />
             </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="Product Domain"
+                value={productDomain}
+                onChange={(e) => setProductDomain(e.target.value)}
+                placeholder="app.example.com"
+                helperText="Enter your product site domain for feature usage tracking (e.g., app.example.com). This will enable Product Analytics on the Performance Hub page."
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
           </Grid>
         </DialogContent>
         <DialogActions>
@@ -5088,6 +5115,7 @@ export default function AdminDashboard() {
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
               setClarityProjectId("");
+              setProductDomain("");
             }}
             disabled={seoDomainsEditLoading}
           >
