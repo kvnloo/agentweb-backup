@@ -19,6 +19,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Localhost development traffic is automatically filtered out for accurate production metrics',
       'Fixed Brand Guidelines Logo Display Bug',
       '- Logo files now display immediately after upload without requiring page reload',
+      'Fixed Web Task Async Parameter Default Value Bug',
+      '- create_task_from_template and create_task_from_prompt now correctly default to async=false when not specified',
+      '- Tasks will now wait for completion and return final results by default, instead of returning immediately with pending status',
+      '- This aligns with documented behavior and prevents unexpected async execution when users don\'t explicitly request it',
     ],
   },
   {

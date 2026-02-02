@@ -4111,7 +4111,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Create task from template
-  public async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
+  public async createTaskFromTemplate(templateId: string, parameters: Record<string, string>, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = false): Promise<any> {
     try {
 
       // Validate parameters
@@ -4284,7 +4284,7 @@ ${emailDraftFormat === 'text'
   }
 
   // Create task from raw prompt
-  public async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = true): Promise<any> {
+  public async createTaskFromPrompt(taskName: string, prompt: string, category: string, userId: string, sessionId: string, attachPreviousTaskResults: boolean = true, attachedFileUrls: string[] = [], async: boolean = false): Promise<any> {
     try {
 
       // Attach previous task results if requested
