@@ -2915,6 +2915,15 @@ export default function AdminDashboard() {
                                   No Clarity ID
                                 </Typography>
                               )}
+                              {user.productDomain ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  Product: {user.productDomain}
+                                </Typography>
+                              ) : (
+                                <Typography variant="body2" color="text.secondary">
+                                  No Product Domain
+                                </Typography>
+                              )}
                             </Box>
                             <IconButton
                               size="small"
