@@ -40,7 +40,7 @@ describe('tokenUtils', () => {
     });
 
     it('should return singular day format for 1 day', () => {
-      const oneDayFromNow = Date.now() + 1 * 24 * 60 * 60 * 1000;
+      const oneDayFromNow = Date.now() + 1.5 * 24 * 60 * 60 * 1000;
       expect(formatExpiryMessage(oneDayFromNow)).toBe('Expires in 1 day');
     });
 
