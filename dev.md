@@ -610,3 +610,21 @@ After publishing GTM container updates to add tracking for app.agentweb.pro, no 
 - Property ID: `489864500`
 - Measurement ID: `G-KKJE0Q33LF`
 - Data Stream: "AgentWeb" (https://www.agentweb.pro)
+
+#### Important Note on Localhost Traffic
+
+**Localhost traffic is still sent to Google Analytics but filtered in Customer Portal**:
+- Development traffic from `localhost` is currently being sent to GA4 property 489864500
+- The backend Product Analytics API (`/api/seo/product-metrics`) filters out localhost traffic using dimension filters:
+  ```typescript
+  dimensionFilter: {
+    andGroup: {
+      expressions: [
+        { filter: { fieldName: "hostName", stringFilter: { matchType: "CONTAINS", value: user.productDomain } } },
+        { notExpression: { filter: { fieldName: "hostName", stringFilter: { matchType: "CONTAINS", value: "localhost" } } } }
+      ]
+    }
+  }
+  ```
+- **Result**: Customer Portal shows accurate production-only metrics, but Google Analytics UI will show inflated numbers that include localhost traffic
+- **Recommendation**: Follow the guide in `GA4_EXCLUDE_LOCALHOST_GUIDE.md` to prevent localhost traffic from reaching GA4 entirely (Method 3 or 4 recommended)
