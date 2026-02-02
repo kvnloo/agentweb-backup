@@ -974,12 +974,29 @@ router.get("/product-metrics", async (req, res) => {
         },
       ],
       dimensionFilter: {
-        filter: {
-          fieldName: "hostName",
-          stringFilter: {
-            matchType: "CONTAINS" as const,
-            value: user.productDomain,
-          },
+        andGroup: {
+          expressions: [
+            {
+              filter: {
+                fieldName: "hostName",
+                stringFilter: {
+                  matchType: "CONTAINS" as const,
+                  value: user.productDomain,
+                },
+              },
+            },
+            {
+              notExpression: {
+                filter: {
+                  fieldName: "hostName",
+                  stringFilter: {
+                    matchType: "CONTAINS" as const,
+                    value: "localhost",
+                  },
+                },
+              },
+            },
+          ],
         },
       },
       metrics: [
@@ -1010,12 +1027,29 @@ router.get("/product-metrics", async (req, res) => {
         },
       ],
       dimensionFilter: {
-        filter: {
-          fieldName: "hostName",
-          stringFilter: {
-            matchType: "CONTAINS" as const,
-            value: user.productDomain,
-          },
+        andGroup: {
+          expressions: [
+            {
+              filter: {
+                fieldName: "hostName",
+                stringFilter: {
+                  matchType: "CONTAINS" as const,
+                  value: user.productDomain,
+                },
+              },
+            },
+            {
+              notExpression: {
+                filter: {
+                  fieldName: "hostName",
+                  stringFilter: {
+                    matchType: "CONTAINS" as const,
+                    value: "localhost",
+                  },
+                },
+              },
+            },
+          ],
         },
       },
       dimensions: [{ name: "date" }],
@@ -1057,12 +1091,29 @@ router.get("/product-metrics", async (req, res) => {
         },
       ],
       dimensionFilter: {
-        filter: {
-          fieldName: "hostName",
-          stringFilter: {
-            matchType: "CONTAINS" as const,
-            value: user.productDomain,
-          },
+        andGroup: {
+          expressions: [
+            {
+              filter: {
+                fieldName: "hostName",
+                stringFilter: {
+                  matchType: "CONTAINS" as const,
+                  value: user.productDomain,
+                },
+              },
+            },
+            {
+              notExpression: {
+                filter: {
+                  fieldName: "hostName",
+                  stringFilter: {
+                    matchType: "CONTAINS" as const,
+                    value: "localhost",
+                  },
+                },
+              },
+            },
+          ],
         },
       },
       dimensions: [
