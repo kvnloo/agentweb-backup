@@ -62,6 +62,11 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'SEO and analytics management'
   },
   {
+    path: '/product',
+    label: 'Product',
+    description: 'Product feature usage and analytics'
+  },
+  {
     path: '/research-reports',
     label: 'Reports',
     description: 'View market research reports'

@@ -67,6 +67,7 @@ export interface User {
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID (numeric, e.g., 123456789)
   clarityProjectId?: string; // Microsoft Clarity Project ID (e.g., ul13e4f7fe)
+  productDomain?: string; // Product site domain for feature usage tracking (e.g., "app.example.com")
   funnelConfig?: {
     stages: Array<{
       name: string;

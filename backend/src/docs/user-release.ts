@@ -7,6 +7,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-02',
+    changes: [
+      'Added Product Analytics Page to Performance Hub',
+      '- Track feature usage and user engagement metrics for your product using Google Analytics 4',
+      '- View active users, sessions, page views, and engagement rates over customizable timeframes (7, 14, 30, or 90 days)',
+      '- Visualize daily usage trends with interactive charts showing user and session patterns',
+      '- Analyze feature usage by page path with metrics including users, page views, average duration, and total duration',
+      '- Sortable table columns let you identify your most-used features and engagement patterns',
+      '- Dynamic URL paths (like /crm/:id) are automatically grouped together for cleaner feature analysis',
+      '- Localhost development traffic is automatically filtered out for accurate production metrics',
+    ],
+  },
+  {
     date: '2026-01-31',
     changes: [
       'Fixed missing images from Agent Mode in Images page',
