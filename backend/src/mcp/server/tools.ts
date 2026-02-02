@@ -1259,7 +1259,7 @@ mcpToolRegistry.register({
       context?.sessionId,
       args.attach_previous_task_results,
       args.attached_file_urls || [],
-      args.async
+      args.async ?? false
     );
   }
 });
@@ -1313,7 +1313,7 @@ mcpToolRegistry.register({
       context?.sessionId,
       args.attach_previous_task_results,
       args.attached_file_urls || [],
-      args.async
+      args.async ?? false
     );
   }
 });
