@@ -17,6 +17,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Sortable table columns let you identify your most-used features and engagement patterns',
       '- Dynamic URL paths (like /crm/:id) are automatically grouped together for cleaner feature analysis',
       '- Localhost development traffic is automatically filtered out for accurate production metrics',
+      'Fixed Brand Guidelines Logo Display Bug',
+      '- Logo files now display immediately after upload without requiring page reload',
     ],
   },
   {
