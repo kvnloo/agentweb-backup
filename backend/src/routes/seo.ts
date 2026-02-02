@@ -1136,21 +1136,86 @@ router.get("/product-metrics", async (req, res) => {
       limit: 50,
     });
 
-    const featureUsage = (featureResponse.rows || []).map((row: any) => {
-      const pageViews = parseInt(row.metricValues?.[0]?.value || "0");
-      const users = parseInt(row.metricValues?.[1]?.value || "0");
-      const totalDuration = parseFloat(row.metricValues?.[2]?.value || "0");
-      const avgDuration = pageViews > 0 ? totalDuration / pageViews : 0;
+    // Function to tokenize path segments (replace dynamic parts with <token>)
+    const tokenizePath = (path: string): string => {
+      return path
+        .split('/')
+        .map(segment => {
+          // Match UUID patterns (8-4-4-4-12 hex digits)
+          if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) {
+            return '<token>';
+          }
+          // Match numeric IDs
+          if (/^\d+$/.test(segment)) {
+            return '<token>';
+          }
+          // Match long alphanumeric hashes (e.g., abc123def456ghi789)
+          if (/^[a-z0-9]{20,}$/i.test(segment)) {
+            return '<token>';
+          }
+          // Match short alphanumeric codes with dashes (e.g., abc-def-ghi)
+          if (/^[a-z0-9]+-[a-z0-9]+-[a-z0-9]+$/i.test(segment)) {
+            return '<token>';
+          }
+          // Match MongoDB ObjectId (24 hex characters)
+          if (/^[0-9a-f]{24}$/i.test(segment)) {
+            return '<token>';
+          }
+          return segment;
+        })
+        .join('/');
+    };
 
-      return {
-        pagePath: row.dimensionValues?.[0]?.value || "/",
-        pageTitle: row.dimensionValues?.[1]?.value || "Unknown",
-        users,
-        pageViews,
-        avgDuration: Math.round(avgDuration * 100) / 100, // Round to 2 decimals
-        totalDuration: Math.round(totalDuration * 100) / 100, // Round to 2 decimals
-      };
+    // Map raw data first
+    const rawFeatureData = (featureResponse.rows || []).map((row: any) => ({
+      pagePath: row.dimensionValues?.[0]?.value || "/",
+      pageTitle: row.dimensionValues?.[1]?.value || "Unknown",
+      users: parseInt(row.metricValues?.[1]?.value || "0"),
+      pageViews: parseInt(row.metricValues?.[0]?.value || "0"),
+      totalDuration: parseFloat(row.metricValues?.[2]?.value || "0"),
+    }));
+
+    // Group by tokenized path
+    const groupedFeatures = new Map<string, {
+      pagePath: string;
+      pageTitle: string;
+      users: number;
+      pageViews: number;
+      totalDuration: number;
+    }>();
+
+    rawFeatureData.forEach(feature => {
+      const tokenized = tokenizePath(feature.pagePath);
+
+      if (groupedFeatures.has(tokenized)) {
+        const existing = groupedFeatures.get(tokenized)!;
+        existing.users += feature.users;
+        existing.pageViews += feature.pageViews;
+        existing.totalDuration += feature.totalDuration;
+      } else {
+        groupedFeatures.set(tokenized, {
+          pagePath: tokenized,
+          pageTitle: feature.pageTitle, // Use first title encountered
+          users: feature.users,
+          pageViews: feature.pageViews,
+          totalDuration: feature.totalDuration,
+        });
+      }
     });
+
+    // Convert to array and calculate avgDuration, then sort by totalDuration desc
+    const featureUsage = Array.from(groupedFeatures.values())
+      .map(feature => ({
+        pagePath: feature.pagePath,
+        pageTitle: feature.pageTitle,
+        users: feature.users,
+        pageViews: feature.pageViews,
+        avgDuration: feature.pageViews > 0
+          ? Math.round((feature.totalDuration / feature.pageViews) * 100) / 100
+          : 0,
+        totalDuration: Math.round(feature.totalDuration * 100) / 100,
+      }))
+      .sort((a, b) => b.totalDuration - a.totalDuration);
 
     res.json({
       productDomain: user.productDomain,
