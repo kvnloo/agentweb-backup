@@ -627,7 +627,7 @@ mcpToolRegistry.register({
   name: 'publish_blog_article',
   definition: {
     name: 'publish_blog_article',
-    description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS. Articles are published as draft by default unless status is set to "published". IMPORTANT: When status is "published", at least one category must be provided.',
+    description: 'Publish a blog article to CMS (Basehub or Webflow) based on the user\'s configured CMS type. Takes the title, description, hero image URL, and blog HTML URL from a previously created blog article (via create_blog_article), extracts the HTML body content, then publishes to the appropriate CMS. Articles are published as draft by default unless status is set to "published". IMPORTANT: When status is "published", at least one category must be provided. CRITICAL: Always review the article content with the user and get explicit approval before publishing, especially when status is "published" for live publication.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1209,7 +1209,7 @@ mcpToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account',
+    description: 'Create a post on a connected social media account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media.',
     inputSchema: {
       type: 'object',
       properties: {
