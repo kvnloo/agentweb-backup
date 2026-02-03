@@ -15,6 +15,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
+import { skillService } from './skillService';
+import { getAllowedFunctionCalls, filterFunctionCalls } from './subscriptionService';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
 // Used for updateEmailDraftForLead to match generateBlogContent pattern
@@ -499,26 +501,49 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
-
-      const systemPrompt = await this.getMarketingSystemPrompt();
+      // 1. Initial Data Fetching (Pre-Loop)
+      let currentSession = await chatbotDb.getChatSession(sessionId);
+      const workPlan = currentSession?.workPlan;
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
       const availableTemplates = await this.getAvailableTemplates();
 
-      // Get session to check for work plan
-      const session = await chatbotDb.getChatSession(sessionId);
-      const workPlan = session?.workPlan;
+      // Get allowed tools from subscription service (cached for the request)
+      const userAllowedTools = await getAllowedFunctionCalls(userId);
 
+      // 2. Initialize Context Variables
+      let associatedSkills: any[] = [];
+      if (currentSession?.associatedSkills?.length) {
+        associatedSkills = await skillService.getSkillsByIds(currentSession.associatedSkills);
+      }
+      
+      // Build initial skill context
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedTools);
+
+      // Helper to build System Prompt
+      let baseSystemPrompt = await this.getMarketingSystemPrompt();
+      // 3. Build Initial Messages
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
 
-      // Build templates context message
-      const templatesContext = this.buildTemplatesContext(availableTemplates);
+      let availableSkillContextMsg = '';
+      const publishedSkills = await skillService.getPublishedSkills();
+      if (publishedSkills.length > 0) {
+        const availableSkillContext = publishedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description}`).join('\n');
+        availableSkillContextMsg = `Available Skills:\n${availableSkillContext}`;
+      }
 
-      // Build initial messages array (preserve structured history and tool messages)
+      const today = new Date().toISOString().split('T')[0];
       const messages: any[] = [
-        { role: 'system', content: `${systemPrompt}\n\nCurrent date: ${new Date().toISOString().split("T")[0]}` },
-        { role: 'assistant', content: templatesContext },
-        ...marketingMessages
+        { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
       ];
+
+      if (availableSkillContextMsg) {
+        messages.push({ role: 'assistant', content: availableSkillContextMsg });
+      }
+
+      // Use helper to inject installed skills and templates
+      this.updateConversationContext(messages, installedSkillContextMsg, availableTemplates, allowedToolNames);
+
+      messages.push(...marketingMessages);
 
       let content = '';
       const toolCalls: any[] = [];
@@ -526,17 +551,45 @@ export class AgentModeService {
       const sources: string[] = [];
 
       // Remember initial message count to slice response messages later
-      const initialMessageCount = messages.length;
+      let initialMessageCount = messages.length;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 20; // Prevent infinite loops
       let iteration = 0;
       let responseMessage: any = null;
+      let skillsUpdated = false;
+      let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
       while (iteration < maxIterations) {
         iteration++;
 
-        // Send progress update: starting iteration
+        // 4. Refresh Context if Skills Changed
+        if (skillsUpdated) {
+            try {
+                // Refresh session and skills
+                currentSession = await chatbotDb.getChatSession(sessionId);
+                if (currentSession?.associatedSkills?.length) {
+                  associatedSkills = await skillService.getSkillsByIds(currentSession.associatedSkills);
+                } else {
+                  associatedSkills = [];
+                }
+
+                // Re-build context using helper
+                const skillContext = this.buildSkillContext(associatedSkills, userAllowedTools);
+                allowedToolNames = skillContext.allowedToolNames;
+                installedSkillContextMsg = skillContext.installedSkillContextMsg;
+
+                // Update messages using helper
+                this.updateConversationContext(messages, installedSkillContextMsg, availableTemplates, allowedToolNames);
+
+                // Invalidate tools cache
+                filteredToolsCache = null;
+                skillsUpdated = false;
+            } catch (error) {
+                console.error('Error refreshing skill context:', error);
+            }
+        }
+
         if (onProgress) {
           onProgress({
             iteration,
@@ -545,13 +598,14 @@ export class AgentModeService {
           });
         }
 
-        // Get available tools filtered by subscription
-        const allTools = this.getAvailableTools();
-        const filteredTools = await this.getFilteredTools(userId, allTools);
+        // 5. Get Tools (Cached)
+        if (!filteredToolsCache) {
+             filteredToolsCache = await this.getFilteredTools(userId, sessionId, allowedToolNames);
+        }
 
         // Make LLM call
         const response = await this.callLLM(llmModel, messages, {
-          tools: filteredTools,
+          tools: filteredToolsCache,
           tool_choice: 'auto',
           max_completion_tokens: 12384,
           temperature: 0.1
@@ -560,7 +614,6 @@ export class AgentModeService {
         // Yield control back to event loop after LLM call to allow health checks and other requests
         // This prevents blocking the main thread during long-running generateResponse operations
         await new Promise(resolve => setImmediate(resolve));
-        //print(re)
         responseMessage = response.choices[0].message;
 
         // Extract content - handle both string and array formats (Claude returns array)
@@ -615,12 +668,35 @@ export class AgentModeService {
 
         // Execute tool calls
         for (const toolCall of responseMessage.tool_calls) {
+          let functionArgs: any;
           try {
-            const functionArgs = JSON.parse(toolCall.function.arguments);
+            try {
+              functionArgs = JSON.parse(toolCall.function.arguments);
+            } catch (parseError) {
+              console.error(`AgentMode: Failed to parse tool arguments for ${toolCall.function.name}:`, parseError);
+              toolCalls.push({
+                id: toolCall.id,
+                name: toolCall.function.name,
+                arguments: toolCall.function.arguments, // Store as raw string since JSON parsing failed
+                error: 'Invalid JSON in tool arguments'
+              });
+              
+               // Append error as tool message so LLM knows it failed
+               messages.push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: `Error: Invalid JSON in arguments: ${(parseError as any).message}`
+              });
+              continue;
+            }
+
+            // Check if we need to refresh skills for next iteration
+            if (toolCall.function.name === 'install_skills') {
+                skillsUpdated = true;
+            }
 
             const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
-
-            // Store only the necessary data for the frontend
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
 
             toolCalls.push({
@@ -664,7 +740,7 @@ export class AgentModeService {
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
-              arguments: JSON.parse(toolCall.function.arguments),
+              arguments: functionArgs || toolCall.function.arguments,
               error: error instanceof Error ? error.message : 'Unknown error'
             });
             
@@ -710,13 +786,18 @@ export class AgentModeService {
           };
         }
       }
-
+      // Filter out user messages from responseMessages since the controller already saved
+      // the user message before calling this function. Only return assistant/tool messages.
+      const responseMessages = messages.slice(initialMessageCount).filter(
+        (msg: any) => msg.role !== 'user'
+      );
+      
       return {
         content,
         toolCalls,
         knowledgeBaseQueries,
         sources,
-        responseMessages: messages.slice(initialMessageCount)
+        responseMessages
       };
     } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);
@@ -741,6 +822,75 @@ export class AgentModeService {
     }
   }
 
+  private buildSkillContext(associatedSkills: any[], userAllowedTools: string[]): { allowedToolNames: Set<string>, installedSkillContextMsg: string } {
+    const allowedToolNames = new Set<string>();
+    allowedToolNames.add('install_skills');
+    
+    if (associatedSkills.length) {
+      associatedSkills.forEach(s => s.toolNames?.forEach((t: string) => {
+        if (userAllowedTools.includes(t) || userAllowedTools.includes('*'))
+          allowedToolNames.add(t);
+      }));
+    }
+
+    let installedSkillContextMsg = '';
+    if (associatedSkills.length) {
+      const context = associatedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt}`).join('\n');
+      installedSkillContextMsg = `Installed Skills:\n${context}`;
+    }
+
+    return { allowedToolNames, installedSkillContextMsg };
+  }
+
+  private updateConversationContext(
+    messages: any[], 
+    installedSkillContextMsg: string, 
+    availableTemplates: any[], 
+    allowedToolNames: Set<string>
+  ) {
+    // 1. Handle Installed Skills Message
+    // Remove existing message first
+    const installedIdx = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Installed Skills:'));
+    if (installedIdx !== -1) {
+      messages.splice(installedIdx, 1);
+    }
+
+    // Insert new message if available
+    if (installedSkillContextMsg) {
+      // Find optimal insertion point: after "Available Skills" or System Prompt
+      const availableSkillMsgIndex = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Skills:'));
+      let insertIndex = 1; // Default after system (assuming system is at 0)
+      if (availableSkillMsgIndex !== -1) {
+        insertIndex = availableSkillMsgIndex + 1;
+      }
+      
+      messages.splice(insertIndex, 0, { role: 'assistant', content: installedSkillContextMsg });
+    }
+
+    // 2. Handle Available Templates Message
+    // Remove existing message first
+    const templatesIdx = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Templates:'));
+    if (templatesIdx !== -1) {
+      messages.splice(templatesIdx, 1);
+    }
+
+    // Insert new message if tool is allowed
+    if (allowedToolNames.has('create_task_from_template')) {
+      const templatesContext = this.buildTemplatesContext(availableTemplates);
+      if (templatesContext !== 'No templates are currently available.') {
+          // Find optimal insertion point
+          let insertIndex = 1;
+          const installedIndex = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Installed Skills:'));
+          const availableIndex = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Skills:'));
+          
+          if (installedIndex !== -1) insertIndex = installedIndex + 1;
+          else if (availableIndex !== -1) insertIndex = availableIndex + 1;
+          
+          messages.splice(insertIndex, 0, { role: 'assistant', content: templatesContext });
+      }
+    }
+  }
+
   async getMarketingSystemPrompt(): Promise<string> {
     // Try to get custom system prompt from settings
     try {
@@ -753,20 +903,17 @@ export class AgentModeService {
     }
 
     // Fallback to default system prompt
-    return `You are Emma, an AI-powered assistant from AgentWeb. You help users execute marketing campaigns through natural conversation and task creation.
+    return `
+      You are Emma, an AI-powered marketing assistant from AgentWeb. You help users execute marketing campaigns through natural conversation.
 
-## Your Capabilities
-You can help with various marketing tasks including:
-- Market research and competitive analysis
-- SWOT analysis for businesses
-- Marketing strategy development
-- Ad creative generation and campaign management
-- Performance analysis and optimization
-- Meta ads metrics analysis and insights
-- Social media listening and brand monitoring
-- Web search for current information and real-time data
-- Analysis of attached files and documents
+      ## Your Approach
+      - You start with a limited set of tools. When a user asks for something outside your current capabilities and you do not have the required skills, you MUST follow this workflow:
+        1. Decide which skills you need based on the user's request and the skill descriptions.
+        2. Use \`install_skills\` to install the required skills.
+      - **IMPORTANT**: You do not have generic tools like web search or image generation by default. You must find and install them using the workflow above.
+      - Always be proactive. If you see a way to help that requires a skill you don't have, find it.
 
+<<<<<<< HEAD
 ## File Attachments
 When users attach files to their messages, you will receive:
 - **Attached Files**: Clickable markdown links in the format \`[filename](url)\`
@@ -941,6 +1088,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
    - Step 4: Generate 3 blog articles (requiredFunctionCalls: ["create_blog_article"])
    - Step 5: Generate social media posts (requiredFunctionCalls: ["generate_image"])
 
+      ## Handling File Attachments
+      When users attach files, you see them as markdown links: \`[filename](url)\`.
+      Analyze these files when relevant to the user's request. If you need specialized tools to process them (like data analysis), associate the corresponding skill first.
+
 ## Response Formatting
 Format your responses in HTML5 for direct rendering. Use:
 - <strong> for important points
@@ -1037,12 +1188,24 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
+    
+    // Filter out the last user message if it matches current messageContent
+    // This prevents duplication when sessionHistory already includes current message
+    const filteredHistory = sessionHistory.filter((msg, index) => {
+      // If this is the last message and it matches current content, skip it
+      if (index === sessionHistory.length - 1 && 
+          msg.role === 'user' && 
+          msg.content === messageContent) {
+        return false;
+      }
+      return true;
+    });
 
     // Determine slice starting at the 10th most recent user message over full history
     let userCount = 0;
     let startIdx = 1; // Assume the first message is the system message
-    for (let i = sessionHistory.length - 1; i >= 0; i--) {
-      if (sessionHistory[i].role === 'user') {
+    for (let i = filteredHistory.length - 1; i >= 0; i--) {
+      if (filteredHistory[i].role === 'user') {
         userCount++;
         if (userCount === 10) {
           startIdx = i;
@@ -1050,7 +1213,9 @@ Use the available tools to create tasks in the agent-engine when complex work is
         }
       }
     }
-    const sliced = sessionHistory.slice(startIdx);
+    const sliced = filteredHistory.slice(startIdx);
+
+
 
     // Copy all sliced messages as-is
     for (const msg of sliced) {
@@ -1205,21 +1370,117 @@ Use the available tools to create tasks in the agent-engine when complex work is
     return context;
   }
 
+  public async listSkills(userId: string, sessionId: string): Promise<any> {
+    try {
+      const publishedSkills = await skillService.getPublishedSkills();
+      
+      if (!publishedSkills.length)
+        return { message: "No skills available in the library." };
+
+      const session = await chatbotDb.getChatSession(sessionId);
+      const currentAssociated = session?.associatedSkills || [];
+      const associatedSkillIds = new Set(currentAssociated);
+      
+      const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
+
+      if (!availableSkills.length)
+        return { message: "All available skills are already installed." };
+
+      return {
+        message: `Found ${availableSkills.length} available skill(s).`,
+        skills: availableSkills.map(s => ({
+          id: s.skillId,
+          name: s.name,
+          description: s.description
+        }))
+      };
+    } catch (error) {
+      console.error('AgentMode: Error in listSkills:', error);
+      return { message: "An error occurred while listing skills." };
+    }
+  }
+
+  public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
+    try {
+        const publishedSkills = await skillService.getPublishedSkills();
+        const skillsToInstall = publishedSkills.filter(s => skillIds.includes(s.skillId));
+
+        if (!skillsToInstall.length)
+          return { message: "No valid skills found for the provided IDs." };
+
+        const skillIdsToAdd = skillsToInstall.map(s => s.skillId);
+        await chatbotDb.addAssociatedSkills(sessionId, skillIdsToAdd);
+
+        return {
+          success: true,
+          message: `Successfully installed ${skillsToInstall.length} skill(s).`,
+          installedSkills: skillsToInstall.map(s => s.name)
+        };
+    } catch (error) {
+        console.error('AgentMode: Error in installSkills:', error);
+        return { message: "An error occurred while installing skills." };
+    }
+  }
+
   public getAvailableTools() {
     return this.toolRegistry.getToolDefinitions();
   }
 
-  // Get filtered tools based on user's subscription type
-  public async getFilteredTools(userId: string, allTools: any[]): Promise<any[]> {
+  // Get filtered tools based on user's subscription type AND session state
+  // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
+  public async getFilteredTools(userId: string, sessionId: string, precomputedAllowedNames?: Set<string>): Promise<any[]> {
     try {
-      const { getAllowedFunctionCalls, filterFunctionCalls } = await import('./subscriptionService');
+      // 1. Get all internal tool objects (flat structure with .name)
+      const allInternalTools = this.toolRegistry.getAllTools();
+      
+      let allowedNames: Set<string>;
+
+      if (precomputedAllowedNames) {
+        // Use pre-computed set if available (optimization)
+        allowedNames = precomputedAllowedNames;
+      } else {
+        // Fallback: Compute allowed names from scratch if not provided
+        allowedNames = new Set<string>();
+        allowedNames.add('install_skills'); // Foundational
+
+        // Load associated skills from DATABASE
+        const session = await chatbotDb.getChatSession(sessionId);
+        const currentAssociated = session?.associatedSkills || [];
+
+        if (currentAssociated.length) {
+          const associatedSkills = await skillService.getSkillsByIds(currentAssociated);
+          const toolNames = associatedSkills.flatMap(skill => skill.toolNames);
+          toolNames.forEach(toolName => allowedNames.add(toolName));
+        }
+      }
+
+      // 3. Filter the internal tool objects
+      const contextAwareTools = allInternalTools.filter(tool => allowedNames.has(tool.name));
+
+      // 4. Map back to wire-format definitions for the LLM
+      const definitions = contextAwareTools.map(t => t.definition);
+
+      // 5. Apply Subscription Filtering
+      // IMPORTANT: Tools associated via Skills bypass subscription filtering
+      // The Skills system is now the primary access control mechanism
       const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
-      // getAllowedFunctionCalls now always returns an array (never null)
-      return filterFunctionCalls(allTools, allowedFunctionCalls);
+      
+      // Add all session-associated tools to the allowed list to bypass subscription filtering
+      if (!allowedFunctionCalls.includes('*')) {
+        allowedNames.forEach(name => {
+          if (!allowedFunctionCalls.includes(name)) {
+            allowedFunctionCalls.push(name);
+          }
+        });
+      }
+
+      return filterFunctionCalls(definitions, allowedFunctionCalls);
     } catch (error) {
-      console.error('Error filtering tools by subscription:', error);
-      // Default to all tools on error
-      return allTools;
+      console.error('Error filtering tools:', error);
+      // Fallback: return only install_skills to be safe, or empty array
+      // DO NOT return all tools on error as it's a security risk
+      const installSkillsTool = this.toolRegistry.getTool('install_skills');
+      return installSkillsTool ? [installSkillsTool.definition] : [];
     }
   }
 

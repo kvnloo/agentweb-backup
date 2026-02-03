@@ -1,6 +1,31 @@
 import { agentModeService } from '../../services/agentModeService';
 import { mcpToolRegistry } from './registry';
 
+mcpToolRegistry.register({
+  name: 'install_skills',
+  definition: {
+    name: 'install_skills',
+    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skillIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of skill IDs to install.'
+        }
+      },
+      required: ['skillIds']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId || !context?.sessionId) {
+        throw new Error("Missing user or session context");
+    }
+    return await agentModeService.installSkills(args.skillIds, context.userId, context.sessionId);
+  }
+});
+
 // --- Tools from marketingTools.ts ---
 mcpToolRegistry.register({
   name: 'list_meta_ads_campaigns',
