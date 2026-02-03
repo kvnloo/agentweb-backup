@@ -3209,6 +3209,12 @@ export const crmDb = {
       updatedAt: string;
       sessionId?: string;
     } | null;
+    icpMatch?: {
+      isMatch: boolean;
+      score: number;
+      reason: string;
+      matchedAt: string;
+    } | null;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -3289,6 +3295,16 @@ export const crmDb = {
         } else {
           setExpressions.push('emailDraft = :emailDraft');
           expressionAttributeValues[':emailDraft'] = updates.emailDraft;
+        }
+      }
+
+      if (updates.icpMatch !== undefined) {
+        if (updates.icpMatch === null) {
+          // Remove icpMatch attribute
+          removeExpressions.push('icpMatch');
+        } else {
+          setExpressions.push('icpMatch = :icpMatch');
+          expressionAttributeValues[':icpMatch'] = updates.icpMatch;
         }
       }
 
@@ -3724,12 +3740,12 @@ export const crmDb = {
       if (user && user.emailDomain) {
         const emailEventsDb = require('./emailEventsDb').emailEventsDb;
         const leadEmail = lead.email?.toLowerCase();
-        
+
         if (leadEmail) {
           // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
           const filteredEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail);
           totalCount += filteredEvents.length;
-          
+
           // Count email events in last 7 days
           filteredEvents.forEach((event: any) => {
             const createdAt = new Date(event.createdAt);
@@ -3738,6 +3754,22 @@ export const crmDb = {
             }
           });
         }
+      }
+
+      // Count LinkedIn message events
+      const leadLinkedIn = lead.linkedin?.toLowerCase();
+      if (leadLinkedIn) {
+        const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+        const linkedInEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
+        totalCount += linkedInEvents.length;
+
+        // Count LinkedIn events in last 7 days
+        linkedInEvents.forEach((event: any) => {
+          const createdAt = new Date(event.createdAt);
+          if (createdAt >= sevenDaysAgo) {
+            last7DaysCount++;
+          }
+        });
       }
 
       return { total: totalCount, last7Days: last7DaysCount };

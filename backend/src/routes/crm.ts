@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { crmDb, taskDb, subscriberDb } from '../services/db';
+import { crmDb, taskDb, subscriberDb, userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
@@ -1131,6 +1131,242 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
   } catch (error: any) {
     console.error('Error processing LinkedIn import:', error);
     res.status(500).json({ message: error.message || 'Failed to process LinkedIn import' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/match-icps
+ * @desc Match leads against ICPs using Claude 4.5
+ * @access Private
+ * @query mode - "preview" (default) or "match"
+ */
+router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const mode = (req.query.mode as string || 'preview').toLowerCase();
+    const socketId = req.body.socketId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Helper function to emit progress
+    const emitProgress = (message: string, progress: number) => {
+      if (socketId) {
+        io.to(socketId).emit('icp-match-progress', {
+          message,
+          progress: Math.round(progress),
+        });
+      }
+    };
+
+    // Get user settings to fetch market strategy
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const marketStrategyData = user.marketStrategy;
+    if (!marketStrategyData) {
+      return res.status(400).json({ message: 'Market strategy not found. Please set up your market strategy in /market-strategy first.' });
+    }
+
+    // Check if ICPs are defined
+    if (!marketStrategyData.icp || marketStrategyData.icp.length === 0) {
+      return res.status(400).json({ message: 'ICPs not defined. Please define your Ideal Customer Profiles in /market-strategy before proceeding.' });
+    }
+
+    // Format market strategy into readable text
+    const marketStrategy = JSON.stringify(marketStrategyData, null, 2);
+
+    // Get all leads in the list (paginate through all)
+    const allLeads: any[] = [];
+    let lastKey: any = undefined;
+
+    do {
+      const result = await crmDb.getLeadsByListId(listId, undefined, lastKey);
+      allLeads.push(...(result.items || []));
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+
+    // Filter leads that haven't been matched yet (no icpMatch field or icpMatch is null)
+    const unmatchedLeads = allLeads.filter(lead => !lead.icpMatch);
+
+    console.log(`[ICP Match] Found ${unmatchedLeads.length} unmatched leads out of ${allLeads.length} total`);
+
+    if (mode === 'preview') {
+      return res.json({
+        success: true,
+        totalLeads: allLeads.length,
+        unmatchedLeads: unmatchedLeads.length,
+        matchedLeads: allLeads.length - unmatchedLeads.length,
+      });
+    } else if (mode === 'match') {
+      if (unmatchedLeads.length === 0) {
+        return res.json({
+          success: true,
+          message: 'No unmatched leads to process',
+          processedCount: 0,
+        });
+      }
+
+      // Import LLMService
+      const { createLLMService } = await import('../utils/llmService');
+
+      emitProgress('Starting ICP matching...', 0);
+
+      // Split leads into 5 chunks for parallel processing
+      const parallelism = 5;
+      const chunkSize = Math.ceil(unmatchedLeads.length / parallelism);
+      const chunks: any[][] = [];
+
+      for (let i = 0; i < unmatchedLeads.length; i += chunkSize) {
+        chunks.push(unmatchedLeads.slice(i, i + chunkSize));
+      }
+
+      console.log(`[ICP Match] Processing ${unmatchedLeads.length} leads in ${chunks.length} parallel chunks`);
+
+      // Shared progress tracking
+      let totalProcessedCount = 0;
+      const progressLock = { value: 0 }; // Simple object to share progress state
+
+      // Process each chunk in parallel
+      const chunkProcessors = chunks.map(async (chunk, chunkIndex) => {
+        // Create separate LLM service instance for each parallel task
+        const llmService = createLLMService('anthropic.claude-sonnet-4-5-20250929-v1:0', 0.7, 4000);
+
+        const batchSize = 10;
+        let chunkProcessedCount = 0;
+
+        for (let i = 0; i < chunk.length; i += batchSize) {
+          const batch = chunk.slice(i, i + batchSize);
+
+          // Prepare batch data for LLM
+          const leadsData = batch.map((lead, index) => ({
+            index: i + index + 1,
+            name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || 'N/A',
+            email: lead.email || 'N/A',
+            company: lead.company || 'N/A',
+            title: lead.title || 'N/A',
+            phone: lead.phone || 'N/A',
+            linkedin: lead.linkedin || 'N/A',
+            notes: lead.notes || 'N/A',
+          }));
+
+          const systemPrompt = `You are an expert business analyst helping to identify Ideal Customer Profile (ICP) matches.
+
+Your task is to analyze each lead and determine if they match the provided market strategy and ICP criteria.
+
+For each lead, provide:
+1. "isMatch": boolean (true if the lead matches the ICP, false otherwise)
+2. "reason": string (concise explanation of why they match or don't match, 1-2 sentences)
+3. "score": number (0-100, confidence score of the match)
+
+Consider factors like:
+- Job title and seniority level
+- Company size and industry
+- Geographic location (if relevant)
+- Technology stack or interests (from LinkedIn/notes)
+- Budget indicators
+- Pain points alignment
+
+Return your analysis as a JSON array with the exact structure:
+[
+  {
+    "index": 1,
+    "isMatch": true,
+    "score": 85,
+    "reason": "Senior decision-maker in target industry with clear pain points"
+  },
+  ...
+]`;
+
+          const userPrompt = `Market Strategy and ICP Criteria:
+${marketStrategy}
+
+Leads to Analyze:
+${JSON.stringify(leadsData, null, 2)}
+
+Please analyze each lead and return a JSON array with your assessment.`;
+
+          try {
+            // Escape curly braces for LangChain template parser
+            const escapeBraces = (str: string) => str.replace(/{/g, '{{').replace(/}/g, '}}');
+            const escapedSystemPrompt = escapeBraces(systemPrompt);
+            const escapedUserPrompt = escapeBraces(userPrompt);
+
+            // Call LLM
+            const response = await llmService.generateJSONContent<Array<{
+              index: number;
+              isMatch: boolean;
+              score: number;
+              reason: string;
+            }>>(escapedSystemPrompt, escapedUserPrompt, 'json');
+
+            // Update each lead with ICP match result
+            for (const result of response) {
+              const leadIndex = result.index - 1;
+              if (leadIndex >= 0 && leadIndex < chunk.length) {
+                const lead = chunk[leadIndex];
+
+                // Update lead in DynamoDB
+                await crmDb.updateLead(listId, lead.leadId, {
+                  icpMatch: {
+                    isMatch: result.isMatch,
+                    score: result.score,
+                    reason: result.reason,
+                    matchedAt: new Date().toISOString(),
+                  },
+                });
+
+                chunkProcessedCount++;
+                totalProcessedCount++;
+              }
+            }
+          } catch (error) {
+            console.error(`[ICP Match] Error processing chunk ${chunkIndex + 1}, batch ${i / batchSize + 1}:`, error);
+            // Continue with next batch even if one fails
+          }
+
+          // Update progress (thread-safe-ish for Node.js single-threaded event loop)
+          const progress = Math.min((totalProcessedCount / unmatchedLeads.length) * 100, 100);
+          emitProgress(`Processed ${totalProcessedCount} of ${unmatchedLeads.length} leads`, progress);
+        }
+
+        return chunkProcessedCount;
+      });
+
+      // Wait for all parallel chunks to complete
+      const chunkResults = await Promise.all(chunkProcessors);
+      const processedCount = chunkResults.reduce((sum, count) => sum + count, 0);
+
+      console.log(`[ICP Match] Completed processing. Total processed: ${processedCount}`);
+      emitProgress('ICP matching complete!', 100);
+
+      res.json({
+        success: true,
+        message: `Successfully matched ${processedCount} leads`,
+        processedCount,
+        totalUnmatched: unmatchedLeads.length,
+      });
+    } else {
+      res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "match"' });
+    }
+  } catch (error: any) {
+    console.error('Error matching ICPs:', error);
+    res.status(500).json({ message: error.message || 'Failed to match ICPs' });
   }
 });
 
