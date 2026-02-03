@@ -170,6 +170,7 @@ export interface ChatSession {
     adminEmail: string;
     isDelegated: boolean;
   }; // Delegate access info when admin is acting on behalf of a user
+  associatedSkills?: string[]; // List of skill IDs associated for this session
 }
 
 // Interface for context chunks
@@ -1074,12 +1075,45 @@ export class ChatbotDB {
       // Remove messages from session object and replace with messages from messages table
       // This ensures we always return the correct format from the messages table
       const { messages: _, ...sessionWithoutMessages } = session;
-      return {
+      const normalizedSession = {
         ...sessionWithoutMessages,
         messages,
       };
+
+      // Normalize associatedSkills to string[] (handles DynamoDB Set wrapper)
+      if (normalizedSession.associatedSkills) {
+        if (typeof normalizedSession.associatedSkills === 'object' && 'values' in (normalizedSession.associatedSkills as any)) {
+          normalizedSession.associatedSkills = (normalizedSession.associatedSkills as any).values;
+        } else if (normalizedSession.associatedSkills instanceof Set) {
+          normalizedSession.associatedSkills = Array.from(normalizedSession.associatedSkills as any);
+        }
+      } else {
+        normalizedSession.associatedSkills = [];
+      }
+
+      return normalizedSession as ChatSession;
     } catch (error) {
       console.error("Error getting chat session:", error);
+      throw error;
+    }
+  }
+
+  async addAssociatedSkills(sessionId: string, skillIds: string[]): Promise<void> {
+    if (!skillIds || !skillIds.length) return;
+
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "ADD associatedSkills :skills",
+      ExpressionAttributeValues: {
+        ":skills": dynamodb.createSet(skillIds),
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error(`Error adding associated skills for session ${sessionId}:`, error);
       throw error;
     }
   }

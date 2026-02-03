@@ -149,62 +149,43 @@ describe('AgentModeService - Tool Descriptions', () => {
     });
   });
 
-  describe('System Prompt - Web Automation Clarification', () => {
-    it('should clarify that task creation tools are for web automation only', async () => {
+  describe('System Prompt - Skill-Based Approach', () => {
+    it('should mention skill installation workflow', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      // System prompt should explicitly state web automation limitation
-      expect(systemPrompt).toContain('Web Automation Tasks Only');
-      expect(systemPrompt).toContain('ONLY for web automation tasks');
+      expect(systemPrompt).toContain('install_skills');
     });
 
-    it('should specify what web automation tasks involve', async () => {
+    it('should explain the skills approach for expanding capabilities', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      // Should mention browser interaction as a key characteristic
-      expect(systemPrompt).toContain('browser interaction');
+      expect(systemPrompt).toContain('skill');
+      expect(systemPrompt).toContain('limited set of tools');
     });
 
-    it('should clarify what task creation tools cannot do', async () => {
+    it('should provide guidance on file attachments', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      // Should explicitly state limitations
-      expect(systemPrompt).toContain('cannot run generic tasks');
+      expect(systemPrompt).toContain('Handling File Attachments');
+      expect(systemPrompt).toContain('markdown links');
     });
 
-    it('should mention both tools in the web automation context', async () => {
+    it('should include response formatting guidelines', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      // Find the section about web automation tasks
-      const webAutomationSection = systemPrompt.match(
-        /Web Automation Tasks Only.*?create_task_from_template.*?create_task_from_prompt/s
-      );
-
-      expect(webAutomationSection).not.toBeNull();
-      expect(webAutomationSection![0]).toContain('create_task_from_template');
-      expect(webAutomationSection![0]).toContain('create_task_from_prompt');
+      expect(systemPrompt).toContain('Format your responses in HTML5');
+      expect(systemPrompt).toContain('<strong>');
+      expect(systemPrompt).toContain('<ul>');
     });
 
-    it('should provide examples of web automation tasks', async () => {
+    it('should emphasize proactive skill discovery', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      // Should include concrete examples
-      const hasExamples = 
-        systemPrompt.includes('logging into websites') ||
-        systemPrompt.includes('scraping data') ||
-        systemPrompt.includes('filling forms');
-
-      expect(hasExamples).toBe(true);
+      expect(systemPrompt).toContain('proactive');
     });
 
-    it('should emphasize web automation in template descriptions', async () => {
+    it('should mention Emma as the AI assistant name', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      // The fallback method description should also mention web automation
-      expect(systemPrompt).toContain('web automation marketing tasks');
-      expect(systemPrompt).toContain('web automation task with a raw prompt');
+      expect(systemPrompt).toContain('Emma');
+      expect(systemPrompt).toContain('AI-powered marketing assistant');
     });
   });
+
 
   describe('Market Strategy Tool Descriptions', () => {
     it('should have update_market_strategy tool with buyerPersonas field in ICP description', () => {

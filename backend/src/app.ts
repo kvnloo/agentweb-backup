@@ -32,6 +32,7 @@ import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import mcpServersRoutes from "./routes/mcpServers";
+import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
@@ -171,6 +172,7 @@ app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
+app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
 
 

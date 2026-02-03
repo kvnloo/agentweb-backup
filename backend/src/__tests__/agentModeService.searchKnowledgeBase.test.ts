@@ -355,25 +355,14 @@ describe('AgentModeService - search_knowledge_base', () => {
   });
 
   describe('System Prompt', () => {
-    it('should mention search_knowledge_base in system prompt', async () => {
+    it('should mention skill installation workflow', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      expect(systemPrompt).toContain('search_knowledge_base');
-      expect(systemPrompt).toContain('Knowledge Base Search');
+      expect(systemPrompt).toContain('install_skills');
     });
 
-    it('should explain when to use knowledge base vs web search', async () => {
+    it('should provide guidance on file attachments', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      expect(systemPrompt).toContain('knowledge base for stored information');
-      expect(systemPrompt).toContain('web search for information from the internet');
-    });
-
-    it('should mention private and public knowledge', async () => {
-      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-
-      expect(systemPrompt).toContain('private knowledge');
-      expect(systemPrompt).toContain('public knowledge');
+      expect(systemPrompt).toContain('Handling File Attachments');
     });
   });
 });

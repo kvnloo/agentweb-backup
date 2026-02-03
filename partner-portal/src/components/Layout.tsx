@@ -161,6 +161,14 @@ export default function Layout() {
                       <Button 
                         color="primary" 
                         component={RouterLink} 
+                        to="/skills"
+                        variant={isActivePath('/skills') ? 'contained' : 'text'}
+                      >
+                        Skills
+                      </Button>
+                      <Button 
+                        color="primary" 
+                        component={RouterLink} 
                         to="/gtm-ops"
                         variant={isActivePath('/gtm-ops') ? 'contained' : 'text'}
                       >
