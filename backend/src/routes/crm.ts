@@ -1147,6 +1147,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
     const { listId } = req.params;
     const mode = (req.query.mode as string || 'preview').toLowerCase();
     const socketId = req.body.socketId;
+    const forceRematch = req.body.forceRematch === true;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1201,10 +1202,14 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       lastKey = result.lastEvaluatedKey;
     } while (lastKey);
 
-    // Filter leads that haven't been matched yet (no icpMatch field or icpMatch is null)
+    // Filter leads based on forceRematch flag
+    const leadsToProcess = forceRematch
+      ? allLeads // Process all leads if force rematch
+      : allLeads.filter(lead => !lead.icpMatch); // Only unmatched leads by default
+
     const unmatchedLeads = allLeads.filter(lead => !lead.icpMatch);
 
-    console.log(`[ICP Match] Found ${unmatchedLeads.length} unmatched leads out of ${allLeads.length} total`);
+    console.log(`[ICP Match] Found ${leadsToProcess.length} leads to process (forceRematch: ${forceRematch}). ${unmatchedLeads.length} unmatched, ${allLeads.length - unmatchedLeads.length} already matched.`);
 
     if (mode === 'preview') {
       return res.json({
@@ -1212,12 +1217,14 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
         totalLeads: allLeads.length,
         unmatchedLeads: unmatchedLeads.length,
         matchedLeads: allLeads.length - unmatchedLeads.length,
+        leadsToProcess: leadsToProcess.length,
+        forceRematch,
       });
     } else if (mode === 'match') {
-      if (unmatchedLeads.length === 0) {
+      if (leadsToProcess.length === 0) {
         return res.json({
           success: true,
-          message: 'No unmatched leads to process',
+          message: 'No leads to process',
           processedCount: 0,
         });
       }
@@ -1229,14 +1236,14 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
 
       // Split leads into 5 chunks for parallel processing
       const parallelism = 5;
-      const chunkSize = Math.ceil(unmatchedLeads.length / parallelism);
+      const chunkSize = Math.ceil(leadsToProcess.length / parallelism);
       const chunks: any[][] = [];
 
-      for (let i = 0; i < unmatchedLeads.length; i += chunkSize) {
-        chunks.push(unmatchedLeads.slice(i, i + chunkSize));
+      for (let i = 0; i < leadsToProcess.length; i += chunkSize) {
+        chunks.push(leadsToProcess.slice(i, i + chunkSize));
       }
 
-      console.log(`[ICP Match] Processing ${unmatchedLeads.length} leads in ${chunks.length} parallel chunks`);
+      console.log(`[ICP Match] Processing ${leadsToProcess.length} leads in ${chunks.length} parallel chunks`);
 
       // Shared progress tracking
       let totalProcessedCount = 0;
@@ -1254,16 +1261,30 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
           const batch = chunk.slice(i, i + batchSize);
 
           // Prepare batch data for LLM
-          const leadsData = batch.map((lead, index) => ({
-            index: i + index + 1,
-            name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || 'N/A',
-            email: lead.email || 'N/A',
-            company: lead.company || 'N/A',
-            title: lead.title || 'N/A',
-            phone: lead.phone || 'N/A',
-            linkedin: lead.linkedin || 'N/A',
-            notes: lead.notes || 'N/A',
-          }));
+          const leadsData = batch.map((lead, index) => {
+            const data: any = {
+              index: i + index + 1,
+              name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || 'N/A',
+              email: lead.email || 'N/A',
+              company: lead.company || 'N/A',
+              title: lead.title || 'N/A',
+              phone: lead.phone || 'N/A',
+              linkedin: lead.linkedin || 'N/A',
+              notes: lead.notes || 'N/A',
+            };
+
+            // Include previous match result if this is a rematch
+            if (lead.icpMatch) {
+              data.previousMatch = {
+                isMatch: lead.icpMatch.isMatch,
+                score: lead.icpMatch.score,
+                reason: lead.icpMatch.reason,
+                matchedAt: lead.icpMatch.matchedAt,
+              };
+            }
+
+            return data;
+          });
 
           const systemPrompt = `You are an expert business analyst helping to identify Ideal Customer Profile (ICP) matches.
 
@@ -1281,6 +1302,8 @@ Consider factors like:
 - Technology stack or interests (from LinkedIn/notes)
 - Budget indicators
 - Pain points alignment
+
+IMPORTANT: Some leads may include a "previousMatch" field with a prior analysis. If present, consider this previous assessment but make your own independent judgment. You may agree or disagree with the previous analysis based on the current ICP criteria.
 
 Return your analysis as a JSON array with the exact structure:
 [
@@ -1341,8 +1364,8 @@ Please analyze each lead and return a JSON array with your assessment.`;
           }
 
           // Update progress (thread-safe-ish for Node.js single-threaded event loop)
-          const progress = Math.min((totalProcessedCount / unmatchedLeads.length) * 100, 100);
-          emitProgress(`Processed ${totalProcessedCount} of ${unmatchedLeads.length} leads`, progress);
+          const progress = Math.min((totalProcessedCount / leadsToProcess.length) * 100, 100);
+          emitProgress(`Processed ${totalProcessedCount} of ${leadsToProcess.length} leads`, progress);
         }
 
         return chunkProcessedCount;
@@ -1359,7 +1382,7 @@ Please analyze each lead and return a JSON array with your assessment.`;
         success: true,
         message: `Successfully matched ${processedCount} leads`,
         processedCount,
-        totalUnmatched: unmatchedLeads.length,
+        totalLeadsProcessed: leadsToProcess.length,
       });
     } else {
       res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "match"' });
