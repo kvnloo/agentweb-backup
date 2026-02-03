@@ -32,7 +32,7 @@ import {
   Edit as EditIcon,
   Add as AddIcon,
   AdminPanelSettings as AdminIcon,
-  InfoOutlined as InfoIcon,
+
   Close as CloseIcon,
   Delete as DeleteIcon,
   CheckBoxOutlineBlank as CheckBoxOutlineBlankIcon,
@@ -187,14 +187,7 @@ export default function Skills() {
     }
   };
 
-  const formatParameters = (params?: ToolParameter) => {
-    if (!params || !params.properties) return "No parameters";
-    const props = Object.keys(params.properties);
-    if (props.length === 0) return "No parameters";
-    
-    const required = params.required || [];
-    return props.map(p => `${p}${required.includes(p) ? '*' : ''}`).join(", ");
-  };
+
 
   const filteredSkills = skills.filter(skill => 
     skill.name.toLowerCase().includes(searchText.toLowerCase()) || 
