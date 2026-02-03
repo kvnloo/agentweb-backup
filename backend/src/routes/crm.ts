@@ -228,7 +228,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -251,6 +251,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
       listSenderId?: string | null;
+      icpsOnly?: boolean;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -309,6 +310,13 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         }
       }
       updates.listSenderId = normalizedListSenderId;
+    }
+
+    if (icpsOnly !== undefined) {
+      if (typeof icpsOnly !== 'boolean') {
+        return res.status(400).json({ message: 'icpsOnly must be a boolean' });
+      }
+      updates.icpsOnly = icpsOnly;
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);
@@ -385,34 +393,82 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     // Validate inputs
     const validPage = Math.max(1, page);
-    const validLimit = Math.min(Math.max(1, limit), 100); // Between 1 and 100
+    const validLimit = Math.min(Math.max(1, limit), 500); // Between 1 and 500
 
-    // For page-based pagination, we need to fetch all previous pages to get to the desired page
-    // This is not ideal for DynamoDB but necessary for page number navigation
-    let lastEvaluatedKey = undefined;
-    if (validPage > 1) {
-      // Fetch pages 1 through (page - 1) to get the cursor for the desired page
-      for (let p = 1; p < validPage; p++) {
-        const prevResult = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
-        lastEvaluatedKey = prevResult.lastEvaluatedKey;
-        if (!lastEvaluatedKey) {
-          // We've reached the end, return empty results
-          return res.json({
-            leads: [],
-            page: validPage,
-            limit: validLimit,
-            totalPages: p,
-            hasMore: false,
-          });
+    let filteredLeads: any[] = [];
+    let hasMoreLeads = true;
+    let totalFilteredCount: number | null = null;
+
+    if (list.icpsOnly) {
+      // ICPs only mode: Fetch ALL ICP leads to get accurate count
+      let allIcpLeads: any[] = [];
+      let currentLastKey = undefined;
+
+      // Fetch all leads and filter to ICPs
+      while (hasMoreLeads) {
+        const result = await crmDb.getLeadsByListId(listId, validLimit, currentLastKey);
+
+        // Filter to only ICP matches
+        const icpLeads = result.items.filter((lead: any) => lead.icpMatch?.isMatch === true);
+        allIcpLeads.push(...icpLeads);
+
+        currentLastKey = result.lastEvaluatedKey;
+        hasMoreLeads = !!result.lastEvaluatedKey;
+      }
+
+      // Now we have all ICP leads and know the exact total
+      totalFilteredCount = allIcpLeads.length;
+
+      // Slice to get only the leads for the requested page
+      const targetLeadsToSkip = (validPage - 1) * validLimit;
+      const targetLeadsToReturn = validLimit;
+      filteredLeads = allIcpLeads.slice(targetLeadsToSkip, targetLeadsToSkip + targetLeadsToReturn);
+
+      // Check if there are more ICP leads after this page
+      hasMoreLeads = allIcpLeads.length > targetLeadsToSkip + targetLeadsToReturn;
+
+      // If we got no leads for this page, it means we're beyond the last page
+      if (filteredLeads.length === 0 && validPage > 1) {
+        return res.json({
+          leads: [],
+          page: validPage,
+          limit: validLimit,
+          totalPages: validPage - 1,
+          hasMore: false,
+          totalFilteredCount: 0,
+        });
+      }
+    } else {
+      // No filter, use normal pagination
+      let lastEvaluatedKey = undefined;
+
+      // For page > 1, fetch previous pages to get the cursor
+      if (validPage > 1) {
+        for (let p = 1; p < validPage; p++) {
+          const prevResult = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
+          lastEvaluatedKey = prevResult.lastEvaluatedKey;
+          if (!lastEvaluatedKey) {
+            // We've reached the end, return empty results
+            return res.json({
+              leads: [],
+              page: validPage,
+              limit: validLimit,
+              totalPages: p,
+              hasMore: false,
+            });
+          }
         }
       }
+
+      // Fetch the current page
+      const result = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
+      filteredLeads = result.items;
+      hasMoreLeads = !!result.lastEvaluatedKey;
     }
 
-    const result = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
-    
     // Add engagement counts to each lead
     const leadsWithCounts = await Promise.all(
-      result.items.map(async (lead: any) => {
+      filteredLeads.map(async (lead: any) => {
         const engagementCounts = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
         return {
           ...lead,
@@ -421,17 +477,18 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         };
       })
     );
-    
+
     // Calculate total pages (approximate - we don't know the exact total without scanning all)
     // For now, we'll indicate if there are more pages
-    const totalPages = result.hasMore ? validPage + 1 : validPage;
+    const totalPages = hasMoreLeads ? validPage + 1 : validPage;
 
     res.json({
       leads: leadsWithCounts,
       page: validPage,
       limit: validLimit,
-      totalPages: result.hasMore ? null : validPage, // null means unknown total
-      hasMore: result.hasMore,
+      totalPages: hasMoreLeads ? null : validPage, // null means unknown total
+      hasMore: hasMoreLeads,
+      totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
     });
   } catch (error: any) {
     console.error('Error fetching leads:', error);

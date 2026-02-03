@@ -2853,6 +2853,7 @@ export const crmDb = {
       alertEvents?: string[];
       listSenderId?: string | null;
       publicAccessEnabled?: boolean;
+      icpsOnly?: boolean;
     }
   ) {
     try {
@@ -2900,6 +2901,12 @@ export const crmDb = {
         expressionAttributeNames['#publicAccessEnabled'] = 'publicAccessEnabled';
         updateExpressions.push('#publicAccessEnabled = :publicAccessEnabled');
         expressionAttributeValues[':publicAccessEnabled'] = updates.publicAccessEnabled;
+      }
+
+      if (updates.icpsOnly !== undefined) {
+        expressionAttributeNames['#icpsOnly'] = 'icpsOnly';
+        updateExpressions.push('#icpsOnly = :icpsOnly');
+        expressionAttributeValues[':icpsOnly'] = updates.icpsOnly;
       }
 
       if (updateExpressions.length === 0) {
