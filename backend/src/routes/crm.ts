@@ -6,6 +6,58 @@ import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
+import AdmZip from 'adm-zip';
+import { emailEventsDb } from '../services/emailEventsDb';
+import { dynamodb } from '../config/aws';
+import { io } from '../server';
+
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+/**
+ * Normalize LinkedIn URL to standard format: https://www.linkedin.com/in/<username>
+ * Strips trailing slashes, query parameters, fragments, and ensures consistent protocol
+ */
+function normalizeLinkedInUrl(url: string): string {
+  if (!url) return '';
+
+  try {
+    // Remove whitespace and convert to lowercase
+    let normalized = url.trim().toLowerCase();
+
+    // Add https:// if missing
+    if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+      normalized = 'https://' + normalized;
+    }
+
+    // Parse URL
+    const urlObj = new URL(normalized);
+
+    // Only accept linkedin.com domains
+    if (!urlObj.hostname.endsWith('linkedin.com')) {
+      return normalized; // Return as-is if not a LinkedIn URL
+    }
+
+    // Extract pathname and clean it
+    let pathname = urlObj.pathname;
+
+    // Remove trailing slash
+    pathname = pathname.replace(/\/$/, '');
+
+    // Only accept /in/ profile URLs (not company pages, etc.)
+    const match = pathname.match(/^\/in\/([a-zA-Z0-9_-]+)/);
+    if (!match) {
+      return normalized; // Return as-is if not a valid /in/ profile URL
+    }
+
+    const username = match[1];
+
+    // Return canonical format
+    return `https://www.linkedin.com/in/${username}`;
+  } catch (error) {
+    // If URL parsing fails, return cleaned version
+    return url.trim().toLowerCase().replace(/\/$/, '');
+  }
+}
 
 const router = express.Router();
 const upload = multer({
@@ -668,6 +720,417 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
   } catch (error: any) {
     console.error('Error importing leads:', error);
     res.status(500).json({ message: error.message || 'Failed to import leads' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/import-linkedin
+ * @desc Import or preview LinkedIn data export
+ * @access Private
+ * @query mode - "preview" (default) or "import"
+ */
+router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const mode = (req.query.mode as string || 'preview').toLowerCase(); // Default to preview
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'ZIP file is required' });
+    }
+
+    const userLinkedInUrl = normalizeLinkedInUrl(req.body.userLinkedInUrl || '');
+    if (!userLinkedInUrl) {
+      return res.status(400).json({ message: 'Your LinkedIn profile URL is required' });
+    }
+
+    // Validate that it's a proper LinkedIn /in/ profile URL
+    if (!userLinkedInUrl.includes('linkedin.com/in/')) {
+      return res.status(400).json({ message: 'Please provide a valid LinkedIn profile URL (https://www.linkedin.com/in/your-profile)' });
+    }
+
+    const socketId = req.body.socketId; // Optional socket ID for progress updates
+
+    // Helper function to emit progress
+    const emitProgress = (message: string, progress?: number) => {
+      if (socketId && mode === 'import') {
+        io.to(socketId).emit('import-progress', { message, progress });
+      }
+    };
+
+    // Parse ZIP file
+    let zip: AdmZip;
+    try {
+      zip = new AdmZip(req.file.buffer);
+    } catch (error: any) {
+      return res.status(400).json({ message: 'Invalid ZIP file' });
+    }
+
+    const zipEntries = zip.getEntries();
+
+    // Find Connections.csv
+    const connectionsEntry = zipEntries.find(e => e.entryName === 'Connections.csv');
+    if (!connectionsEntry) {
+      return res.status(400).json({ message: 'Connections.csv not found in ZIP file' });
+    }
+
+    // Parse Connections.csv
+    let connectionsRecords: any[];
+    try {
+      const connectionsContent = connectionsEntry.getData().toString('utf-8');
+      connectionsRecords = parse(connectionsContent, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        from_line: 4,
+        relax_column_count: true,
+      });
+    } catch (parseError: any) {
+      return res.status(400).json({ message: `Failed to parse Connections.csv: ${parseError.message}` });
+    }
+
+    // Filter connections with URLs and normalize them
+    const validConnections = connectionsRecords
+      .filter(c => c.URL)
+      .map(c => ({
+        ...c,
+        URL: normalizeLinkedInUrl(c.URL),
+      }))
+      .filter(c => c.URL); // Remove any that failed normalization
+
+    // Get existing leads to check for duplicates (paginate through all results)
+    const existingLeads: any[] = [];
+    let leadsLastKey: any = undefined;
+
+    do {
+      const existingLeadsResult = await crmDb.getLeadsByListId(listId, undefined, leadsLastKey);
+      existingLeads.push(...(existingLeadsResult.items || []));
+      leadsLastKey = existingLeadsResult.lastEvaluatedKey;
+    } while (leadsLastKey);
+
+    const existingEmails = new Set(existingLeads.map((l: any) => l.email?.toLowerCase()).filter(Boolean));
+    const existingLinkedIns = new Set(existingLeads.map((l: any) => normalizeLinkedInUrl(l.linkedin || '')).filter(Boolean));
+
+    // Debug logging
+    console.log(`[LinkedIn Import] Found ${existingLeads.length} existing leads`);
+    console.log(`[LinkedIn Import] Existing LinkedIn URLs (first 5):`, Array.from(existingLinkedIns).slice(0, 5));
+    console.log(`[LinkedIn Import] Checking ${validConnections.length} connections from file`);
+    if (validConnections.length > 0) {
+      console.log(`[LinkedIn Import] Sample connection URL from file:`, validConnections[0].URL);
+    }
+
+    // Count duplicates
+    let duplicateCount = 0;
+    const newConnections: any[] = [];
+    const sampleConnections: any[] = [];
+
+    for (const connection of validConnections) {
+      const email = connection['Email Address']?.trim().toLowerCase();
+      const linkedin = connection.URL; // Already normalized
+
+      const emailMatch = email && existingEmails.has(email);
+      const linkedinMatch = linkedin && existingLinkedIns.has(linkedin);
+      const isDuplicate = emailMatch || linkedinMatch;
+
+      if (isDuplicate) {
+        duplicateCount++;
+      } else {
+        newConnections.push(connection);
+        if (sampleConnections.length < 10) {
+          sampleConnections.push({
+            firstName: connection['First Name'] || '',
+            lastName: connection['Last Name'] || '',
+            company: connection.Company || '',
+            position: connection.Position || '',
+            email: connection['Email Address'] || '',
+            linkedin: connection.URL || '',
+            connectedOn: connection['Connected On'] || '',
+          });
+        }
+      }
+    }
+
+    // Debug summary for connections
+    console.log(`[LinkedIn Import] Connection deduplication: ${newConnections.length} new, ${duplicateCount} duplicates out of ${validConnections.length} total`);
+    if (newConnections.length > 0 && newConnections.length <= 10) {
+      console.log(`[LinkedIn Import] New connections that don't match:`, newConnections.map(c => ({
+        name: `${c['First Name']} ${c['Last Name']}`,
+        email: c['Email Address'] || 'no email',
+        linkedin: c.URL || 'no linkedin'
+      })));
+    }
+
+    // Parse messages if available
+    const messagesEntry = zipEntries.find(e => e.entryName === 'messages.csv');
+    let totalMessagesInFile = 0;
+    let newMessagesCount = 0;
+    let duplicateMessagesCount = 0;
+    let messagesSuccessCount = 0;
+    let messagesFailedCount = 0;
+
+    // Declare connections import tracking variables
+    let connectionsSuccessCount = 0;
+    let connectionsErrorCount = 0;
+    let connectionsErrors: string[] = [];
+
+    if (messagesEntry) {
+      try {
+        const messagesContent = messagesEntry.getData().toString('utf-8');
+        const messagesRecords = parse(messagesContent, {
+          columns: true,
+          skip_empty_lines: true,
+          trim: true,
+          relax_column_count: true,
+        });
+
+        // Filter valid messages
+        const validMessages = messagesRecords.filter((m: any) => m['CONVERSATION ID'] && m.DATE);
+        totalMessagesInFile = validMessages.length;
+
+        // Get existing email events to check for duplicates
+        // Use EmailDomainIndex to get all events for this domain
+        const existingEventKeys = new Set<string>();
+        let lastEvaluatedKey: any = undefined;
+
+        do {
+          const existingEventsParams: any = {
+            TableName: `${TABLE_PREFIX}AW-EmailEvents`,
+            IndexName: 'EmailDomainIndex',
+            KeyConditionExpression: 'emailDomain = :domain',
+            ExpressionAttributeValues: {
+              ':domain': `linkedin-${listId}`,
+            },
+          };
+
+          if (lastEvaluatedKey) {
+            existingEventsParams.ExclusiveStartKey = lastEvaluatedKey;
+          }
+
+          const existingEventsResult = await dynamodb.query(existingEventsParams).promise();
+
+          (existingEventsResult.Items || []).forEach((item: any) => {
+            const conversationId = item.data?.conversationId || item.emailId || '';
+            const date = item.data?.date || item.createdAt || '';
+            existingEventKeys.add(`${conversationId}-${date}`);
+          });
+
+          lastEvaluatedKey = existingEventsResult.LastEvaluatedKey;
+        } while (lastEvaluatedKey);
+
+        // Debug logging
+        console.log(`[LinkedIn Import] Found ${existingEventKeys.size} existing message events`);
+        console.log(`[LinkedIn Import] Existing event keys (first 5):`, Array.from(existingEventKeys).slice(0, 5));
+        console.log(`[LinkedIn Import] Checking ${validMessages.length} messages from file`);
+        if (validMessages.length > 0) {
+          const sampleMsg = validMessages[0];
+          console.log(`[LinkedIn Import] Sample message key from file:`, `${sampleMsg['CONVERSATION ID']}-${sampleMsg.DATE}`);
+        }
+
+        // Count new vs duplicate messages, and filter for messages involving the user
+        const newMessages: any[] = [];
+        for (const message of validMessages) {
+          const conversationId = message['CONVERSATION ID'];
+          const date = message.DATE;
+          const senderProfileUrl = normalizeLinkedInUrl(message['SENDER PROFILE URL'] || '');
+          const recipientProfileUrls = message['RECIPIENT PROFILE URLS'] || '';
+
+          // Normalize recipient URLs (comma-separated list)
+          const normalizedRecipientUrls = recipientProfileUrls
+            .split(',')
+            .map((url: string) => normalizeLinkedInUrl(url.trim()))
+            .filter(Boolean);
+
+          // Determine if this message involves the user
+          const senderIsUser = senderProfileUrl === userLinkedInUrl;
+          const recipientIsUser = normalizedRecipientUrls.some((url: string) => url === userLinkedInUrl);
+
+          // Only process messages where one party is the user
+          if (!senderIsUser && !recipientIsUser) {
+            continue; // Skip messages that don't involve the user
+          }
+
+          // Determine the lead LinkedIn URL (whoever is NOT the user)
+          let leadLinkedInUrl: string;
+          let messageDirection: 'sent' | 'received';
+
+          if (senderIsUser) {
+            // User sent this message to lead(s)
+            messageDirection = 'sent';
+            // Filter out the user from recipients and pick first lead
+            // (handles group chats where user might be in recipient list)
+            const leadRecipients = normalizedRecipientUrls.filter((url: string) => url !== userLinkedInUrl);
+            leadLinkedInUrl = leadRecipients[0]; // Use first non-user recipient
+          } else {
+            // Lead sent this message to user (sender is the lead)
+            messageDirection = 'received';
+            leadLinkedInUrl = senderProfileUrl;
+          }
+
+          if (!leadLinkedInUrl) {
+            continue; // Skip if we can't identify the lead
+          }
+
+          const eventKey = `${conversationId}-${date}`;
+
+          if (existingEventKeys.has(eventKey)) {
+            duplicateMessagesCount++;
+          } else {
+            newMessagesCount++;
+            newMessages.push({
+              ...message,
+              leadLinkedInUrl,
+              messageDirection,
+            });
+          }
+        }
+
+        // If mode is import, actually import the messages using batch
+        if (mode === 'import') {
+          emitProgress(`Importing ${newMessages.length} messages...`, 20);
+
+          // Prepare all events for batch import
+          const eventsToImport = newMessages.map((message, index) => {
+            const conversationId = message['CONVERSATION ID'];
+            const date = message.DATE;
+            const from = message.FROM;
+            const senderProfileUrl = normalizeLinkedInUrl(message['SENDER PROFILE URL'] || '');
+            const content = message.CONTENT;
+            const subject = message.SUBJECT;
+            const leadLinkedInUrl = message.leadLinkedInUrl;
+            const messageDirection = message.messageDirection;
+
+            return {
+              event: {
+                type: messageDirection === 'sent' ? 'linkedin.message.sent' : 'linkedin.message.received',
+                created_at: date,
+                data: {
+                  email_id: conversationId,
+                  conversationId,
+                  from,
+                  senderProfileUrl,
+                  content,
+                  subject,
+                  date,
+                  to: message.TO || '',
+                  recipientProfileUrls: message['RECIPIENT PROFILE URLS'] || '',
+                  folder: message.FOLDER || 'INBOX',
+                  direction: messageDirection,
+                } as any,
+              },
+              emailDomain: `linkedin-${listId}`,
+              eventId: `linkedin-${listId}-${conversationId}-${index}-${Date.now()}`,
+              overrideLeadEmail: leadLinkedInUrl,
+            };
+          });
+
+          // Batch import messages in chunks of 100 for progress updates
+          const batchSize = 100;
+
+          for (let i = 0; i < eventsToImport.length; i += batchSize) {
+            const batch = eventsToImport.slice(i, i + batchSize);
+            const batchResult = await emailEventsDb.addEmailEvents(batch);
+
+            messagesSuccessCount += batchResult.successCount;
+            messagesFailedCount += batchResult.failedCount;
+
+            // Calculate progress: 20% to 60% of overall progress
+            const messagesProgress = Math.round(20 + ((i + batch.length) / eventsToImport.length) * 40);
+            emitProgress(`Imported ${messagesSuccessCount} of ${eventsToImport.length} messages`, messagesProgress);
+          }
+
+          if (messagesFailedCount > 0) {
+            console.warn(`Failed to import ${messagesFailedCount} messages`);
+          }
+        }
+      } catch (error) {
+        console.error('Error processing messages:', error);
+        // Continue with 0 message counts if there's an error
+      }
+    }
+
+    // Return response based on mode
+    if (mode === 'preview') {
+      res.json({
+        success: true,
+        preview: {
+          totalConnectionsInFile: validConnections.length,
+          newConnectionsCount: newConnections.length,
+          duplicateConnectionsCount: duplicateCount,
+          totalMessagesInFile,
+          newMessagesCount,
+          duplicateMessagesCount,
+          sampleConnections,
+        },
+      });
+    } else if (mode === 'import') {
+      emitProgress('Starting import...', 0);
+
+      // Import the connections in chunks of 100 for progress updates
+      emitProgress(`Importing ${newConnections.length} connections...`, 65);
+      const leads = newConnections.map(connection => ({
+        email: connection['Email Address']?.trim() || '',
+        firstName: connection['First Name']?.trim() || '',
+        lastName: connection['Last Name']?.trim() || '',
+        phone: '',
+        company: connection.Company?.trim() || '',
+        title: connection.Position?.trim() || '',
+        notes: `Connected on: ${connection['Connected On'] || 'Unknown'}`,
+        linkedin: connection.URL || '', // Already normalized
+        customFields: {
+          'Connected On': connection['Connected On']?.trim() || '',
+          'LinkedIn URL': connection.URL || '', // Already normalized
+        },
+      }));
+
+      const leadBatchSize = 100;
+
+      for (let i = 0; i < leads.length; i += leadBatchSize) {
+        const batch = leads.slice(i, i + leadBatchSize);
+        const results = await crmDb.batchCreateLeads(listId, batch);
+
+        connectionsSuccessCount += results.successCount;
+        connectionsErrorCount += results.errorCount;
+        if (results.errors.length > 0) {
+          connectionsErrors.push(...results.errors);
+        }
+
+        // Calculate progress: 65% to 90% of overall progress
+        const connectionsProgress = Math.round(65 + ((i + batch.length) / leads.length) * 25);
+        emitProgress(`Imported ${connectionsSuccessCount} of ${leads.length} connections`, connectionsProgress);
+      }
+
+      // Emit final progress
+      emitProgress('Import complete!', 100);
+
+      res.json({
+        success: true,
+        successCount: connectionsSuccessCount,
+        errorCount: connectionsErrorCount,
+        errors: connectionsErrors,
+        messagesImported: messagesSuccessCount,
+        message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`,
+      });
+    } else {
+      res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "import"' });
+    }
+  } catch (error: any) {
+    console.error('Error processing LinkedIn import:', error);
+    res.status(500).json({ message: error.message || 'Failed to process LinkedIn import' });
   }
 });
 

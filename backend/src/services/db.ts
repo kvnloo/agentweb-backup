@@ -3767,11 +3767,20 @@ export const crmDb = {
       // Get email events from AW-EmailEvents filtered by domain and lead email
       const emailEventsDb = require('./emailEventsDb').emailEventsDb;
       const leadEmail = lead.email?.toLowerCase();
-      
+      const leadLinkedIn = lead.linkedin?.toLowerCase();
+
       // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
-      const filteredEvents = leadEmail
+      // Query by both email and LinkedIn URL to capture all engagements
+      const emailEvents = leadEmail
         ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail)
         : [];
+
+      // Also get LinkedIn message events for this lead (stored with LinkedIn URL as leadEmail)
+      const linkedInEvents = leadLinkedIn
+        ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn)
+        : [];
+
+      const filteredEvents = [...emailEvents, ...linkedInEvents];
 
       // Transform email events to engagement format
       // For email.received events, fetch the email content
