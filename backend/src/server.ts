@@ -48,6 +48,9 @@ const io = new Server(server, {
   pingInterval: 25000
 });
 
+// Export io instance for use in routes
+export { io };
+
 // Middleware to authenticate WebSocket connections
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;

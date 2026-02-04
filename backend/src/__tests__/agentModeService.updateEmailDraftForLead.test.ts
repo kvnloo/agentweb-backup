@@ -544,8 +544,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.textContent).toBe('This is plain text content without HTML tags.');
-      expect(result.data.htmlContent).toBeUndefined();
+      expect(result.data.email.textContent).toBe('This is plain text content without HTML tags.');
+      expect(result.data.email.htmlContent).toBeUndefined();
 
       // Verify updateLead was called with textContent and format
       expect(crmDb.updateLead).toHaveBeenCalledWith(
@@ -610,8 +610,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.htmlContent).toBe('<p>This is HTML content with <strong>formatting</strong>.</p>');
-      expect(result.data.textContent).toBeUndefined();
+      expect(result.data.email.htmlContent).toBe('<p>This is HTML content with <strong>formatting</strong>.</p>');
+      expect(result.data.email.textContent).toBeUndefined();
 
       // Verify updateLead was called with htmlContent and format
       expect(crmDb.updateLead).toHaveBeenCalledWith(
@@ -799,6 +799,146 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
           }),
         })
       );
+    });
+
+    it('should create both email draft and message draft', async () => {
+      const listId = 'list1';
+      const leadId = 'lead1';
+      const userId = 'user1';
+      const sessionId = 'session1';
+      const instruction = 'Create an outreach message';
+
+      const mockList = {
+        listId,
+        name: 'Test List',
+        userId,
+      };
+
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        linkedin: 'https://www.linkedin.com/in/leadprofile',
+        firstName: 'Jane',
+        lastName: 'Smith',
+        company: 'Tech Corp',
+        title: 'VP Engineering',
+      };
+
+      const mockBrandGuidelines = {
+        exists: true,
+        formattedContent: 'Brand guidelines content',
+      };
+
+      const mockMarketStrategy = {
+        exists: true,
+        formattedContent: 'Market strategy content',
+      };
+
+      const mockSenderInfo = {
+        fromName: 'Sender Name',
+        notes: 'Meeting link: https://calendly.com/meeting',
+      };
+
+      // Mock email draft response
+      const mockEmailDraftResponse = {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                subject: 'Collaboration Opportunity',
+                htmlContent: '<p>Hi Jane,</p><p>I noticed your work at Tech Corp and wanted to reach out about a potential collaboration. Our platforms could complement each other well.</p><p>Would you be open to a quick call?</p>',
+              }),
+            },
+          },
+        ],
+      };
+
+      // Mock message draft response (must be JSON format)
+      const mockMessageDraftResponse = {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                content: 'Hi Jane! Noticed your work at Tech Corp. Would love to chat about a potential collaboration. Open to a quick call?',
+              }),
+            },
+          },
+        ],
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(mockLead);
+      (crmDb.getLeadEngagements as jest.Mock).mockResolvedValue({
+        engagements: [],
+      });
+      mockReadBrandGuidelines.mockResolvedValue(mockBrandGuidelines);
+      mockReadMarketStrategy.mockResolvedValue(mockMarketStrategy);
+      mockGetSenderForLead.mockResolvedValue(mockSenderInfo);
+
+      // Mock OpenAI responses: first for email draft, second for message draft
+      mockCreate
+        .mockResolvedValueOnce(mockEmailDraftResponse)
+        .mockResolvedValueOnce(mockMessageDraftResponse);
+
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({
+        ...mockLead,
+        emailDraft: {
+          subject: 'Collaboration Opportunity',
+          htmlContent: '<p>Hi Jane,</p><p>I noticed your work at Tech Corp and wanted to reach out about a potential collaboration. Our platforms could complement each other well.</p><p>Would you be open to a quick call?</p>',
+          createdAt: expect.any(String),
+          updatedAt: expect.any(String),
+          sessionId,
+        },
+        messageDraft: {
+          content: 'Hi Jane! Noticed your work at Tech Corp. Would love to chat about a potential collaboration. Open to a quick call?',
+          createdAt: expect.any(String),
+          updatedAt: expect.any(String),
+          sessionId,
+        },
+      });
+
+      const result = await (agentModeService as any).updateEmailDraftForLead(
+        listId,
+        leadId,
+        instruction,
+        sessionId,
+        userId,
+        'html'
+      );
+
+      expect(result.success).toBe(true);
+
+      // Should call OpenAI twice: once for email draft, once for message draft
+      expect(mockCreate).toHaveBeenCalledTimes(2);
+
+      // Verify first call is for email draft
+      const firstCall = mockCreate.mock.calls[0][0];
+      expect(firstCall.messages[0].content).toContain('email marketing strategist');
+
+      // Verify second call is for message draft
+      const secondCall = mockCreate.mock.calls[1][0];
+      expect(secondCall.messages[0].content).toContain('concise, engaging messages');
+      expect(secondCall.messages[0].content).toContain('LinkedIn');
+
+      // Should update lead with both email and message drafts
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        listId,
+        leadId,
+        expect.objectContaining({
+          emailDraft: expect.objectContaining({
+            subject: 'Collaboration Opportunity',
+            htmlContent: expect.any(String),
+          }),
+          messageDraft: expect.objectContaining({
+            content: expect.any(String),
+          }),
+        })
+      );
+
+      // Verify message draft is concise (should be under 500 chars)
+      const updateCall = (crmDb.updateLead as jest.Mock).mock.calls[0][2];
+      expect(updateCall.messageDraft.content.length).toBeLessThanOrEqual(500);
     });
   });
 });

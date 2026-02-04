@@ -67,11 +67,11 @@ class EmailEventsDb {
     }
   }
 
-  async addEmailEvent(event: ResendWebhookEvent, emailDomain: string, eventId: string): Promise<EmailEvent> {
+  async addEmailEvent(event: ResendWebhookEvent, emailDomain: string, eventId: string, overrideLeadEmail?: string): Promise<EmailEvent> {
     const processedAt = new Date().toISOString();
 
-    // Extract leadEmail based on event type
-    const leadEmail = this.extractLeadEmail(event);
+    // Extract leadEmail based on event type, or use override if provided
+    const leadEmail = overrideLeadEmail || this.extractLeadEmail(event);
 
     const emailEvent: EmailEvent = {
       eventId,
@@ -90,8 +90,94 @@ class EmailEventsDb {
     };
 
     await dynamodb.put(params).promise();
-    
+
     return emailEvent;
+  }
+
+  /**
+   * Batch add multiple email events
+   * Uses DynamoDB batchWrite for better performance (up to 25 items at a time)
+   */
+  async addEmailEvents(events: Array<{
+    event: ResendWebhookEvent;
+    emailDomain: string;
+    eventId: string;
+    overrideLeadEmail?: string;
+  }>): Promise<{ successCount: number; failedCount: number }> {
+    const processedAt = new Date().toISOString();
+    let successCount = 0;
+    let failedCount = 0;
+
+    // Process in batches of 25 (DynamoDB limit)
+    const batchSize = 25;
+    for (let i = 0; i < events.length; i += batchSize) {
+      const batch = events.slice(i, i + batchSize);
+
+      const emailEvents = batch.map(({ event, emailDomain, eventId, overrideLeadEmail }) => {
+        const leadEmail = overrideLeadEmail || this.extractLeadEmail(event);
+
+        return {
+          eventId,
+          emailId: event.data.email_id,
+          emailDomain,
+          eventType: event.type,
+          createdAt: event.created_at,
+          data: event.data,
+          processedAt,
+          ...(leadEmail && { leadEmail })
+        };
+      });
+
+      const params = {
+        RequestItems: {
+          [TABLE_NAME]: emailEvents.map(event => ({
+            PutRequest: {
+              Item: event
+            }
+          }))
+        }
+      };
+
+      try {
+        let result = await dynamodb.batchWrite(params).promise();
+        let unprocessedItems = result.UnprocessedItems?.[TABLE_NAME] || [];
+
+        // Retry unprocessed items with exponential backoff
+        let retries = 0;
+        const maxRetries = 3;
+
+        while (unprocessedItems.length > 0 && retries < maxRetries) {
+          retries++;
+          const backoffMs = Math.min(1000 * Math.pow(2, retries - 1), 5000); // 1s, 2s, 4s max
+
+          console.log(`Retrying ${unprocessedItems.length} unprocessed items (attempt ${retries}/${maxRetries})...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+
+          const retryParams = {
+            RequestItems: {
+              [TABLE_NAME]: unprocessedItems
+            }
+          };
+
+          result = await dynamodb.batchWrite(retryParams).promise();
+          unprocessedItems = result.UnprocessedItems?.[TABLE_NAME] || [];
+        }
+
+        // Count final results
+        const finalUnprocessedCount = unprocessedItems.length;
+        successCount += batch.length - finalUnprocessedCount;
+        failedCount += finalUnprocessedCount;
+
+        if (finalUnprocessedCount > 0) {
+          console.warn(`Batch write had ${finalUnprocessedCount} unprocessed items after ${retries} retries`);
+        }
+      } catch (error) {
+        console.error('Batch write error:', error);
+        failedCount += batch.length;
+      }
+    }
+
+    return { successCount, failedCount };
   }
 
   async updateEmailEventContent(eventId: string, emailContent: {

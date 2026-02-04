@@ -1,6 +1,6 @@
 {
   "name": "backend",
-  "version": "24.6.0",
+  "version": "24.7.0",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
@@ -48,6 +48,7 @@
     "@types/pdfkit": "^0.13.6",
     "@types/socket.io": "^3.0.2",
     "@types/xml2js": "^0.4.14",
+    "adm-zip": "^0.5.16",
     "aws-sdk": "^2.1531.0",
     "axios": "^1.9.0",
     "bcryptjs": "^2.4.3",
@@ -91,6 +92,7 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
     "@types/jest": "^29.5.14",
     "@types/pdf-parse": "^1.1.1",
     "@types/supertest": "^6.0.3",

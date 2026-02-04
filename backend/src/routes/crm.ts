@@ -1,11 +1,63 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
-import { crmDb, taskDb, subscriberDb } from '../services/db';
+import { crmDb, taskDb, subscriberDb, userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
+import AdmZip from 'adm-zip';
+import { emailEventsDb } from '../services/emailEventsDb';
+import { dynamodb } from '../config/aws';
+import { io } from '../server';
+
+const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+
+/**
+ * Normalize LinkedIn URL to standard format: https://www.linkedin.com/in/<username>
+ * Strips trailing slashes, query parameters, fragments, and ensures consistent protocol
+ */
+function normalizeLinkedInUrl(url: string): string {
+  if (!url) return '';
+
+  try {
+    // Remove whitespace and convert to lowercase
+    let normalized = url.trim().toLowerCase();
+
+    // Add https:// if missing
+    if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+      normalized = 'https://' + normalized;
+    }
+
+    // Parse URL
+    const urlObj = new URL(normalized);
+
+    // Only accept linkedin.com domains
+    if (!urlObj.hostname.endsWith('linkedin.com')) {
+      return normalized; // Return as-is if not a LinkedIn URL
+    }
+
+    // Extract pathname and clean it
+    let pathname = urlObj.pathname;
+
+    // Remove trailing slash
+    pathname = pathname.replace(/\/$/, '');
+
+    // Only accept /in/ profile URLs (not company pages, etc.)
+    const match = pathname.match(/^\/in\/([a-zA-Z0-9_-]+)/);
+    if (!match) {
+      return normalized; // Return as-is if not a valid /in/ profile URL
+    }
+
+    const username = match[1];
+
+    // Return canonical format
+    return `https://www.linkedin.com/in/${username}`;
+  } catch (error) {
+    // If URL parsing fails, return cleaned version
+    return url.trim().toLowerCase().replace(/\/$/, '');
+  }
+}
 
 const router = express.Router();
 const upload = multer({
@@ -176,7 +228,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -199,6 +251,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
       listSenderId?: string | null;
+      icpsOnly?: boolean;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -257,6 +310,13 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         }
       }
       updates.listSenderId = normalizedListSenderId;
+    }
+
+    if (icpsOnly !== undefined) {
+      if (typeof icpsOnly !== 'boolean') {
+        return res.status(400).json({ message: 'icpsOnly must be a boolean' });
+      }
+      updates.icpsOnly = icpsOnly;
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);
@@ -333,53 +393,103 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
 
     // Validate inputs
     const validPage = Math.max(1, page);
-    const validLimit = Math.min(Math.max(1, limit), 100); // Between 1 and 100
+    const validLimit = Math.min(Math.max(1, limit), 500); // Between 1 and 500
 
-    // For page-based pagination, we need to fetch all previous pages to get to the desired page
-    // This is not ideal for DynamoDB but necessary for page number navigation
-    let lastEvaluatedKey = undefined;
-    if (validPage > 1) {
-      // Fetch pages 1 through (page - 1) to get the cursor for the desired page
-      for (let p = 1; p < validPage; p++) {
-        const prevResult = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
-        lastEvaluatedKey = prevResult.lastEvaluatedKey;
-        if (!lastEvaluatedKey) {
-          // We've reached the end, return empty results
-          return res.json({
-            leads: [],
-            page: validPage,
-            limit: validLimit,
-            totalPages: p,
-            hasMore: false,
-          });
+    let filteredLeads: any[] = [];
+    let hasMoreLeads = true;
+    let totalFilteredCount: number | null = null;
+
+    if (list.icpsOnly) {
+      // ICPs only mode: Fetch ALL ICP leads to get accurate count
+      let allIcpLeads: any[] = [];
+      let currentLastKey = undefined;
+
+      // Fetch all leads and filter to ICPs
+      while (hasMoreLeads) {
+        const result = await crmDb.getLeadsByListId(listId, validLimit, currentLastKey);
+
+        // Filter to only ICP matches
+        const icpLeads = result.items.filter((lead: any) => lead.icpMatch?.isMatch === true);
+        allIcpLeads.push(...icpLeads);
+
+        currentLastKey = result.lastEvaluatedKey;
+        hasMoreLeads = !!result.lastEvaluatedKey;
+      }
+
+      // Now we have all ICP leads and know the exact total
+      totalFilteredCount = allIcpLeads.length;
+
+      // Slice to get only the leads for the requested page
+      const targetLeadsToSkip = (validPage - 1) * validLimit;
+      const targetLeadsToReturn = validLimit;
+      filteredLeads = allIcpLeads.slice(targetLeadsToSkip, targetLeadsToSkip + targetLeadsToReturn);
+
+      // Check if there are more ICP leads after this page
+      hasMoreLeads = allIcpLeads.length > targetLeadsToSkip + targetLeadsToReturn;
+
+      // If we got no leads for this page, it means we're beyond the last page
+      if (filteredLeads.length === 0 && validPage > 1) {
+        return res.json({
+          leads: [],
+          page: validPage,
+          limit: validLimit,
+          totalPages: validPage - 1,
+          hasMore: false,
+          totalFilteredCount: 0,
+        });
+      }
+    } else {
+      // No filter, use normal pagination
+      let lastEvaluatedKey = undefined;
+
+      // For page > 1, fetch previous pages to get the cursor
+      if (validPage > 1) {
+        for (let p = 1; p < validPage; p++) {
+          const prevResult = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
+          lastEvaluatedKey = prevResult.lastEvaluatedKey;
+          if (!lastEvaluatedKey) {
+            // We've reached the end, return empty results
+            return res.json({
+              leads: [],
+              page: validPage,
+              limit: validLimit,
+              totalPages: p,
+              hasMore: false,
+            });
+          }
         }
       }
+
+      // Fetch the current page
+      const result = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
+      filteredLeads = result.items;
+      hasMoreLeads = !!result.lastEvaluatedKey;
     }
 
-    const result = await crmDb.getLeadsByListId(listId, validLimit, lastEvaluatedKey);
-    
     // Add engagement counts to each lead
     const leadsWithCounts = await Promise.all(
-      result.items.map(async (lead: any) => {
+      filteredLeads.map(async (lead: any) => {
         const engagementCounts = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
         return {
           ...lead,
-          engagementCount: engagementCounts.total,
+          engagementCount: engagementCounts.total, // Sent messages count
           engagementCountLast7Days: engagementCounts.last7Days,
+          totalAllMessages: engagementCounts.totalAllMessages, // Total messages (sent + received)
         };
       })
     );
-    
+
     // Calculate total pages (approximate - we don't know the exact total without scanning all)
     // For now, we'll indicate if there are more pages
-    const totalPages = result.hasMore ? validPage + 1 : validPage;
+    const totalPages = hasMoreLeads ? validPage + 1 : validPage;
 
     res.json({
       leads: leadsWithCounts,
       page: validPage,
       limit: validLimit,
-      totalPages: result.hasMore ? null : validPage, // null means unknown total
-      hasMore: result.hasMore,
+      totalPages: hasMoreLeads ? null : validPage, // null means unknown total
+      hasMore: hasMoreLeads,
+      totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
     });
   } catch (error: any) {
     console.error('Error fetching leads:', error);
@@ -668,6 +778,685 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
   } catch (error: any) {
     console.error('Error importing leads:', error);
     res.status(500).json({ message: error.message || 'Failed to import leads' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/import-linkedin
+ * @desc Import or preview LinkedIn data export
+ * @access Private
+ * @query mode - "preview" (default) or "import"
+ */
+router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const mode = (req.query.mode as string || 'preview').toLowerCase(); // Default to preview
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'ZIP file is required' });
+    }
+
+    const userLinkedInUrl = normalizeLinkedInUrl(req.body.userLinkedInUrl || '');
+    if (!userLinkedInUrl) {
+      return res.status(400).json({ message: 'Your LinkedIn profile URL is required' });
+    }
+
+    // Validate that it's a proper LinkedIn /in/ profile URL
+    if (!userLinkedInUrl.includes('linkedin.com/in/')) {
+      return res.status(400).json({ message: 'Please provide a valid LinkedIn profile URL (https://www.linkedin.com/in/your-profile)' });
+    }
+
+    const socketId = req.body.socketId; // Optional socket ID for progress updates
+
+    // Helper function to emit progress
+    const emitProgress = (message: string, progress?: number) => {
+      if (socketId && mode === 'import') {
+        io.to(socketId).emit('import-progress', { message, progress });
+      }
+    };
+
+    // Parse ZIP file
+    let zip: AdmZip;
+    try {
+      zip = new AdmZip(req.file.buffer);
+    } catch (error: any) {
+      return res.status(400).json({ message: 'Invalid ZIP file' });
+    }
+
+    const zipEntries = zip.getEntries();
+
+    // Find Connections.csv
+    const connectionsEntry = zipEntries.find(e => e.entryName === 'Connections.csv');
+    if (!connectionsEntry) {
+      return res.status(400).json({ message: 'Connections.csv not found in ZIP file' });
+    }
+
+    // Parse Connections.csv
+    let connectionsRecords: any[];
+    try {
+      const connectionsContent = connectionsEntry.getData().toString('utf-8');
+      connectionsRecords = parse(connectionsContent, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        from_line: 4,
+        relax_column_count: true,
+      });
+    } catch (parseError: any) {
+      return res.status(400).json({ message: `Failed to parse Connections.csv: ${parseError.message}` });
+    }
+
+    // Filter connections with URLs and normalize them
+    const validConnections = connectionsRecords
+      .filter(c => c.URL)
+      .map(c => ({
+        ...c,
+        URL: normalizeLinkedInUrl(c.URL),
+      }))
+      .filter(c => c.URL); // Remove any that failed normalization
+
+    // Get existing leads to check for duplicates (paginate through all results)
+    const existingLeads: any[] = [];
+    let leadsLastKey: any = undefined;
+
+    do {
+      const existingLeadsResult = await crmDb.getLeadsByListId(listId, undefined, leadsLastKey);
+      existingLeads.push(...(existingLeadsResult.items || []));
+      leadsLastKey = existingLeadsResult.lastEvaluatedKey;
+    } while (leadsLastKey);
+
+    const existingEmails = new Set(existingLeads.map((l: any) => l.email?.toLowerCase()).filter(Boolean));
+    const existingLinkedIns = new Set(existingLeads.map((l: any) => normalizeLinkedInUrl(l.linkedin || '')).filter(Boolean));
+
+    // Debug logging
+    console.log(`[LinkedIn Import] Found ${existingLeads.length} existing leads`);
+    console.log(`[LinkedIn Import] Existing LinkedIn URLs (first 5):`, Array.from(existingLinkedIns).slice(0, 5));
+    console.log(`[LinkedIn Import] Checking ${validConnections.length} connections from file`);
+    if (validConnections.length > 0) {
+      console.log(`[LinkedIn Import] Sample connection URL from file:`, validConnections[0].URL);
+    }
+
+    // Count duplicates
+    let duplicateCount = 0;
+    const newConnections: any[] = [];
+    const sampleConnections: any[] = [];
+
+    for (const connection of validConnections) {
+      const email = connection['Email Address']?.trim().toLowerCase();
+      const linkedin = connection.URL; // Already normalized
+
+      const emailMatch = email && existingEmails.has(email);
+      const linkedinMatch = linkedin && existingLinkedIns.has(linkedin);
+      const isDuplicate = emailMatch || linkedinMatch;
+
+      if (isDuplicate) {
+        duplicateCount++;
+      } else {
+        newConnections.push(connection);
+        if (sampleConnections.length < 10) {
+          sampleConnections.push({
+            firstName: connection['First Name'] || '',
+            lastName: connection['Last Name'] || '',
+            company: connection.Company || '',
+            position: connection.Position || '',
+            email: connection['Email Address'] || '',
+            linkedin: connection.URL || '',
+            connectedOn: connection['Connected On'] || '',
+          });
+        }
+      }
+    }
+
+    // Debug summary for connections
+    console.log(`[LinkedIn Import] Connection deduplication: ${newConnections.length} new, ${duplicateCount} duplicates out of ${validConnections.length} total`);
+    if (newConnections.length > 0 && newConnections.length <= 10) {
+      console.log(`[LinkedIn Import] New connections that don't match:`, newConnections.map(c => ({
+        name: `${c['First Name']} ${c['Last Name']}`,
+        email: c['Email Address'] || 'no email',
+        linkedin: c.URL || 'no linkedin'
+      })));
+    }
+
+    // Parse messages if available
+    const messagesEntry = zipEntries.find(e => e.entryName === 'messages.csv');
+    let totalMessagesInFile = 0;
+    let newMessagesCount = 0;
+    let duplicateMessagesCount = 0;
+    let messagesSuccessCount = 0;
+    let messagesFailedCount = 0;
+
+    // Declare connections import tracking variables
+    let connectionsSuccessCount = 0;
+    let connectionsErrorCount = 0;
+    let connectionsErrors: string[] = [];
+
+    if (messagesEntry) {
+      try {
+        const messagesContent = messagesEntry.getData().toString('utf-8');
+        const messagesRecords = parse(messagesContent, {
+          columns: true,
+          skip_empty_lines: true,
+          trim: true,
+          relax_column_count: true,
+        });
+
+        // Filter valid messages (exclude drafts that haven't been sent)
+        const validMessages = messagesRecords.filter((m: any) => {
+          // Must have conversation ID and date
+          if (!m['CONVERSATION ID'] || !m.DATE) return false;
+
+          // Skip messages marked as drafts (IS MESSAGE DRAFT = "Yes")
+          const isDraft = m['IS MESSAGE DRAFT']?.trim().toLowerCase() === 'yes';
+          if (isDraft) return false;
+
+          return true;
+        });
+        totalMessagesInFile = validMessages.length;
+
+        // Get existing email events to check for duplicates
+        // Use EmailDomainIndex to get all events for this domain
+        const existingEventKeys = new Set<string>();
+        let lastEvaluatedKey: any = undefined;
+
+        do {
+          const existingEventsParams: any = {
+            TableName: `${TABLE_PREFIX}AW-EmailEvents`,
+            IndexName: 'EmailDomainIndex',
+            KeyConditionExpression: 'emailDomain = :domain',
+            ExpressionAttributeValues: {
+              ':domain': `linkedin-${listId}`,
+            },
+          };
+
+          if (lastEvaluatedKey) {
+            existingEventsParams.ExclusiveStartKey = lastEvaluatedKey;
+          }
+
+          const existingEventsResult = await dynamodb.query(existingEventsParams).promise();
+
+          (existingEventsResult.Items || []).forEach((item: any) => {
+            const conversationId = item.data?.conversationId || item.emailId || '';
+            const date = item.data?.date || item.createdAt || '';
+            existingEventKeys.add(`${conversationId}-${date}`);
+          });
+
+          lastEvaluatedKey = existingEventsResult.LastEvaluatedKey;
+        } while (lastEvaluatedKey);
+
+        // Debug logging
+        console.log(`[LinkedIn Import] Found ${existingEventKeys.size} existing message events`);
+        console.log(`[LinkedIn Import] Existing event keys (first 5):`, Array.from(existingEventKeys).slice(0, 5));
+        console.log(`[LinkedIn Import] Checking ${validMessages.length} messages from file`);
+        if (validMessages.length > 0) {
+          const sampleMsg = validMessages[0];
+          console.log(`[LinkedIn Import] Sample message key from file:`, `${sampleMsg['CONVERSATION ID']}-${sampleMsg.DATE}`);
+        }
+
+        // Count new vs duplicate messages, and filter for messages involving the user
+        const newMessages: any[] = [];
+        for (const message of validMessages) {
+          const conversationId = message['CONVERSATION ID'];
+          const date = message.DATE;
+          const senderProfileUrl = normalizeLinkedInUrl(message['SENDER PROFILE URL'] || '');
+          const recipientProfileUrls = message['RECIPIENT PROFILE URLS'] || '';
+
+          // Normalize recipient URLs (comma-separated list)
+          const normalizedRecipientUrls = recipientProfileUrls
+            .split(',')
+            .map((url: string) => normalizeLinkedInUrl(url.trim()))
+            .filter(Boolean);
+
+          // Determine if this message involves the user
+          const senderIsUser = senderProfileUrl === userLinkedInUrl;
+          const recipientIsUser = normalizedRecipientUrls.some((url: string) => url === userLinkedInUrl);
+
+          // Only process messages where one party is the user
+          if (!senderIsUser && !recipientIsUser) {
+            continue; // Skip messages that don't involve the user
+          }
+
+          // Determine the lead LinkedIn URL (whoever is NOT the user)
+          let leadLinkedInUrl: string;
+          let messageDirection: 'sent' | 'received';
+
+          if (senderIsUser) {
+            // User sent this message to lead(s)
+            messageDirection = 'sent';
+            // Filter out the user from recipients and pick first lead
+            // (handles group chats where user might be in recipient list)
+            const leadRecipients = normalizedRecipientUrls.filter((url: string) => url !== userLinkedInUrl);
+            leadLinkedInUrl = leadRecipients[0]; // Use first non-user recipient
+          } else {
+            // Lead sent this message to user (sender is the lead)
+            messageDirection = 'received';
+            leadLinkedInUrl = senderProfileUrl;
+          }
+
+          if (!leadLinkedInUrl) {
+            continue; // Skip if we can't identify the lead
+          }
+
+          const eventKey = `${conversationId}-${date}`;
+
+          if (existingEventKeys.has(eventKey)) {
+            duplicateMessagesCount++;
+          } else {
+            newMessagesCount++;
+            newMessages.push({
+              ...message,
+              leadLinkedInUrl,
+              messageDirection,
+            });
+          }
+        }
+
+        // If mode is import, actually import the messages using batch
+        if (mode === 'import') {
+          emitProgress(`Importing ${newMessages.length} messages...`, 20);
+
+          // Prepare all events for batch import
+          const eventsToImport = newMessages.map((message, index) => {
+            const conversationId = message['CONVERSATION ID'];
+            const date = message.DATE;
+            const from = message.FROM;
+            const senderProfileUrl = normalizeLinkedInUrl(message['SENDER PROFILE URL'] || '');
+            const content = message.CONTENT;
+            const subject = message.SUBJECT;
+            const leadLinkedInUrl = message.leadLinkedInUrl;
+            const messageDirection = message.messageDirection;
+
+            return {
+              event: {
+                type: messageDirection === 'sent' ? 'linkedin.message.sent' : 'linkedin.message.received',
+                created_at: date,
+                data: {
+                  email_id: conversationId,
+                  conversationId,
+                  from,
+                  senderProfileUrl,
+                  content,
+                  subject,
+                  date,
+                  to: message.TO || '',
+                  recipientProfileUrls: message['RECIPIENT PROFILE URLS'] || '',
+                  folder: message.FOLDER || 'INBOX',
+                  direction: messageDirection,
+                } as any,
+              },
+              emailDomain: `linkedin-${listId}`,
+              eventId: `linkedin-${listId}-${conversationId}-${index}-${Date.now()}`,
+              overrideLeadEmail: leadLinkedInUrl,
+            };
+          });
+
+          // Batch import messages in chunks of 100 for progress updates
+          const batchSize = 100;
+
+          for (let i = 0; i < eventsToImport.length; i += batchSize) {
+            const batch = eventsToImport.slice(i, i + batchSize);
+            const batchResult = await emailEventsDb.addEmailEvents(batch);
+
+            messagesSuccessCount += batchResult.successCount;
+            messagesFailedCount += batchResult.failedCount;
+
+            // Calculate progress: 20% to 60% of overall progress
+            const messagesProgress = Math.round(20 + ((i + batch.length) / eventsToImport.length) * 40);
+            emitProgress(`Imported ${messagesSuccessCount} of ${eventsToImport.length} messages`, messagesProgress);
+          }
+
+          if (messagesFailedCount > 0) {
+            console.warn(`Failed to import ${messagesFailedCount} messages`);
+          }
+        }
+      } catch (error) {
+        console.error('Error processing messages:', error);
+        // Continue with 0 message counts if there's an error
+      }
+    }
+
+    // Return response based on mode
+    if (mode === 'preview') {
+      res.json({
+        success: true,
+        preview: {
+          totalConnectionsInFile: validConnections.length,
+          newConnectionsCount: newConnections.length,
+          duplicateConnectionsCount: duplicateCount,
+          totalMessagesInFile,
+          newMessagesCount,
+          duplicateMessagesCount,
+          sampleConnections,
+        },
+      });
+    } else if (mode === 'import') {
+      emitProgress('Starting import...', 0);
+
+      // Import the connections in chunks of 100 for progress updates
+      emitProgress(`Importing ${newConnections.length} connections...`, 65);
+      const leads = newConnections.map(connection => ({
+        email: connection['Email Address']?.trim() || '',
+        firstName: connection['First Name']?.trim() || '',
+        lastName: connection['Last Name']?.trim() || '',
+        phone: '',
+        company: connection.Company?.trim() || '',
+        title: connection.Position?.trim() || '',
+        notes: `Connected on: ${connection['Connected On'] || 'Unknown'}`,
+        linkedin: connection.URL || '', // Already normalized
+        customFields: {
+          'Connected On': connection['Connected On']?.trim() || '',
+          'LinkedIn URL': connection.URL || '', // Already normalized
+        },
+      }));
+
+      const leadBatchSize = 100;
+
+      for (let i = 0; i < leads.length; i += leadBatchSize) {
+        const batch = leads.slice(i, i + leadBatchSize);
+        const results = await crmDb.batchCreateLeads(listId, batch);
+
+        connectionsSuccessCount += results.successCount;
+        connectionsErrorCount += results.errorCount;
+        if (results.errors.length > 0) {
+          connectionsErrors.push(...results.errors);
+        }
+
+        // Calculate progress: 65% to 90% of overall progress
+        const connectionsProgress = Math.round(65 + ((i + batch.length) / leads.length) * 25);
+        emitProgress(`Imported ${connectionsSuccessCount} of ${leads.length} connections`, connectionsProgress);
+      }
+
+      // Emit final progress
+      emitProgress('Import complete!', 100);
+
+      res.json({
+        success: true,
+        successCount: connectionsSuccessCount,
+        errorCount: connectionsErrorCount,
+        errors: connectionsErrors,
+        messagesImported: messagesSuccessCount,
+        message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`,
+      });
+    } else {
+      res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "import"' });
+    }
+  } catch (error: any) {
+    console.error('Error processing LinkedIn import:', error);
+    res.status(500).json({ message: error.message || 'Failed to process LinkedIn import' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/match-icps
+ * @desc Match leads against ICPs using Claude 4.5
+ * @access Private
+ * @query mode - "preview" (default) or "match"
+ */
+router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const mode = (req.query.mode as string || 'preview').toLowerCase();
+    const socketId = req.body.socketId;
+    const forceRematch = req.body.forceRematch === true;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Helper function to emit progress
+    const emitProgress = (message: string, progress: number) => {
+      if (socketId) {
+        io.to(socketId).emit('icp-match-progress', {
+          message,
+          progress: Math.round(progress),
+        });
+      }
+    };
+
+    // Get user settings to fetch market strategy
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const marketStrategyData = user.marketStrategy;
+    if (!marketStrategyData) {
+      return res.status(400).json({ message: 'Market strategy not found. Please set up your market strategy in /market-strategy first.' });
+    }
+
+    // Check if ICPs are defined
+    if (!marketStrategyData.icp || marketStrategyData.icp.length === 0) {
+      return res.status(400).json({ message: 'ICPs not defined. Please define your Ideal Customer Profiles in /market-strategy before proceeding.' });
+    }
+
+    // Format market strategy into readable text
+    const marketStrategy = JSON.stringify(marketStrategyData, null, 2);
+
+    // Get all leads in the list (paginate through all)
+    const allLeads: any[] = [];
+    let lastKey: any = undefined;
+
+    do {
+      const result = await crmDb.getLeadsByListId(listId, undefined, lastKey);
+      allLeads.push(...(result.items || []));
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+
+    // Filter leads based on forceRematch flag
+    const leadsToProcess = forceRematch
+      ? allLeads // Process all leads if force rematch
+      : allLeads.filter(lead => !lead.icpMatch); // Only unmatched leads by default
+
+    const unmatchedLeads = allLeads.filter(lead => !lead.icpMatch);
+
+    console.log(`[ICP Match] Found ${leadsToProcess.length} leads to process (forceRematch: ${forceRematch}). ${unmatchedLeads.length} unmatched, ${allLeads.length - unmatchedLeads.length} already matched.`);
+
+    if (mode === 'preview') {
+      return res.json({
+        success: true,
+        totalLeads: allLeads.length,
+        unmatchedLeads: unmatchedLeads.length,
+        matchedLeads: allLeads.length - unmatchedLeads.length,
+        leadsToProcess: leadsToProcess.length,
+        forceRematch,
+      });
+    } else if (mode === 'match') {
+      if (leadsToProcess.length === 0) {
+        return res.json({
+          success: true,
+          message: 'No leads to process',
+          processedCount: 0,
+        });
+      }
+
+      // Import LLMService
+      const { createLLMService } = await import('../utils/llmService');
+
+      emitProgress('Starting ICP matching...', 0);
+
+      // Split leads into 5 chunks for parallel processing
+      const parallelism = 5;
+      const chunkSize = Math.ceil(leadsToProcess.length / parallelism);
+      const chunks: any[][] = [];
+
+      for (let i = 0; i < leadsToProcess.length; i += chunkSize) {
+        chunks.push(leadsToProcess.slice(i, i + chunkSize));
+      }
+
+      console.log(`[ICP Match] Processing ${leadsToProcess.length} leads in ${chunks.length} parallel chunks`);
+
+      // Shared progress tracking
+      let totalProcessedCount = 0;
+      const progressLock = { value: 0 }; // Simple object to share progress state
+
+      // Process each chunk in parallel
+      const chunkProcessors = chunks.map(async (chunk, chunkIndex) => {
+        // Create separate LLM service instance for each parallel task
+        const llmService = createLLMService('anthropic.claude-sonnet-4-5-20250929-v1:0', 0.7, 4000);
+
+        const batchSize = 10;
+        let chunkProcessedCount = 0;
+
+        for (let i = 0; i < chunk.length; i += batchSize) {
+          const batch = chunk.slice(i, i + batchSize);
+
+          // Prepare batch data for LLM
+          const leadsData = batch.map((lead, index) => {
+            const data: any = {
+              index: i + index + 1,
+              name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || 'N/A',
+              email: lead.email || 'N/A',
+              company: lead.company || 'N/A',
+              title: lead.title || 'N/A',
+              phone: lead.phone || 'N/A',
+              linkedin: lead.linkedin || 'N/A',
+              notes: lead.notes || 'N/A',
+            };
+
+            // Include previous match result if this is a rematch
+            if (lead.icpMatch) {
+              data.previousMatch = {
+                isMatch: lead.icpMatch.isMatch,
+                score: lead.icpMatch.score,
+                reason: lead.icpMatch.reason,
+                matchedAt: lead.icpMatch.matchedAt,
+              };
+            }
+
+            return data;
+          });
+
+          const systemPrompt = `You are an expert business analyst helping to identify Ideal Customer Profile (ICP) matches.
+
+Your task is to analyze each lead and determine if they match the provided market strategy and ICP criteria.
+
+For each lead, provide:
+1. "isMatch": boolean (true if the lead matches the ICP, false otherwise)
+2. "reason": string (concise explanation of why they match or don't match, 1-2 sentences)
+3. "score": number (0-100, confidence score of the match)
+
+Consider factors like:
+- Job title and seniority level
+- Company size and industry
+- Geographic location (if relevant)
+- Technology stack or interests (from LinkedIn/notes)
+- Budget indicators
+- Pain points alignment
+
+IMPORTANT: Some leads may include a "previousMatch" field with a prior analysis. If present, consider this previous assessment but make your own independent judgment. You may agree or disagree with the previous analysis based on the current ICP criteria.
+
+Return your analysis as a JSON array with the exact structure:
+[
+  {
+    "index": 1,
+    "isMatch": true,
+    "score": 85,
+    "reason": "Senior decision-maker in target industry with clear pain points"
+  },
+  ...
+]`;
+
+          const userPrompt = `Market Strategy and ICP Criteria:
+${marketStrategy}
+
+Leads to Analyze:
+${JSON.stringify(leadsData, null, 2)}
+
+Please analyze each lead and return a JSON array with your assessment.`;
+
+          try {
+            // Escape curly braces for LangChain template parser
+            const escapeBraces = (str: string) => str.replace(/{/g, '{{').replace(/}/g, '}}');
+            const escapedSystemPrompt = escapeBraces(systemPrompt);
+            const escapedUserPrompt = escapeBraces(userPrompt);
+
+            // Call LLM
+            const response = await llmService.generateJSONContent<Array<{
+              index: number;
+              isMatch: boolean;
+              score: number;
+              reason: string;
+            }>>(escapedSystemPrompt, escapedUserPrompt, 'json');
+
+            // Update each lead with ICP match result
+            for (const result of response) {
+              const leadIndex = result.index - 1;
+              if (leadIndex >= 0 && leadIndex < chunk.length) {
+                const lead = chunk[leadIndex];
+
+                // Update lead in DynamoDB
+                await crmDb.updateLead(listId, lead.leadId, {
+                  icpMatch: {
+                    isMatch: result.isMatch,
+                    score: result.score,
+                    reason: result.reason,
+                    matchedAt: new Date().toISOString(),
+                  },
+                });
+
+                chunkProcessedCount++;
+                totalProcessedCount++;
+              }
+            }
+          } catch (error) {
+            console.error(`[ICP Match] Error processing chunk ${chunkIndex + 1}, batch ${i / batchSize + 1}:`, error);
+            // Continue with next batch even if one fails
+          }
+
+          // Update progress (thread-safe-ish for Node.js single-threaded event loop)
+          const progress = Math.min((totalProcessedCount / leadsToProcess.length) * 100, 100);
+          emitProgress(`Processed ${totalProcessedCount} of ${leadsToProcess.length} leads`, progress);
+        }
+
+        return chunkProcessedCount;
+      });
+
+      // Wait for all parallel chunks to complete
+      const chunkResults = await Promise.all(chunkProcessors);
+      const processedCount = chunkResults.reduce((sum, count) => sum + count, 0);
+
+      console.log(`[ICP Match] Completed processing. Total processed: ${processedCount}`);
+      emitProgress('ICP matching complete!', 100);
+
+      res.json({
+        success: true,
+        message: `Successfully matched ${processedCount} leads`,
+        processedCount,
+        totalLeadsProcessed: leadsToProcess.length,
+      });
+    } else {
+      res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "match"' });
+    }
+  } catch (error: any) {
+    console.error('Error matching ICPs:', error);
+    res.status(500).json({ message: error.message || 'Failed to match ICPs' });
   }
 });
 

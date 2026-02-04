@@ -1,4 +1,25 @@
 // Unit tests for CRM routes
+
+// Mock server and templates controller FIRST before any imports
+jest.mock('../server', () => ({
+  io: {
+    to: jest.fn().mockReturnValue({
+      emit: jest.fn(),
+    }),
+    emit: jest.fn(),
+  },
+  app: {},
+}));
+
+jest.mock('../controllers/templates', () => ({
+  createTemplate: jest.fn(),
+  getTemplates: jest.fn(),
+  getTemplate: jest.fn(),
+  updateTemplate: jest.fn(),
+  deleteTemplate: jest.fn(),
+  publishTemplate: jest.fn(),
+}));
+
 import { Request, Response } from 'express';
 import { crmDb } from '../services/db';
 import { settingsService } from '../services/settingsService';

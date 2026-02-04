@@ -3760,26 +3760,94 @@ ${emailDraftFormat === 'text'
         emailDraft.htmlContent = emailData.htmlContent;
       }
 
-      // Update lead with email draft and format preference
+      // Create message draft for LinkedIn/Facebook/other platforms
+      const messagePrompt = `Based on the email draft you just created, now create a shorter message version suitable for LinkedIn, Facebook, or other messaging platforms.
+
+## Email Draft Created:
+Subject: ${emailData.subject}
+Content: ${emailDraftFormat === 'text' ? emailData.textContent : emailData.htmlContent}
+
+## Requirements for Message Draft:
+1. Keep it concise and conversational (150-300 characters ideal, max 500)
+2. Maintain the core message and call-to-action from the email
+3. Make it platform-agnostic (works for LinkedIn, Facebook, Twitter DMs, etc.)
+4. Use a friendly, professional tone
+5. Include personalization (use lead's name if appropriate)
+6. No need for subject line or signature
+7. Focus on the key value proposition and CTA
+
+Format the response as JSON with this structure:
+{
+  "content": "The complete message content (concise, 150-500 characters)"
+}`;
+
+      // Call LLM to generate message draft
+      const messageCompletion = await openai.chat.completions.create({
+        model: process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-4",
+        messages: [
+          {
+            role: "system",
+            content: "You are an expert at crafting concise, engaging messages for social platforms like LinkedIn, Facebook, and Twitter. Create personalized, platform-agnostic messages that drive engagement. Always respond with valid JSON containing a content field.",
+          },
+          { role: "user", content: messagePrompt },
+        ],
+        temperature: 0.8,
+        max_tokens: 500,
+        response_format: { type: 'json_object' }
+      });
+
+      const messageResponseContent = messageCompletion.choices[0].message.content;
+      if (!messageResponseContent) {
+        throw new Error('No message content generated from LLM');
+      }
+
+      // Parse the JSON response
+      let messageData;
+      try {
+        const cleanedMessageContent = messageResponseContent.replace(/```json\s*|\s*```/g, '').trim();
+        messageData = JSON.parse(cleanedMessageContent);
+      } catch (parseError) {
+        console.error('AgentMode: Error parsing message draft JSON:', parseError);
+        // Continue with email draft only if message draft fails
+        messageData = null;
+      }
+
+      // Create message draft object if we got valid data
+      let messageDraft = null;
+      if (messageData && messageData.content) {
+        const now = new Date().toISOString();
+        messageDraft = {
+          content: messageData.content,
+          createdAt: now,
+          updatedAt: now,
+          sessionId: sessionId
+        };
+      }
+
+      // Update lead with both email draft and message draft
       await crmDb.updateLead(listId, leadId, {
         emailDraft: emailDraft,
-        emailDraftFormat: emailDraftFormat
+        emailDraftFormat: emailDraftFormat,
+        ...(messageDraft && { messageDraft: messageDraft })
       });
 
       return {
         success: true,
         message: existingDraft
-          ? 'Email draft updated successfully'
-          : 'Email draft created successfully',
-        data: emailDraftFormat === 'text'
-          ? {
-            subject: emailData.subject,
-            textContent: emailData.textContent
-          }
-          : {
-            subject: emailData.subject,
-            htmlContent: emailData.htmlContent
-          }
+          ? 'Email and message drafts updated successfully'
+          : 'Email and message drafts created successfully',
+        data: {
+          email: emailDraftFormat === 'text'
+            ? {
+              subject: emailData.subject,
+              textContent: emailData.textContent
+            }
+            : {
+              subject: emailData.subject,
+              htmlContent: emailData.htmlContent
+            },
+          message: messageDraft ? { content: messageDraft.content } : null
+        }
       };
     } catch (error) {
       console.error('AgentMode: Error updating email draft for lead:', error);

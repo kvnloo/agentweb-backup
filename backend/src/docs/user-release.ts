@@ -7,6 +7,20 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-03',
+    changes: [
+      'Enhanced CRM Lead Engagement Tracking and Message Drafts',
+      '- Renamed "Draft Email" to "Draft Message" throughout the CRM interface',
+      '- Now generates both email drafts (longer, formal) and message drafts (shorter, 150-500 chars for social platforms)',
+      '- Message drafts are editable with save functionality and can be easily copied with one click',
+      '- Added "Add Event" dropdown button to quickly log sent messages by platform (LinkedIn, Facebook, Twitter, Instagram, Other)',
+      '- Added "Last Contact" column with color-coded time indicators (No, <1d, <1w, <1m, >1m)',
+      'Supported Importing Connections and Messages from LinkedIn Export',
+      '- Users can now import their LinkedIn connections and messages from a LinkedIn export ZIP file',
+      '- The import process includes deduplication of existing connections and messages',
+    ],
+  },
+  {
     date: '2026-02-02',
     changes: [
       'Added Product Analytics Page to Performance Hub',

@@ -2853,6 +2853,7 @@ export const crmDb = {
       alertEvents?: string[];
       listSenderId?: string | null;
       publicAccessEnabled?: boolean;
+      icpsOnly?: boolean;
     }
   ) {
     try {
@@ -2900,6 +2901,12 @@ export const crmDb = {
         expressionAttributeNames['#publicAccessEnabled'] = 'publicAccessEnabled';
         updateExpressions.push('#publicAccessEnabled = :publicAccessEnabled');
         expressionAttributeValues[':publicAccessEnabled'] = updates.publicAccessEnabled;
+      }
+
+      if (updates.icpsOnly !== undefined) {
+        expressionAttributeNames['#icpsOnly'] = 'icpsOnly';
+        updateExpressions.push('#icpsOnly = :icpsOnly');
+        expressionAttributeValues[':icpsOnly'] = updates.icpsOnly;
       }
 
       if (updateExpressions.length === 0) {
@@ -3209,6 +3216,18 @@ export const crmDb = {
       updatedAt: string;
       sessionId?: string;
     } | null;
+    messageDraft?: {
+      content: string;
+      createdAt: string;
+      updatedAt: string;
+      sessionId?: string;
+    } | null;
+    icpMatch?: {
+      isMatch: boolean;
+      score: number;
+      reason: string;
+      matchedAt: string;
+    } | null;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -3289,6 +3308,26 @@ export const crmDb = {
         } else {
           setExpressions.push('emailDraft = :emailDraft');
           expressionAttributeValues[':emailDraft'] = updates.emailDraft;
+        }
+      }
+
+      if (updates.messageDraft !== undefined) {
+        if (updates.messageDraft === null) {
+          // Remove messageDraft attribute
+          removeExpressions.push('messageDraft');
+        } else {
+          setExpressions.push('messageDraft = :messageDraft');
+          expressionAttributeValues[':messageDraft'] = updates.messageDraft;
+        }
+      }
+
+      if (updates.icpMatch !== undefined) {
+        if (updates.icpMatch === null) {
+          // Remove icpMatch attribute
+          removeExpressions.push('icpMatch');
+        } else {
+          setExpressions.push('icpMatch = :icpMatch');
+          expressionAttributeValues[':icpMatch'] = updates.icpMatch;
         }
       }
 
@@ -3693,26 +3732,31 @@ export const crmDb = {
     }
   },
 
-  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<{ total: number; last7Days: number }> {
+  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<{ total: number; last7Days: number; totalAllMessages: number }> {
     try {
       // Get the lead
       const lead = await this.getLeadById(listId, leadId);
       if (!lead) {
-        return { total: 0, last7Days: 0 };
+        return { total: 0, last7Days: 0, totalAllMessages: 0 };
       }
 
       const now = new Date();
       const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-      let totalCount = 0;
+      let totalCount = 0; // Total SENT messages by user
       let last7DaysCount = 0;
+      let totalAllMessagesCount = 0; // Total ALL messages (sent + received)
 
       // Count manual engagements
       const manualEngagements = (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [];
-      totalCount += manualEngagements.length;
-      
-      // Count manual engagements in last 7 days
-      manualEngagements.forEach((eng) => {
+
+      // Filter for only SENT events (eventType contains "sent")
+      const sentManualEngagements = manualEngagements.filter((eng) => eng.eventType && eng.eventType.toLowerCase().includes('sent'));
+      totalCount += sentManualEngagements.length;
+      totalAllMessagesCount += manualEngagements.length;
+
+      // Count manual sent engagements in last 7 days
+      sentManualEngagements.forEach((eng) => {
         const createdAt = new Date(eng.createdAt);
         if (createdAt >= sevenDaysAgo) {
           last7DaysCount++;
@@ -3724,14 +3768,18 @@ export const crmDb = {
       if (user && user.emailDomain) {
         const emailEventsDb = require('./emailEventsDb').emailEventsDb;
         const leadEmail = lead.email?.toLowerCase();
-        
+
         if (leadEmail) {
           // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
           const filteredEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail);
-          totalCount += filteredEvents.length;
-          
-          // Count email events in last 7 days
-          filteredEvents.forEach((event: any) => {
+
+          // Filter for only SENT events (eventType contains "sent")
+          const sentEvents = filteredEvents.filter((event: any) => event.eventType && event.eventType.toLowerCase().includes('sent'));
+          totalCount += sentEvents.length;
+          totalAllMessagesCount += filteredEvents.length;
+
+          // Count email sent events in last 7 days
+          sentEvents.forEach((event: any) => {
             const createdAt = new Date(event.createdAt);
             if (createdAt >= sevenDaysAgo) {
               last7DaysCount++;
@@ -3740,10 +3788,36 @@ export const crmDb = {
         }
       }
 
-      return { total: totalCount, last7Days: last7DaysCount };
+      // Count LinkedIn message events
+      const leadLinkedIn = lead.linkedin?.toLowerCase();
+      if (leadLinkedIn) {
+        const emailEventsDb = require('./emailEventsDb').emailEventsDb;
+        const linkedInEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
+
+        // Filter for only SENT messages (eventType contains "sent")
+        const sentMessages = linkedInEvents.filter((event: any) => event.eventType && event.eventType.toLowerCase().includes('sent'));
+        totalCount += sentMessages.length;
+
+        // Count ALL messages (sent + received) for totalAllMessagesCount
+        totalAllMessagesCount += linkedInEvents.length;
+
+        // Count LinkedIn sent messages in last 7 days
+        sentMessages.forEach((event: any) => {
+          const createdAt = new Date(event.createdAt);
+          if (createdAt >= sevenDaysAgo) {
+            last7DaysCount++;
+          }
+        });
+      }
+
+      return {
+        total: totalCount, // Messages SENT by user
+        totalAllMessages: totalAllMessagesCount, // ALL messages (sent + received)
+        last7Days: last7DaysCount
+      };
     } catch (error) {
       console.error('Error counting lead engagements:', error);
-      return { total: 0, last7Days: 0 }; // Return 0 on error to avoid breaking the UI
+      return { total: 0, last7Days: 0, totalAllMessages: 0 }; // Return 0 on error to avoid breaking the UI
     }
   },
 
@@ -3767,11 +3841,20 @@ export const crmDb = {
       // Get email events from AW-EmailEvents filtered by domain and lead email
       const emailEventsDb = require('./emailEventsDb').emailEventsDb;
       const leadEmail = lead.email?.toLowerCase();
-      
+      const leadLinkedIn = lead.linkedin?.toLowerCase();
+
       // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
-      const filteredEvents = leadEmail
+      // Query by both email and LinkedIn URL to capture all engagements
+      const emailEvents = leadEmail
         ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail)
         : [];
+
+      // Also get LinkedIn message events for this lead (stored with LinkedIn URL as leadEmail)
+      const linkedInEvents = leadLinkedIn
+        ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn)
+        : [];
+
+      const filteredEvents = [...emailEvents, ...linkedInEvents];
 
       // Transform email events to engagement format
       // For email.received events, fetch the email content
