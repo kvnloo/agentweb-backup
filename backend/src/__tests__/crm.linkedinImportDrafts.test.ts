@@ -174,13 +174,13 @@ urn:li:msg:4,Meeting Request,Me,https://www.linkedin.com/in/me,Alice Chen,https:
       });
 
       expect(validMessages.length).toBe(3);
-      expect(validMessages.map(m => m['CONVERSATION ID'])).toEqual([
+      expect(validMessages.map((m: any) => m['CONVERSATION ID'])).toEqual([
         'urn:li:msg:1',
         'urn:li:msg:2',
         'urn:li:msg:4',
       ]);
       // Draft message (urn:li:msg:3) should be filtered out
-      expect(validMessages.find(m => m['CONVERSATION ID'] === 'urn:li:msg:3')).toBeUndefined();
+      expect(validMessages.find((m: any) => m['CONVERSATION ID'] === 'urn:li:msg:3')).toBeUndefined();
     });
   });
 });
