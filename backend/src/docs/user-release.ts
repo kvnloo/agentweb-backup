@@ -10,6 +10,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
     date: '2026-02-04',
     changes: [
       'Fixed Agent Mode table rendering to eliminate large empty spaces between text and tables',
+      'Fixed Slack report revision workflow not sending revised reports back to Slack',
+      '- MCP tool results were wrapped in {content: "JSON string", raw: {...}} format, causing URL extraction to fail',
+      '- Updated extractMinimalToolResult to parse the content field for update_html_file, generate_image, generate_video, and other tools',
+      '- Revised reports now correctly send the new asset URL back to Slack for approval',
     ],
   },
   {
