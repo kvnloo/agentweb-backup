@@ -472,8 +472,9 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         const engagementCounts = await crmDb.getLeadEngagementCount(listId, lead.leadId, userId);
         return {
           ...lead,
-          engagementCount: engagementCounts.total,
+          engagementCount: engagementCounts.total, // Sent messages count
           engagementCountLast7Days: engagementCounts.last7Days,
+          totalAllMessages: engagementCounts.totalAllMessages, // Total messages (sent + received)
         };
       })
     );
@@ -955,8 +956,17 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
           relax_column_count: true,
         });
 
-        // Filter valid messages
-        const validMessages = messagesRecords.filter((m: any) => m['CONVERSATION ID'] && m.DATE);
+        // Filter valid messages (exclude drafts that haven't been sent)
+        const validMessages = messagesRecords.filter((m: any) => {
+          // Must have conversation ID and date
+          if (!m['CONVERSATION ID'] || !m.DATE) return false;
+
+          // Skip messages marked as drafts (IS MESSAGE DRAFT = "Yes")
+          const isDraft = m['IS MESSAGE DRAFT']?.trim().toLowerCase() === 'yes';
+          if (isDraft) return false;
+
+          return true;
+        });
         totalMessagesInFile = validMessages.length;
 
         // Get existing email events to check for duplicates

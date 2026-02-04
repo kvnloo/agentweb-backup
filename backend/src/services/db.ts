@@ -3732,26 +3732,31 @@ export const crmDb = {
     }
   },
 
-  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<{ total: number; last7Days: number }> {
+  async getLeadEngagementCount(listId: string, leadId: string, userId: string): Promise<{ total: number; last7Days: number; totalAllMessages: number }> {
     try {
       // Get the lead
       const lead = await this.getLeadById(listId, leadId);
       if (!lead) {
-        return { total: 0, last7Days: 0 };
+        return { total: 0, last7Days: 0, totalAllMessages: 0 };
       }
 
       const now = new Date();
       const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-      let totalCount = 0;
+      let totalCount = 0; // Total SENT messages by user
       let last7DaysCount = 0;
+      let totalAllMessagesCount = 0; // Total ALL messages (sent + received)
 
       // Count manual engagements
       const manualEngagements = (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [];
-      totalCount += manualEngagements.length;
-      
-      // Count manual engagements in last 7 days
-      manualEngagements.forEach((eng) => {
+
+      // Filter for only SENT events (eventType contains "sent")
+      const sentManualEngagements = manualEngagements.filter((eng) => eng.eventType && eng.eventType.toLowerCase().includes('sent'));
+      totalCount += sentManualEngagements.length;
+      totalAllMessagesCount += manualEngagements.length;
+
+      // Count manual sent engagements in last 7 days
+      sentManualEngagements.forEach((eng) => {
         const createdAt = new Date(eng.createdAt);
         if (createdAt >= sevenDaysAgo) {
           last7DaysCount++;
@@ -3767,10 +3772,14 @@ export const crmDb = {
         if (leadEmail) {
           // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
           const filteredEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail);
-          totalCount += filteredEvents.length;
 
-          // Count email events in last 7 days
-          filteredEvents.forEach((event: any) => {
+          // Filter for only SENT events (eventType contains "sent")
+          const sentEvents = filteredEvents.filter((event: any) => event.eventType && event.eventType.toLowerCase().includes('sent'));
+          totalCount += sentEvents.length;
+          totalAllMessagesCount += filteredEvents.length;
+
+          // Count email sent events in last 7 days
+          sentEvents.forEach((event: any) => {
             const createdAt = new Date(event.createdAt);
             if (createdAt >= sevenDaysAgo) {
               last7DaysCount++;
@@ -3784,10 +3793,16 @@ export const crmDb = {
       if (leadLinkedIn) {
         const emailEventsDb = require('./emailEventsDb').emailEventsDb;
         const linkedInEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn);
-        totalCount += linkedInEvents.length;
 
-        // Count LinkedIn events in last 7 days
-        linkedInEvents.forEach((event: any) => {
+        // Filter for only SENT messages (eventType contains "sent")
+        const sentMessages = linkedInEvents.filter((event: any) => event.eventType && event.eventType.toLowerCase().includes('sent'));
+        totalCount += sentMessages.length;
+
+        // Count ALL messages (sent + received) for totalAllMessagesCount
+        totalAllMessagesCount += linkedInEvents.length;
+
+        // Count LinkedIn sent messages in last 7 days
+        sentMessages.forEach((event: any) => {
           const createdAt = new Date(event.createdAt);
           if (createdAt >= sevenDaysAgo) {
             last7DaysCount++;
@@ -3795,10 +3810,14 @@ export const crmDb = {
         });
       }
 
-      return { total: totalCount, last7Days: last7DaysCount };
+      return {
+        total: totalCount, // Messages SENT by user
+        totalAllMessages: totalAllMessagesCount, // ALL messages (sent + received)
+        last7Days: last7DaysCount
+      };
     } catch (error) {
       console.error('Error counting lead engagements:', error);
-      return { total: 0, last7Days: 0 }; // Return 0 on error to avoid breaking the UI
+      return { total: 0, last7Days: 0, totalAllMessages: 0 }; // Return 0 on error to avoid breaking the UI
     }
   },
 
