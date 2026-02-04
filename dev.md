@@ -628,3 +628,93 @@ After publishing GTM container updates to add tracking for app.agentweb.pro, no 
   ```
 - **Result**: Customer Portal shows accurate production-only metrics, but Google Analytics UI will show inflated numbers that include localhost traffic
 - **Recommendation**: Follow the guide in `GA4_EXCLUDE_LOCALHOST_GUIDE.md` to prevent localhost traffic from reaching GA4 entirely (Method 3 or 4 recommended)
+
+## February 04, 2026
+
+### LinkedIn Import Stuck at 0% - WebSocket Connection Failure
+
+**Symptom**: LinkedIn import feature in CRM page showed progress stuck at 0%, no data imported to database, WebSocket connection errors in browser console showing malformed URL: `ws://https/socket.io/`
+
+**Root Causes**:
+
+1. **Missing nginx WebSocket configuration in production**
+   - Elastic Beanstalk's nginx proxy doesn't support WebSocket upgrade by default
+   - Socket.IO connections were blocked at the nginx layer
+   - Development worked because it connects directly to backend (no nginx proxy)
+
+2. **Incorrect nginx configuration placement**
+   - Initial fix placed `websocket.conf` in `.platform/nginx/conf.d/`
+   - This directory is for `http` block context (global settings)
+   - `location` blocks are NOT allowed in `http` context → deployment failed
+   - Correct location: `.platform/nginx/conf.d/elasticbeanstalk/` (for `server` block context)
+
+3. **Frontend Socket.IO URL parsing bug**
+   - Code used: `buildApiUrl("").replace("/api", "")`
+   - For staging URL `https://api-stage.agentweb.pro/api`:
+     - Incorrectly replaced "api" everywhere including in "api-stage"
+     - Result: `https://-stage.agentweb.pro` (broken URL)
+     - Socket.IO saw malformed URL and created: `ws://https/socket.io/`
+   - Fix: Use regex to only remove `/api` at the end: `.replace(/\/api\/?$/, "")`
+
+**Resolution Steps**:
+
+1. **Added WebSocket nginx configuration**:
+   ```
+   backend/.platform/nginx/conf.d/elasticbeanstalk/websocket.conf
+   ```
+   - Includes `location /socket.io/` block with WebSocket upgrade headers
+   - `proxy_set_header Upgrade $http_upgrade`
+   - `proxy_set_header Connection "upgrade"`
+   - Extended timeouts for long-running imports (3600s)
+
+2. **Fixed Socket.IO URL parsing** in `customer-portal/src/pages/CRM.tsx`:
+   ```typescript
+   const apiUrl = buildApiUrl("");
+   const socketUrl = apiUrl.replace(/\/api\/?$/, ""); // Only remove /api at END
+   ```
+
+**Debugging Process**:
+
+1. **Initial Investigation**:
+   - Checked Elastic Beanstalk logs via AWS CLI
+   - Required adding IAM permissions for CloudWatch Logs and Beanstalk access
+   - Found no `mode=import` requests in nginx access logs (only `mode=preview`)
+   - Realized import never started due to WebSocket connection failure
+
+2. **Backend Log Analysis**:
+   - Preview requests returned HTTP 200 with valid JSON (~2,185 bytes)
+   - Successfully parsed 2,986-5,538 connections and 5,484-7,132 messages
+   - No server-side errors logged
+   - WebSocket server initialized correctly
+
+3. **Deployment Failures**:
+   - First attempt: Used `map` directive in `conf.d/` → failed (wrong context)
+   - Second attempt: Used `location` block in `conf.d/` → failed (wrong context)
+   - Third attempt: Moved to `conf.d/elasticbeanstalk/` → succeeded
+
+4. **Frontend WebSocket Error**:
+   - Browser console showed malformed WebSocket URL
+   - Traced to `.replace("/api", "")` matching "api" in hostname
+   - Fixed with regex to only match `/api` at end of string
+
+**Key Learnings**:
+
+- **Elastic Beanstalk nginx structure**:
+  - `.platform/nginx/conf.d/` → `http` block (no location blocks allowed)
+  - `.platform/nginx/conf.d/elasticbeanstalk/` → `server` block (location blocks allowed)
+  - Refer to AWS docs: https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/platforms-linux-extend.proxy.html
+
+- **IAM Permissions for Log Access**:
+  - Need `AWSElasticBeanstalkReadOnly` policy
+  - Need `CloudWatchLogsReadOnlyAccess` policy
+  - Can also add `elasticbeanstalk:RetrieveEnvironmentInfo` permission
+
+- **WebSocket Testing**:
+  - Always test Socket.IO connections in staging before production
+  - Check browser console for WebSocket connection errors
+  - Verify correct URL format: `wss://domain.com/socket.io/` not `ws://https/socket.io/`
+
+- **String Replace Gotchas**:
+  - Be careful with `.replace()` when URL contains similar substrings
+  - Use regex with anchors (`$` for end of string) for precise replacements
+  - For staging URLs like `api-stage.agentweb.pro`, simple string replace is dangerous
