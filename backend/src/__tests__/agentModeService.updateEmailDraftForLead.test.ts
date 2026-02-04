@@ -854,12 +854,14 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
         ],
       };
 
-      // Mock message draft response
+      // Mock message draft response (must be JSON format)
       const mockMessageDraftResponse = {
         choices: [
           {
             message: {
-              content: 'Hi Jane! Noticed your work at Tech Corp. Would love to chat about a potential collaboration. Open to a quick call?',
+              content: JSON.stringify({
+                content: 'Hi Jane! Noticed your work at Tech Corp. Would love to chat about a potential collaboration. Open to a quick call?',
+              }),
             },
           },
         ],
