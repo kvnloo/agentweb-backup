@@ -3829,14 +3829,8 @@ export const crmDb = {
         throw new Error('Lead not found');
       }
 
-      // Get user to get emailDomain
+      // Get user to get emailDomain (optional for LinkedIn events)
       const user = await userDb.getUserById(userId);
-      if (!user || !user.emailDomain) {
-        // Return only lead engagements if no email domain configured
-        return {
-          engagements: (lead.engagements as Array<{ eventType: string; eventData: any; createdAt: string }>) || [],
-        };
-      }
 
       // Get email events from AW-EmailEvents filtered by domain and lead email
       const emailEventsDb = require('./emailEventsDb').emailEventsDb;
@@ -3844,12 +3838,13 @@ export const crmDb = {
       const leadLinkedIn = lead.linkedin?.toLowerCase();
 
       // Use optimized query with composite GSI (EmailDomainLeadEmailIndex)
-      // Query by both email and LinkedIn URL to capture all engagements
-      const emailEvents = leadEmail
+      // Query by email only if user has emailDomain configured
+      const emailEvents = (leadEmail && user?.emailDomain)
         ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(user.emailDomain, leadEmail)
         : [];
 
-      // Also get LinkedIn message events for this lead (stored with LinkedIn URL as leadEmail)
+      // Always get LinkedIn message events for this lead (stored with LinkedIn URL as leadEmail)
+      // This should work even if user doesn't have emailDomain configured for regular emails
       const linkedInEvents = leadLinkedIn
         ? await emailEventsDb.getEventsByEmailDomainAndLeadEmail(`linkedin-${listId}`, leadLinkedIn)
         : [];
