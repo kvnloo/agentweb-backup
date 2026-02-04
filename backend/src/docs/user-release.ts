@@ -14,6 +14,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- MCP tool results were wrapped in {content: "JSON string", raw: {...}} format, causing URL extraction to fail',
       '- Updated extractMinimalToolResult to parse the content field for update_html_file, generate_image, generate_video, and other tools',
       '- Revised reports now correctly send the new asset URL back to Slack for approval',
+      'Fixed LinkedIn Import Progress Tracking in CRM',
+      '- LinkedIn import was stuck at 0% due to WebSocket connection failures',
+      '- Added nginx WebSocket configuration to Elastic Beanstalk deployment',
     ],
   },
   {
