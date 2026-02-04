@@ -933,5 +933,166 @@ describe('CRM Database Service', () => {
       expect(result.last7Days).toBeGreaterThanOrEqual(0);
     });
   });
+
+  describe('getLeadEngagements - LinkedIn without emailDomain', () => {
+    it('should return LinkedIn events even when user has no emailDomain configured', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const userId = 'user1';
+
+      const mockLead = {
+        leadId,
+        listId,
+        email: null, // No email
+        linkedin: 'https://www.linkedin.com/in/testuser',
+        engagements: [], // No manual engagements
+      };
+
+      const mockLinkedInEvents = [
+        {
+          eventId: 'linkedin-event1',
+          eventType: 'linkedin.message.sent',
+          emailDomain: `linkedin-${listId}`,
+          leadEmail: 'https://www.linkedin.com/in/testuser',
+          data: {
+            conversationId: 'conv1',
+            from: 'User Name',
+            content: 'Test message',
+            date: '2024-01-01T00:00:00Z',
+          },
+          createdAt: '2024-01-01T00:00:00Z',
+        },
+        {
+          eventId: 'linkedin-event2',
+          eventType: 'linkedin.message.received',
+          emailDomain: `linkedin-${listId}`,
+          leadEmail: 'https://www.linkedin.com/in/testuser',
+          data: {
+            conversationId: 'conv1',
+            from: 'Lead Name',
+            content: 'Reply message',
+            date: '2024-01-02T00:00:00Z',
+          },
+          createdAt: '2024-01-02T00:00:00Z',
+        },
+      ];
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      // Mock emailEventsDb - only LinkedIn query will be called since no email/emailDomain
+      const { emailEventsDb } = require('../services/emailEventsDb');
+      emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockReset();
+      emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockResolvedValue(mockLinkedInEvents);
+
+      // Mock userDb.getUserById - user has NO emailDomain configured
+      const { userDb } = require('../services/db');
+      jest.spyOn(userDb, 'getUserById').mockResolvedValue({
+        userId,
+        email: 'user@example.com',
+        // emailDomain is NOT set
+      });
+
+      const result = await crmDb.getLeadEngagements(listId, leadId, userId);
+
+      // Should return the LinkedIn events even though user has no emailDomain
+      expect(result.engagements).toBeDefined();
+      expect(result.engagements).toHaveLength(2);
+      expect(result.engagements[0].eventType).toMatch(/linkedin\.message\./);
+      expect(result.engagements[1].eventType).toMatch(/linkedin\.message\./);
+
+      // Verify that LinkedIn events query was called with correct domain
+      expect(emailEventsDb.getEventsByEmailDomainAndLeadEmail).toHaveBeenCalledWith(
+        `linkedin-${listId}`,
+        'https://www.linkedin.com/in/testuser'
+      );
+    });
+
+    it('should return both email and LinkedIn events when user has emailDomain', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const userId = 'user1';
+
+      const mockLead = {
+        leadId,
+        listId,
+        email: 'lead@example.com',
+        linkedin: 'https://www.linkedin.com/in/testuser',
+        engagements: [],
+      };
+
+      const mockEmailEvent = {
+        eventId: 'email-event1',
+        eventType: 'email.sent',
+        emailDomain: 'example.com',
+        leadEmail: 'lead@example.com',
+        data: {
+          subject: 'Test Email',
+          email_id: 'email-123',
+        },
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+
+      const mockLinkedInEvent = {
+        eventId: 'linkedin-event1',
+        eventType: 'linkedin.message.sent',
+        emailDomain: `linkedin-${listId}`,
+        leadEmail: 'https://www.linkedin.com/in/testuser',
+        data: {
+          conversationId: 'conv1',
+          from: 'User Name',
+          content: 'Test message',
+        },
+        createdAt: '2024-01-02T00:00:00Z',
+      };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockLead }),
+      });
+
+      // Mock emailEventsDb - set up to return different results for different domains
+      const { emailEventsDb } = require('../services/emailEventsDb');
+      emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockReset();
+      emailEventsDb.getEventsByEmailDomainAndLeadEmail.mockImplementation(
+        (domain: string, leadEmail: string) => {
+          if (domain === 'example.com') {
+            return Promise.resolve([mockEmailEvent]);
+          } else if (domain === `linkedin-${listId}`) {
+            return Promise.resolve([mockLinkedInEvent]);
+          }
+          return Promise.resolve([]);
+        }
+      );
+
+      // Mock userDb.getUserById - user HAS emailDomain configured
+      const { userDb } = require('../services/db');
+      jest.spyOn(userDb, 'getUserById').mockResolvedValue({
+        userId,
+        email: 'user@example.com',
+        emailDomain: 'example.com',
+      });
+
+      const result = await crmDb.getLeadEngagements(listId, leadId, userId);
+
+      // Should return both email and LinkedIn events
+      expect(result.engagements).toBeDefined();
+      expect(result.engagements).toHaveLength(2);
+
+      const eventTypes = result.engagements.map((e: any) => e.eventType);
+      expect(eventTypes).toContain('email.sent');
+      expect(eventTypes).toContain('linkedin.message.sent');
+
+      // Verify both queries were made
+      expect(emailEventsDb.getEventsByEmailDomainAndLeadEmail).toHaveBeenCalledWith(
+        'example.com',
+        'lead@example.com'
+      );
+      expect(emailEventsDb.getEventsByEmailDomainAndLeadEmail).toHaveBeenCalledWith(
+        `linkedin-${listId}`,
+        'https://www.linkedin.com/in/testuser'
+      );
+    });
+  });
 });
 
