@@ -7,6 +7,12 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-04',
+    changes: [
+      'Fixed Agent Mode table rendering to eliminate large empty spaces between text and tables',
+    ],
+  },
+  {
     date: '2026-02-03',
     changes: [
       'Enhanced CRM Lead Engagement Tracking and Message Drafts',
