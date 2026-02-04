@@ -3216,6 +3216,12 @@ export const crmDb = {
       updatedAt: string;
       sessionId?: string;
     } | null;
+    messageDraft?: {
+      content: string;
+      createdAt: string;
+      updatedAt: string;
+      sessionId?: string;
+    } | null;
     icpMatch?: {
       isMatch: boolean;
       score: number;
@@ -3302,6 +3308,16 @@ export const crmDb = {
         } else {
           setExpressions.push('emailDraft = :emailDraft');
           expressionAttributeValues[':emailDraft'] = updates.emailDraft;
+        }
+      }
+
+      if (updates.messageDraft !== undefined) {
+        if (updates.messageDraft === null) {
+          // Remove messageDraft attribute
+          removeExpressions.push('messageDraft');
+        } else {
+          setExpressions.push('messageDraft = :messageDraft');
+          expressionAttributeValues[':messageDraft'] = updates.messageDraft;
         }
       }
 
