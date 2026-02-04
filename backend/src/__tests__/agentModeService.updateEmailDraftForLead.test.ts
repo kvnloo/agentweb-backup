@@ -544,8 +544,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.textContent).toBe('This is plain text content without HTML tags.');
-      expect(result.data.htmlContent).toBeUndefined();
+      expect(result.data.email.textContent).toBe('This is plain text content without HTML tags.');
+      expect(result.data.email.htmlContent).toBeUndefined();
 
       // Verify updateLead was called with textContent and format
       expect(crmDb.updateLead).toHaveBeenCalledWith(
@@ -610,8 +610,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.data.htmlContent).toBe('<p>This is HTML content with <strong>formatting</strong>.</p>');
-      expect(result.data.textContent).toBeUndefined();
+      expect(result.data.email.htmlContent).toBe('<p>This is HTML content with <strong>formatting</strong>.</p>');
+      expect(result.data.email.textContent).toBeUndefined();
 
       // Verify updateLead was called with htmlContent and format
       expect(crmDb.updateLead).toHaveBeenCalledWith(
@@ -916,9 +916,8 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
 
       // Verify second call is for message draft
       const secondCall = mockCreate.mock.calls[1][0];
-      expect(secondCall.messages[0].content).toContain('shorter message version');
-      expect(secondCall.messages[0].content).toContain('150-');
-      expect(secondCall.messages[0].content).toContain('500');
+      expect(secondCall.messages[0].content).toContain('concise, engaging messages');
+      expect(secondCall.messages[0].content).toContain('LinkedIn');
 
       // Should update lead with both email and message drafts
       expect(crmDb.updateLead).toHaveBeenCalledWith(
