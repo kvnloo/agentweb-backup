@@ -657,31 +657,52 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   maxAttempts: 5
                 }).then(async (result) => {
                   console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
-                  
+
                   // Extract the new asset URL from toolCalls
                   let newAssetUrl: string | null = null;
                   let newAssetFilename: string | null = null;
-                  
+                  let toolCallFailed = false;
+                  let toolCallFailureMessage = '';
+
                   if (result.success && result.toolCalls.length > 0) {
                     // Find the tool call that created the asset
                     for (const toolCall of result.toolCalls) {
                       const toolResult = toolCall?.result || {};
-                      
+
                       if (originalApproval.assetType === 'image') {
                         // For images, look for imageUrl, image_url, s3_url, or url in generate_image result
-                        const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
-                        if (imageUrl) {
-                          newAssetUrl = imageUrl;
-                          newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
-                          break;
+                        // Only extract if the tool call succeeded
+                        if (toolResult.success) {
+                          const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
+                          if (imageUrl) {
+                            newAssetUrl = imageUrl;
+                            newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
+                            break;
+                          }
+                        } else if (toolCall.name === 'generate_image') {
+                          // Tool call failed
+                          toolCallFailed = true;
+                          toolCallFailureMessage = toolResult.message || toolCall.error || 'Unknown error';
+                          console.error(`❌ generate_image tool call failed: ${toolCallFailureMessage}`);
                         }
                       } else if (originalApproval.assetType === 'html') {
                         // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file result
-                        const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
-                        if (htmlUrl) {
-                          newAssetUrl = htmlUrl;
-                          newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || `revised_${originalApproval.filename || 'report.html'}`;
-                          break;
+                        // Only extract if the tool call succeeded
+                        if (toolResult.success) {
+                          const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
+                          if (htmlUrl) {
+                            newAssetUrl = htmlUrl;
+                            newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || `revised_${originalApproval.filename || 'report.html'}`;
+                            break;
+                          } else {
+                            // Tool succeeded but no URL in result - this shouldn't happen
+                            console.error(`❌ update_html_file succeeded but no URL in result. Result:`, JSON.stringify(toolResult));
+                          }
+                        } else if (toolCall.name === 'update_html_file') {
+                          // Tool call failed
+                          toolCallFailed = true;
+                          toolCallFailureMessage = toolResult.message || toolCall.error || 'Unknown error';
+                          console.error(`❌ update_html_file tool call failed: ${toolCallFailureMessage}`);
                         }
                       }
                     }
@@ -712,13 +733,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       console.error('❌ Error sending revision asset to Slack:', error);
                     }
                   } else {
-                    console.warn(`⚠️ Could not extract new asset URL from toolCalls. Tool calls: ${JSON.stringify(result.toolCalls)}`);
-                    
+                    // Determine the failure reason for better logging
+                    const failureReason = toolCallFailed
+                      ? `Tool call failed: ${toolCallFailureMessage}`
+                      : 'Could not extract new asset URL from toolCalls';
+
+                    console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
+
                     // Send oncall alert with session ishare link and context
                     try {
                       const { chatbotDb } = await import('../services/chatbotService');
                       const { emailService } = await import('../services/emailService');
-                      
+
                       // Get or create ishare link for the session
                       let ishareLink = '';
                       try {
@@ -728,10 +754,14 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
                         ishareLink = `${customerFrontendUrl}/agent-mode/${agentSessionId}`;
                       }
-                      
+
                       await sendAgentModeOncallAlert({
-                        subject: 'Agent Mode Revision: Failed to Extract Asset URL',
-                        message: `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                        subject: toolCallFailed
+                          ? 'Agent Mode Revision: Tool Call Failed'
+                          : 'Agent Mode Revision: Failed to Extract Asset URL',
+                        message: toolCallFailed
+                          ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
+                          : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                         sessionId: agentSessionId,
                         context: {
                           'iShare Link': ishareLink,
@@ -740,6 +770,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           'Original Filename': originalApproval.filename || 'unknown',
                           'Feedback': feedbackValue,
                           'Revision Success': result.success,
+                          'Tool Call Failed': toolCallFailed,
+                          'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                           'Tool Calls Count': result.toolCalls.length,
                           'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
                           'Execution ID': originalApproval.executionId,
@@ -852,31 +884,52 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       maxAttempts: 5
                     }).then(async (result) => {
                       console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
-                      
+
                       // Extract the new asset URL from toolCalls
                       let newAssetUrl: string | null = null;
                       let newAssetFilename: string | null = null;
-                      
+                      let toolCallFailed = false;
+                      let toolCallFailureMessage = '';
+
                       if (result.success && result.toolCalls.length > 0) {
                         // Find the tool call that created the asset
                         for (const toolCall of result.toolCalls) {
                           const toolResult = toolCall?.result || {};
-                          
+
                           if (originalApproval.assetType === 'image') {
                             // For images, look for imageUrl, image_url, s3_url, or url in generate_image result
-                            const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
-                            if (imageUrl) {
-                              newAssetUrl = imageUrl;
-                              newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
-                              break;
+                            // Only extract if the tool call succeeded
+                            if (toolResult.success) {
+                              const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
+                              if (imageUrl) {
+                                newAssetUrl = imageUrl;
+                                newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
+                                break;
+                              }
+                            } else if (toolCall.name === 'generate_image') {
+                              // Tool call failed
+                              toolCallFailed = true;
+                              toolCallFailureMessage = toolResult.message || toolCall.error || 'Unknown error';
+                              console.error(`❌ generate_image tool call failed: ${toolCallFailureMessage}`);
                             }
                           } else if (originalApproval.assetType === 'html') {
                             // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file result
-                            const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
-                            if (htmlUrl) {
-                              newAssetUrl = htmlUrl;
-                              newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || `revised_${originalApproval.filename || 'report.html'}`;
-                              break;
+                            // Only extract if the tool call succeeded
+                            if (toolResult.success) {
+                              const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
+                              if (htmlUrl) {
+                                newAssetUrl = htmlUrl;
+                                newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || `revised_${originalApproval.filename || 'report.html'}`;
+                                break;
+                              } else {
+                                // Tool succeeded but no URL in result - this shouldn't happen
+                                console.error(`❌ update_html_file succeeded but no URL in result. Result:`, JSON.stringify(toolResult));
+                              }
+                            } else if (toolCall.name === 'update_html_file') {
+                              // Tool call failed
+                              toolCallFailed = true;
+                              toolCallFailureMessage = toolResult.message || toolCall.error || 'Unknown error';
+                              console.error(`❌ update_html_file tool call failed: ${toolCallFailureMessage}`);
                             }
                           }
                         }
@@ -907,13 +960,18 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           console.error('❌ Error sending revision asset to Slack:', error);
                         }
                       } else {
-                        console.warn(`⚠️ Could not extract new asset URL from toolCalls. Tool calls: ${JSON.stringify(result.toolCalls)}`);
-                        
+                        // Determine the failure reason for better logging
+                        const failureReason = toolCallFailed
+                          ? `Tool call failed: ${toolCallFailureMessage}`
+                          : 'Could not extract new asset URL from toolCalls';
+
+                        console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
+
                         // Send oncall alert with session ishare link and context
                         try {
                           const { chatbotDb } = await import('../services/chatbotService');
                           const { emailService } = await import('../services/emailService');
-                          
+
                           // Get or create ishare link for the session
                           let ishareLink = '';
                           try {
@@ -923,10 +981,14 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                             const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
                             ishareLink = `${customerFrontendUrl}/agent-mode/${task.sessionId}`;
                           }
-                          
+
                           await sendAgentModeOncallAlert({
-                            subject: 'Agent Mode Revision: Failed to Extract Asset URL',
-                            message: `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                            subject: toolCallFailed
+                              ? 'Agent Mode Revision: Tool Call Failed'
+                              : 'Agent Mode Revision: Failed to Extract Asset URL',
+                            message: toolCallFailed
+                              ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
+                              : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                             sessionId: task.sessionId,
                             context: {
                               'iShare Link': ishareLink,
@@ -935,6 +997,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                               'Original Filename': originalApproval.filename || 'unknown',
                               'Feedback': feedbackValue,
                               'Revision Success': result.success,
+                              'Tool Call Failed': toolCallFailed,
+                              'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                               'Tool Calls Count': result.toolCalls.length,
                               'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
                               'Execution ID': originalApproval.executionId,

@@ -1052,50 +1052,104 @@ Use the available tools to create tasks in the agent-engine when complex work is
   private extractMinimalToolResult(result: any, toolName: string): any {
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
+      // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse task creation result.content as JSON:`, e);
+        }
+      }
       return {
-        taskId: result.taskId,
-        executionId: result.executionId,
-        status: result.status || 'pending',
-        message: result.message || 'Task created'
+        taskId: actualResult.taskId,
+        executionId: actualResult.executionId,
+        status: actualResult.status || 'pending',
+        message: actualResult.message || 'Task created'
       };
     }
 
     // For image generation, return the essential fields
     if (toolName === 'generate_image') {
+      // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse generate_image result.content as JSON:`, e);
+        }
+      }
       return {
-        success: result.success,
-        message: result.message,
-        imageUrl: result.imageUrl,
-        filename: result.filename
+        success: actualResult.success,
+        message: actualResult.message,
+        imageUrl: actualResult.imageUrl,
+        filename: actualResult.filename
       };
     }
 
     // For video generation, return the essential fields
     if (toolName === 'generate_video') {
+      // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse generate_video result.content as JSON:`, e);
+        }
+      }
       return {
-        success: result.success,
-        message: result.message,
-        videoUrl: result.videoUrl,
-        filename: result.filename
+        success: actualResult.success,
+        message: actualResult.message,
+        videoUrl: actualResult.videoUrl,
+        filename: actualResult.filename
       };
     }
 
     if (toolName === 'describe_video') {
+      // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse describe_video result.content as JSON:`, e);
+        }
+      }
       return {
-        success: result.success,
-        description: result.description,
-        videoUrl: result.videoUrl
+        success: actualResult.success,
+        description: actualResult.description,
+        videoUrl: actualResult.videoUrl
       };
     }
 
     // For HTML file updates, return the essential fields
     if (toolName === 'update_html_file') {
-      return {
-        success: result.success,
-        message: result.message,
-        s3_url: result.s3_url,
-        versioned_filename: result.versioned_filename
+      // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse update_html_file result.content as JSON:`, e);
+        }
+      }
+
+      const extracted: any = {
+        success: actualResult.success,
+        message: actualResult.message,
+        s3_url: actualResult.s3_url,
+        versioned_filename: actualResult.versioned_filename
       };
+      // If the operation failed, include error details
+      if (!actualResult.success && actualResult.error) {
+        extracted.error = actualResult.error;
+      }
+      if (actualResult.suggestion) {
+        extracted.suggestion = actualResult.suggestion;
+      }
+      return extracted;
     }
 
     // For other tools, return empty object to minimize storage
