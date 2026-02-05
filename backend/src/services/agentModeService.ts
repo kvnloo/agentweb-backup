@@ -651,7 +651,10 @@ When updating HTML files, follow this process:
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
-- **Meta Ads Metrics**: Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data
+- **Meta Ads Campaigns and Metrics**:
+- Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
+- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data. You can optionally filter by campaign_name to get metrics for a specific campaign
+- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns, then let the user choose which campaign to analyze before calling 'get_meta_ads_metrics'
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
@@ -855,6 +858,7 @@ Use the available tools to create tasks in the agent-engine when complex work is
       'create_task_from_template': 'template-based task',
       'create_task_from_prompt': 'custom prompt task',
       'create_image_task_from_prompt': 'image generation task',
+      'list_meta_ads_campaigns': 'Meta ads campaigns list',
       'get_meta_ads_metrics': 'Meta ads metrics analysis',
       'search_web': 'web search',
       'create_revision': 'task revision',
@@ -1209,6 +1213,33 @@ Use the available tools to create tasks in the agent-engine when complex work is
           imageUrl: `https://mock-s3-bucket.s3.amazonaws.com/${args.filename || `image_no_c2pa_${Date.now()}.png`}`,
           filename: args.filename || `image_no_c2pa_${Date.now()}.png`,
           originalUrl: args.image_url
+        };
+
+      case 'list_meta_ads_campaigns':
+        return {
+          success: true,
+          message: 'Found 3 campaign(s)',
+          campaigns: [
+            {
+              id: '120208234567890123',
+              name: 'Holiday Campaign 2023',
+              status: 'ACTIVE',
+              objective: 'OUTCOME_LEADS'
+            },
+            {
+              id: '120208234567890124',
+              name: 'Brand Awareness Campaign',
+              status: 'ACTIVE',
+              objective: 'OUTCOME_AWARENESS'
+            },
+            {
+              id: '120208234567890125',
+              name: 'Retargeting Campaign',
+              status: 'PAUSED',
+              objective: 'OUTCOME_SALES'
+            }
+          ],
+          totalCount: 3
         };
 
       case 'get_meta_ads_metrics':
@@ -4587,7 +4618,85 @@ Format the response as JSON with this structure:
     }
   }
 
+  public async listMetaAdsCampaigns(userId: string): Promise<any> {
+    try {
+      // Import the Meta API functions
+      const { getMetaAccessToken } = await import('../utils/secretsManager');
+      const { userDb } = await import('./db');
+      const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
+      // Get user from database
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return {
+          success: false,
+          message: 'User not found',
+          error: 'User not found'
+        };
+      }
+
+      // Check if user has ad account configured
+      if (!user.adAccount || user.adAccount.trim() === "") {
+        return {
+          success: false,
+          message: 'Ad account not configured. Please configure your Meta ad account first.',
+          error: 'Ad account not configured'
+        };
+      }
+
+      // Get Meta API access token from Secrets Manager
+      let accessToken: string;
+      try {
+        accessToken = await getMetaAccessToken();
+      } catch (error: any) {
+        console.error('AgentMode: Error fetching Meta access token:', error);
+        return {
+          success: false,
+          message: 'Meta access token not configured. Please contact your administrator.',
+          error: error.message || 'Failed to fetch access token from Secrets Manager'
+        };
+      }
+
+      // Get API version from environment or default to v18.0
+      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+
+      // Fetch campaigns
+      console.log('AgentMode: Fetching Meta ad campaigns for user:', userId);
+      const campaignsData = await fetchWithRetryAndPaging(
+        `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
+      );
+
+      if (campaignsData.error) {
+        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
+        return {
+          success: false,
+          message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
+          error: campaignsData.error.message
+        };
+      }
+
+      const campaigns = (campaignsData.data || []).map((campaign: any) => ({
+        id: campaign.id,
+        name: campaign.name,
+        status: campaign.status,
+        objective: campaign.objective
+      }));
+
+      return {
+        success: true,
+        message: `Found ${campaigns.length} campaign(s)`,
+        campaigns: campaigns,
+        totalCount: campaigns.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error fetching Meta ad campaigns:', error);
+      return {
+        success: false,
+        message: 'Failed to fetch Meta ad campaigns. Please ensure your Meta ad account is properly configured.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
 
   public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
     try {

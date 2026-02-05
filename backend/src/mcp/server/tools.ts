@@ -3,6 +3,22 @@ import { mcpToolRegistry } from './registry';
 
 // --- Tools from marketingTools.ts ---
 mcpToolRegistry.register({
+  name: 'list_meta_ads_campaigns',
+  definition: {
+    name: 'list_meta_ads_campaigns',
+    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Use this to show users available campaigns before fetching metrics with get_meta_ads_metrics.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.listMetaAdsCampaigns(context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'get_meta_ads_metrics',
   definition: {
     name: 'get_meta_ads_metrics',

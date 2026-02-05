@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-05',
+    changes: [
+      'Added Meta Ads Campaign Listing in Agent Mode',
+      '- New list_meta_ads_campaigns function allows users to view all available Meta ad campaigns before analyzing metrics',
+      '- Shows campaign names, IDs, statuses (ACTIVE/PAUSED), and objectives for easy selection',
+      '- Recommended workflow: First list campaigns to see what\'s available, then use get_meta_ads_metrics with campaign_name to analyze specific campaign performance',
+    ],
+  },
+  {
     date: '2026-02-04',
     changes: [
       'Fixed Agent Mode table rendering to eliminate large empty spaces between text and tables',
