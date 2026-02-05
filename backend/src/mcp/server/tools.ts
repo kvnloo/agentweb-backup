@@ -3,10 +3,26 @@ import { mcpToolRegistry } from './registry';
 
 // --- Tools from marketingTools.ts ---
 mcpToolRegistry.register({
+  name: 'list_meta_ads_campaigns',
+  definition: {
+    name: 'list_meta_ads_campaigns',
+    description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Use this to show users available campaigns before fetching metrics with get_meta_ads_metrics.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.listMetaAdsCampaigns(context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'get_meta_ads_metrics',
   definition: {
     name: 'get_meta_ads_metrics',
-    description: 'Get Meta ad performance metrics and campaign data',
+    description: 'Get Meta ad performance metrics and campaign data. Optionally filter by a specific campaign using campaign_id.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -16,9 +32,9 @@ mcpToolRegistry.register({
           enum: ['7d', '14d', '30d', '90d'],
           default: '7d'
         },
-        campaign_name: {
+        campaign_id: {
           type: 'string',
-          description: 'Optional campaign name to filter metrics by. If provided, only data from campaigns matching this name will be returned.',
+          description: 'Optional campaign ID to filter metrics by. If provided, only data from the specified campaign will be returned. Use list_meta_ads_campaigns to get available campaign IDs.',
           default: null
         }
       },
@@ -26,7 +42,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, args.campaign_name);
+    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, args.campaign_id);
   }
 });
 

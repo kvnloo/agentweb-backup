@@ -31,7 +31,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
   });
 
   describe('getMetaAdsMetrics with campaign filtering', () => {
-    it('should filter breakdown data by campaign when campaign_name is provided', async () => {
+    it('should filter breakdown data by campaign when campaign_id is provided', async () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
@@ -44,17 +44,6 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
 
       // Mock fetch to return sample data
       global.fetch = jest.fn().mockImplementation((url: string) => {
-        if (url.includes('/campaigns') && !url.includes('filtering')) {
-          return Promise.resolve({
-            json: () => Promise.resolve({
-              data: [
-                { id: 'camp1', name: 'FB_Prospecting' },
-                { id: 'camp2', name: 'Other Campaign' }
-              ]
-            })
-          });
-        }
-        
         if (url.includes('breakdowns=publisher_platform,platform_position')) {
           return Promise.resolve({
             json: () => Promise.resolve({
@@ -146,27 +135,27 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
         });
       });
 
-      // Test with campaign name filter
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'FB_Prospecting');
+      // Test with campaign_id filter
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
 
       expect(result.success).toBe(true);
-      
+
       // Check that breakdown data is filtered correctly
       const placementBreakdown = result.data.placementBreakdown;
       const demographicsBreakdown = result.data.demographicsBreakdown;
       const deviceBreakdown = result.data.deviceBreakdown;
-      
-      // Placement breakdown should only contain FB_Prospecting data
+
+      // Placement breakdown should only contain camp1 data
       expect(placementBreakdown).toHaveLength(1);
       expect(placementBreakdown[0].publisher_platform).toBe('facebook');
       expect(placementBreakdown[0].campaign_id).toBe('camp1');
-      
-      // Demographics breakdown should only contain FB_Prospecting data
+
+      // Demographics breakdown should only contain camp1 data
       expect(demographicsBreakdown).toHaveLength(1);
       expect(demographicsBreakdown[0].age).toBe('25-34');
       expect(demographicsBreakdown[0].campaign_id).toBe('camp1');
-      
-      // Device breakdown should only contain FB_Prospecting data
+
+      // Device breakdown should only contain camp1 data
       expect(deviceBreakdown).toHaveLength(1);
       expect(deviceBreakdown[0].impression_device).toBe('iPhone');
       expect(deviceBreakdown[0].campaign_id).toBe('camp1');
@@ -484,7 +473,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
   });
 
   describe('Campaign filtering edge cases', () => {
-    it('should handle case when no campaigns match the filter name', async () => {
+    it('should filter by campaign_id when provided', async () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
@@ -495,29 +484,29 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       const { userDb } = await import('../services/db');
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
 
-      // Mock fetch to return no matching campaigns
+      let capturedUrls: string[] = [];
+
+      // Mock fetch to capture filtering parameter
       global.fetch = jest.fn().mockImplementation((url: string) => {
-        if (url.includes('/campaigns') && !url.includes('filtering')) {
-          return Promise.resolve({
-            json: () => Promise.resolve({
-              data: [
-                { id: 'camp1', name: 'Other Campaign' }
-              ]
-            })
-          });
-        }
-        
-        // For all other API calls, return empty data
+        capturedUrls.push(url);
+
+        // For all API calls, return empty data
         return Promise.resolve({
           json: () => Promise.resolve({ data: [] })
         });
       });
 
-      // Test with non-matching campaign name
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'NonExistentCampaign');
+      // Test with campaign_id filter
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
 
-      expect(result.success).toBe(false);
-      expect(result.message).toContain('No campaigns found matching the name "NonExistentCampaign"');
+      expect(result.success).toBe(true);
+
+      // Verify that filtering parameter is included in API calls
+      const insightsUrl = capturedUrls.find(url => url.includes('insights?fields='));
+      expect(insightsUrl).toBeDefined();
+      expect(insightsUrl).toContain('filtering=');
+      expect(insightsUrl).toContain('campaign.id');
+      expect(insightsUrl).toContain('camp1');
     });
 
     it('should handle case when breakdown data has no campaign_id field', async () => {
@@ -533,16 +522,6 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
 
       // Mock fetch to return data without campaign_id
       global.fetch = jest.fn().mockImplementation((url: string) => {
-        if (url.includes('/campaigns') && !url.includes('filtering')) {
-          return Promise.resolve({
-            json: () => Promise.resolve({
-              data: [
-                { id: 'camp1', name: 'FB_Prospecting' }
-              ]
-            })
-          });
-        }
-        
         if (url.includes('breakdowns=publisher_platform,platform_position')) {
           return Promise.resolve({
             json: () => Promise.resolve({
@@ -561,18 +540,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
             })
           });
         }
-        
+
         // For all other API calls, return empty data
         return Promise.resolve({
           json: () => Promise.resolve({ data: [] })
         });
       });
 
-      // Test with campaign name filter
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'FB_Prospecting');
+      // Test with campaign_id filter
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
 
       expect(result.success).toBe(true);
-      
+
       // Check that breakdown data is empty (filtered out due to missing campaign_id)
       const placementBreakdown = result.data.placementBreakdown;
       expect(placementBreakdown).toHaveLength(0);
