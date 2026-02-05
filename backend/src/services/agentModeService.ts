@@ -268,6 +268,133 @@ export class AgentModeService {
     return this.gemini_client_promise;
   }
 
+  public async getBedrockClient(modelId: string): Promise<any> {
+    // Create a wrapper that implements OpenAI-compatible interface for Bedrock
+    const { ChatBedrockConverse } = await import('@langchain/aws');
+    const { BedrockRuntimeClient } = await import('@aws-sdk/client-bedrock-runtime');
+    const { HumanMessage, AIMessage, SystemMessage, ToolMessage } = await import('@langchain/core/messages');
+
+    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
+    const bedrockClient = new BedrockRuntimeClient({
+      region,
+      credentials: process.env.AWS_ACCESS_KEY_ID ? {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+      } : undefined,
+    });
+
+    // Map certain model IDs to their corresponding inference profile ARNs
+    // Note: Newer Claude models require using inference profiles for cross-region access
+    const actualModelId = modelId === 'anthropic.claude-opus-4-6-v1'
+      ? 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1'
+      : modelId;
+
+    // Create OpenAI-compatible wrapper
+    return {
+      chat: {
+        completions: {
+          create: async (params: any) => {
+            // Create chat instance with current parameters
+            const chatBedrock = new ChatBedrockConverse({
+              model: actualModelId,
+              region,
+              client: bedrockClient,
+              temperature: params.temperature !== undefined ? params.temperature : 0.1,
+              maxTokens: params.max_completion_tokens || undefined,
+            });
+
+            // Convert OpenAI format to LangChain Message objects
+            const messages = params.messages.map((msg: any) => {
+              if (msg.role === 'system') {
+                return new SystemMessage(msg.content);
+              } else if (msg.role === 'user') {
+                return new HumanMessage(msg.content);
+              } else if (msg.role === 'assistant') {
+                if (msg.tool_calls && msg.tool_calls.length > 0) {
+                  // Handle assistant message with tool calls
+                  return new AIMessage({
+                    content: msg.content || '',
+                    tool_calls: msg.tool_calls.map((tc: any) => ({
+                      id: tc.id,
+                      name: tc.function.name,
+                      args: JSON.parse(tc.function.arguments),
+                    })),
+                  });
+                }
+                return new AIMessage(msg.content || '');
+              } else if (msg.role === 'tool') {
+                // Handle tool response messages
+                return new ToolMessage({
+                  content: msg.content,
+                  tool_call_id: msg.tool_call_id,
+                });
+              }
+              return new HumanMessage(String(msg.content || ''));
+            });
+
+            // Bind tools if provided
+            let modelToInvoke: any = chatBedrock;
+            if (params.tools && params.tools.length > 0) {
+              // Tools are in OpenAI format: { type: 'function', function: { name, description, parameters } }
+              // LangChain's bindTools accepts this format
+              try {
+                modelToInvoke = chatBedrock.bindTools(params.tools);
+              } catch (error: any) {
+                console.error('AgentMode: Error binding tools to Bedrock:', error.message);
+                // If bindTools fails, try to invoke without tools
+                console.warn('AgentMode: Falling back to invocation without tools');
+                modelToInvoke = chatBedrock;
+              }
+            }
+
+            // Invoke the model
+            const response: any = await modelToInvoke.invoke(messages);
+
+            // Extract tool calls if present
+            let toolCalls = null;
+            if (response.tool_calls && response.tool_calls.length > 0) {
+              toolCalls = response.tool_calls.map((tc: any, index: number) => ({
+                id: tc.id || `call_${Date.now()}_${index}`,
+                type: 'function',
+                function: {
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.args),
+                },
+              }));
+            }
+
+            // Extract usage information
+            const usage = response.response_metadata?.usage || response.usage_metadata || {};
+            const inputTokens = usage.input_tokens || usage.prompt_tokens || 0;
+            const outputTokens = usage.output_tokens || usage.completion_tokens || 0;
+
+            // Convert response to OpenAI format
+            return {
+              id: `bedrock-${Date.now()}`,
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: modelId,
+              choices: [{
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: (response.content as string) || '',
+                  tool_calls: toolCalls,
+                },
+                finish_reason: toolCalls ? 'tool_calls' : 'stop',
+              }],
+              usage: {
+                prompt_tokens: inputTokens,
+                completion_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+              },
+            };
+          },
+        },
+      },
+    };
+  }
+
   private llmModels: Record<string, LLMModelConfig> = {
     // List openai models - create client dynamically for each deployment
     'gpt-5-chat-2': { client: this.getAzureOpenAIClient('gpt-5-chat-2'), supportsTemperature: true },
@@ -275,6 +402,8 @@ export class AgentModeService {
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
+    // List Claude models via AWS Bedrock - client will be lazy-loaded
+    'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
   async getSupportedModels() {
@@ -332,16 +461,25 @@ export class AgentModeService {
       params.temperature = temperature;
     }
 
-    // Get the client - lazy-load Gemini client if needed
+    // Get the client - lazy-load Gemini or Bedrock client if needed
     let client = this.llmModels[model].client;
     if (!client) {
       if (model === 'gemini-3-pro-preview' || model === 'gemini-3-flash-preview') {
         client = await this.getGeminiClient();
         // Update the cached client for future use
         this.llmModels[model].client = client;
+      } else if (model.startsWith('anthropic.')) {
+        // Lazy-load Bedrock client for Claude models
+        client = await this.getBedrockClient(model);
+        // Update the cached client for future use
+        this.llmModels[model].client = client;
       } else {
         throw new Error(`Client not initialized for model: ${model}`);
       }
+    }
+
+    if (!client) {
+      throw new Error(`Failed to initialize client for model: ${model}`);
     }
 
     const res = await client.chat.completions.create(params);
@@ -422,7 +560,20 @@ export class AgentModeService {
         await new Promise(resolve => setImmediate(resolve));
         //print(re)
         responseMessage = response.choices[0].message;
-        const responseContent = responseMessage.content || '';
+
+        // Extract content - handle both string and array formats (Claude returns array)
+        let responseContent = '';
+        if (typeof responseMessage.content === 'string') {
+          responseContent = responseMessage.content;
+        } else if (Array.isArray(responseMessage.content)) {
+          // Claude format: [{type: "text", text: "..."}, ...]
+          responseContent = responseMessage.content
+            .map((item: any) => item?.text || '')
+            .filter(Boolean)
+            .join('\n');
+        } else if (responseMessage.content && typeof responseMessage.content === 'object') {
+          responseContent = (responseMessage.content as any).text || '';
+        }
 
         // Update content with LLM's response
         if (responseContent) {
@@ -910,7 +1061,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         const attachmentUrls = attachments.map((attachment: any) => {
           return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
         }).join('\n');
-        content = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+        // Ensure content is a string before concatenating
+        let contentStr = '';
+        if (Array.isArray(content)) {
+          contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
+        } else if (typeof content === 'object' && content !== null) {
+          contentStr = (content as any).text || JSON.stringify(content);
+        } else {
+          contentStr = String(content);
+        }
+        content = `${contentStr}\n\n**Attached Files:**\n${attachmentUrls}`;
       }
 
       const messageObj: any = { role: msg.role, content: content };
@@ -926,9 +1086,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
         messageObj.tool_calls = (msg as any).tool_calls;
       }
 
-      // Ensure content is never null or undefined
+      // Ensure content is never null or undefined and normalize format
       if (messageObj.content == null || messageObj.content === null || messageObj.content === undefined) {
         messageObj.content = '';
+      } else if (Array.isArray(messageObj.content)) {
+        // Handle Claude array format
+        messageObj.content = messageObj.content
+          .map((item: any) => item?.text || '')
+          .filter(Boolean)
+          .join('\n');
+      } else if (typeof messageObj.content === 'object') {
+        // Handle object format
+        messageObj.content = (messageObj.content as any).text || JSON.stringify(messageObj.content);
       } else {
         messageObj.content = String(messageObj.content);
       }

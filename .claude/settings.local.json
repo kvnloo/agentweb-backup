@@ -56,7 +56,9 @@
       "Bash(gh pr diff:*)",
       "Bash(node:*)",
       "Bash(echo:*)",
-      "Bash(gh pr view:*)"
+      "Bash(gh pr view:*)",
+      "Bash(npx ts-node:*)",
+      "Bash(open http://localhost:5173/admin?tab=benchmarks)"
     ]
   }
 }

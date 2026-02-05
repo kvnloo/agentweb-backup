@@ -1171,21 +1171,35 @@ const BenchmarksTab: React.FC = () => {
                             Response Messages:
                           </Typography>
                           <Paper sx={{ p: 2, bgcolor: 'grey.50', maxHeight: 300, overflow: 'auto' }}>
-                            {result.responseMessages.map((msg: any, msgIndex: number) => (
-                              <Box key={msgIndex} sx={{ mb: 2, p: 1, border: '1px solid #e0e0e0', borderRadius: 1 }}>
-                                <Typography variant="caption" sx={{ fontWeight: 'bold', color: 
-                                  msg.role === 'assistant' ? '#1976d2' : 
-                                  msg.role === 'tool' ? '#f57c00' : 
-                                  'text.secondary' 
-                                }}>
-                                  {msg.role?.toUpperCase() || 'UNKNOWN'}
-                                </Typography>
-                                
-                                {msg.content && (
-                                  <Typography variant="body2" sx={{ mt: 1, whiteSpace: 'pre-wrap' }}>
-                                    {msg.content}
+                            {result.responseMessages.map((msg: any, msgIndex: number) => {
+                              // Helper to safely extract text from content
+                              const getContent = (content: any): string => {
+                                if (!content) return '';
+                                if (typeof content === 'string') return content;
+                                if (Array.isArray(content)) {
+                                  return content.map(item => item?.text || item?.content || '').filter(Boolean).join('\n');
+                                }
+                                if (typeof content === 'object' && content.text) return content.text;
+                                return JSON.stringify(content);
+                              };
+
+                              const contentText = getContent(msg.content);
+
+                              return (
+                                <Box key={msgIndex} sx={{ mb: 2, p: 1, border: '1px solid #e0e0e0', borderRadius: 1 }}>
+                                  <Typography variant="caption" sx={{ fontWeight: 'bold', color:
+                                    msg.role === 'assistant' ? '#1976d2' :
+                                    msg.role === 'tool' ? '#f57c00' :
+                                    'text.secondary'
+                                  }}>
+                                    {msg.role?.toUpperCase() || 'UNKNOWN'}
                                   </Typography>
-                                )}
+
+                                  {contentText && (
+                                    <Typography variant="body2" sx={{ mt: 1, whiteSpace: 'pre-wrap' }}>
+                                      {contentText}
+                                    </Typography>
+                                  )}
                                 
                                 {msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0 && (
                                   <Box sx={{ mt: 1 }}>
@@ -1207,18 +1221,19 @@ const BenchmarksTab: React.FC = () => {
                                   </Box>
                                 )}
                                 
-                                {msg.role === 'tool' && (
-                                  <Box sx={{ mt: 1 }}>
-                                    <Typography variant="caption" sx={{ fontWeight: 'bold' }}>
-                                      Tool Response ({msg.name}):
-                                    </Typography>
-                                    <pre style={{ fontSize: '0.75rem', margin: '4px 0 0 0', overflowX: 'auto', whiteSpace: 'pre-wrap' }}>
-                                      {msg.content}
-                                    </pre>
-                                  </Box>
-                                )}
-                              </Box>
-                            ))}
+                                  {msg.role === 'tool' && (
+                                    <Box sx={{ mt: 1 }}>
+                                      <Typography variant="caption" sx={{ fontWeight: 'bold' }}>
+                                        Tool Response ({msg.name}):
+                                      </Typography>
+                                      <pre style={{ fontSize: '0.75rem', margin: '4px 0 0 0', overflowX: 'auto', whiteSpace: 'pre-wrap' }}>
+                                        {contentText}
+                                      </pre>
+                                    </Box>
+                                  )}
+                                </Box>
+                              );
+                            })}
                           </Paper>
                         </Box>
                       )}

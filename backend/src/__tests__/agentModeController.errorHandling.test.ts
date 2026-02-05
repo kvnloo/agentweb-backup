@@ -368,4 +368,159 @@ describe('AgentModeController - Error Handling', () => {
       expect(mockRes.status).toHaveBeenCalledWith(500);
     });
   });
+
+  describe('generateResponse - Claude 4.6+ Content Format', () => {
+    it('should handle Claude array format response content', async () => {
+      // The worker service returns normalized content
+      const claudeArrayResponse = {
+        content: 'Hello from Claude!\nHow can I help you today?',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Hello from Claude!' },
+              { type: 'text', text: 'How can I help you today?' }
+            ]
+          }
+        ]
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(claudeArrayResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Hello',
+          llmModel: 'claude-opus-4-6',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: expect.any(String),
+          toolCalls: [],
+          knowledgeBaseQueries: [],
+          sources: []
+        })
+      );
+
+      // Verify the response content was extracted properly
+      const responseCall = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(responseCall.content).toContain('Hello from Claude!');
+      expect(responseCall.content).toContain('How can I help you today?');
+    });
+
+    it('should handle string format response content (backward compatibility)', async () => {
+      const stringResponse = {
+        content: 'Plain string response',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [
+          {
+            role: 'assistant',
+            content: 'Plain string response'
+          }
+        ]
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(stringResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Hello',
+          llmModel: 'gpt-4o',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: 'Plain string response',
+          toolCalls: [],
+          knowledgeBaseQueries: [],
+          sources: []
+        })
+      );
+    });
+
+    it('should filter out empty items from Claude array response', async () => {
+      // Worker service returns already-normalized string content
+      const claudeArrayWithEmptyItems = {
+        content: 'Valid response\nMore content',
+        toolCalls: [],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'Valid response' },
+              { type: 'text', text: '' },
+              { type: 'text', text: 'More content' },
+              { type: 'text', text: null }
+            ]
+          }
+        ]
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(claudeArrayWithEmptyItems);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Hello',
+          llmModel: 'claude-opus-4-6',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      const responseCall = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(responseCall.content).toContain('Valid response');
+      expect(responseCall.content).toContain('More content');
+      // Empty strings and null should be filtered out
+      expect(responseCall.content.split('\n').length).toBe(2);
+    });
+  });
 });

@@ -23,9 +23,13 @@ export class LLMService {
         } : undefined,
       });
       
-      const modelId = model === 'anthropic.claude-sonnet-4-5-20250929-v1:0'
-        ? 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0'
-        : model;
+      // Map model IDs to inference profile ARNs for cross-region access
+      let modelId = model;
+      if (model === 'anthropic.claude-sonnet-4-5-20250929-v1:0') {
+        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0';
+      } else if (model === 'anthropic.claude-opus-4-6-v1') {
+        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1';
+      }
       
       this.chatModel = new ChatBedrockConverse({
         model: modelId,
