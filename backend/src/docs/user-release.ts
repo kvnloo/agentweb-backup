@@ -14,6 +14,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Shows campaign names, IDs, statuses (ACTIVE/PAUSED), and objectives for easy selection',
       '- Updated get_meta_ads_metrics to use campaign_id parameter for accurate campaign filtering',
       '- Recommended workflow: First list campaigns to see available campaign IDs, then use get_meta_ads_metrics with campaign_id to analyze specific campaign performance',
+      'Added Per-Work-Plan Default Model Support',
+      '- Work plans can now define a default LLM model to use when creating sessions',
     ],
   },
   {

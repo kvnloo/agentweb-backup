@@ -5445,6 +5445,7 @@ interface PredefinedWorkPlan {
   requireLogin?: boolean;
   showLoginSignup?: 'after_plan_completed' | 'always';
   showInAgentMode?: boolean;
+  defaultModel?: string;
 }
 
 interface AvailableFunctionCall {
@@ -6114,6 +6115,7 @@ const AgentModeSettings = () => {
         requireLogin: workPlan.requireLogin || false,
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
         showInAgentMode: workPlan.showInAgentMode || false,
+        defaultModel: workPlan.defaultModel?.trim() || undefined,
         steps: workPlan.steps
           .filter(step => step.title.trim().length > 0)
           .map((step, index) => ({
@@ -6188,7 +6190,8 @@ const AgentModeSettings = () => {
       autocomplete: false,
       requireLogin: false,
       showLoginSignup: 'after_plan_completed',
-      showInAgentMode: false
+      showInAgentMode: false,
+      defaultModel: undefined
     };
     
     setPredefinedWorkPlans([
@@ -6811,6 +6814,32 @@ const AgentModeSettings = () => {
                       </Select>
                       <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
                         Controls when the login/signup prompt is displayed during a plan session.
+                      </Typography>
+                    </FormControl>
+
+                    {/* Default Model Selection */}
+                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+                      <InputLabel>Default Model (Optional)</InputLabel>
+                      <Select
+                        value={workPlan.defaultModel || ''}
+                        onChange={(e) => {
+                          const updated = [...predefinedWorkPlans];
+                          updated[workPlanIndex].defaultModel = e.target.value || undefined;
+                          setPredefinedWorkPlans(updated);
+                        }}
+                        label="Default Model (Optional)"
+                      >
+                        <MenuItem value="">
+                          <em>Use Agent Mode Default</em>
+                        </MenuItem>
+                        {supportedModels.map((modelName) => (
+                          <MenuItem key={modelName} value={modelName}>
+                            {modelName}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                        Model to use for sessions created with this work plan. Leave empty to use the global Agent Mode default.
                       </Typography>
                     </FormControl>
 

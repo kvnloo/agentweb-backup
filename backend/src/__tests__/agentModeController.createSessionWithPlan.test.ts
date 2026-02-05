@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { settingsService } from '../services/settingsService';
+import { agentModeService } from '../services/agentModeService';
 import { getUserFromToken } from '../middleware/auth';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
@@ -22,6 +23,13 @@ jest.mock('../services/settingsService', () => ({
   }
 }));
 
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    getSupportedModels: jest.fn(),
+    getDefaultModel: jest.fn()
+  }
+}));
+
 jest.mock('../middleware/auth', () => ({
   getUserFromToken: jest.fn(),
   authenticateToken: jest.fn((req, res, next) => next())
@@ -39,6 +47,7 @@ jest.mock('crypto', () => ({
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
+const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockGetUserFromToken = getUserFromToken as jest.MockedFunction<typeof getUserFromToken>;
 
 describe('AgentModeController - createSessionWithPlan', () => {
@@ -92,13 +101,17 @@ describe('AgentModeController - createSessionWithPlan', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
-    
+
     // Default mock for settings
     mockSettingsService.getSetting.mockResolvedValue({
       settingKey: 'agent-mode-predefined-workplans',
       settingValue: JSON.stringify(mockWorkPlans)
     } as any);
-    
+
+    // Mock agent mode service methods
+    mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-5-chat', 'gemini-3-pro-preview', 'claude-opus-4']);
+    mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat');
+
     // Mock updateSessionLlmModel to return session with llmModel
     mockChatbotDb.updateSessionLlmModel = jest.fn().mockImplementation((sessionId, llmModel) => {
       return Promise.resolve({
@@ -595,6 +608,143 @@ describe('AgentModeController - createSessionWithPlan', () => {
           title: 'Onboarding',
           requireLogin: false
         })
+      );
+    });
+  });
+
+  describe('Default model selection', () => {
+    beforeEach(() => {
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
+    });
+
+    it('should use work plan default model when specified and valid', async () => {
+      const workPlansWithDefaultModel = [
+        {
+          title: 'Onboarding',
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          defaultModel: 'gemini-3-pro-preview'
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithDefaultModel)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockAgentModeService.getSupportedModels).toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        'test-session-123',
+        'gemini-3-pro-preview'
+      );
+      expect(mockAgentModeService.getDefaultModel).not.toHaveBeenCalled();
+    });
+
+    it('should fall back to global default when work plan model is invalid', async () => {
+      const workPlansWithInvalidModel = [
+        {
+          title: 'Onboarding',
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          defaultModel: 'invalid-model-name'
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithInvalidModel)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockAgentModeService.getSupportedModels).toHaveBeenCalled();
+      expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        'test-session-123',
+        'gpt-5-chat' // The mocked default model
+      );
+    });
+
+    it('should use global default when work plan has no default model', async () => {
+      const workPlansWithoutDefaultModel = [
+        {
+          title: 'Onboarding',
+          steps: [{ stepCount: 1, title: 'Step 1' }]
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithoutDefaultModel)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockAgentModeService.getSupportedModels).not.toHaveBeenCalled();
+      expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        'test-session-123',
+        'gpt-5-chat'
+      );
+    });
+
+    it('should use global default when work plan default model is empty string', async () => {
+      const workPlansWithEmptyModel = [
+        {
+          title: 'Onboarding',
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          defaultModel: ''
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithEmptyModel)
+      } as any);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockAgentModeService.getSupportedModels).not.toHaveBeenCalled();
+      expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        'test-session-123',
+        'gpt-5-chat'
+      );
+    });
+
+    it('should handle model validation when supported models list is empty', async () => {
+      const workPlansWithDefaultModel = [
+        {
+          title: 'Onboarding',
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          defaultModel: 'some-model'
+        }
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify(workPlansWithDefaultModel)
+      } as any);
+      mockAgentModeService.getSupportedModels.mockResolvedValue([]);
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockAgentModeService.getSupportedModels).toHaveBeenCalled();
+      expect(mockAgentModeService.getDefaultModel).toHaveBeenCalled();
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith(
+        'test-session-123',
+        'gpt-5-chat'
       );
     });
   });
