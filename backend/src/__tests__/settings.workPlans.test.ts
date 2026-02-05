@@ -163,6 +163,58 @@ describe('Settings Work Plans API', () => {
       expect(res.status).toHaveBeenCalledWith(409);
       expect(res.json).toHaveBeenCalledWith({ error: 'Work plan with this ID already exists' });
     });
+
+    it('should persist defaultModel when specified', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+      mockedSettingsService.setSetting.mockResolvedValue({} as any);
+
+      const req = {
+        body: {
+          title: 'Test Plan',
+          defaultModel: '  gemini-3-pro-preview  ',
+          steps: [{ title: 'Step 1' }]
+        },
+        user: { email: 'admin@example.com' }
+      } as unknown as Request;
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          workPlan: expect.objectContaining({
+            title: 'Test Plan',
+            defaultModel: 'gemini-3-pro-preview'
+          })
+        })
+      );
+
+      const setCall = mockedSettingsService.setSetting.mock.calls[0];
+      const savedPlans = JSON.parse(setCall[1] as string);
+      expect(savedPlans[0].defaultModel).toBe('gemini-3-pro-preview');
+    });
+
+    it('should normalize empty defaultModel to undefined', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+      mockedSettingsService.setSetting.mockResolvedValue({} as any);
+
+      const req = {
+        body: {
+          title: 'Test Plan',
+          defaultModel: '   ',
+          steps: [{ title: 'Step 1' }]
+        },
+        user: { email: 'admin@example.com' }
+      } as unknown as Request;
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      const setCall = mockedSettingsService.setSetting.mock.calls[0];
+      const savedPlans = JSON.parse(setCall[1] as string);
+      expect(savedPlans[0].defaultModel).toBeUndefined();
+    });
   });
 
   describe('PUT /api/settings/agent-mode-predefined-workplans/:planId', () => {
@@ -218,6 +270,71 @@ describe('Settings Work Plans API', () => {
 
       expect(res.status).toHaveBeenCalledWith(404);
       expect(res.json).toHaveBeenCalledWith({ error: 'No predefined work plans found' });
+    });
+
+    it('should update defaultModel when specified', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify([
+          { id: 'plan-1', title: 'Original', steps: [{ stepCount: 1, title: 'Old' }] }
+        ])
+      } as any);
+      mockedSettingsService.setSetting.mockResolvedValue({} as any);
+
+      const req = {
+        params: { planId: 'plan-1' },
+        body: {
+          title: 'Updated',
+          defaultModel: 'claude-opus-4',
+          steps: [{ title: 'New Step' }]
+        },
+        user: { email: 'admin@example.com' }
+      } as unknown as Request;
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          workPlan: expect.objectContaining({
+            id: 'plan-1',
+            title: 'Updated',
+            defaultModel: 'claude-opus-4'
+          })
+        })
+      );
+
+      const setCall = mockedSettingsService.setSetting.mock.calls[0];
+      const savedPlans = JSON.parse(setCall[1] as string);
+      expect(savedPlans[0].defaultModel).toBe('claude-opus-4');
+    });
+
+    it('should remove defaultModel when updated to empty string', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingKey: 'agent-mode-predefined-workplans',
+        settingValue: JSON.stringify([
+          { id: 'plan-1', title: 'Original', defaultModel: 'old-model', steps: [{ stepCount: 1, title: 'Old' }] }
+        ])
+      } as any);
+      mockedSettingsService.setSetting.mockResolvedValue({} as any);
+
+      const req = {
+        params: { planId: 'plan-1' },
+        body: {
+          title: 'Updated',
+          defaultModel: '',
+          steps: [{ title: 'New Step' }]
+        },
+        user: { email: 'admin@example.com' }
+      } as unknown as Request;
+      const res = mockResponse();
+
+      await handler(req, res);
+
+      const setCall = mockedSettingsService.setSetting.mock.calls[0];
+      const savedPlans = JSON.parse(setCall[1] as string);
+      expect(savedPlans[0].defaultModel).toBeUndefined();
     });
   });
 

@@ -3050,8 +3050,26 @@ export const agentModeController = {
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
 
       // Set default model for new sessions
-      const defaultModel = await agentModeService.getDefaultModel();
-      await chatbotDb.updateSessionLlmModel(session.sessionId, defaultModel);
+      // Use work plan's default model if specified, otherwise use global default
+      let selectedModel = predefinedPlan.defaultModel;
+
+      // Validate work plan's default model
+      if (selectedModel) {
+        const supportedModels = await agentModeService.getSupportedModels();
+        if (!supportedModels.includes(selectedModel)) {
+          console.warn(`AgentMode: Work plan default model "${selectedModel}" not supported, using global default`);
+          selectedModel = undefined;
+        } else {
+          console.log(`AgentMode: Using work plan default model: ${selectedModel}`);
+        }
+      }
+
+      // Fall back to global default if no valid work plan model
+      if (!selectedModel) {
+        selectedModel = await agentModeService.getDefaultModel();
+      }
+
+      await chatbotDb.updateSessionLlmModel(session.sessionId, selectedModel);
 
       // Enable interactive sharing for the session
       const conversableToken = crypto.randomBytes(32).toString('hex');
