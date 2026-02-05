@@ -17,6 +17,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fixed LinkedIn Import Progress Tracking in CRM',
       '- LinkedIn import was stuck at 0% due to WebSocket connection failures',
       '- Added nginx WebSocket configuration to Elastic Beanstalk deployment',
+      'Added ICP Score column to CRM Lead Table',
+      '- Renamed "IsICP" column to "Is ICP" for better readability',
+      '- Added new "ICP Score" column displaying the match score as a whole number',
+      '- ICP Score column supports sorting to help prioritize leads',
     ],
   },
   {
