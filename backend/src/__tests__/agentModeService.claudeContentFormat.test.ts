@@ -65,7 +65,7 @@ describe('AgentMode Service - Claude 4.6+ Content Format', () => {
     });
 
     it('should handle null content', () => {
-      const responseContent = null;
+      const responseContent: any = null;
 
       let extractedContent = '';
       if (typeof responseContent === 'string') {
@@ -83,7 +83,7 @@ describe('AgentMode Service - Claude 4.6+ Content Format', () => {
     });
 
     it('should handle undefined content', () => {
-      const responseContent = undefined;
+      const responseContent: any = undefined;
 
       let extractedContent = '';
       if (typeof responseContent === 'string') {
@@ -167,7 +167,7 @@ describe('AgentMode Service - Claude 4.6+ Content Format', () => {
     });
 
     it('should handle null content', () => {
-      const messageContent = null;
+      const messageContent: any = null;
 
       let normalizedContent = '';
       if (messageContent == null || messageContent === null || messageContent === undefined) {
@@ -187,7 +187,7 @@ describe('AgentMode Service - Claude 4.6+ Content Format', () => {
     });
 
     it('should handle undefined content', () => {
-      const messageContent = undefined;
+      const messageContent: any = undefined;
 
       let normalizedContent = '';
       if (messageContent == null || messageContent === null || messageContent === undefined) {
