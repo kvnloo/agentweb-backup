@@ -560,7 +560,20 @@ export class AgentModeService {
         await new Promise(resolve => setImmediate(resolve));
         //print(re)
         responseMessage = response.choices[0].message;
-        const responseContent = responseMessage.content || '';
+
+        // Extract content - handle both string and array formats (Claude returns array)
+        let responseContent = '';
+        if (typeof responseMessage.content === 'string') {
+          responseContent = responseMessage.content;
+        } else if (Array.isArray(responseMessage.content)) {
+          // Claude format: [{type: "text", text: "..."}, ...]
+          responseContent = responseMessage.content
+            .map((item: any) => item?.text || '')
+            .filter(Boolean)
+            .join('\n');
+        } else if (responseMessage.content && typeof responseMessage.content === 'object') {
+          responseContent = (responseMessage.content as any).text || '';
+        }
 
         // Update content with LLM's response
         if (responseContent) {
@@ -1048,7 +1061,16 @@ Use the available tools to create tasks in the agent-engine when complex work is
         const attachmentUrls = attachments.map((attachment: any) => {
           return `[${attachment.filename || 'Attachment'}](${attachment.url})`;
         }).join('\n');
-        content = `${msg.content}\n\n**Attached Files:**\n${attachmentUrls}`;
+        // Ensure content is a string before concatenating
+        let contentStr = '';
+        if (Array.isArray(content)) {
+          contentStr = content.map((item: any) => item?.text || '').filter(Boolean).join('\n');
+        } else if (typeof content === 'object' && content !== null) {
+          contentStr = (content as any).text || JSON.stringify(content);
+        } else {
+          contentStr = String(content);
+        }
+        content = `${contentStr}\n\n**Attached Files:**\n${attachmentUrls}`;
       }
 
       const messageObj: any = { role: msg.role, content: content };
@@ -1064,9 +1086,18 @@ Use the available tools to create tasks in the agent-engine when complex work is
         messageObj.tool_calls = (msg as any).tool_calls;
       }
 
-      // Ensure content is never null or undefined
+      // Ensure content is never null or undefined and normalize format
       if (messageObj.content == null || messageObj.content === null || messageObj.content === undefined) {
         messageObj.content = '';
+      } else if (Array.isArray(messageObj.content)) {
+        // Handle Claude array format
+        messageObj.content = messageObj.content
+          .map((item: any) => item?.text || '')
+          .filter(Boolean)
+          .join('\n');
+      } else if (typeof messageObj.content === 'object') {
+        // Handle object format
+        messageObj.content = (messageObj.content as any).text || JSON.stringify(messageObj.content);
       } else {
         messageObj.content = String(messageObj.content);
       }
