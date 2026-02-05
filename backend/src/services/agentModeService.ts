@@ -653,8 +653,8 @@ When updating HTML files, follow this process:
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
 - **Meta Ads Campaigns and Metrics**:
 - Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
-- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data. You can optionally filter by campaign_name to get metrics for a specific campaign
-- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns, then let the user choose which campaign to analyze before calling 'get_meta_ads_metrics'
+- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data. You can optionally filter by campaign_id to get metrics for a specific campaign
+- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns with their IDs, then let the user choose which campaign to analyze, and call 'get_meta_ads_metrics' with the selected campaign_id for accurate filtering
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
@@ -4698,7 +4698,7 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_name?: string): Promise<any> {
+  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_id?: string): Promise<any> {
     try {
 
       // Import the Meta API functions directly to reuse the same logic
@@ -4759,31 +4759,11 @@ Format the response as JSON with this structure:
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
-      // First, get campaigns to find matching campaign IDs if filtering by campaign name
+      // Build filtering parameter for API calls if campaign_id is provided
       let campaignFilterIds: string[] = [];
-      if (campaign_name) {
-        console.log('AgentMode: Getting campaigns to find matching IDs for:', campaign_name);
-        const campaignsData = await fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`);
-
-        if (campaignsData.error) {
-          console.error('AgentMode: Campaigns API Error:', campaignsData.error);
-          throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
-        }
-
-        const matchingCampaigns = (campaignsData.data || []).filter((campaign: any) =>
-          campaign.name && campaign.name.toLowerCase().includes(campaign_name.toLowerCase())
-        );
-
-        if (matchingCampaigns.length === 0) {
-          return {
-            success: false,
-            message: `No campaigns found matching the name "${campaign_name}"`,
-            error: 'Campaign not found'
-          };
-        }
-
-        campaignFilterIds = matchingCampaigns.map((c: any) => c.id);
-        console.log('AgentMode: Found matching campaign IDs:', campaignFilterIds);
+      if (campaign_id) {
+        console.log('AgentMode: Filtering metrics by campaign ID:', campaign_id);
+        campaignFilterIds = [campaign_id];
       }
 
       // Build filtering parameter for API calls

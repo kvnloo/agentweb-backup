@@ -12,7 +12,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Added Meta Ads Campaign Listing in Agent Mode',
       '- New list_meta_ads_campaigns function allows users to view all available Meta ad campaigns before analyzing metrics',
       '- Shows campaign names, IDs, statuses (ACTIVE/PAUSED), and objectives for easy selection',
-      '- Recommended workflow: First list campaigns to see what\'s available, then use get_meta_ads_metrics with campaign_name to analyze specific campaign performance',
+      '- Updated get_meta_ads_metrics to use campaign_id parameter for accurate campaign filtering',
+      '- Recommended workflow: First list campaigns to see available campaign IDs, then use get_meta_ads_metrics with campaign_id to analyze specific campaign performance',
     ],
   },
   {
