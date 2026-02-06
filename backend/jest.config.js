@@ -6,7 +6,8 @@ module.exports = {
   moduleFileExtensions: ['ts', 'js', 'json'],
   clearMocks: true,
   verbose: false,
-  maxWorkers: '50%',
+  maxWorkers: 2, // Limit to 2 workers to reduce memory usage in CI
+  workerIdleMemoryLimit: '512MB', // Force garbage collection when workers are idle
   setupFilesAfterEnv: ['<rootDir>/src/__tests__/setup.ts'],
   transform: {
     '^.+\\.ts$': [
