@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-06',
     changes: [
+      'Significantly Improved Agent Mode Response Speed',
+      '- Optimized MCP (Model Context Protocol) server initialization to load once at startup instead of on every message',
+      '- Implemented persistent worker process that reuses connections across multiple requests',
+      '- Second and subsequent messages now respond 2-10x faster with near-zero initialization overhead',
+      '- First message speed unchanged as MCP servers initialize once during first request',
+      '- Worker process properly managed with graceful shutdown and automatic recovery',
       'Added LinkedIn Engagement Tools in Agent Mode',
       '- New comment_on_linkedin_post function enables commenting on LinkedIn posts via connected accounts',
       '- New react_to_linkedin_post function supports 6 reaction types: LIKE (👍), PRAISE (👏 celebrate), EMPATHY (❤️ love), INTEREST (💡 insightful), APPRECIATION (🙌 support), ENTERTAINMENT (😂 funny)',
