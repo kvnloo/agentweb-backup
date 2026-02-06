@@ -1886,10 +1886,50 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: "create_html_template",
+  definition: {
+    name: "create_html_template",
+    description: "Create an email template from an existing HTML file or HTML content. The template will be saved to the Email Templates section where it can be edited and previewed. Use this when you want to convert HTML into a reusable email template with variables like {{user_name}} or {{items_n}} for dynamic content.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        html_source: {
+          type: "string",
+          description: "Either an S3 URL to an HTML file, or raw HTML content string"
+        },
+        template_name: {
+          type: "string",
+          description: "Unique name for this email template (e.g., 'welcome_email', 'monthly_newsletter')"
+        },
+        subject: {
+          type: "string",
+          description: "Email subject line. Can include variables like {{user_name}}"
+        },
+        additional_instructions: {
+          type: "string",
+          description: "Optional instructions for how to process the HTML (e.g., 'Add variables for company name and logo', 'Make it more professional', 'Convert product list to array variables')"
+        }
+      },
+      required: ["html_source", "template_name", "subject"]
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.createHtmlTemplate(
+      args.html_source,
+      args.template_name,
+      args.subject,
+      args.additional_instructions || '',
+      context?.userId,
+      context?.sessionId
+    );
+  }
+});
+
+mcpToolRegistry.register({
   name: "save_file",
   definition: {
     name: "save_file",
-    description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference',
+    description: 'Create and save a file with the provided content to S3, then return the file URL for sharing or reference. IMPORTANT: You must provide the COMPLETE file content as a string in the file_content parameter. This tool does NOT retrieve previously generated content - you must include the full content in this call.',
     inputSchema: {
       type: "object",
       properties: {
@@ -1899,13 +1939,22 @@ mcpToolRegistry.register({
         },
         file_content: {
           type: 'string',
-          description: 'Content of the file to save.'
+          description: 'REQUIRED: The complete content of the file to save as a string. You must provide the full file content - this tool cannot retrieve content from previous operations.'
         }
       },
       required: ["file_name", "file_content"]
     }
   },
   execute: async (args: any, context?: any) => {
+    // Log parameters for debugging
+    console.log('save_file tool called with args:', {
+      file_name: args.file_name,
+      file_content_type: typeof args.file_content,
+      file_content_length: args.file_content?.length,
+      has_file_content: args.file_content !== undefined,
+      all_arg_keys: Object.keys(args)
+    });
+
     return await agentModeService.saveFile(args.file_name, args.file_content, context?.userId, context?.sessionId);
   }
 });
