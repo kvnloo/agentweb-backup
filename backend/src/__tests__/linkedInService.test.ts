@@ -786,4 +786,235 @@ describe('LinkedInService', () => {
       });
     });
   });
+
+  describe('createComment', () => {
+    it('should create a comment on a post with correct payload', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { commentUrn: 'urn:li:comment:(urn:li:share:123,456)' },
+        headers: { 'x-restli-id': 'urn:li:comment:(urn:li:share:123,456)' },
+      });
+
+      const result = await service.createComment('token', 'urn:li:share:123', 'urn:li:person:abc', 'Great post!');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        `/rest/socialActions/${encodeURIComponent('urn:li:share:123')}/comments`,
+        {
+          actor: 'urn:li:person:abc',
+          object: 'urn:li:share:123',
+          message: {
+            text: 'Great post!'
+          }
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:comment:(urn:li:share:123,456)');
+    });
+
+    it('should create a comment on behalf of organization', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { commentUrn: 'urn:li:comment:(urn:li:ugcPost:789,101)' },
+        headers: { 'x-restli-id': 'urn:li:comment:(urn:li:ugcPost:789,101)' },
+      });
+
+      const result = await service.createComment('token', 'urn:li:ugcPost:789', 'urn:li:organization:123', 'Insightful!');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        `/rest/socialActions/${encodeURIComponent('urn:li:ugcPost:789')}/comments`,
+        {
+          actor: 'urn:li:organization:123',
+          object: 'urn:li:ugcPost:789',
+          message: {
+            text: 'Insightful!'
+          }
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:comment:(urn:li:ugcPost:789,101)');
+    });
+
+    it('should return commentUrn from response body if header not present', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { commentUrn: 'urn:li:comment:(urn:li:share:111,222)' },
+        headers: {},
+      });
+
+      const result = await service.createComment('token', 'urn:li:share:111', 'urn:li:person:xyz', 'Comment text');
+
+      expect(result).toBe('urn:li:comment:(urn:li:share:111,222)');
+    });
+
+    it('should handle 401 error for expired token', async () => {
+      const axiosError = {
+        response: { status: 401, data: { message: 'Unauthorized' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.post.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.createComment('expired-token', 'urn:li:share:123', 'urn:li:person:abc', 'Comment')
+      ).rejects.toThrow('LinkedIn access token expired or invalid');
+    });
+
+    it('should handle 403 error for permission denied', async () => {
+      const axiosError = {
+        response: { status: 403, data: { message: 'Permission denied' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.post.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.createComment('token', 'urn:li:share:123', 'urn:li:person:abc', 'Comment')
+      ).rejects.toThrow('LinkedIn Permission Denied');
+    });
+
+    it('should handle 429 rate limit error', async () => {
+      const axiosError = {
+        response: { status: 429, data: { message: 'Too Many Requests' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.post.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.createComment('token', 'urn:li:share:123', 'urn:li:person:abc', 'Comment')
+      ).rejects.toThrow('LinkedIn rate limit exceeded');
+    });
+  });
+
+  describe('createReaction', () => {
+    it('should create a LIKE reaction on a post', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { id: 'urn:li:reaction:(urn:li:person:abc,urn:li:share:123)' },
+        headers: { 'x-restli-id': 'urn:li:reaction:(urn:li:person:abc,urn:li:share:123)' },
+      });
+
+      const result = await service.createReaction('token', 'urn:li:share:123', 'urn:li:person:abc', 'LIKE');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        `/rest/reactions?actor=${encodeURIComponent('urn:li:person:abc')}`,
+        {
+          root: 'urn:li:share:123',
+          reactionType: 'LIKE'
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:reaction:(urn:li:person:abc,urn:li:share:123)');
+    });
+
+    it('should create a PRAISE reaction on behalf of organization', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { id: 'urn:li:reaction:(urn:li:organization:123,urn:li:ugcPost:789)' },
+        headers: { 'x-restli-id': 'urn:li:reaction:(urn:li:organization:123,urn:li:ugcPost:789)' },
+      });
+
+      const result = await service.createReaction('token', 'urn:li:ugcPost:789', 'urn:li:organization:123', 'PRAISE');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        `/rest/reactions?actor=${encodeURIComponent('urn:li:organization:123')}`,
+        {
+          root: 'urn:li:ugcPost:789',
+          reactionType: 'PRAISE'
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:reaction:(urn:li:organization:123,urn:li:ugcPost:789)');
+    });
+
+    it('should support all reaction types', async () => {
+      const reactionTypes = ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'] as const;
+
+      for (const reactionType of reactionTypes) {
+        mockClient.post.mockResolvedValue({
+          data: { id: `urn:li:reaction:(urn:li:person:abc,urn:li:share:123)` },
+          headers: { 'x-restli-id': `urn:li:reaction:(urn:li:person:abc,urn:li:share:123)` },
+        });
+
+        const result = await service.createReaction('token', 'urn:li:share:123', 'urn:li:person:abc', reactionType);
+
+        expect(mockClient.post).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({
+            reactionType: reactionType
+          }),
+          expect.any(Object)
+        );
+        expect(result).toBeTruthy();
+      }
+    });
+
+    it('should use LIKE as default reaction type', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { id: 'urn:li:reaction:(urn:li:person:abc,urn:li:share:123)' },
+        headers: { 'x-restli-id': 'urn:li:reaction:(urn:li:person:abc,urn:li:share:123)' },
+      });
+
+      await service.createReaction('token', 'urn:li:share:123', 'urn:li:person:abc');
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          reactionType: 'LIKE'
+        }),
+        expect.any(Object)
+      );
+    });
+
+    it('should return id from response body if header not present', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { id: 'urn:li:reaction:(urn:li:person:xyz,urn:li:share:111)' },
+        headers: {},
+      });
+
+      const result = await service.createReaction('token', 'urn:li:share:111', 'urn:li:person:xyz', 'EMPATHY');
+
+      expect(result).toBe('urn:li:reaction:(urn:li:person:xyz,urn:li:share:111)');
+    });
+
+    it('should handle 401 error for expired token', async () => {
+      const axiosError = {
+        response: { status: 401, data: { message: 'Unauthorized' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.post.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.createReaction('expired-token', 'urn:li:share:123', 'urn:li:person:abc', 'LIKE')
+      ).rejects.toThrow('LinkedIn access token expired or invalid');
+    });
+
+    it('should handle 403 error for permission denied', async () => {
+      const axiosError = {
+        response: { status: 403, data: { message: 'Permission denied' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.post.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.createReaction('token', 'urn:li:share:123', 'urn:li:person:abc', 'INTEREST')
+      ).rejects.toThrow('LinkedIn Permission Denied');
+    });
+
+    it('should handle 429 rate limit error', async () => {
+      const axiosError = {
+        response: { status: 429, data: { message: 'Too Many Requests' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.post.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.createReaction('token', 'urn:li:share:123', 'urn:li:person:abc', 'LIKE')
+      ).rejects.toThrow('LinkedIn rate limit exceeded');
+    });
+  });
 });
