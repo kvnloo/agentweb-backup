@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-06',
+    changes: [
+      'Added LinkedIn Engagement Tools in Agent Mode',
+      '- New comment_on_linkedin_post function enables commenting on LinkedIn posts via connected accounts',
+      '- New react_to_linkedin_post function supports 6 reaction types: LIKE (👍), PRAISE (👏 celebrate), EMPATHY (❤️ love), INTEREST (💡 insightful), APPRECIATION (🙌 support), ENTERTAINMENT (😂 funny)',
+      '- Works with both personal LinkedIn accounts and company pages',
+      '- Automatic token refresh for expired access tokens - seamless authentication handling',
+    ],
+  },
+  {
     date: '2026-02-05',
     changes: [
       'Added Meta Ads Campaign Listing in Agent Mode',

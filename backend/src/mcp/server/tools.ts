@@ -1245,6 +1245,66 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'comment_on_linkedin_post',
+  definition: {
+    name: 'comment_on_linkedin_post',
+    description: 'Create a comment on a LinkedIn post using a connected LinkedIn account. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The connected LinkedIn account ID to comment from'
+        },
+        post_urn: {
+          type: 'string',
+          description: 'The LinkedIn post URN to comment on (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+        },
+        comment_text: {
+          type: 'string',
+          description: 'The comment text content. Should be concise and relevant to the post.'
+        }
+      },
+      required: ['account_id', 'post_urn', 'comment_text']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'react_to_linkedin_post',
+  definition: {
+    name: 'react_to_linkedin_post',
+    description: 'React to a LinkedIn post using a connected LinkedIn account. Supports various reaction types: LIKE (thumbs up), PRAISE (celebrate), EMPATHY (love), INTEREST (insightful), APPRECIATION (support), ENTERTAINMENT (funny). CRITICAL: Always review the reaction with the user and get explicit approval before posting reactions on LinkedIn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The connected LinkedIn account ID to react from'
+        },
+        post_urn: {
+          type: 'string',
+          description: 'The LinkedIn post URN to react to (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+        },
+        reaction_type: {
+          type: 'string',
+          enum: ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'],
+          description: 'The type of reaction. LIKE = Like (👍), PRAISE = Celebrate (👏), EMPATHY = Love (❤️), INTEREST = Insightful (💡), APPRECIATION = Support (🙌), ENTERTAINMENT = Funny (😂)',
+          default: 'LIKE'
+        }
+      },
+      required: ['account_id', 'post_urn']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.reactToLinkedInPost(context?.userId, args.account_id, args.post_urn, args.reaction_type || 'LIKE');
+  }
+});
+
 // --- Tools from taskTools.ts ---
 mcpToolRegistry.register({
   name: 'create_task_from_template',

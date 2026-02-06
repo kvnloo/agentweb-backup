@@ -58,7 +58,9 @@
       "Bash(echo:*)",
       "Bash(gh pr view:*)",
       "Bash(npx ts-node:*)",
-      "Bash(open http://localhost:5173/admin?tab=benchmarks)"
+      "Bash(open http://localhost:5173/admin?tab=benchmarks)",
+      "WebFetch(domain:www.linkedin.com)",
+      "WebFetch(domain:docs.microsoft.com)"
     ]
   }
 }

@@ -1,14 +1,14 @@
 {
   "name": "backend",
-  "version": "25.2.0",
+  "version": "25.3.0",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --exit-child --transpile-only src/server.ts",
     "build": "npx tsc",
-    "test": "jest",
+    "test": "node --max-old-space-size=4096 node_modules/.bin/jest --maxWorkers=2 --forceExit",
     "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage --forceExit",
+    "test:coverage": "node --max-old-space-size=4096 node_modules/.bin/jest --coverage --maxWorkers=2 --forceExit",
     "create-tables": "ts-node scripts/create-tables.ts",
     "create-admin": "ts-node src/scripts/create-admin.ts",
     "mcp:inspector": "PORT=5180 npx @modelcontextprotocol/inspector --transport sse --server-url http://localhost:3001/mcp/server"
