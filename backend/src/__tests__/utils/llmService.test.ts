@@ -16,11 +16,15 @@ const createChainMock = (): ChainMock => ({
 const mockChain = createChainMock();
 
 jest.mock('@langchain/openai', () => ({
-  AzureChatOpenAI: jest.fn().mockImplementation(() => ({}))
+  AzureChatOpenAI: jest.fn().mockImplementation(() => ({
+    invoke: mockInvoke
+  }))
 }));
 
 jest.mock('@langchain/aws', () => ({
-  ChatBedrockConverse: jest.fn().mockImplementation(() => ({}))
+  ChatBedrockConverse: jest.fn().mockImplementation(() => ({
+    invoke: mockInvoke
+  }))
 }));
 
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({

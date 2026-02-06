@@ -371,6 +371,43 @@ npm run create-admin
 - [AgentWeb Customer Portal](https://github.com/AgentWebPro/agentweb-customer-portal)
 - [Growth Genius Chat](https://github.com/AgentWebPro/growth-genius-chat)
 
+### Running Backend with Log File (Recommended for Debugging)
+
+When running the backend during development, it's recommended to redirect output to a log file. This allows AI agents (like Claude Code) to easily access and analyze logs for debugging.
+
+**Start backend with log redirection:**
+```bash
+cd backend
+npm run dev > /tmp/backend.log 2>&1
+```
+
+This command:
+- Redirects both stdout and stderr to `/tmp/backend.log`
+- Allows easy log access for debugging: `tail -f /tmp/backend.log`
+- Enables AI agents to read logs using: `Read tool with file_path="/tmp/backend.log"`
+
+**Alternative: Background with log file:**
+```bash
+cd backend
+nohup npm run dev > /tmp/backend.log 2>&1 &
+echo $! > /tmp/backend.pid
+
+# To stop later:
+kill $(cat /tmp/backend.pid)
+```
+
+**Monitoring logs in real-time:**
+```bash
+# Watch latest logs
+tail -f /tmp/backend.log
+
+# Search for errors
+grep -i "error" /tmp/backend.log
+
+# View last 100 lines
+tail -100 /tmp/backend.log
+```
+
 ### Environment Variables
 
 Backend:

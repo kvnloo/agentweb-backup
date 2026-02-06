@@ -3,6 +3,7 @@ import { ChatBedrockConverse } from '@langchain/aws';
 import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -182,13 +183,14 @@ CRITICAL: You MUST wrap your HTML output in the following XML tags:
 
 The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head, and body sections.`;
 
-      const prompt = ChatPromptTemplate.fromMessages([
-        ['system', htmlSystemPrompt],
-        ['user', userPrompt],
-      ]);
+      // Use direct message objects to avoid LangChain template parsing
+      // This prevents issues with curly braces in CSS, JavaScript, and template variables
+      const messages = [
+        new SystemMessage(htmlSystemPrompt),
+        new HumanMessage(userPrompt),
+      ];
 
-      const chain = prompt.pipe(this.chatModel);
-      const response = await chain.invoke({}) as { content: string };
+      const response = await this.chatModel.invoke(messages) as { content: string };
       const rawResponse = response.content;
 
       // Extract HTML from <actual_html_content> tags

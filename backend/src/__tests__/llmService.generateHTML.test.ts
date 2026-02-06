@@ -210,12 +210,20 @@ Some text after`;
         'Create a page.'
       );
 
-      const { ChatPromptTemplate } = require('@langchain/core/prompts');
-      const callArgs = ChatPromptTemplate.fromMessages.mock.calls[0][0];
-      
-      expect(callArgs[0][1]).toContain('You are a web developer.');
-      expect(callArgs[0][1]).toContain('<actual_html_content>');
-      expect(callArgs[0][1]).toContain('</actual_html_content>');
+      // Check that invoke was called with message objects
+      expect(mockInvoke).toHaveBeenCalledTimes(1);
+      const messages = mockInvoke.mock.calls[0][0];
+
+      // Verify messages array structure
+      expect(messages).toHaveLength(2);
+
+      // Check system message content
+      expect(messages[0].content).toContain('You are a web developer.');
+      expect(messages[0].content).toContain('<actual_html_content>');
+      expect(messages[0].content).toContain('</actual_html_content>');
+
+      // Check user message content
+      expect(messages[1].content).toBe('Create a page.');
     });
   });
 });

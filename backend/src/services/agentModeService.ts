@@ -6760,6 +6760,23 @@ Format the response as JSON with this structure:
     try {
       console.log('AgentMode: Saving file:', fileName, 'for user:', userId, 'session:', sessionId);
 
+      // Validate inputs
+      if (!fileName || typeof fileName !== 'string') {
+        throw new Error('fileName is required and must be a string');
+      }
+
+      if (fileContent === undefined || fileContent === null) {
+        throw new Error('fileContent is required and cannot be undefined or null');
+      }
+
+      if (typeof fileContent !== 'string') {
+        throw new Error(`fileContent must be a string, received: ${typeof fileContent}`);
+      }
+
+      if (fileContent.trim().length === 0) {
+        throw new Error('fileContent cannot be empty');
+      }
+
       // Generate content hash for deduplication
       const contentHash = createHash('sha256').update(fileContent).digest('hex');
 
@@ -9583,10 +9600,11 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
     try {
       // Use Claude model by default (check for Claude in model name)
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-5-20250929-v1:0';
-      
+
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 4000);
+      // Use 16K tokens for HTML generation to avoid truncation
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
 
       // Build system prompt for HTML generation
       const systemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
@@ -9649,6 +9667,176 @@ Please generate a complete, professional HTML document that properly formats and
       return {
         success: false,
         message: 'Failed to create HTML file',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  // Create HTML template from existing HTML file (upload to email templates)
+  public async createHtmlTemplate(
+    htmlSource: string,
+    templateName: string,
+    subject: string,
+    additionalInstructions: string,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Read HTML content from source (either S3 URL or direct HTML content)
+      let htmlContent = htmlSource;
+
+      // If htmlSource looks like a URL, fetch it
+      if (htmlSource.startsWith('http://') || htmlSource.startsWith('https://')) {
+        console.log('AgentMode: Fetching HTML from URL:', htmlSource);
+        const response = await fetch(htmlSource);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch HTML from URL: ${response.statusText}`);
+        }
+        htmlContent = await response.text();
+      }
+
+      // Use Claude model to process/enhance the HTML based on instructions
+      const defaultClaudeModel = 'anthropic.claude-sonnet-4-5-20250929-v1:0';
+
+      const { createLLMService } = await import('../utils/llmService');
+      // Use 16K tokens for HTML template generation to avoid truncation
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
+
+      // Build system prompt for HTML template creation
+      const systemPrompt = `You are an expert web developer and HTML email template designer. Your task is to create or enhance an HTML email template based on the provided HTML content and instructions.
+
+Requirements:
+- Create a well-formatted, professional HTML email template
+- Ensure the HTML is valid and follows email best practices (inline styles, table-based layouts if needed)
+- Make the template reusable by identifying dynamic content that should be replaced with variables
+- Use the {{variable_name}} syntax for all dynamic placeholders (e.g., {{user_name}}, {{company_name}})
+
+CRITICAL - Array Variable Pattern for Repeating Sections:
+For ANY repeating sections (lists, products, features, items, etc.), you MUST use this EXACT three-part pattern:
+  {{property_1_field}} - First item
+  {{property_2_field}} - Second item
+  {{property_n_field}} - Array pattern
+
+Example for a feature list with title and description:
+<div class="feature">
+  <h3>{{features_1_title}}</h3>
+  <p>{{features_1_description}}</p>
+</div>
+<div class="feature">
+  <h3>{{features_2_title}}</h3>
+  <p>{{features_2_description}}</p>
+</div>
+<div class="feature">
+  <h3>{{features_n_title}}</h3>
+  <p>{{features_n_description}}</p>
+</div>
+
+REQUIRED: You MUST include ALL THREE (_1, _2, _n) for EACH property in repeating sections.
+FORBIDDEN: Do NOT use _3, _4, _5, etc. Only _1, _2, and _n are valid.
+
+Other Requirements:
+- Ensure the template is responsive and works well across email clients
+- Include appropriate styling that works in email contexts (inline CSS preferred)
+- Keep the original intent and structure but enhance as needed based on instructions
+- Make sure all images use absolute URLs
+- Ensure proper HTML structure with appropriate tags
+
+The HTML template should be production-ready, well-formatted, and suitable for use as an email template.`;
+
+      // Build user prompt
+      const userPrompt = `Create an email template with the following details:
+
+Template Name: ${templateName}
+Subject Line: ${subject}
+
+Base HTML Content:
+${htmlContent}
+
+Additional Instructions:
+${additionalInstructions || 'None - please process the HTML and identify appropriate variables for dynamic content.'}
+
+Please:
+1. Process the HTML content and enhance it for email template usage
+2. Identify dynamic content and replace with {{variable_name}} placeholders
+3. For repeating sections, use the REQUIRED three-part pattern: {{items_1_property}}, {{items_2_property}}, {{items_n_property}}
+   - MUST include all three: _1, _2, and _n
+   - Do NOT use _3, _4, _5, etc.
+4. Ensure email compatibility (inline styles, proper structure)
+5. Keep the subject line and enhance it with variables if needed
+6. Return ONLY the final HTML content (no explanations)`;
+
+      // Generate enhanced HTML template using LLMService
+      console.log('AgentMode: Generating HTML email template with Claude model');
+      const enhancedHtml = await llmService.generateHTML(systemPrompt, userPrompt);
+
+      if (!enhancedHtml || enhancedHtml.trim().length === 0) {
+        throw new Error('LLM did not generate HTML content');
+      }
+
+      // Extract variables from the enhanced HTML and subject
+      const { variables, arrayVariables } = this.extractVariables(enhancedHtml, subject);
+
+      console.log('AgentMode: Extracted variables:', { variables, arrayVariables });
+
+      // Save template to DynamoDB settings
+      const { settingsService } = await import('./settingsService');
+      const settingName = `email_templates_${userId}`;
+      const existingSetting = await settingsService.getSetting(settingName);
+
+      let templates = [];
+      if (existingSetting) {
+        try {
+          templates = JSON.parse(existingSetting.settingValue);
+        } catch (error) {
+          console.error('Error parsing existing templates:', error);
+          templates = [];
+        }
+      }
+
+      // Check if template already exists
+      const existingTemplateIndex = templates.findIndex(
+        (t: any) => t.template_name === templateName
+      );
+
+      const newTemplate = {
+        template_name: templateName,
+        subject: subject,
+        html_content: enhancedHtml,
+        variables: variables,
+        arrayVariables: arrayVariables,
+        created_at: existingTemplateIndex >= 0 ? templates[existingTemplateIndex].created_at : new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+
+      if (existingTemplateIndex >= 0) {
+        templates[existingTemplateIndex] = newTemplate;
+      } else {
+        templates.push(newTemplate);
+      }
+
+      await settingsService.setSetting(
+        settingName,
+        JSON.stringify(templates),
+        'User email templates',
+        userId
+      );
+
+      console.log('AgentMode: HTML email template created successfully:', templateName);
+
+      return {
+        success: true,
+        template_name: templateName,
+        subject: subject,
+        variables: variables,
+        arrayVariables: arrayVariables,
+        message: `Email template "${templateName}" created successfully with ${variables.length} variables and ${arrayVariables.length} array variables`,
+        preview_note: 'Template is now available in Email Templates section for editing and preview'
+      };
+    } catch (error) {
+      console.error('Error creating HTML template:', error);
+      return {
+        success: false,
+        message: 'Failed to create HTML template',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
