@@ -605,6 +605,116 @@ describe('CRM Routes', () => {
       expect(crmDb.getLeadsByListId).toHaveBeenCalled();
       expect(mockResponse.json).toHaveBeenCalled();
     });
+
+    it('should filter leads server-side when search query is provided', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      const mockLeads = [
+        {
+          leadId: 'lead1',
+          email: 'john@example.com',
+          firstName: 'John',
+          lastName: 'Doe',
+          company: 'Alpha Co',
+          customFields: { role: 'Founder' },
+        },
+        {
+          leadId: 'lead2',
+          email: 'jane@example.com',
+          firstName: 'Jane',
+          lastName: 'Smith',
+          company: 'Beta Co',
+          customFields: { role: 'Designer' },
+        },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
+        total: 0,
+        last7Days: 0,
+        totalAllMessages: 0,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { page: '1', limit: '50', search: 'alpha' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          leads: expect.arrayContaining([
+            expect.objectContaining({ leadId: 'lead1' }),
+          ]),
+          totalFilteredCount: 1,
+        })
+      );
+
+      const responsePayload = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(responsePayload.leads).toHaveLength(1);
+      expect(responsePayload.leads[0].leadId).toBe('lead1');
+    });
+
+    it('should match search query against custom field keys and values', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      const mockLeads = [
+        {
+          leadId: 'lead1',
+          email: 'john@example.com',
+          customFields: { Industry: 'SaaS' },
+        },
+        {
+          leadId: 'lead2',
+          email: 'jane@example.com',
+          customFields: { Title: 'Designer' },
+        },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
+        total: 0,
+        last7Days: 0,
+        totalAllMessages: 0,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { page: '1', limit: '50', search: 'industry' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const responsePayload = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(responsePayload.leads).toHaveLength(1);
+      expect(responsePayload.leads[0].leadId).toBe('lead1');
+      expect(responsePayload.totalFilteredCount).toBe(1);
+    });
   });
 
   describe('POST /api/crm/lists/:listId/leads/import', () => {
