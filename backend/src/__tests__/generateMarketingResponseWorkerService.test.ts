@@ -27,6 +27,28 @@ describe('GenerateMarketingResponseWorkerService', () => {
   let errorHandlers: Map<string, (error: Error) => void>;
   let exitHandlers: Map<string, (code: number | null, signal: string | null) => void>;
 
+  // Helper function to wait for async operations and worker initialization
+  const waitForAsync = async () => {
+    // Wait for ready signal to be sent and processed
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+  };
+
+  // Helper to wait for send to be called (for tests that need to access send calls)
+  const waitForSend = async (minCalls = 1) => {
+    await waitForAsync();
+    // Poll until send has been called the expected number of times
+    let attempts = 0;
+    while (mockWorker.send.mock.calls.length < minCalls && attempts < 10) {
+      await new Promise(resolve => setImmediate(resolve));
+      attempts++;
+    }
+    if (mockWorker.send.mock.calls.length < minCalls) {
+      throw new Error(`Timeout waiting for send to be called ${minCalls} times (got ${mockWorker.send.mock.calls.length})`);
+    }
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
     workerService = new GenerateMarketingResponseWorkerService();
@@ -41,15 +63,37 @@ describe('GenerateMarketingResponseWorkerService', () => {
       on: jest.fn((event: string, handler: any) => {
         // Store handlers for cleanup
         if (event === 'message') {
+          // Always use 'default' key - we only keep one message handler at a time
           messageHandlers.set('default', handler);
+
+          // Automatically send 'ready' signal when the first message handler is registered
+          // This simulates the worker process sending ready after initialization
+          if (messageHandlers.size === 1) {
+            handler({ type: 'ready' });
+          }
         } else if (event === 'error') {
           errorHandlers.set('default', handler);
         } else if (event === 'exit') {
           exitHandlers.set('default', handler);
         }
       }),
+      removeListener: jest.fn((event: string, handler: any) => {
+        // Actually remove the handler when requested
+        if (event === 'message') {
+          // Find and remove the specific handler
+          for (const [key, storedHandler] of messageHandlers.entries()) {
+            if (storedHandler === handler) {
+              messageHandlers.delete(key);
+              break;
+            }
+          }
+        }
+      }),
       send: jest.fn(),
-      kill: jest.fn()
+      kill: jest.fn(),
+      killed: false,
+      stdout: null,
+      stderr: null
     };
 
     // Mock fork to return our mock worker
@@ -67,42 +111,43 @@ describe('GenerateMarketingResponseWorkerService', () => {
     jest.useRealTimers();
   });
 
-  describe('runInWorker', () => {
-    const mockParams = {
-      messageContent: 'Test message',
-      sessionHistory: [],
-      userId: 'test-user-id',
-      llmModel: 'gpt-5.1',
-      sessionId: 'test-session-id',
-      mockMode: false
-    };
+  // Define mockParams at class level so it's accessible to all tests
+  const mockParams = {
+    messageContent: 'Test message',
+    sessionHistory: [],
+    userId: 'test-user-id',
+    llmModel: 'gpt-5.1',
+    sessionId: 'test-session-id',
+    mockMode: false
+  };
 
-    const mockResult = {
-      content: 'Test response',
-      toolCalls: [],
-      knowledgeBaseQueries: [],
-      sources: [],
-      responseMessages: []
-    };
+  const mockResult = {
+    content: 'Test response',
+    toolCalls: [],
+    knowledgeBaseQueries: [],
+    sources: [],
+    responseMessages: []
+  };
+
+  describe('runInWorker', () => {
 
     it('should fork a worker process and send the request', async () => {
-      // Set up mock to resolve with success
-      let messageHandler: ((message: any) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
-
       const promise = workerService.runInWorker(mockParams);
+
+      // Wait for worker initialization
+      await waitForSend();
 
       // Verify fork was called
       expect(fork).toHaveBeenCalled();
 
-      // Simulate worker sending success message immediately
+      // Get the message handler and simulate worker sending success message
+      const messageHandler = messageHandlers.get('default');
       if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
         messageHandler({
           type: 'success',
+          requestId,
           result: mockResult
         });
       }
@@ -111,66 +156,64 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
       // Verify result
       expect(result).toEqual(mockResult);
-      expect(mockWorker.send).toHaveBeenCalledWith({
-        type: 'generateMarketingResponse',
-        params: mockParams
-      });
-      expect(mockWorker.kill).toHaveBeenCalled();
+      expect(mockWorker.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'generateMarketingResponse',
+          requestId: expect.any(String),
+          params: mockParams
+        })
+      );
+      // Worker should NOT be killed in new implementation (reused)
+      expect(mockWorker.kill).not.toHaveBeenCalled();
     });
 
     it('should handle worker error messages', async () => {
-      let messageHandler: ((message: any) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
-
       const promise = workerService.runInWorker(mockParams);
 
+      // Wait for worker initialization
+      await waitForSend();
+
       // Simulate worker sending error message
+      const messageHandler = messageHandlers.get('default');
       if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
         messageHandler({
           type: 'error',
+          requestId,
           error: 'Test error',
           stack: 'Error stack trace'
         });
       }
 
       await expect(promise).rejects.toThrow('Test error');
-      expect(mockWorker.kill).toHaveBeenCalled();
+      // Worker should NOT be killed for individual request errors (reused)
+      expect(mockWorker.kill).not.toHaveBeenCalled();
     });
 
     it('should handle worker process errors', async () => {
-      let errorHandler: ((error: Error) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'error') {
-          errorHandler = handler;
-        }
-      });
-
       const promise = workerService.runInWorker(mockParams);
 
+      // Wait for worker initialization
+      await waitForAsync();
+
       // Simulate worker process error
+      const errorHandler = errorHandlers.get('default');
       if (errorHandler) {
         errorHandler(new Error('Process error'));
       }
 
       await expect(promise).rejects.toThrow('Process error');
-      expect(mockWorker.kill).toHaveBeenCalled();
     });
 
     it('should handle worker process exit with non-zero code', async () => {
-      let exitHandler: ((code: number | null, signal: string | null) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'exit') {
-          exitHandler = handler;
-        }
-      });
-
       const promise = workerService.runInWorker(mockParams);
 
+      // Wait for worker initialization
+      await waitForAsync();
+
       // Simulate worker exit with error code
+      const exitHandler = exitHandlers.get('default');
       if (exitHandler) {
         exitHandler(1, 'SIGTERM');
       }
@@ -182,20 +225,16 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // Use fake timers for timeout test
       jest.useFakeTimers();
 
-      let messageHandler: ((message: any) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
-
       const promise = workerService.runInWorker(mockParams);
+
+      // Process ready message (sent automatically)
+      await Promise.resolve();
+      jest.advanceTimersByTime(0);
 
       // Fast-forward time to trigger timeout (45 minutes = 2700000ms)
       jest.advanceTimersByTime(45 * 60 * 1000);
 
       await expect(promise).rejects.toThrow('generateMarketingResponse worker timed out after 45 minutes');
-      expect(mockWorker.kill).toHaveBeenCalledWith('SIGTERM');
 
       // Clean up
       jest.useRealTimers();
@@ -204,19 +243,20 @@ describe('GenerateMarketingResponseWorkerService', () => {
     it('should clear timeout when worker sends success message', async () => {
       jest.useFakeTimers();
 
-      let messageHandler: ((message: any) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
-
       const promise = workerService.runInWorker(mockParams);
 
+      // Process ready message (sent automatically)
+      await Promise.resolve();
+      jest.advanceTimersByTime(0);
+
       // Send success message before timeout
+      const messageHandler = messageHandlers.get('default');
       if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
         messageHandler({
           type: 'success',
+          requestId,
           result: mockResult
         });
       }
@@ -230,11 +270,11 @@ describe('GenerateMarketingResponseWorkerService', () => {
       jest.useRealTimers();
     });
 
-    it('should use compiled JavaScript in production environment', () => {
+    it('should use compiled JavaScript in production environment', async () => {
       const originalEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'production';
 
-      workerService.runInWorker(mockParams);
+      const promise = workerService.runInWorker(mockParams);
 
       const forkCall = (fork as jest.Mock).mock.calls[0];
       expect(forkCall[0]).toContain('workers/generateMarketingResponseWorker.js');
@@ -242,14 +282,24 @@ describe('GenerateMarketingResponseWorkerService', () => {
       expect(forkCall[2].execArgv).toBeUndefined();
       expect(forkCall[2].env).toEqual(process.env);
 
+      // Wait for ready and complete the promise
+      await waitForSend();
+      const messageHandler = messageHandlers.get('default');
+      if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+        messageHandler({ type: 'success', requestId, result: mockResult });
+      }
+
+      await promise;
       process.env.NODE_ENV = originalEnv;
     });
 
-    it('should use compiled JavaScript in staging environment (NODE_ENV=staging)', () => {
+    it('should use compiled JavaScript in staging environment (NODE_ENV=staging)', async () => {
       const originalEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'staging';
 
-      workerService.runInWorker(mockParams);
+      const promise = workerService.runInWorker(mockParams);
 
       const forkCall = (fork as jest.Mock).mock.calls[0];
       expect(forkCall[0]).toContain('workers/generateMarketingResponseWorker.js');
@@ -257,18 +307,28 @@ describe('GenerateMarketingResponseWorkerService', () => {
       expect(forkCall[2].execArgv).toBeUndefined();
       expect(forkCall[2].env).toEqual(process.env);
 
+      // Wait for ready and complete the promise
+      await waitForSend();
+      const messageHandler = messageHandlers.get('default');
+      if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+        messageHandler({ type: 'success', requestId, result: mockResult });
+      }
+
+      await promise;
       process.env.NODE_ENV = originalEnv;
     });
 
-    it('should use TypeScript with ts-node only in local development (NODE_ENV=development and __dirname in src/)', () => {
+    it('should use TypeScript with ts-node only in local development (NODE_ENV=development and __dirname in src/)', async () => {
       const originalEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'development';
 
-      workerService.runInWorker(mockParams);
+      const promise = workerService.runInWorker(mockParams);
 
       const forkCall = (fork as jest.Mock).mock.calls[0];
       const scriptPath = forkCall[0];
-      
+
       // In test environment, __dirname is in src/__tests__, so it should detect as local dev
       // and use TypeScript with ts-node
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
@@ -279,21 +339,31 @@ describe('GenerateMarketingResponseWorkerService', () => {
         expect(forkCall[2].execArgv).toBeUndefined();
       }
 
+      // Wait for ready and complete the promise
+      await waitForSend();
+      const messageHandler = messageHandlers.get('default');
+      if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+        messageHandler({ type: 'success', requestId, result: mockResult });
+      }
+
+      await promise;
       process.env.NODE_ENV = originalEnv;
     });
 
-    it('should use compiled JavaScript when NODE_ENV=development but code is in dist/ (deployed environment)', () => {
+    it('should use compiled JavaScript when NODE_ENV=development but code is in dist/ (deployed environment)', async () => {
       const originalEnv = process.env.NODE_ENV;
       process.env.NODE_ENV = 'development';
 
       // This test verifies the fix: even when NODE_ENV=development, if __dirname contains 'dist',
       // we should use compiled JavaScript (not TypeScript with ts-node)
       // This covers the staging environment case where NODE_ENV=development but code is deployed
-      workerService.runInWorker(mockParams);
-      
+      const promise = workerService.runInWorker(mockParams);
+
       const forkCall = (fork as jest.Mock).mock.calls[0];
       const scriptPath = forkCall[0];
-      
+
       // The key test: verify that the logic checks __dirname, not just NODE_ENV
       // In test environment, __dirname is typically in src/, so it will use .ts
       // But the logic should handle the case where __dirname contains 'dist' even with NODE_ENV=development
@@ -305,23 +375,26 @@ describe('GenerateMarketingResponseWorkerService', () => {
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');
         expect(forkCall[2].execArgv).toBeUndefined();
       }
-      
+
       // Verify the logic correctly distinguishes between local dev and deployed environments
       // by checking __dirname, not just NODE_ENV
       expect(forkCall).toBeDefined();
       expect(forkCall[2].env).toEqual(process.env);
 
+      // Wait for ready and complete the promise
+      await waitForSend();
+      const messageHandler = messageHandlers.get('default');
+      if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+        messageHandler({ type: 'success', requestId, result: mockResult });
+      }
+
+      await promise;
       process.env.NODE_ENV = originalEnv;
     });
 
     it('should pass mockMode parameter correctly', async () => {
-      let messageHandler: ((message: any) => void) | undefined;
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
-
       const paramsWithMockMode = {
         ...mockParams,
         mockMode: true
@@ -329,16 +402,26 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
       const promise = workerService.runInWorker(paramsWithMockMode);
 
+      // Wait for worker initialization
+      await waitForSend();
+
       // Verify mockMode is sent to worker
-      expect(mockWorker.send).toHaveBeenCalledWith({
-        type: 'generateMarketingResponse',
-        params: paramsWithMockMode
-      });
+      expect(mockWorker.send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'generateMarketingResponse',
+          requestId: expect.any(String),
+          params: paramsWithMockMode
+        })
+      );
 
       // Complete the promise
+      const messageHandler = messageHandlers.get('default');
       if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
         messageHandler({
           type: 'success',
+          requestId,
           result: mockResult
         });
       }
@@ -348,27 +431,28 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
     it('should forward progress updates from worker to callback', async () => {
       const progressCallback = jest.fn();
-      let messageHandler: ((message: any) => void) | undefined;
-      
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
 
       const promise = workerService.runInWorker(mockParams, progressCallback);
 
+      // Wait for worker initialization
+      await waitForSend();
+
       // Simulate worker sending progress updates
+      const messageHandler = messageHandlers.get('default');
       if (messageHandler) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+
         const progress1 = { iteration: 1, status: 'thinking', toolCalls: [] };
-        messageHandler({ type: 'progress', progress: progress1 });
-        
+        messageHandler({ type: 'progress', requestId, progress: progress1 });
+
         const progress2 = { iteration: 1, status: 'executing_tools', toolCalls: [], pendingTools: ['test_tool'] };
-        messageHandler({ type: 'progress', progress: progress2 });
-        
+        messageHandler({ type: 'progress', requestId, progress: progress2 });
+
         // Finally send success
         messageHandler({
           type: 'success',
+          requestId,
           result: mockResult
         });
       }
@@ -384,34 +468,111 @@ describe('GenerateMarketingResponseWorkerService', () => {
     it('should not clear timeout on progress messages', async () => {
       jest.useFakeTimers();
       const progressCallback = jest.fn();
-      let messageHandler: ((message: any) => void) | undefined;
-      
-      mockWorker.on.mockImplementation((event: string, handler: any) => {
-        if (event === 'message') {
-          messageHandler = handler;
-        }
-      });
 
       const promise = workerService.runInWorker(mockParams, progressCallback);
 
+      // Wait for ready to be processed
+      await Promise.resolve();
+      jest.advanceTimersByTime(0);
+
       // Send progress messages
-      if (messageHandler) {
-        messageHandler({ type: 'progress', progress: { iteration: 1, status: 'thinking' } });
-        messageHandler({ type: 'progress', progress: { iteration: 1, status: 'executing_tools' } });
+      const messageHandler = messageHandlers.get('default');
+      if (messageHandler && mockWorker.send.mock.calls.length > 0) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+        messageHandler({ type: 'progress', requestId, progress: { iteration: 1, status: 'thinking' } });
+        messageHandler({ type: 'progress', requestId, progress: { iteration: 1, status: 'executing_tools' } });
       }
 
       // Fast-forward time - timeout should not trigger because progress messages don't clear it
       jest.advanceTimersByTime(1000);
 
       // Send success to complete
-      if (messageHandler) {
-        messageHandler({ type: 'success', result: mockResult });
+      if (messageHandler && mockWorker.send.mock.calls.length > 0) {
+        const sendCall = mockWorker.send.mock.calls[0];
+        const requestId = sendCall[0].requestId;
+        messageHandler({ type: 'success', requestId, result: mockResult });
       }
 
       await promise;
 
       expect(progressCallback).toHaveBeenCalled();
       jest.useRealTimers();
+    });
+
+    it('should reuse the same worker for multiple requests', async () => {
+      // First request
+      const promise1 = workerService.runInWorker(mockParams);
+
+      // Wait for worker initialization
+      await waitForSend();
+
+      const messageHandler = messageHandlers.get('default');
+      if (messageHandler) {
+        const sendCall1 = mockWorker.send.mock.calls[0];
+        const requestId1 = sendCall1[0].requestId;
+        messageHandler({
+          type: 'success',
+          requestId: requestId1,
+          result: mockResult
+        });
+      }
+
+      await promise1;
+
+      // Clear the mock calls to see if fork is called again
+      (fork as jest.Mock).mockClear();
+
+      // Second request - should reuse worker
+      const promise2 = workerService.runInWorker({
+        ...mockParams,
+        messageContent: 'Second message'
+      });
+
+      await waitForSend(2);
+
+      // Worker should NOT be forked again
+      expect(fork).not.toHaveBeenCalled();
+
+      if (messageHandler) {
+        const sendCall2 = mockWorker.send.mock.calls[1];
+        const requestId2 = sendCall2[0].requestId;
+        messageHandler({
+          type: 'success',
+          requestId: requestId2,
+          result: mockResult
+        });
+      }
+
+      await promise2;
+
+      // Verify both requests were sent to the same worker
+      expect(mockWorker.send).toHaveBeenCalledTimes(2);
+      expect(mockWorker.kill).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('shutdown', () => {
+    it('should kill the worker process and reject pending requests', async () => {
+      // Start a request
+      const promise = workerService.runInWorker(mockParams);
+
+      // Wait for worker initialization
+      await waitForAsync();
+
+      // Shutdown before completing the request
+      await workerService.shutdown();
+
+      // Verify worker was killed
+      expect(mockWorker.kill).toHaveBeenCalledWith('SIGTERM');
+
+      // Verify pending request was rejected
+      await expect(promise).rejects.toThrow('Worker shutdown');
+    });
+
+    it('should handle shutdown when no worker is running', async () => {
+      // Should not throw
+      await expect(workerService.shutdown()).resolves.not.toThrow();
     });
   });
 });

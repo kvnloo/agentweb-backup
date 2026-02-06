@@ -24,6 +24,172 @@ interface GenerateMarketingResponseResult {
 }
 
 export class GenerateMarketingResponseWorkerService {
+  private worker: ChildProcess | null = null;
+  private pendingRequests: Map<string, { resolve: Function; reject: Function; onProgress?: Function; timeout: NodeJS.Timeout }> = new Map();
+  private requestIdCounter = 0;
+  private workerReady = false;
+  private workerInitPromise: Promise<void> | null = null;
+
+  /**
+   * Initialize and start the worker process
+   */
+  private async ensureWorker(): Promise<void> {
+    if (this.worker && !this.worker.killed) {
+      if (this.workerReady) {
+        return; // Worker already running and ready
+      }
+      if (this.workerInitPromise) {
+        await this.workerInitPromise;
+        return;
+      }
+    }
+
+    // Get the worker script path
+    let workerScript: string;
+    let execArgv: string[] = [];
+
+    const isDeployedEnvironment = __dirname.includes('/dist/') || __dirname.includes('\\dist\\');
+    const isLocalDevelopment = process.env.NODE_ENV === 'development' && !isDeployedEnvironment;
+
+    if (isLocalDevelopment) {
+      workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
+      execArgv = ['-r', 'ts-node/register'];
+    } else {
+      workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
+    }
+
+    // Fork a new process
+    this.worker = fork(workerScript, [], {
+      stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+      env: process.env,
+      execArgv: execArgv.length > 0 ? execArgv : undefined
+    });
+    this.workerReady = false;
+
+    let readyResolve: (() => void) | undefined;
+    let readyReject: ((error: Error) => void) | undefined;
+    const readyTimeout = setTimeout(() => {
+      const error = new Error('Worker initialization timeout');
+      if (readyReject) {
+        readyReject(error);
+      }
+    }, 60000); // 60 second timeout for initialization
+    this.workerInitPromise = new Promise<void>((resolve, reject) => {
+      readyResolve = () => {
+        this.workerReady = true;
+        clearTimeout(readyTimeout);
+        resolve();
+        this.workerInitPromise = null;
+      };
+      readyReject = (error) => {
+        clearTimeout(readyTimeout);
+        reject(error);
+        this.workerInitPromise = null;
+      };
+    });
+
+    // Forward stdout from worker to parent process
+    if (this.worker.stdout) {
+      this.worker.stdout.on('data', (data: Buffer) => {
+        process.stdout.write(`[Worker] ${data}`);
+      });
+    }
+
+    // Forward stderr from worker to parent process
+    if (this.worker.stderr) {
+      this.worker.stderr.on('data', (data: Buffer) => {
+        process.stderr.write(`[Worker] ${data}`);
+      });
+    }
+
+    // Handle messages from worker
+    this.worker.on('message', (message: any) => {
+      if (message.type === 'ready') {
+        if (!this.workerReady && readyResolve) {
+          console.log('[Worker] Worker ready and initialized');
+          readyResolve();
+        }
+        return;
+      }
+
+      if (message.type === 'progress' && message.requestId) {
+        const pending = this.pendingRequests.get(message.requestId);
+        if (pending?.onProgress) {
+          pending.onProgress(message.progress);
+        }
+        return;
+      }
+
+      if (!message.requestId) return;
+
+      const pending = this.pendingRequests.get(message.requestId);
+      if (!pending) return;
+
+      clearTimeout(pending.timeout);
+      this.pendingRequests.delete(message.requestId);
+
+      if (message.type === 'success') {
+        pending.resolve(message.result);
+      } else if (message.type === 'error') {
+        const error = new Error(message.error);
+        if (message.stack) {
+          error.stack = message.stack;
+        }
+        pending.reject(error);
+      }
+    });
+
+    // Handle worker errors
+    this.worker.on('error', (error) => {
+      console.error('[Worker] Worker process error:', error);
+      if (readyReject) {
+        readyReject(error);
+      }
+      // Reject all pending requests
+      for (const [requestId, pending] of this.pendingRequests.entries()) {
+        clearTimeout(pending.timeout);
+        pending.reject(error);
+      }
+      this.pendingRequests.clear();
+      this.worker = null;
+    });
+
+    // Handle worker exit
+    this.worker.on('exit', (code, signal) => {
+      console.log(`[Worker] Worker process exited with code ${code} and signal ${signal}`);
+      if (readyReject) {
+        readyReject(new Error(`Worker process exited with code ${code} and signal ${signal}`));
+      }
+      // Reject all pending requests
+      for (const [requestId, pending] of this.pendingRequests.entries()) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error(`Worker process exited with code ${code} and signal ${signal}`));
+      }
+      this.pendingRequests.clear();
+      this.worker = null;
+    });
+
+    if (this.workerInitPromise) {
+      await this.workerInitPromise;
+    }
+  }
+
+  /**
+   * Shutdown the worker process
+   */
+  async shutdown(): Promise<void> {
+    if (this.worker && !this.worker.killed) {
+      this.worker.kill('SIGTERM');
+      this.worker = null;
+    }
+    // Clear all pending requests
+    for (const [requestId, pending] of this.pendingRequests.entries()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('Worker shutdown'));
+    }
+    this.pendingRequests.clear();
+  }
+
   /**
    * Run generateMarketingResponse in a separate process
    * This prevents blocking the main event loop, allowing health checks to continue working
@@ -32,100 +198,38 @@ export class GenerateMarketingResponseWorkerService {
     params: GenerateMarketingResponseParams,
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<GenerateMarketingResponseResult> {
+    // Ensure worker is running
+    await this.ensureWorker();
+
+    if (!this.worker) {
+      throw new Error('Failed to start worker process');
+    }
+
     return new Promise((resolve, reject) => {
-      // Get the worker script path
-      // In production/staging, __dirname points to dist/services, so we need to go up to dist/workers
-      // In local development, we use ts-node to run the TypeScript file directly
-      // Check if we're in a deployed environment by checking if __dirname contains 'dist'
-      // (in deployed environments, code is in dist/, in local dev it's in src/)
-      let workerScript: string;
-      let execArgv: string[] = [];
-      
-      const isDeployedEnvironment = __dirname.includes('/dist/') || __dirname.includes('\\dist\\');
-      const isLocalDevelopment = process.env.NODE_ENV === 'development' && !isDeployedEnvironment;
-      
-      if (isLocalDevelopment) {
-        // Local development: use TypeScript with ts-node
-        workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
-        execArgv = ['-r', 'ts-node/register'];
-      } else {
-        // Production/Staging/Deployed: use compiled JavaScript
-        workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
-      }
-      
-      // Fork a new process
-      const worker: ChildProcess = fork(workerScript, [], {
-        stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-        env: process.env,
-        execArgv: execArgv.length > 0 ? execArgv : undefined
-      });
+      // Generate unique request ID
+      const requestId = `req_${++this.requestIdCounter}_${Date.now()}`;
 
-      // Forward stdout from worker to parent process
-      if (worker.stdout) {
-        worker.stdout.on('data', (data: Buffer) => {
-          process.stdout.write(`[Worker] ${data}`);
-        });
-      }
-
-      // Forward stderr from worker to parent process
-      if (worker.stderr) {
-        worker.stderr.on('data', (data: Buffer) => {
-          process.stderr.write(`[Worker] ${data}`);
-        });
-      }
-
-      // Set a timeout for the worker (45 minutes max)
-      // Increased from 30 minutes to accommodate deep research operations
-      // which can take up to 20 minutes (120 attempts * 10 seconds)
+      // Set a timeout for this specific request (45 minutes max)
       const timeout = setTimeout(() => {
-        worker.kill('SIGTERM');
-        reject(new Error('generateMarketingResponse worker timed out after 45 minutes'));
+        const pending = this.pendingRequests.get(requestId);
+        if (pending) {
+          this.pendingRequests.delete(requestId);
+          reject(new Error('generateMarketingResponse worker timed out after 45 minutes'));
+        }
       }, 45 * 60 * 1000);
 
-      // Handle messages from worker
-      worker.on('message', (message: any) => {
-        if (message.type === 'progress') {
-          // Forward progress updates to the callback
-          if (onProgress) {
-            onProgress(message.progress);
-          }
-          // Don't clear timeout on progress messages
-          return;
-        }
-        
-        clearTimeout(timeout);
-        
-        if (message.type === 'success') {
-          worker.kill();
-          resolve(message.result);
-        } else if (message.type === 'error') {
-          worker.kill();
-          const error = new Error(message.error);
-          if (message.stack) {
-            error.stack = message.stack;
-          }
-          reject(error);
-        }
-      });
-
-      // Handle worker errors
-      worker.on('error', (error) => {
-        clearTimeout(timeout);
-        worker.kill();
-        reject(error);
-      });
-
-      // Handle worker exit
-      worker.on('exit', (code, signal) => {
-        clearTimeout(timeout);
-        if (code !== 0 && code !== null) {
-          reject(new Error(`Worker process exited with code ${code} and signal ${signal}`));
-        }
+      // Store the request callbacks
+      this.pendingRequests.set(requestId, {
+        resolve,
+        reject,
+        onProgress,
+        timeout
       });
 
       // Send the request to the worker
-      worker.send({
+      this.worker!.send({
         type: 'generateMarketingResponse',
+        requestId,
         params
       });
     });
@@ -133,4 +237,3 @@ export class GenerateMarketingResponseWorkerService {
 }
 
 export const generateMarketingResponseWorkerService = new GenerateMarketingResponseWorkerService();
-

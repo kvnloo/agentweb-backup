@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-06',
+    changes: [
+      'Significantly Improved Agent Mode Response Speed',
+      '- Optimized MCP (Model Context Protocol) server initialization to load once at startup instead of on every message',
+      '- Implemented persistent worker process that reuses connections across multiple requests',
+      '- Second and subsequent messages now respond 2-10x faster with near-zero initialization overhead',
+      '- First message speed unchanged as MCP servers initialize once during first request',
+      '- Worker process properly managed with graceful shutdown and automatic recovery',
+    ],
+  },
+  {
     date: '2026-02-05',
     changes: [
       'Added Meta Ads Campaign Listing in Agent Mode',

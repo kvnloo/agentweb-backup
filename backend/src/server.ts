@@ -1,5 +1,6 @@
 import app from './app';
 import { agentModeService } from './services/agentModeService';
+import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import http from 'http';
@@ -179,10 +180,13 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
 // Graceful shutdown handler
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n${signal} received. Shutting down gracefully...`);
-  
+
   // Shutdown Agent Mode services (closes MCP clients)
   await agentModeService.shutdown();
-  
+
+  // Shutdown worker service
+  await generateMarketingResponseWorkerService.shutdown();
+
   // Close Socket.IO connections
   io.close((err) => {
     if (err) {
