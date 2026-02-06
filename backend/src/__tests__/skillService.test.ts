@@ -87,6 +87,23 @@ describe('SkillService', () => {
       expect(mockPut).toHaveBeenCalled();
     });
 
+    it('should respect isPublished flag when creating a skill', async () => {
+      mockPromise.mockResolvedValueOnce({});
+
+      const result = await skillService.createSkill(
+        'Published Skill',
+        'Description',
+        [],
+        undefined,
+        true // isPublished
+      );
+
+      expect(result.isPublished).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        Item: expect.objectContaining({ isPublished: true })
+      }));
+    });
+
     it('should generate a unique skillId', async () => {
       const result = await skillService.createSkill('Test', 'Desc', [], undefined);
       expect(result.skillId).toBe('test-skill-id-123');

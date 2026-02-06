@@ -158,7 +158,7 @@ describe('AgentModeService - Tool Descriptions', () => {
     it('should explain the skills approach for expanding capabilities', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
       expect(systemPrompt).toContain('skill');
-      expect(systemPrompt).toContain('limited set of tools');
+      expect(systemPrompt).toContain('dynamic skill set');
     });
 
     it('should provide guidance on file attachments', async () => {
@@ -176,7 +176,8 @@ describe('AgentModeService - Tool Descriptions', () => {
 
     it('should emphasize proactive skill discovery', async () => {
       const systemPrompt = await agentModeService.getMarketingSystemPrompt();
-      expect(systemPrompt).toContain('proactive');
+      // The new prompt uses the Analyze-Install-Execute protocol instead of just saying "be proactive"
+      expect(systemPrompt).toContain('Analyze-Install-Execute');
     });
 
     it('should mention Emma as the AI assistant name', async () => {

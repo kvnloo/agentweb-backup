@@ -3,7 +3,7 @@ import { skillService } from "../services/skillService";
 
 export const createSkill = async (req: Request, res: Response) => {
   try {
-    const { name, description, toolNames, systemPrompt } = req.body;
+    const { name, description, toolNames, systemPrompt, isPublished } = req.body;
     
     if (!name || !description) {
       return res.status(400).json({ message: "Name and description are required" });
@@ -13,7 +13,8 @@ export const createSkill = async (req: Request, res: Response) => {
           name,
           description,
           toolNames || [],
-          systemPrompt
+          systemPrompt,
+          isPublished
     );
 
     res.status(201).json(skill);
