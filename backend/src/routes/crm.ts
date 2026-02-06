@@ -109,6 +109,48 @@ const normalizeSenderId = (senderId: any) => {
   return senderId.trim();
 };
 
+const leadMatchesSearch = (lead: any, rawSearchQuery: string): boolean => {
+  const searchQuery = rawSearchQuery.trim().toLowerCase();
+  if (!searchQuery) {
+    return true;
+  }
+
+  const standardFieldValues = [
+    lead.email,
+    lead.firstName,
+    lead.lastName,
+    `${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+    lead.company,
+    lead.phone,
+    lead.title,
+    lead.notes,
+    lead.linkedin,
+  ];
+
+  if (
+    standardFieldValues.some((value) =>
+      String(value || '').toLowerCase().includes(searchQuery)
+    )
+  ) {
+    return true;
+  }
+
+  const customFields = lead.customFields && typeof lead.customFields === 'object'
+    ? lead.customFields
+    : {};
+
+  const customFieldValueMatch = Object.values(customFields).some((value) =>
+    String(value || '').toLowerCase().includes(searchQuery)
+  );
+  if (customFieldValueMatch) {
+    return true;
+  }
+
+  return Object.keys(customFields).some((key) =>
+    key.toLowerCase().includes(searchQuery)
+  );
+};
+
 // Lead List Routes
 
 /**
@@ -368,6 +410,7 @@ router.delete('/lists/:listId', async (req: Request, res: Response) => {
  * @access Private
  * @query page - Page number (default: 1, 1-indexed)
  * @query limit - Number of items per page (default: 50, max: 100)
+ * @query search - Search leads by standard/custom fields (server-side)
  */
 router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
   try {
@@ -376,6 +419,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const { listId } = req.params;
     const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -398,25 +442,33 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     let filteredLeads: any[] = [];
     let hasMoreLeads = true;
     let totalFilteredCount: number | null = null;
+    let knownTotalPages: number | null = null;
 
-    if (list.icpsOnly) {
-      // ICPs only mode: Fetch ALL ICP leads to get accurate count
+    if (list.icpsOnly || search) {
+      // Filtered mode (ICPs only and/or text search): fetch all leads to compute accurate count.
       let allIcpLeads: any[] = [];
       let currentLastKey = undefined;
+      const fetchLimit = Math.max(validLimit, 100);
 
-      // Fetch all leads and filter to ICPs
+      // Fetch all leads and apply filters in memory.
       while (hasMoreLeads) {
-        const result = await crmDb.getLeadsByListId(listId, validLimit, currentLastKey);
-
-        // Filter to only ICP matches
-        const icpLeads = result.items.filter((lead: any) => lead.icpMatch?.isMatch === true);
-        allIcpLeads.push(...icpLeads);
+        const result = await crmDb.getLeadsByListId(listId, fetchLimit, currentLastKey);
+        const matchingLeads = result.items.filter((lead: any) => {
+          if (list.icpsOnly && lead.icpMatch?.isMatch !== true) {
+            return false;
+          }
+          if (search && !leadMatchesSearch(lead, search)) {
+            return false;
+          }
+          return true;
+        });
+        allIcpLeads.push(...matchingLeads);
 
         currentLastKey = result.lastEvaluatedKey;
         hasMoreLeads = !!result.lastEvaluatedKey;
       }
 
-      // Now we have all ICP leads and know the exact total
+      // We now have exact filtered count.
       totalFilteredCount = allIcpLeads.length;
 
       // Slice to get only the leads for the requested page
@@ -424,10 +476,11 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       const targetLeadsToReturn = validLimit;
       filteredLeads = allIcpLeads.slice(targetLeadsToSkip, targetLeadsToSkip + targetLeadsToReturn);
 
-      // Check if there are more ICP leads after this page
+      // Check if there are more filtered leads after this page.
       hasMoreLeads = allIcpLeads.length > targetLeadsToSkip + targetLeadsToReturn;
+      knownTotalPages = Math.max(1, Math.ceil(totalFilteredCount / validLimit));
 
-      // If we got no leads for this page, it means we're beyond the last page
+      // If this page is beyond range, return empty.
       if (filteredLeads.length === 0 && validPage > 1) {
         return res.json({
           leads: [],
@@ -435,7 +488,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
           limit: validLimit,
           totalPages: validPage - 1,
           hasMore: false,
-          totalFilteredCount: 0,
+          totalFilteredCount,
         });
       }
     } else {
@@ -487,7 +540,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       leads: leadsWithCounts,
       page: validPage,
       limit: validLimit,
-      totalPages: hasMoreLeads ? null : validPage, // null means unknown total
+      totalPages: knownTotalPages ?? (hasMoreLeads ? null : validPage), // null means unknown total
       hasMore: hasMoreLeads,
       totalFilteredCount, // Total ICP count when icpsOnly is enabled, null otherwise
     });

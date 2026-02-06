@@ -20,6 +20,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- New react_to_linkedin_post function supports 6 reaction types: LIKE (👍), PRAISE (👏 celebrate), EMPATHY (❤️ love), INTEREST (💡 insightful), APPRECIATION (🙌 support), ENTERTAINMENT (😂 funny)',
       '- Works with both personal LinkedIn accounts and company pages',
       '- Automatic token refresh for expired access tokens - seamless authentication handling',
+      'Moved CRM lead search to server-side filtering',
+      '- CRM search now runs on backend APIs instead of page-local client filtering',
+      '- Search supports standard lead fields and custom fields server-side',
+      '- Search input stays visible during loading; only lead rows show loading state',
     ],
   },
   {
