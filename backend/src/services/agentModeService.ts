@@ -11289,6 +11289,87 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  async reactToLinkedInPost(userId: string, accountId: string, postUrn: string, reactionType: string = 'LIKE'): Promise<any> {
+    console.log('[AgentMode] reactToLinkedInPost called:', {
+      userId,
+      accountId,
+      postUrn,
+      reactionType
+    });
+
+    try {
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      try {
+        console.log('[AgentMode] Looking up account:', accountId);
+        const account = await getAccountById(accountId, userId);
+        console.log('[AgentMode] Account lookup result:', account ? {
+          found: true,
+          platform: account.platform,
+          accountType: account.config?.account_type,
+          accountName: account.account_name
+        } : { found: false });
+
+        if (!account) {
+          console.log('[AgentMode] Account not found, returning error');
+          return {
+            success: false,
+            message: 'Account not found or access denied'
+          };
+        }
+
+        // Only LinkedIn is supported for reactions
+        if (account.platform !== 'linkedin') {
+          return {
+            success: false,
+            message: 'Reactions are currently only supported for LinkedIn accounts'
+          };
+        }
+
+        console.log('[AgentMode] Getting LinkedIn adapter');
+        const adapter = socialPlatformService.getAdapter(account.platform);
+
+        // Check if the adapter supports reactions
+        if (!adapter.createReaction) {
+          return {
+            success: false,
+            message: 'Reactions are not supported for this platform'
+          };
+        }
+
+        console.log('[AgentMode] Calling adapter.createReaction (adapter will handle token refresh if needed)...');
+        const result = await adapter.createReaction(account, postUrn, reactionType, userId);
+
+        return {
+          success: true,
+          message: result.message,
+          reaction_id: result.postId,
+          post_url: result.postUrl
+        };
+      } catch (error: any) {
+        // Handle specific error messages
+        let message = error.message;
+        if (message.includes('access token expired')) {
+          message = 'Account token expired. Please reconnect the account in Settings.';
+        }
+
+        return {
+          success: false,
+          message: `Failed to react: ${message}`
+        };
+      }
+
+    } catch (error) {
+      console.error('AgentMode: Error reacting to post:', error);
+      return {
+        success: false,
+        message: 'Failed to create reaction',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   // Load posts for connected account helper
   async loadConnectedAccountPosts(
     userId: string,
