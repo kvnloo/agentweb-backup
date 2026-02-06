@@ -1245,6 +1245,35 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'comment_on_linkedin_post',
+  definition: {
+    name: 'comment_on_linkedin_post',
+    description: 'Create a comment on a LinkedIn post using a connected LinkedIn account. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The connected LinkedIn account ID to comment from'
+        },
+        post_urn: {
+          type: 'string',
+          description: 'The LinkedIn post URN to comment on (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321")'
+        },
+        comment_text: {
+          type: 'string',
+          description: 'The comment text content. Should be concise and relevant to the post.'
+        }
+      },
+      required: ['account_id', 'post_urn', 'comment_text']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text);
+  }
+});
+
 // --- Tools from taskTools.ts ---
 mcpToolRegistry.register({
   name: 'create_task_from_template',

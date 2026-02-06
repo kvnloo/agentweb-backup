@@ -489,6 +489,45 @@ export class LinkedInService {
   }
 
   /**
+   * Create a comment on a LinkedIn post
+   * @param accessToken - OAuth access token
+   * @param postUrn - URN of the post to comment on (e.g., "urn:li:ugcPost:123" or "urn:li:share:456")
+   * @param actorUrn - URN of the entity making the comment (person or organization)
+   * @param commentText - The comment text content
+   * @returns Comment URN
+   */
+  async createComment(
+    accessToken: string,
+    postUrn: string,
+    actorUrn: string,
+    commentText: string
+  ): Promise<string> {
+    return this.safeRequest(async () => {
+      // URL-encode the post URN for the path
+      const encodedPostUrn = encodeURIComponent(postUrn);
+
+      const response = await this.client.post(
+        `/rest/socialActions/${encodedPostUrn}/comments`,
+        {
+          actor: actorUrn,
+          object: postUrn,
+          message: {
+            text: commentText
+          }
+        },
+        {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        }
+      );
+
+      // LinkedIn returns the comment URN in the x-restli-id header or in the response body
+      const commentUrn = response.headers['x-restli-id'] || (response.data as any).commentUrn;
+      console.log(`[LinkedIn] Comment created successfully: ${commentUrn}`);
+      return commentUrn;
+    });
+  }
+
+  /**
    * Initialize image upload with LinkedIn
    * Step 1 of the 3-step image upload process
    */

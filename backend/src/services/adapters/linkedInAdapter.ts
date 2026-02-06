@@ -144,6 +144,38 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
+  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string): Promise<PostResult> {
+    const config = account.config as LinkedInConfig;
+    const actorUrn = account.account_id; // The account creating the comment
+
+    try {
+      // Get valid token (refreshes if expired)
+      const { token } = await this.getValidToken(account, userId);
+
+      // Create comment
+      const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText);
+
+      return {
+        success: true,
+        message: 'Comment posted successfully on LinkedIn',
+        postId: commentUrn,
+        postUrl: `https://www.linkedin.com/feed/update/${postUrn}` // Link to the original post
+      };
+    } catch (error: any) {
+      // Rate limit handling
+      if (error.response?.status === 429) {
+        throw new Error('LinkedIn rate limit exceeded. Please try again later.');
+      }
+      if (error.response?.status === 401) {
+        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+      }
+      if (error.response?.status === 403) {
+        throw new Error('Permission denied. Make sure your account has permission to comment on this post.');
+      }
+      throw error;
+    }
+  }
+
   async listPosts(account: ConnectedAccount, options?: { limit?: number }, userId?: string): Promise<any[]> {
     const config = account.config as LinkedInConfig;
     const limit = options?.limit || 10;

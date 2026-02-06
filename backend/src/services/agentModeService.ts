@@ -11208,6 +11208,87 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string): Promise<any> {
+    console.log('[AgentMode] commentOnLinkedInPost called:', {
+      userId,
+      accountId,
+      postUrn,
+      commentLength: commentText?.length || 0
+    });
+
+    try {
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      try {
+        console.log('[AgentMode] Looking up account:', accountId);
+        const account = await getAccountById(accountId, userId);
+        console.log('[AgentMode] Account lookup result:', account ? {
+          found: true,
+          platform: account.platform,
+          accountType: account.config?.account_type,
+          accountName: account.account_name
+        } : { found: false });
+
+        if (!account) {
+          console.log('[AgentMode] Account not found, returning error');
+          return {
+            success: false,
+            message: 'Account not found or access denied'
+          };
+        }
+
+        // Only LinkedIn is supported for commenting
+        if (account.platform !== 'linkedin') {
+          return {
+            success: false,
+            message: 'Commenting is currently only supported for LinkedIn accounts'
+          };
+        }
+
+        console.log('[AgentMode] Getting LinkedIn adapter');
+        const adapter = socialPlatformService.getAdapter(account.platform);
+
+        // Check if the adapter supports commenting
+        if (!adapter.createComment) {
+          return {
+            success: false,
+            message: 'Commenting is not supported for this platform'
+          };
+        }
+
+        console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
+        const result = await adapter.createComment(account, postUrn, commentText, userId);
+
+        return {
+          success: true,
+          message: result.message,
+          comment_id: result.postId,
+          post_url: result.postUrl
+        };
+      } catch (error: any) {
+        // Handle specific error messages
+        let message = error.message;
+        if (message.includes('access token expired')) {
+          message = 'Account token expired. Please reconnect the account in Settings.';
+        }
+
+        return {
+          success: false,
+          message: `Failed to comment: ${message}`
+        };
+      }
+
+    } catch (error) {
+      console.error('AgentMode: Error commenting on post:', error);
+      return {
+        success: false,
+        message: 'Failed to create comment',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   // Load posts for connected account helper
   async loadConnectedAccountPosts(
     userId: string,
