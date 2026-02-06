@@ -53,7 +53,8 @@ export class SkillService {
     name: string,
     description: string,
     toolNames: string[],
-    systemPrompt?: string
+    systemPrompt?: string,
+    isPublished?: boolean
   ): Promise<Skill> {
     const timestamp = new Date().toISOString();
     const skill: Skill = {
@@ -62,7 +63,7 @@ export class SkillService {
       description,
       toolNames,
       systemPrompt,
-      isPublished: false, // Default to Draft (not published)
+      isPublished: isPublished || false, // Default to Draft (not published)
       createdAt: timestamp,
       updatedAt: timestamp,
     };

@@ -70,7 +70,8 @@ describe('SkillController', () => {
         'Test Skill',
         'A test skill',
         ['tool1', 'tool2'],
-        'Test prompt'
+        'Test prompt',
+        undefined
       );
       expect(mockStatus).toHaveBeenCalledWith(201);
       expect(mockJson).toHaveBeenCalledWith(mockSkill);
@@ -129,6 +130,7 @@ describe('SkillController', () => {
         'Test Skill',
         'A test skill',
         [],
+        undefined,
         undefined
       );
       expect(mockStatus).toHaveBeenCalledWith(201);
