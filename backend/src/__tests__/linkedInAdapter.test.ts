@@ -7,6 +7,8 @@
 jest.mock('../services/linkedInService', () => ({
   linkedInService: {
     createPost: jest.fn(),
+    createComment: jest.fn(),
+    createReaction: jest.fn(),
     listPosts: jest.fn(),
     getShareStatistics: jest.fn(),
     getAggregatedMetrics: jest.fn(),
@@ -32,6 +34,11 @@ jest.mock('../config/integrations', () => ({
     clientSecret: 'mock-client-secret',
     redirectUri: 'https://mock-redirect.com/callback',
   }),
+}));
+
+// Mock connectedAccountsDb
+jest.mock('../services/connectedAccountsDb', () => ({
+  updateAccountTokens: jest.fn().mockResolvedValue(undefined),
 }));
 
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
@@ -868,6 +875,234 @@ describe('LinkedInAdapter', () => {
           expect(analytics.likes).toBe(0);
         });
       });
+    });
+  });
+
+  describe('createComment', () => {
+    it('should create a comment successfully for personal account', async () => {
+      mockLinkedInService.createComment.mockResolvedValue('urn:li:comment:(urn:li:share:123,456)');
+
+      const result = await adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Great post!');
+
+      expect(mockLinkedInService.createComment).toHaveBeenCalledWith(
+        'test-access-token',
+        'urn:li:share:123',
+        'urn:li:person:abc123',
+        'Great post!'
+      );
+      expect(result).toEqual({
+        success: true,
+        message: 'Comment posted successfully on LinkedIn',
+        postId: 'urn:li:comment:(urn:li:share:123,456)',
+        postUrl: 'https://www.linkedin.com/feed/update/urn:li:share:123',
+      });
+    });
+
+    it('should create a comment successfully for company account', async () => {
+      mockLinkedInService.createComment.mockResolvedValue('urn:li:comment:(urn:li:ugcPost:789,101)');
+
+      const result = await adapter.createComment(mockCompanyAccount, 'urn:li:ugcPost:789', 'Insightful!');
+
+      expect(mockLinkedInService.createComment).toHaveBeenCalledWith(
+        'test-org-token',
+        'urn:li:ugcPost:789',
+        'urn:li:organization:123456',
+        'Insightful!'
+      );
+      expect(result.success).toBe(true);
+      expect(result.postId).toBe('urn:li:comment:(urn:li:ugcPost:789,101)');
+    });
+
+    it('should throw specific error for 401 response', async () => {
+      mockLinkedInService.createComment.mockRejectedValue({
+        response: { status: 401 },
+        message: 'Unauthorized',
+      });
+
+      await expect(
+        adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Comment')
+      ).rejects.toThrow('LinkedIn access token expired');
+    });
+
+    it('should throw specific error for 403 response', async () => {
+      mockLinkedInService.createComment.mockRejectedValue({
+        response: { status: 403 },
+        message: 'Forbidden',
+      });
+
+      await expect(
+        adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Comment')
+      ).rejects.toThrow('Permission denied');
+    });
+
+    it('should throw specific error for 429 rate limit', async () => {
+      mockLinkedInService.createComment.mockRejectedValue({
+        response: { status: 429 },
+        message: 'Too Many Requests',
+      });
+
+      await expect(
+        adapter.createComment(mockPersonalAccount, 'urn:li:share:123', 'Comment')
+      ).rejects.toThrow('LinkedIn rate limit exceeded');
+    });
+
+    it('should refresh token when expired and retry comment', async () => {
+      // Setup: expired token
+      const expiredAccount: ConnectedAccount = {
+        ...mockPersonalAccount,
+        config: {
+          ...mockPersonalAccount.config,
+          token_expires_at: Date.now() - 1000, // Expired
+        },
+      };
+
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({
+        access_token: 'new-token',
+        expires_in: 3600,
+        refresh_token: 'new-refresh-token',
+      });
+      mockLinkedInService.createComment.mockResolvedValue('urn:li:comment:(urn:li:share:123,789)');
+
+      const result = await adapter.createComment(expiredAccount, 'urn:li:share:123', 'Test', 'user-123');
+
+      expect(mockLinkedInService.refreshAccessToken).toHaveBeenCalled();
+      expect(mockLinkedInService.createComment).toHaveBeenCalledWith(
+        'new-token',
+        'urn:li:share:123',
+        'urn:li:person:abc123',
+        'Test'
+      );
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe('createReaction', () => {
+    it('should create a LIKE reaction successfully for personal account', async () => {
+      mockLinkedInService.createReaction.mockResolvedValue('urn:li:reaction:(urn:li:person:abc123,urn:li:share:123)');
+
+      const result = await adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', 'LIKE');
+
+      expect(mockLinkedInService.createReaction).toHaveBeenCalledWith(
+        'test-access-token',
+        'urn:li:share:123',
+        'urn:li:person:abc123',
+        'LIKE'
+      );
+      expect(result).toEqual({
+        success: true,
+        message: 'Reacted with LIKE on LinkedIn',
+        postId: 'urn:li:reaction:(urn:li:person:abc123,urn:li:share:123)',
+        postUrl: 'https://www.linkedin.com/feed/update/urn:li:share:123',
+      });
+    });
+
+    it('should create a PRAISE reaction for company account', async () => {
+      mockLinkedInService.createReaction.mockResolvedValue('urn:li:reaction:(urn:li:organization:123456,urn:li:ugcPost:789)');
+
+      const result = await adapter.createReaction(mockCompanyAccount, 'urn:li:ugcPost:789', 'PRAISE');
+
+      expect(mockLinkedInService.createReaction).toHaveBeenCalledWith(
+        'test-org-token',
+        'urn:li:ugcPost:789',
+        'urn:li:organization:123456',
+        'PRAISE'
+      );
+      expect(result.success).toBe(true);
+      expect(result.message).toBe('Reacted with PRAISE on LinkedIn');
+    });
+
+    it('should validate reaction type and throw error for invalid type', async () => {
+      await expect(
+        adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', 'INVALID_TYPE')
+      ).rejects.toThrow('Invalid reaction type');
+    });
+
+    it('should accept lowercase reaction types and convert to uppercase', async () => {
+      mockLinkedInService.createReaction.mockResolvedValue('urn:li:reaction:123');
+
+      await adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', 'like');
+
+      expect(mockLinkedInService.createReaction).toHaveBeenCalledWith(
+        'test-access-token',
+        'urn:li:share:123',
+        'urn:li:person:abc123',
+        'LIKE'
+      );
+    });
+
+    it('should support all valid reaction types', async () => {
+      const validTypes = ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'];
+
+      for (const type of validTypes) {
+        mockLinkedInService.createReaction.mockResolvedValue(`urn:li:reaction:${type}`);
+
+        const result = await adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', type);
+
+        expect(result.success).toBe(true);
+        expect(result.message).toBe(`Reacted with ${type} on LinkedIn`);
+      }
+    });
+
+    it('should throw specific error for 401 response', async () => {
+      mockLinkedInService.createReaction.mockRejectedValue({
+        response: { status: 401 },
+        message: 'Unauthorized',
+      });
+
+      await expect(
+        adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', 'LIKE')
+      ).rejects.toThrow('LinkedIn access token expired');
+    });
+
+    it('should throw specific error for 403 response', async () => {
+      mockLinkedInService.createReaction.mockRejectedValue({
+        response: { status: 403 },
+        message: 'Forbidden',
+      });
+
+      await expect(
+        adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', 'LIKE')
+      ).rejects.toThrow('Permission denied');
+    });
+
+    it('should throw specific error for 429 rate limit', async () => {
+      mockLinkedInService.createReaction.mockRejectedValue({
+        response: { status: 429 },
+        message: 'Too Many Requests',
+      });
+
+      await expect(
+        adapter.createReaction(mockPersonalAccount, 'urn:li:share:123', 'LIKE')
+      ).rejects.toThrow('LinkedIn rate limit exceeded');
+    });
+
+    it('should refresh token when expired and retry reaction', async () => {
+      // Setup: expired token
+      const expiredAccount: ConnectedAccount = {
+        ...mockPersonalAccount,
+        config: {
+          ...mockPersonalAccount.config,
+          token_expires_at: Date.now() - 1000, // Expired
+        },
+      };
+
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({
+        access_token: 'new-token',
+        expires_in: 3600,
+        refresh_token: 'new-refresh-token',
+      });
+      mockLinkedInService.createReaction.mockResolvedValue('urn:li:reaction:123');
+
+      const result = await adapter.createReaction(expiredAccount, 'urn:li:share:123', 'EMPATHY', 'user-123');
+
+      expect(mockLinkedInService.refreshAccessToken).toHaveBeenCalled();
+      expect(mockLinkedInService.createReaction).toHaveBeenCalledWith(
+        'new-token',
+        'urn:li:share:123',
+        'urn:li:person:abc123',
+        'EMPATHY'
+      );
+      expect(result.success).toBe(true);
     });
   });
 });

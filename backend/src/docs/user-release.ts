@@ -15,6 +15,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Second and subsequent messages now respond 2-10x faster with near-zero initialization overhead',
       '- First message speed unchanged as MCP servers initialize once during first request',
       '- Worker process properly managed with graceful shutdown and automatic recovery',
+      'Added LinkedIn Engagement Tools in Agent Mode',
+      '- New comment_on_linkedin_post function enables commenting on LinkedIn posts via connected accounts',
+      '- New react_to_linkedin_post function supports 6 reaction types: LIKE (👍), PRAISE (👏 celebrate), EMPATHY (❤️ love), INTEREST (💡 insightful), APPRECIATION (🙌 support), ENTERTAINMENT (😂 funny)',
+      '- Works with both personal LinkedIn accounts and company pages',
+      '- Automatic token refresh for expired access tokens - seamless authentication handling',
     ],
   },
   {

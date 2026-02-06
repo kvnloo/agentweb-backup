@@ -60,6 +60,24 @@ export interface SocialPlatformAdapter {
   createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult>;
 
   /**
+   * Create a comment on a post
+   * @param account - The connected account to comment from
+   * @param postUrn - URN of the post to comment on
+   * @param commentText - The comment text
+   * @param userId - Optional user ID for token refresh capability
+   */
+  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string): Promise<PostResult>;
+
+  /**
+   * React to a post (like, praise, etc.)
+   * @param account - The connected account to react from
+   * @param postUrn - URN of the post to react to
+   * @param reactionType - Type of reaction
+   * @param userId - Optional user ID for token refresh capability
+   */
+  createReaction?(account: ConnectedAccount, postUrn: string, reactionType: string, userId?: string): Promise<PostResult>;
+
+  /**
    * List posts from the account
    * @throws Error if not supported by account type
    */
