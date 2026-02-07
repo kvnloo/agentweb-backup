@@ -5,6 +5,7 @@ import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb } from '../services/db';
+import { agentModeService } from '../services/agentModeService';
 
 const router = express.Router();
 
@@ -190,6 +191,38 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     // Create the lead
     const lead = await crmDb.createLead(leadList.listId, leadData);
 
+    // Auto-create initial drafts for newly forwarded leads (non-blocking)
+    let autoDraftStatus: 'queued' | undefined;
+    let autoDraftError: string | undefined;
+    if (leadList.autoDraftEnabled === true) {
+      autoDraftStatus = 'queued';
+      const sourceLabel = String(mergedCustomFields.source || 'API form submission');
+      const configuredInstruction = typeof leadList.autoDraftInstruction === 'string'
+        ? leadList.autoDraftInstruction.trim()
+        : '';
+      const autoDraftInstruction = `Create an initial outreach message for this new lead from ${sourceLabel}. Keep it concise, personalized, and include a clear next step.${configuredInstruction ? `\n\nAdditional instruction:\n${configuredInstruction}` : ''}`;
+      const autoDraftSessionId = `auto_draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+      // Fire-and-forget so API response is not blocked by draft generation latency.
+      void (async () => {
+        try {
+          const autoDraftResult = await agentModeService.updateEmailDraftForLead(
+            leadList.listId,
+            lead.leadId,
+            autoDraftInstruction,
+            autoDraftSessionId,
+            leadList.userId,
+            'text'
+          );
+          if (!autoDraftResult?.success) {
+            console.error('Auto draft creation failed:', autoDraftResult?.error || autoDraftResult?.message || 'Unknown auto-draft error');
+          }
+        } catch (draftError: any) {
+          console.error('Auto draft creation failed:', draftError?.message || 'Unknown auto-draft error');
+        }
+      })();
+    }
+
     // Trigger api.lead_added alert if configured
     try {
       await leadListAlertService.notifyLeadListOwnerIfConfigured(
@@ -201,6 +234,8 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           forwardedAt: mergedCustomFields.forwardedAt,
           company: leadData.company,
           phone: leadData.phone,
+          ...(autoDraftStatus ? { autoDraftStatus } : {}),
+          ...(autoDraftError ? { autoDraftError } : {}),
         },
         new Date().toISOString()
       );

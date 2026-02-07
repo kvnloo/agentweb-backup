@@ -27,6 +27,17 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     if (eventData.forwardedAt) details.push({ label: 'Forwarded At', value: new Date(eventData.forwardedAt).toLocaleString() });
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
+    if (eventData.autoDraftStatus) {
+      const autoDraftLabel = eventData.autoDraftStatus === 'created'
+        ? 'Created'
+        : eventData.autoDraftStatus === 'failed'
+          ? 'Failed'
+          : 'Queued';
+      details.push({ label: 'Auto Draft', value: autoDraftLabel });
+    }
+    if (eventData.autoDraftError) {
+      details.push({ label: 'Auto Draft Error', value: String(eventData.autoDraftError) });
+    }
   }
   if (eventType === 'api.lead_failed') {
     if (eventData.error) details.push({ label: 'Error', value: String(eventData.error) });
@@ -96,6 +107,9 @@ const sendAlertEmail = async ({
   const eventDetails = buildEventDetails(eventType, eventData);
   const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
   const crmUrl = `${customerFrontendUrl}/crm`;
+  const leadEngagementUrl = lead?.leadId
+    ? `${crmUrl}?listId=${encodeURIComponent(listId)}&leadId=${encodeURIComponent(lead.leadId)}&openEngagement=1`
+    : '';
 
   const text = [
     `A new ${eventType} event was recorded.`,
@@ -103,6 +117,7 @@ const sendAlertEmail = async ({
     `Lead: ${leadName}${showLeadEmail ? ` (${leadEmail})` : ''}`,
     `Time: ${eventTime}`,
     `Manage leads: ${crmUrl}`,
+    leadEngagementUrl ? `Review lead engagement: ${leadEngagementUrl}` : '',
     eventDetails.text,
   ]
     .filter(Boolean)
@@ -117,6 +132,7 @@ const sendAlertEmail = async ({
         <div><strong>Lead:</strong> ${emailService.escapeHtml(leadName)}${showLeadEmail ? ` (${emailService.escapeHtml(leadEmail)})` : ''}</div>
         <div><strong>Time:</strong> ${emailService.escapeHtml(eventTime)}</div>
         <div><strong>Manage leads:</strong> <a href="${emailService.escapeHtml(crmUrl)}">${emailService.escapeHtml(crmUrl)}</a></div>
+        ${leadEngagementUrl ? `<div><strong>Review lead engagement:</strong> <a href="${emailService.escapeHtml(leadEngagementUrl)}">${emailService.escapeHtml(leadEngagementUrl)}</a></div>` : ''}
       </div>
       ${eventDetails.html}
     </div>

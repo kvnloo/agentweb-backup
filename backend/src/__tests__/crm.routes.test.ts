@@ -155,7 +155,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined, null);
+      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined, null, false);
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockList);
     });
@@ -189,7 +189,8 @@ describe('CRM Routes', () => {
         'Alerts List',
         'Alert description',
         ['email.received', 'email.clicked'],
-        null
+        null,
+        false
       );
       expect(mockResponse.status).toHaveBeenCalledWith(201);
     });
@@ -286,7 +287,8 @@ describe('CRM Routes', () => {
         'PoC List',
         undefined,
         undefined,
-        'sender-1'
+        'sender-1',
+        false
       );
       expect(mockResponse.status).toHaveBeenCalledWith(201);
     });
@@ -1073,6 +1075,60 @@ describe('CRM Routes', () => {
           message: expect.stringContaining('either htmlContent or textContent'),
         })
       );
+    });
+  });
+
+  describe('PUT /api/crm/lists/:listId/auto-draft', () => {
+    it('should update auto draft settings with instruction', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({
+        ...mockList,
+        autoDraftEnabled: true,
+        autoDraftInstruction: 'Use an urgent but friendly tone.',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { enabled: true, instruction: 'Use an urgent but friendly tone.' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/auto-draft' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        autoDraftEnabled: true,
+        autoDraftInstruction: 'Use an urgent but friendly tone.'
+      });
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          autoDraftEnabled: true,
+          autoDraftInstruction: 'Use an urgent but friendly tone.',
+        })
+      );
+    });
+
+    it('should return 400 when instruction is not a string', async () => {
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { enabled: true, instruction: 123 };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/auto-draft' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'instruction must be a string' });
     });
   });
 

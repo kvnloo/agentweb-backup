@@ -189,7 +189,7 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, alertEvents, listSenderId } = req.body;
+    const { name, description, alertEvents, listSenderId, autoDraftEnabled } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ message: 'List name is required' });
@@ -213,12 +213,17 @@ router.post('/lists', async (req: Request, res: Response) => {
       }
     }
 
+    if (autoDraftEnabled !== undefined && typeof autoDraftEnabled !== 'boolean') {
+      return res.status(400).json({ message: 'autoDraftEnabled must be a boolean' });
+    }
+
     const list = await crmDb.createLeadList(
       userId,
       name.trim(),
       description?.trim(),
       normalizedAlertEvents,
-      normalizedListSenderId
+      normalizedListSenderId,
+      autoDraftEnabled === true
     );
     res.status(201).json(list);
   } catch (error: any) {
@@ -270,7 +275,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, autoDraftEnabled } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -293,6 +298,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
       listSenderId?: string | null;
+      autoDraftEnabled?: boolean;
       icpsOnly?: boolean;
     } = {};
     if (name !== undefined) {
@@ -359,6 +365,13 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         return res.status(400).json({ message: 'icpsOnly must be a boolean' });
       }
       updates.icpsOnly = icpsOnly;
+    }
+
+    if (autoDraftEnabled !== undefined) {
+      if (typeof autoDraftEnabled !== 'boolean') {
+        return res.status(400).json({ message: 'autoDraftEnabled must be a boolean' });
+      }
+      updates.autoDraftEnabled = autoDraftEnabled;
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);
@@ -1970,6 +1983,65 @@ router.put('/lists/:listId/public-access', async (req: Request, res: Response) =
   } catch (error: any) {
     console.error('Error updating public access:', error);
     res.status(500).json({ message: error.message || 'Failed to update public access' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/lists/:listId/auto-draft
+ * @desc Enable or disable auto draft for API-forwarded leads on a lead list
+ * @access Private
+ */
+router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { enabled, instruction } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ message: 'enabled must be a boolean' });
+    }
+
+    if (instruction !== undefined && typeof instruction !== 'string') {
+      return res.status(400).json({ message: 'instruction must be a string' });
+    }
+
+    const normalizedInstruction = typeof instruction === 'string' ? instruction.trim() : undefined;
+    if (normalizedInstruction !== undefined && normalizedInstruction.length > 2000) {
+      return res.status(400).json({ message: 'instruction must be 2000 characters or fewer' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const updatedList = await crmDb.updateLeadList(listId, {
+      autoDraftEnabled: enabled,
+      ...(normalizedInstruction !== undefined ? { autoDraftInstruction: normalizedInstruction } : {})
+    });
+
+    if (!updatedList) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    res.json({
+      success: true,
+      autoDraftEnabled: updatedList.autoDraftEnabled === true,
+      autoDraftInstruction: typeof updatedList.autoDraftInstruction === 'string' ? updatedList.autoDraftInstruction : '',
+      message: `Auto draft ${enabled ? 'enabled' : 'disabled'} successfully`
+    });
+  } catch (error: any) {
+    console.error('Error updating auto draft:', error);
+    res.status(500).json({ message: error.message || 'Failed to update auto draft' });
   }
 });
 

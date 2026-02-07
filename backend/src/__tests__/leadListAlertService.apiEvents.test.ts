@@ -61,6 +61,7 @@ describe('Lead List Alert Service - API Events', () => {
           forwardedAt: '2026-01-18T10:30:45.123Z',
           company: 'Acme Corp',
           phone: '+1234567890',
+          autoDraftStatus: 'created',
         },
         '2026-01-18T10:30:45.123Z'
       );
@@ -80,6 +81,9 @@ describe('Lead List Alert Service - API Events', () => {
       expect(textContent).toContain('website_contact_form');
       expect(htmlContent).toContain('website_contact_form');
       expect(htmlContent).toContain('Forwarded At');
+      expect(textContent).toContain('Auto Draft: Created');
+      expect(htmlContent).toContain('Auto Draft');
+      expect(htmlContent).toContain('openEngagement=1');
     });
 
     it('should not send alert when api.lead_added is not configured', async () => {
