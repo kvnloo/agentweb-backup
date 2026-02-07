@@ -790,6 +790,145 @@ describe('McpClientService', () => {
     });
   });
 
+  describe('Session Validation for Streamable HTTP', () => {
+    beforeEach(() => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+    });
+
+    it('should validate session ID is established after connection for streamable-http', async () => {
+      Object.assign(internalMcpServers, {
+        'streamable-validated': {
+          transport: 'streamable-http',
+          url: 'http://validated.example.com/mcp'
+        }
+      });
+
+      const mockTransport = {
+        onclose: null,
+        onerror: null,
+        sessionId: 'test-session-123' // Session ID is set
+      };
+
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => mockTransport);
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      // Should not throw
+      await service.initialize();
+
+      expect(StreamableHTTPClientTransport).toHaveBeenCalled();
+      expect(mockClient.connect).toHaveBeenCalled();
+    });
+
+    it('should throw error when session ID is not established for streamable-http', async () => {
+      Object.assign(internalMcpServers, {
+        'streamable-no-session': {
+          transport: 'streamable-http',
+          url: 'http://nosession.example.com/mcp'
+        }
+      });
+
+      const mockTransport = {
+        onclose: null,
+        onerror: null,
+        sessionId: undefined // No session ID
+      };
+
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => mockTransport);
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn(),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      await service.initialize();
+
+      // Should log connection error
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to connect to server streamable-no-session'),
+        expect.objectContaining({
+          message: expect.stringContaining('MCP session not established')
+        })
+      );
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    it('should not validate session for SSE transport', async () => {
+      Object.assign(internalMcpServers, {
+        'sse-no-validation': {
+          transport: 'sse',
+          url: 'http://sse.example.com/mcp'
+        }
+      });
+
+      const mockTransport = {
+        onclose: null,
+        onerror: null
+        // No sessionId property for SSE
+      };
+
+      (SSEClientTransport as jest.Mock).mockImplementation(() => mockTransport);
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      // Should not throw, session validation only for streamable-http
+      await service.initialize();
+
+      expect(SSEClientTransport).toHaveBeenCalled();
+      expect(mockClient.connect).toHaveBeenCalled();
+    });
+
+    it('should wait 100ms before validating session ID', async () => {
+      Object.assign(internalMcpServers, {
+        'streamable-wait': {
+          transport: 'streamable-http',
+          url: 'http://wait.example.com/mcp'
+        }
+      });
+
+      const mockTransport = {
+        onclose: null,
+        onerror: null,
+        sessionId: undefined // Initially undefined
+      };
+
+      // Simulate session ID being set after 50ms
+      setTimeout(() => {
+        mockTransport.sessionId = 'delayed-session-id';
+      }, 50);
+
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => mockTransport);
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: jest.fn()
+      };
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      // Should succeed because the 100ms wait gives time for sessionId to be set
+      await service.initialize();
+
+      expect(mockTransport.sessionId).toBe('delayed-session-id');
+      expect(mockClient.listTools).toHaveBeenCalled();
+    });
+  });
+
   describe('Streamable Http Custom Fetch (Axios Adapter)', () => {
     beforeEach(() => {
       mockAxios.mockReset();
