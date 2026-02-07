@@ -318,6 +318,15 @@ export class McpClientService {
   }
 
   private async connectToServer(name: string, config: McpServerConfig, toolPrefix?: string): Promise<void> {
+    const isInternal = 'isInternal' in config ? config.isInternal : false;
+    
+    // For internal servers, use direct registry access instead of HTTP transport
+    // This avoids session management issues in multi-instance production environments
+    if (isInternal) {
+      await this.connectToInternalServer(name);
+      return;
+    }
+    
     const transportType = getTransportType(config);
     
     // Validate config based on transport type
@@ -365,9 +374,8 @@ export class McpClientService {
     await Promise.race([connectPromise, timeoutPromise]);
     this.clients.set(name, client);
 
-    // Discover tools
+    // Discover tools - at this point, all servers are external (internal handled above)
     const response = await client.listTools();
-    const isInternal = 'isInternal' in config ? config.isInternal : false;
     
     for (const tool of response.tools) {
       // If a prefix is provided, prepend it to the tool name
@@ -386,15 +394,8 @@ export class McpClientService {
         },
         execute: async (args: any, context: ToolContext) => {
           try {
-            // Conditionally inject technical parameters if server is internal
             const toolArgs = { ...args };
-            if (isInternal) {
-              Object.assign(toolArgs, {
-                userId: context.userId,
-                sessionId: context.sessionId,
-                llmModel: context.llmModel
-              });
-            }
+            // External tools don't get injected context params
 
             const result = await client.callTool({
               name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
@@ -427,6 +428,62 @@ export class McpClientService {
       };
 
       this.mcpTools.push(agentTool);
+    }
+  }
+
+  /**
+   * Connect to internal server using direct registry access instead of HTTP transport.
+   * This avoids session management issues in multi-instance production environments.
+   */
+  private async connectToInternalServer(name: string): Promise<void> {
+    console.log(`MCP: Connecting to internal server ${name} using direct registry access...`);
+    
+    try {
+      // Import registry and tools dynamically to avoid circular dependencies
+      const { mcpToolRegistry } = await import('../server/registry');
+      await import('../server/tools'); // Ensure tools are registered
+      
+      const toolDefinitions = mcpToolRegistry.getToolDefinitions();
+      console.log(`MCP: Found ${toolDefinitions.length} tools in internal registry`);
+      
+      for (const toolDef of toolDefinitions) {
+        const agentTool: AgentTool = {
+          name: toolDef.name,
+          definition: {
+            type: "function",
+            function: {
+              name: toolDef.name,
+              description: toolDef.description,
+              parameters: toolDef.inputSchema
+            }
+          },
+          execute: async (args: any, context: ToolContext) => {
+            try {
+              // Pass args directly, context separately - the MCP tools access context?.userId etc
+              const result = await mcpToolRegistry.execute(toolDef.name, args, context);
+              
+              // Format result to match external tool response format
+              const content = result.formattedContent || 
+                (typeof result === 'string' ? result : JSON.stringify(result));
+              
+              return {
+                content,
+                raw: result
+              };
+            } catch (error) {
+              console.error(`MCP Tool Execution Error (${toolDef.name}):`, error);
+              throw error;
+            }
+          }
+        };
+        
+        this.mcpTools.push(agentTool);
+      }
+      
+      console.log(`MCP: Registered ${toolDefinitions.length} internal tools via direct registry`);
+    } catch (error) {
+      console.error(`MCP: Failed to connect to internal server ${name}:`, error);
+      throw error;
     }
   }
 

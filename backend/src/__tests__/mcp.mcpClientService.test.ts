@@ -655,54 +655,70 @@ describe('McpClientService', () => {
   });
 
   describe('tool execution with internal context injection', () => {
-    it('should inject userId, sessionId, llmModel for internal servers', async () => {
-      const mockTools = [
-        { name: 'internal_tool', description: 'Internal tool', inputSchema: { type: 'object' } }
-      ];
-
-      (settingsService.getSetting as jest.Mock).mockResolvedValue({
-        settingValue: JSON.stringify([{
-          name: 'internal-server',
-          transport: 'sse',
+    it('should inject userId, sessionId, llmModel for internal servers via direct registry', async () => {
+      // Internal servers now use direct registry access instead of HTTP transport
+      // This test verifies the connectToInternalServer path
+      
+      // Mock the registry and tools modules that are dynamically imported
+      const mockExecute = jest.fn().mockResolvedValue({
+        formattedContent: 'success result'
+      });
+      
+      jest.doMock('../mcp/server/registry', () => ({
+        mcpToolRegistry: {
+          getToolDefinitions: () => [
+            { name: 'internal_tool', description: 'Internal tool', inputSchema: { type: 'object' } }
+          ],
+          execute: mockExecute
+        }
+      }));
+      
+      jest.doMock('../mcp/server/tools', () => ({}));
+      
+      // Reset modules to pick up mocks
+      jest.resetModules();
+      const { McpClientService } = await import('../mcp/client/mcpClientService');
+      const testService = new McpClientService();
+      
+      // Set up internal server config
+      const { internalMcpServers } = await import('../mcp/client/mcp_config');
+      Object.keys(internalMcpServers).forEach(key => delete (internalMcpServers as any)[key]);
+      Object.assign(internalMcpServers, {
+        'internal-server': { 
+          transport: 'streamable-http',
           url: 'http://internal.example.com/mcp',
           isInternal: true
-        }])
+        }
       });
-
-      const mockCallTool = jest.fn().mockResolvedValue({
-        content: [{ type: 'text', text: 'success' }],
-        isError: false
-      });
-
-      const mockClient = {
-        connect: jest.fn().mockResolvedValue(undefined),
-        listTools: jest.fn().mockResolvedValue({ tools: mockTools }),
-        callTool: mockCallTool,
-        close: jest.fn()
-      };
-      (Client as jest.Mock).mockImplementation(() => mockClient);
-
-      await service.initialize();
-
-      const tools = service.getTools();
+      
+      // Mock settingsService (no external servers)
+      const { settingsService: ss } = await import('../services/settingsService');
+      (ss.getSetting as jest.Mock).mockResolvedValue(null);
+      
+      await testService.initialize();
+      
+      const tools = testService.getTools();
+      expect(tools.length).toBeGreaterThan(0);
+      
       const context = {
         userId: 'user-123',
         sessionId: 'session-456',
         llmModel: 'gpt-4',
         service: {}
       };
-
+      
       await tools[0].execute({ customArg: 'value' }, context);
-
-      expect(mockCallTool).toHaveBeenCalledWith({
-        name: 'internal_tool',
-        arguments: expect.objectContaining({
-          customArg: 'value',
+      
+      // Verify registry.execute was called with args (2nd param) and context (3rd param) separately
+      expect(mockExecute).toHaveBeenCalledWith(
+        'internal_tool',
+        { customArg: 'value' },  // args as second parameter
+        expect.objectContaining({  // context as third parameter
           userId: 'user-123',
           sessionId: 'session-456',
           llmModel: 'gpt-4'
         })
-      }, undefined, { timeout: 3600000 });
+      );
     });
 
     it('should NOT inject context for external servers', async () => {
