@@ -24,6 +24,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- CRM search now runs on backend APIs instead of page-local client filtering',
       '- Search supports standard lead fields and custom fields server-side',
       '- Search input stays visible during loading; only lead rows show loading state',
+      'Enhanced CRM API Integration with Auto Draft and Deep Links',
+      '- API Integration now supports per-list Auto Draft settings with optional additional instruction',
+      '- Auto Draft controls are shown only when Public Access is enabled for the lead list',
+      '- Forwarded leads can auto-generate message drafts using the configured additional instruction',
+      '- Auto draft generation now runs asynchronously and no longer blocks the lead forwarding API response',
+      '- CRM now supports unique deep-link URLs for lead lists, lead engagement popup, and lead edit dialog',
     ],
   },
   {

@@ -340,6 +340,37 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       );
     });
 
+    it('should return response without waiting for auto draft completion', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_async',
+        listId: 'list_123',
+        email: 'async@example.com',
+      });
+
+      (agentModeService.updateEmailDraftForLead as jest.Mock).mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve({ success: true }), 1000))
+      );
+
+      const responsePromise = request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'async@example.com',
+        });
+
+      const raceResult = await Promise.race([
+        responsePromise.then(() => 'response'),
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 150)),
+      ]);
+
+      expect(raceResult).toBe('response');
+      const response = await responsePromise;
+      expect(response.status).toBe(201);
+      expect(response.body.success).toBe(true);
+      expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalled();
+    });
+
     it('should include CORS headers in response', async () => {
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
       (crmDb.createLead as jest.Mock).mockResolvedValue({
