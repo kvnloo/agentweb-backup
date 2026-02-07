@@ -28,7 +28,12 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
     if (eventData.autoDraftStatus) {
-      details.push({ label: 'Auto Draft', value: eventData.autoDraftStatus === 'created' ? 'Created' : 'Failed' });
+      const autoDraftLabel = eventData.autoDraftStatus === 'created'
+        ? 'Created'
+        : eventData.autoDraftStatus === 'failed'
+          ? 'Failed'
+          : 'Queued';
+      details.push({ label: 'Auto Draft', value: autoDraftLabel });
     }
     if (eventData.autoDraftError) {
       details.push({ label: 'Auto Draft Error', value: String(eventData.autoDraftError) });
