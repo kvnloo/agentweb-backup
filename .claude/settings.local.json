@@ -60,7 +60,11 @@
       "Bash(npx ts-node:*)",
       "Bash(open http://localhost:5173/admin?tab=benchmarks)",
       "WebFetch(domain:www.linkedin.com)",
-      "WebFetch(domain:docs.microsoft.com)"
+      "WebFetch(domain:docs.microsoft.com)",
+      "Bash(aws elasticbeanstalk describe-environments:*)",
+      "Bash(aws elasticbeanstalk request-environment-info:*)",
+      "Bash(aws elasticbeanstalk retrieve-environment-info:*)",
+      "Bash(aws dynamodb get-item:*)"
     ]
   }
 }

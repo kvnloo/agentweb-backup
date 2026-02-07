@@ -22,10 +22,11 @@ async function ensureInitialized() {
   }
 
   // Start initialization
+  console.log('[Worker-DEBUG] Starting AgentModeService initialization...');
   initializationPromise = agentModeService.initialize();
   await initializationPromise;
   initialized = true;
-  console.log('[Worker] AgentModeService initialized (MCP servers loaded)');
+  console.log('[Worker-DEBUG] AgentModeService initialized (MCP servers loaded)');
 }
 
 // Initialize immediately when worker starts, then send ready signal

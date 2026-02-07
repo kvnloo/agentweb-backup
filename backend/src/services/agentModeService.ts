@@ -87,18 +87,20 @@ export class AgentModeService {
   }
 
   public async initializeMcp() {
-    if ((AgentModeService as any).mcpInitialized) return;
+    if ((AgentModeService as any).mcpInitialized) {
+      console.log('[MCP-DEBUG] MCP already initialized, skipping');
+      return;
+    }
     (AgentModeService as any).mcpInitialized = true;
 
     try {
+      console.log('[MCP-DEBUG] Initializing MCP client service...');
       await this.mcpClientService.initialize();
       const mcpTools = this.mcpClientService.getTools();
       for (const tool of mcpTools) {
         this.toolRegistry.register(tool);
       }
-      if (mcpTools.length > 0) {
-        // console.log(`AgentMode: Registered ${mcpTools.length} tools from MCP servers`); // Removed temporary log
-      }
+      console.log(`[MCP-DEBUG] Registered ${mcpTools.length} tools from MCP servers`);
     } catch (error) {
       console.error('AgentMode: Error initializing MCP:', error);
       (AgentModeService as any).mcpInitialized = false;

@@ -7,6 +7,20 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-07',
+    changes: [
+      'Fixed MCP Session Race Condition in Agent Mode',
+      '- Resolved "Bad Request: No valid session ID provided" errors in scheduled chats and worker processes',
+      '- Added session validation after MCP connection to ensure session handshake completes before tool calls',
+      '- Worker processes now wait 100ms and verify session ID is established before proceeding',
+      '- Prevents intermittent tool call failures caused by timing-dependent race conditions',
+      'Fixed Agent Mode Message Display Error',
+      '- Fixed "cleanContent.replace is not a function" error when loading certain chat sessions',
+      '- Added type checking to ensure message content is always treated as a string',
+      '- Malformed message data from database now handled gracefully with proper error logging',
+    ],
+  },
+  {
     date: '2026-02-06',
     changes: [
       'Significantly Improved Agent Mode Response Speed',

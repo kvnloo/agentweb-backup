@@ -129,6 +129,9 @@ export function setupMcpServer(app: express.Express) {
   app.post("/mcp/server", express.json(), validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
+    // Log all incoming requests
+    console.log(`[MCP-SERVER-DEBUG] POST request - sessionId header: ${sessionId || 'MISSING'}, method: ${req.body?.method || 'unknown'}, has session: ${sessionId ? sessions.has(sessionId) : 'N/A'}`);
+
     try {
       let transport: StreamableHTTPServerTransport;
 
@@ -136,6 +139,7 @@ export function setupMcpServer(app: express.Express) {
         // Reuse existing transport for established session
         transport = sessions.get(sessionId)!.transport;
         touchSession(sessionId);
+        console.log(`[MCP-SERVER-DEBUG] Using existing session: ${sessionId}`);
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // New initialization request - create new transport
         console.log("[MCP] New Streamable HTTP connection - initializing session");
@@ -143,6 +147,7 @@ export function setupMcpServer(app: express.Express) {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
+            console.log(`[MCP-SERVER-DEBUG] New MCP session created: ${newSessionId}`);
             sessions.set(newSessionId, {
               transport,
               lastActivity: Date.now()

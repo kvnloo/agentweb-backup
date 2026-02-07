@@ -3,14 +3,18 @@ import { error } from 'console';
 import { McpClientService } from '../mcpClientService';
 import { settingsService } from '../../../services/settingsService';
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import fs from 'fs';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 // Mock dependencies
 jest.mock('../../../services/settingsService');
-jest.mock('fs');
 jest.mock('@modelcontextprotocol/sdk/client/index.js');
 jest.mock('@modelcontextprotocol/sdk/client/sse.js');
 jest.mock('@modelcontextprotocol/sdk/client/stdio.js');
+jest.mock('../mcp_config', () => ({
+  internalMcpServers: {}
+}));
+
+import { internalMcpServers } from '../mcp_config';
 
 describe('McpClientService Tool Namespacing', () => {
   let mcpClientService: McpClientService;
@@ -32,7 +36,7 @@ describe('McpClientService Tool Namespacing', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    
+
     // Mock MCP Client
     (Client as jest.Mock).mockImplementation(() => ({
       connect: mockConnect,
@@ -41,23 +45,30 @@ describe('McpClientService Tool Namespacing', () => {
       close: jest.fn()
     }));
 
+    // Mock StdioClientTransport
+    (StdioClientTransport as jest.Mock).mockImplementation(() => ({
+      onclose: null,
+      onerror: null
+    }));
+
+    // Reset internalMcpServers
+    Object.keys(internalMcpServers).forEach(key => delete internalMcpServers[key]);
+
     mcpClientService = new McpClientService();
   });
 
   it('should load file config tools without prefix and DB config tools with prefix', async () => {
-    // Mock file config (Internal)
-    (fs.existsSync as jest.Mock).mockReturnValue(true);
-    (fs.readFileSync as jest.Mock).mockReturnValue(JSON.stringify({
-      mcpServers: {
-        'internal-server': {
-          transport: 'stdio',
-          command: 'node',
-          args: ['server.js']
-        }
+    // Set up internal servers (no prefix)
+    Object.assign(internalMcpServers, {
+      'internal-server': {
+        transport: 'stdio',
+        command: 'node',
+        args: ['server.js'],
+        isInternal: true
       }
-    }));
+    });
 
-    // Mock DB config (External)
+    // Mock DB config (External - with prefix)
     (settingsService.getSetting as jest.Mock).mockResolvedValue({
       settingValue: JSON.stringify([
         {

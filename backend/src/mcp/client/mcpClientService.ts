@@ -363,6 +363,18 @@ export class McpClientService {
     };
 
     await Promise.race([connectPromise, timeoutPromise]);
+
+    // CRITICAL FIX: For StreamableHTTP, ensure session is established before proceeding
+    if (transportType === 'streamable-http') {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const sessionId = (transport as any).sessionId;
+      if (!sessionId) {
+        console.error(`[MCP-ERROR] Failed to establish session for ${name}`);
+        throw new Error(`MCP session not established for ${name}`);
+      }
+      console.log(`[MCP-DEBUG] Connected to ${name} with session ID: ${sessionId}`);
+    }
+
     this.clients.set(name, client);
 
     // Discover tools
@@ -395,6 +407,11 @@ export class McpClientService {
                 llmModel: context.llmModel
               });
             }
+
+            // Log MCP tool call with session info
+            const clientTransport = (client as any)._transport;
+            const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
+            console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${name}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}`);
 
             const result = await client.callTool({
               name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
