@@ -850,6 +850,37 @@ router.put("/funnel-config", async (req, res) => {
   }
 });
 
+// Get service account email for setup instructions
+router.get("/service-account-email", async (req, res) => {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+
+    const serviceAccountJson = await getSecret(secretName);
+    const serviceAccount = JSON.parse(serviceAccountJson);
+
+    if (!serviceAccount.client_email) {
+      return res.status(500).json({
+        success: false,
+        message: "Service account email not found in configuration"
+      });
+    }
+
+    res.json({
+      success: true,
+      serviceAccountEmail: serviceAccount.client_email
+    });
+  } catch (error: any) {
+    console.error("Error fetching service account email:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch service account email",
+      error: error.message
+    });
+  }
+});
+
 // Debug endpoint to test Google Search Console API directly
 router.get("/debug", async (req, res) => {
   try {

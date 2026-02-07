@@ -18,6 +18,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed "cleanContent.replace is not a function" error when loading certain chat sessions',
       '- Added type checking to ensure message content is always treated as a string',
       '- Malformed message data from database now handled gracefully with proper error logging',
+      'Added SEO/GEO Setup Instructions in Customer Portal',
+      '- Displays service account email fetched from AWS Secrets Manager with copy-to-clipboard button',
     ],
   },
   {
