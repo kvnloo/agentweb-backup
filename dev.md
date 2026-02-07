@@ -1,3 +1,55 @@
+# February 07, 2026: MCP Session ID Issue in Worker Process
+
+## Problem
+Production scheduled chats and agent mode tool calls were failing with error:
+```
+StreamableHTTPError: Streamable HTTP error: Error POSTing to endpoint:
+{"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}
+```
+
+## Investigation Timeline
+
+### Symptoms
+- Production backend (v25.6.0) on AWS Elastic Beanstalk experiencing multiple failures
+- Errors occurred at 16:23:30 UTC and 16:25:28 UTC on Feb 7, 2026
+- Affected tools: `read_brand_guidelines`, `read_market_strategy`, `search_knowledge_base`, `create_work_plan`
+- All errors originated from `[Worker]` process, not main backend
+
+### Root Cause
+The **Worker process** (generateMarketingResponseWorker.ts) creates its own AgentModeService instance with an independent MCP client. The StreamableHTTPClientTransport was not properly establishing the MCP session before tool calls were made:
+
+1. Worker initializes and creates MCP client
+2. Client calls `connect(transport)`
+3. Connection completes but session handshake may not be fully established
+4. Tool calls are made immediately without valid `mcp-session-id` header
+5. MCP server rejects requests with error code -32000
+
+### The Fix
+Added session validation in `backend/src/mcp/client/mcpClientService.ts`:
+- Wait 100ms after connection for session initialization to complete
+- Validate that `transport.sessionId` is set before proceeding
+- Throw error if session ID is not established
+- Added comprehensive logging for debugging
+
+### Architecture Notes
+- Main backend has its own MCP client with independent session
+- Worker process has a separate MCP client with its own session
+- Both connect to the internal MCP server at `http://localhost:PORT/mcp/server`
+- Sessions timeout after 1 hour of inactivity (configurable via `MCP_SESSION_TIMEOUT_MS`)
+- Session cleanup runs every hour (configurable via `MCP_CLEANUP_INTERVAL_MS`)
+
+### Production Deployment Requirements
+After this fix, deploy to production with version bump to include:
+- Session validation logic
+- Enhanced debug logging (`[MCP-DEBUG]`, `[MCP-SERVER-DEBUG]`, `[Worker-DEBUG]`)
+- Session ID tracking throughout the tool call lifecycle
+
+### Testing
+Local testing showed the fix working correctly:
+- Worker MCP session established successfully
+- Tool calls (`read_brand_guidelines`, `create_work_plan`) executed without errors
+- Session ID properly included in all HTTP requests
+
 # Continue with Google not working in dev
 It could be due to auth related code was changed and the change would require restart `npm run dev` in order for the Google Login to work again.
 
