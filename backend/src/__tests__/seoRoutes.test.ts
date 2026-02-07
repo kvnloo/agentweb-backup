@@ -71,6 +71,47 @@ describe('SEO Routes', () => {
     }));
   });
 
+  describe('GET /api/seo/service-account-email', () => {
+    it('should return service account email successfully', async () => {
+      (getSecret as jest.Mock).mockResolvedValue(JSON.stringify({
+        private_key: 'mock-private-key',
+        client_email: 'test-service@example.iam.gserviceaccount.com'
+      }));
+
+      const response = await request(app)
+        .get('/api/seo/service-account-email')
+        .expect(200);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.serviceAccountEmail).toBe('test-service@example.iam.gserviceaccount.com');
+    });
+
+    it('should return 500 if service account email not found', async () => {
+      (getSecret as jest.Mock).mockResolvedValue(JSON.stringify({
+        private_key: 'mock-private-key',
+        // Missing client_email
+      }));
+
+      const response = await request(app)
+        .get('/api/seo/service-account-email')
+        .expect(500);
+
+      expect(response.body.success).toBe(false);
+      expect(response.body.message).toBe('Service account email not found in configuration');
+    });
+
+    it('should return 500 if secret fetch fails', async () => {
+      (getSecret as jest.Mock).mockRejectedValue(new Error('Secret not found'));
+
+      const response = await request(app)
+        .get('/api/seo/service-account-email')
+        .expect(500);
+
+      expect(response.body.success).toBe(false);
+      expect(response.body.message).toBe('Failed to fetch service account email');
+    });
+  });
+
   describe('GET /api/seo/metrics', () => {
     it('should return 404 if user not found', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(null);
