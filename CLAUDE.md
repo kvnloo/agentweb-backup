@@ -38,6 +38,9 @@ npm run dev
 # Build TypeScript
 npm run build
 
+# Verify TypeScript compilation (REQUIRED before committing)
+npx tsc
+
 # Run tests (not in CI - run locally before PRs)
 npm test
 
@@ -52,6 +55,8 @@ npm run create-admin
 ```
 
 Backend runs on port 3001 by default.
+
+**IMPORTANT:** Always run `npx tsc` to verify TypeScript compilation before committing changes. This catches type errors early and prevents CI failures.
 
 ### Partner Portal
 
@@ -564,6 +569,33 @@ socket.on('agent-response-chunk', (data) => {
   setResponse(prev => prev + data.chunk);
 });
 ```
+
+## Pre-Commit Checks
+
+**REQUIRED:** Before committing any changes, always run these checks:
+
+### Backend
+
+```bash
+cd backend
+
+# 1. Verify TypeScript compilation (catches type errors)
+npx tsc
+
+# 2. Run tests
+npm test
+```
+
+### Customer Portal
+
+```bash
+cd customer-portal
+
+# Run tests
+npm test
+```
+
+These checks prevent CI failures and ensure code quality. The `npx tsc` command is especially important as it catches TypeScript type errors that may not be caught during development with hot reload.
 
 ## Testing Strategy
 

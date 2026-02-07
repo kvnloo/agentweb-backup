@@ -901,7 +901,7 @@ describe('McpClientService', () => {
         }
       });
 
-      const mockTransport = {
+      const mockTransport: any = {
         onclose: null,
         onerror: null,
         sessionId: undefined // Initially undefined
