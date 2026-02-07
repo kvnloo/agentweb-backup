@@ -2742,7 +2742,9 @@ export const crmDb = {
     name: string,
     description?: string,
     alertEvents?: string[],
-    listSenderId?: string | null
+    listSenderId?: string | null,
+    autoDraftEnabled?: boolean,
+    autoDraftInstruction?: string
   ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2766,6 +2768,8 @@ export const crmDb = {
           alertEvents: normalizedAlertEvents,
           listSenderId: listSenderId ?? null,
           publicAccessEnabled: false, // Default: public access disabled
+          autoDraftEnabled: autoDraftEnabled === true, // Default: auto draft disabled
+          autoDraftInstruction: typeof autoDraftInstruction === 'string' ? autoDraftInstruction.trim() : '',
         },
       };
 
@@ -2853,6 +2857,8 @@ export const crmDb = {
       alertEvents?: string[];
       listSenderId?: string | null;
       publicAccessEnabled?: boolean;
+      autoDraftEnabled?: boolean;
+      autoDraftInstruction?: string;
       icpsOnly?: boolean;
     }
   ) {
@@ -2901,6 +2907,18 @@ export const crmDb = {
         expressionAttributeNames['#publicAccessEnabled'] = 'publicAccessEnabled';
         updateExpressions.push('#publicAccessEnabled = :publicAccessEnabled');
         expressionAttributeValues[':publicAccessEnabled'] = updates.publicAccessEnabled;
+      }
+
+      if (updates.autoDraftEnabled !== undefined) {
+        expressionAttributeNames['#autoDraftEnabled'] = 'autoDraftEnabled';
+        updateExpressions.push('#autoDraftEnabled = :autoDraftEnabled');
+        expressionAttributeValues[':autoDraftEnabled'] = updates.autoDraftEnabled;
+      }
+
+      if (updates.autoDraftInstruction !== undefined) {
+        expressionAttributeNames['#autoDraftInstruction'] = 'autoDraftInstruction';
+        updateExpressions.push('#autoDraftInstruction = :autoDraftInstruction');
+        expressionAttributeValues[':autoDraftInstruction'] = updates.autoDraftInstruction;
       }
 
       if (updates.icpsOnly !== undefined) {

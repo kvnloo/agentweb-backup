@@ -3,6 +3,7 @@ import express from 'express';
 import webhookRouter from '../routes/webhooks';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { agentModeService } from '../services/agentModeService';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -15,6 +16,12 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/leadListAlertService', () => ({
   leadListAlertService: {
     notifyLeadListOwnerIfConfigured: jest.fn(),
+  },
+}));
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    updateEmailDraftForLead: jest.fn(),
   },
 }));
 
@@ -41,6 +48,10 @@ app.use('/api/webhooks', webhookRouter);
 describe('Lead Forwarding API (List ID Authentication)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    (agentModeService.updateEmailDraftForLead as jest.Mock).mockResolvedValue({
+      success: true,
+      message: 'Email and message drafts created successfully',
+    });
   });
 
   describe('POST /api/webhooks/forward-lead', () => {
@@ -49,6 +60,7 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       userId: 'user_123',
       name: 'Test List',
       publicAccessEnabled: true,
+      autoDraftEnabled: true,
     };
 
     it('should reject requests without listId', async () => {
@@ -176,6 +188,15 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
           }),
         })
       );
+
+      expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalledWith(
+        'list_123',
+        'lead_123',
+        expect.stringContaining('Create an initial outreach message for this new lead'),
+        expect.stringMatching(/^auto_draft_/),
+        'user_123',
+        'text'
+      );
     });
 
     it('should successfully forward a lead with full data', async () => {
@@ -262,6 +283,61 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       expect(response.body.success).toBe(true);
       expect(response.body.duplicate).toBe(true);
       expect(response.body.message).toContain('already exists');
+    });
+
+    it('should not create auto draft when autoDraftEnabled is off', async () => {
+      const leadListWithoutAutoDraft = {
+        ...mockLeadList,
+        autoDraftEnabled: false,
+      };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(leadListWithoutAutoDraft);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_999',
+        listId: 'list_123',
+        email: 'no-draft@example.com',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'no-draft@example.com',
+        });
+
+      expect(response.status).toBe(201);
+      expect(agentModeService.updateEmailDraftForLead).not.toHaveBeenCalled();
+    });
+
+    it('should include configured auto draft instruction when creating draft', async () => {
+      const leadListWithInstruction = {
+        ...mockLeadList,
+        autoDraftEnabled: true,
+        autoDraftInstruction: 'Mention the ROI benchmark from the attached case study.',
+      };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(leadListWithInstruction);
+      (crmDb.createLead as jest.Mock).mockResolvedValue({
+        leadId: 'lead_555',
+        listId: 'list_123',
+        email: 'with-instruction@example.com',
+      });
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'with-instruction@example.com',
+          source: 'landing_page',
+        });
+
+      expect(response.status).toBe(201);
+      expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalledWith(
+        'list_123',
+        'lead_555',
+        expect.stringContaining('Mention the ROI benchmark from the attached case study.'),
+        expect.stringMatching(/^auto_draft_/),
+        'user_123',
+        'text'
+      );
     });
 
     it('should include CORS headers in response', async () => {
