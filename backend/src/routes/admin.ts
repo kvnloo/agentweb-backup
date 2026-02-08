@@ -209,7 +209,7 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
 router.put("/users/:userId/seo-aeo", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { seoDomains, googleAnalyticsPropertyId, clarityProjectId, productDomain } = req.body;
+    const { seoDomains, googleAnalyticsPropertyId, gaFilteredDomains, clarityProjectId, productDomain } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -227,8 +227,37 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
       const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
       for (const domain of seoDomains) {
         if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
-          return res.status(400).json({ 
-            message: `Invalid domain format: ${domain}. Please use format like example.com` 
+          return res.status(400).json({
+            message: `Invalid domain format: ${domain}. Please use format like example.com`
+          });
+        }
+      }
+    }
+
+    // Validate gaFilteredDomains is an array if provided
+    if (gaFilteredDomains !== undefined) {
+      if (!Array.isArray(gaFilteredDomains)) {
+        return res.status(400).json({ message: "gaFilteredDomains must be an array" });
+      }
+
+      // Validate each domain format (allow localhost and standard domains)
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      for (const domain of gaFilteredDomains) {
+        if (typeof domain !== 'string') {
+          return res.status(400).json({
+            message: `Invalid filtered domain format: ${domain}. Must be a string`
+          });
+        }
+
+        const trimmedDomain = domain.trim();
+
+        // Allow localhost and IP addresses (common for filtering local/dev traffic)
+        const isLocalhost = trimmedDomain === 'localhost' || trimmedDomain.startsWith('localhost:');
+        const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(trimmedDomain);
+
+        if (!isLocalhost && !isIpAddress && !domainRegex.test(trimmedDomain)) {
+          return res.status(400).json({
+            message: `Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`
           });
         }
       }
@@ -275,6 +304,9 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
     }
     if (googleAnalyticsPropertyId !== undefined) {
       updateData.googleAnalyticsPropertyId = googleAnalyticsPropertyId?.trim() || null;
+    }
+    if (gaFilteredDomains !== undefined) {
+      updateData.gaFilteredDomains = gaFilteredDomains;
     }
     if (clarityProjectId !== undefined) {
       updateData.clarityProjectId = clarityProjectId?.trim() || null;

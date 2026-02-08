@@ -176,6 +176,7 @@ interface User {
   slackChannel?: string; // Default Slack channel for this user
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
+  gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
   clarityProjectId?: string; // Microsoft Clarity Project ID
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
@@ -645,6 +646,7 @@ export default function AdminDashboard() {
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
+  const [gaFilteredDomainsText, setGaFilteredDomainsText] = useState("");
   const [clarityProjectId, setClarityProjectId] = useState("");
   const [productDomain, setProductDomain] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
@@ -1728,7 +1730,10 @@ export default function AdminDashboard() {
 
   const handleSaveSeoDomains = async () => {
     if (!editingSeoDomainsUserId) return;
-    
+
+    // Clear any previous errors
+    setError("");
+
     try {
       setSeoDomainsEditLoading(true);
       
@@ -1777,11 +1782,37 @@ export default function AdminDashboard() {
         }
       }
 
+      // Parse filtered domains from text (one per line or comma-separated)
+      const filteredDomainsText = gaFilteredDomainsText.trim();
+      let filteredDomains: string[] = [];
+
+      if (filteredDomainsText) {
+        // Split by newlines or commas, then filter and validate
+        filteredDomains = filteredDomainsText
+          .split(/[\n,]+/)
+          .map(d => d.trim())
+          .filter(d => d.length > 0);
+
+        // Validate each domain format (allow localhost and standard domains)
+        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+        for (const domain of filteredDomains) {
+          // Allow localhost and IP addresses (common for filtering local/dev traffic)
+          const isLocalhost = domain === 'localhost' || domain.startsWith('localhost:');
+          const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(domain);
+
+          if (!isLocalhost && !isIpAddress && !domainRegex.test(domain)) {
+            setError(`Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`);
+            return;
+          }
+        }
+      }
+
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
         {
           seoDomains: domains,
           googleAnalyticsPropertyId: gaId || null,
+          gaFilteredDomains: filteredDomains,
           clarityProjectId: clarityId || null,
           productDomain: prodDomain || null
         },
@@ -1799,6 +1830,7 @@ export default function AdminDashboard() {
                   ...user,
                   seoDomains: response.data.seoDomains || [],
                   googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined,
+                  gaFilteredDomains: response.data.gaFilteredDomains || [],
                   clarityProjectId: response.data.clarityProjectId || undefined,
                   productDomain: response.data.productDomain || undefined
                 }
@@ -1810,6 +1842,7 @@ export default function AdminDashboard() {
         setEditingSeoDomainsUserId(null);
         setSeoDomainsText("");
         setGoogleAnalyticsPropertyId("");
+        setGaFilteredDomainsText("");
         setClarityProjectId("");
         setProductDomain("");
       }
@@ -2931,6 +2964,7 @@ export default function AdminDashboard() {
                                 setEditingSeoDomainsUserId(user.userId);
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
                                 setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
+                                setGaFilteredDomainsText(user.gaFilteredDomains?.join("\n") || "");
                                 setClarityProjectId(user.clarityProjectId || "");
                                 setProductDomain(user.productDomain || "");
                                 setSeoDomainsDialogOpen(true);
@@ -5040,7 +5074,9 @@ export default function AdminDashboard() {
           setEditingSeoDomainsUserId(null);
           setSeoDomainsText("");
           setGoogleAnalyticsPropertyId("");
+          setGaFilteredDomainsText("");
           setClarityProjectId("");
+          setProductDomain("");
         }}
         maxWidth="sm"
         fullWidth
@@ -5054,7 +5090,9 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setGaFilteredDomainsText("");
               setClarityProjectId("");
+              setProductDomain("");
             }}
             sx={{
               position: 'absolute',
@@ -5095,6 +5133,19 @@ export default function AdminDashboard() {
             <Grid item xs={12}>
               <TextField
                 fullWidth
+                multiline
+                rows={3}
+                label="Filtered Domains (GA)"
+                value={gaFilteredDomainsText}
+                onChange={(e) => setGaFilteredDomainsText(e.target.value)}
+                placeholder="app.example.com&#10;admin.example.com"
+                helperText="Enter domains to exclude from Google Analytics (one per line). This helps filter out internal traffic from subdomains when viewing landing site analytics. Example: Exclude app.agentweb.pro when analyzing agentweb.pro."
+                disabled={seoDomainsEditLoading}
+              />
+            </Grid>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
                 label="Microsoft Clarity Project ID"
                 value={clarityProjectId}
                 onChange={(e) => setClarityProjectId(e.target.value)}
@@ -5123,6 +5174,7 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setGaFilteredDomainsText("");
               setClarityProjectId("");
               setProductDomain("");
             }}

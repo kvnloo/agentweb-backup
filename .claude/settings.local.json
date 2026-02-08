@@ -65,7 +65,8 @@
       "Bash(aws elasticbeanstalk request-environment-info:*)",
       "Bash(aws elasticbeanstalk retrieve-environment-info:*)",
       "Bash(aws dynamodb get-item:*)",
-      "Bash(ps:*)"
+      "Bash(ps:*)",
+      "mcp__playwright__browser_tabs"
     ]
   }
 }
