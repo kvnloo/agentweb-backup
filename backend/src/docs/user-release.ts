@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-08',
+    changes: [
+      'Fixed MCP Session Concurrency Issue for Scheduled Chats',
+      '- Resolved "No valid session ID provided" errors when multiple scheduled chats run concurrently',
+      '- Implemented session-based MCP client pooling - each chat session now gets its own isolated MCP client',
+      '- Added automatic cleanup of stale session pools after 1 hour of inactivity',
+      '- Scheduled chats and agent mode now work reliably under concurrent load',
+    ],
+  },
+  {
     date: '2026-02-07',
     changes: [
       'Fixed MCP Session Race Condition in Agent Mode',

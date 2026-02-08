@@ -78,11 +78,29 @@ function getTransportType(config: McpServerConfig): "sse" | "stdio" | "streamabl
   return "sse";
 }
 
+// Session-based client pool entry
+interface SessionClientPool {
+  clients: Map<string, Client>;
+  lastActivity: number;
+}
+
 export class McpClientService {
   private clients: Map<string, Client> = new Map();
   private mcpTools: AgentTool[] = [];
 
+  // Session-based client pools: Map<chatSessionId, Map<serverName, Client>>
+  private sessionClientPools: Map<string, SessionClientPool> = new Map();
+
+  // Store server configurations for creating session-specific clients
+  private serverConfigs: Map<string, { config: McpServerConfig; toolPrefix?: string }> = new Map();
+
+  // Session cleanup timeout (default: 1 hour)
+  private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
+  private cleanupInterval?: NodeJS.Timeout;
+
   constructor() {
+    // Start periodic cleanup of stale sessions
+    this.startSessionCleanup();
   }
 
 
@@ -133,10 +151,156 @@ export class McpClientService {
 
   private async safeConnectToServer(serverName: string, serverConfig: McpServerConfig, toolPrefix?: string) {
       try {
+          // Store config for creating session-specific clients later
+          this.serverConfigs.set(serverName, { config: serverConfig, toolPrefix });
+
           await this.connectToServer(serverName, serverConfig, toolPrefix);
       } catch (error) {
           console.error(`MCP: Failed to connect to server ${serverName}:`, error);
       }
+  }
+
+  /**
+   * Start periodic cleanup of stale session client pools
+   */
+  private startSessionCleanup() {
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupStaleSessions();
+    }, this.SESSION_TIMEOUT_MS);
+  }
+
+  /**
+   * Cleanup session client pools that haven't been used recently
+   */
+  private async cleanupStaleSessions() {
+    const now = Date.now();
+    const staleSessionIds: string[] = [];
+
+    for (const [sessionId, pool] of this.sessionClientPools.entries()) {
+      if (now - pool.lastActivity > this.SESSION_TIMEOUT_MS) {
+        staleSessionIds.push(sessionId);
+      }
+    }
+
+    for (const sessionId of staleSessionIds) {
+      console.log(`[MCP-CLEANUP] Removing stale session client pool: ${sessionId.substring(0, 8)}`);
+      await this.releaseSessionClients(sessionId);
+    }
+  }
+
+  /**
+   * Update last activity timestamp for a session
+   */
+  private touchSession(sessionId: string) {
+    const pool = this.sessionClientPools.get(sessionId);
+    if (pool) {
+      pool.lastActivity = Date.now();
+    }
+  }
+
+  /**
+   * Get or create a client for a specific chat session
+   * This ensures each chat session has its own isolated MCP client connection
+   */
+  private async getSessionClient(serverName: string, chatSessionId: string): Promise<Client> {
+    // Touch session to update last activity
+    this.touchSession(chatSessionId);
+
+    // Get or create session pool
+    if (!this.sessionClientPools.has(chatSessionId)) {
+      console.log(`[MCP-SESSION] Creating new client pool for session: ${chatSessionId.substring(0, 8)}`);
+      this.sessionClientPools.set(chatSessionId, {
+        clients: new Map(),
+        lastActivity: Date.now()
+      });
+    }
+
+    const sessionPool = this.sessionClientPools.get(chatSessionId)!;
+
+    // Check if client already exists for this session
+    if (sessionPool.clients.has(serverName)) {
+      return sessionPool.clients.get(serverName)!;
+    }
+
+    // Create new client for this session
+    const serverConfig = this.serverConfigs.get(serverName);
+    if (!serverConfig) {
+      throw new Error(`MCP: Server config not found for ${serverName}`);
+    }
+
+    console.log(`[MCP-SESSION] Creating new client for server "${serverName}" in session ${chatSessionId.substring(0, 8)}`);
+
+    const transport = await this.createTransport(serverName, serverConfig.config);
+    const client = new Client(
+      {
+        name: "AgentWeb-Backend",
+        version: "1.0.0"
+      },
+      {
+        capabilities: {}
+      }
+    );
+
+    // Add timeout to connection
+    const connectPromise = client.connect(transport);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), 15000)
+    );
+
+    transport.onclose = () => console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${chatSessionId.substring(0, 8)}) closed`);
+    transport.onerror = (err: any) => {
+      const errorMessage = err?.message || '';
+      if (
+        errorMessage.includes('AbortError') ||
+        errorMessage.includes('SSE stream disconnected') ||
+        errorMessage.includes('This operation was aborted')
+      ) {
+        return;
+      }
+      console.error(`[MCP-SESSION] Transport error for ${serverName} (session ${chatSessionId.substring(0, 8)}):`, err);
+    };
+
+    await Promise.race([connectPromise, timeoutPromise]);
+
+    // Wait for session establishment
+    const transportType = getTransportType(serverConfig.config);
+    if (transportType === 'streamable-http') {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const sessionId = (transport as any).sessionId;
+      if (!sessionId) {
+        console.warn(`[MCP-SESSION-WARN] Session ID not detected for ${serverName}`);
+      } else {
+        console.log(`[MCP-SESSION] Connected to ${serverName} with MCP session ID: ${sessionId} for chat session: ${chatSessionId.substring(0, 8)}`);
+      }
+    }
+
+    // Store in session pool
+    sessionPool.clients.set(serverName, client);
+
+    return client;
+  }
+
+  /**
+   * Release all clients for a specific chat session
+   * Call this when a chat session ends to free resources
+   */
+  async releaseSessionClients(chatSessionId: string): Promise<void> {
+    const sessionPool = this.sessionClientPools.get(chatSessionId);
+    if (!sessionPool) {
+      return;
+    }
+
+    console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${chatSessionId.substring(0, 8)}`);
+
+    for (const [serverName, client] of sessionPool.clients.entries()) {
+      try {
+        await client.close();
+      } catch (error) {
+        console.error(`[MCP-SESSION] Error closing client for ${serverName}:`, error);
+      }
+    }
+
+    this.sessionClientPools.delete(chatSessionId);
   }
 
   /**
@@ -410,16 +574,20 @@ export class McpClientService {
               });
             }
 
+            // CRITICAL FIX: Get session-specific client instead of using shared client
+            // This ensures each chat session has its own isolated MCP connection
+            const sessionClient = await this.getSessionClient(name, context.sessionId);
+
             // Log MCP tool call with session info
-            const clientTransport = (client as any)._transport;
+            const clientTransport = (sessionClient as any)._transport;
             const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
             console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${name}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}`);
 
-            const result = await client.callTool({
+            const result = await sessionClient.callTool({
               name: originalToolName, // Use ORIGINAL (unprefixed) name for execution
               arguments: toolArgs
             }, undefined, { timeout: 3600000 }); // 1 hour timeout (effectively unlimited for this use case)
-            
+
             // Cast content to any to access properties safely
             const contentArray = (result.content as any[]) || [];
 
@@ -439,7 +607,7 @@ export class McpClientService {
               raw: result
             };
           } catch (error) {
-            console.error(`MCP Tool Execution Error (${exposedToolName}):`, error);
+            console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
             throw error;
           }
         }
@@ -470,6 +638,18 @@ export class McpClientService {
    * Cleanup connections
    */
   async shutdown(): Promise<void> {
+    // Stop cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = undefined;
+    }
+
+    // Close all session client pools
+    for (const sessionId of this.sessionClientPools.keys()) {
+      await this.releaseSessionClients(sessionId);
+    }
+
+    // Close shared clients (from initial initialization)
     for (const [name, client] of this.clients.entries()) {
       try {
         await client.close();

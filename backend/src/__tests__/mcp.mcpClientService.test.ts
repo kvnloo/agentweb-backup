@@ -932,6 +932,175 @@ describe('McpClientService', () => {
     });
   });
 
+  describe('Session-Based Client Pooling', () => {
+    beforeEach(() => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+    });
+
+    it('should create isolated MCP client for each chat session', async () => {
+      Object.assign(internalMcpServers, {
+        'test-server': { transport: 'streamable-http', url: 'http://test.example.com/mcp' }
+      });
+
+      let clientCount = 0;
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => {
+        clientCount++;
+        return {
+          onclose: null,
+          onerror: null,
+          sessionId: `mcp-session-${clientCount}`
+        };
+      });
+
+      (Client as jest.Mock).mockImplementation(() => {
+        const currentCount = clientCount;
+        return {
+          connect: jest.fn().mockResolvedValue(undefined),
+          listTools: jest.fn().mockResolvedValue({ tools: [] }),
+          close: jest.fn(),
+          _transport: { sessionId: `mcp-session-${currentCount}` }
+        };
+      });
+
+      await service.initialize();
+
+      // Get clients for two different sessions
+      const client1 = await (service as any).getSessionClient('test-server', 'session-1');
+      const client2 = await (service as any).getSessionClient('test-server', 'session-2');
+
+      expect(client1._transport.sessionId).toBe('mcp-session-2');
+      expect(client2._transport.sessionId).toBe('mcp-session-3');
+      expect(client1).not.toBe(client2);
+    });
+
+    it('should reuse client for same chat session', async () => {
+      Object.assign(internalMcpServers, {
+        'test-server': { transport: 'streamable-http', url: 'http://test.example.com/mcp' }
+      });
+
+      const mockTransport = { onclose: null, onerror: null, sessionId: 'mcp-session-1' };
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => mockTransport);
+
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: jest.fn(),
+        _transport: mockTransport
+      };
+
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+
+      // Get client twice for same session
+      const client1 = await (service as any).getSessionClient('test-server', 'session-1');
+      const client2 = await (service as any).getSessionClient('test-server', 'session-1');
+
+      expect(client1).toBe(client2);
+      expect(Client).toHaveBeenCalledTimes(2); // Once for init, once for session
+    });
+
+    it('should release all clients for a session', async () => {
+      Object.assign(internalMcpServers, {
+        'test-server': { transport: 'streamable-http', url: 'http://test.example.com/mcp' }
+      });
+
+      const mockTransport = { onclose: null, onerror: null, sessionId: 'mcp-session-1' };
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => mockTransport);
+
+      const mockClose = jest.fn().mockResolvedValue(undefined);
+      const mockClient = {
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
+        close: mockClose,
+        _transport: mockTransport
+      };
+
+      (Client as jest.Mock).mockImplementation(() => mockClient);
+
+      await service.initialize();
+
+      await (service as any).getSessionClient('test-server', 'session-1');
+      await service.releaseSessionClients('session-1');
+
+      expect(mockClose).toHaveBeenCalled();
+    });
+
+    it('should handle releasing non-existent session gracefully', async () => {
+      await service.initialize();
+
+      // Should not throw
+      await service.releaseSessionClients('non-existent-session');
+    });
+
+    it('should use session-specific client in tool execution', async () => {
+      const mockTools = [
+        { name: 'test_tool', description: 'Test tool', inputSchema: { type: 'object' } }
+      ];
+
+      Object.assign(internalMcpServers, {
+        'test-server': {
+          transport: 'streamable-http',
+          url: 'http://test.example.com/mcp',
+          isInternal: true
+        }
+      });
+
+      const mockCallTool = jest.fn().mockResolvedValue({
+        content: [{ type: 'text', text: 'result' }],
+        isError: false
+      });
+
+      let clientCount = 0;
+      (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => {
+        clientCount++;
+        return {
+          onclose: null,
+          onerror: null,
+          sessionId: `mcp-session-${clientCount}`
+        };
+      });
+
+      (Client as jest.Mock).mockImplementation(() => ({
+        connect: jest.fn().mockResolvedValue(undefined),
+        listTools: jest.fn().mockResolvedValue({ tools: mockTools }),
+        callTool: mockCallTool,
+        close: jest.fn(),
+        _transport: { sessionId: `mcp-session-${clientCount}` }
+      }));
+
+      await service.initialize();
+
+      const tools = service.getTools();
+
+      // Execute tool with different sessions
+      const context1 = { userId: 'u1', sessionId: 'chat-session-1', llmModel: 'm', service: {} };
+      const context2 = { userId: 'u2', sessionId: 'chat-session-2', llmModel: 'm', service: {} };
+
+      await tools[0].execute({ arg: 'val1' }, context1);
+      await tools[0].execute({ arg: 'val2' }, context2);
+
+      // Should have called tool twice (once per session)
+      expect(mockCallTool).toHaveBeenCalledTimes(2);
+      expect(mockCallTool).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'test_tool' }),
+        undefined,
+        { timeout: 3600000 }
+      );
+    });
+
+    it('should have cleanup interval configured', async () => {
+      // Just verify the service sets up cleanup - detailed timer testing is complex
+      await service.initialize();
+
+      // Verify cleanup interval exists in service (implementation detail)
+      const cleanupInterval = (service as any).cleanupInterval;
+      expect(cleanupInterval).toBeDefined();
+
+      await service.shutdown();
+    });
+  });
+
   describe('Streamable Http Custom Fetch (Axios Adapter)', () => {
     beforeEach(() => {
       mockAxios.mockReset();
