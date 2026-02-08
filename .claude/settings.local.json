@@ -64,7 +64,8 @@
       "Bash(aws elasticbeanstalk describe-environments:*)",
       "Bash(aws elasticbeanstalk request-environment-info:*)",
       "Bash(aws elasticbeanstalk retrieve-environment-info:*)",
-      "Bash(aws dynamodb get-item:*)"
+      "Bash(aws dynamodb get-item:*)",
+      "Bash(ps:*)",
     ]
   }
 }

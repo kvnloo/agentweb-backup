@@ -825,7 +825,7 @@ describe('McpClientService', () => {
       expect(mockClient.connect).toHaveBeenCalled();
     });
 
-    it('should throw error when session ID is not established for streamable-http', async () => {
+    it('should log warning but continue when session ID is not established for streamable-http', async () => {
       Object.assign(internalMcpServers, {
         'streamable-no-session': {
           transport: 'streamable-http',
@@ -843,24 +843,27 @@ describe('McpClientService', () => {
 
       const mockClient = {
         connect: jest.fn().mockResolvedValue(undefined),
-        listTools: jest.fn(),
+        listTools: jest.fn().mockResolvedValue({ tools: [] }),
         close: jest.fn()
       };
       (Client as jest.Mock).mockImplementation(() => mockClient);
 
-      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
 
       await service.initialize();
 
-      // Should log connection error
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to connect to server streamable-no-session'),
-        expect.objectContaining({
-          message: expect.stringContaining('MCP session not established')
-        })
+      // Should log warning but continue
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Session ID not detected for streamable-no-session')
+      );
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('will try to proceed anyway')
       );
 
-      consoleErrorSpy.mockRestore();
+      // Should still attempt to list tools despite missing session ID
+      expect(mockClient.listTools).toHaveBeenCalled();
+
+      consoleWarnSpy.mockRestore();
     });
 
     it('should not validate session for SSE transport', async () => {
@@ -893,7 +896,7 @@ describe('McpClientService', () => {
       expect(mockClient.connect).toHaveBeenCalled();
     });
 
-    it('should wait 100ms before validating session ID', async () => {
+    it('should wait 500ms before validating session ID', async () => {
       Object.assign(internalMcpServers, {
         'streamable-wait': {
           transport: 'streamable-http',
@@ -907,10 +910,10 @@ describe('McpClientService', () => {
         sessionId: undefined // Initially undefined
       };
 
-      // Simulate session ID being set after 50ms
+      // Simulate session ID being set after 300ms
       setTimeout(() => {
         mockTransport.sessionId = 'delayed-session-id';
-      }, 50);
+      }, 300);
 
       (StreamableHTTPClientTransport as jest.Mock).mockImplementation(() => mockTransport);
 
@@ -921,7 +924,7 @@ describe('McpClientService', () => {
       };
       (Client as jest.Mock).mockImplementation(() => mockClient);
 
-      // Should succeed because the 100ms wait gives time for sessionId to be set
+      // Should succeed because the 500ms wait gives time for sessionId to be set
       await service.initialize();
 
       expect(mockTransport.sessionId).toBe('delayed-session-id');

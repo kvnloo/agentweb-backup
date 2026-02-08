@@ -20,6 +20,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Malformed message data from database now handled gracefully with proper error logging',
       'Added SEO/GEO Setup Instructions in Customer Portal',
       '- Displays service account email fetched from AWS Secrets Manager with copy-to-clipboard button',
+      'Fixed External MCP Server Connection Issues',
+      '- Increased session establishment wait time from 100ms to 500ms for better reliability',
+      '- Changed strict error to warning when session ID is not immediately available',
+      'Fixed Scheduled Chat Function Call Search Crash',
+      '- Fixed browser crash when searching function calls in scheduled chat editor',
     ],
   },
   {

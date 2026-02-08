@@ -366,13 +366,15 @@ export class McpClientService {
 
     // CRITICAL FIX: For StreamableHTTP, ensure session is established before proceeding
     if (transportType === 'streamable-http') {
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Wait longer for session establishment (increased from 100ms to 500ms)
+      await new Promise(resolve => setTimeout(resolve, 500));
       const sessionId = (transport as any).sessionId;
       if (!sessionId) {
-        console.error(`[MCP-ERROR] Failed to establish session for ${name}`);
-        throw new Error(`MCP session not established for ${name}`);
+        console.warn(`[MCP-WARN] Session ID not detected for ${name}, but will try to proceed anyway`);
+        console.warn(`[MCP-WARN] If tool listing fails, the server may not be responding properly`);
+      } else {
+        console.log(`[MCP-DEBUG] Connected to ${name} with session ID: ${sessionId}`);
       }
-      console.log(`[MCP-DEBUG] Connected to ${name} with session ID: ${sessionId}`);
     }
 
     this.clients.set(name, client);
