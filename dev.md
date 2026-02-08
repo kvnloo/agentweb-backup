@@ -1,3 +1,59 @@
+# February 08, 2026: MCP Session Concurrency Fix
+
+## Problem
+Scheduled chats failing with "Bad Request: No valid session ID provided" errors. Multiple concurrent chat sessions in the same worker process were sharing a single MCP client connection, causing session ID conflicts.
+
+## Root Cause
+- Worker process creates ONE AgentModeService with ONE McpClientService
+- All concurrent chat sessions used the SAME MCP client with SAME session ID
+- When multiple chats ran simultaneously, MCP server returned "has session: false"
+- Production logs showed: `MCP session: abf29003-1882-423c-ba87-57ee2c9e7749, chat sessionId: 9816f8e4...` but `has session: false`
+
+## The Fix
+Implemented session-based client pooling in `backend/src/mcp/client/mcpClientService.ts`:
+- Added `sessionClientPools: Map<chatSessionId, ClientPool>` to isolate clients per chat session
+- Created `getSessionClient(serverName, chatSessionId)` method - each chat gets its own MCP client
+- Modified tool execution to use `getSessionClient()` instead of shared client
+- Added automatic cleanup of stale session pools (1 hour timeout, configurable via `MCP_CLIENT_SESSION_TIMEOUT_MS`)
+- Added `releaseSessionClients(chatSessionId)` for manual cleanup
+
+## Changes
+**File modified:** `backend/src/mcp/client/mcpClientService.ts` (~150 lines added)
+
+**Key change in tool execution:**
+```typescript
+// Before: All sessions share same client
+execute: async (args, context) => {
+  const result = await client.callTool(...);  // ← Shared
+}
+
+// After: Each session gets its own client
+execute: async (args, context) => {
+  const sessionClient = await this.getSessionClient(name, context.sessionId);
+  const result = await sessionClient.callTool(...);  // ← Isolated
+}
+```
+
+## Testing
+Run verification test:
+```bash
+cd backend
+npx ts-node src/scripts/test-mcp-fix.ts
+```
+
+Expected output:
+```
+✓ SUCCESS: Each chat session has its own isolated MCP client!
+Chat sessions: 3
+Unique MCP sessions: 3
+```
+
+## Deployment Verification
+After deployment, monitor for:
+- `[MCP-SESSION] Creating new client pool for session: {id}` (new logs)
+- `[MCP-SESSION] Connected to {server} with MCP session ID: {mcpId} for chat session: {chatId}` (new logs)
+- No "has session: false" errors (old bug eliminated)
+
 # February 07, 2026: MCP Session ID Issue in Worker Process
 
 ## Problem
