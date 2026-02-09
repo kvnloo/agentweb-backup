@@ -501,14 +501,23 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
-      // 1. Initial Data Fetching (Pre-Loop)
-      let currentSession = await chatbotDb.getChatSession(sessionId);
+      // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
+      let [
+        currentSession,
+        availableTemplates,
+        userAllowedTools,
+        publishedSkills,
+        baseSystemPrompt
+      ] = await Promise.all([
+        chatbotDb.getChatSession(sessionId),
+        this.getAvailableTemplates(),
+        getAllowedFunctionCalls(userId),
+        skillService.getPublishedSkills(),
+        this.getMarketingSystemPrompt()
+      ]);
+
       const workPlan = currentSession?.workPlan;
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
-      const availableTemplates = await this.getAvailableTemplates();
-
-      // Get allowed tools from subscription service (cached for the request)
-      const userAllowedTools = await getAllowedFunctionCalls(userId);
 
       // 2. Initialize Context Variables
       let associatedSkills: any[] = [];
@@ -519,13 +528,10 @@ export class AgentModeService {
       // Build initial skill context
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedTools);
 
-      // Helper to build System Prompt
-      let baseSystemPrompt = await this.getMarketingSystemPrompt();
       // 3. Build Initial Messages
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
 
       let availableSkillContextMsg = '';
-      const publishedSkills = await skillService.getPublishedSkills();
       if (publishedSkills.length > 0) {
         const availableSkillContext = publishedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description}`).join('\n');
         availableSkillContextMsg = `Available Skills:\n${availableSkillContext}`;
@@ -600,7 +606,7 @@ export class AgentModeService {
 
         // 5. Get Tools (Cached)
         if (!filteredToolsCache) {
-             filteredToolsCache = await this.getFilteredTools(userId, sessionId, allowedToolNames);
+             filteredToolsCache = await this.getFilteredTools(userId, allowedToolNames, userAllowedTools);
         }
 
         // Make LLM call
@@ -667,29 +673,13 @@ export class AgentModeService {
         }
 
         // Execute tool calls
+        // Collect tool call counts for batched DB update (reduces N writes to 1)
+        const pendingCounterUpdates: Record<string, number> = {};
+
         for (const toolCall of responseMessage.tool_calls) {
           let functionArgs: any;
           try {
-            try {
-              functionArgs = JSON.parse(toolCall.function.arguments);
-            } catch (parseError) {
-              console.error(`AgentMode: Failed to parse tool arguments for ${toolCall.function.name}:`, parseError);
-              toolCalls.push({
-                id: toolCall.id,
-                name: toolCall.function.name,
-                arguments: toolCall.function.arguments, // Store as raw string since JSON parsing failed
-                error: 'Invalid JSON in tool arguments'
-              });
-              
-               // Append error as tool message so LLM knows it failed
-               messages.push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: `Error: Invalid JSON in arguments: ${(parseError as any).message}`
-              });
-              continue;
-            }
+            functionArgs = JSON.parse(toolCall.function.arguments);
 
             // Check if we need to refresh skills for next iteration
             if (toolCall.function.name === 'install_skills') {
@@ -717,13 +707,9 @@ export class AgentModeService {
               });
             }
 
-            // Update the calledFunctions counter immediately after successful tool call
-            try {
-              await chatbotDb.incrementCalledFunctions(sessionId, { [toolCall.function.name]: 1 });
-            } catch (counterError) {
-              console.error('AgentMode: Failed to update function call counter:', counterError);
-              // Don't fail the whole tool call if counter update fails
-            }
+            // Collect for batched counter update instead of immediate DB write
+            pendingCounterUpdates[toolCall.function.name] = 
+              (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
             // Append the tool call result as a tool message for the model to consume next
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
@@ -765,6 +751,16 @@ export class AgentModeService {
               name: toolCall.function.name,
               content: errorContent
             });
+          }
+        }
+
+        // Batch update function call counters after processing all tools in this iteration
+        if (Object.keys(pendingCounterUpdates).length > 0) {
+          try {
+            await chatbotDb.incrementCalledFunctions(sessionId, pendingCounterUpdates);
+          } catch (counterError) {
+            console.error('AgentMode: Failed to batch update function call counters:', counterError);
+            // Don't fail the whole iteration if counter update fails
           }
         }
 
@@ -906,9 +902,20 @@ export class AgentModeService {
     return `
       You are Emma, an AI-powered marketing assistant from AgentWeb. You help users execute marketing campaigns through natural conversation.
 
+      ## Your Capabilities
+      You can help with various marketing tasks including:
+      - Market research and competitive analysis
+      - SWOT analysis for businesses
+      - Marketing strategy development
+      - Ad creative generation and campaign management
+      - Performance analysis and optimization
+      - Meta ads metrics analysis and insights
+      - Social media listening and brand monitoring
+      - Web search for current information and real-time data
+      - Analysis of attached files and documents
+
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
-
       ### 1. ANALYZE (Think Through the Complete Task)
       Before doing anything, break down the user's request into ALL the individual actions/tools you will need:
       - What data do you need to read? (e.g., brand guidelines, market strategy)
@@ -920,15 +927,15 @@ export class AgentModeService {
       - Match each required action to a skill by checking the Tools list
       - For complex tasks, you will typically need 2-4 skills
       - Example: "read brand guidelines and create a blog" requires:
-        - Brand Strategy & Market Research (has read_brand_guidelines)
-        - Content Intelligence & Authoring (has create_blog_article)
+      - Brand Strategy & Market Research (has read_brand_guidelines)
+      - Content Intelligence & Authoring (has create_blog_article)
 
       ### 3. INSTALL ALL SKILLS AT ONCE
       Use \`install_skills\` with an array containing ALL the skill IDs you identified:
       - Do NOT install skills one at a time
       - Do NOT start executing until all required skills are installed
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
-      
+
       ### 4. EXECUTE
       Once all skills are installed and tools are available:
       - Use the tools to fulfill the user's request
@@ -941,7 +948,6 @@ export class AgentModeService {
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
 
-<<<<<<< HEAD
 ## File Attachments
 When users attach files to their messages, you will receive:
 - **Attached Files**: Clickable markdown links in the format \`[filename](url)\`
@@ -1465,53 +1471,43 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   // Get filtered tools based on user's subscription type AND session state
   // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
-  public async getFilteredTools(userId: string, sessionId: string, precomputedAllowedNames?: Set<string>): Promise<any[]> {
+  public async getFilteredTools(
+    userId: string, 
+    precomputedAllowedSkillToolNames?: Set<string>,
+    precomputedAllowedAllFunctionCalls?: string[]  // New parameter to avoid duplicate getAllowedFunctionCalls call
+  ): Promise<any[]> {
     try {
-      // 1. Get all internal tool objects (flat structure with .name)
-      const allInternalTools = this.toolRegistry.getAllTools();
       
-      let allowedNames: Set<string>;
+      if (precomputedAllowedSkillToolNames) {
+        // 1. Get all internal tool objects (flat structure with .name)
+        const allInternalTools = this.toolRegistry.getAllTools();
 
-      if (precomputedAllowedNames) {
-        // Use pre-computed set if available (optimization)
-        allowedNames = precomputedAllowedNames;
-      } else {
-        // Fallback: Compute allowed names from scratch if not provided
-        allowedNames = new Set<string>();
-        allowedNames.add('install_skills'); // Foundational
+        // 3. Filter the internal tool objects
+        const contextAwareTools = allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name));
 
-        // Load associated skills from DATABASE
-        const session = await chatbotDb.getChatSession(sessionId);
-        const currentAssociated = session?.associatedSkills || [];
+        // 4. Map back to wire-format definitions for the LLM
+        const definitions = contextAwareTools.map(t => t.definition);
 
-        if (currentAssociated.length) {
-          const associatedSkills = await skillService.getSkillsByIds(currentAssociated);
-          const toolNames = associatedSkills.flatMap(skill => skill.toolNames);
-          toolNames.forEach(toolName => allowedNames.add(toolName));
-        }
-      }
-
-      // 3. Filter the internal tool objects
-      const contextAwareTools = allInternalTools.filter(tool => allowedNames.has(tool.name));
-
-      // 4. Map back to wire-format definitions for the LLM
-      const definitions = contextAwareTools.map(t => t.definition);
-
-      // 5. Apply Subscription Filtering
-      // IMPORTANT: Tools associated via Skills bypass subscription filtering
-      // The Skills system is now the primary access control mechanism
-      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+        // 5. Apply Subscription Filtering
+        // IMPORTANT: Tools associated via Skills bypass subscription filtering
+        // The Skills system is now the primary access control mechanism
+        // Use pre-fetched allowedFunctionCalls if available to avoid duplicate DB call
+        const allowedFunctionCalls = precomputedAllowedAllFunctionCalls 
+        ? [...precomputedAllowedAllFunctionCalls]  // Clone to avoid mutation
+        : await getAllowedFunctionCalls(userId);
       
-      // Add all session-associated tools to the allowed list to bypass subscription filtering
-      if (!allowedFunctionCalls.includes('*')) {
-        allowedNames.forEach(name => {
-          if (!allowedFunctionCalls.includes(name)) {
-            allowedFunctionCalls.push(name);
-          }
+        // Add all session-associated tools to the allowed list to bypass subscription filtering
+        if (!allowedFunctionCalls.includes('*')) {
+          precomputedAllowedSkillToolNames.forEach(name => {
+            if (!allowedFunctionCalls.includes(name)) {
+              allowedFunctionCalls.push(name);
+            }
         });
       }
 
       return filterFunctionCalls(definitions, allowedFunctionCalls);
+    }
+    return [];
     } catch (error) {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array

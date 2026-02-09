@@ -215,12 +215,8 @@ describe('AgentModeService - Skills', () => {
     });
 
     it('should return only install_skills if no skills associated', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-        sessionId: 'session-123',
-        associatedSkills: [],
-      });
-
-      const result = await agentModeService.getFilteredTools('user-123', 'session-123');
+      // Pass empty set as precomputed allowed names (simulating no associated skills)
+      const result = await agentModeService.getFilteredTools('user-123', new Set(['install_skills']));
 
       // Should have at least install_skills
       const toolNames = result.map((t: any) => t.function?.name || t.name);
@@ -228,26 +224,23 @@ describe('AgentModeService - Skills', () => {
     });
 
     it('should return skill tools when skills are associated', async () => {
-      const associatedSkills = [
-        { skillId: 's1', name: 'Skill', toolNames: ['read_brand_guidelines'], description: '', isPublished: true },
-      ];
+      // Mock associated skills being passed as precomputed set
+      const precomputedNames = new Set(['read_brand_guidelines', 'install_skills']);
 
-      (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
-        sessionId: 'session-123',
-        associatedSkills: ['s1'],
-      });
-      (skillService.getSkillsByIds as jest.Mock).mockResolvedValue(associatedSkills);
-
-      const result = await agentModeService.getFilteredTools('user-123', 'session-123');
+      const result = await agentModeService.getFilteredTools('user-123', precomputedNames);
 
       const toolNames = result.map((t: any) => t.function?.name || t.name);
       expect(toolNames).toContain('read_brand_guidelines');
     });
 
     it('should return install_skills on error', async () => {
-      (chatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('DB Error'));
+      // Force error by passing invalid type to force crash in logic if we want to test try/catch
+      // Or better, mock this.toolRegistry.getAllTools to throw
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockImplementationOnce(() => {
+        throw new Error('Registry Error');
+      });
 
-      const result = await agentModeService.getFilteredTools('user-123', 'session-123');
+      const result = await agentModeService.getFilteredTools('user-123', new Set());
 
       // Should fallback to just install_skills
       expect(result.length).toBeGreaterThanOrEqual(0);
@@ -258,13 +251,13 @@ describe('AgentModeService - Skills', () => {
 
       const result = await agentModeService.getFilteredTools(
         'user-123',
-        'session-123',
         precomputedNames
       );
 
-      // Should not call getChatSession when precomputed names provided
       // Result should be filtered based on precomputed names
       expect(result).toBeDefined();
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).toContain('read_brand_guidelines');
     });
   });
 
