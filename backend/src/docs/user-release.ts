@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Enhanced User Journey Funnel Management in SEO/GEO Page',
       '- Users can now delete the last funnel without restriction',
+      'Updated Meta Ads Metrics Tooling in Agent Mode',
+      '- get_meta_ads_metrics now supports campaign_ids as a list and requires at least one campaign ID',
+      '- Added backward compatibility for legacy campaign_id/single-string inputs to prevent tool call failures',
+      '- Response payload is now lightweight (uses formattedContent with S3 detail links) to reduce message storage size',
     ],
   },
   {

@@ -136,32 +136,31 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       });
 
       // Test with campaign_id filter
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', ['camp1']);
 
       expect(result.success).toBe(true);
 
-      // Check that breakdown data is filtered correctly
-      const placementBreakdown = result.data.placementBreakdown;
-      const demographicsBreakdown = result.data.demographicsBreakdown;
-      const deviceBreakdown = result.data.deviceBreakdown;
+      // Validate filtering by checking generated CSV contents
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadMock = uploadFileToS3 as jest.Mock;
 
-      // Placement breakdown should only contain camp1 data
-      expect(placementBreakdown).toHaveLength(1);
-      expect(placementBreakdown[0].publisher_platform).toBe('facebook');
-      expect(placementBreakdown[0].campaign_id).toBe('camp1');
+      const placementCall = uploadMock.mock.calls.find((call: any) => call[1].includes('placement-breakdown'));
+      const demographicsCall = uploadMock.mock.calls.find((call: any) => call[1].includes('demographics-breakdown'));
+      const deviceCall = uploadMock.mock.calls.find((call: any) => call[1].includes('device-breakdown'));
 
-      // Demographics breakdown should only contain camp1 data
-      expect(demographicsBreakdown).toHaveLength(1);
-      expect(demographicsBreakdown[0].age).toBe('25-34');
-      expect(demographicsBreakdown[0].campaign_id).toBe('camp1');
+      const placementCsv = placementCall?.[0]?.toString() || '';
+      const demographicsCsv = demographicsCall?.[0]?.toString() || '';
+      const deviceCsv = deviceCall?.[0]?.toString() || '';
 
-      // Device breakdown should only contain camp1 data
-      expect(deviceBreakdown).toHaveLength(1);
-      expect(deviceBreakdown[0].impression_device).toBe('iPhone');
-      expect(deviceBreakdown[0].campaign_id).toBe('camp1');
+      expect(placementCsv).toContain('facebook');
+      expect(placementCsv).not.toContain('instagram');
+      expect(demographicsCsv).toContain('25-34');
+      expect(demographicsCsv).not.toContain('35-44');
+      expect(deviceCsv).toContain('iPhone');
+      expect(deviceCsv).not.toContain('Android');
     });
 
-    it('should return all breakdown data when no campaign filtering is applied', async () => {
+    it('should return all breakdown data when multiple campaign_ids are provided', async () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
@@ -209,16 +208,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
         });
       });
 
-      // Test without campaign filtering
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123');
+      // Test with both campaign IDs
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', ['camp1', 'camp2']);
 
       expect(result.success).toBe(true);
-      
-      // Check that all breakdown data is returned
-      const placementBreakdown = result.data.placementBreakdown;
-      expect(placementBreakdown).toHaveLength(2);
-      expect(placementBreakdown[0].publisher_platform).toBe('facebook');
-      expect(placementBreakdown[1].publisher_platform).toBe('instagram');
+
+      // Check that both placements are present in generated placement CSV
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const uploadMock = uploadFileToS3 as jest.Mock;
+      const placementCall = uploadMock.mock.calls.find((call: any) => call[1].includes('placement-breakdown'));
+      const placementCsv = placementCall?.[0]?.toString() || '';
+      expect(placementCsv).toContain('facebook');
+      expect(placementCsv).toContain('instagram');
     });
   });
 
@@ -473,6 +474,32 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
   });
 
   describe('Campaign filtering edge cases', () => {
+    it('should accept legacy single campaign ID string input', async () => {
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789'
+      };
+
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      const capturedUrls: string[] = [];
+
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        capturedUrls.push(url);
+        return Promise.resolve({
+          json: () => Promise.resolve({ data: [] })
+        });
+      });
+
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
+
+      expect(result.success).toBe(true);
+      const insightsUrl = capturedUrls.find(url => url.includes('insights?fields='));
+      expect(insightsUrl).toContain('filtering=');
+      expect(insightsUrl).toContain('camp1');
+    });
+
     it('should filter by campaign_id when provided', async () => {
       // Mock user data
       const mockUser = {
@@ -497,7 +524,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       });
 
       // Test with campaign_id filter
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', ['camp1']);
 
       expect(result.success).toBe(true);
 
@@ -548,13 +575,12 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       });
 
       // Test with campaign_id filter
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', ['camp1']);
 
       expect(result.success).toBe(true);
 
-      // Check that breakdown data is empty (filtered out due to missing campaign_id)
-      const placementBreakdown = result.data.placementBreakdown;
-      expect(placementBreakdown).toHaveLength(0);
+      // Check that placement breakdown section is not generated when filtered data is empty
+      expect(result.formattedContent).not.toContain('Placement Breakdown');
     });
   });
 });
