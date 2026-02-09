@@ -181,7 +181,7 @@ describe('AgentModeService - create_social_media_posts function', () => {
       expect(imgTagMatch).toBeNull();
     });
 
-    it('should convert markdown content to HTML', async () => {
+    it('should include preview text container for post content', async () => {
       const mockPosts = [
         {
           type: 'linkedin',
@@ -200,10 +200,10 @@ describe('AgentModeService - create_social_media_posts function', () => {
         'session123'
       );
 
-      // Verify markdown processor was used
       const uploadCall = mockUploadFileToS3.mock.calls[0];
       const htmlContent = uploadCall[0];
-      expect(htmlContent).toContain('post-content');
+      expect(htmlContent).toContain('platform-preview-text');
+      expect(htmlContent).toContain('LinkedIn Preview');
     });
 
     it('should generate HTML with proper structure', async () => {
@@ -236,6 +236,7 @@ describe('AgentModeService - create_social_media_posts function', () => {
       expect(htmlContent).toContain('LinkedIn');
       expect(htmlContent).toContain('Copy Content');
       expect(htmlContent).toContain('copyPostContent');
+      expect(htmlContent).not.toContain('Full draft content');
     });
 
     it('should handle single post', async () => {
@@ -453,6 +454,63 @@ describe('AgentModeService - create_social_media_posts function', () => {
   });
 
   describe('HTML Generation', () => {
+    it('should render platform preview sections for posts', async () => {
+      const mockPosts = [
+        { type: 'linkedin', content: 'LinkedIn preview content' },
+        { type: 'x/twitter', content: 'Twitter preview content' },
+        { type: 'instagram', content: 'Instagram preview content' }
+      ];
+
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/posts.html'
+      });
+
+      await (agentModeService as any).createSocialMediaPosts(
+        mockPosts,
+        'user123',
+        'session123'
+      );
+
+      const uploadCall = mockUploadFileToS3.mock.calls[0];
+      const htmlContent = uploadCall[0];
+
+      expect(htmlContent).toContain('class="platform-preview"');
+      expect(htmlContent).toContain('LinkedIn Preview');
+      expect(htmlContent).toContain('X (Twitter) Preview');
+      expect(htmlContent).toContain('Instagram Preview');
+    });
+
+    it('should include platform-specific truncated preview markers when content is long', async () => {
+      const linkedInLongContent = 'A'.repeat(400);
+      const twitterLongContent = 'B'.repeat(400);
+      const instagramLongContent = 'C'.repeat(400);
+
+      const mockPosts = [
+        { type: 'linkedin', content: linkedInLongContent },
+        { type: 'x/twitter', content: twitterLongContent },
+        { type: 'instagram', content: instagramLongContent }
+      ];
+
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.example.com/posts.html'
+      });
+
+      await (agentModeService as any).createSocialMediaPosts(
+        mockPosts,
+        'user123',
+        'session123'
+      );
+
+      const uploadCall = mockUploadFileToS3.mock.calls[0];
+      const htmlContent = uploadCall[0];
+
+      expect(htmlContent).toContain('class="preview-more-button"');
+      expect(htmlContent).toContain('...more');
+      expect(htmlContent).toContain('Show more');
+    });
+
     it('should include copy functionality in HTML', async () => {
       const mockPosts = [
         {
@@ -478,6 +536,7 @@ describe('AgentModeService - create_social_media_posts function', () => {
       expect(htmlContent).toContain('copyPostContent');
       expect(htmlContent).toContain('Copy Content');
       expect(htmlContent).toContain('post-raw-content');
+      expect(htmlContent).toContain('togglePreviewText');
     });
 
     it('should include proper styling for different post types', async () => {
@@ -537,11 +596,11 @@ describe('AgentModeService - create_social_media_posts function', () => {
       expect(htmlContent).toContain('Post 3');
     });
 
-    it('should style images in post content with proper CSS', async () => {
+    it('should include preview action rows with social interaction labels', async () => {
       const mockPosts = [
         {
           type: 'linkedin',
-          content: 'Check out this image: ![Alt text](https://example.com/image-in-content.jpg)'
+          content: 'Action preview check'
         }
       ];
 
@@ -559,21 +618,18 @@ describe('AgentModeService - create_social_media_posts function', () => {
       const uploadCall = mockUploadFileToS3.mock.calls[0];
       const htmlContent = uploadCall[0];
       
-      // Verify CSS styling for images in post content exists
-      expect(htmlContent).toContain('.post-content img');
-      expect(htmlContent).toContain('max-width: 100%');
-      expect(htmlContent).toContain('height: auto');
-      expect(htmlContent).toContain('border-radius: 4px');
-      expect(htmlContent).toContain('box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1)');
-      expect(htmlContent).toContain('margin: 15px 0');
-      expect(htmlContent).toContain('display: block');
+      expect(htmlContent).toContain('platform-preview-actions-row');
+      expect(htmlContent).toContain('Like');
+      expect(htmlContent).toContain('Comment');
+      expect(htmlContent).toContain('Repost');
+      expect(htmlContent).toContain('preview-metrics');
     });
 
-    it('should style images in content even when image_url parameter is also provided', async () => {
+    it('should show image_url inside preview image block', async () => {
       const mockPosts = [
         {
           type: 'linkedin',
-          content: 'Post with both: ![Image in content](https://example.com/content-image.jpg)',
+          content: 'Post with image',
           image_url: 'https://example.com/parameter-image.jpg'
         }
       ];
@@ -592,14 +648,9 @@ describe('AgentModeService - create_social_media_posts function', () => {
       const uploadCall = mockUploadFileToS3.mock.calls[0];
       const htmlContent = uploadCall[0];
       
-      // Verify both image styling classes exist
-      expect(htmlContent).toContain('.post-content img');
-      expect(htmlContent).toContain('.post-image img');
-      
-      // Verify CSS properties for content images
-      expect(htmlContent).toContain('max-width: 100%');
-      expect(htmlContent).toContain('border-radius: 4px');
+      expect(htmlContent).toContain('platform-preview-image');
+      expect(htmlContent).toContain('https://example.com/parameter-image.jpg');
+      expect(htmlContent).toContain('.platform-preview-image img');
     });
   });
 });
-

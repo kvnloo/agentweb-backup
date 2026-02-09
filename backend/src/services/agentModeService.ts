@@ -8199,17 +8199,102 @@ Format the response as JSON with this structure:
       // Import required utilities
       const { uploadFileToS3 } = await import('../utils/s3Utils');
 
-      // Dynamically import remark modules (ES modules)
-      const { remark } = await import('remark');
-      const remarkHtml = (await import('remark-html')).default;
-      const remarkGfm = (await import('remark-gfm')).default;
-      const remarkBreaks = (await import('remark-breaks')).default;
+      const escapeHtml = (value: string): string => (
+        value
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;')
+      );
 
-      // Convert markdown to HTML processor
-      const processor = remark()
-        .use(remarkGfm) // GitHub Flavored Markdown support
-        .use(remarkBreaks) // Convert line breaks to <br> tags
-        .use(remarkHtml, { sanitize: false }); // Convert to HTML
+      const stripMarkdownForPreview = (value: string): string => {
+        return value
+          .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+          .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
+          .replace(/(^|\s)([*_~]{1,3})([^*_~]+)\2/g, '$1$3')
+          .replace(/^#{1,6}\s+/gm, '')
+          .replace(/^\s*[-*+]\s+/gm, '')
+          .replace(/^\s*\d+\.\s+/gm, '')
+          .replace(/\r\n/g, '\n')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+      };
+
+      const buildPlatformPreview = (type: string, value: string): { shortText: string; fullText: string; isTruncated: boolean; moreLabel: string } => {
+        const previewText = stripMarkdownForPreview(value).replace(/\s+/g, ' ').trim();
+        const platformRules: Record<string, { limit: number; moreLabel: string }> = {
+          linkedin: { limit: 260, moreLabel: '...more' },
+          'x/twitter': { limit: 240, moreLabel: 'Show more' },
+          instagram: { limit: 125, moreLabel: '...more' },
+          facebook: { limit: 280, moreLabel: '...more' },
+          custom: { limit: 260, moreLabel: '...more' }
+        };
+        const rule = platformRules[type] || platformRules.custom;
+
+        if (!previewText || previewText.length <= rule.limit) {
+          return { shortText: previewText, fullText: previewText, isTruncated: false, moreLabel: rule.moreLabel };
+        }
+
+        const truncated = previewText.slice(0, rule.limit);
+        const lastSpace = truncated.lastIndexOf(' ');
+        const safeSlice = lastSpace > Math.floor(rule.limit * 0.6) ? truncated.slice(0, lastSpace) : truncated;
+        return {
+          shortText: safeSlice.trimEnd(),
+          fullText: previewText,
+          isTruncated: true,
+          moreLabel: rule.moreLabel
+        };
+      };
+
+      const getPreviewActions = (type: string): Array<{ icon: string; label: string }> => {
+        const actionsByType: Record<string, Array<{ icon: string; label: string }>> = {
+          linkedin: [
+            { icon: '👍', label: 'Like' },
+            { icon: '💬', label: 'Comment' },
+            { icon: '🔁', label: 'Repost' },
+            { icon: '✉️', label: 'Send' }
+          ],
+          'x/twitter': [
+            { icon: '💬', label: 'Reply' },
+            { icon: '🔁', label: 'Repost' },
+            { icon: '❤️', label: 'Like' },
+            { icon: '↗', label: 'Share' }
+          ],
+          instagram: [
+            { icon: '❤️', label: 'Like' },
+            { icon: '💬', label: 'Comment' },
+            { icon: '🔁', label: 'Repost' },
+            { icon: '✈️', label: 'Share' }
+          ],
+          facebook: [
+            { icon: '👍', label: 'Like' },
+            { icon: '💬', label: 'Comment' },
+            { icon: '🔁', label: 'Repost' },
+            { icon: '↗', label: 'Share' }
+          ],
+          custom: [
+            { icon: '👍', label: 'Like' },
+            { icon: '💬', label: 'Comment' },
+            { icon: '🔁', label: 'Repost' }
+          ]
+        };
+
+        return actionsByType[type] || actionsByType.custom;
+      };
+
+      const getPreviewMetrics = (type: string): string => {
+        const metricsByType: Record<string, string> = {
+          linkedin: '182 likes • 24 comments • 11 reposts',
+          'x/twitter': '97 likes • 15 comments • 23 reposts',
+          instagram: '241 likes • 28 comments • 9 reposts',
+          facebook: '156 likes • 19 comments • 7 reposts',
+          custom: '128 likes • 17 comments • 8 reposts'
+        };
+
+        return metricsByType[type] || metricsByType.custom;
+      };
 
       // Generate HTML for each post
       const postsHtml = posts.map((post, index) => {
@@ -8224,8 +8309,11 @@ Format the response as JSON with this structure:
         };
         const typeLabel = typeLabelMap[post.type] || post.type.charAt(0).toUpperCase() + post.type.slice(1);
 
-        // Convert markdown content to HTML
-        const htmlContent = processor.processSync(post.content || '').toString();
+        const preview = buildPlatformPreview(post.type, post.content || '');
+        const actionItems = getPreviewActions(post.type);
+        const actionButtonsHtml = actionItems
+          .map((action) => `<span class="preview-action-item"><span class="preview-action-icon">${action.icon}</span>${action.label}</span>`)
+          .join('');
 
         // Build post HTML
         let postHtml = `
@@ -8234,24 +8322,35 @@ Format the response as JSON with this structure:
           <span class="post-number">Post ${postNumber}</span>
           <span class="post-type">${typeLabel}</span>
         </div>
-        <div class="post-content">
-          ${htmlContent}
-        </div>`;
+        <div class="platform-preview" data-platform="${post.type}">
+          <div class="platform-preview-header">${typeLabel} Preview</div>
+          <div class="platform-preview-body">
+            <div class="platform-preview-text" id="post-${index}-preview-text">${escapeHtml(preview.shortText || '')}</div>
+            ${preview.isTruncated ? `<button class="preview-more-button" id="post-${index}-more" data-more-label="${escapeHtml(preview.moreLabel)}" onclick="togglePreviewText(${index})">${preview.moreLabel}</button>` : ''}
+          </div>`;
 
-        // Add image if provided
         if (post.image_url) {
           postHtml += `
-        <div class="post-image">
-          <img src="${post.image_url}" alt="Post image" />
-        </div>`;
+          <div class="platform-preview-image">
+            <img src="${post.image_url}" alt="Post image" />
+          </div>`;
         }
+
+        postHtml += `
+          <div class="preview-metrics">${getPreviewMetrics(post.type)}</div>
+          <div class="platform-preview-actions-row">
+            ${actionButtonsHtml}
+          </div>
+        </div>`;
 
         // Add copy button
         postHtml += `
         <div class="post-actions">
-          <button class="copy-button" onclick="copyPostContent(${index})">Copy Content</button>
+          <button class="copy-button" onclick="copyPostContent(${index}, this)">Copy Content</button>
         </div>
-        <div class="post-raw-content" id="post-${index}-raw" style="display: none;">${post.content}</div>
+        <div class="post-preview-short" id="post-${index}-short" style="display: none;">${escapeHtml(preview.shortText || '')}</div>
+        <div class="post-preview-full" id="post-${index}-full" style="display: none;">${escapeHtml(preview.fullText || '')}</div>
+        <div class="post-raw-content" id="post-${index}-raw" style="display: none;">${escapeHtml(post.content || '')}</div>
       </div>`;
 
         return postHtml;
@@ -8337,46 +8436,108 @@ Format the response as JSON with this structure:
         .post[data-type="custom"] .post-type {
             background-color: #666;
         }
-        .post-content {
+        .platform-preview {
             margin: 15px 0;
-            font-size: 16px;
-            line-height: 1.6;
-            color: #333;
+            border: 1px solid #d0d7de;
+            border-radius: 10px;
+            background-color: #ffffff;
+            overflow: hidden;
         }
-        .post-content p {
-            margin-bottom: 12px;
+        .platform-preview-header {
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            padding: 8px 12px;
+            border-bottom: 1px solid #ebedf0;
+            color: #4d5760;
+            background: #f7f8fa;
         }
-        .post-content h1, .post-content h2, .post-content h3 {
-            margin-top: 20px;
-            margin-bottom: 12px;
+        .platform-preview-body {
+            font-size: 15px;
+            line-height: 1.5;
+            color: #1f2328;
+            padding: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
         }
-        .post-content ul, .post-content ol {
-            margin-left: 20px;
-            margin-bottom: 12px;
+        .platform-preview-text {
+            white-space: pre-wrap;
         }
-        .post-content a {
-            color: #0077b5;
-            text-decoration: none;
+        .preview-more-button {
+            margin-top: 6px;
+            border: none;
+            background: transparent;
+            color: #656d76;
+            font-weight: 600;
+            font-size: 14px;
+            padding: 0;
+            cursor: pointer;
         }
-        .post-content a:hover {
+        .preview-more-button:hover {
             text-decoration: underline;
         }
-        .post-content img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 4px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            margin: 15px 0;
+        .platform-preview-image img {
+            width: 100%;
+            max-height: 420px;
+            object-fit: cover;
+            border-top: 1px solid #ebedf0;
+            border-bottom: 1px solid #ebedf0;
             display: block;
         }
-        .post-image {
-            margin: 15px 0;
+        .preview-metrics {
+            padding: 10px 12px 8px;
+            color: #57606a;
+            font-size: 13px;
+            border-bottom: 1px solid #ebedf0;
         }
-        .post-image img {
-            max-width: 100%;
-            height: auto;
-            border-radius: 4px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        .platform-preview-actions-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-around;
+            padding: 8px 6px;
+            gap: 6px;
+        }
+        .preview-action-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #57606a;
+            font-size: 13px;
+            font-weight: 600;
+            padding: 6px 8px;
+            border-radius: 6px;
+        }
+        .preview-action-icon {
+            font-size: 14px;
+            line-height: 1;
+        }
+        .preview-action-item:hover {
+            background-color: #f3f4f6;
+        }
+        .post[data-type="linkedin"] .platform-preview {
+            border-color: #d9e3ee;
+            background-color: #ffffff;
+        }
+        .post[data-type="linkedin"] .platform-preview-header {
+            color: #0a66c2;
+            background-color: #f3f8ff;
+        }
+        .post[data-type="x/twitter"] .platform-preview {
+            border-color: #cfd9de;
+            background-color: #ffffff;
+        }
+        .post[data-type="x/twitter"] .platform-preview-header {
+            color: #0f1419;
+            background-color: #f7f9f9;
+        }
+        .post[data-type="instagram"] .platform-preview {
+            border-color: #f0d6e2;
+            background: #fff;
+        }
+        .post[data-type="instagram"] .platform-preview-header {
+            color: #c13584;
+            background: linear-gradient(90deg, rgba(252,175,69,0.12) 0%, rgba(221,42,123,0.12) 50%, rgba(129,52,175,0.12) 100%);
         }
         .post-actions {
             margin-top: 15px;
@@ -8420,7 +8581,28 @@ Format the response as JSON with this structure:
         ${postsHtml}
     </div>
     <script>
-        function copyPostContent(index) {
+        function togglePreviewText(index) {
+            const previewTextEl = document.getElementById('post-' + index + '-preview-text');
+            const shortTextEl = document.getElementById('post-' + index + '-short');
+            const fullTextEl = document.getElementById('post-' + index + '-full');
+            const moreButtonEl = document.getElementById('post-' + index + '-more');
+            if (!previewTextEl || !shortTextEl || !fullTextEl || !moreButtonEl) return;
+
+            const isExpanded = moreButtonEl.getAttribute('data-expanded') === 'true';
+            const moreLabel = moreButtonEl.getAttribute('data-more-label') || '...more';
+            if (isExpanded) {
+                previewTextEl.textContent = shortTextEl.textContent || '';
+                moreButtonEl.textContent = moreLabel;
+                moreButtonEl.setAttribute('data-expanded', 'false');
+                return;
+            }
+
+            previewTextEl.textContent = fullTextEl.textContent || '';
+            moreButtonEl.textContent = 'Show less';
+            moreButtonEl.setAttribute('data-expanded', 'true');
+        }
+
+        function copyPostContent(index, buttonEl) {
             const rawContentElement = document.getElementById('post-' + index + '-raw');
             if (!rawContentElement) return;
             
@@ -8436,7 +8618,7 @@ Format the response as JSON with this structure:
             
             try {
                 document.execCommand('copy');
-                const button = event.target;
+                const button = buttonEl;
                 const originalText = button.textContent;
                 button.textContent = 'Copied!';
                 button.style.backgroundColor = '#28a745';
