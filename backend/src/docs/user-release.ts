@@ -15,6 +15,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- get_meta_ads_metrics now supports campaign_ids as a list and requires at least one campaign ID',
       '- Added backward compatibility for legacy campaign_id/single-string inputs to prevent tool call failures',
       '- Response payload is now lightweight (uses formattedContent with S3 detail links) to reduce message storage size',
+      'Fixed CRM Lead Search Consistency',
+      '- Resolved stale lead results after changing or clearing search text',
+      '- Example: searching for "Wang" and then deleting the query now correctly refreshes to current results',
     ],
   },
   {
