@@ -583,15 +583,14 @@ describe('SEO Routes', () => {
         .mockResolvedValueOnce([{
           rows: [{
             dimensionValues: [
-              { value: 'Test Page' },
-              { value: '/test-page' },
-              { value: 'example.com' }
+              { value: '/test-page' },      // pagePath (no longer includes pageTitle)
+              { value: 'example.com' }      // hostName
             ],
             metricValues: [
-              { value: '50' },
-              { value: '0.75' },
-              { value: '300' },
-              { value: '200' }
+              { value: '50' },   // sessions
+              { value: '0.75' }, // engagementRate
+              { value: '300' },  // userEngagementDuration
+              { value: '200' }   // eventCount
             ]
           }]
         }])
@@ -612,7 +611,10 @@ describe('SEO Routes', () => {
         .get('/api/seo/metrics')
         .expect(200);
 
+      // Verify the path is correctly constructed
       expect(response.body.gaMetrics.topPagesByEngagement[0].pagePath).toBe('https://example.com/test-page');
+      // pageTitle should now be the path itself (since we removed the pageTitle dimension)
+      expect(response.body.gaMetrics.topPagesByEngagement[0].pageTitle).toBe('/test-page');
     });
   });
 
