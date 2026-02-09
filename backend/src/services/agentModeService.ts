@@ -806,8 +806,9 @@ When updating HTML files, follow this process:
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
 - **Meta Ads Campaigns and Metrics**:
 - Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
-- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data. You can optionally filter by campaign_id to get metrics for a specific campaign
-- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns with their IDs, then let the user choose which campaign to analyze, and call 'get_meta_ads_metrics' with the selected campaign_id for accurate filtering
+- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data for selected campaigns
+- **Required parameter**: 'campaign_ids' (array of campaign IDs) is mandatory for 'get_meta_ads_metrics'
+- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns with their IDs, then let the user choose campaigns to analyze, and call 'get_meta_ads_metrics' with the selected campaign_ids array for accurate filtering
 - When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
 - Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
 - Consider the user's industry, business stage, and previous conversation context when analyzing performance
@@ -1414,6 +1415,22 @@ Use the available tools to create tasks in the agent-engine when complex work is
         };
 
       case 'get_meta_ads_metrics':
+        const normalizedCampaignIds = Array.isArray(args.campaign_ids)
+          ? args.campaign_ids
+          : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
+            ? [args.campaign_ids.trim()]
+            : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
+              ? [args.campaign_id.trim()]
+              : [];
+
+        if (normalizedCampaignIds.length === 0) {
+          return {
+            success: false,
+            message: 'campaign_ids is required and must contain at least one campaign ID.',
+            error: 'Invalid campaign_ids'
+          };
+        }
+
         // Calculate attribution window based on timeframe
         const timeframe = args.timeframe || '7d';
         const now = new Date();
@@ -1451,168 +1468,23 @@ Use the available tools to create tasks in the agent-engine when complex work is
 
         return {
           success: true,
-          data: {
-            attributionWindow: {
-              start: formatDate(startDate),
-              end: formatDate(endDate),
-              days: days
-            },
-            campaignSummary: {
-              totalCampaigns: 3,
-              totalSpend: 1250.75,
-              totalImpressions: 125000,
-              totalClicks: 4500,
-              averageCtr: 3.6,
-              averageCpc: 0.28,
-              totalWebsiteLeads: 23,
-              averageCostPerWebsiteLead: 54.38
-            },
-            adPerformance: [
-              {
-                name: 'Holiday Campaign 2023',
-                spend: 750.25,
-                impressions: 75000,
-                clicks: 2700,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 14,
-                costPerWebsiteLead: 53.59
-              },
-              {
-                name: 'Brand Awareness Campaign',
-                spend: 350.50,
-                impressions: 35000,
-                clicks: 1260,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 6,
-                costPerWebsiteLead: 58.42
-              },
-              {
-                name: 'Retargeting Campaign',
-                spend: 150.00,
-                impressions: 15000,
-                clicks: 540,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 3,
-                costPerWebsiteLead: 50.00
-              }
-            ],
-            adSetsData: [
-              {
-                name: 'Holiday - Lookalike Audience',
-                campaignName: 'Holiday Campaign 2023',
-                spend: 450.15,
-                impressions: 45000,
-                clicks: 1620,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 8,
-                costPerWebsiteLead: 56.27
-              },
-              {
-                name: 'Holiday - Interest Targeting',
-                campaignName: 'Holiday Campaign 2023',
-                spend: 300.10,
-                impressions: 30000,
-                clicks: 1080,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 6,
-                costPerWebsiteLead: 50.02
-              },
-              {
-                name: 'Brand - Broad Targeting',
-                campaignName: 'Brand Awareness Campaign',
-                spend: 350.50,
-                impressions: 35000,
-                clicks: 1260,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 6,
-                costPerWebsiteLead: 58.42
-              },
-              {
-                name: 'Retargeting - Website Visitors',
-                campaignName: 'Retargeting Campaign',
-                spend: 150.00,
-                impressions: 15000,
-                clicks: 540,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 3,
-                costPerWebsiteLead: 50.00
-              }
-            ],
-            adsData: [
-              {
-                name: 'Holiday Sale - Creative A',
-                adSetName: 'Holiday - Lookalike Audience',
-                campaignName: 'Holiday Campaign 2023',
-                spend: 225.08,
-                impressions: 22500,
-                clicks: 810,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 4,
-                costPerWebsiteLead: 56.27
-              },
-              {
-                name: 'Holiday Sale - Creative B',
-                adSetName: 'Holiday - Lookalike Audience',
-                campaignName: 'Holiday Campaign 2023',
-                spend: 225.07,
-                impressions: 22500,
-                clicks: 810,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 4,
-                costPerWebsiteLead: 56.27
-              },
-              {
-                name: 'Brand Awareness - Video',
-                adSetName: 'Brand - Broad Targeting',
-                campaignName: 'Brand Awareness Campaign',
-                spend: 350.50,
-                impressions: 35000,
-                clicks: 1260,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 6,
-                costPerWebsiteLead: 58.42
-              },
-              {
-                name: 'Retargeting - Special Offer',
-                adSetName: 'Retargeting - Website Visitors',
-                campaignName: 'Retargeting Campaign',
-                spend: 150.00,
-                impressions: 15000,
-                clicks: 540,
-                ctr: 3.6,
-                cpc: 0.28,
-                websiteLeads: 3,
-                costPerWebsiteLead: 50.00
-              }
-            ],
-            demographicsBreakdown: [
-              { age: '25-34', gender: 'female', impressions: '45000', clicks: '1620', spend: '450.15', websiteLeads: '8' },
-              { age: '35-44', gender: 'male', impressions: '35000', clicks: '1260', spend: '350.10', websiteLeads: '6' },
-              { age: '25-34', gender: 'male', impressions: '30000', clicks: '1080', spend: '300.10', websiteLeads: '5' },
-              { age: '45-54', gender: 'female', impressions: '15000', clicks: '540', spend: '150.40', websiteLeads: '4' }
-            ],
-            placementBreakdown: [
-              { publisher_platform: 'facebook', platform_position: 'feed', impressions: '75000', clicks: '2700', spend: '750.25', websiteLeads: '14' },
-              { publisher_platform: 'instagram', platform_position: 'feed', impressions: '35000', clicks: '1260', spend: '350.50', websiteLeads: '6' },
-              { publisher_platform: 'facebook', platform_position: 'stories', impressions: '15000', clicks: '540', spend: '150.00', websiteLeads: '3' }
-            ],
-            deviceBreakdown: [
-              { device_platform: 'mobile', impressions: '80000', clicks: '2880', spend: '800.40', websiteLeads: '15' },
-              { device_platform: 'desktop', impressions: '30000', clicks: '1080', spend: '300.20', websiteLeads: '6' },
-              { device_platform: 'tablet', impressions: '15000', clicks: '540', spend: '150.15', websiteLeads: '2' }
-            ]
+          timeframe: args.timeframe || '7d',
+          attributionWindow: {
+            start: formatDate(startDate),
+            end: formatDate(endDate),
+            days: days
           },
-          timeframe: args.timeframe || '7d'
+          campaignSummary: {
+            totalCampaigns: 3,
+            totalSpend: 1250.75,
+            totalImpressions: 125000,
+            totalClicks: 4500,
+            averageCtr: 3.6,
+            averageCpc: 0.28,
+            totalWebsiteLeads: 23,
+            averageCostPerWebsiteLead: 54.38
+          },
+          formattedContent: `📊 **Meta Ads Performance Data**\n\n**Attribution Window:** ${formatDate(startDate)} to ${formatDate(endDate)} (${days} days)\n\n**📈 Campaign Summary**\n- Total Campaigns: 3\n- Total Spend: $1250.75\n- Impressions: 125,000\n- Clicks: 4,500\n- CTR: 3.60%\n- CPC: $0.28\n- Website Leads: 23\n\n**📥 Detailed Data Files**\n1. **Ad-Level Data**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n2. **Demographics Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n3. **Placement Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n4. **Device Breakdown**\n   📥 [Download CSV](https://s3.amazonaws.com/mock-bucket/mock-file.csv)\n`
         };
 
       case 'search_web':
@@ -4869,7 +4741,7 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_id?: string): Promise<any> {
+  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
     try {
 
       // Import the Meta API functions directly to reuse the same logic
@@ -4930,11 +4802,19 @@ Format the response as JSON with this structure:
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
-      // Build filtering parameter for API calls if campaign_id is provided
+      // Build filtering parameter for API calls from campaign_ids
       let campaignFilterIds: string[] = [];
-      if (campaign_id) {
-        console.log('AgentMode: Filtering metrics by campaign ID:', campaign_id);
-        campaignFilterIds = [campaign_id];
+      const rawCampaignIds = Array.isArray(campaign_ids)
+        ? campaign_ids
+        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
+      campaignFilterIds = [...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))];
+      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
+      if (campaignFilterIds.length === 0) {
+        return {
+          success: false,
+          message: 'campaign_ids is required and must contain at least one campaign ID.',
+          error: 'Invalid campaign_ids'
+        };
       }
 
       // Build filtering parameter for API calls
@@ -5045,16 +4925,8 @@ Format the response as JSON with this structure:
         success: true,
         message: `Meta ads metrics loaded for ${timeframe} timeframe`,
         timeframe,
-        data: {
-          adPerformance,
-          adSetsData: processedAdSetsData,
-          adsData: processedAdsData,
-          campaignSummary,
-          demographicsBreakdown: processedDemographicsBreakdown,
-          placementBreakdown: processedPlacementBreakdown,
-          deviceBreakdown: processedDeviceBreakdown,
-          attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays }
-        },
+        attributionWindow: { start: sinceStr, end: untilStr, days: attributionDays },
+        campaignSummary,
         formattedContent
       };
 

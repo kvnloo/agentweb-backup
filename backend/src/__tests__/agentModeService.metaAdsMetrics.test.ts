@@ -63,7 +63,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Calculate expected dates (yesterday and 6 days before)
       const yesterday = new Date();
@@ -101,7 +101,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('14d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('14d', 'user123', ['camp1']);
 
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
@@ -136,7 +136,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('30d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('30d', 'user123', ['camp1']);
 
       const yesterday = new Date();
       yesterday.setDate(yesterday.getDate() - 1);
@@ -173,7 +173,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Check demographics breakdown
       const demographicsUrl = capturedUrls.find(url => 
@@ -220,7 +220,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Check demographics breakdown
       const demographicsUrl = capturedUrls.find(url => 
@@ -270,7 +270,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       const breakdownUrls = capturedUrls.filter(url => 
         url.includes('breakdowns=')
@@ -315,7 +315,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should have made multiple attempts
       expect(attemptCount).toBeGreaterThan(1);
@@ -352,7 +352,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should have made multiple attempts
       expect(attemptCount).toBeGreaterThan(1);
@@ -383,7 +383,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should have made multiple attempts
       expect(attemptCount).toBeGreaterThan(1);
@@ -412,7 +412,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should only attempt once per API call (no retry for 404)
       // There are 9 parallel API calls in Promise.all
@@ -444,7 +444,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should attempt 3 times per API call (initial + 2 retries)
       // There are 9 parallel API calls in Promise.all
@@ -487,7 +487,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should have retried
       expect(attemptCount).toBeGreaterThan(1);
@@ -569,7 +569,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Verify pagination was triggered
       const fetchCalls = (global.fetch as jest.Mock).mock.calls;
@@ -645,7 +645,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should have successfully fetched and merged all pages
       expect(result.success).toBe(true);
@@ -710,7 +710,7 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Should have retried the second page
       expect(attemptMap['page2']).toBeGreaterThan(1);
@@ -754,11 +754,10 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
         });
       }) as jest.Mock;
 
-      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123');
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', ['camp1']);
 
       // Result should not contain paging information
-      expect(result.data).toBeDefined();
-      expect(result.data.adPerformance).toBeDefined();
+      expect(result.formattedContent).toBeDefined();
       
       // The internal data structures should not have paging info
       // (This is implicit since we delete it after merging)
@@ -766,4 +765,3 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     }, 10000);
   });
 });
-
