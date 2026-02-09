@@ -50,31 +50,7 @@ async function saveUserFunnels(userId: string, funnels: FunnelsSettings): Promis
 router.get("/", async (req, res) => {
   try {
     const userId = (req as any).user.userId;
-    let funnels = await getUserFunnels(userId);
-
-    // If no funnels exist, create a default one
-    if (Object.keys(funnels).length === 0) {
-      const defaultStages = [
-        { name: "Homepage", eventName: "page_view", filterExpression: "pagePath=~^/$", color: "#4285F4" },
-        { name: "Form Click", eventName: "click", filterExpression: "linkUrl=~forms.withsurface.com", color: "#34A853" },
-        { name: "Form Submit", eventName: "form_submit", color: "#FBBC04" },
-      ];
-
-      const funnelId = uuidv4();
-      const now = new Date().toISOString();
-
-      funnels = {
-        [funnelId]: {
-          id: funnelId,
-          name: "Main Conversion Funnel",
-          stages: defaultStages,
-          createdAt: now,
-          updatedAt: now,
-        },
-      };
-
-      await saveUserFunnels(userId, funnels);
-    }
+    const funnels = await getUserFunnels(userId);
 
     // Convert to array format for response
     const funnelsArray = Object.values(funnels).map(funnel => ({

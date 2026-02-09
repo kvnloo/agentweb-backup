@@ -81,13 +81,9 @@ describe('Funnel Routes', () => {
       expect(response.body.funnels[0].name).toBe('Main Conversion Funnel');
     });
 
-    it('should create default funnel if none exists', async () => {
+    it('should return empty list when no funnels exist', async () => {
       mockGet.mockReturnValue({
         promise: jest.fn().mockResolvedValue({ Item: undefined })
-      });
-
-      mockPut.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({})
       });
 
       const response = await request(app)
@@ -95,9 +91,8 @@ describe('Funnel Routes', () => {
         .expect(200);
 
       expect(response.body.success).toBe(true);
-      expect(response.body.funnels).toHaveLength(1);
-      expect(response.body.funnels[0].name).toBe('Main Conversion Funnel');
-      expect(mockPut).toHaveBeenCalled();
+      expect(response.body.funnels).toEqual([]);
+      expect(mockPut).not.toHaveBeenCalled();
     });
   });
 
