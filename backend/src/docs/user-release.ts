@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-09',
+    changes: [
+      'Enhanced User Journey Funnel Management in SEO/GEO Page',
+      '- Users can now delete the last funnel without restriction',
+    ],
+  },
+  {
     date: '2026-02-08',
     changes: [
       'Fixed MCP Session Concurrency Issue for Scheduled Chats',
