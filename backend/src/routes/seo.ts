@@ -447,6 +447,28 @@ router.get("/metrics", async (req, res) => {
 
           const propertyId = user.googleAnalyticsPropertyId;
 
+          // Build dimension filter to exclude filtered domains
+          let dimensionFilter: any = undefined;
+          if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
+            const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
+              notExpression: {
+                filter: {
+                  fieldName: "hostName",
+                  stringFilter: {
+                    matchType: "CONTAINS" as const,
+                    value: domain,
+                  },
+                },
+              },
+            }));
+
+            dimensionFilter = {
+              andGroup: {
+                expressions: notExpressions,
+              },
+            };
+          }
+
           // Fetch overall metrics (basic metrics first)
           const [overallResponse] = await gaClient.runReport({
             property: `properties/${propertyId}`,
@@ -463,6 +485,7 @@ router.get("/metrics", async (req, res) => {
               { name: "averageSessionDuration" },
               { name: "bounceRate" },
             ],
+            ...(dimensionFilter && { dimensionFilter }),
           });
 
           // Fetch top pages by engagement
@@ -485,7 +508,7 @@ router.get("/metrics", async (req, res) => {
                 },
               ],
               dimensions: [
-                { name: "pageTitle" },
+                // Only use pagePath and hostName to avoid duplicate rows for different page titles
                 { name: "pagePath" },
                 { name: "hostName" },
               ],
@@ -497,20 +520,20 @@ router.get("/metrics", async (req, res) => {
               ],
               orderBys: [
                 {
-                  metric: { metricName: "engagementRate" },
+                  metric: { metricName: "userEngagementDuration" },
                   desc: true,
                 },
               ],
               limit: 20,
+              ...(dimensionFilter && { dimensionFilter }),
             });
 
             if (pagesEngagementResponse.rows) {
               pagesEngagementResponse.rows.forEach((row) => {
                 const dimensions = row.dimensionValues || [];
                 const metrics = row.metricValues || [];
-                const pageTitle = dimensions[0]?.value || "Untitled";
-                const pagePath = dimensions[1]?.value || "";
-                const hostName = dimensions[2]?.value || "";
+                const pagePath = dimensions[0]?.value || "";
+                const hostName = dimensions[1]?.value || "";
                 const sessions = parseInt(metrics[0]?.value || "0");
                 const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
                 const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
@@ -528,8 +551,9 @@ router.get("/metrics", async (req, res) => {
                   fullUrl = `https://${user.seoDomains[0]}${path}`;
                 }
 
+                // Use the path as the title since we're grouping by path
                 topPagesByEngagement.push({
-                  pageTitle,
+                  pageTitle: pagePath,
                   pagePath: fullUrl,
                   sessions,
                   engagementRate,
@@ -559,6 +583,7 @@ router.get("/metrics", async (req, res) => {
               { name: "screenPageViews" },
             ],
             keepEmptyRows: false,
+            ...(dimensionFilter && { dimensionFilter }),
           });
 
           // Fetch traffic sources for AEO analysis
@@ -587,6 +612,7 @@ router.get("/metrics", async (req, res) => {
               },
             ],
             limit: 50,
+            ...(dimensionFilter && { dimensionFilter }),
           });
 
 
