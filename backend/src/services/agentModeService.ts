@@ -501,14 +501,23 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
-      // 1. Initial Data Fetching (Pre-Loop)
-      let currentSession = await chatbotDb.getChatSession(sessionId);
+      // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
+      let [
+        currentSession,
+        availableTemplates,
+        userAllowedTools,
+        publishedSkills,
+        baseSystemPrompt
+      ] = await Promise.all([
+        chatbotDb.getChatSession(sessionId),
+        this.getAvailableTemplates(),
+        getAllowedFunctionCalls(userId),
+        skillService.getPublishedSkills(),
+        this.getMarketingSystemPrompt()
+      ]);
+
       const workPlan = currentSession?.workPlan;
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
-      const availableTemplates = await this.getAvailableTemplates();
-
-      // Get allowed tools from subscription service (cached for the request)
-      const userAllowedTools = await getAllowedFunctionCalls(userId);
 
       // 2. Initialize Context Variables
       let associatedSkills: any[] = [];
@@ -519,13 +528,10 @@ export class AgentModeService {
       // Build initial skill context
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedTools);
 
-      // Helper to build System Prompt
-      let baseSystemPrompt = await this.getMarketingSystemPrompt();
       // 3. Build Initial Messages
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
 
       let availableSkillContextMsg = '';
-      const publishedSkills = await skillService.getPublishedSkills();
       if (publishedSkills.length > 0) {
         const availableSkillContext = publishedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description}`).join('\n');
         availableSkillContextMsg = `Available Skills:\n${availableSkillContext}`;
@@ -600,7 +606,7 @@ export class AgentModeService {
 
         // 5. Get Tools (Cached)
         if (!filteredToolsCache) {
-             filteredToolsCache = await this.getFilteredTools(userId, sessionId, allowedToolNames);
+             filteredToolsCache = await this.getFilteredTools(userId, allowedToolNames, userAllowedTools);
         }
 
         // Make LLM call
@@ -667,29 +673,13 @@ export class AgentModeService {
         }
 
         // Execute tool calls
+        // Collect tool call counts for batched DB update (reduces N writes to 1)
+        const pendingCounterUpdates: Record<string, number> = {};
+
         for (const toolCall of responseMessage.tool_calls) {
           let functionArgs: any;
           try {
-            try {
-              functionArgs = JSON.parse(toolCall.function.arguments);
-            } catch (parseError) {
-              console.error(`AgentMode: Failed to parse tool arguments for ${toolCall.function.name}:`, parseError);
-              toolCalls.push({
-                id: toolCall.id,
-                name: toolCall.function.name,
-                arguments: toolCall.function.arguments, // Store as raw string since JSON parsing failed
-                error: 'Invalid JSON in tool arguments'
-              });
-              
-               // Append error as tool message so LLM knows it failed
-               messages.push({
-                tool_call_id: toolCall.id,
-                role: 'tool',
-                name: toolCall.function.name,
-                content: `Error: Invalid JSON in arguments: ${(parseError as any).message}`
-              });
-              continue;
-            }
+            functionArgs = JSON.parse(toolCall.function.arguments);
 
             // Check if we need to refresh skills for next iteration
             if (toolCall.function.name === 'install_skills') {
@@ -717,13 +707,9 @@ export class AgentModeService {
               });
             }
 
-            // Update the calledFunctions counter immediately after successful tool call
-            try {
-              await chatbotDb.incrementCalledFunctions(sessionId, { [toolCall.function.name]: 1 });
-            } catch (counterError) {
-              console.error('AgentMode: Failed to update function call counter:', counterError);
-              // Don't fail the whole tool call if counter update fails
-            }
+            // Collect for batched counter update instead of immediate DB write
+            pendingCounterUpdates[toolCall.function.name] = 
+              (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
             // Append the tool call result as a tool message for the model to consume next
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
@@ -765,6 +751,16 @@ export class AgentModeService {
               name: toolCall.function.name,
               content: errorContent
             });
+          }
+        }
+
+        // Batch update function call counters after processing all tools in this iteration
+        if (Object.keys(pendingCounterUpdates).length > 0) {
+          try {
+            await chatbotDb.incrementCalledFunctions(sessionId, pendingCounterUpdates);
+          } catch (counterError) {
+            console.error('AgentMode: Failed to batch update function call counters:', counterError);
+            // Don't fail the whole iteration if counter update fails
           }
         }
 
@@ -906,9 +902,20 @@ export class AgentModeService {
     return `
       You are Emma, an AI-powered marketing assistant from AgentWeb. You help users execute marketing campaigns through natural conversation.
 
+      ## Your Capabilities
+      You can help with various marketing tasks including:
+      - Market research and competitive analysis
+      - SWOT analysis for businesses
+      - Marketing strategy development
+      - Ad creative generation and campaign management
+      - Performance analysis and optimization
+      - Meta ads metrics analysis and insights
+      - Social media listening and brand monitoring
+      - Web search for current information and real-time data
+      - Analysis of attached files and documents
+
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
-
       ### 1. ANALYZE (Think Through the Complete Task)
       Before doing anything, break down the user's request into ALL the individual actions/tools you will need:
       - What data do you need to read? (e.g., brand guidelines, market strategy)
@@ -920,15 +927,15 @@ export class AgentModeService {
       - Match each required action to a skill by checking the Tools list
       - For complex tasks, you will typically need 2-4 skills
       - Example: "read brand guidelines and create a blog" requires:
-        - Brand Strategy & Market Research (has read_brand_guidelines)
-        - Content Intelligence & Authoring (has create_blog_article)
+      - Brand Strategy & Market Research (has read_brand_guidelines)
+      - Content Intelligence & Authoring (has create_blog_article)
 
       ### 3. INSTALL ALL SKILLS AT ONCE
       Use \`install_skills\` with an array containing ALL the skill IDs you identified:
       - Do NOT install skills one at a time
       - Do NOT start executing until all required skills are installed
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
-      
+
       ### 4. EXECUTE
       Once all skills are installed and tools are available:
       - Use the tools to fulfill the user's request
@@ -940,181 +947,6 @@ export class AgentModeService {
       * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
-
-<<<<<<< HEAD
-## File Attachments
-When users attach files to their messages, you will receive:
-- **Attached Files**: Clickable markdown links in the format \`[filename](url)\`
-- You can reference these files by their URLs and analyze their content
-- Use the file URLs to understand what the user has shared and provide relevant assistance
-- **IMPORTANT**: When creating tasks that are related to the attached files, you MUST include the attachment details (URLs and filenames) in the task prompt, otherwise the task execution won't have access to the files
-
-## Page Content Extraction
-- **read_page_source**: Use this tool to read HTML source code from webpages. However, if the result contains mostly JavaScript code or script tags instead of actual page content, the page likely requires browser rendering.
-- **Fallback for JavaScript-rendered pages**: If \`read_page_source\` returns script code instead of content, use \`create_task_from_template\` with template \`__extract_page_content__\` and the page url to fetch the page content using browser automation. This will take about 30 seconds but can handle JavaScript-rendered content.
-
-## HTML File Updates
-When updating HTML files, follow this process:
-1. **First, read the original file**: Use the \`read_file\` tool to get the complete HTML content from the file URL
-2. **Analyze the content**: Review the full HTML structure to understand what needs to be modified
-3. **Make targeted changes**: Update only the specific parts that need modification while preserving the rest
-4. **Save as new file**: Use the \`save_file\` tool to save the updated content to a new file
-5. **Never truncate or use placeholders**: Always include the complete, updated HTML content in the save_file call
-6. **Preserve structure**: Maintain the original HTML structure, DOCTYPE, head, body, and styling
-7. **Complete content only**: Do not use "...", "[content continues]", or any truncation indicators
-
-## Task Creation Approach
-- **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
-- **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
-- **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
-- **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
-- All available templates are provided in the context above - select the most appropriate one based on the user's request
-- Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
-- Example: {"site_url": "example.com", "business_area": "e-commerce"}
-- Templates provide structured, proven approaches to common web automation marketing tasks
-- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
-- The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
- - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
- - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
- - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
- - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
-   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
-- **Meta Ads Campaigns and Metrics**:
-- Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
-- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data. You can optionally filter by campaign_id to get metrics for a specific campaign
-- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns with their IDs, then let the user choose which campaign to analyze, and call 'get_meta_ads_metrics' with the selected campaign_id for accurate filtering
-- When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
-- Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
-- Consider the user's industry, business stage, and previous conversation context when analyzing performance
-- Compare metrics against industry benchmarks and identify specific optimization opportunities
-- If a user asks about a specific ad that doesn't appear in the metrics data, explain that the ad may be disabled, paused, or have no activity in the selected timeframe
-- **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
-- **Web Search**: Use 'search_web' proactively to gather information from the internet before asking users for clarification
-- **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
-- **When to search**: Before asking users for more details, search for market data, industry trends, competitor information, or other information available on the internet
-- **Search first, ask second**: Use web search to gather background information and context from the internet before requesting additional details from users
-- **Search topics include**: Market trends, industry benchmarks, competitor analysis, news, regulatory information, technology updates, or any information from the internet that would help provide better recommendations
-- **Search strategy**: Use specific, targeted search queries to find the most relevant information
-- **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
-- **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
-- **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
-- **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
-- **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
-
-- **Previous Task Results**: Previous task results are automatically attached by default to provide context
-- This includes the latest HTML results from previous completed tasks in the same conversation
-- Set attach_previous_task_results to false only if you don't want previous results included
-- **Revision Method**: [DEPRECATED: 'create_revision' is deprecated] For image revision, use 'generate_image' with the original image as an input image. For HTML report revision, use 'update_html_file' to update the HTML file content.
-
-## "whitepapers" / "research reports" / "executive summaries"
-
-For whitepapers, research reports, or executive summaries (target: 8-12 pages):
-
-**Step 1 - Deep Research**
-Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages). This returns research_url (S3 URL).
-
-**Step 2 - Generate Charts**: Call 'perform_data_analysis' with:
-      - file_urls: [research_url from Step 1]
-      - analysis_instruction: "Analyze the research data and generate 3-4 chart images using Python matplotlib or plotly. Output actual PNG/image files (not JavaScript or HTML code). Create bar charts, pie charts, line graphs, or diagrams that illustrate key statistics, trends, and comparisons mentioned in the research. Use plt.savefig() to output each chart as an image."
-      Save the chart image URLs from the response (embedded as ![Chart](url) in the analysis output).
-
-**Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
-
-**Step 4 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
-      1. Executive Summary (length="short", ~1 page)
-      2. Introduction/Background (length="short", ~1 page)
-      3. Key Findings (length="medium", ~2 pages)
-      4. Analysis/Discussion (length="long", ~3 pages)
-      5. Conclusion & Recommendations (length="short", ~1 page)
-      6. References (length="short")
-
-      Do NOT create chapters within sections. Do NOT create more than 6 sections.
- **Step 5 - Generate Content**: For EACH section, call 'generate_book_content' with:
-      - book_id, section_id
-      - research_url: Pass the S3 URL from Step 1 (the function will fetch research content automatically)
-      - content_description: Brief section-specific instructions. **IMPORTANT**: If this section should include charts from Step 2, add to content_description: "Include the following chart image: ![Chart Title](chart_url_from_step_2)" for each relevant chart.
-      - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
-      - imagine: false (stick to research facts, don't invent details)
-
-## Task Execution
-- When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
-- The tool call results will include the current status of any running tasks
-- You can reference the status information provided in the tool call results
-- If a user asks about task status, use the current status from the tool call results
-
-## Communication Style
-- Be helpful, professional, and conversational
-- **Research before asking**: Use web search to gather current information before asking users for clarification
-- **Proactive information gathering**: Search for market data, trends, and context to provide more informed recommendations
-- **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
-- Ask clarifying questions only after you've searched for available information
-- **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
-- **Task confirmation required**: Always explain what a task will do and ask for confirmation before creating it (tasks take time to complete)
-- **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
-- Provide clear explanations of what you're doing and what information you've found
-- Keep responses concise but informative
-- Always confirm task creation and provide relevant details
-- When using templates, explain which template was selected and why
-- When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
-- Focus on actionable insights and strategic guidance based on current data and conversation context
-- If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
-- **Never offer to pull metrics for individual ads by name** - you can only analyze the ads that appear in the current metrics data set
-
-## Work Plan Capabilities
-You can create and manage multi-step work plans using these tools:
-- **create_work_plan**: Create a structured plan with a title and numbered steps. Each step can include optional requiredFunctionCalls to enforce validation. **CRITICAL: Always check your context messages for an existing work plan before creating a new one. If a work plan already exists (you'll see a message starting with "⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS"), DO NOT create a new plan - use modify_work_plan instead.**
-- **modify_work_plan**: Add new steps or modify existing step details (does not change status). Can also add or modify requiredFunctionCalls for steps. Use this when a work plan already exists and you need to make changes.
-- **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes. **IMPORTANT**: If a step has requiredFunctionCalls defined, you MUST have called those functions before marking it as completed, or you'll get an error.
-
-Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
-
-## GTM Plan Capabilities
-You can read and create Go-To-Market (GTM) plans using these tools:
-- **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.
-- **read_gtm_plan**: Read a specific GTM plan by its plan ID. Returns complete plan details including all phases and work items with their statuses, durations, completion times, and DRI (Directly Responsible Individual) email addresses at plan, phase, and item levels.
-- **create_gtm_plan**: Create a new GTM plan with a title, optional description, optional DRI (Directly Responsible Individual) email at plan level, and optional phases with work items. You can create a complete plan structure in one call by including phases (each with title, description, duration, optional DRI) and work items (each with title, optional description, optional duration, optional DRI) within each phase. DRI can be specified at the plan level, phase level, or work item level. Returns the created plan with its unique identifier.
-
-**IMPORTANT RESTRICTIONS:**
-- **You CANNOT modify existing GTM plans** - You can only read existing plans and create new ones.
-- **You CANNOT update work item statuses** - You cannot mark work items as completed, skipped, or pending.
-- **You CANNOT add phases or work items to existing plans** - You cannot modify the structure of an existing GTM plan.
-- **To modify plans**: Users must go to the /gtm-plan page in the customer portal to manually add phases, work items, update statuses, and make other changes.
-
-Use GTM plans to understand the user's go-to-market strategy and provide context-aware assistance. When a user asks about their GTM plan, use read_gtm_plan to get the current state and provide insights based on the plan structure and progress. When creating a GTM plan, you can include the complete structure with phases and work items in a single call.
-
-## Lead Lists Management
-You can manage lead lists and add leads to them using these tools:
-- **get_lead_lists**: Get all lead lists for the user. Returns list IDs, names, descriptions, lead counts, and creation dates. Use this to see what lead lists exist before adding leads or creating new lists.
-- **create_lead_list**: Create a new lead list with a name and optional description. Returns the created list with its ID. Use this when the user wants to organize leads into a new list.
-- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
-
-**Best Practices for Lead Lists:**
-- When a user wants to add leads, first check if a suitable list exists using get_lead_lists
-- If no appropriate list exists, offer to create one using create_lead_list
-- When adding leads, use field names that make sense for the data you're storing - you're not limited to predefined fields
-- The email field (if provided) is used for deduplication and merging - leads with the same email will be merged with existing records
-- Include as much information as possible to make the leads more valuable
-- You can use any field names - standard fields (email, firstName, lastName, phone, company, title, notes, linkedin) are recognized, and all other fields will be stored as custom fields
-- Always confirm the list_id with the user or use get_lead_lists to find the correct one before adding leads
-
-### Required Function Calls
-You can specify required function calls for any step to ensure proper validation:
-- Add requiredFunctionCalls array when creating or modifying steps
-- Example: \`requiredFunctionCalls: ["create_blog_article", "generate_image"]\`
-- When marking a step as completed, the system will validate that all required functions were actually called
-- If any required functions are missing, you'll get an error message listing what's missing
-- This ensures you don't skip important work before marking steps complete
-
-### Client Onboarding Workflow
-When a user requests client onboarding or says "onboard new client" or similar:
-1. **Ask for website URL**: Request their business website URL first
-2. **Create the work plan**: Use create_work_plan with title "Client Onboarding" and these steps with required function calls:
-   - Step 1: Analyze website and business (requiredFunctionCalls: ["search_web"])
-   - Step 2: Create/update brand guidelines (requiredFunctionCalls: ["update_brand_guidelines"])
-   - Step 3: Create/update marketing strategy (requiredFunctionCalls: ["update_marketing_strategy"])
-   - Step 4: Generate 3 blog articles (requiredFunctionCalls: ["create_blog_article"])
-   - Step 5: Generate social media posts (requiredFunctionCalls: ["generate_image"])
 
       ## Handling File Attachments
       When users attach files, you see them as markdown links: \`[filename](url)\`.
@@ -1456,53 +1288,43 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   // Get filtered tools based on user's subscription type AND session state
   // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
-  public async getFilteredTools(userId: string, sessionId: string, precomputedAllowedNames?: Set<string>): Promise<any[]> {
+  public async getFilteredTools(
+    userId: string, 
+    precomputedAllowedSkillToolNames?: Set<string>,
+    precomputedAllowedAllFunctionCalls?: string[]  // New parameter to avoid duplicate getAllowedFunctionCalls call
+  ): Promise<any[]> {
     try {
-      // 1. Get all internal tool objects (flat structure with .name)
-      const allInternalTools = this.toolRegistry.getAllTools();
       
-      let allowedNames: Set<string>;
+      if (precomputedAllowedSkillToolNames) {
+        // 1. Get all internal tool objects (flat structure with .name)
+        const allInternalTools = this.toolRegistry.getAllTools();
 
-      if (precomputedAllowedNames) {
-        // Use pre-computed set if available (optimization)
-        allowedNames = precomputedAllowedNames;
-      } else {
-        // Fallback: Compute allowed names from scratch if not provided
-        allowedNames = new Set<string>();
-        allowedNames.add('install_skills'); // Foundational
+        // 3. Filter the internal tool objects
+        const contextAwareTools = allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name));
 
-        // Load associated skills from DATABASE
-        const session = await chatbotDb.getChatSession(sessionId);
-        const currentAssociated = session?.associatedSkills || [];
+        // 4. Map back to wire-format definitions for the LLM
+        const definitions = contextAwareTools.map(t => t.definition);
 
-        if (currentAssociated.length) {
-          const associatedSkills = await skillService.getSkillsByIds(currentAssociated);
-          const toolNames = associatedSkills.flatMap(skill => skill.toolNames);
-          toolNames.forEach(toolName => allowedNames.add(toolName));
-        }
-      }
-
-      // 3. Filter the internal tool objects
-      const contextAwareTools = allInternalTools.filter(tool => allowedNames.has(tool.name));
-
-      // 4. Map back to wire-format definitions for the LLM
-      const definitions = contextAwareTools.map(t => t.definition);
-
-      // 5. Apply Subscription Filtering
-      // IMPORTANT: Tools associated via Skills bypass subscription filtering
-      // The Skills system is now the primary access control mechanism
-      const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+        // 5. Apply Subscription Filtering
+        // IMPORTANT: Tools associated via Skills bypass subscription filtering
+        // The Skills system is now the primary access control mechanism
+        // Use pre-fetched allowedFunctionCalls if available to avoid duplicate DB call
+        const allowedFunctionCalls = precomputedAllowedAllFunctionCalls 
+        ? [...precomputedAllowedAllFunctionCalls]  // Clone to avoid mutation
+        : await getAllowedFunctionCalls(userId);
       
-      // Add all session-associated tools to the allowed list to bypass subscription filtering
-      if (!allowedFunctionCalls.includes('*')) {
-        allowedNames.forEach(name => {
-          if (!allowedFunctionCalls.includes(name)) {
-            allowedFunctionCalls.push(name);
-          }
+        // Add all session-associated tools to the allowed list to bypass subscription filtering
+        if (!allowedFunctionCalls.includes('*')) {
+          precomputedAllowedSkillToolNames.forEach(name => {
+            if (!allowedFunctionCalls.includes(name)) {
+              allowedFunctionCalls.push(name);
+            }
         });
       }
 
       return filterFunctionCalls(definitions, allowedFunctionCalls);
+    }
+    return [];
     } catch (error) {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
