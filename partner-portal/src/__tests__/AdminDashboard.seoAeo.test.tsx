@@ -174,7 +174,7 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
 
     it('should call API with Microsoft Clarity Project ID', async () => {
       mockedAxios.put.mockResolvedValueOnce({
-        data: { 
+        data: {
           userId: mockUserId,
           clarityProjectId: 'ul13e4f7fe'
         },
@@ -197,6 +197,184 @@ describe('AdminDashboard - SEO/AEO Configuration', () => {
         })
       );
       expect(response.data.clarityProjectId).toBe('ul13e4f7fe');
+    });
+  });
+
+  describe('gaFilteredDomains configuration', () => {
+    it('should call API with gaFilteredDomains containing standard domains', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: {
+          userId: mockUserId,
+          gaFilteredDomains: ['app.example.com', 'admin.example.com']
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        { gaFilteredDomains: ['app.example.com', 'admin.example.com'] },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(mockedAxios.put).toHaveBeenCalledWith(
+        expect.stringContaining('/api/admin/users/user1/seo-aeo'),
+        { gaFilteredDomains: ['app.example.com', 'admin.example.com'] },
+        expect.objectContaining({
+          headers: { Authorization: `Bearer ${mockToken}` }
+        })
+      );
+      expect(response.data.gaFilteredDomains).toEqual(['app.example.com', 'admin.example.com']);
+    });
+
+    it('should call API with gaFilteredDomains containing localhost', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: {
+          userId: mockUserId,
+          gaFilteredDomains: ['localhost', 'localhost:3000']
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        { gaFilteredDomains: ['localhost', 'localhost:3000'] },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(response.data.gaFilteredDomains).toEqual(['localhost', 'localhost:3000']);
+    });
+
+    it('should call API with gaFilteredDomains containing IP addresses', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: {
+          userId: mockUserId,
+          gaFilteredDomains: ['127.0.0.1', '192.168.1.1:8080']
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        { gaFilteredDomains: ['127.0.0.1', '192.168.1.1:8080'] },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(response.data.gaFilteredDomains).toEqual(['127.0.0.1', '192.168.1.1:8080']);
+    });
+
+    it('should call API with mixed gaFilteredDomains (domains, localhost, IPs)', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: {
+          userId: mockUserId,
+          gaFilteredDomains: ['app.example.com', 'localhost', '127.0.0.1']
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        { gaFilteredDomains: ['app.example.com', 'localhost', '127.0.0.1'] },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(response.data.gaFilteredDomains).toEqual(['app.example.com', 'localhost', '127.0.0.1']);
+    });
+
+    it('should handle API errors for invalid gaFilteredDomains format', async () => {
+      mockedAxios.put.mockRejectedValueOnce({
+        response: {
+          status: 400,
+          data: {
+            message: 'Invalid filtered domain format: invalid_domain. Please use format like app.example.com, localhost, or an IP address'
+          }
+        }
+      });
+
+      try {
+        await mockedAxios.put(
+          `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+          { gaFilteredDomains: ['invalid_domain'] },
+          {
+            headers: { Authorization: `Bearer ${mockToken}` }
+          }
+        );
+      } catch (error: any) {
+        expect(error.response.status).toBe(400);
+        expect(error.response.data.message).toContain('Invalid filtered domain format');
+      }
+    });
+
+    it('should call API with empty gaFilteredDomains array', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: {
+          userId: mockUserId,
+          gaFilteredDomains: []
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        { gaFilteredDomains: [] },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(response.data.gaFilteredDomains).toEqual([]);
+    });
+
+    it('should call API with all SEO/AEO fields including gaFilteredDomains', async () => {
+      mockedAxios.put.mockResolvedValueOnce({
+        data: {
+          userId: mockUserId,
+          seoDomains: ['example.com'],
+          googleAnalyticsPropertyId: '123456789',
+          gaFilteredDomains: ['app.example.com', 'localhost'],
+          clarityProjectId: 'ul13e4f7fe',
+          productDomain: 'app.example.com'
+        },
+        status: 200
+      });
+
+      const response = await mockedAxios.put(
+        `http://localhost:3001/api/admin/users/${mockUserId}/seo-aeo`,
+        {
+          seoDomains: ['example.com'],
+          googleAnalyticsPropertyId: '123456789',
+          gaFilteredDomains: ['app.example.com', 'localhost'],
+          clarityProjectId: 'ul13e4f7fe',
+          productDomain: 'app.example.com'
+        },
+        {
+          headers: { Authorization: `Bearer ${mockToken}` }
+        }
+      );
+
+      expect(mockedAxios.put).toHaveBeenCalledWith(
+        expect.stringContaining('/api/admin/users/user1/seo-aeo'),
+        {
+          seoDomains: ['example.com'],
+          googleAnalyticsPropertyId: '123456789',
+          gaFilteredDomains: ['app.example.com', 'localhost'],
+          clarityProjectId: 'ul13e4f7fe',
+          productDomain: 'app.example.com'
+        },
+        expect.objectContaining({
+          headers: { Authorization: `Bearer ${mockToken}` }
+        })
+      );
+      expect(response.data.gaFilteredDomains).toEqual(['app.example.com', 'localhost']);
+      expect(response.data.seoDomains).toEqual(['example.com']);
+      expect(response.data.googleAnalyticsPropertyId).toBe('123456789');
     });
   });
 });

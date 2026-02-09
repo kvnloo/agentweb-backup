@@ -14,6 +14,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Implemented session-based MCP client pooling - each chat session now gets its own isolated MCP client',
       '- Added automatic cleanup of stale session pools after 1 hour of inactivity',
       '- Scheduled chats and agent mode now work reliably under concurrent load',
+      'Added Google Analytics Domain Filtering for SEO/GEO Page',
+      '- New "Filtered Domains (GA)" field in Admin Dashboard SEO/AEO configuration allows excluding specific domains from analytics',
+      '- Filter out development/internal traffic from subdomains (e.g., app.agentweb.pro, localhost) when viewing landing site analytics',
+      '- Top Pages by Engagement now groups by path instead of page title to eliminate duplicate entries for multilingual pages',
     ],
   },
   {
