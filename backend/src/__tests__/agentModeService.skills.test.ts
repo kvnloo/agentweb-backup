@@ -30,12 +30,23 @@ jest.mock('../services/subscriptionService', () => ({
   filterFunctionCalls: jest.fn().mockImplementation((tools) => tools),
 }));
 
-// Mock MCP client service
 jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({
     initialize: jest.fn(),
     getTools: jest.fn().mockReturnValue([]),
     shutdown: jest.fn(),
+    refresh: jest.fn(), // Added refresh mock
+  })),
+}));
+
+// Mock ToolRegistry
+jest.mock('../mcp/client/toolRegistry', () => ({
+  ToolRegistry: jest.fn().mockImplementation(() => ({
+    register: jest.fn(),
+    unregister: jest.fn(),
+    getAllTools: jest.fn().mockReturnValue([]),
+    getTool: jest.fn(),
+    getToolDefinitions: jest.fn().mockReturnValue([]),
   })),
 }));
 
@@ -156,11 +167,67 @@ describe('AgentModeService - Skills', () => {
 
       expect(result.message).toContain('error occurred');
     });
+
+    it('should install other_skills virtual skill', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ];
+      
+      // Mock getUnassociatedTools behavior - we need to mock internal method or toolRegistry
+      // Easier to spy on toolRegistry in beforeEach if we could, but here we can rely on 
+      // the fact that getUnassociatedTools calls this.toolRegistry.getAllTools()
+      
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } }, // associated
+        { name: 'orphan_tool', definition: { function: { description: 'desc2' } } }, // unassociated
+        { name: 'install_skills', definition: { function: { description: 'infra' } } } // infra
+      ];
+      
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await agentModeService.installSkills(
+        ['__other_skills__'],
+        'user-123',
+        'session-123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.installedSkills).toContain('other_skills');
+      expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', ['__other_skills__']);
+    });
+
+    it('should install mixed real skills and other_skills', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ];
+      
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } }, 
+        { name: 'orphan_tool', definition: { function: { description: 'desc2' } } }
+      ];
+      
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      (chatbotDb.addAssociatedSkills as jest.Mock).mockResolvedValue(undefined);
+
+      const result = await agentModeService.installSkills(
+        ['skill-1', '__other_skills__'],
+        'user-123',
+        'session-123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.installedSkills).toContain('Skill 1');
+      expect(result.installedSkills).toContain('other_skills');
+      expect(chatbotDb.addAssociatedSkills).toHaveBeenCalledWith('session-123', ['skill-1', '__other_skills__']);
+    });
   });
 
   describe('buildSkillContext', () => {
     it('should add install_skills to allowed tools by default', () => {
-      const result = (agentModeService as any).buildSkillContext([], ['*']);
+      const result = (agentModeService as any).buildSkillContext([], ['*'], [], []);
 
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
     });
@@ -170,7 +237,7 @@ describe('AgentModeService - Skills', () => {
         { skillId: 's1', name: 'Skill', toolNames: ['tool1', 'tool2'], description: '', isPublished: true },
       ];
 
-      const result = (agentModeService as any).buildSkillContext(skills, ['*']);
+      const result = (agentModeService as any).buildSkillContext(skills, ['*'], [], []);
 
       expect(result.allowedToolNames.has('tool1')).toBe(true);
       expect(result.allowedToolNames.has('tool2')).toBe(true);
@@ -183,7 +250,7 @@ describe('AgentModeService - Skills', () => {
       // User only has access to tool1 and tool2
       const userAllowedTools = ['tool1', 'tool2'];
 
-      const result = (agentModeService as any).buildSkillContext(skills, userAllowedTools);
+      const result = (agentModeService as any).buildSkillContext(skills, userAllowedTools, [], []);
 
       expect(result.allowedToolNames.has('tool1')).toBe(true);
       expect(result.allowedToolNames.has('tool2')).toBe(true);
@@ -195,7 +262,7 @@ describe('AgentModeService - Skills', () => {
         { skillId: 's1', name: 'Content Creation', description: 'Create content', systemPrompt: 'Custom instructions', toolNames: ['tool1'], isPublished: true },
       ];
 
-      const result = (agentModeService as any).buildSkillContext(skills, ['*']);
+      const result = (agentModeService as any).buildSkillContext(skills, ['*'], [], []);
 
       expect(result.installedSkillContextMsg).toContain('Installed Skills:');
       expect(result.installedSkillContextMsg).toContain('Content Creation');
@@ -203,14 +270,196 @@ describe('AgentModeService - Skills', () => {
     });
 
     it('should return empty context message when no skills', () => {
-      const result = (agentModeService as any).buildSkillContext([], ['*']);
+      const result = (agentModeService as any).buildSkillContext([], ['*'], [], []);
 
       expect(result.installedSkillContextMsg).toBe('');
+    });
+
+    it('should add unassociated tools when __other_skills__ is associated', () => {
+      const publishedSkills = [
+          { skillId: 's1', name: 'S1', toolNames: ['t1'], isPublished: true }
+      ];
+      const mockTools = [
+          { name: 't1', definition: {} },
+          { name: 'orphan_tool', definition: {} }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).buildSkillContext([], ['*'], publishedSkills, ['__other_skills__']);
+
+      expect(result.allowedToolNames.has('orphan_tool')).toBe(true);
+    });
+
+    it('should exclude infrastructure tools from unassociated tools', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+          { name: 'orphan_tool', definition: {} },
+          { name: 'install_skills', definition: {} },
+          { name: 'explore_skills', definition: {} },
+          { name: 'mcpservers_fetch', definition: {} }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).buildSkillContext([], ['*'], publishedSkills, ['__other_skills__']);
+
+      // orphan_tool should be included
+      expect(result.allowedToolNames.has('orphan_tool')).toBe(true);
+      // install_skills is always included (infrastructure but needed)
+      expect(result.allowedToolNames.has('install_skills')).toBe(true);
+      // explore_skills and mcpservers_fetch should NOT be in allowedToolNames from other_skills
+      // (they're infrastructure tools excluded from getUnassociatedTools)
+    });
+  });
+
+  describe('getUnassociatedTools', () => {
+    it('should return tools not associated with any published skill', () => {
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1', 'tool2'], isPublished: true }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'tool2', definition: { function: { description: 'desc2' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'orphan desc' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('orphan_tool');
+      expect(result[0].description).toBe('orphan desc');
+    });
+
+    it('should exclude infrastructure tools', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'regular_tool', definition: { function: { description: 'regular' } } },
+        { name: 'install_skills', definition: { function: { description: 'infra1' } } },
+        { name: 'explore_skills', definition: { function: { description: 'infra2' } } },
+        { name: 'mcpservers_fetch', definition: { function: { description: 'infra3' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('regular_tool');
+    });
+
+    it('should return empty array when all tools are associated', () => {
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1', 'tool2'], isPublished: true }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'tool2', definition: { function: { description: 'desc2' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(0);
+    });
+
+    it('should handle missing description gracefully', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'tool_no_desc', definition: {} }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('tool_no_desc');
+      expect(result[0].description).toBe('');
+    });
+  });
+
+  describe('buildAvailableSkillsMessage', () => {
+    it('should list published skills not already associated', () => {
+      const publishedSkills = [
+        { skillId: 's1', name: 'Skill 1', description: 'Desc 1', isPublished: true },
+        { skillId: 's2', name: 'Skill 2', description: 'Desc 2', isPublished: true }
+      ];
+      const associatedSkillIds = ['s1'];
+
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, associatedSkillIds);
+
+      expect(result).toContain('Available Skills:');
+      expect(result).toContain('s2- Skill 2: Desc 2');
+      expect(result).not.toContain('s1- Skill 1');
+    });
+
+    it('should include __other_skills__ when there are unassociated tools', () => {
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1'], isPublished: true }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'orphan desc' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, []);
+
+      expect(result).toContain('__other_skills__- other_skills:');
+      expect(result).toContain('orphan_tool: orphan desc');
+    });
+
+    it('should not include __other_skills__ when already associated', () => {
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1'], isPublished: true }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } },
+        { name: 'orphan_tool', definition: { function: { description: 'orphan desc' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, ['__other_skills__']);
+
+      expect(result).not.toContain('__other_skills__');
+    });
+
+    it('should return empty string when no available skills and no unassociated tools', () => {
+      const publishedSkills = [
+        { skillId: 's1', name: 'S1', toolNames: ['tool1'], isPublished: true }
+      ];
+      const mockTools = [
+        { name: 'tool1', definition: { function: { description: 'desc1' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      // All skills associated, all tools associated
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, ['s1']);
+
+      expect(result).toBe('');
+    });
+
+    it('should return empty string when no published skills and only infrastructure tools', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'install_skills', definition: { function: { description: 'infra' } } },
+        { name: 'explore_skills', definition: { function: { description: 'infra' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).buildAvailableSkillsMessage(publishedSkills, []);
+
+      expect(result).toBe('');
     });
   });
 
   describe('getFilteredTools', () => {
     beforeEach(async () => {
+      // Mock tools for getFilteredTools tests
+      const mockTools = [
+        { name: 'read_brand_guidelines', definition: { function: { name: 'read_brand_guidelines', description: 'desc' } } },
+        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } }
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      
       await agentModeService.initialize();
     });
 
@@ -270,6 +519,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         'Installed Skills:\ns1- Skill 1: Description',
+        '', // availableSkillContextMsg
         [],
         new Set(['install_skills'])
       );
@@ -287,6 +537,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         'Installed Skills:\nNEW CONTENT',
+        '', // availableSkillContextMsg
         [],
         new Set(['install_skills'])
       );
@@ -304,12 +555,34 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         '',
+        '', // availableSkillContextMsg
         [],
         new Set(['install_skills'])
       );
 
       const installedMsg = messages.find(m => m.content?.startsWith('Installed Skills:'));
       expect(installedMsg).toBeUndefined();
+    });
+
+    it('should update Available Skills message', () => {
+      const messages: any[] = [
+        { role: 'system', content: 'System prompt' },
+        { role: 'assistant', content: 'Available Skills:\nOLD LIST' },
+      ];
+
+      (agentModeService as any).updateConversationContext(
+        messages,
+        '',
+        'Available Skills:\nNEW LIST', // availableSkillContextMsg
+        [],
+        new Set(['install_skills'])
+      );
+
+      const availableMsgs = messages.filter(m => m.content?.startsWith('Available Skills:'));
+      expect(availableMsgs).toHaveLength(1);
+      expect(availableMsgs[0].content).toContain('NEW LIST');
+      // Should be placed after system prompt (index 1)
+      expect(messages[1].content).toContain('NEW LIST');
     });
   });
 });

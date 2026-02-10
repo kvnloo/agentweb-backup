@@ -5,7 +5,7 @@ mcpToolRegistry.register({
   name: 'install_skills',
   definition: {
     name: 'install_skills',
-    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use.',
+    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -21,6 +21,9 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     if (!context?.userId || !context?.sessionId) {
         throw new Error("Missing user or session context");
+    }
+    if (!Array.isArray(args.skillIds) || args.skillIds.length === 0) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
     }
     return await agentModeService.installSkills(args.skillIds, context.userId, context.sessionId);
   }

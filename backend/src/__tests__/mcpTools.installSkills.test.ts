@@ -136,24 +136,30 @@ describe('MCP Tool - install_skills', () => {
     expect(result.message).toContain('No valid skills found');
   });
 
-  it('should handle empty skillIds array', async () => {
+  it('should return validation error for empty skillIds array', async () => {
     const tool = mcpToolRegistry.getTool('install_skills');
-    
-    const mockResult = {
-      message: 'No valid skills found for the provided IDs.',
-    };
-    (agentModeService.installSkills as jest.Mock).mockResolvedValue(mockResult);
 
     const result = await tool?.execute(
       { skillIds: [] },
       { userId: 'user-123', sessionId: 'session-456' }
     );
 
-    expect(agentModeService.installSkills).toHaveBeenCalledWith(
-      [],
-      'user-123',
-      'session-456'
+    // Should return early with validation message, not call installSkills
+    expect(agentModeService.installSkills).not.toHaveBeenCalled();
+    expect(result.message).toContain('skillIds must be a non-empty array');
+  });
+
+  it('should return validation error for non-array skillIds', async () => {
+    const tool = mcpToolRegistry.getTool('install_skills');
+
+    const result = await tool?.execute(
+      { skillIds: 'not-an-array' },
+      { userId: 'user-123', sessionId: 'session-456' }
     );
+
+    // Should return early with validation message, not call installSkills
+    expect(agentModeService.installSkills).not.toHaveBeenCalled();
+    expect(result.message).toContain('skillIds must be a non-empty array');
   });
 
   it('should propagate service errors', async () => {
