@@ -833,9 +833,14 @@ export class AgentModeService {
     availableTemplates: any[], 
     allowedToolNames: Set<string>
   ) {
+    // Helper to safely check if content starts with a prefix (handles array content)
+    const contentStartsWith = (content: any, prefix: string): boolean => {
+      return typeof content === 'string' && content.startsWith(prefix);
+    };
+
     // 1. Handle Available Skills Message
     // Remove existing message first
-    const availableSkillIdx = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Skills:'));
+    const availableSkillIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Skills:'));
     if (availableSkillIdx !== -1) {
       messages.splice(availableSkillIdx, 1);
     }
@@ -846,7 +851,7 @@ export class AgentModeService {
 
     // 2. Handle Installed Skills Message
     // Remove existing message first
-    const installedIdx = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Installed Skills:'));
+    const installedIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Installed Skills:'));
     if (installedIdx !== -1) {
       messages.splice(installedIdx, 1);
     }
@@ -854,18 +859,18 @@ export class AgentModeService {
     // Insert new message if available
     if (installedSkillContextMsg) {
       // Find optimal insertion point: after "Available Skills" or System Prompt
-      const availableSkillMsgIndex = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Skills:'));
+      const availableSkillMsgIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Skills:'));
       let insertIndex = 1; // Default after system (assuming system is at 0)
       if (availableSkillMsgIndex !== -1) {
         insertIndex = availableSkillMsgIndex + 1;
       }
-      
+
       messages.splice(insertIndex, 0, { role: 'assistant', content: installedSkillContextMsg });
     }
 
     // 3. Handle Available Templates Message
     // Remove existing message first
-    const templatesIdx = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Templates:'));
+    const templatesIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Templates:'));
     if (templatesIdx !== -1) {
       messages.splice(templatesIdx, 1);
     }
@@ -876,12 +881,12 @@ export class AgentModeService {
       if (templatesContext !== 'No templates are currently available.') {
           // Find optimal insertion point
           let insertIndex = 1;
-          const installedIndex = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Installed Skills:'));
-          const availableIndex = messages.findIndex(m => m.role === 'assistant' && m.content && m.content.startsWith('Available Skills:'));
-          
+          const installedIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Installed Skills:'));
+          const availableIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Skills:'));
+
           if (installedIndex !== -1) insertIndex = installedIndex + 1;
           else if (availableIndex !== -1) insertIndex = availableIndex + 1;
-          
+
           messages.splice(insertIndex, 0, { role: 'assistant', content: templatesContext });
       }
     }
