@@ -37,7 +37,13 @@ const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 
 describe('calculateNextRunTime Function Logic', () => {
   beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
     jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
   });
 
   describe('Hourly frequency', () => {
@@ -123,9 +129,8 @@ describe('calculateNextRunTime Function Logic', () => {
       const fromDate = new Date('2026-01-05T09:00:00.000Z');
       const result = calculateNextRunTime('monthly', fromDate);
 
-      // Should be 1st Monday of March 2026 (Mar 2, 2026)
-      // Note: If current date is Feb 2, 2026 or later, the next occurrence is March
-      expect(result.getUTCMonth()).toBe(2); // March
+      // With fixed test clock (Jan 1, 2026), next run is 1st Monday of February 2026 (Feb 2, 2026)
+      expect(result.getUTCMonth()).toBe(1); // February
       expect(result.getUTCDay()).toBe(1); // Monday
       expect(result.getUTCDate()).toBe(2);
     });
@@ -158,43 +163,43 @@ function calculateNextRunTime(frequency: string, fromDate: Date): Date {
 
   switch (frequency) {
     case 'hourly':
-      nextRun.setHours(nextRun.getHours() + 1);
-      nextRun.setMinutes(0, 0, 0);
+      nextRun.setUTCHours(nextRun.getUTCHours() + 1);
+      nextRun.setUTCMinutes(0, 0, 0);
       while (nextRun <= now) {
-        nextRun.setHours(nextRun.getHours() + 1);
+        nextRun.setUTCHours(nextRun.getUTCHours() + 1);
       }
       break;
     case 'daily':
-      nextRun.setDate(nextRun.getDate() + 1);
+      nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       while (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 1);
+        nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       }
       break;
     case 'weekly':
-      nextRun.setDate(nextRun.getDate() + 7);
+      nextRun.setUTCDate(nextRun.getUTCDate() + 7);
       while (nextRun <= now) {
-        nextRun.setDate(nextRun.getDate() + 7);
+        nextRun.setUTCDate(nextRun.getUTCDate() + 7);
       }
       break;
     case 'monthly':
-      const currentDayOfWeek = nextRun.getDay();
-      const currentWeekOfMonth = Math.floor((nextRun.getDate() - 1) / 7);
+      const currentDayOfWeek = nextRun.getUTCDay();
+      const currentWeekOfMonth = Math.floor((nextRun.getUTCDate() - 1) / 7);
 
-      nextRun.setMonth(nextRun.getMonth() + 1);
-      nextRun.setDate(1);
+      nextRun.setUTCMonth(nextRun.getUTCMonth() + 1);
+      nextRun.setUTCDate(1);
 
-      const firstDayOfMonth = nextRun.getDay();
+      const firstDayOfMonth = nextRun.getUTCDay();
       let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
       daysToAdd += currentWeekOfMonth * 7;
-      nextRun.setDate(1 + daysToAdd);
+      nextRun.setUTCDate(1 + daysToAdd);
 
       while (nextRun <= now) {
-        nextRun.setMonth(nextRun.getMonth() + 1);
-        nextRun.setDate(1);
-        const firstDayOfMonth = nextRun.getDay();
+        nextRun.setUTCMonth(nextRun.getUTCMonth() + 1);
+        nextRun.setUTCDate(1);
+        const firstDayOfMonth = nextRun.getUTCDay();
         let daysToAdd = (currentDayOfWeek - firstDayOfMonth + 7) % 7;
         daysToAdd += currentWeekOfMonth * 7;
-        nextRun.setDate(1 + daysToAdd);
+        nextRun.setUTCDate(1 + daysToAdd);
       }
       break;
   }
