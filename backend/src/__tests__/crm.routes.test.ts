@@ -24,6 +24,8 @@ import { Request, Response } from 'express';
 import { crmDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
+import { agentModeService } from '../services/agentModeService';
+import { createLLMService } from '../utils/llmService';
 import router from '../routes/crm';
 
 // Mock dependencies
@@ -52,6 +54,16 @@ jest.mock('../services/db', () => ({
   subscriberDb: {
     getAllTaskSubscribers: jest.fn(),
   },
+}));
+
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    searchWeb: jest.fn(),
+  },
+}));
+
+jest.mock('../utils/llmService', () => ({
+  createLLMService: jest.fn(),
 }));
 
 jest.mock('../services/settingsService', () => ({
@@ -567,6 +579,144 @@ describe('CRM Routes', () => {
       expect(crmDb.updateLead).not.toHaveBeenCalled();
       expect(mockResponse.status).toHaveBeenCalledWith(400);
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'selectedSenderId must reference a configured sender' });
+    });
+  });
+
+  describe('POST /api/crm/lists/:listId/leads/enrich-web', () => {
+    const findEnrichWebPostHandler = () => router.stack.find((r: any) =>
+      r.route?.path === '/lists/:listId/leads/enrich-web' && r.route?.methods?.post
+    );
+
+    it('should return preview counts', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          { leadId: 'lead1', company: 'Acme', customFields: {} },
+          { leadId: 'lead2', company: 'Beta', customFields: { web_company_info: 'Existing info' } },
+          { leadId: 'lead3', company: '' },
+        ],
+        lastEvaluatedKey: null,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'preview' };
+      mockRequest.body = { forceEnrich: false };
+
+      const handler = findEnrichWebPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        totalLeads: 3,
+        leadsWithCompany: 2,
+        alreadyEnrichedLeads: 1,
+        couldBeEnrichedLeads: 1,
+        leadsToProcess: 1,
+      }));
+    });
+
+    it('should set "Company information not found" when search has no results', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          {
+            leadId: 'lead1',
+            company: 'Unknown Co',
+            customFields: {},
+          },
+        ],
+        lastEvaluatedKey: null,
+      });
+      (agentModeService.searchWeb as jest.Mock).mockResolvedValue({
+        success: false,
+        error: 'No search results found',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'enrich' };
+      mockRequest.body = {};
+
+      const handler = findEnrichWebPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
+        customFields: {
+          web_company_info: 'Company information not found',
+        },
+      });
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        processedCount: 1,
+        failedCount: 0,
+      }));
+    });
+
+    it('should retry with stricter JSON instructions when first JSON parse fails', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          {
+            leadId: 'lead-json-retry',
+            company: 'Acme',
+            customFields: {},
+          },
+        ],
+        lastEvaluatedKey: null,
+      });
+      (agentModeService.searchWeb as jest.Mock).mockResolvedValue({
+        success: true,
+        results: [{ title: 'Acme', url: 'https://acme.test', snippet: 'Acme overview' }],
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockRejectedValue(new SyntaxError('Bad JSON')),
+        generateContent: jest.fn().mockResolvedValue('{"web_company_info":"Acme builds B2B software."}'),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'enrich' };
+      mockRequest.body = {};
+
+      const handler = findEnrichWebPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockLlmService.generateJSONContent).toHaveBeenCalled();
+      expect(mockLlmService.generateContent).toHaveBeenCalled();
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead-json-retry', {
+        customFields: {
+          web_company_info: 'Acme builds B2B software.',
+        },
+      });
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        processedCount: 1,
+        failedCount: 0,
+      }));
     });
   });
 

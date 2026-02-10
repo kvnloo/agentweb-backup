@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Enhanced User Journey Funnel Management in SEO/GEO Page',
       '- Users can now delete the last funnel without restriction',
+      'Added CRM Lead "Enrich with Web" Workflow',
+      '- New Enrich with Web action in CRM lead lists with preview dialog and force enrich option',
+      '- Uses web search + AI to generate web_company_info custom field per lead',
+      '- Added progress updates and clearer completion/error messaging during enrichment',
       'Updated Meta Ads Metrics Tooling in Agent Mode',
       '- get_meta_ads_metrics now supports campaign_ids as a list and requires at least one campaign ID',
       '- Added backward compatibility for legacy campaign_id/single-string inputs to prevent tool call failures',
