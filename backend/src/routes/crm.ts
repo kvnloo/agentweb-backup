@@ -1704,20 +1704,43 @@ Return ONLY a JSON object with this exact structure:
   "web_company_info": "string"
 }
 
+JSON formatting rules (mandatory):
+- Output must be valid JSON parsable by JSON.parse
+- Use double quotes for keys and string values
+- Do not wrap output in markdown or code fences
+- Do not include any text before or after the JSON object
+
 Requirements for web_company_info:
 - 3-6 sentences
 - Include what the company does, likely industry/market, key products/services, and notable context
 - Be factual and avoid speculation
 - If no good company information is available from the provided search results, return EXACTLY: "Company information not found"`;
 
+            const leadContext: Record<string, string> = {};
+            const leadNameFromFirstLast = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+            const leadName = String(
+              lead.name ||
+              lead.fullName ||
+              leadNameFromFirstLast ||
+              ''
+            ).trim();
+            if (leadName) {
+              leadContext.name = leadName;
+            }
+            if (lead.email && String(lead.email).trim()) {
+              leadContext.email = String(lead.email).trim();
+            }
+            if (lead.title && String(lead.title).trim()) {
+              leadContext.title = String(lead.title).trim();
+            }
+            if (lead.linkedin && String(lead.linkedin).trim()) {
+              leadContext.linkedin = String(lead.linkedin).trim();
+            }
+
             const userPrompt = `Lead company name: ${companyName}
 
 Lead context:
-${JSON.stringify({
-  name: `${lead.firstName || ''} ${lead.lastName || ''}`.trim() || null,
-  title: lead.title || null,
-  linkedin: lead.linkedin || null,
-}, null, 2)}
+${JSON.stringify(leadContext, null, 2)}
 
 Web search result:
 ${JSON.stringify(webSearchResult, null, 2)}
@@ -1725,11 +1748,48 @@ ${JSON.stringify(webSearchResult, null, 2)}
 Generate web_company_info now.`;
 
             currentStep = 'llm';
-            const response = await llmService.generateJSONContent<{ web_company_info?: string }>(
-              escapeBraces(systemPrompt),
-              escapeBraces(userPrompt),
-              'json'
-            );
+            let response: { web_company_info?: string } | null = null;
+            try {
+              response = await llmService.generateJSONContent<{ web_company_info?: string }>(
+                escapeBraces(systemPrompt),
+                escapeBraces(userPrompt),
+                'json'
+              );
+            } catch (firstParseError: any) {
+              // Retry with stricter formatting instructions to recover from occasional malformed JSON.
+              const strictRetryPrompt = `${userPrompt}
+
+CRITICAL RETRY INSTRUCTIONS:
+Return exactly one JSON object.
+No markdown, no backticks, no comments, no trailing commas.
+Valid example:
+{"web_company_info":"Company information not found"}`;
+
+              const rawRetry = await llmService.generateContent(
+                escapeBraces(systemPrompt),
+                escapeBraces(strictRetryPrompt),
+                'text'
+              );
+
+              const cleanedRetry = rawRetry
+                .trim()
+                .replace(/^```json\s*/i, '')
+                .replace(/^```\s*/i, '')
+                .replace(/\s*```$/, '')
+                .trim();
+
+              try {
+                response = JSON.parse(cleanedRetry);
+              } catch {
+                const firstBrace = cleanedRetry.indexOf('{');
+                const lastBrace = cleanedRetry.lastIndexOf('}');
+                if (firstBrace !== -1 && lastBrace > firstBrace) {
+                  response = JSON.parse(cleanedRetry.slice(firstBrace, lastBrace + 1));
+                } else {
+                  throw firstParseError;
+                }
+              }
+            }
 
             const webCompanyInfo = typeof response?.web_company_info === 'string'
               ? response.web_company_info.trim()
