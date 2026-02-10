@@ -1511,7 +1511,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
 /**
  * @route POST /api/crm/lists/:listId/leads/match-icps
- * @desc Match leads against ICPs using Claude 4.5
+ * @desc Match leads against ICPs using AI
  * @access Private
  * @query mode - "preview" (default) or "match"
  */
@@ -1627,7 +1627,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       // Process each chunk in parallel
       const chunkProcessors = chunks.map(async (chunk, chunkIndex) => {
         // Create separate LLM service instance for each parallel task
-        const llmService = createLLMService('anthropic.claude-sonnet-4-5-20250929-v1:0', 0.7, 4000);
+        const llmService = createLLMService('gpt-5.2-chat', 1);
 
         const batchSize = 10;
         let chunkProcessedCount = 0;
@@ -1770,7 +1770,7 @@ Please analyze each lead and return a JSON array with your assessment.`;
 
 /**
  * @route POST /api/crm/lists/:listId/leads/enrich-web
- * @desc Enrich leads with web company info using web search + Claude
+ * @desc Enrich leads with web company info using web search + AI
  * @access Private
  * @query mode - "preview" (default) or "enrich"
  */
