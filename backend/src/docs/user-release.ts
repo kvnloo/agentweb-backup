@@ -14,6 +14,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Enforced a shared send rate of 2 requests per second to stay within provider limits',
       '- Added retry with exponential backoff for retryable email delivery failures',
       '- CRM and other Resend-based sends now automatically use the shared queued sender',
+      'Added Admin CRM Sync for Users and Waitlist',
+      '- Added "Sync to CRM" button in Admin Users and Waitlist tabs',
+      '- Added lead list ID configuration popup and AW-Settings persistence per source',
+      '- Added "Start Syncing" with incremental sync based on last successful sync timestamp',
+      '- Added optional "Force full sync" mode to re-sync all records',
     ],
   },
   {
