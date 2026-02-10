@@ -106,39 +106,38 @@ describe('calculateNextRunTime Function Logic', () => {
 
   describe('Monthly frequency', () => {
     it('should calculate same weekday and week position', () => {
-      // 2nd Tuesday of January 2026 (Jan 13, 2026) at 10:30 AM
-      const fromDate = new Date('2026-01-13T10:30:00.000Z');
+      // 2nd Tuesday of January 2027 (Jan 12, 2027) at 10:30 AM
+      const fromDate = new Date('2027-01-12T10:30:00.000Z');
       const result = calculateNextRunTime('monthly', fromDate);
 
-      // Should be 2nd Tuesday of February 2026 (Feb 10, 2026) at 10:30 AM
+      // Should be 2nd Tuesday of February 2027 (Feb 9, 2027) at 10:30 AM
       expect(result.getUTCMonth()).toBe(1); // February (0-indexed)
       expect(result.getUTCDay()).toBe(2); // Tuesday
-      expect(result.getUTCDate()).toBe(10); // 2nd Tuesday
+      expect(result.getUTCDate()).toBe(9); // 2nd Tuesday
       expect(result.getUTCHours()).toBe(10);
       expect(result.getUTCMinutes()).toBe(30);
     });
 
     it('should handle 1st Monday correctly', () => {
-      // 1st Monday of January 2026 (Jan 5, 2026)
-      const fromDate = new Date('2026-01-05T09:00:00.000Z');
+      // 1st Monday of January 2027 (Jan 4, 2027)
+      const fromDate = new Date('2027-01-04T09:00:00.000Z');
       const result = calculateNextRunTime('monthly', fromDate);
 
-      // Should be 1st Monday of March 2026 (Mar 2, 2026)
-      // Note: If current date is Feb 2, 2026 or later, the next occurrence is March
-      expect(result.getUTCMonth()).toBe(2); // March
+      // Should be 1st Monday of February 2027 (Feb 1, 2027)
+      expect(result.getUTCMonth()).toBe(1); // February
       expect(result.getUTCDay()).toBe(1); // Monday
-      expect(result.getUTCDate()).toBe(2);
+      expect(result.getUTCDate()).toBe(1);
     });
 
     it('should handle last week of month correctly', () => {
-      // 4th Friday of January 2026 (Jan 23, 2026)
-      const fromDate = new Date('2026-01-23T15:00:00.000Z');
+      // 4th Friday of January 2027 (Jan 22, 2027)
+      const fromDate = new Date('2027-01-22T15:00:00.000Z');
       const result = calculateNextRunTime('monthly', fromDate);
 
-      // Should be 4th Friday of February 2026 (Feb 27, 2026)
+      // Should be 4th Friday of February 2027 (Feb 26, 2027)
       expect(result.getUTCMonth()).toBe(1);
       expect(result.getUTCDay()).toBe(5); // Friday
-      expect(result.getUTCDate()).toBe(27);
+      expect(result.getUTCDate()).toBe(26);
     });
 
     it('should ensure next run is in the future', () => {
