@@ -375,6 +375,18 @@ export class AgentModeService {
             const inputTokens = usage.input_tokens || usage.prompt_tokens || 0;
             const outputTokens = usage.output_tokens || usage.completion_tokens || 0;
 
+            // Extract text content - handle both string and array formats (Anthropic returns array)
+            let messageContent: string = '';
+            if (typeof response.content === 'string') {
+              messageContent = response.content;
+            } else if (Array.isArray(response.content)) {
+              // Anthropic/Bedrock format: [{type: "text", text: "..."}, ...]
+              messageContent = response.content
+                .map((item: any) => item?.text || '')
+                .filter(Boolean)
+                .join('\n');
+            }
+
             // Convert response to OpenAI format
             return {
               id: `bedrock-${Date.now()}`,
@@ -385,7 +397,7 @@ export class AgentModeService {
                 index: 0,
                 message: {
                   role: 'assistant',
-                  content: (response.content as string) || '',
+                  content: messageContent,
                   tool_calls: toolCalls,
                 },
                 finish_reason: toolCalls ? 'tool_calls' : 'stop',
