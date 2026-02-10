@@ -1657,6 +1657,25 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
             );
 
             if (!webSearchResult?.success) {
+              const searchErrorMessage = String(
+                webSearchResult?.error || webSearchResult?.message || ''
+              );
+              const isNoResults =
+                searchErrorMessage.toLowerCase().includes('no search results found');
+
+              if (isNoResults) {
+                currentStep = 'update';
+                await crmDb.updateLead(listId, lead.leadId, {
+                  customFields: {
+                    ...(lead.customFields || {}),
+                    web_company_info: notFoundValue,
+                  },
+                });
+                chunkProcessedCount++;
+                totalProcessedCount++;
+                continue;
+              }
+
               console.warn(`[Web Enrich] searchWeb failed for "${companyName}": ${webSearchResult?.error || webSearchResult?.message || 'Unknown search error'}`);
               failureBreakdown.searchWebFailed++;
               chunkFailedCount++;
