@@ -152,6 +152,37 @@ const leadMatchesSearch = (lead: any, rawSearchQuery: string): boolean => {
   );
 };
 
+const ENGAGED_EVENT_KEYWORDS = ['clicked', 'replied', 'received'];
+
+const textIncludesEngagementKeyword = (value: any): boolean => {
+  const normalized = String(value || '').toLowerCase();
+  return ENGAGED_EVENT_KEYWORDS.some((keyword) => normalized.includes(keyword));
+};
+
+const leadHasEngagedEvents = async (listId: string, lead: any, userId: string): Promise<boolean> => {
+  const manualEngagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
+  for (const engagement of manualEngagements) {
+    if (
+      textIncludesEngagementKeyword(engagement?.eventType) ||
+      textIncludesEngagementKeyword(JSON.stringify(engagement?.eventData || {}))
+    ) {
+      return true;
+    }
+  }
+
+  try {
+    const engagementResult = await crmDb.getLeadEngagements(listId, lead.leadId, userId);
+    const allEngagements = Array.isArray(engagementResult?.engagements) ? engagementResult.engagements : [];
+    return allEngagements.some((engagement: any) =>
+      textIncludesEngagementKeyword(engagement?.eventType) ||
+      textIncludesEngagementKeyword(JSON.stringify(engagement?.eventData || {}))
+    );
+  } catch (error) {
+    console.error(`Error checking engagement keywords for lead ${lead?.leadId}:`, error);
+    return false;
+  }
+};
+
 // Lead List Routes
 
 /**
@@ -276,7 +307,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, autoDraftEnabled } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -301,6 +332,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       listSenderId?: string | null;
       autoDraftEnabled?: boolean;
       icpsOnly?: boolean;
+      engagedOnly?: boolean;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -366,6 +398,13 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         return res.status(400).json({ message: 'icpsOnly must be a boolean' });
       }
       updates.icpsOnly = icpsOnly;
+    }
+
+    if (engagedOnly !== undefined) {
+      if (typeof engagedOnly !== 'boolean') {
+        return res.status(400).json({ message: 'engagedOnly must be a boolean' });
+      }
+      updates.engagedOnly = engagedOnly;
     }
 
     if (autoDraftEnabled !== undefined) {
@@ -434,6 +473,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
     const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const engagedOnlyQuery = req.query.engagedOnly;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -458,7 +498,18 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     let totalFilteredCount: number | null = null;
     let knownTotalPages: number | null = null;
 
-    if (list.icpsOnly || search) {
+    let effectiveEngagedOnly = list.engagedOnly === true;
+    if (engagedOnlyQuery !== undefined) {
+      if (engagedOnlyQuery === 'true') {
+        effectiveEngagedOnly = true;
+      } else if (engagedOnlyQuery === 'false') {
+        effectiveEngagedOnly = false;
+      } else {
+        return res.status(400).json({ message: 'engagedOnly must be "true" or "false"' });
+      }
+    }
+
+    if (list.icpsOnly || search || effectiveEngagedOnly) {
       // Filtered mode (ICPs only and/or text search): fetch all leads to compute accurate count.
       let allIcpLeads: any[] = [];
       let currentLastKey = undefined;
@@ -467,15 +518,22 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       // Fetch all leads and apply filters in memory.
       while (hasMoreLeads) {
         const result = await crmDb.getLeadsByListId(listId, fetchLimit, currentLastKey);
-        const matchingLeads = result.items.filter((lead: any) => {
+        const matchingLeads: any[] = [];
+        for (const lead of result.items) {
           if (list.icpsOnly && lead.icpMatch?.isMatch !== true) {
-            return false;
+            continue;
           }
           if (search && !leadMatchesSearch(lead, search)) {
-            return false;
+            continue;
           }
-          return true;
-        });
+          if (effectiveEngagedOnly) {
+            const hasEngaged = await leadHasEngagedEvents(listId, lead, userId);
+            if (!hasEngaged) {
+              continue;
+            }
+          }
+          matchingLeads.push(lead);
+        }
         allIcpLeads.push(...matchingLeads);
 
         currentLastKey = result.lastEvaluatedKey;

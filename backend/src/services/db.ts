@@ -2770,6 +2770,7 @@ export const crmDb = {
           publicAccessEnabled: false, // Default: public access disabled
           autoDraftEnabled: autoDraftEnabled === true, // Default: auto draft disabled
           autoDraftInstruction: typeof autoDraftInstruction === 'string' ? autoDraftInstruction.trim() : '',
+          engagedOnly: false,
         },
       };
 
@@ -2860,6 +2861,7 @@ export const crmDb = {
       autoDraftEnabled?: boolean;
       autoDraftInstruction?: string;
       icpsOnly?: boolean;
+      engagedOnly?: boolean;
     }
   ) {
     try {
@@ -2925,6 +2927,12 @@ export const crmDb = {
         expressionAttributeNames['#icpsOnly'] = 'icpsOnly';
         updateExpressions.push('#icpsOnly = :icpsOnly');
         expressionAttributeValues[':icpsOnly'] = updates.icpsOnly;
+      }
+
+      if (updates.engagedOnly !== undefined) {
+        expressionAttributeNames['#engagedOnly'] = 'engagedOnly';
+        updateExpressions.push('#engagedOnly = :engagedOnly');
+        expressionAttributeValues[':engagedOnly'] = updates.engagedOnly;
       }
 
       if (updateExpressions.length === 0) {

@@ -434,6 +434,32 @@ describe('CRM Routes', () => {
       });
     });
 
+    it('should update engagedOnly for a lead list', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({
+        ...mockList,
+        engagedOnly: true,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { engagedOnly: true };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        engagedOnly: true,
+      });
+    });
+
     it('should return 400 if sortConfig direction is invalid', async () => {
       const mockList = {
         listId: 'list1',
@@ -472,6 +498,26 @@ describe('CRM Routes', () => {
       }
       
       expect(mockResponse.status).toHaveBeenCalledWith(400);
+    });
+
+    it('should return 400 if engagedOnly is not a boolean', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { engagedOnly: 'yes' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'engagedOnly must be a boolean' });
     });
   });
 
@@ -854,6 +900,57 @@ describe('CRM Routes', () => {
 
       mockRequest.params = { listId: 'list1' };
       mockRequest.query = { page: '1', limit: '50', search: 'industry' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const responsePayload = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(responsePayload.leads).toHaveLength(1);
+      expect(responsePayload.leads[0].leadId).toBe('lead1');
+      expect(responsePayload.totalFilteredCount).toBe(1);
+    });
+
+    it('should filter leads server-side when engagedOnly is enabled', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+        engagedOnly: true,
+      };
+
+      const mockLeads = [
+        { leadId: 'lead1', email: 'engaged@example.com', engagements: [] },
+        { leadId: 'lead2', email: 'cold@example.com', engagements: [] },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.getLeadEngagements as jest.Mock).mockImplementation((_listId: string, leadId: string) => {
+        if (leadId === 'lead1') {
+          return Promise.resolve({
+            engagements: [{ eventType: 'email.received', eventData: {}, createdAt: new Date().toISOString() }],
+          });
+        }
+        return Promise.resolve({
+          engagements: [{ eventType: 'email.sent', eventData: {}, createdAt: new Date().toISOString() }],
+        });
+      });
+      (crmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
+        total: 1,
+        last7Days: 1,
+        totalAllMessages: 1,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { page: '1', limit: '50' };
 
       const handler = router.stack.find((r: any) =>
         r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get

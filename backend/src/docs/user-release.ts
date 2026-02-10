@@ -19,6 +19,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Added lead list ID configuration popup and AW-Settings persistence per source',
       '- Added "Start Syncing" with incremental sync based on last successful sync timestamp',
       '- Added optional "Force full sync" mode to re-sync all records',
+      'Added CRM Engaged-Only Lead Filtering',
+      '- Added "Engaged only" checkbox next to "ICPs only" in CRM lead list filters',
+      '- Engaged-only filtering now detects lead actions using engagement keywords: clicked, replied, and received',
+      '- Added custom event naming guidance to include these keywords for more reliable engagement detection',
     ],
   },
   {
