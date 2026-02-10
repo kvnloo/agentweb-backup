@@ -21,11 +21,12 @@ jest.mock('../controllers/templates', () => ({
 }));
 
 import { Request, Response } from 'express';
-import { crmDb } from '../services/db';
+import { crmDb, userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { agentModeService } from '../services/agentModeService';
 import { createLLMService } from '../utils/llmService';
+import { emailEventsDb } from '../services/emailEventsDb';
 import router from '../routes/crm';
 
 // Mock dependencies
@@ -37,6 +38,8 @@ jest.mock('../services/db', () => ({
     updateLeadList: jest.fn(),
     deleteLeadList: jest.fn(),
     getLeadsByListId: jest.fn(),
+    getLeadsByICPFlag: jest.fn(),
+    getLeadsByEngagedFlag: jest.fn(),
     createLead: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
@@ -53,6 +56,16 @@ jest.mock('../services/db', () => ({
   },
   subscriberDb: {
     getAllTaskSubscribers: jest.fn(),
+  },
+  userDb: {
+    getUserById: jest.fn(),
+  },
+}));
+
+jest.mock('../services/emailEventsDb', () => ({
+  emailEventsDb: {
+    getEventsByEmailDomain: jest.fn(),
+    getEventsByEmailDomainAndLeadEmail: jest.fn(),
   },
 }));
 
@@ -442,6 +455,16 @@ describe('CRM Routes', () => {
       };
 
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        emailDomain: 'example.com',
+      });
+      (emailEventsDb.getEventsByEmailDomain as jest.Mock).mockResolvedValue([]);
       (crmDb.updateLeadList as jest.Mock).mockResolvedValue({
         ...mockList,
         engagedOnly: true,
@@ -933,16 +956,22 @@ describe('CRM Routes', () => {
         lastEvaluatedKey: null,
         hasMore: false,
       });
-      (crmDb.getLeadEngagements as jest.Mock).mockImplementation((_listId: string, leadId: string) => {
-        if (leadId === 'lead1') {
-          return Promise.resolve({
-            engagements: [{ eventType: 'email.received', eventData: {}, createdAt: new Date().toISOString() }],
-          });
-        }
-        return Promise.resolve({
-          engagements: [{ eventType: 'email.sent', eventData: {}, createdAt: new Date().toISOString() }],
-        });
+      (crmDb.getLeadsByEngagedFlag as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
       });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        emailDomain: 'example.com',
+      });
+      (emailEventsDb.getEventsByEmailDomain as jest.Mock).mockResolvedValue([
+        {
+          eventType: 'email.clicked',
+          leadEmail: 'engaged@example.com',
+          data: {},
+        },
+      ]);
       (crmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
         total: 1,
         last7Days: 1,
@@ -963,6 +992,8 @@ describe('CRM Routes', () => {
       expect(responsePayload.leads).toHaveLength(1);
       expect(responsePayload.leads[0].leadId).toBe('lead1');
       expect(responsePayload.totalFilteredCount).toBe(1);
+      expect(emailEventsDb.getEventsByEmailDomain).toHaveBeenCalledWith('example.com');
+      expect(emailEventsDb.getEventsByEmailDomain).toHaveBeenCalledWith('linkedin-list1');
     });
   });
 

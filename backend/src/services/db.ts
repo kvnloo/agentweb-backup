@@ -45,6 +45,16 @@ const handleDynamoDbError = (error: any, operation: string) => {
   throw error;
 };
 
+const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
+
+const engagementMatchesKeyword = (engagement: any): boolean => {
+  const eventType = String(engagement?.eventType || "").toLowerCase();
+  const eventData = String(JSON.stringify(engagement?.eventData || {})).toLowerCase();
+  return ENGAGED_EVENT_KEYWORDS.some(
+    (keyword) => eventType.includes(keyword) || eventData.includes(keyword)
+  );
+};
+
 // Ensure the User interface is exported
 export interface User {
   userId: string;
@@ -3100,6 +3110,8 @@ export const crmDb = {
         linkedin: leadData.linkedin?.trim() || '',
         customFields: leadData.customFields || {},
         engagements: [], // Initialize with empty array
+        isICP: 0,
+        isEngaged: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -3179,6 +3191,68 @@ export const crmDb = {
       };
     } catch (error) {
       handleDynamoDbError(error, "getLeadsByListId");
+      throw error;
+    }
+  },
+
+  async getLeadsByICPFlag(listId: string, isICP: 0 | 1, limit?: number, lastEvaluatedKey?: any) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'listId-isICP-index',
+        KeyConditionExpression: 'listId = :listId AND isICP = :isICP',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':isICP': isICP,
+        },
+      };
+
+      if (limit !== undefined && limit > 0) {
+        params.Limit = limit;
+      }
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return {
+        items: result.Items || [],
+        lastEvaluatedKey: result.LastEvaluatedKey || null,
+        hasMore: !!result.LastEvaluatedKey,
+      };
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadsByICPFlag");
+      throw error;
+    }
+  },
+
+  async getLeadsByEngagedFlag(listId: string, isEngaged: 0 | 1, limit?: number, lastEvaluatedKey?: any) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'listId-isEngaged-index',
+        KeyConditionExpression: 'listId = :listId AND isEngaged = :isEngaged',
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':isEngaged': isEngaged,
+        },
+      };
+
+      if (limit !== undefined && limit > 0) {
+        params.Limit = limit;
+      }
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return {
+        items: result.Items || [],
+        lastEvaluatedKey: result.LastEvaluatedKey || null,
+        hasMore: !!result.LastEvaluatedKey,
+      };
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadsByEngagedFlag");
       throw error;
     }
   },
@@ -3351,9 +3425,13 @@ export const crmDb = {
         if (updates.icpMatch === null) {
           // Remove icpMatch attribute
           removeExpressions.push('icpMatch');
+          setExpressions.push('isICP = :isICP');
+          expressionAttributeValues[':isICP'] = 0;
         } else {
           setExpressions.push('icpMatch = :icpMatch');
           expressionAttributeValues[':icpMatch'] = updates.icpMatch;
+          setExpressions.push('isICP = :isICP');
+          expressionAttributeValues[':isICP'] = updates.icpMatch.isMatch === true ? 1 : 0;
         }
       }
 
@@ -3532,6 +3610,8 @@ export const crmDb = {
             linkedin: lead.linkedin?.trim() || '',
             customFields: lead.customFields || {},
             engagements: [], // Initialize with empty array
+            isICP: 0,
+            isEngaged: 0,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
@@ -3995,6 +4075,7 @@ export const crmDb = {
 
       // Add the new engagement
       const updatedEngagements = [...existingEngagements, engagementWithId];
+      const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
 
       // Update the lead with the new engagements array
       const params = {
@@ -4003,9 +4084,10 @@ export const crmDb = {
           listId,
           leadId,
         },
-        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
         ExpressionAttributeValues: {
           ':engagements': updatedEngagements,
+          ':isEngaged': isEngaged,
           ':updatedAt': new Date().toISOString(),
         },
         ReturnValues: 'ALL_NEW',
@@ -4047,6 +4129,7 @@ export const crmDb = {
         ...engagement,
         eventId, // Preserve the original eventId
       };
+      const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
 
       // Update the lead with the updated engagements array
       const params = {
@@ -4055,9 +4138,10 @@ export const crmDb = {
           listId,
           leadId,
         },
-        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
         ExpressionAttributeValues: {
           ':engagements': updatedEngagements,
+          ':isEngaged': isEngaged,
           ':updatedAt': new Date().toISOString(),
         },
         ReturnValues: 'ALL_NEW',
@@ -4084,6 +4168,7 @@ export const crmDb = {
 
       // Find and remove the matching engagement by eventId
       const updatedEngagements = existingEngagements.filter((eng) => eng.eventId !== eventId);
+      const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
 
       // Check if we actually removed something
       if (updatedEngagements.length === existingEngagements.length) {
@@ -4097,9 +4182,10 @@ export const crmDb = {
           listId,
           leadId,
         },
-        UpdateExpression: 'SET engagements = :engagements, updatedAt = :updatedAt',
+        UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
         ExpressionAttributeValues: {
           ':engagements': updatedEngagements,
+          ':isEngaged': isEngaged,
           ':updatedAt': new Date().toISOString(),
         },
         ReturnValues: 'ALL_NEW',
