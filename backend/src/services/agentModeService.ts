@@ -6437,12 +6437,34 @@ Format the response as JSON with this structure:
 
       // Limit max results to 10
       const limitedMaxResults = Math.min(maxResults, 10);
+      const maxAttempts = Math.max(1, Number(process.env.SEARCH_WEB_MAX_RETRIES || 4));
+      const baseDelayMs = Math.max(100, Number(process.env.SEARCH_WEB_RETRY_BASE_MS || 600));
+      let attempt = 0;
+      let searchResults: any[] = [];
 
-      // Use a simple web search API - you can replace this with your preferred search service
-      // For now, we'll use a mock implementation that returns structured results
-      // In production, you might want to use Google Custom Search API, Bing Search API, or similar
+      while (attempt < maxAttempts) {
+        attempt += 1;
+        try {
+          searchResults = await this.performWebSearch(query, limitedMaxResults);
+          break;
+        } catch (error) {
+          const isLastAttempt = attempt >= maxAttempts;
+          const shouldRetry = this.isRetryableSearchError(error);
 
-      const searchResults = await this.performWebSearch(query, limitedMaxResults);
+          if (!shouldRetry || isLastAttempt) {
+            throw error;
+          }
+
+          // Exponential backoff with jitter to reduce burst pressure and quota spikes.
+          const jitterMs = Math.floor(Math.random() * 300);
+          const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
+          console.warn(
+            `AgentMode: searchWeb retry ${attempt}/${maxAttempts} for query "${query}" after ${delayMs}ms due to:`,
+            error instanceof Error ? error.message : error
+          );
+          await this.sleep(delayMs);
+        }
+      }
 
       // Format the results for LLM consumption
       const formattedContent = this.formatWebSearchResults({
@@ -6467,6 +6489,37 @@ Format the response as JSON with this structure:
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
+  }
+
+  private isRetryableSearchError(error: any): boolean {
+    const statusCode = error?.code || error?.response?.status || error?.status;
+    const message = String(error?.message || '').toLowerCase();
+    const reason = String(error?.errors?.[0]?.reason || '').toLowerCase();
+
+    const hasQuotaSignal =
+      message.includes('quota') ||
+      message.includes('rate limit') ||
+      reason.includes('quot') ||
+      reason.includes('ratelimit') ||
+      reason.includes('rate_limit_exceeded');
+
+    const hasTransientSignal =
+      statusCode === 429 ||
+      statusCode === 408 ||
+      statusCode === 500 ||
+      statusCode === 502 ||
+      statusCode === 503 ||
+      statusCode === 504 ||
+      message.includes('econnreset') ||
+      message.includes('etimedout') ||
+      message.includes('socket hang up') ||
+      message.includes('temporarily unavailable');
+
+    return hasQuotaSignal || hasTransientSignal;
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, ms));
   }
 
   // Get Google Search API credentials from AWS Secrets Manager
