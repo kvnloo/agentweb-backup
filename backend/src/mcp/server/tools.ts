@@ -50,7 +50,7 @@ mcpToolRegistry.register({
   name: 'get_meta_ads_metrics',
   definition: {
     name: 'get_meta_ads_metrics',
-    description: 'Get Meta ad performance metrics and campaign data. Optionally filter by a specific campaign using campaign_id.',
+    description: 'Get Meta ad performance metrics and campaign data for specific campaigns. Requires campaign_ids (array of campaign IDs). Use list_meta_ads_campaigns first to get available IDs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -60,17 +60,27 @@ mcpToolRegistry.register({
           enum: ['7d', '14d', '30d', '90d'],
           default: '7d'
         },
-        campaign_id: {
-          type: 'string',
-          description: 'Optional campaign ID to filter metrics by. If provided, only data from the specified campaign will be returned. Use list_meta_ads_campaigns to get available campaign IDs.',
-          default: null
+        campaign_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs.'
         }
       },
-      required: []
+      required: ['campaign_ids']
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, args.campaign_id);
+    // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
+    const normalizedCampaignIds = Array.isArray(args.campaign_ids)
+      ? args.campaign_ids
+      : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
+        ? [args.campaign_ids.trim()]
+        : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
+          ? [args.campaign_id.trim()]
+          : [];
+
+    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, normalizedCampaignIds);
   }
 });
 
@@ -2190,4 +2200,3 @@ mcpToolRegistry.register({
     return await agentModeService.setWorkPlanStatus(args.updates, context?.sessionId);
   }
 });
-

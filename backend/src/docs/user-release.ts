@@ -7,6 +7,25 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-09',
+    changes: [
+      'Enhanced User Journey Funnel Management in SEO/GEO Page',
+      '- Users can now delete the last funnel without restriction',
+      'Added CRM Lead "Enrich with Web" Workflow',
+      '- New Enrich with Web action in CRM lead lists with preview dialog and force enrich option',
+      '- Uses web search + AI to generate web_company_info custom field per lead',
+      '- Added progress updates and clearer completion/error messaging during enrichment',
+      '- Edit Lead now shows full custom field values and correctly persists deleting the last custom field',
+      'Updated Meta Ads Metrics Tooling in Agent Mode',
+      '- get_meta_ads_metrics now supports campaign_ids as a list and requires at least one campaign ID',
+      '- Added backward compatibility for legacy campaign_id/single-string inputs to prevent tool call failures',
+      '- Response payload is now lightweight (uses formattedContent with S3 detail links) to reduce message storage size',
+      'Fixed CRM Lead Search Consistency',
+      '- Resolved stale lead results after changing or clearing search text',
+      '- Example: searching for "Wang" and then deleting the query now correctly refreshes to current results',
+    ],
+  },
+  {
     date: '2026-02-08',
     changes: [
       'Fixed MCP Session Concurrency Issue for Scheduled Chats',

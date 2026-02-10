@@ -4,6 +4,7 @@ import { crmDb, taskDb, subscriberDb, userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { agentModeService } from '../services/agentModeService';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
@@ -1368,7 +1369,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       emitProgress('Starting ICP matching...', 0);
 
       // Split leads into 5 chunks for parallel processing
-      const parallelism = 5;
+      const parallelism = 20;
       const chunkSize = Math.ceil(leadsToProcess.length / parallelism);
       const chunks: any[][] = [];
 
@@ -1523,6 +1524,336 @@ Please analyze each lead and return a JSON array with your assessment.`;
   } catch (error: any) {
     console.error('Error matching ICPs:', error);
     res.status(500).json({ message: error.message || 'Failed to match ICPs' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/leads/enrich-web
+ * @desc Enrich leads with web company info using web search + Claude
+ * @access Private
+ * @query mode - "preview" (default) or "enrich"
+ */
+router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const mode = (req.query.mode as string || 'preview').toLowerCase();
+    const socketId = req.body.socketId;
+    const forceEnrich = req.body.forceEnrich === true;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const emitProgress = (message: string, progress: number) => {
+      if (socketId) {
+        io.to(socketId).emit('web-enrich-progress', {
+          message,
+          progress: Math.round(progress),
+        });
+      }
+    };
+
+    const allLeads: any[] = [];
+    let lastKey: any = undefined;
+
+    do {
+      const result = await crmDb.getLeadsByListId(listId, undefined, lastKey);
+      allLeads.push(...(result.items || []));
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+
+    const hasCompany = (lead: any) => typeof lead.company === 'string' && lead.company.trim().length > 0;
+    const hasWebCompanyInfo = (lead: any) => {
+      const value = lead?.customFields?.web_company_info;
+      return typeof value === 'string' && value.trim().length > 0;
+    };
+
+    const leadsWithCompany = allLeads.filter(hasCompany);
+    const alreadyEnrichedLeads = leadsWithCompany.filter(hasWebCompanyInfo);
+    const notEnrichedLeads = leadsWithCompany.filter((lead) => !hasWebCompanyInfo(lead));
+    const leadsToProcess = forceEnrich ? leadsWithCompany : notEnrichedLeads;
+
+    if (mode === 'preview') {
+      return res.json({
+        success: true,
+        totalLeads: allLeads.length,
+        leadsWithCompany: leadsWithCompany.length,
+        alreadyEnrichedLeads: alreadyEnrichedLeads.length,
+        couldBeEnrichedLeads: notEnrichedLeads.length,
+        leadsToProcess: leadsToProcess.length,
+        forceEnrich,
+      });
+    } else if (mode === 'enrich') {
+      if (leadsToProcess.length === 0) {
+        return res.json({
+          success: true,
+          message: 'No leads to process',
+          processedCount: 0,
+          failedCount: 0,
+        });
+      }
+
+      const { createLLMService } = await import('../utils/llmService');
+      const notFoundValue = 'Company information not found';
+
+      emitProgress('Starting web enrichment...', 0);
+
+      const parallelism = 20;
+      const chunkSize = Math.max(1, Math.ceil(leadsToProcess.length / parallelism));
+      const chunks: any[][] = [];
+
+      for (let i = 0; i < leadsToProcess.length; i += chunkSize) {
+        chunks.push(leadsToProcess.slice(i, i + chunkSize));
+      }
+
+      let totalProcessedCount = 0;
+      let totalFailedCount = 0;
+      const failureBreakdown = {
+        searchWebFailed: 0,
+        llmOrParseFailed: 0,
+        updateFailed: 0,
+        unknownFailed: 0,
+      };
+
+      const escapeBraces = (str: string) => str.replace(/{/g, '{{').replace(/}/g, '}}');
+
+      const chunkProcessors = chunks.map(async (chunk) => {
+        const llmService = createLLMService('gpt-5.2-chat', 1);
+        let chunkProcessedCount = 0;
+        let chunkFailedCount = 0;
+
+        for (const lead of chunk) {
+          let currentStep: 'search' | 'llm' | 'update' | 'unknown' = 'unknown';
+          try {
+            const companyName = String(lead.company || '').trim();
+            if (!companyName) {
+              currentStep = 'update';
+              await crmDb.updateLead(listId, lead.leadId, {
+                customFields: {
+                  ...(lead.customFields || {}),
+                  web_company_info: notFoundValue,
+                },
+              });
+              chunkProcessedCount++;
+              totalProcessedCount++;
+              continue;
+            }
+
+            currentStep = 'search';
+            const webSearchResult = await agentModeService.searchWeb(
+              `${companyName} company overview`,
+              5
+            );
+
+            if (!webSearchResult?.success) {
+              const searchErrorMessage = String(
+                webSearchResult?.error || webSearchResult?.message || ''
+              );
+              const isNoResults =
+                searchErrorMessage.toLowerCase().includes('no search results found');
+
+              if (isNoResults) {
+                currentStep = 'update';
+                await crmDb.updateLead(listId, lead.leadId, {
+                  customFields: {
+                    ...(lead.customFields || {}),
+                    web_company_info: notFoundValue,
+                  },
+                });
+                chunkProcessedCount++;
+                totalProcessedCount++;
+                continue;
+              }
+
+              console.warn(`[Web Enrich] searchWeb failed for "${companyName}": ${webSearchResult?.error || webSearchResult?.message || 'Unknown search error'}`);
+              failureBreakdown.searchWebFailed++;
+              chunkFailedCount++;
+              totalFailedCount++;
+              continue;
+            }
+
+            if (!Array.isArray(webSearchResult?.results) || webSearchResult.results.length === 0) {
+              await crmDb.updateLead(listId, lead.leadId, {
+                customFields: {
+                  ...(lead.customFields || {}),
+                  web_company_info: notFoundValue,
+                },
+              });
+              chunkProcessedCount++;
+              totalProcessedCount++;
+              continue;
+            }
+
+            const systemPrompt = `You are a company research analyst.
+
+Your task is to produce a concise, high-value company profile from web search results.
+
+Return ONLY a JSON object with this exact structure:
+{
+  "web_company_info": "string"
+}
+
+JSON formatting rules (mandatory):
+- Output must be valid JSON parsable by JSON.parse
+- Use double quotes for keys and string values
+- Do not wrap output in markdown or code fences
+- Do not include any text before or after the JSON object
+
+Requirements for web_company_info:
+- 3-6 sentences
+- Include what the company does, likely industry/market, key products/services, and notable context
+- Be factual and avoid speculation
+- If no good company information is available from the provided search results, return EXACTLY: "Company information not found"`;
+
+            const leadContext: Record<string, string> = {};
+            const leadNameFromFirstLast = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
+            const leadName = String(
+              lead.name ||
+              lead.fullName ||
+              leadNameFromFirstLast ||
+              ''
+            ).trim();
+            if (leadName) {
+              leadContext.name = leadName;
+            }
+            if (lead.email && String(lead.email).trim()) {
+              leadContext.email = String(lead.email).trim();
+            }
+            if (lead.title && String(lead.title).trim()) {
+              leadContext.title = String(lead.title).trim();
+            }
+            if (lead.linkedin && String(lead.linkedin).trim()) {
+              leadContext.linkedin = String(lead.linkedin).trim();
+            }
+
+            const userPrompt = `Lead company name: ${companyName}
+
+Lead context:
+${JSON.stringify(leadContext, null, 2)}
+
+Web search result:
+${JSON.stringify(webSearchResult, null, 2)}
+
+Generate web_company_info now.`;
+
+            currentStep = 'llm';
+            let response: { web_company_info?: string } | null = null;
+            try {
+              response = await llmService.generateJSONContent<{ web_company_info?: string }>(
+                escapeBraces(systemPrompt),
+                escapeBraces(userPrompt),
+                'json'
+              );
+            } catch (firstParseError: any) {
+              // Retry with stricter formatting instructions to recover from occasional malformed JSON.
+              const strictRetryPrompt = `${userPrompt}
+
+CRITICAL RETRY INSTRUCTIONS:
+Return exactly one JSON object.
+No markdown, no backticks, no comments, no trailing commas.
+Valid example:
+{"web_company_info":"Company information not found"}`;
+
+              const rawRetry = await llmService.generateContent(
+                escapeBraces(systemPrompt),
+                escapeBraces(strictRetryPrompt),
+                'text'
+              );
+
+              const cleanedRetry = rawRetry
+                .trim()
+                .replace(/^```json\s*/i, '')
+                .replace(/^```\s*/i, '')
+                .replace(/\s*```$/, '')
+                .trim();
+
+              try {
+                response = JSON.parse(cleanedRetry);
+              } catch {
+                const firstBrace = cleanedRetry.indexOf('{');
+                const lastBrace = cleanedRetry.lastIndexOf('}');
+                if (firstBrace !== -1 && lastBrace > firstBrace) {
+                  response = JSON.parse(cleanedRetry.slice(firstBrace, lastBrace + 1));
+                } else {
+                  throw firstParseError;
+                }
+              }
+            }
+
+            const webCompanyInfo = typeof response?.web_company_info === 'string'
+              ? response.web_company_info.trim()
+              : notFoundValue;
+
+            currentStep = 'update';
+            await crmDb.updateLead(listId, lead.leadId, {
+              customFields: {
+                ...(lead.customFields || {}),
+                web_company_info: webCompanyInfo || notFoundValue,
+              },
+            });
+
+            chunkProcessedCount++;
+            totalProcessedCount++;
+          } catch (error) {
+            console.error(`[Web Enrich] Failed to enrich lead ${lead?.leadId}:`, error);
+            if (currentStep === 'search') {
+              failureBreakdown.searchWebFailed++;
+            } else if (currentStep === 'llm') {
+              failureBreakdown.llmOrParseFailed++;
+            } else if (currentStep === 'update') {
+              failureBreakdown.updateFailed++;
+            } else {
+              failureBreakdown.unknownFailed++;
+            }
+            chunkFailedCount++;
+            totalFailedCount++;
+          }
+
+          const completed = totalProcessedCount + totalFailedCount;
+          const progress = Math.min((completed / leadsToProcess.length) * 100, 100);
+          emitProgress(
+            `Processed ${completed} of ${leadsToProcess.length} leads (${totalProcessedCount} enriched, ${totalFailedCount} failed)`,
+            progress
+          );
+        }
+
+        return {
+          processed: chunkProcessedCount,
+          failed: chunkFailedCount,
+        };
+      });
+
+      await Promise.all(chunkProcessors);
+
+      emitProgress('Web enrichment complete!', 100);
+
+      return res.json({
+        success: true,
+        message: totalFailedCount > 0
+          ? `Enrichment completed with ${totalProcessedCount} enriched and ${totalFailedCount} failed`
+          : `Successfully enriched ${totalProcessedCount} leads`,
+        processedCount: totalProcessedCount,
+        failedCount: totalFailedCount,
+        totalLeadsProcessed: leadsToProcess.length,
+        failureBreakdown,
+      });
+    }
+
+    return res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "enrich"' });
+  } catch (error: any) {
+    console.error('Error enriching leads with web company info:', error);
+    return res.status(500).json({ message: error.message || 'Failed to enrich leads with web company info' });
   }
 });
 
