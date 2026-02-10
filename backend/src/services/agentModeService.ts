@@ -543,12 +543,15 @@ export class AgentModeService {
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
       ];
 
-      if (availableSkillContextMsg) {
-        messages.push({ role: 'assistant', content: availableSkillContextMsg });
-      }
+      console.log('[DEBUG] Initial messages count:', messages.length);
+      console.log('[DEBUG] availableSkillContextMsg exists:', !!availableSkillContextMsg);
+      console.log('[DEBUG] installedSkillContextMsg exists:', !!installedSkillContextMsg);
 
       // Use helper to inject installed skills and templates
+      // NOTE: Do NOT manually insert availableSkillContextMsg here - updateConversationContext handles it
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg, availableTemplates, allowedToolNames);
+      
+      console.log('[DEBUG] After updateConversationContext, messages count:', messages.length);
 
       messages.push(...marketingMessages);
 
@@ -833,38 +836,60 @@ export class AgentModeService {
     availableTemplates: any[], 
     allowedToolNames: Set<string>
   ) {
+    console.log('[DEBUG updateConversationContext] Starting with messages count:', messages.length);
+    console.log('[DEBUG updateConversationContext] availableSkillContextMsg:', availableSkillContextMsg ? 'EXISTS' : 'NULL');
+    console.log('[DEBUG updateConversationContext] installedSkillContextMsg:', installedSkillContextMsg ? 'EXISTS' : 'NULL');
+    
     // Helper to safely check if content starts with a prefix (handles both string and Anthropic array format)
     const contentStartsWith = (content: any, prefix: string): boolean => {
-      console.log("Content: ", content);
-      console.log("Prefix: ", prefix);
+      console.log("[DEBUG contentStartsWith] Checking content type:", typeof content, "Array?", Array.isArray(content));
+      console.log("[DEBUG contentStartsWith] Prefix:", prefix);
+      
       if (typeof content === 'string') {
-        return content.startsWith(prefix);
+        const result = content.startsWith(prefix);
+        console.log("[DEBUG contentStartsWith] String match result:", result);
+        return result;
       }
       // Handle Anthropic's array content format: [{type: "text", text: "..."}]
       if (Array.isArray(content) && content.length > 0) {
         const firstBlock = content[0];
         if (firstBlock && firstBlock.type === 'text' && typeof firstBlock.text === 'string') {
-          return firstBlock.text.startsWith(prefix);
+          const result = firstBlock.text.startsWith(prefix);
+          console.log("[DEBUG contentStartsWith] Array format match result:", result, "Text:", firstBlock.text.substring(0, 50));
+          return result;
         }
       }
+      console.log("[DEBUG contentStartsWith] No match, returning false");
       return false;
     };
 
     // 1. Handle Available Skills Message
     // Remove existing message first
+    console.log('[DEBUG] Searching for existing "Available Skills:" message...');
     const availableSkillIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Skills:'));
+    console.log('[DEBUG] Found existing "Available Skills:" at index:', availableSkillIdx);
+    
     if (availableSkillIdx !== -1) {
+      console.log('[DEBUG] Removing existing "Available Skills:" message at index:', availableSkillIdx);
       messages.splice(availableSkillIdx, 1);
     }
+    
     // Insert updated message if available
     if (availableSkillContextMsg) {
+      console.log('[DEBUG] Inserting new "Available Skills:" message at index 1');
       messages.splice(1, 0, { role: 'assistant', content: availableSkillContextMsg });
+    } else {
+      console.log('[DEBUG] No availableSkillContextMsg to insert');
     }
 
     // 2. Handle Installed Skills Message
     // Remove existing message first
+    console.log('[DEBUG] Searching for existing "Installed Skills:" message...');
     const installedIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Installed Skills:'));
+    console.log('[DEBUG] Found existing "Installed Skills:" at index:', installedIdx);
+    
     if (installedIdx !== -1) {
+      console.log('[DEBUG] Removing existing "Installed Skills:" message at index:', installedIdx);
       messages.splice(installedIdx, 1);
     }
 
@@ -877,13 +902,20 @@ export class AgentModeService {
         insertIndex = availableSkillMsgIndex + 1;
       }
 
+      console.log('[DEBUG] Inserting new "Installed Skills:" message at index:', insertIndex);
       messages.splice(insertIndex, 0, { role: 'assistant', content: installedSkillContextMsg });
+    } else {
+      console.log('[DEBUG] No installedSkillContextMsg to insert');
     }
 
     // 3. Handle Available Templates Message
     // Remove existing message first
+    console.log('[DEBUG] Searching for existing "Available Templates:" message...');
     const templatesIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Templates:'));
+    console.log('[DEBUG] Found existing "Available Templates:" at index:', templatesIdx);
+    
     if (templatesIdx !== -1) {
+      console.log('[DEBUG] Removing existing "Available Templates:" message at index:', templatesIdx);
       messages.splice(templatesIdx, 1);
     }
 
@@ -899,9 +931,25 @@ export class AgentModeService {
           if (installedIndex !== -1) insertIndex = installedIndex + 1;
           else if (availableIndex !== -1) insertIndex = availableIndex + 1;
 
+          console.log('[DEBUG] Inserting new "Available Templates:" message at index:', insertIndex);
           messages.splice(insertIndex, 0, { role: 'assistant', content: templatesContext });
+      } else {
+        console.log('[DEBUG] No templates available to insert');
       }
+    } else {
+      console.log('[DEBUG] create_task_from_template tool not allowed, skipping templates message');
     }
+    
+    console.log('[DEBUG updateConversationContext] Final messages count:', messages.length);
+    console.log('[DEBUG updateConversationContext] Message structure:');
+    messages.forEach((msg, idx) => {
+      const contentPreview = typeof msg.content === 'string' 
+        ? msg.content.substring(0, 50) 
+        : Array.isArray(msg.content) 
+          ? `[Array] ${msg.content[0]?.text?.substring(0, 50) || 'N/A'}`
+          : 'N/A';
+      console.log(`  [${idx}] role: ${msg.role}, content: ${contentPreview}...`);
+    });
   }
 
   async getMarketingSystemPrompt(): Promise<string> {
