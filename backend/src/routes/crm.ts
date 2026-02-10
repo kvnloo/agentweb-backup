@@ -152,6 +152,217 @@ const leadMatchesSearch = (lead: any, rawSearchQuery: string): boolean => {
   );
 };
 
+const ENGAGED_EVENT_KEYWORDS = ['clicked', 'replied', 'received'];
+
+const textIncludesEngagementKeyword = (value: any): boolean => {
+  const normalized = String(value || '').toLowerCase();
+  return ENGAGED_EVENT_KEYWORDS.some((keyword) => normalized.includes(keyword));
+};
+
+const leadHasManualEngagedEvents = (lead: any): boolean => {
+  const manualEngagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
+  return manualEngagements.some((engagement: any) =>
+    textIncludesEngagementKeyword(engagement?.eventType) ||
+    textIncludesEngagementKeyword(JSON.stringify(engagement?.eventData || {}))
+  );
+};
+
+const buildEngagedLeadLookup = async (listId: string, userId: string): Promise<{
+  engagedEmails: Set<string>;
+  engagedLinkedinUrls: Set<string>;
+}> => {
+  const engagedEmails = new Set<string>();
+  const engagedLinkedinUrls = new Set<string>();
+
+  try {
+    const user = await userDb.getUserById(userId);
+    const userEmailDomain = user?.emailDomain?.trim();
+
+    if (userEmailDomain) {
+      const domainEvents = await emailEventsDb.getEventsByEmailDomain(userEmailDomain);
+      for (const event of domainEvents) {
+        if (
+          textIncludesEngagementKeyword(event?.eventType) ||
+          textIncludesEngagementKeyword(JSON.stringify(event?.data || {}))
+        ) {
+          const leadEmail = String(event?.leadEmail || '').trim().toLowerCase();
+          if (leadEmail) {
+            engagedEmails.add(leadEmail);
+          }
+        }
+      }
+    }
+
+    const linkedInEvents = await emailEventsDb.getEventsByEmailDomain(`linkedin-${listId}`);
+    for (const event of linkedInEvents) {
+      if (
+        textIncludesEngagementKeyword(event?.eventType) ||
+        textIncludesEngagementKeyword(JSON.stringify(event?.data || {}))
+      ) {
+        const linkedInUrl = String(event?.leadEmail || '').trim().toLowerCase();
+        if (linkedInUrl) {
+          engagedLinkedinUrls.add(linkedInUrl);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`Error building engaged lead lookup for list ${listId}:`, error);
+  }
+
+  return {
+    engagedEmails,
+    engagedLinkedinUrls,
+  };
+};
+
+const leadMatchesEngagedLookup = (
+  lead: any,
+  lookup: { engagedEmails: Set<string>; engagedLinkedinUrls: Set<string> }
+): boolean => {
+  if (leadHasManualEngagedEvents(lead)) {
+    return true;
+  }
+
+  const normalizedEmail = String(lead?.email || '').trim().toLowerCase();
+  if (normalizedEmail && lookup.engagedEmails.has(normalizedEmail)) {
+    return true;
+  }
+
+  const normalizedLinkedIn = String(lead?.linkedin || '').trim().toLowerCase();
+  if (normalizedLinkedIn && lookup.engagedLinkedinUrls.has(normalizedLinkedIn)) {
+    return true;
+  }
+
+  const manualEngagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
+  return manualEngagements.some((engagement: any) =>
+      textIncludesEngagementKeyword(engagement?.eventType) ||
+      textIncludesEngagementKeyword(JSON.stringify(engagement?.eventData || {}))
+    );
+};
+
+const leadMatchesICPFlag = (lead: any): boolean => {
+  if (lead?.isICP !== undefined && lead?.isICP !== null) {
+    return Number(lead.isICP) === 1;
+  }
+  return lead?.icpMatch?.isMatch === true;
+};
+
+const leadMatchesEngagedFlag = (
+  lead: any,
+  lookup?: { engagedEmails: Set<string>; engagedLinkedinUrls: Set<string> } | null
+): boolean => {
+  if (lead?.isEngaged !== undefined && lead?.isEngaged !== null) {
+    return Number(lead.isEngaged) === 1;
+  }
+  if (lookup) {
+    return leadMatchesEngagedLookup(lead, lookup);
+  }
+  return leadHasManualEngagedEvents(lead);
+};
+
+const updateLeadFlag = async (listId: string, leadId: string, updates: { isICP?: 0 | 1; isEngaged?: 0 | 1 }) => {
+  const expressions: string[] = [];
+  const values: Record<string, any> = {
+    ':updatedAt': new Date().toISOString(),
+  };
+
+  if (updates.isICP !== undefined) {
+    expressions.push('isICP = :isICP');
+    values[':isICP'] = updates.isICP;
+  }
+  if (updates.isEngaged !== undefined) {
+    expressions.push('isEngaged = :isEngaged');
+    values[':isEngaged'] = updates.isEngaged;
+  }
+  if (expressions.length === 0) {
+    return;
+  }
+  expressions.push('updatedAt = :updatedAt');
+
+  await dynamodb.update({
+    TableName: `${TABLE_PREFIX}AW-Leads`,
+    Key: { listId, leadId },
+    UpdateExpression: `SET ${expressions.join(', ')}`,
+    ExpressionAttributeValues: values,
+  }).promise();
+};
+
+const ensureLeadICPFlags = async (listId: string) => {
+  let lastKey: any = undefined;
+  do {
+    const batch = await crmDb.getLeadsByListId(listId, 200, lastKey);
+    const leadsToUpdate = batch.items.filter((lead: any) => {
+      const targetValue = lead?.icpMatch?.isMatch === true ? 1 : 0;
+      const currentValue = lead?.isICP === undefined || lead?.isICP === null
+        ? null
+        : Number(lead.isICP);
+      return currentValue !== targetValue;
+    });
+    await Promise.all(
+      leadsToUpdate.map((lead: any) =>
+        updateLeadFlag(listId, lead.leadId, { isICP: lead?.icpMatch?.isMatch === true ? 1 : 0 })
+      )
+    );
+    lastKey = batch.lastEvaluatedKey;
+  } while (lastKey);
+};
+
+const ensureLeadEngagedFlags = async (listId: string, userId: string) => {
+  const lookup = await buildEngagedLeadLookup(listId, userId);
+  let lastKey: any = undefined;
+  do {
+    const batch = await crmDb.getLeadsByListId(listId, 200, lastKey);
+    const leadsToUpdate = batch.items.filter((lead: any) => {
+      const targetValue = leadMatchesEngagedLookup(lead, lookup) ? 1 : 0;
+      const currentValue = lead?.isEngaged === undefined || lead?.isEngaged === null
+        ? null
+        : Number(lead.isEngaged);
+      return currentValue !== targetValue;
+    });
+    await Promise.all(
+      leadsToUpdate.map((lead: any) =>
+        updateLeadFlag(listId, lead.leadId, {
+          isEngaged: leadMatchesEngagedLookup(lead, lookup) ? 1 : 0,
+        })
+      )
+    );
+    lastKey = batch.lastEvaluatedKey;
+  } while (lastKey);
+};
+
+const fetchAllLeadsByList = async (listId: string, pageSize: number): Promise<any[]> => {
+  let lastKey: any = undefined;
+  const items: any[] = [];
+  do {
+    const result = await crmDb.getLeadsByListId(listId, pageSize, lastKey);
+    items.push(...result.items);
+    lastKey = result.lastEvaluatedKey;
+  } while (lastKey);
+  return items;
+};
+
+const fetchAllLeadsByFlagIndex = async (
+  listId: string,
+  flagType: 'icp' | 'engaged',
+  pageSize: number
+): Promise<any[]> => {
+  let lastKey: any = undefined;
+  const items: any[] = [];
+  try {
+    do {
+      const result = flagType === 'icp'
+        ? await crmDb.getLeadsByICPFlag(listId, 1, pageSize, lastKey)
+        : await crmDb.getLeadsByEngagedFlag(listId, 1, pageSize, lastKey);
+      items.push(...result.items);
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+    return items;
+  } catch (error: any) {
+    console.warn(`Falling back from ${flagType} index for list ${listId}:`, error?.message || error);
+    return fetchAllLeadsByList(listId, pageSize);
+  }
+};
+
 // Lead List Routes
 
 /**
@@ -276,7 +487,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, autoDraftEnabled } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -301,6 +512,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       listSenderId?: string | null;
       autoDraftEnabled?: boolean;
       icpsOnly?: boolean;
+      engagedOnly?: boolean;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -365,7 +577,20 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       if (typeof icpsOnly !== 'boolean') {
         return res.status(400).json({ message: 'icpsOnly must be a boolean' });
       }
+      if (icpsOnly === true && list.icpsOnly !== true) {
+        await ensureLeadICPFlags(listId);
+      }
       updates.icpsOnly = icpsOnly;
+    }
+
+    if (engagedOnly !== undefined) {
+      if (typeof engagedOnly !== 'boolean') {
+        return res.status(400).json({ message: 'engagedOnly must be a boolean' });
+      }
+      if (engagedOnly === true && list.engagedOnly !== true) {
+        await ensureLeadEngagedFlags(listId, userId);
+      }
+      updates.engagedOnly = engagedOnly;
     }
 
     if (autoDraftEnabled !== undefined) {
@@ -434,6 +659,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const page = req.query.page ? parseInt(req.query.page as string, 10) : 1;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
     const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const engagedOnlyQuery = req.query.engagedOnly;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -458,43 +684,58 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     let totalFilteredCount: number | null = null;
     let knownTotalPages: number | null = null;
 
-    if (list.icpsOnly || search) {
-      // Filtered mode (ICPs only and/or text search): fetch all leads to compute accurate count.
-      let allIcpLeads: any[] = [];
-      let currentLastKey = undefined;
-      const fetchLimit = Math.max(validLimit, 100);
+    let effectiveEngagedOnly = list.engagedOnly === true;
+    if (engagedOnlyQuery !== undefined) {
+      if (engagedOnlyQuery === 'true') {
+        effectiveEngagedOnly = true;
+      } else if (engagedOnlyQuery === 'false') {
+        effectiveEngagedOnly = false;
+      } else {
+        return res.status(400).json({ message: 'engagedOnly must be "true" or "false"' });
+      }
+    }
 
-      // Fetch all leads and apply filters in memory.
-      while (hasMoreLeads) {
-        const result = await crmDb.getLeadsByListId(listId, fetchLimit, currentLastKey);
-        const matchingLeads = result.items.filter((lead: any) => {
-          if (list.icpsOnly && lead.icpMatch?.isMatch !== true) {
-            return false;
-          }
-          if (search && !leadMatchesSearch(lead, search)) {
-            return false;
-          }
-          return true;
-        });
-        allIcpLeads.push(...matchingLeads);
+    if (list.icpsOnly || search || effectiveEngagedOnly) {
+      // Filtered mode: use flag indexes when possible, then apply remaining filters in-memory.
+      const fetchLimit = Math.max(validLimit, 200);
 
-        currentLastKey = result.lastEvaluatedKey;
-        hasMoreLeads = !!result.lastEvaluatedKey;
+      let candidateLeads: any[] = [];
+      if (list.icpsOnly && effectiveEngagedOnly) {
+        candidateLeads = await fetchAllLeadsByFlagIndex(listId, 'engaged', fetchLimit);
+      } else if (list.icpsOnly) {
+        candidateLeads = await fetchAllLeadsByFlagIndex(listId, 'icp', fetchLimit);
+      } else if (effectiveEngagedOnly) {
+        candidateLeads = await fetchAllLeadsByFlagIndex(listId, 'engaged', fetchLimit);
+      } else {
+        candidateLeads = await fetchAllLeadsByList(listId, fetchLimit);
       }
 
-      // We now have exact filtered count.
-      totalFilteredCount = allIcpLeads.length;
+      const needsEngagedLookupFallback = effectiveEngagedOnly &&
+        candidateLeads.some((lead: any) => lead?.isEngaged === undefined || lead?.isEngaged === null);
+      const engagedLookup = needsEngagedLookupFallback
+        ? await buildEngagedLeadLookup(listId, userId)
+        : null;
 
-      // Slice to get only the leads for the requested page
+      const allMatchingLeads = candidateLeads.filter((lead: any) => {
+        if (list.icpsOnly && !leadMatchesICPFlag(lead)) {
+          return false;
+        }
+        if (effectiveEngagedOnly && !leadMatchesEngagedFlag(lead, engagedLookup)) {
+          return false;
+        }
+        if (search && !leadMatchesSearch(lead, search)) {
+          return false;
+        }
+        return true;
+      });
+
+      totalFilteredCount = allMatchingLeads.length;
       const targetLeadsToSkip = (validPage - 1) * validLimit;
       const targetLeadsToReturn = validLimit;
-      filteredLeads = allIcpLeads.slice(targetLeadsToSkip, targetLeadsToSkip + targetLeadsToReturn);
-
-      // Check if there are more filtered leads after this page.
-      hasMoreLeads = allIcpLeads.length > targetLeadsToSkip + targetLeadsToReturn;
+      filteredLeads = allMatchingLeads.slice(targetLeadsToSkip, targetLeadsToSkip + targetLeadsToReturn);
+      hasMoreLeads = allMatchingLeads.length > targetLeadsToSkip + targetLeadsToReturn;
       knownTotalPages = Math.max(1, Math.ceil(totalFilteredCount / validLimit));
 
-      // If this page is beyond range, return empty.
       if (filteredLeads.length === 0 && validPage > 1) {
         return res.json({
           leads: [],
