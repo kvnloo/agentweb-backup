@@ -72,6 +72,7 @@ import {
   Add as AddIcon,
   ThumbUp as ThumbUpIcon,
   ThumbDown as ThumbDownIcon,
+  Sync as SyncIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -264,6 +265,8 @@ interface KnowledgeBaseMetrics {
     uploadedFilesSize?: number;
   }[];
 }
+
+type CrmSyncSource = "users" | "waitlist";
 
 const ChatDialog = ({
   session,
@@ -727,6 +730,14 @@ export default function AdminDashboard() {
   const [passwordUserEmail, setPasswordUserEmail] = useState<string | null>(null);
   const [newPassword, setNewPassword] = useState("");
   const [passwordResetLoading, setPasswordResetLoading] = useState(false);
+  const [crmSyncDialogOpen, setCrmSyncDialogOpen] = useState(false);
+  const [crmSyncSource, setCrmSyncSource] = useState<CrmSyncSource>("users");
+  const [crmSyncListId, setCrmSyncListId] = useState("");
+  const [crmSyncLastSyncAt, setCrmSyncLastSyncAt] = useState<string | null>(null);
+  const [crmSyncLoading, setCrmSyncLoading] = useState(false);
+  const [crmSyncSaving, setCrmSyncSaving] = useState(false);
+  const [crmSyncRunning, setCrmSyncRunning] = useState(false);
+  const [crmSyncForceFull, setCrmSyncForceFull] = useState(false);
 
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
@@ -960,6 +971,65 @@ export default function AdminDashboard() {
 
   const handleWaitlistAction = async (email: string, status: string) => {
     await updateWaitlistStatus(email, status);
+  };
+
+  const loadCrmSyncConfig = async (source: CrmSyncSource) => {
+    try {
+      setCrmSyncLoading(true);
+      const response = await axios.get(buildApiUrl(`/api/admin/crm-sync/${source}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setCrmSyncListId(response.data?.listId || "");
+      setCrmSyncLastSyncAt(response.data?.lastSyncAt || null);
+    } catch (err: any) {
+      console.error("Error loading CRM sync config:", err);
+      setError(err.response?.data?.message || "Failed to load CRM sync configuration");
+    } finally {
+      setCrmSyncLoading(false);
+    }
+  };
+
+  const handleOpenCrmSyncDialog = async (source: CrmSyncSource) => {
+    setCrmSyncSource(source);
+    setCrmSyncForceFull(false);
+    setCrmSyncDialogOpen(true);
+    await loadCrmSyncConfig(source);
+  };
+
+  const handleSaveCrmSyncConfig = async () => {
+    try {
+      setCrmSyncSaving(true);
+      await axios.put(
+        buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}`),
+        { listId: crmSyncListId.trim() },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSuccess(`CRM sync configuration saved for ${crmSyncSource}.`);
+      await loadCrmSyncConfig(crmSyncSource);
+    } catch (err: any) {
+      console.error("Error saving CRM sync config:", err);
+      setError(err.response?.data?.message || "Failed to save CRM sync configuration");
+    } finally {
+      setCrmSyncSaving(false);
+    }
+  };
+
+  const handleStartCrmSync = async () => {
+    try {
+      setCrmSyncRunning(true);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}/start`),
+        { forceFullSync: crmSyncForceFull },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setCrmSyncLastSyncAt(response.data?.lastSyncAt || null);
+      setSuccess(response.data?.message || `CRM sync started for ${crmSyncSource}.`);
+    } catch (err: any) {
+      console.error("Error starting CRM sync:", err);
+      setError(err.response?.data?.message || "Failed to start CRM sync");
+    } finally {
+      setCrmSyncRunning(false);
+    }
   };
 
   const handleOpenDeleteConfirm = (email: string) => {
@@ -2706,6 +2776,15 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
+          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+            <Button
+              variant="contained"
+              startIcon={<SyncIcon />}
+              onClick={() => handleOpenCrmSyncDialog("users")}
+            >
+              Sync to CRM
+            </Button>
+          </Box>
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -3343,8 +3422,14 @@ export default function AdminDashboard() {
             </Alert>
           )}
 
-          {/* Manual Invite Button */}
-          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+          <Box sx={{ display: "flex", justifyContent: "space-between", mb: 2 }}>
+            <Button
+              variant="contained"
+              startIcon={<SyncIcon />}
+              onClick={() => handleOpenCrmSyncDialog("waitlist")}
+            >
+              Sync to CRM
+            </Button>
             <Button
               variant="contained"
               startIcon={<PersonAddIcon />}
@@ -5472,6 +5557,68 @@ export default function AdminDashboard() {
             disabled={editWaitlistLoading}
           >
             {editWaitlistLoading ? <CircularProgress size={24} /> : 'Save'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog
+        open={crmSyncDialogOpen}
+        onClose={() => setCrmSyncDialogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Sync {crmSyncSource === "users" ? "Users" : "Waitlist"} to CRM
+        </DialogTitle>
+        <DialogContent>
+          {crmSyncLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 3 }}>
+              <CircularProgress size={24} />
+            </Box>
+          ) : (
+            <Box sx={{ pt: 1 }}>
+              <TextField
+                fullWidth
+                label="Lead List ID"
+                value={crmSyncListId}
+                onChange={(e) => setCrmSyncListId(e.target.value)}
+                helperText="Configured in CRM lead list API Integration"
+                disabled={crmSyncSaving || crmSyncRunning}
+                sx={{ mb: 2 }}
+              />
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Last sync: {crmSyncLastSyncAt ? new Date(crmSyncLastSyncAt).toLocaleString() : "Never"}
+              </Typography>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={crmSyncForceFull}
+                    onChange={(e) => setCrmSyncForceFull(e.target.checked)}
+                    disabled={crmSyncRunning}
+                  />
+                }
+                label="Force full sync"
+              />
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCrmSyncDialogOpen(false)} disabled={crmSyncSaving || crmSyncRunning}>
+            Close
+          </Button>
+          <Button
+            variant="outlined"
+            onClick={handleSaveCrmSyncConfig}
+            disabled={crmSyncLoading || crmSyncSaving || crmSyncRunning || !crmSyncListId.trim()}
+          >
+            {crmSyncSaving ? <CircularProgress size={20} /> : "Save"}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={handleStartCrmSync}
+            disabled={crmSyncLoading || crmSyncSaving || crmSyncRunning || !crmSyncListId.trim()}
+          >
+            {crmSyncRunning ? <CircularProgress size={20} /> : "Start Syncing"}
           </Button>
         </DialogActions>
       </Dialog>
