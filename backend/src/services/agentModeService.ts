@@ -833,9 +833,21 @@ export class AgentModeService {
     availableTemplates: any[], 
     allowedToolNames: Set<string>
   ) {
-    // Helper to safely check if content starts with a prefix (handles array content)
+    // Helper to safely check if content starts with a prefix (handles both string and Anthropic array format)
     const contentStartsWith = (content: any, prefix: string): boolean => {
-      return typeof content === 'string' && content.startsWith(prefix);
+      console.log("Content: ", content);
+      console.log("Prefix: ", prefix);
+      if (typeof content === 'string') {
+        return content.startsWith(prefix);
+      }
+      // Handle Anthropic's array content format: [{type: "text", text: "..."}]
+      if (Array.isArray(content) && content.length > 0) {
+        const firstBlock = content[0];
+        if (firstBlock && firstBlock.type === 'text' && typeof firstBlock.text === 'string') {
+          return firstBlock.text.startsWith(prefix);
+        }
+      }
+      return false;
     };
 
     // 1. Handle Available Skills Message
