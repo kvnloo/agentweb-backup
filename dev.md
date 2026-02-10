@@ -1,3 +1,49 @@
+# February 10, 2026: CRM Web Enrichment Production Failure Investigation (v26.2.0)
+
+## Investigation Summary
+- Environment checked: `Agentweb-backend-env-prod-3` (AWS Elastic Beanstalk, `us-west-2`)
+- Logs inspected from full bundle and tail logs
+- Main failing workflow: `POST /api/crm/lists/:listId/leads/enrich-web?mode=enrich`
+
+## Key Findings
+- Primary failure is Google Custom Search quota/rate limiting:
+  - `Quota exceeded for quota metric 'Queries' and limit 'Queries per minute per user'`
+  - Observed repeatedly in `web.stdout.log` during enrich runs.
+  - Example lines:
+    - `/tmp/eb-prod3-bundle/var/log/web.stdout.log:285`
+    - `/tmp/eb-prod3-bundle/var/log/web.stdout.log:45596`
+    - `/tmp/eb-prod3-bundle/var/log/web.stdout.log:46733`
+- Nginx upstream timeout occurred for the enrich endpoint:
+  - `/tmp/eb-prod3-bundle/var/log/nginx/error.log:247`
+  - `upstream timed out ... POST /api/crm/lists/.../leads/enrich-web?mode=enrich`
+- Secondary issue: occasional LLM JSON parsing failures:
+  - `LLMService: Error generating content: SyntaxError...`
+  - Examples:
+    - `/tmp/eb-prod3-bundle/var/log/web.stdout.log:45`
+    - `/tmp/eb-prod3-bundle/var/log/web.stdout.log:45252`
+    - `/tmp/eb-prod3-bundle/var/log/web.stdout.log:46165`
+- `connect() failed (111: Connection refused)` entries align with deployment restarts and are not the main enrich failure cause.
+
+## Impact
+- Enrichment batch jobs report many failed leads due to `searchWeb` quota errors.
+- Some enrich requests run long enough to hit upstream timeout.
+- JSON parse failures reduce successful enrichments further.
+
+## TODO (Feb 10, 2026)
+- [ ] Add server-side rate limiting and retry/backoff for `searchWeb` (respect Google per-minute quota).
+- [ ] Reduce effective enrichment search concurrency in production (current burst is too high).
+- [ ] Move enrich processing to async job execution with progress polling to avoid long blocking HTTP request timeouts.
+- [ ] Add early circuit-breaker behavior when quota errors spike (fail fast with clear status instead of repeated retries).
+- [ ] Harden JSON extraction path:
+  - [ ] enforce strict JSON response mode/instructions
+  - [ ] keep retry with stricter prompt
+  - [ ] add safe fallback parse guardrails
+- [ ] Add metrics and alerts:
+  - [ ] quota error count
+  - [ ] enrich timeout count
+  - [ ] per-batch success/fail rate
+- [ ] Document operational limits for enrichment batch size and recommended concurrency.
+
 # February 08, 2026: MCP Session Concurrency Fix (v25.9.0)
 
 ## Problem
