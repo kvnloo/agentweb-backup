@@ -651,6 +651,83 @@ describe('CRM Routes', () => {
     });
   });
 
+  describe('POST /api/crm/lists/:listId/leads/match-icps', () => {
+    const findMatchIcpsPostHandler = () => router.stack.find((r: any) =>
+      r.route?.path === '/lists/:listId/leads/match-icps' && r.route?.methods?.post
+    );
+
+    it('should use gpt-5.2-chat for ICP matching', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user-id',
+        marketStrategy: {
+          businessOverview: 'B2B SaaS',
+          icp: [
+            {
+              title: 'SaaS founders',
+              description: 'Early-stage SaaS founders',
+              valueProposition: 'Automation',
+            },
+          ],
+        },
+      });
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [
+          {
+            leadId: 'lead1',
+            firstName: 'John',
+            lastName: 'Doe',
+            email: 'john@example.com',
+            company: 'Acme',
+            title: 'Founder',
+          },
+        ],
+        lastEvaluatedKey: null,
+      });
+
+      const mockLlmService = {
+        generateJSONContent: jest.fn().mockResolvedValue([
+          {
+            index: 1,
+            isMatch: true,
+            score: 88,
+            reason: 'Founder aligns with ICP.',
+          },
+        ]),
+      };
+      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { mode: 'match' };
+      mockRequest.body = {};
+
+      const handler = findMatchIcpsPostHandler();
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(createLLMService).toHaveBeenCalledWith('gpt-5.2-chat', 1);
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
+        icpMatch: {
+          isMatch: true,
+          score: 88,
+          reason: 'Founder aligns with ICP.',
+          matchedAt: expect.any(String),
+        },
+      });
+      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
+        success: true,
+        processedCount: 1,
+      }));
+    });
+  });
+
   describe('POST /api/crm/lists/:listId/leads/enrich-web', () => {
     const findEnrichWebPostHandler = () => router.stack.find((r: any) =>
       r.route?.path === '/lists/:listId/leads/enrich-web' && r.route?.methods?.post
