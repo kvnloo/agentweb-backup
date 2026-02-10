@@ -75,6 +75,7 @@ export default function Skills() {
   const [systemPrompt, setSystemPrompt] = useState("");
   const [isPublished, setIsPublished] = useState(false);
   const [toolSearchText, setToolSearchText] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const { token } = useAuth();
 
@@ -98,7 +99,7 @@ export default function Skills() {
       });
       const allTools = (response.data.functionCalls as AvailableTool[]) || [];
       // Filter out internal/infrastructure tools
-      setAvailableTools(allTools.filter(t => t.name !== 'explore_skills' && t.name !== 'mcpservers_fetch'));
+      setAvailableTools(allTools.filter(t => t.name !== 'explore_skills' && t.name !== 'mcpservers_fetch' && t.name !== 'install_skills'));
     } catch (err) {
       console.error("Failed to fetch available tools", err);
     }
@@ -142,6 +143,7 @@ export default function Skills() {
       return;
     }
 
+    setSaving(true);
     try {
       const skillData = {
         name,
@@ -161,6 +163,8 @@ export default function Skills() {
     } catch (err) {
       setError("Failed to save skill");
       console.error(err);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -194,6 +198,13 @@ export default function Skills() {
     skill.description.toLowerCase().includes(searchText.toLowerCase()) ||
     (skill.toolNames && skill.toolNames.some(tool => tool.toLowerCase().includes(searchText.toLowerCase())))
   );
+
+  // Compute unused tools (tools not assigned to any skill)
+  const usedToolNames = new Set<string>();
+  skills.forEach(skill => {
+    skill.toolNames?.forEach(t => usedToolNames.add(t));
+  });
+  const unusedTools = availableTools.filter(t => !usedToolNames.has(t.name));
 
   return (
     <Container maxWidth="lg">
@@ -325,6 +336,24 @@ export default function Skills() {
           </TableContainer>
         )}
       </Paper>
+
+      {!loading && unusedTools.length > 0 && (
+        <Alert severity="warning" sx={{ mt: 3, mb: 4 }}>
+          <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 'bold' }}>
+            {unusedTools.length} tool(s) not assigned to any skill:
+          </Typography>
+          <Typography variant="body2" sx={{ mb: 1.5 }}>
+            These tools are automatically grouped into a virtual "other_skills" skill, making them available to Emma even without an explicit skill assignment.
+          </Typography>
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+            {unusedTools.map(tool => (
+              <Tooltip key={tool.name} title={tool.description} arrow>
+                <Chip label={tool.name} size="small" color="warning" variant="outlined" />
+              </Tooltip>
+            ))}
+          </Box>
+        </Alert>
+      )}
 
       {/* Create/Edit Skill Dialog */}
       <Dialog open={openEditDialog} onClose={handleCloseEditDialog} maxWidth="md" fullWidth>
@@ -474,8 +503,8 @@ export default function Skills() {
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={handleCloseEditDialog} color="inherit">Cancel</Button>
-          <Button onClick={handleSubmit} variant="contained" color="primary" sx={{ minWidth: 120 }}>
-            {currentSkill ? "Save Changes" : "Create Skill"}
+          <Button onClick={handleSubmit} variant="contained" color="primary" sx={{ minWidth: 120 }} disabled={saving}>
+            {saving ? <CircularProgress size={20} color="inherit" /> : (currentSkill ? "Save Changes" : "Create Skill")}
           </Button>
         </DialogActions>
       </Dialog>
