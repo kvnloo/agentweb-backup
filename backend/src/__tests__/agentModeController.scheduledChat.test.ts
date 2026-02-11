@@ -41,11 +41,16 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 
 jest.mock('../services/db', () => ({
   scheduleDb: {
+    createSchedule: jest.fn(),
     addRunResult: jest.fn(),
     getScheduleById: jest.fn(),
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
     updateSchedule: jest.fn(),
+    getSchedulesByUserId: jest.fn(),
+  },
+  userDb: {
+    getUserById: jest.fn(),
   },
   taskDb: {
     getTaskExecutionById: jest.fn(),
@@ -62,13 +67,14 @@ jest.mock('../services/emailService', () => ({
   emailService: {
     sendScheduledChatResultEmail: jest.fn(),
     sendDailyDigestEmail: jest.fn(),
+    sendScheduledChatVariableRequestEmail: jest.fn(),
   },
 }));
 
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
-import { scheduleDb, taskDb } from '../services/db';
+import { scheduleDb, taskDb, userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { agentModeController } from '../controllers/agentModeController';
@@ -77,6 +83,7 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockTaskDb = taskDb as jest.Mocked<typeof taskDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 
@@ -130,6 +137,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(baseSchedule);
     mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([]);
     mockScheduleDb.updateScheduleAfterRun.mockResolvedValue(undefined);
+    mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
   });
 
   afterEach(() => {
@@ -563,6 +571,36 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         })
       );
     });
+
+    it('should not run test scheduled chat when required variable values are missing', async () => {
+      const variableSchedule = {
+        ...baseSchedule,
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {}
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(variableSchedule as any);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(400);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: 'Missing variable values for scheduled chat',
+          missingVariables: ['company_name']
+        })
+      );
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
   });
 
   describe('runScheduledChats endpoint', () => {
@@ -636,6 +674,133 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         processed: 0,
         results: [],
       });
+    });
+
+    it('should request variable values and skip run when required variables are missing', async () => {
+      const scheduleWithVariables = {
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: {},
+        emailNotifications: ['notify@example.com'],
+      };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithVariables]);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      const nextRunTime = new Date(response.results[0].nextRunTime).getTime();
+      const variableRequestExpiresAt = new Date(response.results[0].variableRequestExpiresAt).getTime();
+      expect(response.results[0]).toEqual(
+        expect.objectContaining({
+          scheduleId: mockScheduleId,
+          status: 'waiting_for_variables',
+          missingVariables: ['company_name'],
+          variableRequestExpiresAt: expect.any(String),
+        })
+      );
+      expect(nextRunTime - variableRequestExpiresAt).toBe(30 * 60 * 1000);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          variableRequestStatus: 'pending',
+        })
+      );
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).toHaveBeenCalledWith(
+        ['notify@example.com'],
+        'Test Schedule',
+        mockScheduleId,
+        [{ name: 'company_name', description: 'Company name' }],
+        expect.any(String),
+        expect.any(String)
+      );
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it('should request variable values when values are stale (not provided after latest request)', async () => {
+      const scheduleWithStaleValues = {
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: { company_name: 'Acme Inc' },
+        variableRequestStatus: 'provided',
+        // Missing variableRequestSentAt/variableValuesUpdatedAt means values are considered stale for auto-run
+        emailNotifications: ['notify@example.com'],
+      };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithStaleValues] as any);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.results[0]).toEqual(
+        expect.objectContaining({
+          scheduleId: mockScheduleId,
+          status: 'waiting_for_variables',
+          missingVariables: ['company_name'],
+        })
+      );
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).toHaveBeenCalledWith(
+        ['notify@example.com'],
+        'Test Schedule',
+        mockScheduleId,
+        [{ name: 'company_name', description: 'Company name' }],
+        expect.any(String),
+        expect.any(String)
+      );
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    });
+
+    it('should request variable values when existing values predate the last run', async () => {
+      const scheduleWithOutdatedValues = {
+        ...baseSchedule,
+        frequency: 'daily',
+        variables: [{ name: 'company_name', description: 'Company name' }],
+        variableValues: { company_name: 'Acme Inc' },
+        variableRequestStatus: 'provided',
+        variableRequestSentAt: '2026-01-01T00:00:00.000Z',
+        variableValuesUpdatedAt: '2026-01-01T00:10:00.000Z',
+        lastRunTime: '2026-01-02T00:00:00.000Z',
+        emailNotifications: ['notify@example.com'],
+      };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithOutdatedValues] as any);
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      const response = (mockRes.json as jest.Mock).mock.calls[0][0];
+      expect(response.results[0]).toEqual(
+        expect.objectContaining({
+          scheduleId: mockScheduleId,
+          status: 'waiting_for_variables',
+          missingVariables: ['company_name'],
+        })
+      );
+      expect(mockEmailService.sendScheduledChatVariableRequestEmail).toHaveBeenCalledWith(
+        ['notify@example.com'],
+        'Test Schedule',
+        mockScheduleId,
+        [{ name: 'company_name', description: 'Company name' }],
+        expect.any(String),
+        expect.any(String)
+      );
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
 
     it('should default to max 5 concurrent runs when MAX_CONCURRENT_RUNS is not set', async () => {
@@ -1318,6 +1483,87 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     });
   });
 
+  describe('submitScheduledChatVariables endpoint', () => {
+    const scheduleId = 'schedule-with-vars';
+    const userId = 'test-user-123';
+
+    it('should save values and trigger immediate run when all variables are provided', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        scheduleId,
+        userId,
+        status: 'active',
+        scheduleName: 'Vars Schedule',
+        startingMessage: 'Run for {{company_name}} in {{target_market}}',
+        variables: [{ name: 'company_name' }, { name: 'target_market' }],
+        emailNotifications: [],
+      } as any);
+
+      const mockReq = {
+        user: { userId },
+        params: { scheduleId },
+        body: {
+          variableValues: {
+            company_name: 'Acme Inc',
+            target_market: 'SMB',
+          },
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.submitScheduledChatVariables(mockReq, mockRes);
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        scheduleId,
+        expect.objectContaining({
+          variableValues: {
+            company_name: 'Acme Inc',
+            target_market: 'SMB',
+          },
+          variableRequestStatus: 'provided',
+        })
+      );
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          missingVariables: [],
+        })
+      );
+    });
+
+    it('should save values without forcing immediate run when triggerRun is false', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        scheduleId,
+        userId,
+        status: 'active',
+        variables: [{ name: 'company_name' }],
+      } as any);
+
+      const mockReq = {
+        user: { userId },
+        params: { scheduleId },
+        body: {
+          triggerRun: false,
+          variableValues: {
+            company_name: 'Acme Inc',
+          },
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.submitScheduledChatVariables(mockReq, mockRes);
+
+      const payload = mockScheduleDb.updateSchedule.mock.calls[mockScheduleDb.updateSchedule.mock.calls.length - 1][1];
+      expect(payload).not.toHaveProperty('nextRunTime');
+    });
+  });
+
   describe('Run Count Feature', () => {
     // Mock the scheduleDb.createSchedule to capture the schedule object
     const mockCreateSchedule = jest.fn();
@@ -1419,6 +1665,63 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           );
         }
       });
+
+      it('should parse variables from startingMessage and keep provided descriptions', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Variable Schedule',
+            startingMessage: 'Summarize {{company_name}} for {{target_market}}',
+            emailNotifications: ['notify@example.com'],
+            scheduleFrequency: 'daily',
+            variables: [
+              { name: 'company_name', description: 'Company legal name' },
+              { name: 'target_market', description: 'Primary market segment' },
+            ],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.objectContaining({
+            variables: [
+              { name: 'company_name', description: 'Company legal name' },
+              { name: 'target_market', description: 'Primary market segment' },
+            ],
+            variableRequestStatus: 'pending',
+          })
+        );
+      });
+
+      it('should reject creating variable schedule without email notifications', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Variable Schedule',
+            startingMessage: 'Summarize {{company_name}}',
+            scheduleFrequency: 'daily',
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith({
+          error: 'Email Notifications are required when using variables in startingMessage'
+        });
+      });
     });
 
     describe('updateScheduledChat', () => {
@@ -1509,6 +1812,39 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             error: 'runCount must be -1 (unlimited) or a positive integer',
           })
         );
+      });
+
+      it('should reject updating variable schedule without email notifications', async () => {
+        mockScheduleDb.getScheduleById.mockResolvedValue({
+          scheduleId: mockScheduleId,
+          userId: mockUserId,
+          status: 'active',
+          nextRunTime: '2025-01-15T09:00:00.000Z',
+          emailNotifications: [],
+        } as any);
+
+        const mockReq = {
+          user: { userId: mockUserId },
+          params: { scheduleId: mockScheduleId },
+          body: {
+            scheduleName: 'Updated Schedule',
+            startingMessage: 'Analyze {{company_name}}',
+            scheduleFrequency: 'daily',
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith({
+          error: 'Email Notifications are required when using variables in startingMessage'
+        });
       });
     });
   });

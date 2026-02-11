@@ -111,6 +111,94 @@ interface ScheduledChatTestResult {
   createdAt: string;
 }
 
+interface ScheduledChatVariable {
+  name: string;
+  description?: string;
+}
+
+const SCHEDULED_CHAT_VARIABLE_REGEX = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+
+function extractScheduledChatVariableNames(startingMessage: string): string[] {
+  const seen = new Set<string>();
+  let match: RegExpExecArray | null;
+  SCHEDULED_CHAT_VARIABLE_REGEX.lastIndex = 0;
+  while ((match = SCHEDULED_CHAT_VARIABLE_REGEX.exec(startingMessage)) !== null) {
+    seen.add(match[1]);
+  }
+  return Array.from(seen);
+}
+
+function validateAndBuildScheduledChatVariables(
+  startingMessage: string,
+  inputVariables: unknown,
+  existingVariables: ScheduledChatVariable[] = []
+): { variables: ScheduledChatVariable[]; error?: string } {
+  const variableNames = extractScheduledChatVariableNames(startingMessage);
+  if (variableNames.length === 0) {
+    return { variables: [] };
+  }
+
+  const normalizedInputVariables: ScheduledChatVariable[] = Array.isArray(inputVariables)
+    ? inputVariables
+        .filter((v: any) => v && typeof v.name === 'string')
+        .map((v: any) => ({
+          name: v.name.trim(),
+          description: typeof v.description === 'string' ? v.description.trim() : '',
+        }))
+    : [];
+
+  const inputNames = new Set(normalizedInputVariables.map(v => v.name));
+  const unknownVariables = Array.from(inputNames).filter(name => !variableNames.includes(name));
+  if (unknownVariables.length > 0) {
+    return {
+      variables: [],
+      error: `Variables not found in startingMessage: ${unknownVariables.join(', ')}`
+    };
+  }
+
+  const existingDescriptionMap = new Map(
+    (existingVariables || []).map(variable => [variable.name, variable.description || ''])
+  );
+  const inputDescriptionMap = new Map(
+    normalizedInputVariables.map(variable => [variable.name, variable.description || ''])
+  );
+
+  const variables = variableNames.map((name) => ({
+    name,
+    description: inputDescriptionMap.has(name)
+      ? inputDescriptionMap.get(name) || ''
+      : existingDescriptionMap.get(name) || '',
+  }));
+
+  return { variables };
+}
+
+function getMissingScheduledChatVariableNames(
+  variables: ScheduledChatVariable[],
+  variableValues: Record<string, string> = {}
+): string[] {
+  return variables
+    .filter(variable => !variableValues[variable.name] || !String(variableValues[variable.name]).trim())
+    .map(variable => variable.name);
+}
+
+function applyScheduledChatVariableValues(
+  startingMessage: string,
+  variableValues: Record<string, string> = {}
+): string {
+  return startingMessage.replace(SCHEDULED_CHAT_VARIABLE_REGEX, (_, variableName: string) => {
+    const value = variableValues[variableName];
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      return `{{${variableName}}}`;
+    }
+    return value;
+  });
+}
+
+function hashScheduledChatVariableAccessToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
 // Helper function to reconstruct actualResponse from session messages (only used when sending emails)
 async function getActualResponseFromSession(sessionId: string): Promise<string> {
   try {
@@ -586,6 +674,30 @@ async function runScheduledChat(
   const now = new Date();
 
   try {
+    const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+    const scheduleVariableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
+      ? schedule.variableValues as Record<string, string>
+      : {};
+    const missingVariableNames = getMissingScheduledChatVariableNames(scheduleVariables, scheduleVariableValues);
+    if (scheduleVariables.length > 0 && missingVariableNames.length > 0) {
+      return {
+        scheduleId: schedule.scheduleId,
+        runId: require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `Scheduled chat cannot run. Missing variable values: ${missingVariableNames.map(name => `{{${name}}}`).join(', ')}`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString()
+      };
+    }
+
     // Check if required function calls are allowed for the user's subscription
     const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     if (expectedFunctionCalls.length > 0) {
@@ -718,11 +830,16 @@ async function runScheduledChat(
       minCount: functionCallMinCalls[funcName] || 1
     }));
 
+    const resolvedStartingMessage = applyScheduledChatVariableValues(
+      schedule.startingMessage,
+      schedule.variableValues || {}
+    );
+
     // Run verified chat
     const result = await runVerifiedChat({
       sessionId,
       userId,
-      startingMessage: schedule.startingMessage,
+      startingMessage: resolvedStartingMessage,
       keywords: expectedKeywords,
       requiredFunctions,
       maxAttempts: 20,
@@ -2255,7 +2372,9 @@ export const agentModeController = {
         emailNotifications,
         emailCampaignTaskId,
         llmModel,
-        runCount
+        runCount,
+        variables,
+        variableValues
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -2296,7 +2415,7 @@ export const agentModeController = {
         scheduledNextRunTime = calculatedTime.toISOString();
       }
 
-      const scheduledChat = {
+      const scheduledChat: any = {
         scheduleId,
         taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
         userId: user.userId,
@@ -2317,8 +2436,39 @@ export const agentModeController = {
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
         llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
-        runCount: runCount !== undefined ? runCount : -1 // Default to unlimited runs if not specified
+        runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
+        variables: [] as ScheduledChatVariable[],
+        variableValues: {} as Record<string, string>,
+        variableRequestStatus: 'idle'
       };
+
+      const { variables: normalizedVariables, error: variableError } =
+        validateAndBuildScheduledChatVariables(startingMessage, variables);
+      if (variableError) {
+        return res.status(400).json({ error: variableError });
+      }
+      if (normalizedVariables.length > 0 && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
+      }
+
+      const normalizedVariableValues: Record<string, string> = {};
+      if (normalizedVariables.length > 0 && variableValues && typeof variableValues === 'object') {
+        normalizedVariables.forEach((variable) => {
+          const rawValue = (variableValues as Record<string, unknown>)[variable.name];
+          if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+            normalizedVariableValues[variable.name] = rawValue.trim();
+          }
+        });
+      }
+
+      scheduledChat.variables = normalizedVariables;
+      scheduledChat.variableValues = normalizedVariableValues;
+      scheduledChat.variableRequestStatus = normalizedVariables.length > 0
+        ? (getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length > 0 ? 'pending' : 'provided')
+        : 'idle';
+      if (Object.keys(normalizedVariableValues).length > 0) {
+        scheduledChat.variableValuesUpdatedAt = now.toISOString();
+      }
 
       await scheduleDb.createSchedule(scheduledChat);
 
@@ -2376,7 +2526,9 @@ export const agentModeController = {
         dailyDigest,
         emailCampaignTaskId,
         llmModel,
-        runCount
+        runCount,
+        variables,
+        variableValues
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -2426,6 +2578,52 @@ export const agentModeController = {
         llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
       };
 
+      const { variables: normalizedVariables, error: variableError } =
+        validateAndBuildScheduledChatVariables(startingMessage, variables, existingSchedule.variables || []);
+      if (variableError) {
+        return res.status(400).json({ error: variableError });
+      }
+      const effectiveEmailNotifications = Array.isArray(emailNotifications)
+        ? emailNotifications
+        : (Array.isArray(existingSchedule.emailNotifications) ? existingSchedule.emailNotifications : []);
+      if (normalizedVariables.length > 0 && effectiveEmailNotifications.length === 0) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
+      }
+      updates.variables = normalizedVariables;
+
+      // Preserve existing values for unchanged variables unless explicitly overwritten
+      const existingValues = (existingSchedule.variableValues && typeof existingSchedule.variableValues === 'object')
+        ? existingSchedule.variableValues as Record<string, string>
+        : {};
+      const normalizedVariableValues: Record<string, string> = {};
+
+      normalizedVariables.forEach((variable) => {
+        const incomingValue = variableValues && typeof variableValues === 'object'
+          ? (variableValues as Record<string, unknown>)[variable.name]
+          : undefined;
+
+        if (typeof incomingValue === 'string') {
+          const trimmed = incomingValue.trim();
+          if (trimmed.length > 0) {
+            normalizedVariableValues[variable.name] = trimmed;
+          }
+          return;
+        }
+
+        const existingValue = existingValues[variable.name];
+        if (typeof existingValue === 'string' && existingValue.trim().length > 0) {
+          normalizedVariableValues[variable.name] = existingValue.trim();
+        }
+      });
+
+      updates.variableValues = normalizedVariableValues;
+      updates.variableRequestStatus = normalizedVariables.length > 0
+        ? (getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length > 0 ? 'pending' : 'provided')
+        : 'idle';
+      if (Object.keys(normalizedVariableValues).length > 0) {
+        updates.variableValuesUpdatedAt = now.toISOString();
+      }
+
       // Only include nextRunTime in updates if it was explicitly provided
       if (shouldUpdateNextRunTime) {
         updates.nextRunTime = scheduledNextRunTime;
@@ -2448,6 +2646,274 @@ export const agentModeController = {
     }
   },
 
+  // Submit variable values for a scheduled chat
+  async submitScheduledChatVariables(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { variableValues, triggerRun } = req.body as { variableValues?: Record<string, string>; triggerRun?: boolean };
+
+      if (!variableValues || typeof variableValues !== 'object') {
+        return res.status(400).json({ error: 'variableValues object is required' });
+      }
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      if (variables.length === 0) {
+        return res.status(400).json({ error: 'This scheduled chat has no variables' });
+      }
+
+      const sanitizedValues: Record<string, string> = {};
+      variables.forEach((variable) => {
+        const rawValue = variableValues[variable.name];
+        if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+          sanitizedValues[variable.name] = rawValue.trim();
+        }
+      });
+
+      const missingVariableNames = getMissingScheduledChatVariableNames(variables, sanitizedValues);
+      const nowIso = new Date().toISOString();
+
+      await scheduleDb.updateSchedule(scheduleId, {
+        variableValues: sanitizedValues,
+        variableRequestStatus: missingVariableNames.length > 0 ? 'pending' : 'provided',
+        variableValuesUpdatedAt: nowIso,
+        variableRequestAccessTokenConsumedAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      if (missingVariableNames.length === 0 && triggerRun !== false) {
+        const scheduleToRun: any = {
+          ...schedule,
+          variableValues: sanitizedValues,
+          variableRequestStatus: 'provided',
+          variableValuesUpdatedAt: nowIso
+        };
+
+        runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
+          if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+            try {
+              await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+                variableValues: {},
+                variableRequestStatus: 'pending',
+                updatedAt: new Date().toISOString()
+              });
+            } catch (clearError) {
+              console.error(`Error clearing variable values after manual trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+            }
+          }
+
+          if (result.sessionId) {
+            try {
+              const emailNotifications = scheduleToRun.emailNotifications || [];
+              if (emailNotifications.length > 0) {
+                await emailService.sendScheduledChatResultEmail(
+                  emailNotifications,
+                  scheduleToRun.scheduleName,
+                  result,
+                  scheduleToRun.scheduleId
+                );
+              }
+            } catch (emailError) {
+              console.error('Error sending scheduled chat result email after manual trigger:', emailError);
+            }
+          }
+        }).catch(async (runError) => {
+          if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+            scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+              variableValues: {},
+              variableRequestStatus: 'pending',
+              updatedAt: new Date().toISOString()
+            }).catch((clearError) => {
+              console.error(`Error clearing variable values after failed manual trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+            });
+          }
+          console.error(`Error triggering scheduled chat after variable submission for ${scheduleToRun.scheduleName}:`, runError);
+        });
+      }
+
+      res.json({
+        message: missingVariableNames.length === 0
+          ? (triggerRun === false
+              ? 'Variable values saved.'
+              : 'Variable values saved. Scheduled chat run started.')
+          : 'Variable values saved, but some required variables are still missing.',
+        missingVariables: missingVariableNames
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit scheduled chat variables error:', error);
+      res.status(500).json({ error: 'Failed to submit scheduled chat variables' });
+    }
+  },
+
+  // Public endpoint: view required variables by one-time access token (no login required)
+  async getScheduledChatVariablesByAccessToken(req: Request, res: Response) {
+    try {
+      const { accessToken } = req.params;
+      if (!accessToken || typeof accessToken !== 'string') {
+        return res.status(400).json({ error: 'Access token is required' });
+      }
+
+      const tokenHash = hashScheduledChatVariableAccessToken(accessToken);
+      const schedule = await scheduleDb.getScheduledChatByVariableAccessTokenHash(tokenHash);
+      if (!schedule) {
+        return res.status(404).json({ error: 'Invalid or expired variable request link' });
+      }
+
+      const nowMs = Date.now();
+      const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
+        ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
+        : NaN;
+      const isExpired = Number.isFinite(expiresAtMs) && expiresAtMs < nowMs;
+      if (isExpired) {
+        return res.status(410).json({ error: 'This variable request link has expired' });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      const isCompleted = Boolean(schedule.variableRequestAccessTokenConsumedAt)
+        || schedule.variableRequestStatus === 'provided';
+
+      return res.json({
+        scheduleId: schedule.scheduleId,
+        scheduleName: schedule.scheduleName || 'Scheduled Chat',
+        variables,
+        status: isCompleted ? 'completed' : 'pending',
+        submittedAt: schedule.variableRequestAccessTokenConsumedAt || null,
+        expiresAt: schedule.variableRequestAccessTokenExpiresAt || null,
+      });
+    } catch (error) {
+      console.error('AgentMode: Get scheduled chat variables by access token error:', error);
+      return res.status(500).json({ error: 'Failed to load variable request' });
+    }
+  },
+
+  // Public endpoint: submit variables by one-time access token (no login required)
+  async submitScheduledChatVariablesByAccessToken(req: Request, res: Response) {
+    try {
+      const { accessToken } = req.params;
+      const { variableValues } = req.body as { variableValues?: Record<string, string> };
+
+      if (!accessToken || typeof accessToken !== 'string') {
+        return res.status(400).json({ error: 'Access token is required' });
+      }
+      if (!variableValues || typeof variableValues !== 'object') {
+        return res.status(400).json({ error: 'variableValues object is required' });
+      }
+
+      const tokenHash = hashScheduledChatVariableAccessToken(accessToken);
+      const schedule = await scheduleDb.getScheduledChatByVariableAccessTokenHash(tokenHash);
+      if (!schedule) {
+        return res.status(404).json({ error: 'Invalid or expired variable request link' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
+        ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
+        : NaN;
+      if (Number.isFinite(expiresAtMs) && expiresAtMs < Date.now()) {
+        return res.status(410).json({ error: 'This variable request link has expired' });
+      }
+
+      if (schedule.variableRequestAccessTokenConsumedAt) {
+        return res.status(409).json({
+          error: 'This variable request link has already been used',
+          status: 'completed',
+          submittedAt: schedule.variableRequestAccessTokenConsumedAt
+        });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      if (variables.length === 0) {
+        return res.status(400).json({ error: 'This scheduled chat has no variables' });
+      }
+
+      const sanitizedValues: Record<string, string> = {};
+      variables.forEach((variable) => {
+        const rawValue = variableValues[variable.name];
+        if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+          sanitizedValues[variable.name] = rawValue.trim();
+        }
+      });
+
+      const missingVariableNames = getMissingScheduledChatVariableNames(variables, sanitizedValues);
+      if (missingVariableNames.length > 0) {
+        return res.status(400).json({
+          error: 'Missing values for required variables',
+          missingVariables: missingVariableNames
+        });
+      }
+
+      await scheduleDb.updateSchedule(schedule.scheduleId, {
+        variableValues: sanitizedValues,
+        variableRequestStatus: 'provided',
+        variableValuesUpdatedAt: nowIso,
+        variableRequestAccessTokenConsumedAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      const scheduleToRun: any = {
+        ...schedule,
+        variableValues: sanitizedValues,
+        variableRequestStatus: 'provided',
+        variableValuesUpdatedAt: nowIso
+      };
+
+      runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
+        if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+          try {
+            await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+              variableValues: {},
+              variableRequestStatus: 'pending',
+              updatedAt: new Date().toISOString()
+            });
+          } catch (clearError) {
+            console.error(`Error clearing variable values after public trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+          }
+        }
+
+        if (result.sessionId) {
+          try {
+            const emailNotifications = scheduleToRun.emailNotifications || [];
+            if (emailNotifications.length > 0) {
+              await emailService.sendScheduledChatResultEmail(
+                emailNotifications,
+                scheduleToRun.scheduleName,
+                result,
+                scheduleToRun.scheduleId
+              );
+            }
+          } catch (emailError) {
+            console.error('Error sending scheduled chat result email after public variable submit:', emailError);
+          }
+        }
+      }).catch((runError) => {
+        if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+          scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+            variableValues: {},
+            variableRequestStatus: 'pending',
+            updatedAt: new Date().toISOString()
+          }).catch((clearError) => {
+            console.error(`Error clearing variable values after failed public trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+          });
+        }
+        console.error(`Error triggering scheduled chat after public variable submission for ${scheduleToRun.scheduleName}:`, runError);
+      });
+
+      return res.json({
+        message: 'Variable values submitted successfully. Scheduled chat run started.',
+        status: 'completed',
+        submittedAt: nowIso
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit scheduled chat variables by access token error:', error);
+      return res.status(500).json({ error: 'Failed to submit variable values' });
+    }
+  },
+
   async testScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -2457,6 +2923,18 @@ export const agentModeController = {
       const schedule = await scheduleDb.getScheduleById(scheduleId);
       if (!schedule || schedule.userId !== user.userId) {
         return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      const variableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
+        ? schedule.variableValues as Record<string, string>
+        : {};
+      const missingVariables = getMissingScheduledChatVariableNames(variables, variableValues);
+      if (variables.length > 0 && missingVariables.length > 0) {
+        return res.status(400).json({
+          error: 'Missing variable values for scheduled chat',
+          missingVariables
+        });
       }
 
       // Run the scheduled chat as a test
@@ -2673,6 +3151,92 @@ export const agentModeController = {
       for (const schedule of scheduledChats) {
         try {
           const now = new Date();
+          const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+          const scheduleVariableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
+            ? schedule.variableValues as Record<string, string>
+            : {};
+          const missingVariableNames = getMissingScheduledChatVariableNames(scheduleVariables, scheduleVariableValues);
+          const hasAllVariableValues = missingVariableNames.length === 0;
+          const hasVariableRequestSentAt = typeof schedule.variableRequestSentAt === 'string' && schedule.variableRequestSentAt.length > 0;
+          const hasVariableValuesUpdatedAt = typeof schedule.variableValuesUpdatedAt === 'string' && schedule.variableValuesUpdatedAt.length > 0;
+          const hasLastRunTime = typeof schedule.lastRunTime === 'string' && schedule.lastRunTime.length > 0;
+          const variableRequestSentAtMs = hasVariableRequestSentAt ? new Date(schedule.variableRequestSentAt).getTime() : NaN;
+          const variableValuesUpdatedAtMs = hasVariableValuesUpdatedAt ? new Date(schedule.variableValuesUpdatedAt).getTime() : NaN;
+          const lastRunTimeMs = hasLastRunTime ? new Date(schedule.lastRunTime).getTime() : NaN;
+          const valuesProvidedAfterLatestRequest = Number.isFinite(variableRequestSentAtMs)
+            && Number.isFinite(variableValuesUpdatedAtMs)
+            && variableValuesUpdatedAtMs >= variableRequestSentAtMs;
+          const valuesProvidedAfterLastRun = !Number.isFinite(lastRunTimeMs)
+            || (Number.isFinite(variableValuesUpdatedAtMs) && variableValuesUpdatedAtMs > lastRunTimeMs);
+          const isVariableRequestSatisfied = schedule.variableRequestStatus === 'provided'
+            && hasAllVariableValues
+            && valuesProvidedAfterLatestRequest
+            && valuesProvidedAfterLastRun;
+
+          // Calculate next run based on the current nextRunTime to preserve the scheduled time
+          const currentNextRun = new Date(schedule.nextRunTime);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
+
+          if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
+            const requestedVariableNames = missingVariableNames.length > 0
+              ? missingVariableNames
+              : scheduleVariables.map(variable => variable.name);
+            const variableAccessToken = crypto.randomBytes(32).toString('hex');
+            const variableAccessTokenHash = hashScheduledChatVariableAccessToken(variableAccessToken);
+            const variableAccessTokenExpiresAtDate = new Date(nextRunTime.getTime() - (30 * 60 * 1000));
+            const variableAccessTokenExpiresAt = variableAccessTokenExpiresAtDate.toISOString();
+            const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+            const variableInputUrl = `${customerFrontendUrl}/scheduled-chat/variables/${variableAccessToken}`;
+
+            // Advance next run immediately. This run window is now waiting for variable submission.
+            await scheduleDb.updateScheduleAfterRun(
+              schedule.scheduleId,
+              now.toISOString(),
+              nextRunTime.toISOString(),
+              true
+            );
+
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              updatedAt: now.toISOString(),
+              variableRequestStatus: 'pending',
+              variableRequestSentAt: now.toISOString(),
+              variableRequestAccessTokenHash: variableAccessTokenHash,
+              variableRequestAccessTokenExpiresAt: variableAccessTokenExpiresAt,
+              variableRequestAccessTokenConsumedAt: ''
+            });
+
+            try {
+              const user = await userDb.getUserById(schedule.userId);
+              const emailNotifications = schedule.emailNotifications || [];
+              const recipients = emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []);
+
+              if (recipients.length > 0) {
+                await emailService.sendScheduledChatVariableRequestEmail(
+                  recipients,
+                  schedule.scheduleName,
+                  schedule.scheduleId,
+                  scheduleVariables.filter(variable => requestedVariableNames.includes(variable.name)),
+                  variableInputUrl,
+                  variableAccessTokenExpiresAt
+                );
+              } else {
+                console.log(`No recipients configured for variable request on schedule ${schedule.scheduleName}`);
+              }
+            } catch (error) {
+              console.error(`Error sending variable request email for schedule ${schedule.scheduleName}:`, error);
+            }
+
+            results.push({
+              scheduleId: schedule.scheduleId,
+              scheduleName: schedule.scheduleName,
+              status: 'waiting_for_variables',
+              nextRunTime: nextRunTime.toISOString(),
+              variableRequestExpiresAt: variableAccessTokenExpiresAt,
+              missingVariables: requestedVariableNames
+            });
+
+            continue;
+          }
 
           // Check if we've reached the concurrent run limit
           if (currentConcurrentRuns >= maxConcurrentRuns) {
@@ -2704,9 +3268,6 @@ export const agentModeController = {
 
           // Update the schedule with next run time FIRST (synchronously)
           // This prevents agent-engine from repeatedly calling the same schedule
-          // Calculate next run based on the current nextRunTime to preserve the scheduled time
-          const currentNextRun = new Date(schedule.nextRunTime);
-          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
 
           // Decrement runCount and auto-pause if it reaches 0
           // Note: Both successful and failed runs count toward the run limit
@@ -2724,6 +3285,19 @@ export const agentModeController = {
           runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
+
+            // Clear consumed variable values so each run requests fresh values
+            if (scheduleVariables.length > 0) {
+              try {
+                await scheduleDb.updateSchedule(schedule.scheduleId, {
+                  variableValues: {},
+                  variableRequestStatus: 'pending',
+                  updatedAt: new Date().toISOString()
+                });
+              } catch (error) {
+                console.error(`Error clearing variable values for schedule ${schedule.scheduleName}:`, error);
+              }
+            }
 
             // Send email notification with the result (only if it actually ran, not if it was blocked)
             // If result.sessionId is empty, it means the run was blocked due to subscription restrictions
@@ -2766,6 +3340,16 @@ export const agentModeController = {
           }).catch((error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
+
+            if (scheduleVariables.length > 0) {
+              scheduleDb.updateSchedule(schedule.scheduleId, {
+                variableValues: {},
+                variableRequestStatus: 'pending',
+                updatedAt: new Date().toISOString()
+              }).catch((updateError) => {
+                console.error(`Error clearing variable values after failed run for schedule ${schedule.scheduleName}:`, updateError);
+              });
+            }
 
             console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
             // Log the full error details for debugging
