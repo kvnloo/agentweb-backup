@@ -90,15 +90,15 @@ router.post("/", async (req, res) => {
       return res.status(409).json({ message: "Server with this name already exists" });
     }
     
-    // Create new server config
+    // Create new server config, scoped to the selected transport
     const newServer: McpServerConfig = {
       name,
       transport,
-      ...(url && { url }),
-      ...(command && { command }),
-      ...(args && { args }),
-      ...(env && { env }),
-      ...(accessToken && { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") }),
+      ...(transport === 'stdio' && command && { command }),
+      ...(transport === 'stdio' && args && { args }),
+      ...(transport === 'stdio' && env && { env }),
+      ...(transport !== 'stdio' && url && { url }),
+      ...(transport !== 'stdio' && accessToken && { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
     };
     servers.push(newServer);
@@ -162,29 +162,34 @@ router.put("/:name", async (req, res) => {
       return res.status(400).json({ message: "URL must be a valid http or https URL" });
     }
     
-    // Update server config
+    // Update server config; only persist fields relevant to selected transport
     const updatedServer: McpServerConfig = {
       name: newName || serverName,
       transport: effectiveTransport,
-      ...(url !== undefined && { url }),
-      ...(command !== undefined && { command }),
-      ...(args !== undefined && { args }),
-      ...(env !== undefined && { env }),
-      // Handle access token encryption
-      ...(accessToken !== undefined && (() => {
-        // If empty string, allow it (clearing token)
-        if (!accessToken) return { accessToken };
-        
-        // Try to decrypt to see if it's already encrypted
-        try {
-           decryptPassword(accessToken);
-           // If successful, it's already encrypted, allow as is
-           return { accessToken };
-        } catch (e) {
-           // If failed, it's plain text, encrypt it
-           return { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") };
-        }
-      })()),
+      ...(effectiveTransport === 'stdio'
+        ? {
+            ...(command !== undefined && { command }),
+            ...(args !== undefined && { args }),
+            ...(env !== undefined && { env }),
+          }
+        : {
+            ...(url !== undefined && { url }),
+            // Handle access token encryption
+            ...(accessToken !== undefined && (() => {
+              // If empty string, allow it (clearing token)
+              if (!accessToken) return { accessToken };
+              
+              // Try to decrypt to see if it's already encrypted
+              try {
+                 decryptPassword(accessToken);
+                 // If successful, it's already encrypted, allow as is
+                 return { accessToken };
+              } catch (e) {
+                 // If failed, it's plain text, encrypt it
+                 return { accessToken: encryptPassword(accessToken, (req as any).user?.userId || "admin") };
+              }
+            })()),
+          }),
       ...(typeof isInternal === 'boolean' && { isInternal }),
       discoveredTools: servers[serverIndex].discoveredTools,
     };
