@@ -2415,7 +2415,7 @@ export const agentModeController = {
         scheduledNextRunTime = calculatedTime.toISOString();
       }
 
-      const scheduledChat = {
+      const scheduledChat: any = {
         scheduleId,
         taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
         userId: user.userId,
@@ -2439,7 +2439,7 @@ export const agentModeController = {
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
         variableValues: {} as Record<string, string>,
-        variableRequestStatus: 'idle' as const
+        variableRequestStatus: 'idle'
       };
 
       const { variables: normalizedVariables, error: variableError } =
@@ -2687,7 +2687,7 @@ export const agentModeController = {
       });
 
       if (missingVariableNames.length === 0 && triggerRun !== false) {
-        const scheduleToRun = {
+        const scheduleToRun: any = {
           ...schedule,
           variableValues: sanitizedValues,
           variableRequestStatus: 'provided',
@@ -2855,7 +2855,7 @@ export const agentModeController = {
         updatedAt: nowIso,
       });
 
-      const scheduleToRun = {
+      const scheduleToRun: any = {
         ...schedule,
         variableValues: sanitizedValues,
         variableRequestStatus: 'provided',
