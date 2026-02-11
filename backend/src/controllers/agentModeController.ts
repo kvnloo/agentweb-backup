@@ -1107,9 +1107,7 @@ export async function generateSessionResponse(
   );
 
   // Add all response messages to session (includes assistant responses and tool calls)
-  console.log('AgentMode generateSessionResponse: Adding response messages to session', response.responseMessages);
   await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
-  console.log('AgentMode generateSessionResponse: Response messages added successfully');
 
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
