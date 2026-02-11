@@ -99,7 +99,7 @@ export default function Skills() {
       });
       const allTools = (response.data.functionCalls as AvailableTool[]) || [];
       // Filter out internal/infrastructure tools
-      setAvailableTools(allTools.filter(t => t.name !== 'explore_skills' && t.name !== 'mcpservers_fetch' && t.name !== 'install_skills'));
+      setAvailableTools(allTools.filter(t => t.name !== 'install_skills'));
     } catch (err) {
       console.error("Failed to fetch available tools", err);
     }

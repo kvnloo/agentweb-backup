@@ -294,8 +294,7 @@ describe('AgentModeService - Skills', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
           { name: 'orphan_tool', definition: {} },
-          { name: 'install_skills', definition: {} },
-          { name: 'mcpservers_fetch', definition: {} }
+          { name: 'install_skills', definition: {} }
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -305,8 +304,6 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('orphan_tool')).toBe(true);
       // install_skills is always included (infrastructure but needed)
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
-      // mcpservers_fetch should NOT be in allowedToolNames from other_skills
-      // (it's an infrastructure tool excluded from getUnassociatedTools)
     });
   });
 
@@ -333,8 +330,7 @@ describe('AgentModeService - Skills', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
         { name: 'regular_tool', definition: { function: { description: 'regular' } } },
-        { name: 'install_skills', definition: { function: { description: 'infra1' } } },
-        { name: 'mcpservers_fetch', definition: { function: { description: 'infra3' } } }
+        { name: 'install_skills', definition: { function: { description: 'infra1' } } }
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -438,8 +434,7 @@ describe('AgentModeService - Skills', () => {
     it('should return empty string when no published skills and only infrastructure tools', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
-        { name: 'install_skills', definition: { function: { description: 'infra' } } },
-        { name: 'mcpservers_fetch', definition: { function: { description: 'infra' } } }
+        { name: 'install_skills', definition: { function: { description: 'infra' } } }
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 

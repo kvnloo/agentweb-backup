@@ -1466,11 +1466,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  private static readonly INFRASTRUCTURE_TOOLS = new Set(['install_skills', 'mcpservers_fetch']);
+  private static readonly INFRASTRUCTURE_TOOLS = new Set(['install_skills']);
 
   /**
    * Get tools that are not associated with any published skill.
-   * Excludes infrastructure tools (install_skills, mcpservers_fetch).
+   * Excludes infrastructure tools (install_skills).
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
     // Collect all tool names used by any published skill
