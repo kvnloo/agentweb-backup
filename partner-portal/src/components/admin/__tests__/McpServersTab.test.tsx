@@ -65,6 +65,9 @@ describe('McpServersTab', () => {
 
         await waitFor(() => {
             expect(screen.getByText('No MCP servers configured')).toBeInTheDocument();
+            expect(
+              screen.getByText(/will restart the Agent Mode worker process/i)
+            ).toBeInTheDocument();
         });
     });
 
