@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-11',
+    changes: [
+      'Supported Variables for Scheduled Chats',
+      '- Users can now define variables when configuring a Scheduled Chat',
+      '- When a Scheduled Chat is triggered, users are prompted to provide variable values from the UI or by email link',
+      '- The Scheduled Chat run continues only after all required variable values are provided',
+      '- Variable request email links expire 30 minutes before the next run time so the next scheduled run is not disrupted',
+    ],
+  },
+  {
     date: '2026-02-10',
     changes: [
       'Added Stdio MCP Support for Local MCP Servers',

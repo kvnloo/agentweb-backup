@@ -817,6 +817,110 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     }
   },
 
+  async sendScheduledChatVariableRequestEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    variables: Array<{ name: string; description?: string }>,
+    variableInputUrl?: string,
+    expiresAt?: string
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const manageUrl = `${customerFrontendUrl}/agent-mode`;
+      const inputUrl = variableInputUrl || manageUrl;
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+      const expirationDate = expiresAt
+        ? new Date(expiresAt).toLocaleString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZoneName: 'short'
+          })
+        : null;
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 760px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+            .header { background-color: #1976d2; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .content { padding: 20px; }
+            .var-list { margin: 12px 0 0 0; padding-left: 18px; }
+            .var-list li { margin: 8px 0; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 10px 18px; text-decoration: none; border-radius: 4px; margin-top: 10px; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h2 style="margin: 0;">Variable Values Required</h2>
+              <p style="margin: 6px 0 0 0; opacity: 0.92;">${scheduleName}</p>
+            </div>
+            <div class="content">
+              <p>
+                A scheduled chat run was due at <strong>${currentDate}</strong>, but it is waiting for variable values.
+              </p>
+              <p>Please provide values for:</p>
+              <ul class="var-list">
+                ${variables.map(variable => `<li><strong>{{${variable.name}}}</strong>${variable.description ? ` - ${variable.description}` : ''}</li>`).join('')}
+              </ul>
+              ${expirationDate ? `<p><strong>This request expires at ${expirationDate}.</strong></p>` : ''}
+              <p>After values are provided, the scheduled run will start automatically.</p>
+              <a href="${inputUrl}" class="button">Provide Variable Values</a>
+              <p style="margin-top: 12px; font-size: 12px; color: #6c757d;">
+                This link can only be used once and cannot be used after it expires.
+              </p>
+            </div>
+            <div class="footer">
+              <p style="margin: 0; color: #6c757d; font-size: 12px;">
+                Schedule ID: ${scheduleId}
+              </p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `
+Scheduled Chat Waiting For Variables: ${scheduleName}
+
+A scheduled chat run was due at ${currentDate}, but it is waiting for variable values.
+
+Please provide values for:
+${variables.map(variable => `- {{${variable.name}}}${variable.description ? `: ${variable.description}` : ''}`).join('\n')}
+
+${expirationDate ? `This request expires at ${expirationDate}.\n` : ''}
+
+After values are provided, the scheduled run will start automatically.
+
+Provide variable values: ${inputUrl}
+This link can only be used once and cannot be used after it expires.
+
+Manage scheduled chats: ${manageUrl}
+Schedule ID: ${scheduleId}
+      `;
+
+      const subject = `🟡 Scheduled Chat Waiting for Variables: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Scheduled chat variable request email sent to recipients: ${emailList.join(', ')}`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled chat variable request emails to ${emailList.join(', ')}:`, error);
+    }
+  },
+
   async sendScheduledChatResultEmail(
     toEmails: string | string[],
     scheduleName: string,

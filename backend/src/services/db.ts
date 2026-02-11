@@ -1634,6 +1634,14 @@ export const scheduleDb = {
     type?: string;
     emailCampaignTaskId?: string;
     runCount?: number; // -1 for unlimited, positive integer for limited runs
+    variables?: Array<{ name: string; description?: string }>;
+    variableValues?: { [variableName: string]: string };
+    variableRequestStatus?: 'idle' | 'pending' | 'provided';
+    variableRequestSentAt?: string;
+    variableValuesUpdatedAt?: string;
+    variableRequestAccessTokenHash?: string;
+    variableRequestAccessTokenExpiresAt?: string;
+    variableRequestAccessTokenConsumedAt?: string;
   }) {
     try {
       const params = {
@@ -1701,6 +1709,14 @@ export const scheduleDb = {
             updatedAt: string;
             emailCampaignTaskId: string;
             runCount: number;
+            variables: Array<{ name: string; description?: string }>;
+            variableValues: { [variableName: string]: string };
+            variableRequestStatus: 'idle' | 'pending' | 'provided';
+            variableRequestSentAt: string;
+            variableValuesUpdatedAt: string;
+            variableRequestAccessTokenHash: string;
+            variableRequestAccessTokenExpiresAt: string;
+            variableRequestAccessTokenConsumedAt: string;
           }>
         ) {
           try {
@@ -1866,6 +1882,39 @@ export const scheduleDb = {
             throw error;
           }
         },
+
+  async getScheduledChatByVariableAccessTokenHash(variableRequestAccessTokenHash: string) {
+    try {
+      let lastEvaluatedKey: any | undefined;
+
+      do {
+        const params: any = {
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          FilterExpression: '#type = :type AND #tokenHash = :tokenHash',
+          ExpressionAttributeNames: {
+            '#type': 'type',
+            '#tokenHash': 'variableRequestAccessTokenHash',
+          },
+          ExpressionAttributeValues: {
+            ':type': 'scheduled_chat',
+            ':tokenHash': variableRequestAccessTokenHash,
+          },
+          ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey }),
+        };
+
+        const result = await dynamodb.scan(params).promise();
+        if (result.Items && result.Items.length > 0) {
+          return result.Items[0];
+        }
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return null;
+    } catch (error) {
+      handleDynamoDbError(error, "getScheduledChatByVariableAccessTokenHash");
+      return null;
+    }
+  },
 
   async deleteSchedule(scheduleId: string) {
     try {
