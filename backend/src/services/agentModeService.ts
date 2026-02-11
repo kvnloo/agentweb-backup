@@ -893,7 +893,8 @@ export class AgentModeService {
     }
 
     // Insert new message if tool is allowed
-    if (allowedToolNames.has('create_task_from_template')) {
+    // TODO: Following condition is commented for now, need to think about it as if user just saying do seo of this site then if emma dosn't have skill which has create_task_from_template tool then it will not show available templates
+    // if (allowedToolNames.has('create_task_from_template')) {
       const templatesContext = this.buildTemplatesContext(availableTemplates);
       if (templatesContext !== 'No templates are currently available.') {
           // Find optimal insertion point
@@ -906,7 +907,7 @@ export class AgentModeService {
 
           messages.splice(insertIndex, 0, { role: 'assistant', content: templatesContext });
       }
-    }
+    // }
   }
 
   async getMarketingSystemPrompt(): Promise<string> {
