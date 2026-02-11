@@ -53,14 +53,22 @@ export const getSkill = async (req: Request, res: Response) => {
 export const updateSkill = async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const updates = req.body;
+    const { name, description, toolNames, systemPrompt, isPublished } = req.body;
 
     const existingSkill = await skillService.getSkill(skillId);
     if (!existingSkill) {
       return res.status(404).json({ message: "Skill not found" });
     }
 
-    const updatedSkill = { ...existingSkill, ...updates, skillId }; // Ensure ID matches
+    const updatedSkill = {
+      ...existingSkill,
+      ...(name !== undefined && { name }),
+      ...(description !== undefined && { description }),
+      ...(toolNames !== undefined && { toolNames }),
+      ...(systemPrompt !== undefined && { systemPrompt }),
+      ...(isPublished !== undefined && { isPublished }),
+      skillId,
+    };
     await skillService.updateSkill(updatedSkill);
 
     res.status(200).json(updatedSkill);
