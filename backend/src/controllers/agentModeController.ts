@@ -1208,10 +1208,10 @@ export const agentModeController = {
 
       // Extract function names and descriptions
       const functionCalls = toolsToReturn
-        .filter((tool: any) => tool.type === 'function')
+        .filter((tool: any) => tool?.type === 'function' && tool?.function?.name)
         .map((tool: any) => ({
           name: tool.function.name,
-          description: tool.function.description
+          description: tool.function.description || ''
         }));
 
       res.json({ functionCalls });

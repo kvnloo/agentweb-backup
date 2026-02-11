@@ -3,11 +3,32 @@ import { getSecret } from '../utils/secretsManager';
 import axios from 'axios';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 
+interface SendEmailParams {
+  from: string;
+  to: string | string[];
+  subject: string;
+  html?: string;
+  text?: string;
+  inReplyTo?: string;
+  replyTo?: string;
+}
+
+interface QueuedEmailSend {
+  id: number;
+  params: SendEmailParams;
+  resolve: (value: any | null) => void;
+}
+
 class ResendService {
   private resend: Resend | null = null;
   private apiKey: string | null = null;
   private readonly MAX_RETRIES = 3;
   private readonly BASE_DELAY = 1000; // 1 second base delay
+  private readonly MIN_SEND_INTERVAL_MS = 500; // 2 requests/sec
+  private sendQueue: QueuedEmailSend[] = [];
+  private isQueueWorkerRunning = false;
+  private lastSendAt = 0;
+  private queueItemId = 0;
 
   private async initializeResend() {
     if (this.resend) return;
@@ -37,9 +58,52 @@ class ResendService {
   }
 
   private isRateLimitError(error: any): boolean {
-    return error?.statusCode === 429 || 
+    return error?.statusCode === 429 ||
+           error?.status === 429 ||
            error?.message?.includes('rate_limit_exceeded') ||
            error?.message?.includes('Too many requests');
+  }
+
+  private isRetryableError(error: any): boolean {
+    if (this.isRateLimitError(error)) {
+      return true;
+    }
+
+    const status = error?.statusCode || error?.status || error?.response?.status;
+    if (typeof status === 'number' && status >= 500) {
+      return true;
+    }
+
+    const message = String(error?.message || '').toLowerCase();
+    return (
+      message.includes('timeout') ||
+      message.includes('timed out') ||
+      message.includes('socket hang up') ||
+      message.includes('econnreset') ||
+      message.includes('eai_again') ||
+      message.includes('network')
+    );
+  }
+
+  private shouldRetry(attempt: number, error: any): boolean {
+    return attempt < this.MAX_RETRIES && this.isRetryableError(error);
+  }
+
+  private async waitForRateLimitWindow() {
+    const elapsed = Date.now() - this.lastSendAt;
+    const remaining = this.MIN_SEND_INTERVAL_MS - elapsed;
+    if (remaining > 0) {
+      await this.sleep(remaining);
+    }
+  }
+
+  private toErrorWithMetadata(error: any): Error {
+    const fallbackMessage = typeof error === 'string' ? error : JSON.stringify(error);
+    const wrappedError: any = new Error(error?.message || fallbackMessage || 'Unknown Resend error');
+    wrappedError.statusCode = error?.statusCode || error?.status;
+    wrappedError.response = error?.response;
+    wrappedError.code = error?.code;
+    return wrappedError;
   }
 
   private async retryWithBackoff<T>(
@@ -54,9 +118,9 @@ class ResendService {
       } catch (error: any) {
         lastError = error;
         
-        if (this.isRateLimitError(error) && attempt < this.MAX_RETRIES) {
+        if (this.shouldRetry(attempt, error)) {
           const delay = this.BASE_DELAY * Math.pow(2, attempt - 1); // Exponential backoff
-          console.log(`${operationName} failed with rate limit (attempt ${attempt}/${this.MAX_RETRIES}), retrying in ${delay}ms...`);
+          console.log(`${operationName} failed with retryable error (attempt ${attempt}/${this.MAX_RETRIES}), retrying in ${delay}ms...`);
           await this.sleep(delay);
         } else {
           console.error(`${operationName} failed on attempt ${attempt}:`, error);
@@ -69,7 +133,54 @@ class ResendService {
     return null;
   }
 
-  async sendEmail({
+  private async processSendQueue() {
+    if (this.isQueueWorkerRunning) {
+      return;
+    }
+
+    this.isQueueWorkerRunning = true;
+    console.log('Resend queue worker started');
+
+    try {
+      while (this.sendQueue.length > 0) {
+        const queueItem = this.sendQueue.shift();
+        if (!queueItem) {
+          continue;
+        }
+
+        await this.waitForRateLimitWindow();
+        const recipient = Array.isArray(queueItem.params.to) ? queueItem.params.to.join(', ') : queueItem.params.to;
+        console.log(`Processing Resend queue item #${queueItem.id} for: ${recipient} (remaining: ${this.sendQueue.length})`);
+
+        const result = await this.performSend(queueItem.params);
+        this.lastSendAt = Date.now();
+        queueItem.resolve(result);
+      }
+    } finally {
+      this.isQueueWorkerRunning = false;
+      console.log('Resend queue worker idle');
+
+      // Handle race where a new item is enqueued while worker is shutting down.
+      if (this.sendQueue.length > 0) {
+        void this.processSendQueue();
+      }
+    }
+  }
+
+  private enqueueSend(params: SendEmailParams): Promise<any | null> {
+    return new Promise((resolve) => {
+      const queueItem: QueuedEmailSend = {
+        id: ++this.queueItemId,
+        params,
+        resolve
+      };
+      this.sendQueue.push(queueItem);
+      console.log(`Queued Resend email #${queueItem.id}. Queue size: ${this.sendQueue.length}`);
+      void this.processSendQueue();
+    });
+  }
+
+  private async performSend({
     from,
     to,
     subject,
@@ -77,20 +188,12 @@ class ResendService {
     text,
     inReplyTo,
     replyTo
-  }: {
-    from: string;
-    to: string | string[];
-    subject: string;
-    html?: string;
-    text?: string;
-    inReplyTo?: string;
-    replyTo?: string;
-  }) {
+  }: SendEmailParams) {
     await this.initializeResend();
 
     if (!this.resend) {
       console.error('Resend service not initialized');
-      return;
+      return null;
     }
 
     const emailOptions: any = {
@@ -125,18 +228,14 @@ class ResendService {
       console.log(`  Reply-To: ${replyTo}`);
     }
 
-    // Add delay before attempting to send to respect rate limit (2 per second = 500ms minimum)
-    // Using 600ms to provide a safety margin and account for processing time
-    const RATE_LIMIT_DELAY = 600; // 600ms = ~1.67 emails/second, safely under 2/second limit
-    console.log(`Waiting ${RATE_LIMIT_DELAY}ms before sending email to ${recipient}...`);
-    await this.sleep(RATE_LIMIT_DELAY);
-
     const result = await this.retryWithBackoff(
       async () => {
         const { data, error } = await this.resend!.emails.send(emailOptions);
         
         if (error) {
-          throw new Error(`Resend API error: ${JSON.stringify(error)}`);
+          const resendError: any = this.toErrorWithMetadata(error);
+          resendError.message = `Resend API error: ${JSON.stringify(error)}`;
+          throw resendError;
         }
         
         return data;
@@ -151,6 +250,10 @@ class ResendService {
     }
 
     return result;
+  }
+
+  async sendEmail(params: SendEmailParams) {
+    return this.enqueueSend(params);
   }
 
   /**

@@ -7,6 +7,28 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-10',
+    changes: [
+      'Added Stdio MCP Support for Local MCP Servers',
+      '- Admin MCP Servers now supports Stdio transport for backend-launched local MCP processes',
+      '- You can configure local MCPs (for example Brave Search MCP via npx) without running a separate HTTP MCP service',
+      'Improved Resend Email Delivery Reliability',
+      '- Added a global Resend send queue to process outbound emails in order',
+      '- Enforced a shared send rate of 2 requests per second to stay within provider limits',
+      '- Added retry with exponential backoff for retryable email delivery failures',
+      '- CRM and other Resend-based sends now automatically use the shared queued sender',
+      'Added Admin CRM Sync for Users and Waitlist',
+      '- Added "Sync to CRM" button in Admin Users and Waitlist tabs',
+      '- Added lead list ID configuration popup and AW-Settings persistence per source',
+      '- Added "Start Syncing" with incremental sync based on last successful sync timestamp',
+      '- Added optional "Force full sync" mode to re-sync all records',
+      'Added CRM Engaged-Only Lead Filtering',
+      '- Added "Engaged only" checkbox next to "ICPs only" in CRM lead list filters',
+      '- Engaged-only filtering now detects lead actions using engagement keywords: clicked, replied, and received',
+      '- Added custom event naming guidance to include these keywords for more reliable engagement detection',
+    ],
+  },
+  {
     date: '2026-02-09',
     changes: [
       'Enhanced User Journey Funnel Management in SEO/GEO Page',

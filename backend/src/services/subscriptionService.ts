@@ -94,7 +94,7 @@ export async function getAllAvailableFunctionCalls(): Promise<string[]> {
     const { agentModeService } = await import("./agentModeService");
     const tools = agentModeService.getAvailableTools();
     return tools
-      .filter((tool: any) => tool.type === "function")
+      .filter((tool: any) => tool?.type === "function" && tool?.function?.name)
       .map((tool: any) => tool.function?.name)
       .filter((name: string) => name); // Filter out undefined/null
   } catch (error) {

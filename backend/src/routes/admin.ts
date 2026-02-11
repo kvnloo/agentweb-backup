@@ -4,7 +4,7 @@ import bcrypt from "bcryptjs";
 import axios from "axios";
 import { authenticateToken } from "../middleware/auth";
 import { isAdmin } from "../middleware/admin";
-import { userDb, taskDb, subscriberDb } from "../services/db";
+import { userDb, taskDb, subscriberDb, crmDb } from "../services/db";
 import { waitlistDb } from "../services/waitlistDb";
 import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
@@ -15,10 +15,315 @@ import { workflowDb } from "../services/workflowDb";
 import { settingsService } from "../services/settingsService";
 
 const router = express.Router();
+const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
+const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
+
+interface CrmSyncSetting {
+  listId: string;
+  lastSyncAt?: string;
+}
+
+const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null => {
+  if (!rawValue) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== "object" || typeof parsed.listId !== "string") {
+      return null;
+    }
+    const setting: CrmSyncSetting = {
+      listId: parsed.listId.trim(),
+    };
+    if (parsed.lastSyncAt && typeof parsed.lastSyncAt === "string") {
+      setting.lastSyncAt = parsed.lastSyncAt;
+    }
+    return setting.listId ? setting : null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const getCrmSyncSettingName = (source: string) => `${CRM_SYNC_SETTING_PREFIX}${source}`;
+
+const splitName = (fullName?: string | null): { firstName?: string; lastName?: string } => {
+  if (!fullName || typeof fullName !== "string") {
+    return {};
+  }
+  const normalized = fullName.trim();
+  if (!normalized) {
+    return {};
+  }
+  const parts = normalized.split(/\s+/);
+  if (parts.length === 1) {
+    return { firstName: parts[0] };
+  }
+  return {
+    firstName: parts[0],
+    lastName: parts.slice(1).join(" "),
+  };
+};
+
+const isAfterLastSync = (recordTime: string | undefined, lastSyncAt: string | undefined): boolean => {
+  if (!lastSyncAt) {
+    return true;
+  }
+  if (!recordTime) {
+    return true;
+  }
+  const recordMs = new Date(recordTime).getTime();
+  const lastSyncMs = new Date(lastSyncAt).getTime();
+  if (Number.isNaN(recordMs) || Number.isNaN(lastSyncMs)) {
+    return true;
+  }
+  return recordMs > lastSyncMs;
+};
 
 // Apply authentication and admin middleware to all routes
 router.use(authenticateToken);
 router.use(isAdmin);
+
+// Get CRM sync configuration for admin Users/Waitlist sync
+router.get("/crm-sync/:source", async (req, res) => {
+  try {
+    const { source } = req.params;
+    if (!CRM_SYNC_SOURCES.has(source)) {
+      return res.status(400).json({ message: "source must be users or waitlist" });
+    }
+
+    const settingName = getCrmSyncSettingName(source);
+    const setting = await settingsService.getSetting(settingName);
+    const parsed = parseCrmSyncSetting(setting?.settingValue);
+
+    if (!parsed) {
+      return res.json({
+        source,
+        listId: "",
+        lastSyncAt: null,
+      });
+    }
+
+    return res.json({
+      source,
+      listId: parsed.listId,
+      lastSyncAt: parsed.lastSyncAt || null,
+    });
+  } catch (error) {
+    console.error("Error getting CRM sync setting:", error);
+    return res.status(500).json({ message: "Error fetching CRM sync setting" });
+  }
+});
+
+// Save CRM sync configuration for admin Users/Waitlist sync
+router.put("/crm-sync/:source", async (req, res) => {
+  try {
+    const { source } = req.params;
+    const { listId } = req.body;
+
+    if (!CRM_SYNC_SOURCES.has(source)) {
+      return res.status(400).json({ message: "source must be users or waitlist" });
+    }
+    if (!listId || typeof listId !== "string" || !listId.trim()) {
+      return res.status(400).json({ message: "listId is required" });
+    }
+
+    const normalizedListId = listId.trim();
+    const existingList = await crmDb.getLeadListById(normalizedListId);
+    if (!existingList) {
+      return res.status(404).json({ message: "Lead list not found" });
+    }
+
+    const settingName = getCrmSyncSettingName(source);
+    const existingSetting = await settingsService.getSetting(settingName);
+    const parsedExisting = parseCrmSyncSetting(existingSetting?.settingValue);
+    const nextSetting: CrmSyncSetting = {
+      listId: normalizedListId,
+      lastSyncAt: parsedExisting?.lastSyncAt,
+    };
+
+    await settingsService.setSetting(
+      settingName,
+      JSON.stringify(nextSetting),
+      `Admin CRM sync setting for ${source}`,
+      req.user?.email || "admin"
+    );
+
+    return res.json({
+      success: true,
+      source,
+      listId: nextSetting.listId,
+      lastSyncAt: nextSetting.lastSyncAt || null,
+    });
+  } catch (error) {
+    console.error("Error saving CRM sync setting:", error);
+    return res.status(500).json({ message: "Error saving CRM sync setting" });
+  }
+});
+
+// Start CRM sync for users or waitlist using configured lead list ID
+router.post("/crm-sync/:source/start", async (req, res) => {
+  try {
+    const { source } = req.params;
+    const forceFullSync = req.body?.forceFullSync === true;
+
+    if (!CRM_SYNC_SOURCES.has(source)) {
+      return res.status(400).json({ message: "source must be users or waitlist" });
+    }
+
+    const settingName = getCrmSyncSettingName(source);
+    const setting = await settingsService.getSetting(settingName);
+    const parsed = parseCrmSyncSetting(setting?.settingValue);
+    if (!parsed?.listId) {
+      return res.status(400).json({ message: "Please configure lead list ID first" });
+    }
+
+    const leadList = await crmDb.getLeadListById(parsed.listId);
+    if (!leadList) {
+      return res.status(404).json({ message: "Configured lead list not found" });
+    }
+    if (leadList.publicAccessEnabled !== true) {
+      return res.status(400).json({
+        message: "Configured lead list API integration is not enabled. Enable Public Access in CRM first.",
+      });
+    }
+
+    let leads: Array<{
+      email?: string;
+      firstName?: string;
+      lastName?: string;
+      phone?: string;
+      company?: string;
+      title?: string;
+      notes?: string;
+      customFields?: Record<string, any>;
+    }> = [];
+    const previousLastSyncAt = parsed.lastSyncAt;
+
+    if (source === "users") {
+      const users = await userDb.getAllUsers();
+      const filteredUsers = users.filter((user: any) => {
+        if (!user?.email) {
+          return false;
+        }
+        if (forceFullSync) {
+          return true;
+        }
+        return isAfterLastSync(user.createdAt, previousLastSyncAt);
+      });
+
+      leads = filteredUsers.map((user: any) => {
+        const nameFromRecord = user.fullName || user.displayName || user.name || "";
+        const parsedName = splitName(nameFromRecord);
+        return {
+          email: String(user.email || "").toLowerCase(),
+          firstName: parsedName.firstName,
+          lastName: parsedName.lastName,
+          notes: user.supportNote || "",
+          customFields: {
+            source: "admin_users",
+            userId: user.userId || "",
+            roles: Array.isArray(user.roles) ? user.roles.join(",") : "",
+            isAdmin: user.isAdmin ? "yes" : "no",
+            isActive: user.isActive === false ? "no" : "yes",
+            createdAt: user.createdAt || "",
+            lastLoginTime: user.lastLoginTime || "",
+            stripe_customer_id: user.stripe_customer_id || "",
+            adAccount: user.adAccount || "",
+            emailDomain: user.emailDomain || "",
+            slackChannel: user.slackChannel || "",
+            subscriptionType: user.subscriptionType || "",
+          },
+        };
+      });
+    } else {
+      const waitlistEntries: any[] = [];
+      let lastEvaluatedKey: any = undefined;
+      do {
+        const result = await waitlistDb.list(lastEvaluatedKey);
+        waitlistEntries.push(...(result.items || []));
+        lastEvaluatedKey = result.lastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      const filteredEntries = waitlistEntries.filter((entry: any) => {
+        if (!entry?.email) {
+          return false;
+        }
+        if (forceFullSync) {
+          return true;
+        }
+        const createdTime = entry.joinedAt || entry.createdAt;
+        return isAfterLastSync(createdTime, previousLastSyncAt);
+      });
+
+      leads = filteredEntries.map((entry: any) => {
+        const parsedName = splitName(entry.fullName || "");
+        return {
+          email: String(entry.email || "").toLowerCase(),
+          firstName: parsedName.firstName,
+          lastName: parsedName.lastName,
+          phone: entry.phoneNumber || "",
+          company: entry.companyName || "",
+          notes: entry.useCaseDescription || "",
+          customFields: {
+            source: "admin_waitlist",
+            status: entry.status || "pending",
+            joinedAt: entry.joinedAt || "",
+            invitedAt: entry.invitedAt || "",
+            requestReport: entry.requestReport === true ? "yes" : "no",
+            supportNote: entry.supportNote || "",
+            stripe_customer_id: entry.stripe_customer_id || "",
+            monthlyMarketingSpend: entry.monthlyMarketingSpend || "",
+            businessArea: entry.businessArea || "",
+            marketingChannels: Array.isArray(entry.marketingChannels) ? entry.marketingChannels.join(",") : "",
+            useCaseCategories: Array.isArray(entry.useCaseCategories) ? entry.useCaseCategories.join(",") : "",
+          },
+        };
+      });
+    }
+
+    const syncStartedAt = new Date().toISOString();
+    const results = leads.length > 0
+      ? await crmDb.batchCreateLeads(parsed.listId, leads)
+      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[] };
+
+    let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
+    if (results.errorCount === 0) {
+      updatedLastSyncAt = syncStartedAt;
+      const nextSetting: CrmSyncSetting = {
+        listId: parsed.listId,
+        lastSyncAt: updatedLastSyncAt,
+      };
+      await settingsService.setSetting(
+        settingName,
+        JSON.stringify(nextSetting),
+        `Admin CRM sync setting for ${source}`,
+        req.user?.email || "admin"
+      );
+    }
+
+    return res.json({
+      success: true,
+      source,
+      listId: parsed.listId,
+      forceFullSync,
+      previousLastSyncAt: previousLastSyncAt || null,
+      lastSyncAt: updatedLastSyncAt,
+      attemptedCount: leads.length,
+      successCount: results.successCount,
+      newCount: results.newCount,
+      mergedCount: results.mergedCount,
+      errorCount: results.errorCount,
+      errors: results.errors,
+      message:
+        results.errorCount === 0
+          ? `Synced ${results.successCount} record(s) from ${source}.`
+          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`,
+    });
+  } catch (error: any) {
+    console.error("Error running CRM sync:", error);
+    return res.status(500).json({ message: error.message || "Error running CRM sync" });
+  }
+});
 
 // Get all users
 router.get("/users", async (req, res) => {

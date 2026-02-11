@@ -6,6 +6,8 @@ jest.mock('../services/agentModeService', () => ({
     getAvailableTools: () => [
       { type: 'function', function: { name: 'generate_image', description: 'Generate images' } },
       { type: 'function', function: { name: 'generate_video', description: 'Generate videos' } },
+      { type: 'function', function: { description: 'Missing name' } },
+      { type: 'function' },
       { type: 'non-function', other: true },
     ],
   })),
@@ -14,6 +16,8 @@ jest.mock('../services/agentModeService', () => ({
     getAvailableTools: () => [
       { type: 'function', function: { name: 'generate_image', description: 'Generate images' } },
       { type: 'function', function: { name: 'generate_video', description: 'Generate videos' } },
+      { type: 'function', function: { description: 'Missing name' } },
+      { type: 'function' },
       { type: 'non-function', other: true },
     ],
   },
