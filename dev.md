@@ -1,3 +1,20 @@
+# February 11, 2026: Staging Backend Down (Agentweb-backend-env-1)
+
+## Problem
+Staging EB environment `Agentweb-backend-env-1` was Severe/Red. Deployment of `backend_v26.6.1-staging-pr455` repeatedly failed with command timeout on instance `i-0645dba745fc59889`.
+
+## Investigation
+- Instance EC2 system checks passed (running, reachable) but EB agent was completely unresponsive
+- All EB commands timed out: deployments, log retrieval, restart — nothing got through
+- The first deployment of the version at 07:00 UTC succeeded, but a subsequent redeploy at 08:36 UTC hung and the instance never recovered
+- 4 consecutive deployment attempts all timed out (600s command timeout)
+- Root cause: `t3.small` (2GB RAM) exhausted memory — `npm install` during deployment + Node.js app exceeded available resources, freezing the EB agent
+
+## Resolution
+1. Rebooted the instance via EC2 Console — environment recovered to healthy
+2. Upgraded instance types from `t3.small` to `t3.medium` / `t3.large` to prevent recurrence
+3. Configuration update completed successfully, environment Green/Ok
+
 # February 10, 2026: CRM Web Enrichment Production Failure Investigation (v26.2.0)
 
 ## Investigation Summary
