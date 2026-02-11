@@ -58,13 +58,15 @@ describe('McpClientService Tool Namespacing', () => {
   });
 
   it('should load file config tools without prefix and DB config tools with prefix', async () => {
-    // Set up internal servers (no prefix)
+    // Set up internal servers (no prefix) - loaded from file config
+    // Note: isInternal flag is NOT set here because isInternal:true servers
+    // are now skipped during initialization (they self-connect and create circular deps).
+    // This test verifies the file-config vs DB-config namespacing behavior.
     Object.assign(internalMcpServers, {
       'internal-server': {
         transport: 'stdio',
         command: 'node',
-        args: ['server.js'],
-        isInternal: true
+        args: ['server.js']
       }
     });
 
