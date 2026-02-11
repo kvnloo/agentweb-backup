@@ -1038,12 +1038,14 @@ describe('McpClientService', () => {
         { name: 'test_tool', description: 'Test tool', inputSchema: { type: 'object' } }
       ];
 
-      Object.assign(internalMcpServers, {
-        'test-server': {
+      // Use DB config path since internal servers with isInternal:true are now skipped
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([{
+          name: 'test-server',
           transport: 'streamable-http',
           url: 'http://test.example.com/mcp',
           isInternal: true
-        }
+        }])
       });
 
       const mockCallTool = jest.fn().mockResolvedValue({

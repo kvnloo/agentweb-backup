@@ -110,10 +110,18 @@ export class McpClientService {
   async initialize(): Promise<void> {
     try {
       // 1. Load Internal Config (from code)
-      console.log(`MCP: Loading ${Object.keys(internalMcpServers).length} internal servers from config`);
-      for (const [serverName, serverConfig] of Object.entries(internalMcpServers)) {
-        // Internal tools don't get a prefix
-        await this.safeConnectToServer(serverName, serverConfig);
+      // Skip servers marked isInternal: true — they connect back to ourselves
+      // and create a circular dependency. Internal tools are registered directly
+      // via the ToolRegistry in agentModeService.registerTools().
+      const externalConfigServers = Object.entries(internalMcpServers)
+        .filter(([_, config]) => !('isInternal' in config && config.isInternal));
+      if (externalConfigServers.length > 0) {
+        console.log(`MCP: Loading ${externalConfigServers.length} non-internal servers from config`);
+        for (const [serverName, serverConfig] of externalConfigServers) {
+          await this.safeConnectToServer(serverName, serverConfig);
+        }
+      } else {
+        console.log('MCP: No non-internal servers in config (skipping self-connection)');
       }
 
 
