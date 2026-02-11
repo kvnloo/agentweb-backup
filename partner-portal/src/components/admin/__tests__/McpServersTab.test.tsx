@@ -69,15 +69,25 @@ describe('McpServersTab', () => {
     });
 
     it('renders list of servers', async () => {
-        mockedAxios.get.mockResolvedValueOnce({ data: mockServers });
+        mockedAxios.get.mockResolvedValueOnce({ data: [...mockServers, {
+          name: 'local-stdio',
+          transport: 'stdio',
+          command: 'npx',
+          url: 'test@example.com',
+          discoveredTools: []
+        }] });
 
         render(<McpServersTab />);
 
         await waitFor(() => {
             expect(screen.getByText('server1')).toBeInTheDocument();
             expect(screen.getByText('server2')).toBeInTheDocument();
+            expect(screen.getByText('local-stdio')).toBeInTheDocument();
             expect(screen.getByText('streamable-http')).toBeInTheDocument();
             expect(screen.getByText('sse')).toBeInTheDocument();
+            expect(screen.getByText('stdio')).toBeInTheDocument();
+            // Stdio rows should prefer command display over url fallback
+            expect(screen.getByText('npx')).toBeInTheDocument();
         });
     });
 
@@ -150,6 +160,53 @@ describe('McpServersTab', () => {
 
         // Verify loaded
         expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    });
+
+    it('can add a stdio server with command, args, and env', async () => {
+        mockedAxios.get.mockResolvedValueOnce({ data: [] }); // Initial load
+
+        render(<McpServersTab />);
+        await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByText('Add Server'));
+        expect(screen.getByText('Add MCP Server')).toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'brave-local' } });
+
+        fireEvent.mouseDown(screen.getByRole('combobox'));
+        const listbox = screen.getByRole('listbox');
+        fireEvent.click(within(listbox).getByText('Stdio (Backend launches process)'));
+
+        fireEvent.change(await screen.findByLabelText(/Command/i), { target: { value: 'npx' } });
+        fireEvent.change(screen.getByLabelText(/Arguments \(optional, one per line\)/i), {
+          target: { value: '-y\n@brave/brave-search-mcp-server\n--transport\nstdio' }
+        });
+        fireEvent.change(screen.getByLabelText(/Environment Variables JSON \(optional\)/i), {
+          target: { value: '{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}' }
+        });
+
+        mockedAxios.post.mockResolvedValueOnce({});
+        mockedAxios.post.mockResolvedValueOnce({ data: { count: 1 } });
+        mockedAxios.get.mockResolvedValueOnce({
+          data: [{ name: 'brave-local', transport: 'stdio', command: 'npx', discoveredTools: ['brave_web_search'] }]
+        });
+
+        fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+
+        await waitFor(() => {
+          expect(mockedAxios.post).toHaveBeenNthCalledWith(
+            1,
+            'http://localhost:3000/api/admin/mcp-servers',
+            expect.objectContaining({
+              name: 'brave-local',
+              transport: 'stdio',
+              command: 'npx',
+              args: ['-y', '@brave/brave-search-mcp-server', '--transport', 'stdio'],
+              env: { BRAVE_API_KEY: '${BRAVE_API_KEY}' }
+            }),
+            expect.any(Object)
+          );
+        });
     });
 
     it('can delete a server', async () => {
@@ -311,6 +368,29 @@ describe('McpServersTab', () => {
             fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'http://valid-url.com' } });
 
             // Add button should be enabled
+            expect(screen.getByRole('button', { name: 'Add' })).not.toBeDisabled();
+        });
+
+        it('does not block stdio add when URL is invalid but transport is stdio', async () => {
+            mockedAxios.get.mockResolvedValueOnce({ data: [] });
+
+            render(<McpServersTab />);
+            await waitFor(() => expect(screen.queryByRole('progressbar')).not.toBeInTheDocument());
+
+            fireEvent.click(screen.getByText('Add Server'));
+            fireEvent.change(screen.getByLabelText(/Server Name/i), { target: { value: 'local-stdio' } });
+
+            // Start with invalid URL on HTTP transport
+            fireEvent.change(screen.getByLabelText(/URL/i), { target: { value: 'not-a-url' } });
+            expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
+
+            // Switch to stdio and provide required command
+            fireEvent.mouseDown(screen.getByRole('combobox'));
+            const listbox = screen.getByRole('listbox');
+            fireEvent.click(within(listbox).getByText('Stdio (Backend launches process)'));
+            fireEvent.change(await screen.findByLabelText(/Command/i), { target: { value: 'npx' } });
+
+            // URL is irrelevant for stdio; env json is optional
             expect(screen.getByRole('button', { name: 'Add' })).not.toBeDisabled();
         });
     });

@@ -166,6 +166,23 @@ describe('MCP Servers Routes - Validation', () => {
 
       expect(res.status).toBe(201);
     });
+
+    it('should ignore url field for stdio transport and preserve command', async () => {
+      const res = await request(app)
+        .post('/api/admin/mcp-servers')
+        .send({
+          name: 'stdio-server',
+          transport: 'stdio',
+          url: 'test@example.com',
+          command: 'npx',
+          args: ['-y', '@brave/brave-search-mcp-server']
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body.transport).toBe('stdio');
+      expect(res.body.command).toBe('npx');
+      expect(res.body.url).toBeUndefined();
+    });
   });
 
   describe('PUT /api/admin/mcp-servers/:name - Validation', () => {

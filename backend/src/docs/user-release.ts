@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-10',
     changes: [
+      'Added Stdio MCP Support for Local MCP Servers',
+      '- Admin MCP Servers now supports Stdio transport for backend-launched local MCP processes',
+      '- You can configure local MCPs (for example Brave Search MCP via npx) without running a separate HTTP MCP service',
       'Improved Resend Email Delivery Reliability',
       '- Added a global Resend send queue to process outbound emails in order',
       '- Enforced a shared send rate of 2 requests per second to stay within provider limits',

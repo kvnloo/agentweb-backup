@@ -82,7 +82,7 @@ class McpServersErrorBoundary extends Component<{ children: React.ReactNode }, E
 
 interface McpServer {
   name: string;
-  transport: "sse" | "streamable-http";
+  transport: "sse" | "streamable-http" | "stdio";
   url?: string;
   command?: string;
   args?: string[];
@@ -126,6 +126,20 @@ const McpServersTab: React.FC = () => {
   // unused state removed
   
   const { token } = useAuth();
+
+  const isHttpTransport =
+    formData.transport === "streamable-http" || formData.transport === "sse";
+  const isStdioTransport = formData.transport === "stdio";
+  const hasInvalidName = !!formData.name && !isValidServerName(formData.name);
+  const hasInvalidUrl = isHttpTransport && !!formData.url && !isValidUrl(formData.url);
+  const missingRequiredUrl = isHttpTransport && !formData.url?.trim();
+  const missingRequiredCommand = isStdioTransport && !formData.command?.trim();
+  const isFormInvalid =
+    !formData.name ||
+    hasInvalidName ||
+    hasInvalidUrl ||
+    missingRequiredUrl ||
+    missingRequiredCommand;
 
   useEffect(() => {
     loadServers();
@@ -187,11 +201,23 @@ const McpServersTab: React.FC = () => {
         }
       }
 
-      const finalPayload = {
-          ...parsedConfig,
-          ...formData, // UI fields override
-          args: parsedArgs, // Args overrides
-      };
+      const finalPayload = formData.transport === "stdio"
+        ? {
+            ...parsedConfig,
+            name: formData.name,
+            transport: formData.transport,
+            command: formData.command,
+            args: parsedArgs,
+            isInternal: formData.isInternal,
+          }
+        : {
+            ...parsedConfig,
+            name: formData.name,
+            transport: formData.transport,
+            url: formData.url,
+            accessToken: formData.accessToken,
+            isInternal: formData.isInternal,
+          };
 
       await axios.post(buildApiUrl("/api/admin/mcp-servers"), finalPayload, {
         headers: { Authorization: `Bearer ${token}` },
@@ -238,11 +264,23 @@ const McpServersTab: React.FC = () => {
         }
       }
 
-      const payload = {
-        ...parsedConfig,
-        ...formData,
-        args: parsedArgs,
-      };
+      const payload = formData.transport === "stdio"
+        ? {
+            ...parsedConfig,
+            name: formData.name,
+            transport: formData.transport,
+            command: formData.command,
+            args: parsedArgs,
+            isInternal: formData.isInternal,
+          }
+        : {
+            ...parsedConfig,
+            name: formData.name,
+            transport: formData.transport,
+            url: formData.url,
+            accessToken: formData.accessToken,
+            isInternal: formData.isInternal,
+          };
 
       await axios.put(
         buildApiUrl(`/api/admin/mcp-servers/${encodeURIComponent(serverToEdit.name)}`),
@@ -423,13 +461,17 @@ const McpServersTab: React.FC = () => {
                             ? "primary"
                             : server.transport === "sse"
                             ? "secondary"
+                            : server.transport === "stdio"
+                            ? "success"
                             : "default"
                         }
                       />
                     </TableCell>
                     <TableCell>
                       <Typography variant="body2" sx={{ maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis" }}>
-                        {server.url || server.command || "-"}
+                        {server.transport === "stdio"
+                          ? server.command || server.url || "-"
+                          : server.url || server.command || "-"}
                       </Typography>
                     </TableCell>
                     <TableCell>
@@ -520,17 +562,30 @@ const McpServersTab: React.FC = () => {
                 value={formData.transport}
                 label="Transport Type"
                 onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    transport: e.target.value as McpServer["transport"],
+                  setFormData((prev) => {
+                    const nextTransport = e.target.value as McpServer["transport"];
+                    if (nextTransport === "stdio") {
+                      return {
+                        ...prev,
+                        transport: nextTransport,
+                        url: "",
+                        accessToken: "",
+                      };
+                    }
+                    return {
+                      ...prev,
+                      transport: nextTransport,
+                      command: "",
+                    };
                   })
                 }
               >
                 <MenuItem value="streamable-http">Streamable HTTP</MenuItem>
                 <MenuItem value="sse">SSE (Server-Sent Events)</MenuItem>
+                <MenuItem value="stdio">Stdio (Backend launches process)</MenuItem>
               </Select>
             </FormControl>
-            {(formData.transport === "streamable-http" || formData.transport === "sse") && (
+            {isHttpTransport && (
               <TextField
                 label="URL"
                 value={formData.url}
@@ -542,15 +597,46 @@ const McpServersTab: React.FC = () => {
                 helperText={formData.url && !isValidUrl(formData.url) ? "Must be a valid http or https URL" : ""}
               />
             )}
-            {/* Stdio Removed */}
-            <TextField
-              label="Access Token (optional)"
-              value={formData.accessToken}
-              onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
-              fullWidth
-              type="password"
-              placeholder="${MCP_ACCESS_TOKEN}"
-            />
+            {isStdioTransport && (
+              <>
+                <TextField
+                  label="Command"
+                  value={formData.command}
+                  onChange={(e) => setFormData({ ...formData, command: e.target.value })}
+                  fullWidth
+                  required
+                  placeholder="npx"
+                />
+                <TextField
+                  label="Arguments (optional, one per line)"
+                  value={argsInput}
+                  onChange={(e) => setArgsInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={3}
+                  placeholder={"-y\n@brave/brave-search-mcp-server\n--transport\nstdio"}
+                />
+                <TextField
+                  label="Environment Variables JSON (optional)"
+                  value={configInput}
+                  onChange={(e) => setConfigInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={4}
+                  placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                />
+              </>
+            )}
+            {isHttpTransport && (
+              <TextField
+                label="Access Token (optional)"
+                value={formData.accessToken}
+                onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
+                fullWidth
+                type="password"
+                placeholder="${MCP_ACCESS_TOKEN}"
+              />
+            )}
 
           </Box>
         </DialogContent>
@@ -559,7 +645,7 @@ const McpServersTab: React.FC = () => {
           <Button
             onClick={handleAddServer}
             variant="contained"
-            disabled={formLoading || !formData.name || !isValidServerName(formData.name!) || (!!formData.url && !isValidUrl(formData.url))}
+            disabled={formLoading || isFormInvalid}
           >
             {formLoading ? <CircularProgress size={24} /> : "Add"}
           </Button>
@@ -586,17 +672,30 @@ const McpServersTab: React.FC = () => {
                 value={formData.transport}
                 label="Transport Type"
                 onChange={(e) =>
-                  setFormData({
-                    ...formData,
-                    transport: e.target.value as McpServer["transport"],
+                  setFormData((prev) => {
+                    const nextTransport = e.target.value as McpServer["transport"];
+                    if (nextTransport === "stdio") {
+                      return {
+                        ...prev,
+                        transport: nextTransport,
+                        url: "",
+                        accessToken: "",
+                      };
+                    }
+                    return {
+                      ...prev,
+                      transport: nextTransport,
+                      command: "",
+                    };
                   })
                 }
               >
                 <MenuItem value="streamable-http">Streamable HTTP</MenuItem>
                 <MenuItem value="sse">SSE (Server-Sent Events)</MenuItem>
+                <MenuItem value="stdio">Stdio (Backend launches process)</MenuItem>
               </Select>
             </FormControl>
-            {(formData.transport === "streamable-http" || formData.transport === "sse") && (
+            {isHttpTransport && (
               <TextField
                 label="URL"
                 value={formData.url}
@@ -607,14 +706,43 @@ const McpServersTab: React.FC = () => {
                 helperText={formData.url && !isValidUrl(formData.url) ? "Must be a valid http or https URL" : ""}
               />
             )}
-            {/* Stdio Removed */}
-            <TextField
-              label="Access Token (optional)"
-              value={formData.accessToken}
-              onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
-              fullWidth
-              type="password"
-            />
+            {isStdioTransport && (
+              <>
+                <TextField
+                  label="Command"
+                  value={formData.command}
+                  onChange={(e) => setFormData({ ...formData, command: e.target.value })}
+                  fullWidth
+                  required
+                />
+                <TextField
+                  label="Arguments (optional, one per line)"
+                  value={argsInput}
+                  onChange={(e) => setArgsInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={3}
+                />
+                <TextField
+                  label="Environment Variables JSON (optional)"
+                  value={configInput}
+                  onChange={(e) => setConfigInput(e.target.value)}
+                  fullWidth
+                  multiline
+                  minRows={4}
+                  placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                />
+              </>
+            )}
+            {isHttpTransport && (
+              <TextField
+                label="Access Token (optional)"
+                value={formData.accessToken}
+                onChange={(e) => setFormData({ ...formData, accessToken: e.target.value })}
+                fullWidth
+                type="password"
+              />
+            )}
 
           </Box>
         </DialogContent>
@@ -623,7 +751,7 @@ const McpServersTab: React.FC = () => {
           <Button
             onClick={handleEditServer}
             variant="contained"
-            disabled={formLoading || (!!formData.name && !isValidServerName(formData.name!)) || (!!formData.url && !isValidUrl(formData.url))}
+            disabled={formLoading || isFormInvalid}
           >
             {formLoading ? <CircularProgress size={24} /> : "Save"}
           </Button>
