@@ -4,8 +4,30 @@ import { encryptPassword, decryptPassword } from "./config";
 import { McpClientService } from "../mcp/client/mcpClientService";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { agentModeService } from "../services/agentModeService";
+import { generateMarketingResponseWorkerService } from "../services/generateMarketingResponseWorkerService";
 
 const router = express.Router();
+
+/**
+ * Keep worker and main process MCP registries in sync after config changes.
+ * Worker is intentionally recycled so it re-initializes MCP servers from latest DB config.
+ */
+const syncMcpAndRecycleWorker = () => {
+  (async () => {
+    try {
+      await agentModeService.refreshMcpTools();
+    } catch (err) {
+      console.error("Error refreshing MCP tools after config change:", err);
+    }
+
+    try {
+      await generateMarketingResponseWorkerService.shutdown();
+      console.log("MCP: Worker recycled after MCP config change");
+    } catch (err) {
+      console.error("Error recycling worker after MCP config change:", err);
+    }
+  })();
+};
 
 // Validation constants
 const NAME_REGEX = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -111,10 +133,8 @@ router.post("/", async (req, res) => {
       (req as any).user?.userId || "admin"
     );
     
-    // Refresh MCP tools asynchronously (don't block response)
-    agentModeService.refreshMcpTools().catch(err => {
-      console.error('Error refreshing MCP tools after add:', err);
-    });
+    // Refresh MCP tools and recycle worker asynchronously (don't block response)
+    syncMcpAndRecycleWorker();
     
     res.status(201).json(newServer);
   } catch (error) {
@@ -203,10 +223,8 @@ router.put("/:name", async (req, res) => {
       (req as any).user?.userId || "admin"
     );
     
-    // Refresh MCP tools asynchronously (don't block response)
-    agentModeService.refreshMcpTools().catch(err => {
-      console.error('Error refreshing MCP tools after update:', err);
-    });
+    // Refresh MCP tools and recycle worker asynchronously (don't block response)
+    syncMcpAndRecycleWorker();
     
     res.json(updatedServer);
   } catch (error) {
@@ -250,10 +268,8 @@ router.delete("/:name", async (req, res) => {
       (req as any).user?.userId || "admin"
     );
     
-    // Refresh MCP tools asynchronously (don't block response)
-    agentModeService.refreshMcpTools().catch(err => {
-      console.error('Error refreshing MCP tools after delete:', err);
-    });
+    // Refresh MCP tools and recycle worker asynchronously (don't block response)
+    syncMcpAndRecycleWorker();
     
     res.json({ message: "Server deleted successfully" });
   } catch (error) {
