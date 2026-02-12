@@ -1235,12 +1235,12 @@ mcpToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media.',
+    description: 'Create a post on a connected social media account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: { type: 'string', description: 'The connected account ID' },
-        content: { type: 'string', description: 'Post text content. Length limits depend on the specific platform.' },
+        content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform.' },
         media_urls: {
           type: 'array',
           items: { type: 'string' },

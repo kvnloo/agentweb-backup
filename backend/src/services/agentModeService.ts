@@ -833,6 +833,14 @@ When updating HTML files, follow this process:
 - Set attach_previous_task_results to false only if you don't want previous results included
 - **Revision Method**: [DEPRECATED: 'create_revision' is deprecated] For image revision, use 'generate_image' with the original image as an input image. For HTML report revision, use 'update_html_file' to update the HTML file content.
 
+## Social Media Posting (Connected Accounts)
+When posting to connected social media accounts using 'post_on_connected_account':
+- **CRITICAL: Always include the COMPLETE, FULL post content** in the content parameter. Never truncate, abbreviate, summarize, or omit any part of the text.
+- Include ALL paragraphs, line breaks, hashtags, emojis, mentions, and formatting exactly as approved by the user.
+- Do NOT use placeholders like "...", "[rest of content]", or any truncation indicators.
+- If the user approved a multi-paragraph post, include every single paragraph in full.
+- The content parameter must be an exact copy of what was shown to and approved by the user.
+
 ## "whitepapers" / "research reports" / "executive summaries"
 
 For whitepapers, research reports, or executive summaries (target: 8-12 pages):

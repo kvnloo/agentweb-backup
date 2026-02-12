@@ -73,7 +73,8 @@
       "Bash(aws elasticbeanstalk describe-configuration-settings:*)",
       "Bash(aws ec2 describe-instance-status:*)",
       "Bash(aws elasticbeanstalk describe-application-versions:*)",
-      "Bash(npx vitest:*)"
+      "Bash(npx vitest:*)",
+      "Bash(python3:*)"
     ]
   }
 }
