@@ -561,7 +561,7 @@ export class LinkedInService {
 
   async createPost(accessToken: string, authorUrn: string, text: string, imageUrns?: string[]): Promise<string> {
     return this.safeRequest(async () => {
-
+      console.log('[LinkedIn] createPost called for author:', authorUrn);
 
       const payload: any = {
         author: authorUrn,
@@ -595,7 +595,17 @@ export class LinkedInService {
         const urlMatch = text.match(/https?:\/\/[^\s)}\]]+/);
         if (urlMatch) {
           const articleUrl = urlMatch[0];
-          const og = await this.fetchOgMetadata(articleUrl);
+          console.log('[LinkedIn] Fetching OG metadata for:', articleUrl);
+          // Race OG fetch against a timeout so it never blocks post creation for too long
+          const ogPromise = this.fetchOgMetadata(articleUrl);
+          const timeoutPromise = new Promise<{ title: string; description?: string; image?: string }>((resolve) =>
+            setTimeout(() => {
+              console.log('[LinkedIn] OG metadata fetch timed out, using URL-derived title');
+              resolve({ title: this.titleFromUrl(articleUrl) });
+            }, 12000)
+          );
+          const og = await Promise.race([ogPromise, timeoutPromise]);
+          console.log('[LinkedIn] OG metadata result - title:', og.title, ', hasImage:', !!og.image);
           const article: any = {
             source: articleUrl,
             title: og.title,
@@ -617,12 +627,13 @@ export class LinkedInService {
 
 
 
+      console.log('[LinkedIn] Sending post to LinkedIn API...');
       const response = await this.client.post('/rest/posts', payload, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
 
       const postUrn = response.headers['x-restli-id'] || (response.data as any).id;
-
+      console.log('[LinkedIn] Post created successfully:', postUrn);
 
       // LinkedIn Versioned API returns the URN in the x-restli-id header
       return postUrn;
