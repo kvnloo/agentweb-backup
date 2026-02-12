@@ -525,6 +525,85 @@ describe('LinkedInService', () => {
       expect(result).toBe('urn:li:share:no-thumb');
     });
 
+    it('should escape LinkedIn little format reserved characters in commentary', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:escaped1' },
+      });
+
+      const textWithReservedChars = 'AI as a tool (Chatbots) & more {things} [here] | now <html> @mention *bold* _italic_ ~strike~';
+
+      await service.createPost('token', 'urn:li:person:123', textWithReservedChars);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // All reserved chars except # should be escaped with backslash
+      expect(commentary).toContain('\\(Chatbots\\)');
+      expect(commentary).toContain('\\{things\\}');
+      expect(commentary).toContain('\\[here\\]');
+      expect(commentary).toContain('\\|');
+      expect(commentary).toContain('\\<html\\>');
+      expect(commentary).toContain('\\@mention');
+      expect(commentary).toContain('\\*bold\\*');
+      expect(commentary).toContain('\\_italic\\_');
+      expect(commentary).toContain('\\~strike\\~');
+    });
+
+    it('should preserve hashtags (# not escaped) in commentary', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:hashtag1' },
+      });
+
+      const textWithHashtags = 'Great insights on AI! #MarTech #AI #Growth';
+
+      await service.createPost('token', 'urn:li:person:123', textWithHashtags);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // Hashtags should NOT be escaped
+      expect(commentary).toContain('#MarTech');
+      expect(commentary).toContain('#AI');
+      expect(commentary).toContain('#Growth');
+      expect(commentary).not.toContain('\\#');
+    });
+
+    it('should escape backslashes first to avoid double-escaping', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:backslash1' },
+      });
+
+      const textWithBackslash = 'path\\to\\file (test)';
+
+      await service.createPost('token', 'urn:li:person:123', textWithBackslash);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // Backslashes escaped first, then parens escaped
+      // 'path\to\file (test)' -> 'path\\to\\file \(test\)'
+      expect(commentary).toBe('path\\\\to\\\\file \\(test\\)');
+    });
+
+    it('should handle real-world LinkedIn post with parentheses that caused truncation', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:realworld1' },
+      });
+
+      const realWorldText = 'The "Agency Model" is dying. AI as a tool (Chatbots) won\'t save you. Here\'s why.';
+
+      await service.createPost('token', 'urn:li:organization:123', realWorldText);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // The parentheses around "Chatbots" should be escaped
+      expect(commentary).toContain('\\(Chatbots\\)');
+      // The full text should be present (not truncated at parentheses)
+      expect(commentary).toContain("won't save you");
+      expect(commentary).toContain("Here's why.");
+    });
+
     it('should not add article content when post has no URL', async () => {
       mockClient.post.mockResolvedValueOnce({
         data: {},

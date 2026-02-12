@@ -441,6 +441,32 @@ export class LinkedInService {
    * Handles both Personal and Organization posts based on authorUrn
    */
   /**
+   * Escape reserved characters for LinkedIn's 'little' text format.
+   * The commentary field uses 'little' format where these characters are reserved:
+   * | { } @ [ ] ( ) < > # \ * _ ~
+   * Unescaped reserved chars cause LinkedIn to silently truncate the post text.
+   * We preserve # unescaped so hashtags (#word) work as HashtagElements.
+   */
+  private escapeLinkedInLittle(text: string): string {
+    // Backslash must be escaped first to avoid double-escaping
+    return text
+      .replace(/\\/g, '\\\\')
+      .replace(/\|/g, '\\|')
+      .replace(/\{/g, '\\{')
+      .replace(/\}/g, '\\}')
+      .replace(/@/g, '\\@')
+      .replace(/\[/g, '\\[')
+      .replace(/\]/g, '\\]')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)')
+      .replace(/</g, '\\<')
+      .replace(/>/g, '\\>')
+      .replace(/\*/g, '\\*')
+      .replace(/_/g, '\\_')
+      .replace(/~/g, '\\~');
+  }
+
+  /**
    * Extract a human-readable title from a URL path as fallback when OG metadata can't be fetched
    */
   private titleFromUrl(url: string): string {
@@ -565,7 +591,7 @@ export class LinkedInService {
 
       const payload: any = {
         author: authorUrn,
-        commentary: text,
+        commentary: this.escapeLinkedInLittle(text),
         visibility: 'PUBLIC',
         lifecycleState: 'PUBLISHED',
         distribution: {
@@ -629,13 +655,20 @@ export class LinkedInService {
 
 
 
-      console.log('[LinkedIn] Sending post to LinkedIn API...');
+      console.log('[LinkedIn] Sending post to LinkedIn API - commentary length:', payload.commentary?.length, ', hasArticle:', !!payload.content?.article);
       const response = await this.client.post('/rest/posts', payload, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
 
       const postUrn = response.headers['x-restli-id'] || (response.data as any).id;
       console.log('[LinkedIn] Post created successfully:', postUrn);
+      // Log if LinkedIn returned any response body (may contain modified content)
+      if (response.data && Object.keys(response.data).length > 0) {
+        const respCommentary = (response.data as any).commentary;
+        if (respCommentary && respCommentary.length !== payload.commentary?.length) {
+          console.error('[LinkedIn] WARNING: Response commentary length differs! Sent:', payload.commentary?.length, 'Received:', respCommentary.length);
+        }
+      }
 
       // LinkedIn Versioned API returns the URN in the x-restli-id header
       return postUrn;
