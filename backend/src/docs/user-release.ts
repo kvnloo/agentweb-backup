@@ -14,6 +14,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When a Scheduled Chat is triggered, users are prompted to provide variable values from the UI or by email link',
       '- The Scheduled Chat run continues only after all required variable values are provided',
       '- Variable request email links expire 30 minutes before the next run time so the next scheduled run is not disrupted',
+      'Added Character Counter for Auto Draft Instruction',
+      '- The Additional Instruction field in Auto Draft now displays a live character count with a 2,000-character limit',
+      '- The counter turns red when the limit is exceeded, and the Save button is disabled until the text is shortened',
+      'Fixed Inconsistent Text Color in Dark Mode',
+      '- Corrected a malformed CSS color variable that caused some users to see yellow text instead of white on primary elements',
     ],
   },
   {
