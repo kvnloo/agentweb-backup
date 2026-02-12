@@ -519,13 +519,11 @@ export class AgentModeService {
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       let [
         currentSession,
-        availableTemplates,
         userAllowedTools,
         publishedSkills,
         baseSystemPrompt
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
-        this.getAvailableTemplates(),
         getAllowedFunctionCalls(userId),
         skillService.getPublishedSkills(),
         this.getMarketingSystemPrompt()
@@ -555,7 +553,7 @@ export class AgentModeService {
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
       ];
       // Use helper to inject installed skills and templates
-      this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg, availableTemplates, allowedToolNames);
+      this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
       messages.push(...marketingMessages);
 
@@ -599,7 +597,7 @@ export class AgentModeService {
                 availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds);
 
                 // Update messages using helper
-                this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg, availableTemplates, allowedToolNames);
+                this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
                 // Invalidate tools cache
                 filteredToolsCache = null;
@@ -834,11 +832,9 @@ export class AgentModeService {
 
 
   private updateConversationContext(
-    messages: any[], 
-    installedSkillContextMsg: string, 
-    availableSkillContextMsg: string,
-    availableTemplates: any[], 
-    allowedToolNames: Set<string>
+    messages: any[],
+    installedSkillContextMsg: string,
+    availableSkillContextMsg: string
   ) {
     // Helper to safely check if content starts with a prefix (handles both string and Anthropic array format)
     const contentStartsWith = (content: any, prefix: string): boolean => {
@@ -884,30 +880,6 @@ export class AgentModeService {
 
       messages.splice(insertIndex, 0, { role: 'assistant', content: installedSkillContextMsg });
     }
-
-    // 3. Handle Available Templates Message
-    // Remove existing message first
-    const templatesIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Templates:'));
-    if (templatesIdx !== -1) {
-      messages.splice(templatesIdx, 1);
-    }
-
-    // Insert new message if tool is allowed
-    // TODO: Following condition is commented for now, need to think about it as if user just saying do seo of this site then if emma dosn't have skill which has create_task_from_template tool then it will not show available templates
-    // if (allowedToolNames.has('create_task_from_template')) {
-      const templatesContext = this.buildTemplatesContext(availableTemplates);
-      if (templatesContext !== 'No templates are currently available.') {
-          // Find optimal insertion point
-          let insertIndex = 1;
-          const installedIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Installed Skills:'));
-          const availableIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Skills:'));
-
-          if (installedIndex !== -1) insertIndex = installedIndex + 1;
-          else if (availableIndex !== -1) insertIndex = availableIndex + 1;
-
-          messages.splice(insertIndex, 0, { role: 'assistant', content: templatesContext });
-      }
-    // }
   }
 
   async getMarketingSystemPrompt(): Promise<string> {
@@ -997,7 +969,7 @@ When updating HTML files, follow this process:
 - **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
 - **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
 - **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
-- All available templates are provided in the context above - select the most appropriate one based on the user's request
+- Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
 - Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
 - Example: {"site_url": "example.com", "business_area": "e-commerce"}
 - Templates provide structured, proven approaches to common web automation marketing tasks
@@ -1400,42 +1372,6 @@ When a user requests client onboarding or says "onboard new client" or similar:
     return messages;
   }
 
-  private buildTemplatesContext(templates: any[]): string {
-    if (templates.length === 0) {
-      return 'No templates are currently available.';
-    }
-
-    let context = 'Available Templates:\n\n';
-
-    // Group templates by category
-    const groupedTemplates: Record<string, any[]> = {};
-    templates.forEach(template => {
-      const category = template.category || 'General';
-      if (!groupedTemplates[category]) {
-        groupedTemplates[category] = [];
-      }
-      groupedTemplates[category].push(template);
-    });
-
-    // Build context for each category
-    Object.entries(groupedTemplates).forEach(([category, categoryTemplates]) => {
-      context += `## ${category}\n`;
-      categoryTemplates.forEach(template => {
-        context += `**${template.name}** (ID: ${template.templateId})\n`;
-        context += `Description: ${template.description}\n`;
-        if (template.parameters && template.parameters.length > 0) {
-          const paramNames = template.parameters.map((p: any) => typeof p === 'string' ? p : p.name || p.id);
-          context += `Parameters: ${paramNames.join(', ')}\n`;
-        }
-        context += `\n`;
-      });
-    });
-
-    context += `\nTo use a template, call the 'create_task_from_template' tool with the template_id and parameters_json string (JSON format where keys are parameter names and values are the actual values).`;
-
-    return context;
-  }
-
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
       const publishedSkills = await skillService.getPublishedSkills();
@@ -1760,6 +1696,21 @@ When a user requests client onboarding or says "onboard new client" or similar:
   private getMockToolResult(toolName: string, args: any): any {
     // Return realistic mock data for different tool types
     switch (toolName) {
+      case 'list_task_templates':
+        return {
+          success: true,
+          message: 'Found 2 template(s)',
+          templates_by_category: {
+            'SEO': [
+              { template_id: 'mock-template-1', name: 'SEO Analysis', description: 'Analyze website SEO', category: 'SEO', parameters: ['site_url'] }
+            ],
+            'Research': [
+              { template_id: 'mock-template-2', name: 'Competitor Research', description: 'Research competitors', category: 'Research', parameters: ['competitor_url'] }
+            ]
+          },
+          totalTemplates: 2
+        };
+
       case 'create_task_from_template':
         return {
           success: true,
@@ -4687,7 +4638,52 @@ Format the response as JSON with this structure:
     }
   }
 
+  // List task templates (used by list_task_templates MCP tool)
+  public async listTaskTemplates(category?: string): Promise<any> {
+    try {
+      let templates = await this.getAvailableTemplates();
 
+      if (category) {
+        templates = templates.filter((t: any) => t.category === category);
+      }
+
+      if (templates.length === 0) {
+        return {
+          success: true,
+          message: 'No templates are currently available.',
+          templates: [],
+          totalTemplates: 0
+        };
+      }
+
+      // Group by category for organized presentation
+      const grouped: Record<string, any[]> = {};
+      templates.forEach((t: any) => {
+        const cat = t.category || 'General';
+        if (!grouped[cat]) grouped[cat] = [];
+        grouped[cat].push({
+          template_id: t.templateId,
+          name: t.name,
+          description: t.description,
+          category: cat,
+          parameters: (t.parameters || []).map((p: any) => typeof p === 'string' ? p : p.name || p.id)
+        });
+      });
+
+      return {
+        success: true,
+        message: `Found ${templates.length} template(s)`,
+        templates_by_category: grouped,
+        totalTemplates: templates.length
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: 'Failed to list task templates',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
 
   // Helper method to convert file URLs to TaskAttachment objects
   private convertUrlsToAttachments(fileUrls: string[]): any[] {

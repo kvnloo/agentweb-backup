@@ -512,9 +512,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         'Installed Skills:\ns1- Skill 1: Description',
-        '', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        '' // availableSkillContextMsg
       );
 
       const installedMsg = messages.find(m => m.content?.startsWith('Installed Skills:'));
@@ -530,9 +528,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         'Installed Skills:\nNEW CONTENT',
-        '', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        '' // availableSkillContextMsg
       );
 
       const installedMsgs = messages.filter(m => m.content?.startsWith('Installed Skills:'));
@@ -548,9 +544,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         '',
-        '', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        '' // availableSkillContextMsg
       );
 
       const installedMsg = messages.find(m => m.content?.startsWith('Installed Skills:'));
@@ -566,9 +560,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         '',
-        'Available Skills:\nNEW LIST', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        'Available Skills:\nNEW LIST' // availableSkillContextMsg
       );
 
       const availableMsgs = messages.filter(m => m.content?.startsWith('Available Skills:'));

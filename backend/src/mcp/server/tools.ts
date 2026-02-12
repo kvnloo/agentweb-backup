@@ -1343,6 +1343,27 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'list_task_templates',
+  definition: {
+    name: 'list_task_templates',
+    description: 'List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this to find the right template before creating a task with create_task_from_template.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: {
+          type: 'string',
+          description: 'Optional: Filter templates by category'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listTaskTemplates(args.category);
+  }
+});
+
 // --- Tools from taskTools.ts ---
 mcpToolRegistry.register({
   name: 'create_task_from_template',
