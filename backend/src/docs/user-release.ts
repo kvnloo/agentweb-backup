@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-12',
+    changes: [
+      'Mitigated the issue of content truncated when posting on LinkedIn',
+      'Mitigated the issue preview not generated for articles',
+    ],
+  },
+  {
     date: '2026-02-11',
     changes: [
       'Supported Variables for Scheduled Chats',
