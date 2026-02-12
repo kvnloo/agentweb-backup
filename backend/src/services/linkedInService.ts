@@ -598,13 +598,15 @@ export class LinkedInService {
           console.log('[LinkedIn] Fetching OG metadata for:', articleUrl);
           // Race OG fetch against a timeout so it never blocks post creation for too long
           const ogPromise = this.fetchOgMetadata(articleUrl);
-          const timeoutPromise = new Promise<{ title: string; description?: string; image?: string }>((resolve) =>
-            setTimeout(() => {
+          let timeoutId: ReturnType<typeof setTimeout>;
+          const timeoutPromise = new Promise<{ title: string; description?: string; image?: string }>((resolve) => {
+            timeoutId = setTimeout(() => {
               console.log('[LinkedIn] OG metadata fetch timed out, using URL-derived title');
               resolve({ title: this.titleFromUrl(articleUrl) });
-            }, 12000)
-          );
+            }, 12000);
+          });
           const og = await Promise.race([ogPromise, timeoutPromise]);
+          clearTimeout(timeoutId!);
           console.log('[LinkedIn] OG metadata result - title:', og.title, ', hasImage:', !!og.image);
           const article: any = {
             source: articleUrl,
