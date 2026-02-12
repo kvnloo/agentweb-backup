@@ -2699,12 +2699,28 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
 
     try {
-      return await this.toolRegistry.execute(toolName, args, {
+      const result = await this.toolRegistry.execute(toolName, args, {
         userId,
         sessionId,
         llmModel,
         service: this,
       });
+
+      // If result is already MCP-wrapped (from external MCP tools via mcpClientService),
+      // pass it through unchanged. External tools return { content: string, raw: { content: [...] } }
+      if (result && typeof result.content === 'string' && result.raw) {
+        return result;
+      }
+
+      // Simulate MCP wrapping for internal tools to maintain consistent
+      // response format with external MCP tools
+      const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+      return {
+        content: resultStr,
+        raw: {
+          content: [{ type: 'text', text: resultStr }]
+        }
+      };
     } catch (error) {
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
