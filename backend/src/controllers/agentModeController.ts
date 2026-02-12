@@ -1381,6 +1381,13 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
 
+      // Clean up progress store on error so session doesn't appear stuck in generating state
+      const sessionId = req.body?.sessionId;
+      if (sessionId) {
+        emitProgress(sessionId, { iteration: 0, status: 'complete' });
+        progressStore.delete(sessionId);
+      }
+
       // Handle specific error types
       if (error instanceof Error) {
         if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
@@ -1458,7 +1465,7 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+        if (error.message.includes('content policies') || error.message.includes('violate content policies') || error.message.includes('content management policy') || error.message.includes('content_filter')) {
           res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
@@ -1853,11 +1860,18 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
 
+      // Clean up progress store on error so session doesn't appear stuck in generating state
+      const shareId = req.params?.shareId;
+      if (shareId) {
+        emitProgress(shareId, { iteration: 0, status: 'complete' });
+        progressStore.delete(shareId);
+      }
+
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
         if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
           // Extract the actual error message from the error
-          const errorMessage = error.message.includes(':') 
+          const errorMessage = error.message.includes(':')
             ? error.message.split(':').slice(1).join(':').trim()
             : `This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`;
           res.status(413).json({
@@ -1931,7 +1945,7 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+        if (error.message.includes('content policies') || error.message.includes('violate content policies') || error.message.includes('content management policy') || error.message.includes('content_filter')) {
           res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
@@ -3458,6 +3472,13 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
 
+      // Clean up progress store on error so session doesn't appear stuck in generating state
+      const convSessionId = req.params?.shareId;
+      if (convSessionId) {
+        emitProgress(convSessionId, { iteration: 0, status: 'complete' });
+        progressStore.delete(convSessionId);
+      }
+
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
         if (error.message.includes('SESSION_SIZE_LIMIT_EXCEEDED')) {
@@ -3480,7 +3501,7 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+        if (error.message.includes('content policies') || error.message.includes('violate content policies') || error.message.includes('content management policy') || error.message.includes('content_filter')) {
           res.status(400).json({
             error: 'Content policy violation',
             message: error.message,

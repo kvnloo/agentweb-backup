@@ -42,6 +42,7 @@ jest.mock('../utils/sseProgress', () => ({
   progressStore: {
     delete: jest.fn(),
   },
+  emitProgress: jest.fn(),
   hasActiveProgress: jest.fn().mockReturnValue(false),
 }));
 
