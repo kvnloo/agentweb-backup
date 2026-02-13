@@ -2428,6 +2428,79 @@ router.get("/knowledge-base-metrics", async (req, res) => {
   }
 });
 
+// Get GTM analytics (aggregate work item metrics across all plans)
+router.get("/analytics/gtm", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const hasDateRange = startDate && endDate;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    const result = await dynamodb.scan({
+      TableName: TABLE_NAME,
+    }).promise();
+
+    const plans = result.Items || [];
+
+    let totalItems = 0;
+    let completedItems = 0;
+    let completedItemsInRange = 0;
+
+    for (const plan of plans) {
+      const phases = plan.phases || [];
+      for (const phase of phases) {
+        const items = phase.workItems || [];
+        totalItems += items.length;
+        for (const item of items) {
+          if (item.status === "completed") {
+            completedItems++;
+            if (hasDateRange) {
+              // Use completedAt if available, otherwise infer creation date from item ID
+              // ID format: workitem-{timestampMs}-{phaseIdx}-{itemIdx}-{random}
+              // Use completedAt if available, otherwise infer creation date from item ID
+              // ID format: workitem-{timestampMs}-{phaseIdx}-{itemIdx}-{random}
+              let itemDate = item.completedAt;
+              if (!itemDate && item.id) {
+                const match = item.id.match(/^workitem-(\d+)-/);
+                if (match) {
+                  itemDate = new Date(parseInt(match[1], 10)).toISOString();
+                }
+              }
+              // Compare date portion only (startDate/endDate are yyyy-MM-dd)
+              if (itemDate) {
+                const itemDay = itemDate.slice(0, 10);
+                if (itemDay >= (startDate as string) && itemDay <= (endDate as string)) {
+                  completedItemsInRange++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    res.json({
+      totalItems,
+      completedItems,
+      completedItemsInRange: hasDateRange ? completedItemsInRange : completedItems,
+    });
+  } catch (error: any) {
+    console.error("Error getting GTM analytics:", error);
+    res.status(500).json({ message: "Error fetching GTM analytics" });
+  }
+});
+
 // Get all GTM plans from all users
 router.get("/gtm-plans", async (req, res) => {
   try {
@@ -2557,6 +2630,8 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       ...(notes !== undefined && { notes }),
       ...(dri !== undefined && { dri: dri || null }),
       ...(dueDate !== undefined && { dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null }),
+      ...(status === "completed" && originalItem.status !== "completed" && { completedAt: new Date().toISOString() }),
+      ...(status !== undefined && status !== "completed" && originalItem.status === "completed" && { completedAt: null }),
     };
 
     workItems[workItemIndex] = updatedWorkItem;

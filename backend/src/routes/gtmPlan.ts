@@ -372,6 +372,8 @@ router.put("/:planId/phases/:phaseId/work-items/:workItemId", authenticateToken,
       ...(title !== undefined && { title }),
       ...(description !== undefined && { description: description || null }),
       ...(dueDate !== undefined && { dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null }),
+      ...(status === "completed" && originalItem.status !== "completed" && { completedAt: new Date().toISOString() }),
+      ...(status !== undefined && status !== "completed" && originalItem.status === "completed" && { completedAt: null }),
     };
 
     // Only track actual changes for notifications
