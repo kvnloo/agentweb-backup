@@ -3,6 +3,7 @@ import { benchmarkTestDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { skillService } from '../services/skillService';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { BenchmarkTest, CreateBenchmarkTestRequest, RunBenchmarkTestRequest } from '../types/benchmark';
 import { v4 as uuidv4 } from 'uuid';
@@ -13,10 +14,10 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
     const { sessionId, testName, description, expectedOutput, llmModel }: CreateBenchmarkTestRequest = req.body;
     const adminUserId = req.user.userId;
 
-    // Check if user is admin (required for creating benchmark tests)
+    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can create benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can create benchmark tests'
       });
     }
 
@@ -93,10 +94,9 @@ export async function createBenchmarkTest(req: AuthenticatedRequest, res: Respon
 // Get all benchmark tests (admin only)
 export async function getAllBenchmarkTests(req: AuthenticatedRequest, res: Response) {
   try {
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can view all benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can view all benchmark tests'
       });
     }
 
@@ -119,10 +119,9 @@ export async function getAllBenchmarkTests(req: AuthenticatedRequest, res: Respo
 // Get benchmark tests created by current admin
 export async function getMyBenchmarkTests(req: AuthenticatedRequest, res: Response) {
   try {
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can view benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can view benchmark tests'
       });
     }
 
@@ -147,17 +146,16 @@ export async function getBenchmarkTest(req: AuthenticatedRequest, res: Response)
   try {
     const { testId } = req.params;
 
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can view benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can view benchmark tests'
       });
     }
 
     const test = await benchmarkTestDb.getBenchmarkTest(testId);
     if (!test) {
-      return res.status(404).json({ 
-        message: 'Benchmark test not found' 
+      return res.status(404).json({
+        message: 'Benchmark test not found'
       });
     }
 
@@ -177,10 +175,9 @@ export async function updateBenchmarkTest(req: AuthenticatedRequest, res: Respon
     const { testId } = req.params;
     const updates = req.body;
 
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can update benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can update benchmark tests'
       });
     }
 
@@ -212,10 +209,9 @@ export async function deleteBenchmarkTest(req: AuthenticatedRequest, res: Respon
   try {
     const { testId } = req.params;
 
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can delete benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can delete benchmark tests'
       });
     }
 
@@ -292,10 +288,9 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
     const { testId } = req.params;
     const { llmName }: RunBenchmarkTestRequest = req.body;
 
-    // Check if user is admin
     if (!req.user.isAdmin) {
-      return res.status(403).json({ 
-        message: 'Only admin users can run benchmark tests' 
+      return res.status(403).json({
+        message: 'Only admin users can run benchmark tests'
       });
     }
 
@@ -318,6 +313,17 @@ export async function runBenchmarkTest(req: AuthenticatedRequest, res: Response)
     const defaultModel = await agentModeService.getDefaultModel();
 
     try {
+      // Pre-install all skills on the benchmark session so that tools referenced
+      // in the stored conversation history are available to the LLM from the start.
+      // Without this, skill-gated tools (like create_task_from_template) would be
+      // missing from the tool list, causing models to fall back to inline answers.
+      const publishedSkills = await skillService.getPublishedSkills();
+      const allSkillIds = [
+        ...publishedSkills.map(s => s.skillId),
+        '__other_skills__'
+      ];
+      await agentModeService.installSkills(allSkillIds, test.userId, test.sessionId);
+
       // Prepare input for benchmark execution
       const messages = test.conversationHistory.messages;
       if (messages.length === 0) {

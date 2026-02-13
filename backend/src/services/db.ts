@@ -2709,7 +2709,24 @@ class BenchmarkTestDB {
     }
   }
 
+  /**
+   * Trim large fields from a test result to keep DynamoDB item size manageable.
+   * Truncates actualResponse and removes responseMessages (full conversation).
+   */
+  private trimTestResult(result: any): any {
+    const MAX_RESPONSE_LENGTH = 2000;
+    const trimmed = { ...result };
+    if (typeof trimmed.actualResponse === 'string' && trimmed.actualResponse.length > MAX_RESPONSE_LENGTH) {
+      trimmed.actualResponse = trimmed.actualResponse.slice(0, MAX_RESPONSE_LENGTH) + '... [truncated]';
+    }
+    // responseMessages contains the full LLM conversation and is very large — drop it from stored history
+    delete trimmed.responseMessages;
+    return trimmed;
+  }
+
   async addTestResult(testId: string, testResult: any) {
+    const trimmedResult = this.trimTestResult(testResult);
+
     const params = {
       TableName: this.tableName,
       Key: {
@@ -2721,7 +2738,7 @@ class BenchmarkTestDB {
         '#updatedAt': 'updatedAt',
       },
       ExpressionAttributeValues: {
-        ':testResult': [testResult],
+        ':testResult': [trimmedResult],
         ':emptyList': [],
         ':updatedAt': new Date().toISOString(),
       },
@@ -2734,8 +2751,8 @@ class BenchmarkTestDB {
     } catch (error: any) {
       // Handle DynamoDB item size limit error
       if (error.code === 'ValidationException' && error.message?.includes('exceeded the maximum allowed size')) {
-        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 5 test history records.`);
-        
+        console.log(`Item size limit exceeded for test ${testId}. Trimming test history.`);
+
         try {
           // Get the current test to access testHistory
           const currentTest = await this.getBenchmarkTest(testId);
@@ -2744,18 +2761,20 @@ class BenchmarkTestDB {
           }
 
           const testHistory = currentTest.testHistory || [];
-          
+
           // Check if we have any history to work with
           if (testHistory.length === 0) {
             throw new Error('Item size limit exceeded but no test history to remove');
           }
-          
-          // Keep only the last 5 records (most recent)
-          const updatedHistory = testHistory.slice(-5);
-          
-          console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records.`);
-          
-          // Use a direct update to replace the entire testHistory array
+
+          // Keep only the last 5 records and trim each one
+          const updatedHistory = testHistory.slice(-5).map((r: any) => this.trimTestResult(r));
+
+          console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records (trimmed).`);
+
+          // Use a direct update to replace the entire testHistory array with trimmed new result included
+          updatedHistory.push(trimmedResult);
+
           const cleanupParams = {
             TableName: this.tableName,
             Key: {
@@ -2772,19 +2791,16 @@ class BenchmarkTestDB {
             },
             ReturnValues: 'ALL_NEW',
           };
-          
-          await this.docClient.update(cleanupParams).promise();
-          
-          // Retry adding the new test result
-          const retryResult = await this.docClient.update(params).promise();
-          console.log(`Successfully added test result after cleanup. History now has ${updatedHistory.length + 1} records.`);
+
+          const retryResult = await this.docClient.update(cleanupParams).promise();
+          console.log(`Successfully added test result after cleanup. History now has ${updatedHistory.length} records.`);
           return retryResult.Attributes;
         } catch (cleanupError) {
           console.error('Error cleaning up test history:', cleanupError);
           throw new Error(`Failed to add test result and cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : 'Unknown error'}`);
         }
       }
-      
+
       handleDynamoDbError(error, "addTestResult");
       throw error;
     }

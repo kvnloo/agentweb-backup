@@ -538,7 +538,9 @@ export class AgentModeService {
       if (sessionAssociatedSkillIds.length) {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
-      
+
+      console.log(`[Benchmark Debug] sessionId=${sessionId}, mockMode=${mockMode}, publishedSkills=${publishedSkills.length}, sessionAssociatedSkillIds=[${sessionAssociatedSkillIds.join(', ')}], associatedSkills=${associatedSkills.length}`);
+
       // Build initial skill context
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedTools, publishedSkills, sessionAssociatedSkillIds);
 
@@ -548,6 +550,10 @@ export class AgentModeService {
       // Build the "Available Skills" message (excluding already-associated skills)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds);
 
+      console.log(`[Benchmark Debug] allowedToolNames=[${[...allowedToolNames].join(', ')}]`);
+      console.log(`[Benchmark Debug] availableSkillContextMsg=${availableSkillContextMsg ? 'present (' + availableSkillContextMsg.length + ' chars)' : 'EMPTY'}`);
+      console.log(`[Benchmark Debug] installedSkillContextMsg=${installedSkillContextMsg ? 'present (' + installedSkillContextMsg.length + ' chars)' : 'EMPTY'}`);
+
       const today = new Date().toISOString().split('T')[0];
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
@@ -556,6 +562,8 @@ export class AgentModeService {
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
       messages.push(...marketingMessages);
+
+      console.log(`[Benchmark Debug] Final message roles: [${messages.map((m: any, i: number) => `${i}:${m.role}${typeof m.content === 'string' && m.content.startsWith('Available Skills:') ? '(available-skills)' : ''}${typeof m.content === 'string' && m.content.startsWith('Installed Skills:') ? '(installed-skills)' : ''}`).join(', ')}]`);
 
       let content = '';
       const toolCalls: any[] = [];
@@ -692,6 +700,22 @@ export class AgentModeService {
           try {
             functionArgs = JSON.parse(toolCall.function.arguments);
 
+            // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
+            // LLMs may hallucinate tool calls from conversation history even when the tool
+            // isn't in the current tools list. Return an error so the LLM learns to install skills first.
+            // Only enforce when the skills system is active (published skills exist).
+            if (publishedSkills.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
+              console.log(`[Benchmark Debug] BLOCKED tool call "${toolCall.function.name}" — not in allowedToolNames=[${[...allowedToolNames].join(', ')}]`);
+              const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: errorMsg })
+              });
+              continue;
+            }
+
             // Check if we need to refresh skills for next iteration
             if (toolCall.function.name === 'install_skills') {
                 skillsUpdated = true;
@@ -719,7 +743,7 @@ export class AgentModeService {
             }
 
             // Collect for batched counter update instead of immediate DB write
-            pendingCounterUpdates[toolCall.function.name] = 
+            pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
             // Append the tool call result as a tool message for the model to consume next
@@ -2672,8 +2696,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
-    // Return mock data if in mock mode
-    if (mockMode) {
+    // In mock mode, infrastructure tools like install_skills must execute for real
+    // because they only update session state in DynamoDB (no external side effects)
+    // and are required for the skill-gated tool flow to work during benchmark tests.
+    if (mockMode && !AgentModeService.INFRASTRUCTURE_TOOLS.has(toolName)) {
       return this.getMockToolResult(toolName, args);
     }
 
