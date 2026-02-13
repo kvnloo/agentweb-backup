@@ -36,7 +36,7 @@ describe('Lead List Alert Service - API Events', () => {
     listId: 'list_123',
     name: 'Test Lead List',
     userId: 'user_123',
-    alertEvents: ['api.lead_added', 'api.lead_failed'],
+    alertEvents: ['api.lead_added', 'api.lead_updated', 'api.lead_failed'],
   };
 
   const mockLead = {
@@ -159,6 +159,64 @@ describe('Lead List Alert Service - API Events', () => {
     });
   });
 
+  describe('notifyLeadListOwnerIfConfigured - api.lead_updated', () => {
+    it('should send alert email when api.lead_updated event is configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_updated',
+        {
+          source: 'website_contact_form',
+          forwardedAt: '2026-01-18T10:30:45.123Z',
+          company: 'Acme Corp',
+          phone: '+1234567890',
+        },
+        '2026-01-18T10:30:45.123Z'
+      );
+
+      expect(emailService.sendEmail).toHaveBeenCalledWith(
+        'owner@example.com',
+        'Lead list alert: api.lead_updated',
+        expect.stringContaining('api.lead_updated'),
+        expect.stringContaining('api.lead_updated')
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const textContent = emailCall[2];
+      const htmlContent = emailCall[3];
+
+      expect(textContent).toContain('website_contact_form');
+      expect(htmlContent).toContain('website_contact_form');
+      expect(htmlContent).toContain('Updated At');
+      expect(textContent).toContain('Acme Corp');
+      expect(htmlContent).toContain('Acme Corp');
+    });
+
+    it('should not send alert when api.lead_updated is not configured', async () => {
+      const listWithoutAlert = {
+        ...mockList,
+        alertEvents: ['email.received'],
+      };
+
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        listWithoutAlert,
+        mockLead,
+        'api.lead_updated',
+        {
+          source: 'website_contact_form',
+          forwardedAt: '2026-01-18T10:30:45.123Z',
+        },
+        '2026-01-18T10:30:45.123Z'
+      );
+
+      expect(emailService.sendEmail).not.toHaveBeenCalled();
+    });
+  });
+
   describe('notifyLeadListOwnerIfConfigured - api.lead_failed', () => {
     it('should send alert email when api.lead_failed event is configured', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
@@ -269,6 +327,34 @@ describe('Lead List Alert Service - API Events', () => {
       expect(htmlContent).toContain('Tech Corp');
       expect(htmlContent).toContain('<strong>Phone:</strong>');
       expect(htmlContent).toContain('+1987654321');
+    });
+
+    it('should format api.lead_updated event details correctly', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_updated',
+        {
+          source: 'linkedin_outreach',
+          forwardedAt: '2026-01-18T10:30:45.123Z',
+          company: 'Updated Corp',
+          phone: '+1555555555',
+        },
+        '2026-01-18T10:30:45.123Z'
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const htmlContent = emailCall[3];
+
+      expect(htmlContent).toContain('<strong>Source:</strong>');
+      expect(htmlContent).toContain('linkedin_outreach');
+      expect(htmlContent).toContain('<strong>Updated At:</strong>');
+      expect(htmlContent).toContain('<strong>Company:</strong>');
+      expect(htmlContent).toContain('Updated Corp');
+      expect(htmlContent).toContain('<strong>Phone:</strong>');
+      expect(htmlContent).toContain('+1555555555');
     });
 
     it('should format api.lead_failed event details correctly', async () => {

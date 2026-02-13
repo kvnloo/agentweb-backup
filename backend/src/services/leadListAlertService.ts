@@ -39,6 +39,12 @@ const buildEventDetails = (eventType: string, eventData: any) => {
       details.push({ label: 'Auto Draft Error', value: String(eventData.autoDraftError) });
     }
   }
+  if (eventType === 'api.lead_updated') {
+    if (eventData.source) details.push({ label: 'Source', value: String(eventData.source) });
+    if (eventData.forwardedAt) details.push({ label: 'Updated At', value: new Date(eventData.forwardedAt).toLocaleString() });
+    if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
+    if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
+  }
   if (eventType === 'api.lead_failed') {
     if (eventData.error) details.push({ label: 'Error', value: String(eventData.error) });
     if (eventData.source) details.push({ label: 'Source', value: String(eventData.source) });
