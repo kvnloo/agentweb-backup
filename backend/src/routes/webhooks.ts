@@ -4,9 +4,76 @@ import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { crmDb } from '../services/db';
+import { crmDb, dripCampaignDb } from '../services/db';
 
 const router = express.Router();
+
+// Helper function to handle drip campaign replies
+async function handleDripCampaignReply(event: ResendWebhookEvent, emailDomain: string) {
+  try {
+    // Extract the sender's email (who replied)
+    const replyFromEmail = event.data.from.toLowerCase();
+
+    // Query email events to find the original sent email from this domain to this lead
+    const sentEvents = await emailEventsDb.getEventsByEmailDomainAndLeadEmail(emailDomain, replyFromEmail);
+
+    // Look for the most recent 'email.sent' or 'email.delivered' event with drip campaign metadata
+    for (const sentEvent of sentEvents) {
+      const metadata = sentEvent.data?.tags;
+
+      if (metadata && metadata.campaignId && metadata.enrollmentId) {
+        console.log(`Detected reply to drip campaign ${metadata.campaignId}, enrollment ${metadata.enrollmentId}`);
+
+        // Get the campaign to check if stopOnReply is enabled
+        const campaign = await dripCampaignDb.getCampaign(metadata.campaignId);
+        if (!campaign) {
+          console.log(`Campaign ${metadata.campaignId} not found`);
+          continue;
+        }
+
+        // Check if stopOnReply is enabled
+        if (campaign.stopConditions?.stopOnReply) {
+          // Get the enrollment
+          const enrollment = await dripCampaignDb.getEnrollment(metadata.enrollmentId);
+          if (!enrollment) {
+            console.log(`Enrollment ${metadata.enrollmentId} not found`);
+            continue;
+          }
+
+          // Only stop if enrollment is still active
+          if (enrollment.status === 'active') {
+            console.log(`Stopping enrollment ${metadata.enrollmentId} due to reply`);
+
+            // Update enrollment status to stopped
+            await dripCampaignDb.updateEnrollment(metadata.enrollmentId, {
+              status: 'stopped',
+              stoppedAt: new Date().toISOString(),
+              stoppedReason: 'replied'
+            });
+
+            // Update campaign stats
+            await dripCampaignDb.updateCampaign(metadata.campaignId, {
+              'stats.active': (campaign.stats?.active || 1) - 1,
+              'stats.stopped': (campaign.stats?.stopped || 0) + 1
+            });
+
+            console.log(`Successfully stopped enrollment ${metadata.enrollmentId}`);
+          } else {
+            console.log(`Enrollment ${metadata.enrollmentId} is already ${enrollment.status}, not stopping`);
+          }
+        } else {
+          console.log(`Campaign ${metadata.campaignId} does not have stopOnReply enabled`);
+        }
+
+        // We found and processed the campaign, break out
+        break;
+      }
+    }
+  } catch (error) {
+    console.error('Error handling drip campaign reply:', error);
+    // Don't throw - we don't want to fail the webhook if drip campaign processing fails
+  }
+}
 
 // Resend webhook endpoint
 router.post('/resend', async (req: express.Request, res: express.Response) => {
@@ -79,6 +146,8 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       
       case 'email.received':
         console.log(`Email received: ${event.data.email_id} from ${event.data.from} to ${Array.isArray(event.data.to) ? event.data.to.join(', ') : event.data.to}`);
+        // Check if this is a reply to a drip campaign email
+        await handleDripCampaignReply(event, emailDomain);
         break;
       
       default:

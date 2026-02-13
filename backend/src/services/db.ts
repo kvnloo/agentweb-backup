@@ -4013,4 +4013,346 @@ export const crmDb = {
       throw error;
     }
   },
+
+  // Email Event operations
+  async createEmailEvent(data: {
+    eventId: string;
+    listId: string;
+    leadId: string;
+    emailDomain: string;
+    leadEmail: string;
+    eventType: string;
+    timestamp: string;
+    metadata?: any;
+  }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-EmailEvents`,
+        Item: data,
+      };
+
+      await dynamodb.put(params).promise();
+      return params.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "createEmailEvent");
+      throw error;
+    }
+  },
+
+  async getEmailEventsByLeadId(leadId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-EmailEvents`,
+        FilterExpression: 'leadId = :leadId',
+        ExpressionAttributeValues: {
+          ':leadId': leadId,
+        },
+      };
+
+      const result = await dynamodb.scan(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getEmailEventsByLeadId");
+      throw error;
+    }
+  },
+
+  async getEmailEventsByCampaign(campaignId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-EmailEvents`,
+        FilterExpression: 'metadata.campaignId = :campaignId',
+        ExpressionAttributeValues: {
+          ':campaignId': campaignId,
+        },
+      };
+
+      const result = await dynamodb.scan(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getEmailEventsByCampaign");
+      throw error;
+    }
+  },
+};
+
+// Drip Campaign Database Operations
+export const dripCampaignDb = {
+  // Campaign operations
+  async createCampaign(data: {
+    campaignId: string;
+    userId: string;
+    listId: string;
+    name: string;
+    description?: string;
+    status: 'draft' | 'active' | 'paused' | 'completed';
+    emails: Array<{
+      stepId: string;
+      stepNumber: number;
+      subject: string;
+      aiPrompt: string;
+      timingType: 'relative' | 'absolute';
+      delayDays?: number;
+      delayHours?: number;
+      sendDate?: string;
+      senderId?: string;
+    }>;
+    stopConditions?: {
+      stopOnReply: boolean;
+      stopOnUnsubscribe: boolean;
+      stopOnBounce: boolean;
+    };
+  }) {
+    try {
+      const now = new Date().toISOString();
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+        Item: {
+          ...data,
+          createdAt: now,
+          updatedAt: now,
+          stats: {
+            totalEnrolled: 0,
+            active: 0,
+            completed: 0,
+            stopped: 0,
+          },
+        },
+      };
+
+      await dynamodb.put(params).promise();
+      return params.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "createCampaign");
+      throw error;
+    }
+  },
+
+  async getCampaign(campaignId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+        Key: { campaignId },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "getCampaign");
+      throw error;
+    }
+  },
+
+  async listCampaignsByUserId(userId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+        IndexName: 'UserIdIndex',
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: {
+          ':userId': userId,
+        },
+        ScanIndexForward: false, // Sort by createdAt descending
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "listCampaignsByUserId");
+      throw error;
+    }
+  },
+
+  async updateCampaign(campaignId: string, updates: any) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: any = {};
+      const expressionAttributeValues: any = {};
+
+      // Build update expression dynamically
+      Object.keys(updates).forEach((key, index) => {
+        const attrName = `#attr${index}`;
+        const attrValue = `:val${index}`;
+        updateExpressions.push(`${attrName} = ${attrValue}`);
+        expressionAttributeNames[attrName] = key;
+        expressionAttributeValues[attrValue] = updates[key];
+      });
+
+      // Always update updatedAt
+      updateExpressions.push('#updatedAt = :updatedAt');
+      expressionAttributeNames['#updatedAt'] = 'updatedAt';
+      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+        Key: { campaignId },
+        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateCampaign");
+      throw error;
+    }
+  },
+
+  async deleteCampaign(campaignId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+        Key: { campaignId },
+      };
+
+      await dynamodb.delete(params).promise();
+    } catch (error) {
+      handleDynamoDbError(error, "deleteCampaign");
+      throw error;
+    }
+  },
+
+  // Enrollment operations
+  async createEnrollment(data: {
+    enrollmentId: string;
+    campaignId: string;
+    leadId: string;
+    listId: string;
+    userId: string;
+    status: 'active' | 'completed' | 'stopped';
+    currentStep: number;
+    nextSendTime?: string;
+  }) {
+    try {
+      const now = new Date().toISOString();
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+        Item: {
+          ...data,
+          enrolledAt: now,
+          sentEmails: [],
+        },
+      };
+
+      await dynamodb.put(params).promise();
+      return params.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "createEnrollment");
+      throw error;
+    }
+  },
+
+  async getEnrollment(enrollmentId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+        Key: { enrollmentId },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "getEnrollment");
+      throw error;
+    }
+  },
+
+  async listEnrollmentsByCampaign(campaignId: string, status?: string) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+        IndexName: 'CampaignStatusIndex',
+        KeyConditionExpression: status
+          ? 'campaignId = :campaignId AND #status = :status'
+          : 'campaignId = :campaignId',
+        ExpressionAttributeValues: {
+          ':campaignId': campaignId,
+          ...(status && { ':status': status }),
+        },
+      };
+
+      if (status) {
+        params.ExpressionAttributeNames = {
+          '#status': 'status',
+        };
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "listEnrollmentsByCampaign");
+      throw error;
+    }
+  },
+
+  async queryDueEnrollments(now: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+        IndexName: 'NextSendTimeIndex',
+        KeyConditionExpression: '#status = :status AND nextSendTime <= :now',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+        },
+        ExpressionAttributeValues: {
+          ':status': 'active',
+          ':now': now,
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "queryDueEnrollments");
+      throw error;
+    }
+  },
+
+  async updateEnrollment(enrollmentId: string, updates: any) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: any = {};
+      const expressionAttributeValues: any = {};
+
+      // Build update expression dynamically
+      Object.keys(updates).forEach((key, index) => {
+        const attrName = `#attr${index}`;
+        const attrValue = `:val${index}`;
+        updateExpressions.push(`${attrName} = ${attrValue}`);
+        expressionAttributeNames[attrName] = key;
+        expressionAttributeValues[attrValue] = updates[key];
+      });
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+        Key: { enrollmentId },
+        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateEnrollment");
+      throw error;
+    }
+  },
+
+  async deleteEnrollment(enrollmentId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+        Key: { enrollmentId },
+      };
+
+      await dynamodb.delete(params).promise();
+    } catch (error) {
+      handleDynamoDbError(error, "deleteEnrollment");
+      throw error;
+    }
+  },
 };

@@ -76,7 +76,8 @@ class ResendService {
     html,
     text,
     inReplyTo,
-    replyTo
+    replyTo,
+    tags
   }: {
     from: string;
     to: string | string[];
@@ -85,6 +86,7 @@ class ResendService {
     text?: string;
     inReplyTo?: string;
     replyTo?: string;
+    tags?: Record<string, string>;
   }) {
     await this.initializeResend();
 
@@ -117,6 +119,11 @@ class ResendService {
       emailOptions.headers = {
         'In-Reply-To': inReplyTo
       };
+    }
+
+    // Add tags for tracking (e.g., drip campaign metadata)
+    if (tags) {
+      emailOptions.tags = tags;
     }
 
     const recipient = Array.isArray(to) ? to.join(', ') : to;

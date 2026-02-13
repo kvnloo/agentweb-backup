@@ -31,6 +31,7 @@ import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import supportRoutes from "./routes/support";
+import dripCampaignRoutes from "./routes/dripCampaigns";
 import { authenticateToken } from "./middleware/auth";
 
 const { version } = require('../package.json');
@@ -163,6 +164,7 @@ app.use("/api/books", booksRoutes);
 app.use("/api/oauth/linkedin", linkedinAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/api/drip", dripCampaignRoutes);
 
 
 // Health check endpoint

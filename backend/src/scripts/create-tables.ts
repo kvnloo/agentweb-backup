@@ -1117,6 +1117,95 @@ const createLeadsTable = async () => {
   }
 };
 
+// Create Drip Campaigns table
+const createDripCampaignsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-DripCampaigns`,
+    KeySchema: [
+      { AttributeName: 'campaignId', KeyType: 'HASH' }
+    ],
+    AttributeDefinitions: [
+      { AttributeName: 'campaignId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'createdAt', AttributeType: 'S' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'createdAt', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ]
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create Drip Enrollments table
+const createDripEnrollmentsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-DripEnrollments`,
+    KeySchema: [
+      { AttributeName: 'enrollmentId', KeyType: 'HASH' }
+    ],
+    AttributeDefinitions: [
+      { AttributeName: 'enrollmentId', AttributeType: 'S' },
+      { AttributeName: 'campaignId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'nextSendTime', AttributeType: 'S' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST',
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'CampaignStatusIndex',
+        KeySchema: [
+          { AttributeName: 'campaignId', KeyType: 'HASH' },
+          { AttributeName: 'status', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'NextSendTimeIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'nextSendTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ]
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Book Contents table
 const createBookContentsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1236,6 +1325,8 @@ const main = async () => {
     await createGTMPlansTable();
     await createLeadListsTable();
     await createLeadsTable();
+    await createDripCampaignsTable();
+    await createDripEnrollmentsTable();
     await createBooksTable();
     await createBookContentsTable();
     await createConnectedAccountPostsTable();

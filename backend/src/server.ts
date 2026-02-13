@@ -5,6 +5,7 @@ import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { generateChatResponse } from './services/chatbotService';
+import { dripCampaignProcessor } from './services/dripCampaignProcessor';
 
 dotenv.config();
 
@@ -178,5 +179,8 @@ createTestAccount().then(() => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
+
+    // Start drip campaign processor
+    dripCampaignProcessor.start();
   });
 }); 
