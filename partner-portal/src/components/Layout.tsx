@@ -164,7 +164,7 @@ export default function Layout() {
                         to="/gtm-ops"
                         variant={isActivePath('/gtm-ops') ? 'contained' : 'text'}
                       >
-                        GTM Plans
+                        GTM Tracker
                       </Button>
                     </>
                   )}
