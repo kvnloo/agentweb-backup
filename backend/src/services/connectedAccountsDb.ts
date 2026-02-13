@@ -42,10 +42,23 @@ export interface LinkedInConfig extends BaseOAuthConfig {
 }
 
 /**
+ * Instagram-specific configuration
+ */
+export interface InstagramConfig extends BaseOAuthConfig {
+  account_type: 'business' | 'creator';
+  instagram_account_id: string;
+  facebook_page_id: string;
+  facebook_page_access_token: string;
+  username: string;
+  profile_picture_url?: string;
+  followers_count?: number;
+}
+
+/**
  * Union type for all platform-specific configurations.
  * Add new platform configs here as they are implemented.
  */
-export type PlatformConfig = LinkedInConfig; // | FacebookConfig | TwitterConfig
+export type PlatformConfig = LinkedInConfig | InstagramConfig;
 
 /**
  * Connected Account configuration stored in the User record
@@ -315,8 +328,8 @@ export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> 
     // For LinkedIn with refresh token, fall through to API verification which handles refresh
   }
   
-  // Second check: verify via API (only for LinkedIn for now)
-  if (account.platform === 'linkedin') {
+  // Second check: verify via API (for platforms with adapter support)
+  if (account.platform === 'linkedin' || account.platform === 'instagram') {
     try {
       // Use adapter for verification which handles auto-refresh
       const { socialPlatformService } = await import('./socialPlatformService');

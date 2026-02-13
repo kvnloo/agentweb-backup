@@ -72,7 +72,8 @@
       "Bash(aws elasticbeanstalk describe-instances-health:*)",
       "Bash(aws elasticbeanstalk describe-configuration-settings:*)",
       "Bash(aws ec2 describe-instance-status:*)",
-      "Bash(aws elasticbeanstalk describe-application-versions:*)"
+      "Bash(aws elasticbeanstalk describe-application-versions:*)",
+      "WebFetch(domain:developers.facebook.com)"
     ]
   }
 }

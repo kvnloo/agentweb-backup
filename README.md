@@ -1109,6 +1109,116 @@ The system automatically detects the field type based on whether the field name 
 5. Name the secret according to your environment (`dev/AgentWeb/Webflow` or `prod/AgentWeb/Webflow`)
 6. Click "Store"
 
+### Connected Accounts (Social Media OAuth)
+
+AgentWeb supports connecting social media accounts (LinkedIn, Instagram) via OAuth. Connected accounts allow the platform to post content, fetch analytics, and manage social media on behalf of users.
+
+#### LinkedIn OAuth Configuration
+
+LinkedIn uses OAuth 2.0 for both personal profiles and company pages.
+
+**1. Create a LinkedIn App:**
+- Go to [LinkedIn Developer Portal](https://www.linkedin.com/developers/apps)
+- Create a new app (or use an existing one)
+- Under "Auth", note the Client ID and Client Secret
+- Add the following redirect URLs:
+  - Development: `http://localhost:3001/api/oauth/linkedin/callback`
+  - Staging: `https://api-stage.agentweb.pro/api/oauth/linkedin/callback`
+  - Production: `https://api.agentweb.pro/api/oauth/linkedin/callback`
+- Under "Products", request access to:
+  - Share on LinkedIn
+  - Sign In with LinkedIn using OpenID Connect
+  - Advertising API (for organization management)
+
+**2. Store Credentials in AWS Secrets Manager:**
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/LinkedIn/Company`
+- Secret Value (JSON format):
+```json
+{
+  "clientId": "your_linkedin_client_id",
+  "clientSecret": "your_linkedin_client_secret"
+}
+```
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/LinkedIn/Company`
+- Secret Value (JSON format):
+```json
+{
+  "clientId": "your_linkedin_client_id",
+  "clientSecret": "your_linkedin_client_secret"
+}
+```
+
+#### Instagram OAuth Configuration
+
+Instagram Business/Creator accounts are connected via Meta's Graph API. The OAuth flow goes through Facebook Login, then discovers which Facebook Pages have Instagram accounts attached.
+
+**Prerequisites:**
+- A Facebook App with Instagram Graph API access
+- Instagram Business or Creator accounts linked to Facebook Pages
+
+**1. Create a Meta (Facebook) App:**
+- Go to [Meta for Developers](https://developers.facebook.com/)
+- Create a new app (choose "Business" type)
+- Add the "Instagram Graph API" product
+- Under "App Settings" > "Basic", note the App ID and App Secret
+- Under "Facebook Login" > "Settings", add the following redirect URLs:
+  - Development: `http://localhost:3001/api/oauth/instagram/callback`
+  - Staging: `https://api-stage.agentweb.pro/api/oauth/instagram/callback`
+  - Production: `https://api.agentweb.pro/api/oauth/instagram/callback`
+
+**2. Configure Permissions:**
+
+The app requests the following scopes during OAuth:
+- `instagram_basic` - Read Instagram profile info and media
+- `instagram_content_publish` - Publish content to Instagram
+- `instagram_manage_insights` - Access Instagram Insights
+- `pages_show_list` - List Facebook Pages the user manages
+- `pages_read_engagement` - Read Page engagement data
+- `business_management` - Manage business assets
+
+**3. Store Credentials in AWS Secrets Manager:**
+
+**For Development:**
+- Secret Name: `dev/AgentWeb/Instagram`
+- Secret Value (JSON format):
+```json
+{
+  "appId": "your_meta_app_id",
+  "appSecret": "your_meta_app_secret"
+}
+```
+
+**For Production:**
+- Secret Name: `prod/AgentWeb/Instagram`
+- Secret Value (JSON format):
+```json
+{
+  "appId": "your_meta_app_id",
+  "appSecret": "your_meta_app_secret"
+}
+```
+
+**4. How the Instagram OAuth Flow Works:**
+
+1. User clicks "Instagram" on the Settings > Connected Accounts page
+2. A popup opens to Facebook Login with Instagram scopes
+3. After authorization, the backend exchanges the code for a short-lived token
+4. The short-lived token is exchanged for a long-lived token (valid 60 days)
+5. The backend discovers Facebook Pages the user manages
+6. For each Page, it checks if an Instagram Business/Creator account is linked
+7. The user selects which Instagram accounts to connect
+8. Tokens and account metadata are stored in the user's `connected_accounts` in DynamoDB
+
+**5. Linking Instagram to a Facebook Page:**
+
+If users don't see their Instagram account during the connection flow, they need to:
+1. Convert their Instagram account to a Business or Creator account (in Instagram Settings > Account > Switch to Professional Account)
+2. Link it to a Facebook Page (in Instagram Settings > Account > Linked Accounts > Facebook, or in the Facebook Page Settings > Instagram)
+
 ### MCP Server Configuration
 
 The backend supports multiple Model Context Protocol (MCP) servers, which can be configured internally (via code) or externally (via database/UI).

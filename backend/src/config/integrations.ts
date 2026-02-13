@@ -1,11 +1,24 @@
 
-import { getLinkedInCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getInstagramCredentials } from '../utils/secretsManager';
 
 // LinkedIn account type for OAuth
 export type LinkedInAccountType = 'personal' | 'company';
 
 // Static configuration values (URLs, scopes, etc.)
 export const INTEGRATION_CONFIG = {
+  instagram: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/instagram/callback`,
+    scopes: [
+      'instagram_basic',
+      'instagram_content_publish',
+      'instagram_manage_insights',
+      'pages_show_list',
+      'pages_read_engagement',
+      'business_management'
+    ],
+    authorizationUrl: 'https://www.facebook.com/v21.0/dialog/oauth',
+    tokenUrl: 'https://graph.facebook.com/v21.0/oauth/access_token',
+  },
   linkedin: {
     // Unified configuration for both personal and organization accounts
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/linkedin/callback`,
@@ -65,6 +78,38 @@ export async function getLinkedInConfig(): Promise<LinkedInConfig> {
     authorizationUrl: INTEGRATION_CONFIG.linkedin.authorizationUrl,
     tokenUrl: INTEGRATION_CONFIG.linkedin.tokenUrl,
     profileUrl: INTEGRATION_CONFIG.linkedin.profileUrl
+  };
+}
+
+// Instagram configuration interface
+export interface InstagramOAuthConfig {
+  appId: string;
+  appSecret: string;
+  configId: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  webhookVerifyToken: string;
+}
+
+/**
+ * Fetches Instagram OAuth configuration from AWS Secrets Manager.
+ * Instagram uses Meta's Graph API, so credentials are a Facebook/Meta App.
+ * Credentials are stored at dev/AgentWeb/Instagram (or prod/... for production)
+ */
+export async function getInstagramConfig(): Promise<InstagramOAuthConfig> {
+  const credentials = await getInstagramCredentials();
+
+  return {
+    appId: credentials.appId,
+    appSecret: credentials.appSecret,
+    configId: credentials.configId,
+    webhookVerifyToken: credentials.webhookVerifyToken,
+    redirectUri: INTEGRATION_CONFIG.instagram.redirectUri,
+    scopes: INTEGRATION_CONFIG.instagram.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.instagram.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.instagram.tokenUrl,
   };
 }
 

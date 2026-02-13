@@ -97,6 +97,50 @@ export async function getGCSPPrivateKey(): Promise<string> {
 }
 
 /**
+ * Interface for Instagram (Meta) credentials returned from Secrets Manager
+ */
+export interface InstagramCredentials {
+  appId: string;
+  appSecret: string;
+  webhookVerifyToken: string;
+  configId: string;
+}
+
+/**
+ * Get Instagram (Meta) OAuth credentials from AWS Secrets Manager
+ * These are the Facebook/Meta App credentials used for Instagram Graph API.
+ *
+ * Secret location: dev/AgentWeb/Instagram (or prod/... for production)
+ *
+ * @returns The Instagram app credentials (appId and appSecret)
+ */
+export async function getInstagramCredentials(): Promise<InstagramCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Instagram'
+      : 'dev/AgentWeb/Instagram';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Instagram credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as InstagramCredentials;
+
+    if (!credentials.appId || !credentials.appSecret || !credentials.webhookVerifyToken || !credentials.configId) {
+      throw new Error('Instagram credentials missing appId, appSecret, webhookVerifyToken, or configId');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Instagram credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Instagram credentials from Secrets Manager');
+  }
+}
+
+/**
  * Interface for LinkedIn credentials returned from Secrets Manager
  */
 export interface LinkedInCredentials {
