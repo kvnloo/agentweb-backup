@@ -131,6 +131,7 @@ export async function getAllowedFunctionCalls(
 
     // If all functions are allowed, return wildcard
     if (
+      !subscriptionType.allowedFunctionCalls ||
       subscriptionType.allowedFunctionCalls.includes("*") ||
       subscriptionType.allowedFunctionCalls.length === 0
     ) {

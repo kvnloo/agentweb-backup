@@ -3036,7 +3036,7 @@ router.get("/subscription-types", async (req, res) => {
       }
       
       // Expand "*" to actual list if present (for backward compatibility)
-      let normalizedFunctionCalls = type.allowedFunctionCalls;
+      let normalizedFunctionCalls = type.allowedFunctionCalls || [];
       if (normalizedFunctionCalls.includes('*')) {
         normalizedFunctionCalls = allAvailableFunctionCalls;
       }
@@ -3095,7 +3095,7 @@ router.post("/subscription-types", async (req, res) => {
       }
       
       // Expand "*" to actual list of function calls
-      let normalizedFunctionCalls = type.allowedFunctionCalls;
+      let normalizedFunctionCalls = type.allowedFunctionCalls || [];
       if (normalizedFunctionCalls.includes('*')) {
         normalizedFunctionCalls = allAvailableFunctionCalls;
       }
