@@ -74,7 +74,10 @@
       "Bash(aws ec2 describe-instance-status:*)",
       "Bash(aws elasticbeanstalk describe-application-versions:*)",
       "Bash(npx vitest:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "WebFetch(domain:start.waldium.com)",
+      "WebFetch(domain:slrgkgulru.pixelflow.so)",
+      "WebFetch(domain:docs.pixelflow.so)"
     ]
   }
 }
