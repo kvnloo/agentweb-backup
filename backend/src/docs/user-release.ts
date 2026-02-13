@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-13',
+    changes: [
+      'GTM Tracker Analytics in Admin Dashboard',
+      '- Added GTM Tracker card to the Admin Overview tab showing completed items in period, total completed, and total items',
+      '- Analytics respect the date range filter using work item completedAt timestamps',
+      '- Falls back to item creation date (from item ID) when completedAt is not available',
+      'Work Item Completion Tracking',
+      '- Work items now record a completedAt timestamp when marked as completed',
+      '- completedAt is cleared if the item is moved back to a non-completed status',
+    ],
+  },
+  {
     date: '2026-02-12',
     changes: [
       'Mitigated the issue of content truncated when posting on LinkedIn',
