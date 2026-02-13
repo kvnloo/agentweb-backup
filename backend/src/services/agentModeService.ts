@@ -20,6 +20,50 @@ import { getAllowedFunctionCalls, filterFunctionCalls } from './subscriptionServ
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
+import { metaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { uploadFileToS3 } from '../utils/s3Utils';
+
+const ALLOWED_MARKETING_EDGES = [
+  'campaigns', 'adsets', 'ads', 'adcreatives', 'customaudiences', 'images', 'previews', 'targetingsearch', ''
+];
+
+const ALLOWED_NODE_TYPES = ['account', 'campaign', 'adset', 'ad'];
+
+const ALLOWED_INSIGHTS_FIELDS = [
+  'impressions', 'clicks', 'spend', 'reach', 'frequency', 'cpc', 'ctr', 'unique_clicks',
+  'account_id', 'campaign_id', 'adset_id', 'ad_id', 'campaign_name', 'adset_name', 'ad_name',
+  'inline_link_clicks', 'cost_per_inline_link_click', 'actions', 'cost_per_action_type'
+];
+
+const ALLOWED_INSIGHTS_BREAKDOWNS = [
+  'age', 'gender', 'country', 'region', 'publisher_platform', 'platform_position', 'device_platform'
+];
+
+/**
+ * Meta v24 Objective to Optimization Goal Compatibility Matrix
+ */
+const META_OBJ_GOAL_MAP: Record<string, string[]> = {
+  OUTCOME_TRAFFIC: ['LINK_CLICKS', 'LANDING_PAGE_VIEWS'],
+  OUTCOME_AWARENESS: ['REACH', 'IMPRESSIONS', 'THRUPLAY'],
+  OUTCOME_ENGAGEMENT: ['POST_ENGAGEMENT', 'THRUPLAY', 'LINK_CLICKS'],
+  OUTCOME_SALES: ['OFFSITE_CONVERSIONS', 'VALUE'],
+  OUTCOME_LEADS: ['OFFSITE_CONVERSIONS'],
+  OUTCOME_APP_PROMOTION: ['APP_INSTALLS']
+};
+
+/**
+ * Meta v24 Optimization Goal to Billing Event Compatibility Matrix
+ */
+const META_GOAL_BILLING_MAP: Record<string, string[]> = {
+  LINK_CLICKS: ['LINK_CLICKS', 'IMPRESSIONS'],
+  REACH: ['IMPRESSIONS'],
+  LANDING_PAGE_VIEWS: ['IMPRESSIONS'],
+  POST_ENGAGEMENT: ['IMPRESSIONS'],
+  APP_INSTALLS: ['IMPRESSIONS'],
+  THRUPLAY: ['IMPRESSIONS'],
+  OFFSITE_CONVERSIONS: ['IMPRESSIONS'],
+  VALUE: ['IMPRESSIONS']
+};
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
 // Used for updateEmailDraftForLead to match generateBlogContent pattern
@@ -973,6 +1017,13 @@ export class AgentModeService {
       - Use the tools to fulfill the user's request
       - Do not ask for permission to use installed tools
       - Complete the entire workflow
+
+      ## Credentials & Account IDs (CRITICAL)
+      - **META ADS**: You are FORBIDDEN from guessing Ad Account IDs (e.g., "act_123456").
+      - The **VERY FIRST STEP** for any Meta Ads task is calling \`list_connected_accounts(platform="meta")\`.
+      - Present the resulting IDs and Names to the user and ask them to select one.
+      - If \`list_connected_accounts\` returns no results, you MUST tell the user to connect their account in the portal settings.
+      - **DO NOT** use placeholder strings like "act_placeholder" or "placeholder". If you do not have a real ID, you cannot use the marketing tools.
 
       ## Critical Rules
       * **Complete Task Analysis First**: Always analyze the ENTIRE task before installing any skills
@@ -4909,123 +4960,741 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async listMetaAdsCampaigns(userId: string): Promise<any> {
+  private async getMetaCredentials(userId: string, accountId?: string) {
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(userId);
+    if (!user) throw new Error('User not found');
+
+    const connectedAccounts = user.connected_accounts || [];
+    if (!Array.isArray(connectedAccounts)) {
+      throw new Error('Invalid user account data');
+    }
+
+    // Helper to strip 'act_' prefix
+    const clean = (id: string) => (id || '').replace('act_', '');
+
+    // 1. Filter for valid Meta Ad Accounts
+    const fbAccounts = connectedAccounts.filter((acc: any) => 
+      (acc.platform === 'facebook' || acc.platform === 'meta') && 
+      acc.config?.account_type === 'ad_account' &&
+      acc.config?.access_token
+    );
+
+    if (fbAccounts.length === 0) {
+      console.error(`[AgentMode] No valid Meta connected account found for user ${userId}`);
+      throw new Error('Meta ad account not connected. Please connect your Facebook account in settings.');
+    }
+
+    // 2. Handle specific account selection if accountId is provided
+    if (accountId) {
+      const cleanTargetId = clean(accountId);
+      const selected = fbAccounts.find(acc => clean(acc.account_id || acc.config?.ad_account_id) === cleanTargetId);
+
+      if (!selected) {
+        throw new Error(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
+      }
+
+      return {
+        accountId: clean(selected.account_id || selected.config?.ad_account_id),
+        accessToken: selected.config.access_token
+      };
+    }
+
+    // 3. Handle multiple accounts ambiguity
+    if (fbAccounts.length > 1) {
+      const accountList = fbAccounts
+        .map(acc => {
+          const id = clean(acc.account_id || acc.config?.ad_account_id);
+          return `${acc.account_name} (ID: act_${id})`;
+        })
+        .join(', ');
+      throw new Error(`Multiple Meta accounts found: [${accountList}]. Specify which one to use.`);
+    }
+
+    // 4. Default to the single available account
+    const selected = fbAccounts[0];
+    console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
+    
+    return {
+      accountId: clean(selected.account_id || selected.config?.ad_account_id),
+      accessToken: selected.config.access_token
+    };
+  }
+
+  /**
+   * Secure wrapper for Meta Ads Insights API calls (with internal async polling)
+   */
+  public async callMetaAdsInsightsApiWrapper(
+    userId: string,
+    args: {
+      node_id: string;
+      params: any;
+      account_id?: string;
+    }
+  ): Promise<any> {
     try {
-      // Import the Meta API functions
-      const { getMetaAccessToken } = await import('../utils/secretsManager');
-      const { userDb } = await import('./db');
-      const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
-
-      // Get user from database
-      const user = await userDb.getUserById(userId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found',
-          error: 'User not found'
-        };
+      const { node_id, params, account_id } = args;
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const actualNodeId = node_id === 'account' ? `act_${accountId}` : node_id;
+      
+      const version = process.env.META_API_VERSION || 'v21.0';
+      const baseUrl = `https://graph.facebook.com/${version}`;
+      
+      // 1. Submit Async Job with Guardrails
+      const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
+      
+      const filteredParams = { ...params };
+      if (filteredParams.fields) {
+        const fields = Array.isArray(filteredParams.fields) ? filteredParams.fields : filteredParams.fields.split(',');
+        filteredParams.fields = fields.filter((f: string) => ALLOWED_INSIGHTS_FIELDS.includes(f.trim())).join(',');
+      }
+      if (filteredParams.breakdowns) {
+        const breakdowns = Array.isArray(filteredParams.breakdowns) ? filteredParams.breakdowns : filteredParams.breakdowns.split(',');
+        filteredParams.breakdowns = breakdowns.filter((b: string) => ALLOWED_INSIGHTS_BREAKDOWNS.includes(b.trim())).join(',');
       }
 
-      // Check if user has ad account configured
-      if (!user.adAccount || user.adAccount.trim() === "") {
-        return {
-          success: false,
-          message: 'Ad account not configured. Please configure your Meta ad account first.',
-          error: 'Ad account not configured'
-        };
+      const submitRes = await axios.post(submitUrl, {
+        ...filteredParams,
+        access_token: accessToken
+      });
+
+      const reportRunId = (submitRes.data as any).report_run_id;
+      if (!reportRunId) {
+        throw new Error('Failed to get report_run_id from Meta');
       }
 
-      // Get Meta API access token from Secrets Manager
-      let accessToken: string;
-      try {
-        accessToken = await getMetaAccessToken();
-      } catch (error: any) {
-        console.error('AgentMode: Error fetching Meta access token:', error);
-        return {
-          success: false,
-          message: 'Meta access token not configured. Please contact your administrator.',
-          error: error.message || 'Failed to fetch access token from Secrets Manager'
-        };
+      // 2. Internal Polling Engine
+      let isReady = false;
+      let attempts = 0;
+      const maxAttempts = 30; // 5 minutes at 10s interval
+      
+      while (!isReady && attempts < maxAttempts) {
+        attempts++;
+        await new Promise(resolve => setTimeout(resolve, 10000)); // 10s delay
+
+        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
+          params: { access_token: accessToken }
+        });
+
+        const status = (statusRes.data as any).async_status;
+        const percentComplete = (statusRes.data as any).async_percent_completion;
+        
+        console.log(`[MetaAds] Polling report ${reportRunId}: ${status} (${percentComplete}%)`);
+
+        if (status === 'Job Completed') {
+          isReady = true;
+        } else if (status === 'Job Failed' || status === 'Job Skipped') {
+          throw new Error(`Meta Insights Job failed: ${status}`);
+        }
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      if (!isReady) {
+        throw new Error('Meta Insights Job timed out after 5 minutes');
+      }
 
-      // Fetch campaigns
-      console.log('AgentMode: Fetching Meta ad campaigns for user:', userId);
-      const campaignsData = await fetchWithRetryAndPaging(
-        `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
+      // 3. Fetch Final Results (handling pagination)
+      const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
+      
+      // Use existing fetchWithRetryAndPaging or simple loop
+      let allData: any[] = [];
+      let currentUrl: string | null = `${resultsUrl}?access_token=${accessToken}`;
+      
+      while (currentUrl) {
+        const paginationRes: any = await axios.get(currentUrl);
+        allData = [...allData, ...(paginationRes.data.data || [])];
+        currentUrl = paginationRes.data.paging?.next || null;
+      }
+
+      // 4. Store in S3
+      const envelope = {
+        metadata: {
+          requested_at: new Date().toISOString(),
+          tool: 'call_meta_ads_insights_api',
+          params: args,
+          report_run_id: reportRunId
+        },
+        data: allData
+      };
+
+      const filename = `insights_${actualNodeId}_${Date.now()}.json`;
+      const s3Result = await uploadFileToS3(
+        JSON.stringify(envelope, null, 2),
+        filename,
+        userId,
+        'application/json'
       );
 
-      if (campaignsData.error) {
-        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
-        return {
-          success: false,
-          message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
-          error: campaignsData.error.message
-        };
+      return { s3_url: s3Result.url };
+    } catch (error: any) {
+      console.error('AgentMode: Error in callMetaAdsInsightsApiWrapper:', error);
+      // Store error payload
+      try {
+        const errorEnvelope = { metadata: { requested_at: new Date().toISOString(), tool: 'call_meta_ads_insights_api' }, error: error.message };
+        const errS3 = await uploadFileToS3(JSON.stringify(errorEnvelope), `error_insights_${Date.now()}.json`, userId, 'application/json');
+        return { s3_url: errS3.url, error: true };
+      } catch (e) {
+        return { success: false, error: error.message };
       }
+    }
+  }
 
-      const campaigns = (campaignsData.data || []).map((campaign: any) => ({
-        id: campaign.id,
-        name: campaign.name,
-        status: campaign.status,
-        objective: campaign.objective
-      }));
+  // --- Unified Meta Ads Manager Methods ---
+  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<any> {
+    switch (action) {
+      case 'LIST':
+        return this.listMetaAdsCampaigns(userId, account_id);
+      case 'CREATE':
+        return this.createMetaAdsCampaign(userId, { ...params, account_id });
+      case 'UPDATE':
+        if (!campaign_id) throw new Error('campaign_id is required for UPDATE action');
+        console.log(`AgentMode: Updating campaign ${campaign_id} with params:`, params);
+        return this.updateMetaAdsCampaign(userId, campaign_id, params, account_id);
+      case 'DELETE':
+        if (!campaign_id) throw new Error('campaign_id is required for DELETE action');
+        return this.deleteMetaAdsCampaign(userId, campaign_id, account_id);
+      default:
+        throw new Error(`Invalid action: ${action}`);
+    }
+  }
+
+  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<any> {
+    switch (action) {
+      case 'LIST':
+        return this.listMetaAdsAdSets(userId, campaign_id, account_id);
+      case 'CREATE':
+        // Explicitly pass account_id in args for createMetaAdsAdSet as it expects it in the args object
+        return this.createMetaAdsAdSet(userId, { ...params, account_id, campaign_id });
+      case 'UPDATE':
+        if (!ad_set_id) throw new Error('ad_set_id is required for UPDATE action');
+        console.log(`AgentMode: Updating ad set ${ad_set_id} with params:`, params);
+        return this.updateMetaAdsAdSet(userId, ad_set_id, params, account_id);
+      case 'DELETE':
+        if (!ad_set_id) throw new Error('ad_set_id is required for DELETE action');
+        return this.deleteMetaAdsAdSet(userId, ad_set_id, account_id);
+      default:
+        throw new Error(`Invalid action: ${action}`);
+    }
+  }
+
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<any> {
+    switch (action) {
+      case 'LIST':
+        return this.listMetaAdsAdCreatives(userId, account_id);
+      case 'CREATE':
+        return this.createMetaAdsAdCreative(userId, { ...params, account_id });
+      case 'UPLOAD_IMAGE':
+          if (!params.image_url) throw new Error('image_url is required for UPLOAD_IMAGE action');
+          return this.uploadMetaAdsImage(userId, params.image_url, account_id);
+      case 'UPLOAD_VIDEO':
+          if (!params.video_url && !params.image_url) throw new Error('video_url (or image_url as proxy) is required for UPLOAD_VIDEO action');
+          return this.uploadMetaAdsVideo(userId, params.video_url || params.image_url, account_id);
+      default:
+        throw new Error(`Invalid action: ${action}`);
+    }
+  }
+
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<any> {
+    switch (action) {
+      case 'LIST':
+        return this.listMetaAdsAds(userId, ad_set_id, account_id);
+      case 'CREATE':
+         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
+      case 'UPDATE':
+        if (!ad_id) throw new Error('ad_id is required for UPDATE action');
+        console.log(`AgentMode: Updating ad ${ad_id} with params:`, params);
+        return this.updateMetaAdsAd(userId, ad_id, params, account_id);
+      case 'DELETE':
+        if (!ad_id) throw new Error('ad_id is required for DELETE action');
+        return this.deleteMetaAdsAd(userId, ad_id, account_id);
+      default:
+        throw new Error(`Invalid action: ${action}`);
+    }
+  }
+
+  public async listMetaPages(userId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const pages = await metaService.getPages(accessToken);
+      const totalCount = Array.isArray(pages) ? pages.length : 0;
 
       return {
         success: true,
-        message: `Found ${campaigns.length} campaign(s)`,
-        campaigns: campaigns,
-        totalCount: campaigns.length
+        message: `Found ${totalCount} Facebook Page(s)`,
+        pages: pages,
+        totalCount: totalCount
       };
-    } catch (error) {
-      console.error('AgentMode: Error fetching Meta ad campaigns:', error);
+    } catch (error: any) {
+      console.error('AgentMode: Error fetching Meta pages:', error);
       return {
         success: false,
-        message: 'Failed to fetch Meta ad campaigns. Please ensure your Meta ad account is properly configured.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        message: error.message || 'Failed to fetch Meta pages.',
+        error: error.message
       };
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
+  public async listMetaAdsCampaigns(userId: string, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
+      const totalCount = Array.isArray(campaigns) ? campaigns.length : 0;
+
+      return {
+        success: true,
+        message: `Found ${totalCount} campaign(s)`,
+        campaigns: campaigns,
+        totalCount: totalCount
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error fetching Meta ad campaigns:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to fetch Meta ad campaigns.',
+        error: error.message
+      };
+    }
+  }
+
+  public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
+      const campaign = await metaService.createCampaign(accountId, accessToken, params);
+
+      return {
+        success: true,
+        message: `Campaign "${campaign.name}" created successfully`,
+        campaign: campaign
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Meta ad campaign:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to create Meta ad campaign.',
+        error: error.message
+      };
+    }
+  }
+
+  public async listMetaAdsAdSets(userId: string, campaignId?: string, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const adSets = (await metaService.listAdSets(accountId, accessToken, campaignId)) || [];
+      const totalCount = Array.isArray(adSets) ? adSets.length : 0;
+
+      return {
+        success: true,
+        message: `Found ${totalCount} ad set(s)`,
+        adSets: adSets,
+        totalCount: totalCount
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error fetching Meta ad sets:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to fetch Meta ad sets.',
+        error: error.message
+      };
+    }
+  }
+
+  public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
+      
+      // --- Deterministic Validation Engine ---
+      
+      // 1. Budget Min/Max Guards
+      const dailyBudget = args.daily_budget;
+      const lifetimeBudget = args.lifetime_budget;
+      
+      if ((dailyBudget !== undefined && lifetimeBudget !== undefined)) {
+        throw new Error('Exactly one of daily_budget or lifetime_budget must be provided, not both.');
+      }
+      if (dailyBudget === undefined && lifetimeBudget === undefined) {
+        throw new Error('Either daily_budget or lifetime_budget must be provided.');
+      }
+
+      const budget = dailyBudget ?? lifetimeBudget;
+      if (budget < 1.00) {
+        throw new Error('Minimum budget must be at least $1.00 USD.');
+      }
+      
+      // Hallucination Guard
+      if (dailyBudget > 5000) throw new Error('Daily budget exceeds safety limit of $5,000.');
+      if (lifetimeBudget > 50000) throw new Error('Lifetime budget exceeds safety limit of $50,000.');
+
+      // 2. Schedule Enforcement
+      if (lifetimeBudget !== undefined && !args.end_time) {
+        throw new Error('end_time is required when using a lifetime_budget.');
+      }
+
+      const startTime = args.start_time ? new Date(args.start_time) : new Date();
+      const endTime = args.end_time ? new Date(args.end_time) : null;
+
+      if (endTime) {
+        if (startTime >= endTime) {
+          throw new Error('start_time must be strictly before end_time.');
+        }
+        
+        // 24h Duration Enforcement for Lifetime Budget
+        if (lifetimeBudget !== undefined) {
+          const durationHrs = (endTime.getTime() - startTime.getTime()) / (1000 * 60 * 60);
+          if (durationHrs < 24) {
+            throw new Error('Lifetime budget campaigns must have a duration of at least 24 hours.');
+          }
+        }
+      }
+
+      // Auto-set start_time for ACTIVE status if missing
+      if (args.status === 'ACTIVE' && !args.start_time) {
+        args.start_time = new Date().toISOString();
+      }
+
+      // 3. Campaign Objective & Goal/Billing Compatibility
+      let objective = args.campaign_objective;
+      if (!objective) {
+        // Fetch campaign to resolve objective
+        const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);
+        objective = campaign.objective;
+      }
+
+      const allowedGoals = META_OBJ_GOAL_MAP[objective];
+      if (!allowedGoals || !allowedGoals.includes(args.optimization_goal)) {
+        throw new Error(`Optimization goal "${args.optimization_goal}" is not compatible with campaign objective "${objective}". Allowed: ${allowedGoals?.join(', ') || 'none'}`);
+      }
+
+      const allowedBilling = META_GOAL_BILLING_MAP[args.optimization_goal];
+      if (!allowedBilling || !allowedBilling.includes(args.billing_event)) {
+        throw new Error(`Billing event "${args.billing_event}" is not compatible with optimization goal "${args.optimization_goal}". Allowed: ${allowedBilling?.join(', ') || 'none'}`);
+      }
+
+      // 4. Bidding Strategy rules
+      const strategy = args.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
+      if (strategy === 'LOWEST_COST_WITH_MIN_ROAS') {
+        throw new Error('ROAS bidding (LOWEST_COST_WITH_MIN_ROAS) is not yet supported.');
+      }
+      if (strategy === 'LOWEST_COST_WITHOUT_CAP' && args.bid_amount !== undefined) {
+        throw new Error('bid_amount must not be provided for LOWEST_COST_WITHOUT_CAP strategy.');
+      }
+      if ((strategy === 'LOWEST_COST_WITH_BID_CAP' || strategy === 'COST_CAP') && args.bid_amount === undefined) {
+        throw new Error(`bid_amount is required for ${strategy} strategy.`);
+      }
+
+      // 5. Targeting Guardrails
+      if (!args.targeting || typeof args.targeting !== 'object') {
+        throw new Error('Targeting object is required.');
+      }
+      if (!args.targeting.geo_locations || Object.keys(args.targeting.geo_locations).length === 0) {
+        throw new Error('targeting.geo_locations is required and cannot be empty.');
+      }
+      const geo = args.targeting.geo_locations;
+      if (!geo.countries && !geo.regions && !geo.cities && !geo.zips) {
+        throw new Error('targeting.geo_locations must contain at least one of: countries, regions, cities, or zips.');
+      }
+      if (args.targeting.age_min !== undefined && args.targeting.age_min < 18) {
+        throw new Error('targeting.age_min must be at least 18.');
+      }
+
+      // --- Prepared Params for SDK layer ---
+      // Convert all currencies to cents
+      const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
+      
+      const normalizedParams: MetaAdsAdSetParams = {
+        ...args,
+        daily_budget: toCents(args.daily_budget),
+        lifetime_budget: toCents(args.lifetime_budget),
+        bid_amount: toCents(args.bid_amount),
+        bid_strategy: strategy // Ensure we use the resolved strategy
+      };
+
+      const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
+
+      return {
+        success: true,
+        message: `Ad set "${adSet.name}" created successfully`,
+        adSet: adSet
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Meta ad set:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to create Meta ad set.',
+        error: error.message,
+        details: error.structuredError // Extract structured error if available from metaService
+      };
+    }
+  }
+
+  public async listMetaAdsAdCreatives(userId: string, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const creatives = (await metaService.listAdCreatives(accountId, accessToken)) || [];
+      const totalCount = Array.isArray(creatives) ? creatives.length : 0;
+
+      return {
+        success: true,
+        message: `Found ${totalCount} ad creative(s)`,
+        creatives: creatives,
+        totalCount: totalCount
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error fetching Meta ad creatives:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to fetch Meta ad creatives.',
+        error: error.message
+      };
+    }
+  }
+
+  public async createMetaAdsAdCreative(userId: string, params: MetaAdsAdCreativeParams & { account_id?: string }): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
+      const creative = await metaService.createAdCreative(accountId, accessToken, params);
+
+      return {
+        success: true,
+        message: `Ad creative "${creative.name}" created successfully`,
+        creative: creative
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Meta ad creative:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to create Meta ad creative.',
+        error: error.message
+      };
+    }
+  }
+
+  public async listMetaAdsAds(userId: string, adSetId?: string, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const ads = (await metaService.listAds(accountId, accessToken, adSetId)) || [];
+      const totalCount = Array.isArray(ads) ? ads.length : 0;
+
+      return {
+        success: true,
+        message: `Found ${totalCount} ad(s)`,
+        ads: ads,
+        totalCount: totalCount
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error fetching Meta ads:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to fetch Meta ads.',
+        error: error.message
+      };
+    }
+  }
+
+  public async createMetaAdsAd(userId: string, params: MetaAdsAdParams & { account_id?: string }): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
+      const ad = await metaService.createAd(accountId, accessToken, params);
+
+      return {
+        success: true,
+        message: `Ad "${ad.name}" created successfully`,
+        ad: ad
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error creating Meta ad:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to create Meta ad.',
+        error: error.message
+      };
+    }
+  }
+
+  public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.updateCampaign(accessToken, campaignId, params);
+      return {
+        success: true,
+        message: `Campaign updated successfully`
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Meta ad campaign:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to update Meta ad campaign.',
+        error: error.message
+      };
+    }
+  }
+
+  public async deleteMetaAdsCampaign(userId: string, campaignId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteCampaign(accessToken, campaignId);
+      return {
+        success: true,
+        message: `Campaign deleted successfully`
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error deleting Meta ad campaign:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to delete Meta ad campaign.',
+        error: error.message
+      };
+    }
+  }
+
+  public async updateMetaAdsAdSet(userId: string, adSetId: string, params: any, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.updateAdSet(accessToken, adSetId, params);
+      return {
+        success: true,
+        message: `Ad set updated successfully`
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Meta ad set:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to update Meta ad set.',
+        error: error.message
+      };
+    }
+  }
+
+  public async deleteMetaAdsAdSet(userId: string, adSetId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAdSet(accessToken, adSetId);
+      return {
+        success: true,
+        message: `Ad set deleted successfully`
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error deleting Meta ad set:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to delete Meta ad set.',
+        error: error.message
+      };
+    }
+  }
+
+  public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.updateAd(accessToken, adId, params);
+      return {
+        success: true,
+        message: `Ad updated successfully`
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error updating Meta ad:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to update Meta ad.',
+        error: error.message
+      };
+    }
+  }
+
+  public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
+    try {
+      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      await metaService.deleteAd(accessToken, adId);
+      return {
+        success: true,
+        message: `Ad deleted successfully`
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error deleting Meta ad:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to delete Meta ad.',
+        error: error.message
+      };
+    }
+  }
+
+  public async uploadMetaAdsImage(userId: string, imageUrl: string, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      
+      // Download image from URL
+      const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+      const buffer = Buffer.from(response.data as any);
+      // Simple filename extraction or default
+      let filename = 'ad-image.jpg';
+      try {
+        const urlObj = new URL(imageUrl);
+        const pathname = urlObj.pathname;
+        const potentialFilename = path.basename(pathname);
+        if (potentialFilename && potentialFilename.length > 0 && potentialFilename.includes('.')) {
+          filename = potentialFilename;
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      const image = await metaService.uploadImage(accountId, accessToken, filename, buffer);
+      return {
+        success: true,
+        message: `Image uploaded successfully`,
+        image: image
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error uploading Meta ad image:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to upload Meta ad image.',
+        error: error.message
+      };
+    }
+  }
+
+  public async uploadMetaAdsVideo(userId: string, videoUrl: string, account_id?: string): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      
+      console.log(`AgentMode: Uploading video to Meta Ads (Account: ${accountId})`);
+      const video = await metaService.uploadVideo(accountId, accessToken, videoUrl);
+
+      return {
+        success: true,
+        message: `Video "${videoUrl}" uploaded successfully`,
+        video: video
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error uploading Meta ad video:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to upload Meta ad video. Ensure the URL is publicly accessible.',
+        error: error.message
+      };
+    }
+  }
+
+  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids?: string[], account_id?: string): Promise<any> {
     try {
 
       // Import the Meta API functions directly to reuse the same logic
-      const { getMetaAccessToken } = await import('../utils/secretsManager');
-      const { userDb } = await import('./db');
       const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-      // Get user from database
-      const user = await userDb.getUserById(userId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found',
-          error: 'User not found'
-        };
-      }
-
-      // Check if user has ad account configured
-      if (!user.adAccount || user.adAccount.trim() === "") {
-        return {
-          success: false,
-          message: 'Ad account not configured. Please configure your Meta ad account first.',
-          error: 'Ad account not configured'
-        };
-      }
-
-      // Get Meta API access token from Secrets Manager
+      // Use centralized credential retrieval
+      let accountId: string;
       let accessToken: string;
+      
       try {
-        accessToken = await getMetaAccessToken();
+        const creds = await this.getMetaCredentials(userId, account_id);
+        accountId = creds.accountId;
+        accessToken = creds.accessToken;
       } catch (error: any) {
-        console.error('AgentMode: Error fetching Meta access token:', error);
+        console.error('AgentMode: Error fetching Meta credentials:', error);
         return {
           success: false,
-          message: 'Meta access token not configured. Please contact your administrator.',
-          error: error.message || 'Failed to fetch access token from Secrets Manager'
+          message: error.message || 'Ad account not configured. Please configure your Meta ad account first.',
+          error: error.message || 'Ad account not configured'
         };
       }
 
@@ -5074,21 +5743,21 @@ Format the response as JSON with this structure:
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
 
@@ -5186,6 +5855,219 @@ Format the response as JSON with this structure:
         success: false,
         message: 'Failed to fetch Meta ads metrics. Please ensure your Meta ad account is properly configured.',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Master method for calling Meta Marketing API.
+   * Routes the request to the appropriate entity manager based on entity_type.
+   */
+  public async callMetaMarketingApi(
+    userId: string,
+    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE',
+    action: string,
+    account_id: string,
+    campaign_id?: string,
+    ad_set_id?: string,
+    ad_id?: string,
+    params: any = {}
+  ): Promise<any> {
+    console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
+    
+    // Ensure params is an object
+    params = params || {};
+
+    switch (entity_type) {
+      case 'CAMPAIGN':
+        // Map master params to specific params if needed, but schema is unified so passing through is safe
+        return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
+      
+      case 'AD_SET':
+        // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
+        return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
+      
+      case 'AD_CREATIVE':
+        return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params);
+      
+      case 'AD':
+        return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params);
+      
+      case 'CUSTOM_AUDIENCE':
+        return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
+
+      case 'TARGETING':
+        return this.searchAdTargeting(userId, account_id, params.q, params.type);
+
+      case 'PAGE':
+        return this.listMetaPages(userId, account_id);
+
+      default:
+        throw new Error(`Invalid entity_type: ${entity_type}`);
+    }
+  }
+
+  /**
+   * Manage Custom Audiences (Custom, Lookalike, Website)
+   */
+  public async manageMetaCustomAudiences(
+    userId: string,
+    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS',
+    account_id: string,
+    params: any
+  ): Promise<any> {
+    try {
+       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+       switch (action) {
+         case 'LIST': {
+            const result = await metaService.listCustomAudiences(accountId, accessToken);
+            const audiences = Array.isArray(result) ? result : [];
+            return {
+              success: true,
+              message: `Found ${audiences.length} custom audience(s)`,
+              audiences: audiences
+            };
+         }
+         case 'CREATE': {
+            debugger;
+            const audience = await metaService.createCustomAudience(accountId, accessToken, params);
+            return {
+              success: true,
+              message: `Custom Audience "${audience.name}" created successfully`,
+              audience: audience
+            };
+         }
+         case 'UPLOAD_USERS': {
+            debugger;
+            if (!params.id || !params.payload || !params.schema) {
+              throw new Error('UPLOAD_USERS requires "id", "schema", and "payload".');
+            }
+            let userPayload = params.payload;
+            
+            // Smart handling: Check if payload is a URL (S3 or otherwise)
+            if (typeof userPayload === 'string' && (userPayload.startsWith('http://') || userPayload.startsWith('https://'))) {
+               try {
+                  console.log(`[AgentMode] Detected URL in payload, fetching content: ${userPayload}`);
+                  const response = await axios.get(userPayload);
+                  // Ensure response data is a string for parsing
+                  userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
+               } catch (fetchError: any) {
+                  throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
+               }
+            }
+
+            // Parse CSV/String payload into Arrays
+            let parsedPayload: string[][] = [];
+            if (Array.isArray(userPayload)) {
+                // Already an array (e.g. from JSON)
+                parsedPayload = userPayload;
+            } else if (typeof userPayload === 'string') {
+                // Split by newline to get rows
+                const rows = userPayload.split(/\r?\n/).filter(row => row.trim().length > 0);
+                // Split by comma to get columns
+                parsedPayload = rows.map(row => row.split(',').map(cell => cell.trim()));
+            } else {
+                // Fallback or error
+                parsedPayload = []; 
+                console.warn('[AgentMode] Payload format unrecognized for UPLOAD_USERS, sending empty array.');
+            }
+
+            // SHA256 Hashing logic
+            // Iterating through parsed payload and hashing fields based on schema
+            
+            const hashedPayload = parsedPayload.map((row: string[]) => {
+                return row.map((cell: string, index: number) => {
+                    const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';
+                    let value = cell ? cell.trim() : '';
+
+                    if (!value) return '';
+
+                    // Pass through if already a SHA256 hash (64 hex chars)
+                    if (/^[a-fA-F0-9]{64}$/.test(value)) {
+                        return value;
+                    }
+
+                    // Normalization Rules per Meta requirements:
+                    if (['EMAIL'].includes(fieldType)) {
+                        value = value.toLowerCase();
+                    } else if (['PHONE'].includes(fieldType)) {
+                        // Standardize to digits only (strip spaces, dashes, parens)
+                        value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
+                    } else if (['GEN'].includes(fieldType)) {
+                        // Gender: 'f' or 'm'
+                        value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
+                    } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
+                         // Keep trimmed string
+                         value = value.trim();
+                    } else if (['COUNTRY'].includes(fieldType)) {
+                        // Country codes must be lowercase 2-letter ISO
+                        value = value.toLowerCase();
+                    } else {
+                        // Default: lowercase + trim
+                        value = value.toLowerCase();
+                    }
+
+                    // Compute SHA256
+                    return createHash('sha256').update(value).digest('hex');
+                });
+            });
+
+            console.log(`[AgentMode] Hashed ${hashedPayload.length} rows for upload.`);
+
+            const result = await metaService.uploadCustomAudienceUsers(
+              accountId, 
+              accessToken, 
+              params.id, 
+              params.schema, 
+              hashedPayload
+            );
+
+            return {
+              success: true,
+              message: `Successfully initiated user upload to audience ${params.id}`,
+              result: result
+            };
+         }
+         default:
+           throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
+       }
+     } catch (error: any) {
+       console.error('AgentMode: Error managing custom audiences:', error);
+       return {
+         success: false,
+         message: error.message || 'Failed to manage custom audiences.',
+         error: error.message
+       };
+     }
+  }
+
+  /**
+   * Search for Detailed Targeting options (Interests, Behaviors, Demographics)
+   */
+  public async searchAdTargeting(
+    userId: string,
+    account_id: string,
+    q: string,
+    type: string = 'adTargetingCategory'
+  ): Promise<any> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      
+      const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type);
+      const results = Array.isArray(searchResult) ? searchResult : [];
+      
+      return {
+        success: true,
+        message: `Found ${results.length} results for "${q}"`,
+        data: results
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error searching ad targeting:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to search ad targeting.',
+        error: error.message
       };
     }
   }

@@ -1,166 +1,839 @@
-import { FacebookAdsApi, User, AdAccount, Page } from 'facebook-nodejs-business-sdk';
+import { FacebookAdsApi, User, AdAccount, Page, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 
-export class MetaService {
-
-    constructor() {
-        // SDK is initialized per request with access token
-    }
-
-    /**
-     * Initialize the Facebook Ads API with the provided access token
-     */
-    private initApi(accessToken: string): FacebookAdsApi {
-
-        const api = FacebookAdsApi.init(accessToken);
-        return api;
-    }
-
-    /**
-     * Handle SDK errors
-     */
-    private handleError(error: any): void {
-        console.error('Meta SDK Error:', error);
-
-        // The SDK error structure might vary, but typically it has a response object
-        const responseBy = error.response;
-
-        if (responseBy) {
-            const status = responseBy.status;
-            // Try to extract error message safely
-            const data = responseBy.data || {};
-            const message = data.error?.message || error.message;
-
-            if (status === 401 || status === 190) {
-                throw new Error('Meta access token expired or invalid');
-            }
-            if (status === 403) {
-                throw new Error(`Meta Permission Denied: ${message}`);
-            }
-            if (status === 429) {
-                throw new Error('Meta rate limit exceeded');
-            }
-            throw new Error(`Meta API Error: ${message}`);
-        }
-
-        throw error;
-    }
-
-    /**
-     * Get ad accounts accessible by the user using Facebook SDK
-     * @param accessToken - Meta OAuth access token
-     * @returns Array of ad account objects
-     */
-    async getAdAccounts(accessToken: string): Promise<MetaAdAccount[]> {
-        try {
-            this.initApi(accessToken);
-            const user = new User('me');
-            const fields = ['id', 'name', 'account_id', 'currency', 'account_status', 'owner', 'business'];
-
-            const adAccountsPath = await user.getAdAccounts(fields);
-
-            return adAccountsPath
-                .filter((account: any) => account.business)
-                .map((account: any) => ({
-                    id: account.id,
-                    name: account.name,
-                    account_id: account.account_id,
-                    currency: account.currency,
-                    account_status: account.account_status,
-                    owner: account.owner,
-                    business: account.business
-                }));
-
-        } catch (error: any) {
-            this.handleError(error);
-            return []; // Unreachable due to throw in handleError
-        }
-    }
-
-    /**
-     * Get pages managed by the user using Facebook SDK
-     * IMPORTANT: Each page has its own page_access_token
-     * @param accessToken - Meta OAuth user access token
-     * @returns Array of page objects with page-specific tokens
-     */
-    async getPages(accessToken: string): Promise<MetaPage[]> {
-        try {
-            this.initApi(accessToken);
-            const user = new User('me');
-            const fields = ['id', 'name', 'access_token', 'category', 'tasks'];
-
-            // Fetch pages (accounts edge on User)
-            const pagesPath = await user.getAccounts(fields);
-
-            return pagesPath.map((page: any) => ({
-                id: page.id,
-                name: page.name,
-                access_token: page.access_token,
-                category: page.category,
-                tasks: page.tasks
-            }));
-
-        } catch (error: any) {
-            this.handleError(error);
-            return []; // Unreachable
-        }
-    }
-
-    /**
-     * Verify if an access token is still valid
-     * @param accessToken - Meta OAuth access token
-     * @returns Object with valid status and optional error message
-     */
-    async verifyToken(accessToken: string): Promise<{ valid: boolean; error?: string }> {
-        try {
-            this.initApi(accessToken);
-            const user = new User('me');
-            await user.get(['id']); // Simple fetch to verify token
-            return { valid: true };
-        } catch (error: any) {
-            const responseBy = error.response;
-            if (responseBy) {
-                const status = responseBy.status;
-                if (status === 401 || status === 190) {
-                    return { valid: false, error: 'Token expired or revoked' };
-                }
-                if (status === 403) {
-                    return { valid: false, error: 'Token permissions revoked' };
-                }
-            }
-
-            console.warn('[Meta verifyToken] Error:', error.message);
-            return { valid: false, error: 'Could not verify token' };
-        }
-    }
-
-    /**
-     * Get user profile information
-     * @param accessToken - Meta OAuth access token
-     * @returns User profile with id, name, and email
-     */
-    async getUserProfile(accessToken: string): Promise<{
-        id: string;
-        name: string;
-        email?: string;
-    }> {
-        try {
-            this.initApi(accessToken);
-            // The SDK returns a User object which should contain the requested fields.
-            // TypeScript might not know about dynamic fields, so we cast to any to access them.
-            const user = new User('me');
-            const response = await user.get(['id', 'name', 'email']) as any;
-
-            return {
-                id: response.id,
-                name: response.name,
-                email: response.email
-            };
-        } catch (error: any) {
-            this.handleError(error);
-            throw error;
-        }
-    }
+export interface MetaAdsCampaignParams {
+  name: string;
+  objective: string;
+  status?: string;
+  special_ad_categories?: string[];
 }
 
-export const metaService = new MetaService();
+export interface MetaAdsAdSetParams {
+  name: string;
+  campaign_id: string;
+  daily_budget?: number; // Budget in dollars (e.g., 1.00)
+  lifetime_budget?: number; // Budget in dollars (e.g., 50.00)
+  start_time?: string;
+  end_time?: string;
+  billing_event: string;
+  optimization_goal: string;
+  bid_strategy?: string;
+  bid_amount?: number; // Bid amount in dollars (e.g., 0.50)
+  targeting: any;
+  status?: string;
+  promoted_object?: any;
+}
+
+export interface MetaAdsAdCreativeParams {
+  name: string;
+  page_id: string;
+  image_hash?: string;
+  image_url?: string;
+  video_id?: string;
+  carousel_cards?: Array<{
+    image_hash?: string;
+    image_url?: string;
+    title?: string;
+    description?: string;
+    link_url?: string;
+    video_id?: string;
+  }>;
+  body: string;
+  title: string;
+  link_url: string;
+  call_to_action_type?: string;
+}
+
+// ... (existing code for other interfaces) ...
+
+
+
+export interface MetaAdsAdParams {
+  name: string;
+  adset_id: string;
+  creative_id: string;
+  status?: string;
+}
+
+export class MetaService {
+  private static instance: MetaService;
+
+  private constructor() {
+    // SDK is initialized per request with access token
+  }
+
+  public static getInstance(): MetaService {
+    if (!MetaService.instance) {
+      MetaService.instance = new MetaService();
+    }
+    return MetaService.instance;
+  }
+
+  private appId: string | null = null;
+  private appSecret: string | null = null;
+
+  /**
+   * Initialize the Facebook Ads API with the provided access token
+   */
+  private initApi(accessToken: string): FacebookAdsApi {
+    const api = FacebookAdsApi.init(accessToken);
+    return api;
+  }
+
+  private log(message: string, data?: any) {
+    console.log(`[MetaService] ${message}`, data ? JSON.stringify(data, null, 2) : '');
+  }
+
+  /**
+   * Handle SDK errors
+   */
+  private handleError(error: any, context?: string): void {
+    if (context) {
+      console.error(`[MetaAdsError] --- START ERROR LOG ---`);
+      console.error(`[MetaAdsError] Context: ${context}`);
+      
+      // Deep inspection of the error object
+      console.dir(error, { depth: null, colors: true });
+
+      const fbError = error.response || error.error || error;
+      const responseData = error.response?.data || error.response || {};
+      
+      const structuredError: any = {
+        message: responseData.message || fbError.message || error.message,
+        code: responseData.code || fbError.code || error.code,
+        error_subcode: responseData.error_subcode || fbError.error_subcode || error.error_subcode,
+        error_user_title: responseData.error_user_title || fbError.error_user_title || error.error_user_title,
+        error_user_msg: responseData.error_user_msg || fbError.error_user_msg || error.error_user_msg,
+        fbtrace_id: responseData.fbtrace_id || fbError.fbtrace_id || error.fbtrace_id,
+        classification: 'UNKNOWN_ERROR'
+      };
+
+      // Deterministic Error Classification
+      const code = Number(structuredError.code);
+      if (code === 100) {
+        structuredError.classification = 'VALIDATION_ERROR';
+      } else if ([1, 2, 4, 17].includes(code)) {
+        structuredError.classification = 'RETRYABLE_ERROR';
+      } else if (code === 368) {
+        structuredError.classification = 'RETRYABLE_WITH_BACKOFF';
+      } else if (code === 10 || (code >= 200 && code <= 299)) {
+        structuredError.classification = 'PERMISSION_ERROR';
+      }
+
+      console.error(`[MetaAdsError] Structured Data:`, JSON.stringify(structuredError, null, 2));
+      console.error(`[MetaAdsError] --- END ERROR LOG ---`);
+      
+      // Attach structured error to the original error object before throwing
+      const enhancedError = error instanceof Error ? error : new Error(structuredError.message);
+      (enhancedError as any).structuredError = structuredError;
+      throw enhancedError;
+    }
+
+    console.error('Meta SDK Error:', error);
+
+    // The SDK error structure might vary, but typically it has a response object
+    const responseBy = error.response;
+
+    if (responseBy) {
+      const status = responseBy.status;
+      // Try to extract error message safely
+      const data = responseBy.data || {};
+      const message = data.error?.message || error.message;
+
+      if (status === 401 || status === 190) {
+        throw new Error('Meta access token expired or invalid');
+      }
+      if (status === 403) {
+        throw new Error(`Meta Permission Denied: ${message}`);
+      }
+      if (status === 429) {
+        throw new Error('Meta rate limit exceeded');
+      }
+      throw new Error(`Meta API Error: ${message}`);
+    }
+
+    throw error;
+  }
+
+  public setAppCredentials(appId: string, appSecret: string) {
+    this.appId = appId;
+    this.appSecret = appSecret;
+  }
+
+  /**
+   * Get ad accounts accessible by the user using Facebook SDK
+   * @param accessToken - Meta OAuth access token
+   * @returns Array of ad account objects
+   */
+  async getAdAccounts(accessToken: string): Promise<MetaAdAccount[]> {
+    try {
+      this.initApi(accessToken);
+      const user = new User('me');
+      const fields = ['id', 'name', 'account_id', 'currency', 'account_status', 'owner', 'business'];
+
+      const adAccountsPath = await user.getAdAccounts(fields);
+
+      return adAccountsPath
+        .filter((account: any) => account.business)
+        .map((account: any) => ({
+          id: account.id,
+          name: account.name,
+          account_id: account.account_id,
+          currency: account.currency,
+          account_status: account.account_status,
+          owner: account.owner,
+          business: account.business
+        }));
+
+    } catch (error: any) {
+      this.handleError(error);
+      return []; // Unreachable due to throw in handleError
+    }
+  }
+
+  /**
+   * Get pages managed by the user using Facebook SDK
+   * IMPORTANT: Each page has its own page_access_token
+   * @param accessToken - Meta OAuth user access token
+   * @returns Array of page objects with page-specific tokens
+   */
+  async getPages(accessToken: string): Promise<MetaPage[]> {
+    try {
+      this.initApi(accessToken);
+      const user = new User('me');
+      const fields = ['id', 'name', 'access_token', 'category', 'tasks'];
+
+      // Fetch pages (accounts edge on User)
+      const pagesPath = await user.getAccounts(fields);
+
+      return pagesPath.map((page: any) => ({
+        id: page.id || page._data?.id,
+        name: page.name || page._data?.name,
+        access_token: page.access_token || page._data?.access_token,
+        category: page.category || page._data?.category,
+        tasks: page.tasks || page._data?.tasks
+      }));
+
+    } catch (error: any) {
+      this.handleError(error);
+      return []; // Unreachable
+    }
+  }
+
+  /**
+   * Verify if an access token is still valid
+   * @param accessToken - Meta OAuth access token
+   * @returns Object with valid status and optional error message
+   */
+  async verifyToken(accessToken: string): Promise<{ valid: boolean; error?: string }> {
+    try {
+      this.initApi(accessToken);
+      const user = new User('me');
+      await user.get(['id']); // Simple fetch to verify token
+      return { valid: true };
+    } catch (error: any) {
+      const responseBy = error.response;
+      if (responseBy) {
+        const status = responseBy.status;
+        if (status === 401 || status === 190) {
+          return { valid: false, error: 'Token expired or revoked' };
+        }
+        if (status === 403) {
+          return { valid: false, error: 'Token permissions revoked' };
+        }
+      }
+
+      console.warn('[Meta verifyToken] Error:', error.message);
+      return { valid: false, error: 'Could not verify token' };
+    }
+  }
+
+  /**
+   * Get user profile information
+   * @param accessToken - Meta OAuth access token
+   * @returns User profile with id, name, and email
+   */
+  async getUserProfile(accessToken: string): Promise<{
+    id: string;
+    name: string;
+    email?: string;
+  }> {
+    try {
+      this.initApi(accessToken);
+      // The SDK returns a User object which should contain the requested fields.
+      // TypeScript might not know about dynamic fields, so we cast to any to access them.
+      const user = new User('me');
+      const response = await user.get(['id', 'name', 'email']) as any;
+
+      return {
+        id: response.id,
+        name: response.name,
+        email: response.email
+      };
+    } catch (error: any) {
+      this.handleError(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get a single campaign
+   */
+  public async getCampaign(adAccountId: string, accessToken: string, campaignId: string) {
+    try {
+      this.initApi(accessToken);
+      const campaign = new Campaign(campaignId);
+      const fields = ['id', 'name', 'status', 'objective'];
+      this.log(`Fetching campaign: ${campaignId}`);
+      const result = await campaign.get(fields);
+      return result._data;
+    } catch (error) {
+      return this.handleError(error, 'getCampaign');
+    }
+  }
+
+  /**
+   * List campaigns for an ad account
+   */
+  public async listCampaigns(adAccountId: string, accessToken: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = ['id', 'name', 'status', 'objective', 'start_time', 'stop_time'];
+      this.log(`Listing campaigns for account: ${adAccountId}`, { fields });
+      const campaigns = await account.getCampaigns(fields);
+      return campaigns.map((c: any) => c._data);
+    } catch (error) {
+      return this.handleError(error, 'listCampaigns');
+    }
+  }
+
+  /**
+   * Create a new campaign
+   */
+  public async createCampaign(adAccountId: string, accessToken: string, params: MetaAdsCampaignParams) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const specialCategories = (params.special_ad_categories || [])
+        .filter(cat => cat !== 'NONE' && cat !== '');
+
+      // Use literal strings for keys to avoid any SDK field mapping issues
+      const finalParams: any = {
+        name: params.name,
+        objective: params.objective,
+        status: params.status || 'PAUSED',
+        special_ad_categories: specialCategories,
+        is_adset_budget_sharing_enabled: false, // Required by some accounts when CBO is off
+      };
+
+      // Handle Advantage Campaign Budget (CBO)
+      if ((params as any).advantage_campaign_budget && (params as any).budget_amount) {
+        finalParams.daily_budget = Math.round((params as any).budget_amount * 100);
+      }
+
+      this.log(`Attempting createCampaign with literal keys:`, finalParams);
+      
+      // Request 'id' back to ensure we don't get an empty return
+      const campaign = await account.createCampaign(['id'], finalParams);
+      return campaign._data;
+    } catch (error) {
+      return this.handleError(error, 'createCampaign');
+    }
+  }
+
+  /**
+   * Update campaign
+   */
+  public async updateCampaign(accessToken: string, campaignId: string, params: any) {
+    try {
+      this.initApi(accessToken);
+      const campaign = new Campaign(campaignId);
+      this.log(`Updating campaign ${campaignId} with params:`, params);
+      await campaign.update([], params);
+      return { success: true };
+    } catch (error) {
+      return this.handleError(error, 'updateCampaign');
+    }
+  }
+
+  /**
+   * Delete a campaign
+   */
+  public async deleteCampaign(accessToken: string, campaignId: string) {
+    try {
+      this.initApi(accessToken);
+      const campaign = new Campaign(campaignId);
+      this.log(`Deleting campaign ${campaignId}`);
+      await campaign.delete([], {});
+      return { success: true };
+    } catch (error) {
+      return this.handleError(error, 'deleteCampaign');
+    }
+  }
+
+  /**
+   * List ad sets for an ad account
+   */
+  public async listAdSets(adAccountId: string, accessToken: string, campaignId?: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = ['id', 'name', 'status', 'campaign_id', 'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting'];
+      const params = campaignId ? { campaign_id: campaignId } : {};
+      this.log(`Listing ad sets for account: ${adAccountId}`, { fields, ...params });
+      const adSets = await account.getAdSets(fields, params);
+      return adSets.map((as: any) => as._data);
+    } catch (error) {
+      return this.handleError(error, 'listAdSets');
+    }
+  }
+
+  /**
+   * Create a new ad set
+   */
+  public async createAdSet(adAccountId: string, accessToken: string, params: MetaAdsAdSetParams) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      
+      const adSetParams: any = {};
+      
+      // Mandatory Mapping (Strict !== undefined)
+      if (params.name !== undefined) adSetParams[AdSet.Fields.name] = params.name;
+      if (params.campaign_id !== undefined) adSetParams[AdSet.Fields.campaign_id] = params.campaign_id;
+      if (params.billing_event !== undefined) adSetParams[AdSet.Fields.billing_event] = params.billing_event;
+      if (params.optimization_goal !== undefined) adSetParams[AdSet.Fields.optimization_goal] = params.optimization_goal;
+      if (params.targeting !== undefined) adSetParams[AdSet.Fields.targeting] = params.targeting;
+      if (params.status !== undefined) adSetParams[AdSet.Fields.status] = params.status;
+      
+      // Monetary Mapping (Already converted to cents by service layer)
+      if (params.daily_budget !== undefined) adSetParams[AdSet.Fields.daily_budget] = params.daily_budget;
+      if (params.lifetime_budget !== undefined) adSetParams[AdSet.Fields.lifetime_budget] = params.lifetime_budget;
+      if (params.bid_strategy !== undefined) adSetParams[AdSet.Fields.bid_strategy] = params.bid_strategy;
+      if (params.bid_amount !== undefined) adSetParams[AdSet.Fields.bid_amount] = params.bid_amount;
+
+      // Scheduling
+      if (params.start_time !== undefined) adSetParams[AdSet.Fields.start_time] = params.start_time;
+      if (params.end_time !== undefined) adSetParams[AdSet.Fields.end_time] = params.end_time;
+      if (params.promoted_object !== undefined) adSetParams[AdSet.Fields.promoted_object] = params.promoted_object;
+
+      // Defensive: Ensure no 'id' or other accidental fields
+      delete adSetParams.id;
+      delete adSetParams.account_id;
+
+      this.log(`Creating ad set in account: ${adAccountId} with payload:`, adSetParams);
+      
+      // Note: SDK v24.0.1+ internal POST mapping handlesact_ prefix and body params correctly.
+      const adSet = await account.createAdSet([], adSetParams);
+      return adSet._data;
+    } catch (error: any) {
+      return this.handleError(error, 'createAdSet');
+    }
+  }
+
+  /**
+   * Update ad set
+   */
+  public async updateAdSet(accessToken: string, adSetId: string, params: any) {
+    try {
+      this.initApi(accessToken);
+      const adSet = new AdSet(adSetId);
+      this.log(`Updating ad set ${adSetId} with params:`, params);
+      await adSet.update([], params);
+      return { success: true };
+    } catch (error) {
+      return this.handleError(error, 'updateAdSet');
+    }
+  }
+
+  /**
+   * Delete an ad set
+   */
+  public async deleteAdSet(accessToken: string, adSetId: string) {
+    try {
+      this.initApi(accessToken);
+      const adSet = new AdSet(adSetId);
+      this.log(`Deleting ad set ${adSetId}`);
+      await adSet.delete([], {});
+      return { success: true };
+    } catch (error) {
+      return this.handleError(error, 'deleteAdSet');
+    }
+  }
+
+  /**
+   * List ad creatives for an ad account
+   */
+  public async listAdCreatives(adAccountId: string, accessToken: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = ['id', 'name', 'status', 'body', 'title', 'image_url', 'thumbnail_url', 'object_type'];
+      this.log(`Listing ad creatives for account: ${adAccountId}`, { fields });
+      const creatives = await account.getAdCreatives(fields);
+      return creatives.map((c: any) => c._data);
+    } catch (error) {
+      return this.handleError(error, 'listAdCreatives');
+    }
+  }
+
+  /**
+   * Create a new ad creative (Supports Image, Video, Carousel)
+   */
+  public async createAdCreative(adAccountId: string, accessToken: string, params: MetaAdsAdCreativeParams) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      
+      let objectStorySpec: any = {
+        page_id: params.page_id,
+      };
+
+      // 1. VIDEO CREATIVE
+      if (params.video_id) {
+        objectStorySpec.video_data = {
+          video_id: params.video_id,
+          image_url: params.image_url, // Thumbnail
+          message: params.body,
+          title: params.title,
+          call_to_action: params.call_to_action_type ? {
+            type: params.call_to_action_type,
+            value: { link: params.link_url }
+          } : undefined
+        };
+      } 
+      // 2. CAROUSEL CREATIVE
+      else if (params.carousel_cards && params.carousel_cards.length > 0) {
+        objectStorySpec.link_data = {
+          message: params.body,
+          link: params.link_url, // Fallback/Main link
+          caption: params.link_url,
+          child_attachments: params.carousel_cards.map(card => ({
+            link: card.link_url || params.link_url,
+            image_hash: card.image_hash,
+            picture: card.image_url,
+            name: card.title,
+            description: card.description,
+            video_id: card.video_id,
+            call_to_action: params.call_to_action_type ? { // Inherit CTA or customize per card if needed
+                type: params.call_to_action_type, 
+                value: { link: card.link_url || params.link_url }
+            } : undefined
+          })),
+          call_to_action: params.call_to_action_type ? {
+            type: params.call_to_action_type,
+            value: { link: params.link_url }
+          } : undefined
+        };
+      } 
+      // 3. SINGLE IMAGE CREATIVE (Default)
+      else {
+        objectStorySpec.link_data = {
+          message: params.body,
+          link: params.link_url,
+          caption: params.link_url, // Link data caption must be a URL string
+          name: params.title,    // Large headline title
+          call_to_action: params.call_to_action_type ? {
+            type: params.call_to_action_type,
+            value: { link: params.link_url }
+          } : undefined
+        };
+
+        if (params.image_hash) {
+          objectStorySpec.link_data.image_hash = params.image_hash;
+        } else if (params.image_url) {
+          objectStorySpec.link_data.picture = params.image_url;
+        }
+      }
+
+      const creativeParams: any = {
+        [AdCreative.Fields.name]: params.name,
+        [AdCreative.Fields.object_story_spec]: objectStorySpec
+      };
+
+      this.log(`Creating ad creative in account: ${adAccountId}`, creativeParams);
+      const creative = await account.createAdCreative([], creativeParams);
+      return creative._data;
+    } catch (error) {
+      return this.handleError(error, 'createAdCreative');
+    }
+  }
+
+  /**
+   * List ads for an ad account
+   */
+  public async listAds(adAccountId: string, accessToken: string, adSetId?: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = ['id', 'name', 'status', 'adset_id', 'campaign_id', 'creative'];
+      const params = adSetId ? { adset_id: adSetId } : {};
+      this.log(`Listing ads for account: ${adAccountId}`, { fields, ...params });
+      const ads = await account.getAds(fields, params);
+      return ads.map((a: any) => a._data);
+    } catch (error) {
+      return this.handleError(error, 'listAds');
+    }
+  }
+
+  /**
+   * Create a new ad
+   */
+  public async createAd(adAccountId: string, accessToken: string, params: MetaAdsAdParams) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const adParams = {
+        [Ad.Fields.name]: params.name,
+        [Ad.Fields.adset_id]: params.adset_id,
+        [Ad.Fields.creative]: { creative_id: params.creative_id },
+        [Ad.Fields.status]: params.status || Ad.Status.paused,
+      };
+      this.log(`Creating ad in account: ${adAccountId}`, adParams);
+      const ad = await account.createAd([], adParams);
+      return ad._data;
+    } catch (error) {
+      return this.handleError(error, 'createAd');
+    }
+  }
+
+  /**
+   * Update ad
+   */
+  public async updateAd(accessToken: string, adId: string, params: any) {
+    try {
+      this.initApi(accessToken);
+      const ad = new Ad(adId);
+      this.log(`Updating ad ${adId} with params:`, params);
+      await ad.update([], params);
+      return { success: true };
+    } catch (error) {
+      return this.handleError(error, 'updateAd');
+    }
+  }
+
+  /**
+   * Delete an ad
+   */
+  public async deleteAd(accessToken: string, adId: string) {
+    try {
+      this.initApi(accessToken);
+      const ad = new Ad(adId);
+      this.log(`Deleting ad ${adId}`);
+      await ad.delete([], {});
+      return { success: true };
+    } catch (error) {
+      return this.handleError(error, 'deleteAd');
+    }
+  }
+
+  /**
+   * Upload image to ad account
+   */
+  public async uploadImage(adAccountId: string, accessToken: string, filename: string, fileBuffer: Buffer) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      this.log(`Uploading image to account: ${adAccountId}, filename: ${filename}`);
+      const adImage = await account.createAdImage([], {
+        filename: filename,
+        bytes: fileBuffer.toString('base64'),
+      });
+      return adImage._data;
+    } catch (error) {
+      return this.handleError(error, 'uploadImage');
+    }
+  }
+
+  /**
+   * Upload video to ad account
+   */
+  public async uploadVideo(adAccountId: string, accessToken: string, videoUrl: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      this.log(`Uploading video to account: ${adAccountId}, url: ${videoUrl}`);
+      // Using file_url for remote upload which is supported by Meta API
+      const adVideo = await account.createAdVideo([], {
+        file_url: videoUrl,
+      });
+      return adVideo._data;
+    } catch (error) {
+      return this.handleError(error, 'uploadVideo');
+    }
+  }
+
+  /**
+   * List Custom Audiences
+   */
+  public async listCustomAudiences(adAccountId: string, accessToken: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      const fields = [
+        'id', 
+        'name', 
+        'description', 
+        'delivery_status', 
+        'subtype', 
+        'customer_file_source'
+      ];
+      this.log(`Listing custom audiences for account: ${adAccountId}`, { fields });
+      const audiences = await account.getCustomAudiences(fields, { limit: 50 });
+      return audiences.map((a: any) => a._data);
+    } catch (error) {
+      return this.handleError(error, 'listCustomAudiences');
+    }
+  }
+
+  /**
+   * Create Custom Audience (Custom File or Lookalike)
+   */
+  public async createCustomAudience(adAccountId: string, accessToken: string, params: any) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      
+      const audienceParams: any = {
+        name: params.name,
+        subtype: params.subtype, // CUSTOM, LOOKALIKE, WEBSITE
+        description: params.description,
+      };
+
+      if (params.subtype === 'CUSTOM') {
+          audienceParams.customer_file_source = params.customer_file_source || 'USER_PROVIDED_ONLY';
+      } else if (params.subtype === 'LOOKALIKE') {
+          audienceParams.lookalike_spec = params.lookalike_spec; 
+          // { ratio: 0.01, origin: [{id: '...'}], country: 'US' }
+      }
+
+      this.log(`Creating custom audience in account: ${adAccountId}`, audienceParams);
+      const audience = await account.createCustomAudience([], audienceParams);
+      return audience._data;
+    } catch (error) {
+      return this.handleError(error, 'createCustomAudience');
+    }
+  }
+
+  /**
+   * Add users to a Custom Audience (from CSV/Hashed data)
+   */
+  public async uploadCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
+    try {
+      this.initApi(accessToken);
+      const audience = new CustomAudience(audienceId);
+      
+      this.log(`Uploading users to custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+      
+      const params = {
+        payload: {
+          schema: schema,
+          data: payload
+        }
+      };
+
+      // For 'createUser' edge (POST /users), the first arg is 'fields' (usually empty), second is 'params'
+      const result = await audience.createUser(
+        [], 
+        params
+      );
+      
+      return result._data || result;
+    } catch (error) {
+       return this.handleError(error, 'uploadCustomAudienceUsers');
+    }
+  }
+
+  /**
+   * Search for Detailed Targeting options
+   */
+  public async searchTargeting(adAccountId: string, accessToken: string, q: string, type: string) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      
+      const params: any = {
+        q: q,
+        type: type,
+        class: type // behaviors and demographics often use 'class' parameter
+      };
+
+      if (type === 'adinterest') {
+          delete params.class;
+      }
+
+      this.log(`Searching targeting options in account: ${adAccountId}`, params);
+      
+      // 'targetingsearch' edge returns a list of targeting options
+      const results = await account.getTargetingSearch([], params);
+      
+      // Handle both Cursor and plain array responses
+      const data = results.map((item: any) => item._data);
+      return data;
+    } catch (error) {
+      return this.handleError(error, 'searchTargeting');
+    }
+  }
+
+  /**
+   * Get insights/performance data
+   */
+  public async getInsights(adAccountId: string, accessToken: string, params: { timeframe: string, level?: string }) {
+    try {
+      this.initApi(accessToken);
+      const account = new AdAccount(`act_${adAccountId}`);
+      
+      // Calculate date range based on timeframe using explicit YYYY-MM-DD
+      const now = new Date();
+      const format = (d: Date) => d.toISOString().split('T')[0];
+      
+      let since = new Date();
+      since.setDate(now.getDate() - 7);
+      
+      if (params.timeframe === '14d') since.setDate(now.getDate() - 14);
+      if (params.timeframe === '30d') since.setDate(now.getDate() - 30);
+      if (params.timeframe === '90d') since.setDate(now.getDate() - 90);
+
+      const dateRange = { 
+        since: format(since), 
+        until: format(now) 
+      };
+
+      const level = params.level || 'campaign';
+      
+      // Define fields based on level to avoid "Invalid field" errors from Meta
+      const fields = [
+        'impressions',
+        'clicks',
+        'spend',
+        'reach',
+        'frequency',
+        'objective',
+        'cpc',
+        'ctr',
+      ];
+
+      if (level === 'campaign') {
+        fields.push('campaign_id', 'campaign_name');
+      } else if (level === 'adset') {
+        fields.push('campaign_id', 'campaign_name', 'adset_id', 'adset_name');
+      } else if (level === 'ad') {
+        fields.push('campaign_id', 'campaign_name', 'adset_id', 'adset_name', 'ad_id', 'ad_name');
+      }
+
+      const searchParams = {
+        level: level,
+        time_range: dateRange,
+      };
+
+      this.log(`Fetching insights for account: ${adAccountId}`, searchParams);
+      const insights = await account.getInsights(fields, searchParams);
+      return insights.map((i: any) => i._data);
+    } catch (error) {
+      return this.handleError(error, 'getInsights');
+    }
+  }
+}
+
+export const metaService = MetaService.getInstance();
