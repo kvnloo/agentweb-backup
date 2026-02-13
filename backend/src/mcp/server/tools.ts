@@ -81,11 +81,18 @@ mcpToolRegistry.register({
               LIST, CREATE, UPDATE, DELETE
 
             AD:
-              LIST, CREATE, UPDATE, DELETE
+              LIST:   'ad_set_id' (optional filter)
+              CREATE: 'ad_set_id', params: ['name', 'creative_id', 'status'(status is optional)]
+              UPDATE: 'ad_id', params: ['name', 'status'] (at least one)
+              DELETE: 'ad_id'
 
             AD_CREATIVE:
-              LIST, CREATE, UPDATE, DELETE, UPLOAD_IMAGE, UPLOAD_VIDEO
-
+              LIST: [No extra params]
+              CREATE: params: ['name', 'page_id', 'body', 'title', 'link_url', 'call_to_action_type'(call_to_action_type is optional)] 
+                AND ONE OF: ['image_hash', 'image_url', 'video_id', 'carousel_cards']
+              UPLOAD_IMAGE: params: ['image_url']
+              UPLOAD_VIDEO: params: ['video_url']
+            
             CUSTOM_AUDIENCE:
               LIST, CREATE, UPLOAD_USERS
 
