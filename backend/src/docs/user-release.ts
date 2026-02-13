@@ -11,6 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
     changes: [
       'Mitigated the issue of content truncated when posting on LinkedIn',
       'Mitigated the issue preview not generated for articles',
+      'CRM API Integration: Lead Merge on Duplicate Email',
+      '- When a lead is forwarded via API with an email that already exists in the list, the new data is merged into the existing lead instead of being dropped',
+      '- Returns lead.created for new leads, lead.updated for merged leads, and lead.unchanged when no data differs',
+      '- Auto Draft is triggered for both new and updated leads when enabled',
+      '- Added api.lead_updated as a selectable Alert Event for lead lists',
     ],
   },
   {
