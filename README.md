@@ -2537,3 +2537,54 @@ No additional configuration is needed in most cases.
 
 # How to kill backend
 lsof -ti:3001 | xargs kill -9 2>/dev/null && echo "✅ Backend killed" || echo "ℹ️ No backend process running on port 3001"
+
+## PixelFlow Form Tracking Verification
+
+How to verify that a customer's website has PixelFlow form submission tracking properly configured.
+
+Reference: https://docs.pixelflow.so/articles/event-classes-on-html-websites-4c49z
+
+### What to check
+
+1. **Base script installed** - The page should load the PixelFlow snippet with a valid `apiKey`, `siteId`, and `apiEndpoint`:
+
+```html
+<script>
+!(function(p,i,x,f,l,o,w){
+  p["PixelFlowObject"]=f;
+  p[f]=p[f]||function(){(p[f].q=p[f].q||[]).push(arguments);};
+  p[f].l=1*new Date();
+  o=i.createElement(x);w=i.getElementsByTagName(x)[0];
+  o.src=l;o.async=1;
+  p[f].apiKey="<SITE_API_KEY>";
+  p[f].siteId="<SITE_ID>";
+  p[f].apiEndpoint="https://api.pixelflow.so/event";
+  w.parentNode.insertBefore(o,w);
+})(window,document,"script","pixelFlow","https://<subdomain>.pixelflow.so/pfm.js");
+</script>
+```
+
+2. **Required CSS classes on form elements** - The following PixelFlow event classes must be present in the HTML:
+
+| Element | Required Class | Purpose |
+|---|---|---|
+| Form or wrapper `<div>` | `info-frm-cntr-pf` | Identifies the form container |
+| Submit button | `action-btn-lead-011-pf` | Triggers the lead capture event |
+| Email input | `info-cust-em-pf` | Extracts the submitted email |
+| First name input | `info-cust-fn-pf` | Extracts first name (if applicable) |
+| Last name input | `info-cust-ln-pf` | Extracts last name (if applicable) |
+| Phone input | `info-cust-ph-pf` | Extracts phone number (if applicable) |
+
+For registration/signup forms, use `action-btn-reg-007-pf` on the submit button instead of `action-btn-lead-011-pf`.
+
+### How to check
+
+1. Open the site in a browser and open DevTools (F12).
+2. **Verify script is loaded**: In the Network tab, filter by `pfm.js` and confirm it loads successfully (HTTP 200).
+3. **Verify event classes**: In the Elements tab, inspect the form and check that:
+   - The `<form>` or its wrapper has `info-frm-cntr-pf` in its class list.
+   - The submit `<button>` has `action-btn-lead-011-pf` in its class list.
+   - The email `<input>` has `info-cust-em-pf` in its class list.
+4. **Verify events fire**: In the Network tab, filter by `api.pixelflow.so`. Submit the form and confirm a request is sent to the event endpoint with the form data.
+
+If any of the classes in step 3 are missing, form submissions will **not** be tracked by PixelFlow even if the base script is installed.
