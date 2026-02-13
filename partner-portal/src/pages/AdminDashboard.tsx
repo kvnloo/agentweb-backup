@@ -686,6 +686,7 @@ export default function AdminDashboard() {
     taskAnalytics,
     userAnalytics,
     agentModeAnalytics,
+    gtmAnalytics,
     loadUsers,
     loadWaitlist,
     loadAnalytics,
@@ -2577,6 +2578,31 @@ export default function AdminDashboard() {
                                 ))}
                               </Box>
                             )}
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          GTM Tracker
+                        </Typography>
+                        {gtmAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {gtmAnalytics.completedItemsInRange || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Completed Items (in period)
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total Completed: {gtmAnalytics.completedItems || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total Items: {gtmAnalytics.totalItems || 0}
+                            </Typography>
                           </>
                         )}
                       </CardContent>

@@ -212,6 +212,183 @@ describe('Admin GTM Plans Endpoint', () => {
   });
 });
 
+describe('Admin GTM Analytics Endpoint', () => {
+  let mockScan: jest.Mock;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.NODE_ENV = 'development';
+
+    mockScan = jest.fn().mockReturnValue({ promise: jest.fn() });
+    (DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => ({
+      scan: mockScan,
+    }));
+  });
+
+  it('should return aggregate work item metrics', async () => {
+    const mockPlans = [
+      {
+        planId: 'plan-1',
+        phases: [
+          {
+            id: 'phase-1',
+            status: 'in_progress',
+            workItems: [
+              { id: 'item-1', status: 'completed', completedAt: '2026-02-01T10:00:00Z' },
+              { id: 'item-2', status: 'pending' },
+              { id: 'item-3', status: 'completed', completedAt: '2026-02-10T10:00:00Z' },
+            ],
+          },
+        ],
+      },
+      {
+        planId: 'plan-2',
+        phases: [
+          {
+            id: 'phase-2',
+            status: 'completed',
+            workItems: [
+              { id: 'item-4', status: 'completed', completedAt: '2026-01-05T10:00:00Z' },
+            ],
+          },
+        ],
+      },
+    ];
+
+    mockScan.mockReturnValue({
+      promise: jest.fn().mockResolvedValue({ Items: mockPlans }),
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/gtm')
+      .expect(200);
+
+    expect(response.body.totalItems).toBe(4);
+    expect(response.body.completedItems).toBe(3);
+    expect(response.body.completedItemsInRange).toBe(3);
+  });
+
+  it('should filter completed items by date range using completedAt', async () => {
+    const mockPlans = [
+      {
+        planId: 'plan-1',
+        phases: [
+          {
+            id: 'phase-1',
+            status: 'in_progress',
+            workItems: [
+              { id: 'item-1', status: 'completed', completedAt: '2026-02-05T10:00:00Z' },
+              { id: 'item-2', status: 'completed', completedAt: '2026-01-10T10:00:00Z' },
+              { id: 'item-3', status: 'completed', completedAt: '2026-02-15T10:00:00Z' },
+              { id: 'item-4', status: 'pending' },
+            ],
+          },
+        ],
+      },
+    ];
+
+    mockScan.mockReturnValue({
+      promise: jest.fn().mockResolvedValue({ Items: mockPlans }),
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/gtm?startDate=2026-02-01&endDate=2026-02-13')
+      .expect(200);
+
+    expect(response.body.totalItems).toBe(4);
+    expect(response.body.completedItems).toBe(3);
+    expect(response.body.completedItemsInRange).toBe(1); // only item-1 (Feb 5) is in range
+  });
+
+  it('should fall back to item ID timestamp when completedAt is missing', async () => {
+    // workitem-1738368000000 = 2025-02-01T00:00:00Z (in range)
+    // workitem-1704067200000 = 2024-01-01T00:00:00Z (out of range)
+    const mockPlans = [
+      {
+        planId: 'plan-1',
+        phases: [
+          {
+            id: 'phase-1',
+            status: 'in_progress',
+            workItems: [
+              { id: 'workitem-1738368000000-0-0-abc', status: 'completed' },
+              { id: 'workitem-1704067200000-0-1-def', status: 'completed' },
+            ],
+          },
+        ],
+      },
+    ];
+
+    mockScan.mockReturnValue({
+      promise: jest.fn().mockResolvedValue({ Items: mockPlans }),
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/gtm?startDate=2025-01-01&endDate=2025-12-31')
+      .expect(200);
+
+    expect(response.body.totalItems).toBe(2);
+    expect(response.body.completedItems).toBe(2);
+    expect(response.body.completedItemsInRange).toBe(1); // only the 2025-02-01 item
+  });
+
+  it('should return all completed as in-range when no date range provided', async () => {
+    const mockPlans = [
+      {
+        planId: 'plan-1',
+        phases: [
+          {
+            id: 'phase-1',
+            status: 'in_progress',
+            workItems: [
+              { id: 'item-1', status: 'completed', completedAt: '2026-02-01T10:00:00Z' },
+              { id: 'item-2', status: 'completed', completedAt: '2025-01-01T10:00:00Z' },
+            ],
+          },
+        ],
+      },
+    ];
+
+    mockScan.mockReturnValue({
+      promise: jest.fn().mockResolvedValue({ Items: mockPlans }),
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/gtm')
+      .expect(200);
+
+    expect(response.body.totalItems).toBe(2);
+    expect(response.body.completedItems).toBe(2);
+    expect(response.body.completedItemsInRange).toBe(2);
+  });
+
+  it('should handle empty plans', async () => {
+    mockScan.mockReturnValue({
+      promise: jest.fn().mockResolvedValue({ Items: [] }),
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/gtm')
+      .expect(200);
+
+    expect(response.body.totalItems).toBe(0);
+    expect(response.body.completedItems).toBe(0);
+    expect(response.body.completedItemsInRange).toBe(0);
+  });
+
+  it('should handle DynamoDB errors', async () => {
+    mockScan.mockReturnValue({
+      promise: jest.fn().mockRejectedValue(new Error('DynamoDB error')),
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/gtm')
+      .expect(500);
+
+    expect(response.body.message).toContain('Error fetching GTM analytics');
+  });
+});
+
 describe('Admin GTM Plans Update Endpoints', () => {
   let mockGet: jest.Mock;
   let mockUpdate: jest.Mock;
