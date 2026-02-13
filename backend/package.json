@@ -60,6 +60,7 @@
     "date-fns-tz": "^3.2.0",
     "dotenv": "^16.0.3",
     "express": "^4.18.3",
+    "facebook-nodejs-business-sdk": "^24.0.1",
     "google-auth-library": "^9.15.1",
     "googleapis": "^144.0.0",
     "html-entities": "^2.6.0",
@@ -95,6 +96,7 @@
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
+    "@types/facebook-nodejs-business-sdk": "^23.0.0",
     "@types/jest": "^29.5.14",
     "@types/pdf-parse": "^1.1.1",
     "@types/supertest": "^6.0.3",

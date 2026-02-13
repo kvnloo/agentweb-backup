@@ -1,25 +1,10 @@
 import { userDb, User } from './db';
 
-/**
- * Helper function to normalize connected_accounts to array format
- */
-const normalizeAccounts = (connectedAccounts: any): ConnectedAccountConfig[] => {
-  if (!connectedAccounts) {
-    return [];
-  }
-  
-  if (Array.isArray(connectedAccounts)) {
-    return connectedAccounts as ConnectedAccountConfig[];
-  }
-  
-  return [];
-};
-
 // ============================================
-// Platform Type Definitions
+// Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'facebook' | 'twitter' | 'instagram';
+export type PlatformType = 'linkedin' | 'meta' | 'twitter' | 'instagram';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -28,8 +13,24 @@ export interface BaseOAuthConfig {
   access_token: string;
   refresh_token?: string;
   token_expires_at: number;
-  scopes: string[];
+  scopes?: string[]; // Track granted permissions
 }
+
+/**
+ * Helper function to normalize connected_accounts to array format
+ */
+const normalizeAccounts = (connectedAccounts: any): ConnectedAccountConfig[] => {
+  if (!connectedAccounts) {
+    return [];
+  }
+
+  if (Array.isArray(connectedAccounts)) {
+    return connectedAccounts as ConnectedAccountConfig[];
+  }
+
+  return [];
+};
+
 
 /**
  * LinkedIn-specific configuration
@@ -42,10 +43,33 @@ export interface LinkedInConfig extends BaseOAuthConfig {
 }
 
 /**
+ * Meta Ad Account Configuration
+ */
+export interface MetaAdAccountConfig extends BaseOAuthConfig {
+  account_type: 'ad_account';
+  ad_account_id: string;
+  currency?: string;
+  account_status?: number;
+}
+
+/**
+ * Meta Page Configuration
+ * IMPORTANT: Pages have their own page_access_token separate from user token
+ * The page_access_token is stored in the access_token field
+ */
+export interface MetaPageConfig extends BaseOAuthConfig {
+  account_type: 'page';
+  page_id: string;
+  category?: string;
+}
+
+export type MetaConfig = MetaAdAccountConfig | MetaPageConfig;
+
+/**
  * Union type for all platform-specific configurations.
  * Add new platform configs here as they are implemented.
  */
-export type PlatformConfig = LinkedInConfig; // | FacebookConfig | TwitterConfig
+export type PlatformConfig = LinkedInConfig | MetaConfig; // | TwitterConfig
 
 /**
  * Connected Account configuration stored in the User record
