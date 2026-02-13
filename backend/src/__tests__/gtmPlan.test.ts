@@ -599,7 +599,7 @@ describe('GTM Plan Route Tests', () => {
 
     it('should clear completedAt on work item when status transitions away from completed', () => {
       const originalItem = { id: 'item-1', title: 'Item 1', status: 'completed', completedAt: '2026-01-01T00:00:00Z' };
-      const status = 'in_progress';
+      const status: string = 'in_progress';
 
       const updatedWorkItem = {
         ...originalItem,
