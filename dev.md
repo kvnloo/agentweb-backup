@@ -1,3 +1,23 @@
+# February 12, 2026: PixelFlow Form Tracking Audit — start.waldium.com
+
+## Pages Checked
+- `https://start.waldium.com/` (v1)
+- `https://start.waldium.com/v2`
+
+## Result: Form submission NOT tracked on either page
+
+**Base script**: Installed correctly on both pages (same API key, site ID, endpoint).
+
+**Missing event classes** (required per [PixelFlow docs](https://docs.pixelflow.so/articles/event-classes-on-html-websites-4c49z)):
+
+| Element | Required Class | Status |
+|---|---|---|
+| Form container | `info-frm-cntr-pf` | Missing |
+| Submit button | `action-btn-lead-011-pf` | Missing |
+| Email input | `info-cust-em-pf` | Missing |
+
+Both pages share the same `LeadForm` React component. Adding the three classes to that component will fix both pages.
+
 # February 11, 2026: Staging Backend Down (Agentweb-backend-env-1)
 
 ## Problem
