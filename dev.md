@@ -1,3 +1,23 @@
+# February 12, 2026: ClickUp Integration via MCP
+
+## Investigation
+- ClickUp provides a remote MCP server at `https://mcp.clickup.com/mcp` (OAuth 2.1, read-only scope)
+- Supports 20+ tools: search, tasks, comments, time tracking, workspace hierarchy, members, chat, docs
+- AgentWeb already has external MCP client infrastructure (`mcpClientService.ts`) — plan is to connect to ClickUp's MCP server directly with per-user OAuth tokens
+- Main gap: current MCP client uses a single shared token per server; need to extend it to support per-user OAuth connections
+
+## Approach
+- Option A (chosen): Connect to ClickUp's remote MCP server directly, inheriting all their tools automatically
+- Add ClickUp as a connected account type with OAuth flow
+- Extend `mcpClientService` to support per-user MCP sessions
+
+## Status
+- Submitted ClickUp MCP Server Allowlist Request Form for redirect URIs:
+  - `https://api.agentweb.pro/api/auth/clickup/callback` (Production)
+  - `https://api-stage.agentweb.pro/api/auth/clickup/callback` (Staging)
+  - `http://localhost:3001/api/auth/clickup/callback` (Development)
+- Waiting for ClickUp approval before proceeding with implementation
+- 
 # February 12, 2026: PixelFlow Form Tracking Audit — start.waldium.com
 
 ## Pages Checked
