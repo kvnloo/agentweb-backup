@@ -139,3 +139,44 @@ export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
   }
 }
 
+/**
+ * Interface for Meta credentials returned from Secrets Manager
+ */
+export interface MetaCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Meta OAuth credentials from AWS Secrets Manager
+ * 
+ * Secret location: dev/AgentWeb/Meta (or prod/... for production)
+ * 
+ * @returns The Meta client credentials (clientId and clientSecret)
+ */
+export async function getMetaCredentials(): Promise<MetaCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/MetaApp'
+      : 'dev/AgentWeb/MetaApp';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Meta credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as MetaCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Meta credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Meta credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Meta credentials from Secrets Manager');
+  }
+}
+
