@@ -177,24 +177,73 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       linkedin: linkedin?.trim() || '',
     };
 
-    // Add custom fields with source and createdAt tracking
-    const mergedCustomFields: Record<string, any> = {
+    // Add custom fields with source tracking
+    const incomingCustomFields: Record<string, any> = {
       ...(customFields && typeof customFields === 'object' ? customFields : {}),
       // Add source field (from request or default to 'api')
       source: source?.trim() || customFields?.source || 'api',
-      // Add timestamp when lead was forwarded
-      forwardedAt: new Date().toISOString(),
     };
+
+    // Check if lead already exists by email - merge instead of dropping
+    const existingLead = await crmDb.getLeadByEmail(leadList.listId, email.trim().toLowerCase());
+
+    // Only stamp forwardedAt for new leads; for existing leads, preserve the original timestamp
+    const mergedCustomFields: Record<string, any> = existingLead
+      ? incomingCustomFields
+      : { ...incomingCustomFields, forwardedAt: new Date().toISOString() };
 
     leadData.customFields = mergedCustomFields;
 
-    // Create the lead
-    const lead = await crmDb.createLead(leadList.listId, leadData);
+    let lead: any;
+    let isNew = false;
+    let isUpdated = false;
 
-    // Auto-create initial drafts for newly forwarded leads (non-blocking)
+    if (existingLead) {
+      // Merge new data into existing lead (only overwrite with non-empty values)
+      const normalize = (value: any): string => {
+        if (value === null || value === undefined) return '';
+        return String(value).trim();
+      };
+
+      const updates: any = {};
+      let changed = false;
+
+      const standardFields = ['firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'] as const;
+      for (const field of standardFields) {
+        const newValue = normalize(leadData[field]);
+        if (newValue) {
+          const existingValue = normalize(existingLead[field]);
+          if (existingValue !== newValue) {
+            updates[field] = newValue;
+            changed = true;
+          }
+        }
+      }
+
+      // Merge custom fields
+      const existingCustomFields = existingLead.customFields || {};
+      const mergedCf = { ...existingCustomFields, ...mergedCustomFields };
+      if (JSON.stringify(existingCustomFields) !== JSON.stringify(mergedCf)) {
+        updates.customFields = mergedCf;
+        changed = true;
+      }
+
+      if (changed) {
+        await crmDb.updateLead(leadList.listId, existingLead.leadId, updates);
+        isUpdated = true;
+      }
+
+      lead = { ...existingLead, ...updates };
+    } else {
+      // Create a new lead
+      lead = await crmDb.createLead(leadList.listId, leadData);
+      isNew = true;
+    }
+
+    // Auto-create drafts for new and updated leads (non-blocking); skip unchanged duplicates
     let autoDraftStatus: 'queued' | undefined;
     let autoDraftError: string | undefined;
-    if (leadList.autoDraftEnabled === true) {
+    if ((isNew || isUpdated) && leadList.autoDraftEnabled === true) {
       autoDraftStatus = 'queued';
       const sourceLabel = String(mergedCustomFields.source || 'API form submission');
       const configuredInstruction = typeof leadList.autoDraftInstruction === 'string'
@@ -223,33 +272,55 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       })();
     }
 
-    // Trigger api.lead_added alert if configured
-    try {
-      await leadListAlertService.notifyLeadListOwnerIfConfigured(
-        leadList,
-        lead,
-        'api.lead_added',
-        {
-          source: mergedCustomFields.source,
-          forwardedAt: mergedCustomFields.forwardedAt,
-          company: leadData.company,
-          phone: leadData.phone,
-          ...(autoDraftStatus ? { autoDraftStatus } : {}),
-          ...(autoDraftError ? { autoDraftError } : {}),
-        },
-        new Date().toISOString()
-      );
-    } catch (alertError) {
-      console.error('Failed to send api.lead_added alert:', alertError);
-      // Don't fail the request if alert fails
+    // Trigger alerts: api.lead_added for new, api.lead_updated for merged, nothing for no-op
+    if (isNew || isUpdated) {
+      const alertEventType = isUpdated ? 'api.lead_updated' : 'api.lead_added';
+      try {
+        await leadListAlertService.notifyLeadListOwnerIfConfigured(
+          leadList,
+          lead,
+          alertEventType,
+          {
+            source: mergedCustomFields.source,
+            forwardedAt: mergedCustomFields.forwardedAt,
+            company: leadData.company,
+            phone: leadData.phone,
+            ...(autoDraftStatus ? { autoDraftStatus } : {}),
+            ...(autoDraftError ? { autoDraftError } : {}),
+          },
+          new Date().toISOString()
+        );
+      } catch (alertError) {
+        console.error(`Failed to send ${alertEventType} alert:`, alertError);
+        // Don't fail the request if alert fails
+      }
     }
 
-    res.status(201).json({
-      success: true,
-      message: 'Lead forwarded successfully',
-      leadId: lead.leadId,
-      listId: leadList.listId
-    });
+    if (isNew) {
+      res.status(201).json({
+        success: true,
+        message: 'Lead forwarded successfully',
+        event: 'lead.created',
+        leadId: lead.leadId,
+        listId: leadList.listId
+      });
+    } else if (isUpdated) {
+      res.status(200).json({
+        success: true,
+        message: 'Lead updated successfully',
+        event: 'lead.updated',
+        leadId: lead.leadId,
+        listId: leadList.listId
+      });
+    } else {
+      res.status(200).json({
+        success: true,
+        message: 'Lead already exists with no changes',
+        event: 'lead.unchanged',
+        leadId: lead.leadId,
+        listId: leadList.listId
+      });
+    }
 
   } catch (error: any) {
     console.error('Lead forwarding error:', error);
@@ -274,15 +345,6 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       );
     } catch (alertError) {
       console.error('Failed to send api.lead_failed alert:', alertError);
-    }
-
-    // Handle duplicate email error - return success to prevent retries
-    if (error.message?.includes('already exists') || error.message?.includes('duplicate')) {
-      return res.status(200).json({
-        success: true,
-        message: 'Lead already exists in the list',
-        duplicate: true
-      });
     }
 
     res.status(500).json({
