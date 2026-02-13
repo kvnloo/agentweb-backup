@@ -1456,6 +1456,34 @@ When a user requests client onboarding or says "onboard new client" or similar:
     return `Available Skills:\n${skillEntries.join('\n')}`;
   }
 
+  /**
+   * Get all skills (published + virtual other_skills) with installed status for UI display.
+   */
+  public async getSkillsForDisplay(associatedSkillIds: string[]): Promise<{ skillId: string; name: string; description: string; installed: boolean }[]> {
+    const publishedSkills = await skillService.getPublishedSkills();
+    const installedIds = new Set(associatedSkillIds);
+
+    const skills = publishedSkills.map(s => ({
+      skillId: s.skillId,
+      name: s.name,
+      description: s.description,
+      installed: installedIds.has(s.skillId)
+    }));
+
+    // Add virtual other_skills entry if there are unassociated tools
+    const unassociatedTools = this.getUnassociatedTools(publishedSkills);
+    if (unassociatedTools.length > 0) {
+      skills.push({
+        skillId: OTHER_SKILLS_VIRTUAL_ID,
+        name: 'Other Skills',
+        description: unassociatedTools.map(t => t.name).join(', '),
+        installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID)
+      });
+    }
+
+    return skills;
+  }
+
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
         const publishedSkills = await skillService.getPublishedSkills();

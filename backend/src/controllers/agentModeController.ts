@@ -1002,6 +1002,7 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
+  skills?: { skillId: string; name: string; description: string; installed: boolean }[];
 }> {
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
@@ -1112,9 +1113,18 @@ export async function generateSessionResponse(
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
+  // Build skills list with installed status (includes virtual other_skills)
+  let skills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
+  try {
+    skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || []);
+  } catch (error) {
+    console.error('AgentMode generateSessionResponse: Failed to fetch skills:', error);
+  }
+
   return {
     ...response,
-    workPlan: finalSession?.workPlan
+    workPlan: finalSession?.workPlan,
+    skills
   };
 }
 
@@ -1291,11 +1301,20 @@ export const agentModeController = {
 
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
+      // Build skills list with installed status (includes virtual other_skills)
+      let skills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
+      try {
+        skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || []);
+      } catch (error) {
+        console.error('AgentMode getSession: Failed to fetch skills:', error);
+      }
+
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSession = {
         ...session,
         messages: filterMessagesForClient(session.messages),
-        hasActiveProgress: progressActive
+        hasActiveProgress: progressActive,
+        skills
       };
 
       res.json(filteredSession);
@@ -1376,7 +1395,8 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -1781,6 +1801,14 @@ export const agentModeController = {
         // Continue without supportNote if fetch fails
       }
 
+      // Build skills list with installed status (includes virtual other_skills)
+      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
+      try {
+        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || []);
+      } catch (error) {
+        console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
+      }
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1794,7 +1822,8 @@ export const agentModeController = {
           llmModel: modelToUse,
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
-          supportNote: supportNote
+          supportNote: supportNote,
+          skills: sharedSkills
         }
       });
     } catch (error) {
@@ -1855,7 +1884,8 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -3467,7 +3497,8 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);

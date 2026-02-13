@@ -9,6 +9,13 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsByIds: jest.fn().mockResolvedValue([])
+  }
+}));
+
 describe('Agent Mode Controller - Session Loading', () => {
   const mockUser = {
     userId: 'user-123',
@@ -72,7 +79,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         ],
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
-        hasActiveProgress: false
+        hasActiveProgress: false,
+        skills: []
       });
     });
 
@@ -185,7 +193,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         ],
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
-        hasActiveProgress: false
+        hasActiveProgress: false,
+        skills: []
       });
     });
 
@@ -220,7 +229,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         messages: [],
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
-        hasActiveProgress: false
+        hasActiveProgress: false,
+        skills: []
       });
     });
   });
