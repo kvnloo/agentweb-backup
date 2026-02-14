@@ -77,7 +77,8 @@
       "Bash(python3:*)",
       "WebFetch(domain:start.waldium.com)",
       "WebFetch(domain:slrgkgulru.pixelflow.so)",
-      "WebFetch(domain:docs.pixelflow.so)"
+      "WebFetch(domain:docs.pixelflow.so)",
+      "Bash(npm ls:*)"
     ]
   }
 }
