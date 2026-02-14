@@ -127,6 +127,111 @@ describe('AgentModeService - Brand Guidelines Update', () => {
       expect(updateCall[1].brandGuidelines.brandData.primaryColor).toBe('#0000FF');
     });
 
+    it('should reject SVG files for logo brand assets', async () => {
+      const userId = 'test-user-123';
+      const updateData = {
+        brandAssets: [
+          { type: 'logo', url: 'https://example.com/logo.svg', filename: 'logo.svg' }
+        ]
+      };
+
+      // Mock user with existing brand guidelines
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        brandGuidelines: {
+          brandData: { brandName: 'Test Brand' },
+          attachments: [],
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z',
+        },
+      });
+
+      const result = await (agentModeService as any).updateBrandGuidelines(updateData, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('SVG files are not supported');
+      expect(result.error).toBe('SVG format not allowed for logo uploads');
+      expect(mockUserDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it('should reject SVG files for secondaryLogo brand assets', async () => {
+      const userId = 'test-user-123';
+      const updateData = {
+        brandAssets: [
+          { type: 'secondaryLogo', url: 'https://example.com/secondary.svg', filename: 'secondary.svg' }
+        ]
+      };
+
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        brandGuidelines: {
+          brandData: { brandName: 'Test Brand' },
+          attachments: [],
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z',
+        },
+      });
+
+      const result = await (agentModeService as any).updateBrandGuidelines(updateData, userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('SVG files are not supported');
+    });
+
+    it('should allow PNG files for logo brand assets', async () => {
+      const userId = 'test-user-123';
+      const updateData = {
+        brandAssets: [
+          { type: 'logo', url: 'https://example.com/logo.png', filename: 'logo.png' }
+        ]
+      };
+
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        brandGuidelines: {
+          brandData: { brandName: 'Test Brand' },
+          attachments: [],
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z',
+        },
+      });
+
+      mockUserDb.updateUser.mockResolvedValue({});
+
+      const result = await (agentModeService as any).updateBrandGuidelines(updateData, userId);
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should allow SVG files for non-logo brand assets (e.g., brandGuide)', async () => {
+      const userId = 'test-user-123';
+      const updateData = {
+        brandAssets: [
+          { type: 'brandGuide', url: 'https://example.com/guide.svg', filename: 'guide.svg' }
+        ]
+      };
+
+      mockUserDb.getUserById.mockResolvedValue({
+        userId,
+        email: 'test@example.com',
+        brandGuidelines: {
+          brandData: { brandName: 'Test Brand' },
+          attachments: [],
+          createdAt: '2023-01-01T00:00:00.000Z',
+          updatedAt: '2023-01-01T00:00:00.000Z',
+        },
+      });
+
+      mockUserDb.updateUser.mockResolvedValue({});
+
+      const result = await (agentModeService as any).updateBrandGuidelines(updateData, userId);
+
+      expect(result.success).toBe(true);
+    });
+
     it('should return error when user is not found', async () => {
       const userId = 'non-existent-user';
       const updateData = {

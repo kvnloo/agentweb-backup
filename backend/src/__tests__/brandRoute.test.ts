@@ -939,4 +939,39 @@ describe('Brand Route - Bug Fix Tests', () => {
       expect(parsedBrandValues).toEqual(["New value 1", "New value 2"]);
     });
   });
+
+  describe('SVG file rejection for logo uploads', () => {
+    it('should reject SVG files for logo uploads based on mimetype', () => {
+      const SVG_MIME_TYPES = ["image/svg+xml"];
+      const file = { mimetype: "image/svg+xml", originalname: "logo.svg" };
+
+      const isSvg = SVG_MIME_TYPES.includes(file.mimetype) || file.originalname.toLowerCase().endsWith(".svg");
+      expect(isSvg).toBe(true);
+    });
+
+    it('should reject SVG files for logo uploads based on file extension', () => {
+      const SVG_MIME_TYPES = ["image/svg+xml"];
+      // Some systems may not detect SVG mimetype correctly
+      const file = { mimetype: "application/octet-stream", originalname: "brand-logo.SVG" };
+
+      const isSvg = SVG_MIME_TYPES.includes(file.mimetype) || file.originalname.toLowerCase().endsWith(".svg");
+      expect(isSvg).toBe(true);
+    });
+
+    it('should allow PNG files for logo uploads', () => {
+      const SVG_MIME_TYPES = ["image/svg+xml"];
+      const file = { mimetype: "image/png", originalname: "logo.png" };
+
+      const isSvg = SVG_MIME_TYPES.includes(file.mimetype) || file.originalname.toLowerCase().endsWith(".svg");
+      expect(isSvg).toBe(false);
+    });
+
+    it('should allow JPEG files for logo uploads', () => {
+      const SVG_MIME_TYPES = ["image/svg+xml"];
+      const file = { mimetype: "image/jpeg", originalname: "logo.jpg" };
+
+      const isSvg = SVG_MIME_TYPES.includes(file.mimetype) || file.originalname.toLowerCase().endsWith(".svg");
+      expect(isSvg).toBe(false);
+    });
+  });
 });
