@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-14',
     changes: [
+      'Faster Admin Overview Tab Loading',
+      '- Task analytics now fetches all 7 DynamoDB tables in parallel instead of sequentially',
+      '- Agent Mode analytics uses a lightweight message stats query instead of loading full session messages',
+      '- Tool call success and failure counts are now derived from tool response messages',
       'Notification Email Confirmation When Testing Scheduled Chats',
       '- When testing a Scheduled Chat that has notification emails configured, a confirmation dialog now appears before the test runs',
       '- The dialog shows the configured email recipients and includes a toggle to send the notification email after the test completes',
