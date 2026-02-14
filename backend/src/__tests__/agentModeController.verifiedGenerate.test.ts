@@ -641,6 +641,137 @@ describe('AgentModeController - Verified Generate', () => {
       );
     });
 
+    it('should enforce high minCount for multiple variations', async () => {
+      // First attempt: only 3 generate_image calls
+      const partialResponse = {
+        ...mockResponse,
+        content: 'Generated 3 images',
+        toolCalls: [
+          { name: 'generate_image', arguments: { prompt: 'image1' } },
+          { name: 'generate_image', arguments: { prompt: 'image2' } },
+          { name: 'generate_image', arguments: { prompt: 'image3' } },
+        ],
+      };
+
+      // Second attempt: 2 more generate_image calls to reach 5 total
+      const remainingResponse = {
+        ...mockResponse,
+        content: 'Generated remaining images',
+        toolCalls: [
+          { name: 'generate_image', arguments: { prompt: 'image4' } },
+          { name: 'generate_image', arguments: { prompt: 'image5' } },
+        ],
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker
+        .mockResolvedValueOnce(partialResponse)
+        .mockResolvedValueOnce(remainingResponse);
+
+      let disconnectCallback: (() => void) | undefined;
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          startingMessage: 'Create images. Generate 5 variations.',
+          requiredFunctions: [{ functionName: 'generate_image', minCount: 5 }],
+          keywords: [],
+          attachments: [],
+          maxAttempts: 10,
+        },
+        on: jest.fn((event: string, callback: () => void) => {
+          if (event === 'close') {
+            disconnectCallback = callback;
+          }
+        }),
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+        on: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.verifiedGenerate(mockReq, mockRes);
+
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
+      expect(mockRes.status).toHaveBeenCalledWith(200);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          attempts: 2,
+          functionStatus: expect.arrayContaining([
+            expect.objectContaining({
+              functionName: 'generate_image',
+              requiredCount: 5,
+              actualCount: 5,
+              met: true,
+            }),
+          ]),
+        })
+      );
+    });
+
+    it('should enforce minCount for variations multiplied by ICPs', async () => {
+      // Simulates 2 ICPs * 3 variations = minCount 6
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Generated all images',
+        toolCalls: [
+          { name: 'generate_image', arguments: { prompt: 'icp1-v1' } },
+          { name: 'generate_image', arguments: { prompt: 'icp1-v2' } },
+          { name: 'generate_image', arguments: { prompt: 'icp1-v3' } },
+          { name: 'generate_image', arguments: { prompt: 'icp2-v1' } },
+          { name: 'generate_image', arguments: { prompt: 'icp2-v2' } },
+          { name: 'generate_image', arguments: { prompt: 'icp2-v3' } },
+        ],
+      };
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      let disconnectCallback: (() => void) | undefined;
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          startingMessage: 'Create images for 2 ICPs with 3 variations each',
+          requiredFunctions: [{ functionName: 'generate_image', minCount: 6 }],
+          keywords: [],
+          attachments: [],
+          maxAttempts: 10,
+        },
+        on: jest.fn((event: string, callback: () => void) => {
+          if (event === 'close') {
+            disconnectCallback = callback;
+          }
+        }),
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+        on: jest.fn(),
+      } as unknown as Response;
+
+      await agentModeController.verifiedGenerate(mockReq, mockRes);
+
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).toHaveBeenCalledWith(200);
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          attempts: 1,
+          functionStatus: expect.arrayContaining([
+            expect.objectContaining({
+              functionName: 'generate_image',
+              requiredCount: 6,
+              actualCount: 6,
+              met: true,
+            }),
+          ]),
+        })
+      );
+    });
+
     it('should use default maxAttempts of 5 when not provided', async () => {
       const incompleteResponse = {
         ...mockResponse,

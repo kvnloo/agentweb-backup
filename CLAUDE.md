@@ -56,6 +56,15 @@ npm run create-admin
 
 Backend runs on port 3001 by default.
 
+**IMPORTANT:** When taking over the backend (starting it via `npm run dev` or similar), always redirect output to `/tmp/backend.log` so logs can be reviewed later. For example:
+
+```bash
+cd backend
+npm run dev > /tmp/backend.log 2>&1 &
+```
+
+Use `tail -f /tmp/backend.log` or the Read tool on `/tmp/backend.log` to check logs during development.
+
 **IMPORTANT:** Always run `npx tsc` to verify TypeScript compilation before committing changes. This catches type errors early and prevents CI failures.
 
 ### Partner Portal

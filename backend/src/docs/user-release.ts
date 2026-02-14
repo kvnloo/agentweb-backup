@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-13',
     changes: [
+      'Number of Variations for Create Ad Images',
+      '- Added "Number of Variations" selector (1–10) to the Create Ad Images dialog, defaulting to 1',
+      '- The verified-generate backend enforces the requested number of generate_image calls per ICP',
+      '- Image Revision variations selector also extended from 5 to 10',
       'GTM Tracker Analytics in Admin Dashboard',
       '- Added GTM Tracker card to the Admin Overview tab showing completed items in period, total completed, and total items',
       '- Analytics respect the date range filter using work item completedAt timestamps',
