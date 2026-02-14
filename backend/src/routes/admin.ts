@@ -1342,6 +1342,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
     const messagesByRole: Record<string, number> = { user: 0, assistant: 0, system: 0, tool: 0 };
     let messagesWithAttachments = 0;
     let messagesWithToolCalls = 0;
+    let successfulToolCalls = 0;
+    let failedToolCalls = 0;
     let totalTokens = 0;
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
@@ -1360,6 +1362,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
       }
       messagesWithAttachments += stats.messagesWithAttachments;
       messagesWithToolCalls += stats.messagesWithToolCalls;
+      successfulToolCalls += stats.successfulToolCalls;
+      failedToolCalls += stats.failedToolCalls;
       totalTokens += stats.totalTokens;
       totalPromptTokens += stats.totalPromptTokens;
       totalCompletionTokens += stats.totalCompletionTokens;
@@ -1540,6 +1544,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
       messagesByRole,
       messagesWithAttachments,
       messagesWithToolCalls,
+      successfulToolCalls,
+      failedToolCalls,
       totalTokens,
       totalPromptTokens,
       totalCompletionTokens,

@@ -47,6 +47,8 @@ describe('Admin Agent Mode Analytics', () => {
       messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
       messagesWithAttachments: 0,
       messagesWithToolCalls: 0,
+      successfulToolCalls: 0,
+      failedToolCalls: 0,
       totalTokens: 0,
       totalPromptTokens: 0,
       totalCompletionTokens: 0,
@@ -228,6 +230,8 @@ describe('Admin Agent Mode Analytics', () => {
           messagesByRole: { user: 2, assistant: 1, system: 0, tool: 0 },
           messagesWithAttachments: 1,
           messagesWithToolCalls: 0,
+          successfulToolCalls: 0,
+          failedToolCalls: 0,
           totalTokens: 0,
           totalPromptTokens: 0,
           totalCompletionTokens: 0,
@@ -240,6 +244,8 @@ describe('Admin Agent Mode Analytics', () => {
           messagesByRole: { user: 1, assistant: 1, system: 0, tool: 0 },
           messagesWithAttachments: 0,
           messagesWithToolCalls: 1,
+          successfulToolCalls: 1,
+          failedToolCalls: 0,
           totalTokens: 150,
           totalPromptTokens: 100,
           totalCompletionTokens: 50,
@@ -251,6 +257,8 @@ describe('Admin Agent Mode Analytics', () => {
         messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
         messagesWithAttachments: 0,
         messagesWithToolCalls: 0,
+        successfulToolCalls: 0,
+        failedToolCalls: 0,
         totalTokens: 0,
         totalPromptTokens: 0,
         totalCompletionTokens: 0,
@@ -269,8 +277,74 @@ describe('Admin Agent Mode Analytics', () => {
     expect(response.body.messagesByRole.user).toBe(3); // 2 from session 1, 1 from session 2
     expect(response.body.messagesByRole.assistant).toBe(2); // 1 from session 1, 1 from session 2
     expect(response.body.messagesWithAttachments).toBe(1); // 1 message with attachment
-    expect(response.body.messagesWithToolCalls).toBe(1); // 1 message with tool calls
+    expect(response.body.messagesWithToolCalls).toBe(1); // 1 tool role message
+    expect(response.body.successfulToolCalls).toBe(1); // 1 successful tool call
+    expect(response.body.failedToolCalls).toBe(0); // 0 failed tool calls
     expect(response.body.totalTokens).toBe(150); // From the assistant message with usage
+  });
+
+  it('should aggregate successful and failed tool calls from message stats', async () => {
+    const now = new Date();
+    const startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+
+    const mockSessions: ChatSession[] = [
+      createMockSession({ sessionId: 'session-1' }),
+      createMockSession({ sessionId: 'session-2' }),
+    ];
+
+    mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
+    mockChatbotDb.getMessageStats.mockImplementation(async (sessionId: string) => {
+      if (sessionId === 'session-1') {
+        return {
+          totalMessages: 5,
+          messagesByRole: { user: 1, assistant: 1, system: 0, tool: 3 },
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 3,
+          successfulToolCalls: 2,
+          failedToolCalls: 1,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          messagesWithTokenData: 0,
+        };
+      }
+      if (sessionId === 'session-2') {
+        return {
+          totalMessages: 4,
+          messagesByRole: { user: 1, assistant: 1, system: 0, tool: 2 },
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 2,
+          successfulToolCalls: 0,
+          failedToolCalls: 2,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          messagesWithTokenData: 0,
+        };
+      }
+      return {
+        totalMessages: 0,
+        messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
+        messagesWithAttachments: 0,
+        messagesWithToolCalls: 0,
+        successfulToolCalls: 0,
+        failedToolCalls: 0,
+        totalTokens: 0,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        messagesWithTokenData: 0,
+      };
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/agent-mode')
+      .query({ startDate, endDate })
+      .expect(200);
+
+    expect(response.body.messagesWithToolCalls).toBe(5); // 3 + 2
+    expect(response.body.successfulToolCalls).toBe(2); // 2 + 0
+    expect(response.body.failedToolCalls).toBe(3); // 1 + 2
   });
 
   it('should calculate tool calls metrics correctly', async () => {

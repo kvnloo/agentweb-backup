@@ -733,12 +733,17 @@ export class ChatbotDB {
   /**
    * Lightweight method to get message statistics for a session without fetching full message content.
    * Uses ProjectionExpression to minimize read capacity and skips repair logic.
+   * Tool call success/failure is determined from role='tool' messages:
+   *   - Failed tool calls have content starting with "⚠️ Tool Error:"
+   *   - All other tool messages are counted as successful
    */
   async getMessageStats(sessionId: string): Promise<{
     totalMessages: number;
     messagesByRole: Record<string, number>;
     messagesWithAttachments: number;
     messagesWithToolCalls: number;
+    successfulToolCalls: number;
+    failedToolCalls: number;
     totalTokens: number;
     totalPromptTokens: number;
     totalCompletionTokens: number;
@@ -750,9 +755,10 @@ export class ChatbotDB {
       ExpressionAttributeValues: {
         ":sessionId": sessionId,
       },
-      ProjectionExpression: "message.#r, message.metadata.attachments, message.metadata.toolCalls, message.tool_calls, message.usage",
+      ProjectionExpression: "message.#r, message.#c, message.metadata.attachments, message.tool_calls, message.usage",
       ExpressionAttributeNames: {
         "#r": "role",
+        "#c": "content",
       },
     };
 
@@ -764,6 +770,8 @@ export class ChatbotDB {
       messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 } as Record<string, number>,
       messagesWithAttachments: 0,
       messagesWithToolCalls: 0,
+      successfulToolCalls: 0,
+      failedToolCalls: 0,
       totalTokens: 0,
       totalPromptTokens: 0,
       totalCompletionTokens: 0,
@@ -783,9 +791,15 @@ export class ChatbotDB {
         stats.messagesWithAttachments++;
       }
 
-      if ((msg.tool_calls && msg.tool_calls.length > 0) ||
-          (msg.metadata?.toolCalls && msg.metadata.toolCalls.length > 0)) {
+      // Count tool calls from role='tool' messages (each one represents an executed tool call)
+      if (role === 'tool') {
         stats.messagesWithToolCalls++;
+        const content = typeof msg.content === 'string' ? msg.content : '';
+        if (content.startsWith('⚠️ Tool Error:') || content.includes('"success":false') || content.includes('"success": false')) {
+          stats.failedToolCalls++;
+        } else {
+          stats.successfulToolCalls++;
+        }
       }
 
       if (msg.usage) {
