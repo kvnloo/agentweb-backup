@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-14',
+    changes: [
+      'Notification Email Confirmation When Testing Scheduled Chats',
+      '- When testing a Scheduled Chat that has notification emails configured, a confirmation dialog now appears before the test runs',
+      '- The dialog shows the configured email recipients and includes a toggle to send the notification email after the test completes',
+      '- Your preference is remembered across sessions so you don\'t have to re-select it each time',
+      '- Scheduled Chats without email notifications configured continue to run tests immediately with no dialog',
+    ],
+  },
+  {
     date: '2026-02-13',
     changes: [
       'Banned SVG File Uploads for Brand Logos',

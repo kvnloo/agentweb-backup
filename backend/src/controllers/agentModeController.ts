@@ -2986,6 +2986,24 @@ export const agentModeController = {
       // Run the scheduled chat as a test
       const result = await runScheduledChat(schedule, user.userId, true);
 
+      // Send notification email if requested
+      const { sendNotificationEmail } = req.body || {};
+      if (sendNotificationEmail && result.sessionId) {
+        try {
+          const emailNotifications = schedule.emailNotifications || [];
+          if (emailNotifications.length > 0) {
+            await emailService.sendScheduledChatResultEmail(
+              emailNotifications,
+              schedule.scheduleName,
+              result,
+              schedule.scheduleId
+            );
+          }
+        } catch (emailError) {
+          console.error('AgentMode: Failed to send test notification email:', emailError);
+        }
+      }
+
       res.json(result);
 
     } catch (error) {

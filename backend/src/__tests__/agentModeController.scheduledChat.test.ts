@@ -607,6 +607,178 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
+
+    it('should send notification email when sendNotificationEmail is true and schedule has email notifications', async () => {
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        emailNotifications: ['user@example.com', 'admin@example.com'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithEmails);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: { sendNotificationEmail: true },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
+        ['user@example.com', 'admin@example.com'],
+        'Test Schedule',
+        expect.objectContaining({ sessionId: 'test-session-123' }),
+        mockScheduleId
+      );
+    });
+
+    it('should not send notification email when sendNotificationEmail is false', async () => {
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        emailNotifications: ['user@example.com'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithEmails);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: { sendNotificationEmail: false },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
+    });
+
+    it('should not send notification email when sendNotificationEmail is true but no email notifications configured', async () => {
+      // baseSchedule has no emailNotifications
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: { sendNotificationEmail: true },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
+    });
+
+    it('should not send notification email when body is missing', async () => {
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        emailNotifications: ['user@example.com'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithEmails);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
+    });
+
+    it('should still return success even if notification email fails', async () => {
+      const scheduleWithEmails = {
+        ...baseSchedule,
+        emailNotifications: ['user@example.com'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleWithEmails);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+      mockEmailService.sendScheduledChatResultEmail.mockRejectedValue(new Error('SMTP failure'));
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: { sendNotificationEmail: true },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should still return the test result, not an error
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scheduleId: mockScheduleId,
+          passed: true,
+        })
+      );
+      expect(mockRes.status).not.toHaveBeenCalledWith(500);
+    });
   });
 
   describe('runScheduledChats endpoint', () => {
