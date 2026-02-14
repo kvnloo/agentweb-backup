@@ -142,6 +142,18 @@ router.post(
 
       const files = req.files as { [fieldname: string]: Express.Multer.File[] };
 
+      // Reject SVG files for logo uploads - SVG can contain scripts and is not suitable for logo storage
+      const SVG_MIME_TYPES = ["image/svg+xml"];
+      const logoFields = ["logo", "secondaryLogo"] as const;
+      for (const field of logoFields) {
+        const file = files[field]?.[0];
+        if (file && (SVG_MIME_TYPES.includes(file.mimetype) || file.originalname.toLowerCase().endsWith(".svg"))) {
+          return res.status(400).json({
+            error: `SVG files are not supported for ${field === "logo" ? "primary" : "secondary"} logo uploads. Please convert your SVG to PNG or another raster format before uploading.`,
+          });
+        }
+      }
+
       // Upload files to S3
       const attachments = [];
 
