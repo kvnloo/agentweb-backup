@@ -757,10 +757,11 @@ export class ChatbotDB {
       ExpressionAttributeValues: {
         ":sessionId": sessionId,
       },
-      ProjectionExpression: "message.#r, message.#c, message.metadata.attachments, message.tool_calls, message.usage",
+      ProjectionExpression: "message.#r, message.#c, message.metadata.attachments, message.tool_calls, message.#u",
       ExpressionAttributeNames: {
         "#r": "role",
         "#c": "content",
+        "#u": "usage",
       },
     };
 
