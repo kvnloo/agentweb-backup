@@ -730,6 +730,75 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Lightweight method to get message statistics for a session without fetching full message content.
+   * Uses ProjectionExpression to minimize read capacity and skips repair logic.
+   */
+  async getMessageStats(sessionId: string): Promise<{
+    totalMessages: number;
+    messagesByRole: Record<string, number>;
+    messagesWithAttachments: number;
+    messagesWithToolCalls: number;
+    totalTokens: number;
+    totalPromptTokens: number;
+    totalCompletionTokens: number;
+    messagesWithTokenData: number;
+  }> {
+    const params = {
+      TableName: this.messagesTableName,
+      KeyConditionExpression: "sessionId = :sessionId",
+      ExpressionAttributeValues: {
+        ":sessionId": sessionId,
+      },
+      ProjectionExpression: "message.#r, message.metadata.attachments, message.metadata.toolCalls, message.tool_calls, message.usage",
+      ExpressionAttributeNames: {
+        "#r": "role",
+      },
+    };
+
+    const result = await dynamodb.query(params).promise();
+    const items = result.Items || [];
+
+    const stats = {
+      totalMessages: items.length,
+      messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 } as Record<string, number>,
+      messagesWithAttachments: 0,
+      messagesWithToolCalls: 0,
+      totalTokens: 0,
+      totalPromptTokens: 0,
+      totalCompletionTokens: 0,
+      messagesWithTokenData: 0,
+    };
+
+    for (const item of items) {
+      const msg = item.message;
+      if (!msg) continue;
+
+      const role = msg.role || "unknown";
+      if (stats.messagesByRole[role] !== undefined) {
+        stats.messagesByRole[role]++;
+      }
+
+      if (msg.metadata?.attachments && msg.metadata.attachments.length > 0) {
+        stats.messagesWithAttachments++;
+      }
+
+      if ((msg.tool_calls && msg.tool_calls.length > 0) ||
+          (msg.metadata?.toolCalls && msg.metadata.toolCalls.length > 0)) {
+        stats.messagesWithToolCalls++;
+      }
+
+      if (msg.usage) {
+        stats.totalTokens += msg.usage.total_tokens || 0;
+        stats.totalPromptTokens += msg.usage.prompt_tokens || 0;
+        stats.totalCompletionTokens += msg.usage.completion_tokens || 0;
+        stats.messagesWithTokenData++;
+      }
+    }
+
+    return stats;
+  }
+
   // Migrate messages from session record to AW-ChatMessages table
   private async migrateMessagesToMessagesTable(sessionId: string, messages: ChatMessage[]): Promise<void> {
     if (!messages || messages.length === 0) {

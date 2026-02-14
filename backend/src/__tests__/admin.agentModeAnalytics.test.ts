@@ -9,6 +9,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getAllSessions: jest.fn(),
     getChatSession: jest.fn(),
+    getMessageStats: jest.fn(),
   },
 }));
 
@@ -40,6 +41,17 @@ app.use('/api/admin', adminRoutes);
 describe('Admin Agent Mode Analytics', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: getMessageStats returns empty stats for any session
+    mockChatbotDb.getMessageStats.mockResolvedValue({
+      totalMessages: 0,
+      messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
+      messagesWithAttachments: 0,
+      messagesWithToolCalls: 0,
+      totalTokens: 0,
+      totalPromptTokens: 0,
+      totalCompletionTokens: 0,
+      messagesWithTokenData: 0,
+    });
   });
 
   const mockGetChatSession = (sessions: ChatSession[]) => {
@@ -207,34 +219,52 @@ describe('Admin Agent Mode Analytics', () => {
       }),
     ];
 
-    const sessionsWithMessages: ChatSession[] = [
-      {
-        ...mockSessions[0],
-        messages: [
-          { role: 'user', content: 'Message 1', metadata: { timestamp: new Date().toISOString(), attachments: [{ url: 'test.jpg', filename: 'test.jpg', size: 100, mimetype: 'image/jpeg', uploadedAt: new Date().toISOString() }] } },
-          { role: 'assistant', content: 'Response 1' },
-          { role: 'user', content: 'Message 2' },
-        ],
-      },
-      {
-        ...mockSessions[1],
-        messages: [
-          { role: 'user', content: 'Message 3' },
-          { role: 'assistant', content: 'Response 2', tool_calls: [{ id: '1', function: { name: 'search_web' } }], usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, estimated_cost: 0.001 } },
-        ],
-      },
-    ];
-
     mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
-    mockGetChatSession(sessionsWithMessages);
+    // Mock getMessageStats to return per-session stats
+    mockChatbotDb.getMessageStats.mockImplementation(async (sessionId: string) => {
+      if (sessionId === 'session-1') {
+        return {
+          totalMessages: 3,
+          messagesByRole: { user: 2, assistant: 1, system: 0, tool: 0 },
+          messagesWithAttachments: 1,
+          messagesWithToolCalls: 0,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          messagesWithTokenData: 0,
+        };
+      }
+      if (sessionId === 'session-2') {
+        return {
+          totalMessages: 2,
+          messagesByRole: { user: 1, assistant: 1, system: 0, tool: 0 },
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 1,
+          totalTokens: 150,
+          totalPromptTokens: 100,
+          totalCompletionTokens: 50,
+          messagesWithTokenData: 1,
+        };
+      }
+      return {
+        totalMessages: 0,
+        messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
+        messagesWithAttachments: 0,
+        messagesWithToolCalls: 0,
+        totalTokens: 0,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        messagesWithTokenData: 0,
+      };
+    });
 
     const response = await request(app)
       .get('/api/admin/analytics/agent-mode')
       .query({ startDate, endDate })
       .expect(200);
 
-    expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith('session-1');
-    expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith('session-2');
+    expect(mockChatbotDb.getMessageStats).toHaveBeenCalledWith('session-1');
+    expect(mockChatbotDb.getMessageStats).toHaveBeenCalledWith('session-2');
     expect(response.body.totalMessages).toBe(5);
     expect(response.body.messagesByRole.user).toBe(3); // 2 from session 1, 1 from session 2
     expect(response.body.messagesByRole.assistant).toBe(2); // 1 from session 1, 1 from session 2
