@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-13',
     changes: [
+      'Banned SVG File Uploads for Brand Logos',
+      '- SVG files are no longer accepted for primary or secondary logo uploads in Brand Guidelines',
+      '- This restriction also applies when updating brand guidelines through Agent Mode',
+      '- SVG files could cause issues with downstream image generation workflows',
+      '- Users are prompted to convert SVG files to PNG or another raster format before uploading',
       'Number of Variations for Create Ad Images',
       '- Added "Number of Variations" selector (1–10) to the Create Ad Images dialog, defaulting to 1',
       '- The verified-generate backend enforces the requested number of generate_image calls per ICP',

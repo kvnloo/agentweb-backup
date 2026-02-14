@@ -4592,6 +4592,24 @@ Format the response as JSON with this structure:
         updatedBrandData.founders = mergedFounders;
       }
 
+      // Reject SVG files for logo/secondaryLogo assets
+      if (brandAssets !== undefined) {
+        const assetsToCheck = Array.isArray(brandAssets) ? brandAssets : [brandAssets];
+        for (const asset of assetsToCheck) {
+          if (asset && (asset.type === 'logo' || asset.type === 'secondaryLogo')) {
+            const url = (asset.url || '').toLowerCase();
+            const filename = (asset.filename || '').toLowerCase();
+            if (url.endsWith('.svg') || filename.endsWith('.svg') || url.includes('.svg?')) {
+              return {
+                success: false,
+                message: `SVG files are not supported for ${asset.type === 'logo' ? 'primary' : 'secondary'} logo. Please convert your SVG to PNG or another raster format before uploading.`,
+                error: 'SVG format not allowed for logo uploads'
+              };
+            }
+          }
+        }
+      }
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
