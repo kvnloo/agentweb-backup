@@ -1144,18 +1144,16 @@ export const taskDb = {
       const startDateISO = new Date(startDate).toISOString();
       const endDateISO = new Date(endDate).toISOString();
 
-      // Get all tasks with pagination
-      const tasks = await this.scanAllItems(`${TABLE_PREFIX}AW-Tasks`);
-
-      // Get all executions with pagination
-      const executions = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`);
-
-      // Get all other data with pagination
-      const schedules = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
-      const templates = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`);
-      const configs = await this.scanAllItems(`${TABLE_PREFIX}AW-Configs`);
-      const workflows = await this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`);
-      const workflowExecutions = await this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`);
+      // Get all data with pagination (parallel)
+      const [tasks, executions, schedules, templates, configs, workflows, workflowExecutions] = await Promise.all([
+        this.scanAllItems(`${TABLE_PREFIX}AW-Tasks`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`),
+      ]);
 
       // Helper function to check if date is within range
       const isDateInRange = (dateStr: string) => {

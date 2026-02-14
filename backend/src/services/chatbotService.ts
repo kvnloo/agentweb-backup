@@ -161,6 +161,7 @@ export interface ChatSession {
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
+  failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"; // Type of session based on how it was created
@@ -727,6 +728,89 @@ export class ChatbotDB {
       console.error("Error getting messages from messages table:", error);
       throw error;
     }
+  }
+
+  /**
+   * Lightweight method to get message statistics for a session without fetching full message content.
+   * Uses ProjectionExpression to minimize read capacity and skips repair logic.
+   * Tool call success/failure is determined from role='tool' messages:
+   *   - Failed tool calls have content starting with "⚠️ Tool Error:"
+   *   - All other tool messages are counted as successful
+   */
+  async getMessageStats(sessionId: string): Promise<{
+    totalMessages: number;
+    messagesByRole: Record<string, number>;
+    messagesWithAttachments: number;
+    messagesWithToolCalls: number;
+    successfulToolCalls: number;
+    failedToolCalls: number;
+    totalTokens: number;
+    totalPromptTokens: number;
+    totalCompletionTokens: number;
+    messagesWithTokenData: number;
+  }> {
+    const params = {
+      TableName: this.messagesTableName,
+      KeyConditionExpression: "sessionId = :sessionId",
+      ExpressionAttributeValues: {
+        ":sessionId": sessionId,
+      },
+      ProjectionExpression: "message.#r, message.#c, message.metadata.attachments, message.tool_calls, message.usage",
+      ExpressionAttributeNames: {
+        "#r": "role",
+        "#c": "content",
+      },
+    };
+
+    const result = await dynamodb.query(params).promise();
+    const items = result.Items || [];
+
+    const stats = {
+      totalMessages: items.length,
+      messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 } as Record<string, number>,
+      messagesWithAttachments: 0,
+      messagesWithToolCalls: 0,
+      successfulToolCalls: 0,
+      failedToolCalls: 0,
+      totalTokens: 0,
+      totalPromptTokens: 0,
+      totalCompletionTokens: 0,
+      messagesWithTokenData: 0,
+    };
+
+    for (const item of items) {
+      const msg = item.message;
+      if (!msg) continue;
+
+      const role = msg.role || "unknown";
+      if (stats.messagesByRole[role] !== undefined) {
+        stats.messagesByRole[role]++;
+      }
+
+      if (msg.metadata?.attachments && msg.metadata.attachments.length > 0) {
+        stats.messagesWithAttachments++;
+      }
+
+      // Count tool calls from role='tool' messages (each one represents an executed tool call)
+      if (role === 'tool') {
+        stats.messagesWithToolCalls++;
+        const content = typeof msg.content === 'string' ? msg.content : '';
+        if (content.startsWith('⚠️ Tool Error:') || content.includes('"success":false') || content.includes('"success": false')) {
+          stats.failedToolCalls++;
+        } else {
+          stats.successfulToolCalls++;
+        }
+      }
+
+      if (msg.usage) {
+        stats.totalTokens += msg.usage.total_tokens || 0;
+        stats.totalPromptTokens += msg.usage.prompt_tokens || 0;
+        stats.totalCompletionTokens += msg.usage.completion_tokens || 0;
+        stats.messagesWithTokenData++;
+      }
+    }
+
+    return stats;
   }
 
   // Migrate messages from session record to AW-ChatMessages table
@@ -1676,6 +1760,49 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error incrementing called functions:", error);
+      throw error;
+    }
+  }
+
+  async incrementFailedFunctions(
+    sessionId: string,
+    functionCounts: Record<string, number>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    // Get current session to retrieve existing failedFunctions
+    const session = await this.getChatSession(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    // Merge the new counts with existing counts
+    const currentCounts = session.failedFunctions || {};
+    const updatedCounts = { ...currentCounts };
+
+    for (const [functionName, count] of Object.entries(functionCounts)) {
+      updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET failedFunctions = :failedFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":failedFunctions": updatedCounts,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error incrementing failed functions:", error);
       throw error;
     }
   }
