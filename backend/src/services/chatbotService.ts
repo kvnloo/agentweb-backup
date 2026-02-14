@@ -161,6 +161,7 @@ export interface ChatSession {
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
+  failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"; // Type of session based on how it was created
@@ -1722,6 +1723,49 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error incrementing called functions:", error);
+      throw error;
+    }
+  }
+
+  async incrementFailedFunctions(
+    sessionId: string,
+    functionCounts: Record<string, number>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    // Get current session to retrieve existing failedFunctions
+    const session = await this.getChatSession(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+
+    // Merge the new counts with existing counts
+    const currentCounts = session.failedFunctions || {};
+    const updatedCounts = { ...currentCounts };
+
+    for (const [functionName, count] of Object.entries(functionCounts)) {
+      updatedCounts[functionName] = (updatedCounts[functionName] || 0) + count;
+    }
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET failedFunctions = :failedFunctions, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":failedFunctions": updatedCounts,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error incrementing failed functions:", error);
       throw error;
     }
   }

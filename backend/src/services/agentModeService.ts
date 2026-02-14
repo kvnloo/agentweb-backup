@@ -778,6 +778,14 @@ export class AgentModeService {
               });
             }
             
+            // Update the failedFunctions counter immediately after failed tool call
+            try {
+              await chatbotDb.incrementFailedFunctions(sessionId, { [toolCall.function.name]: 1 });
+            } catch (counterError) {
+              console.error('AgentMode: Failed to update failed function call counter:', counterError);
+              // Don't fail the whole tool call if counter update fails
+            }
+
             // Ensure LLM receives the error to adjust its plan
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);

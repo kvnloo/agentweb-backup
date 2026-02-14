@@ -37,6 +37,7 @@ import {
   MenuItem,
   FormGroup,
   Link,
+  Collapse,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -591,6 +592,7 @@ export default function AdminDashboard() {
   };
   
   const [tabValue, setTabValue] = useState(getInitialTabValue());
+  const [toolCallsExpanded, setToolCallsExpanded] = useState(false);
   const [startDate, setStartDate] = useState<Date | null>(
     new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
   );
@@ -2541,10 +2543,10 @@ export default function AdminDashboard() {
                     </Card>
                   </Grid>
                   <Grid item xs={12} md={3}>
-                    <Card>
+                    <Card sx={{ cursor: 'pointer' }} onClick={() => setToolCallsExpanded(v => !v)}>
                       <CardContent>
                         <Typography variant="h6" gutterBottom>
-                          Tool Calls
+                          Tool Calls {toolCallsExpanded ? '▲' : '▼'}
                         </Typography>
                         {agentModeAnalytics && (
                           <>
@@ -2609,6 +2611,41 @@ export default function AdminDashboard() {
                     </Card>
                   </Grid>
                 </Grid>
+
+                {/* Tool Call Details Table (expanded) */}
+                <Collapse in={toolCallsExpanded}>
+                  <Card sx={{ mb: 3 }}>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        Tool Call Details
+                      </Typography>
+                      {agentModeAnalytics && (agentModeAnalytics.toolCallDetailsInRange || agentModeAnalytics.toolCallDetails) && (
+                        <TableContainer>
+                          <Table size="small">
+                            <TableHead>
+                              <TableRow>
+                                <TableCell sx={{ fontWeight: 'bold' }}>Tool Name</TableCell>
+                                <TableCell align="right" sx={{ fontWeight: 'bold' }}>Total</TableCell>
+                                <TableCell align="right" sx={{ fontWeight: 'bold' }}>Success</TableCell>
+                                <TableCell align="right" sx={{ fontWeight: 'bold' }}>Failure</TableCell>
+                              </TableRow>
+                            </TableHead>
+                            <TableBody>
+                              {(agentModeAnalytics.toolCallDetailsInRange || agentModeAnalytics.toolCallDetails || []).map((tool: any) => (
+                                <TableRow key={tool.name}>
+                                  <TableCell>{tool.name}</TableCell>
+                                  <TableCell align="right">{tool.total}</TableCell>
+                                  <TableCell align="right" sx={{ color: 'success.main' }}>{tool.success}</TableCell>
+                                  <TableCell align="right" sx={{ color: tool.failure > 0 ? 'error.main' : 'text.secondary' }}>{tool.failure}</TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </TableContainer>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Collapse>
 
                 {/* Agent Mode Growth Charts */}
                 <Grid container spacing={3} sx={{ mb: 4 }}>

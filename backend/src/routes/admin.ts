@@ -1479,6 +1479,45 @@ router.get("/analytics/agent-mode", async (req, res) => {
       }
     });
     
+    // Failed tool calls by function name (breakdown)
+    const failedToolCallsByFunction: Record<string, number> = {};
+    const failedToolCallsByFunctionInRange: Record<string, number> = {};
+
+    agentSessions.forEach((session) => {
+      if (session.failedFunctions) {
+        Object.entries(session.failedFunctions).forEach(([functionName, count]) => {
+          failedToolCallsByFunction[functionName] = (failedToolCallsByFunction[functionName] || 0) + count;
+
+          if (isInRange(session.createdAt)) {
+            failedToolCallsByFunctionInRange[functionName] = (failedToolCallsByFunctionInRange[functionName] || 0) + count;
+          }
+        });
+      }
+    });
+
+    // Build tool call details with success and failure counts
+    const allToolNames = new Set([
+      ...Object.keys(toolCallsByFunction),
+      ...Object.keys(failedToolCallsByFunction),
+    ]);
+    const toolCallDetails = Array.from(allToolNames).map((name) => ({
+      name,
+      total: (toolCallsByFunction[name] || 0) + (failedToolCallsByFunction[name] || 0),
+      success: toolCallsByFunction[name] || 0,
+      failure: failedToolCallsByFunction[name] || 0,
+    })).sort((a, b) => b.total - a.total);
+
+    const allToolNamesInRange = new Set([
+      ...Object.keys(toolCallsByFunctionInRange),
+      ...Object.keys(failedToolCallsByFunctionInRange),
+    ]);
+    const toolCallDetailsInRange = Array.from(allToolNamesInRange).map((name) => ({
+      name,
+      total: (toolCallsByFunctionInRange[name] || 0) + (failedToolCallsByFunctionInRange[name] || 0),
+      success: toolCallsByFunctionInRange[name] || 0,
+      failure: failedToolCallsByFunctionInRange[name] || 0,
+    })).sort((a, b) => b.total - a.total);
+
     // Get top tools (sorted by usage)
     const topTools = Object.entries(toolCallsByFunction)
       .sort(([, a], [, b]) => b - a)
@@ -1562,6 +1601,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
       toolCallsByFunctionInRange,
       topTools,
       topToolsInRange,
+      toolCallDetails,
+      toolCallDetailsInRange,
       dailyGrowth: sortedDailyGrowth,
     });
   } catch (error) {
