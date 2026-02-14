@@ -14,6 +14,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The dialog shows the configured email recipients and includes a toggle to send the notification email after the test completes',
       '- Your preference is remembered across sessions so you don\'t have to re-select it each time',
       '- Scheduled Chats without email notifications configured continue to run tests immediately with no dialog',
+      'Tool Call Input Viewer in Agent Mode',
+      '- Tool calls in chat messages now display as compact inline badges instead of a vertical list',
+      '- Clicking a tool badge expands a table showing the input parameters passed to that tool',
+      '- Only one tool\'s input is shown at a time (accordion style) to keep the view clean',
+      '- Long parameter values are truncated to 200 characters with the full length displayed',
     ],
   },
   {
