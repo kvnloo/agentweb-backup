@@ -424,6 +424,95 @@ describe('Admin Agent Mode Analytics', () => {
     }
   });
 
+  it('should calculate tool call details with success and failure counts', async () => {
+    const now = new Date();
+    const startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+
+    const mockSessions: ChatSession[] = [
+      createMockSession({
+        sessionId: 'session-1',
+        calledFunctions: { generate_image: 5, search_web: 3 },
+        failedFunctions: { generate_image: 1, search_web: 2 },
+      }),
+      createMockSession({
+        sessionId: 'session-2',
+        calledFunctions: { generate_video: 2 },
+        failedFunctions: { generate_video: 1, create_html: 3 },
+      }),
+    ];
+
+    mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
+
+    const response = await request(app)
+      .get('/api/admin/analytics/agent-mode')
+      .query({ startDate, endDate })
+      .expect(200);
+
+    const details = response.body.toolCallDetails;
+    expect(Array.isArray(details)).toBe(true);
+
+    // Check generate_image: 5 success + 1 failure = 6 total
+    const generateImage = details.find((d: any) => d.name === 'generate_image');
+    expect(generateImage).toEqual({ name: 'generate_image', total: 6, success: 5, failure: 1 });
+
+    // Check search_web: 3 success + 2 failure = 5 total
+    const searchWeb = details.find((d: any) => d.name === 'search_web');
+    expect(searchWeb).toEqual({ name: 'search_web', total: 5, success: 3, failure: 2 });
+
+    // Check create_html: 0 success + 3 failure = 3 total (only in failedFunctions)
+    const createHtml = details.find((d: any) => d.name === 'create_html');
+    expect(createHtml).toEqual({ name: 'create_html', total: 3, success: 0, failure: 3 });
+
+    // Check generate_video: 2 success + 1 failure = 3 total
+    const generateVideo = details.find((d: any) => d.name === 'generate_video');
+    expect(generateVideo).toEqual({ name: 'generate_video', total: 3, success: 2, failure: 1 });
+
+    // Check sorted by total descending
+    for (let i = 0; i < details.length - 1; i++) {
+      expect(details[i].total).toBeGreaterThanOrEqual(details[i + 1].total);
+    }
+  });
+
+  it('should handle sessions with no failedFunctions (backward compatibility)', async () => {
+    const now = new Date();
+    const startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+
+    const mockSessions: ChatSession[] = [
+      createMockSession({
+        sessionId: 'session-1',
+        calledFunctions: { generate_image: 3, search_web: 2 },
+      }),
+      createMockSession({
+        sessionId: 'session-2',
+        calledFunctions: { generate_video: 1 },
+      }),
+    ];
+
+    mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
+
+    const response = await request(app)
+      .get('/api/admin/analytics/agent-mode')
+      .query({ startDate, endDate })
+      .expect(200);
+
+    const details = response.body.toolCallDetails;
+    expect(Array.isArray(details)).toBe(true);
+    expect(details.length).toBe(3);
+
+    // All entries should have failure = 0
+    details.forEach((d: any) => {
+      expect(d.failure).toBe(0);
+      expect(d.total).toBe(d.success);
+    });
+
+    // Check specific values
+    expect(details.find((d: any) => d.name === 'generate_image')).toEqual({ name: 'generate_image', total: 3, success: 3, failure: 0 });
+    expect(details.find((d: any) => d.name === 'search_web')).toEqual({ name: 'search_web', total: 2, success: 2, failure: 0 });
+    expect(details.find((d: any) => d.name === 'generate_video')).toEqual({ name: 'generate_video', total: 1, success: 1, failure: 0 });
+  });
+
   it('should handle sessions without date range parameters', async () => {
     const mockSessions: ChatSession[] = [
       createMockSession({ sessionId: 'session-1' }),
