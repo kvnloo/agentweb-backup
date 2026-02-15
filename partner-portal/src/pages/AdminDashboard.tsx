@@ -689,6 +689,7 @@ export default function AdminDashboard() {
     userAnalytics,
     agentModeAnalytics,
     gtmAnalytics,
+    crmAnalytics,
     loadUsers,
     loadWaitlist,
     loadAnalytics,
@@ -2604,6 +2605,37 @@ export default function AdminDashboard() {
                             </Typography>
                             <Typography variant="body2" color="text.secondary">
                               Total Items: {gtmAnalytics.totalItems || 0}
+                            </Typography>
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          CRM
+                        </Typography>
+                        {crmAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {crmAnalytics.totalLeads || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total Leads
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              New Leads: <span style={{ color: '#4caf50' }}>+{crmAnalytics.newLeads || 0}</span>
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Lists: {crmAnalytics.totalLists || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              ICP Leads: {crmAnalytics.totalICPLeads || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Engaged: {crmAnalytics.totalEngagedLeads || 0}
                             </Typography>
                           </>
                         )}

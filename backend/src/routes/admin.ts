@@ -2504,6 +2504,77 @@ router.get("/analytics/gtm", async (req, res) => {
   }
 });
 
+// CRM analytics endpoint
+router.get("/analytics/crm", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const hasDateRange = startDate && endDate;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+
+    const scanAll = async (tableName: string) => {
+      const items: any[] = [];
+      let lastKey: any = undefined;
+      do {
+        const result: any = await dynamodb.scan({
+          TableName: tableName,
+          ...(lastKey && { ExclusiveStartKey: lastKey }),
+        }).promise();
+        items.push(...(result.Items || []));
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+      return items;
+    };
+
+    const [leadLists, leads] = await Promise.all([
+      scanAll(`${TABLE_PREFIX}AW-LeadLists`),
+      scanAll(`${TABLE_PREFIX}AW-Leads`),
+    ]);
+
+    const totalLists = leadLists.length;
+    const totalLeads = leads.length;
+    const totalICPLeads = leads.filter((l) => l.isICP === 1).length;
+    const totalEngagedLeads = leads.filter((l) => l.isEngaged === 1).length;
+
+    let newLists = totalLists;
+    let newLeads = totalLeads;
+
+    if (hasDateRange) {
+      newLists = leadLists.filter((l) => {
+        const d = (l.createdAt || "").slice(0, 10);
+        return d >= (startDate as string) && d <= (endDate as string);
+      }).length;
+
+      newLeads = leads.filter((l) => {
+        const d = (l.createdAt || "").slice(0, 10);
+        return d >= (startDate as string) && d <= (endDate as string);
+      }).length;
+    }
+
+    res.json({
+      totalLists,
+      newLists,
+      totalLeads,
+      newLeads,
+      totalICPLeads,
+      totalEngagedLeads,
+    });
+  } catch (error: any) {
+    console.error("Error getting CRM analytics:", error);
+    res.status(500).json({ message: "Error fetching CRM analytics" });
+  }
+});
+
 // Get all GTM plans from all users
 router.get("/gtm-plans", async (req, res) => {
   try {
