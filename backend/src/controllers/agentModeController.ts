@@ -703,11 +703,13 @@ async function runScheduledChat(
     if (expectedFunctionCalls.length > 0) {
       const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
       const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
-      
+
+      // If wildcard is present, all function calls are allowed — skip filtering
+      const allAllowed = allowedFunctionCalls.includes("*");
+
       // Check if all required function calls are allowed
-      // getAllowedFunctionCalls now always returns an array (never null or "*")
       // If the array is empty, it means no functions are allowed (shouldn't happen, but handle it)
-      if (allowedFunctionCalls.length === 0) {
+      if (!allAllowed && allowedFunctionCalls.length === 0) {
         // This shouldn't happen, but if it does, block all function calls
         const disallowedFunctions = expectedFunctionCalls;
         
@@ -753,10 +755,10 @@ async function runScheduledChat(
         return errorResult;
       }
       
-      const disallowedFunctions = expectedFunctionCalls.filter((funcName: string) => 
+      const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
         !allowedFunctionCalls.includes(funcName)
       );
-        
+
       if (disallowedFunctions.length > 0) {
         // Get user info for email
         const { userDb } = await import('../services/db');
