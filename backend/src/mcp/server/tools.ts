@@ -1350,17 +1350,12 @@ mcpToolRegistry.register({
     description: 'List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this to find the right template before creating a task with create_task_from_template.',
     inputSchema: {
       type: 'object',
-      properties: {
-        category: {
-          type: 'string',
-          description: 'Optional: Filter templates by category'
-        }
-      },
+      properties: {},
       required: []
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.listTaskTemplates(args.category);
+    return await agentModeService.listTaskTemplates();
   }
 });
 
@@ -1369,13 +1364,13 @@ mcpToolRegistry.register({
   name: 'create_task_from_template',
   definition: {
     name: 'create_task_from_template',
-    description: 'Create a web automation task using a specific template with the provided parameters',
+    description: 'Create a web automation task using a specific template. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.',
     inputSchema: {
       type: 'object',
       properties: {
         template_id: { 
           type: 'string', 
-          description: 'The ID of the template to use for creating the task' 
+          description: 'The template ID obtained from list_task_templates. Do not guess or fabricate template IDs.'
         },
         parameters_json: { 
           type: 'string', 

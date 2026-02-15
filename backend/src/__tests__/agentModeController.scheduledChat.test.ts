@@ -10,6 +10,7 @@ jest.mock('../services/subscriptionService', () => ({
     'modify_work_plan',
     'set_work_plan_status',
   ]),
+  getAllowedSkills: jest.fn(async () => ['*']),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -30,6 +31,7 @@ jest.mock('../services/agentModeService', () => ({
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
+    installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
   },
 }));
 
@@ -84,10 +86,13 @@ import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb, userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { getAllowedFunctionCalls } from '../services/subscriptionService';
+import { getAllowedFunctionCalls, getAllowedSkills } from '../services/subscriptionService';
+import { skillService } from '../services/skillService';
 import { agentModeController } from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
+const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
+const mockedSkillService = skillService as jest.Mocked<typeof skillService>;
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -2266,6 +2271,222 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       expect(mockEmailService.sendScheduledChatErrorEmail).toHaveBeenCalled();
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('auto-install skills for required functions', () => {
+    it('should auto-install skills that contain required function calls', async () => {
+      const publishedSkills = [
+        { skillId: 'marketing-skill', name: 'Marketing', toolNames: ['get_marketing_tips', 'read_brand_guidelines'] },
+        { skillId: 'research-skill', name: 'Research', toolNames: ['analyze_competitors', 'search_web'] },
+        { skillId: 'unrelated-skill', name: 'Unrelated', toolNames: ['generate_image'] },
+      ];
+      mockedSkillService.getPublishedSkills.mockResolvedValue(publishedSkills as any);
+      mockedGetAllowedSkills.mockResolvedValue(['*']);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should install only skills containing required tools
+      expect(mockAgentModeService.installSkills).toHaveBeenCalledWith(
+        expect.arrayContaining(['marketing-skill', 'research-skill']),
+        mockUserId,
+        'test-session-123'
+      );
+      // Should not install unrelated skill
+      const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
+      expect(installedIds).not.toContain('unrelated-skill');
+    });
+
+    it('should only install subscription-allowed skills', async () => {
+      const publishedSkills = [
+        { skillId: 'marketing-skill', name: 'Marketing', toolNames: ['get_marketing_tips'] },
+        { skillId: 'research-skill', name: 'Research', toolNames: ['analyze_competitors'] },
+      ];
+      mockedSkillService.getPublishedSkills.mockResolvedValue(publishedSkills as any);
+      // Only marketing-skill is allowed
+      mockedGetAllowedSkills.mockResolvedValue(['marketing-skill']);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should only install the allowed skill
+      const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
+      expect(installedIds).toContain('marketing-skill');
+      expect(installedIds).not.toContain('research-skill');
+    });
+
+    it('should not call installSkills when no required functions are specified', async () => {
+      const scheduleNoFunctions = {
+        ...baseSchedule,
+        requiredFunctionCalls: [],
+        keywords: [],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(scheduleNoFunctions);
+
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse,
+        content: 'Some response',
+        toolCalls: [],
+      });
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockAgentModeService.installSkills).not.toHaveBeenCalled();
+    });
+
+    it('should install __other_skills__ when required tools are not in any published skill', async () => {
+      const publishedSkills = [
+        { skillId: 'marketing-skill', name: 'Marketing', toolNames: ['get_marketing_tips'] },
+      ];
+      mockedSkillService.getPublishedSkills.mockResolvedValue(publishedSkills as any);
+      mockedGetAllowedSkills.mockResolvedValue(['*']);
+
+      // analyze_competitors is not in any published skill
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      const installedIds = (mockAgentModeService.installSkills as jest.Mock).mock.calls[0][0];
+      expect(installedIds).toContain('marketing-skill');
+      expect(installedIds).toContain('__other_skills__');
+    });
+
+    it('should handle auto-install errors gracefully and still run the chat', async () => {
+      mockedSkillService.getPublishedSkills.mockRejectedValue(new Error('Skill service down'));
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should still run the chat despite auto-install failure
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
+    });
+  });
+
+  describe('decrement bug fix - function call counts accumulate across attempts', () => {
+    it('should accumulate function call counts across attempts and succeed when all are met', async () => {
+      let callCount = 0;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // First attempt: only get_marketing_tips, missing analyze_competitors
+          return Promise.resolve({
+            ...mockResponse,
+            content: 'Here are some general tips.',
+            toolCalls: [{ name: 'get_marketing_tips', arguments: {} }],
+          });
+        } else {
+          // Second attempt: calls analyze_competitors
+          return Promise.resolve({
+            ...mockResponse,
+            content: 'Here are some marketing strategy and competitor analysis.',
+            toolCalls: [{ name: 'analyze_competitors', arguments: {} }],
+          });
+        }
+      });
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should succeed on second attempt since both functions were called across attempts
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'success',
+          passed: true,
+          functionCallMatches: expect.arrayContaining(['get_marketing_tips', 'analyze_competitors']),
+          functionCallMisses: [],
+        })
+      );
+      // Should have needed exactly 2 attempts
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(2);
     });
   });
 });

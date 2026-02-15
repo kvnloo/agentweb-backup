@@ -1687,6 +1687,16 @@ When a user requests client onboarding or says "onboard new client" or similar:
       const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
       const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
 
+      // Foundation tools must always bypass subscription filtering — they are
+      // core primitives (work plan, search, save) needed by every session.
+      if (!allowedFunctionCalls.includes('*')) {
+        AgentModeService.FOUNDATION_TOOLS.forEach(name => {
+          if (!allowedFunctionCalls.includes(name)) {
+            allowedFunctionCalls.push(name);
+          }
+        });
+      }
+
       // Add all session-associated tools to the allowed list to bypass subscription filtering
       // (skills already installed in the session should remain usable)
       if (precomputedAllowedSkillToolNames && !allowedFunctionCalls.includes('*')) {
@@ -4776,18 +4786,14 @@ Format the response as JSON with this structure:
         }));
     } catch (error) {
       console.error('Error fetching templates:', error);
-      return [];
+      throw error;
     }
   }
 
   // List task templates (used by list_task_templates MCP tool)
-  public async listTaskTemplates(category?: string): Promise<any> {
+  public async listTaskTemplates(): Promise<any> {
     try {
-      let templates = await this.getAvailableTemplates();
-
-      if (category) {
-        templates = templates.filter((t: any) => t.category === category);
-      }
+      const templates = await this.getAvailableTemplates();
 
       if (templates.length === 0) {
         return {

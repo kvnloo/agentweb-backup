@@ -74,28 +74,6 @@ describe('AgentModeService - listTaskTemplates', () => {
     expect(researchTemplate.parameters).toEqual(['competitor_url']);
   });
 
-  it('should filter by category when provided', async () => {
-    mockedTaskTemplateDb.getPublishedTemplates.mockResolvedValue(mockTemplates as any);
-
-    const result = await agentModeService.listTaskTemplates('SEO');
-
-    expect(result.success).toBe(true);
-    expect(result.totalTemplates).toBe(2);
-    expect(result.templates_by_category['SEO']).toHaveLength(2);
-    expect(result.templates_by_category['Research']).toBeUndefined();
-  });
-
-  it('should return empty result when no templates match category filter', async () => {
-    mockedTaskTemplateDb.getPublishedTemplates.mockResolvedValue(mockTemplates as any);
-
-    const result = await agentModeService.listTaskTemplates('Nonexistent');
-
-    expect(result.success).toBe(true);
-    expect(result.totalTemplates).toBe(0);
-    expect(result.templates).toEqual([]);
-    expect(result.message).toBe('No templates are currently available.');
-  });
-
   it('should return empty result when no templates available', async () => {
     mockedTaskTemplateDb.getPublishedTemplates.mockResolvedValue([]);
 
@@ -107,16 +85,14 @@ describe('AgentModeService - listTaskTemplates', () => {
     expect(result.message).toBe('No templates are currently available.');
   });
 
-  it('should handle errors gracefully when getAvailableTemplates fails', async () => {
-    // getAvailableTemplates catches DB errors internally and returns [],
-    // so listTaskTemplates returns an empty result
+  it('should return error when getAvailableTemplates fails', async () => {
     mockedTaskTemplateDb.getPublishedTemplates.mockRejectedValue(new Error('DB connection failed'));
 
     const result = await agentModeService.listTaskTemplates();
 
-    expect(result.success).toBe(true);
-    expect(result.totalTemplates).toBe(0);
-    expect(result.message).toBe('No templates are currently available.');
+    expect(result.success).toBe(false);
+    expect(result.message).toBe('Failed to list task templates');
+    expect(result.error).toBe('DB connection failed');
   });
 
   it('should filter out templates with empty categories', async () => {
