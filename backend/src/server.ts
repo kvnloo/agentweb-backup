@@ -226,13 +226,18 @@ createTestAccount().then(async () => {
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
 
-    // Initialize Agent Mode tools AFTER the server is listening
-    try {
-      console.log('Initializing Agent Mode Tools...');
-      await agentModeService.initialize();
-      console.log('Agent Mode Tools initialized successfully');
-    } catch (error) {
-      console.error('Failed to initialize Agent Mode Tools:', error);
-    }
+    // Initialize Agent Mode tools in background - don't block server startup
+    // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
+    console.log('Initializing Agent Mode Tools (non-blocking)...');
+    agentModeService.initialize()
+      .then(() => {
+        console.log('Agent Mode Tools initialized successfully');
+        // Pre-start the worker process so MCP servers are ready before the first chat message
+        console.log('Pre-starting worker process...');
+        generateMarketingResponseWorkerService.ensureWorkerReady()
+          .then(() => console.log('Worker process pre-started and ready'))
+          .catch((error) => console.error('Failed to pre-start worker process:', error));
+      })
+      .catch((error) => console.error('Failed to initialize Agent Mode Tools:', error));
   });
 }); 

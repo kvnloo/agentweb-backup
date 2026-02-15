@@ -18,15 +18,25 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/subscriptionService', () => ({
   getUserSubscriptionType: jest.fn(async () => 'Pro'),
   getAllowedPages: jest.fn(async () => ['/tasks', '/seo']),
-  getAllowedFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video']),
+  getAllowedSkills: jest.fn(async () => ['skill-1', 'skill-2']),
 }));
 
-import { getUserSubscriptionType, getAllowedPages, getAllowedFunctionCalls } from '../services/subscriptionService';
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn(async () => [
+      { skillId: 'skill-1', name: 'Web Search', description: 'Search the web' },
+      { skillId: 'skill-2', name: 'Image Gen', description: 'Generate images' },
+      { skillId: 'skill-3', name: 'SEO Tools', description: 'SEO analysis' },
+    ]),
+  },
+}));
+
+import { getUserSubscriptionType, getAllowedPages, getAllowedSkills } from '../services/subscriptionService';
 
 const mockedUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockedGetUserSubscriptionType = getUserSubscriptionType as jest.MockedFunction<typeof getUserSubscriptionType>;
 const mockedGetAllowedPages = getAllowedPages as jest.MockedFunction<typeof getAllowedPages>;
-const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
+const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
 
 let app: express.Application;
 
@@ -46,7 +56,7 @@ describe('GET /api/auth/me subscription fields', () => {
     app.use('/api/auth', authRoutes);
   });
 
-  it('includes subscriptionType, allowedPages and allowedFunctionCalls for customer users', async () => {
+  it('includes subscriptionType, allowedPages and allowedSkills for customer users', async () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({
       userId: 'user-1',
       email: 'customer@example.com',
@@ -62,11 +72,14 @@ describe('GET /api/auth/me subscription fields', () => {
     expect(res.body.password).toBeUndefined();
     expect(res.body.subscriptionType).toBe('Pro');
     expect(res.body.allowedPages).toEqual(['/tasks', '/seo']);
-    expect(res.body.allowedFunctionCalls).toEqual(['generate_image', 'generate_video']);
+    expect(res.body.allowedSkills).toEqual([
+      { skillId: 'skill-1', name: 'Web Search' },
+      { skillId: 'skill-2', name: 'Image Gen' },
+    ]);
 
     expect(mockedGetUserSubscriptionType).toHaveBeenCalledWith('user-1');
     expect(mockedGetAllowedPages).toHaveBeenCalledWith('user-1');
-    expect(mockedGetAllowedFunctionCalls).toHaveBeenCalledWith('user-1');
+    expect(mockedGetAllowedSkills).toHaveBeenCalledWith('user-1');
   });
 
   it('does not call subscriptionService for non-customer users', async () => {
@@ -83,10 +96,10 @@ describe('GET /api/auth/me subscription fields', () => {
 
     expect(res.body.subscriptionType).toBeUndefined();
     expect(res.body.allowedPages).toBeUndefined();
-    expect(res.body.allowedFunctionCalls).toBeUndefined();
+    expect(res.body.allowedSkills).toBeUndefined();
 
     expect(mockedGetUserSubscriptionType).not.toHaveBeenCalled();
     expect(mockedGetAllowedPages).not.toHaveBeenCalled();
-    expect(mockedGetAllowedFunctionCalls).not.toHaveBeenCalled();
+    expect(mockedGetAllowedSkills).not.toHaveBeenCalled();
   });
 });

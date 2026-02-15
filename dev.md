@@ -17,7 +17,8 @@
   - `https://api-stage.agentweb.pro/api/auth/clickup/callback` (Staging)
   - `http://localhost:3001/api/auth/clickup/callback` (Development)
 - Waiting for ClickUp approval before proceeding with implementation
-- 
+
+
 # February 12, 2026: PixelFlow Form Tracking Audit — start.waldium.com
 
 ## Pages Checked

@@ -171,6 +171,7 @@ export interface ChatSession {
     adminEmail: string;
     isDelegated: boolean;
   }; // Delegate access info when admin is acting on behalf of a user
+  associatedSkills?: string[]; // List of skill IDs associated for this session
 }
 
 // Interface for context chunks
@@ -437,6 +438,7 @@ export class ChatbotDB {
       emailCampaignTaskId,
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
+      ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
     };
 
     if (pageContent) {
@@ -1159,12 +1161,56 @@ export class ChatbotDB {
       // Remove messages from session object and replace with messages from messages table
       // This ensures we always return the correct format from the messages table
       const { messages: _, ...sessionWithoutMessages } = session;
-      return {
+      const normalizedSession = {
         ...sessionWithoutMessages,
         messages,
       };
+
+      // Normalize associatedSkills to string[] (handles DynamoDB Set wrapper)
+      // Legacy sessions (pre-skills) have no associatedSkills field — preserve undefined
+      // so downstream code can distinguish them from new sessions with associatedSkills: [].
+      if (normalizedSession.associatedSkills && !Array.isArray(normalizedSession.associatedSkills)) {
+        // DynamoDB Set wrapper: { values: [...], type: 'String' }
+        if (typeof normalizedSession.associatedSkills === 'object' && 'values' in (normalizedSession.associatedSkills as any)) {
+          normalizedSession.associatedSkills = (normalizedSession.associatedSkills as any).values;
+        } else {
+          normalizedSession.associatedSkills = Array.from(normalizedSession.associatedSkills as any);
+        }
+      }
+
+      return normalizedSession as ChatSession;
     } catch (error) {
       console.error("Error getting chat session:", error);
+      throw error;
+    }
+  }
+
+  async addAssociatedSkills(sessionId: string, skillIds: string[]): Promise<void> {
+    if (!skillIds || !skillIds.length) return;
+
+    // Read-merge-write: read current skills, deduplicate, write back as a List.
+    // Uses SET (not ADD/list_append) to handle both List and legacy Set attribute types.
+    try {
+      const session = await this.getChatSession(sessionId);
+      const current: string[] = Array.isArray(session?.associatedSkills) ? session!.associatedSkills : [];
+      const currentSet = new Set(current);
+      const newSkills = skillIds.filter(id => !currentSet.has(id));
+      if (newSkills.length === 0) return;
+
+      const merged = [...current, ...newSkills];
+
+      const params = {
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: "SET associatedSkills = :skills",
+        ExpressionAttributeValues: {
+          ":skills": merged,
+        },
+      };
+
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error(`Error adding associated skills for session ${sessionId}:`, error);
       throw error;
     }
   }

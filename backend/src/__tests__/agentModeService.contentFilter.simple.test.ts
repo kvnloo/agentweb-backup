@@ -6,6 +6,17 @@ jest.mock('../services/settingsService');
 jest.mock('../services/db');
 jest.mock('../services/chatbotService');
 jest.mock('../utils/secretsManager');
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsByIds: jest.fn().mockResolvedValue([])
+  }
+}));
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
+  filterFunctionCalls: jest.fn().mockImplementation((tools) => tools)
+}));
 
 describe('AgentModeService - Content Filtering Error Handling', () => {
   let agentModeService: AgentModeService;

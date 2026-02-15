@@ -1002,6 +1002,7 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
+  skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
 }> {
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
@@ -1112,9 +1113,18 @@ export async function generateSessionResponse(
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
+  // Build skills list with installed status (includes virtual other_skills), filtered by subscription
+  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+  try {
+    skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
+  } catch (error) {
+    console.error('AgentMode generateSessionResponse: Failed to fetch skills:', error);
+  }
+
   return {
     ...response,
-    workPlan: finalSession?.workPlan
+    workPlan: finalSession?.workPlan,
+    skills
   };
 }
 
@@ -1279,23 +1289,27 @@ export const agentModeController = {
       }
       const progressActive = hasActiveProgress(session.sessionId);
 
-      // Allow admin users to access any session for benchmark creation
-      if (user && user.isAdmin) {
-        return res.json({ ...session, hasActiveProgress: progressActive });
-      }
-
       // For non-admin users, check if they own the session
-      if (session.userId !== user?.userId) {
+      if (!user?.isAdmin && session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
+      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
+      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      try {
+        skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
+      } catch (error) {
+        console.error('AgentMode getSession: Failed to fetch skills:', error);
+      }
+
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSession = {
         ...session,
         messages: filterMessagesForClient(session.messages),
-        hasActiveProgress: progressActive
+        hasActiveProgress: progressActive,
+        skills
       };
 
       res.json(filteredSession);
@@ -1322,12 +1336,19 @@ export const agentModeController = {
       }
 
       // Extract function names and descriptions
-      const functionCalls = toolsToReturn
+      let functionCalls = toolsToReturn
         .filter((tool: any) => tool?.type === 'function' && tool?.function?.name)
         .map((tool: any) => ({
           name: tool.function.name,
           description: tool.function.description || ''
         }));
+
+      // When fetching for skill configuration, exclude foundation tools
+      // (they're always available and shouldn't be assigned to skills)
+      if (req.query?.forSkillConfig === 'true') {
+        const foundationTools = agentModeService.getFoundationToolNames();
+        functionCalls = functionCalls.filter((fc: any) => !foundationTools.has(fc.name));
+      }
 
       res.json({ functionCalls });
     } catch (error) {
@@ -1376,7 +1397,8 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -1781,6 +1803,14 @@ export const agentModeController = {
         // Continue without supportNote if fetch fails
       }
 
+      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
+      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      try {
+        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
+      } catch (error) {
+        console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
+      }
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1794,7 +1824,8 @@ export const agentModeController = {
           llmModel: modelToUse,
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
-          supportNote: supportNote
+          supportNote: supportNote,
+          skills: sharedSkills
         }
       });
     } catch (error) {
@@ -1855,7 +1886,8 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -3485,7 +3517,8 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);

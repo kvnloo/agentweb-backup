@@ -71,6 +71,12 @@ jest.mock('../services/emailService', () => ({
   },
 }));
 
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+  },
+}));
+
 // Import mocked services
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';

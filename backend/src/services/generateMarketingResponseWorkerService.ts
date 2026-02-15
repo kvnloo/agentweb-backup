@@ -175,6 +175,14 @@ export class GenerateMarketingResponseWorkerService {
   }
 
   /**
+   * Pre-start the worker process so it's ready before the first request.
+   * Called at server startup to avoid cold-start latency on the first chat message.
+   */
+  async ensureWorkerReady(): Promise<void> {
+    await this.ensureWorker();
+  }
+
+  /**
    * Shutdown the worker process
    */
   async shutdown(): Promise<void> {

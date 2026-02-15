@@ -30,6 +30,7 @@ import WorkflowExecutionDetails from './pages/WorkflowExecutionDetails';
 import Release from './pages/Release';
 import Guide from './pages/Guide';
 import Templates from './pages/Templates';
+import Skills from './pages/Skills';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
 import { useEffect } from 'react';
@@ -74,6 +75,14 @@ export default function App() {
                       element={
                         <PartnerRoute>
                           <Templates />
+                        </PartnerRoute>
+                      }
+                    />
+                    <Route
+                      path="skills"
+                      element={
+                        <PartnerRoute>
+                          <Skills />
                         </PartnerRoute>
                       }
                     />

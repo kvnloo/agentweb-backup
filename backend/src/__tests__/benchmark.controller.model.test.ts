@@ -3,12 +3,14 @@ jest.mock('../services/db');
 jest.mock('../services/chatbotService');
 jest.mock('../services/agentModeService');
 jest.mock('../services/generateMarketingResponseWorkerService');
+jest.mock('../services/skillService');
 
 import { Request, Response } from 'express';
 import { benchmarkTestDb } from '../services/db';
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { skillService } from '../services/skillService';
 import {
   createBenchmarkTest,
   runBenchmarkTest,
@@ -23,6 +25,7 @@ const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeSer
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<
   typeof generateMarketingResponseWorkerService
 >;
+const mockSkillService = skillService as jest.Mocked<typeof skillService>;
 
 describe('Benchmark Controller - Model Selection', () => {
   let mockReq: Partial<AuthenticatedRequest>;
@@ -54,6 +57,10 @@ describe('Benchmark Controller - Model Selection', () => {
     // Set default model
     mockAgentModeService.default_model = 'gpt-5-chat-2';
     mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+
+    // Mock skillService for pre-installing skills in runBenchmarkTest
+    mockSkillService.getPublishedSkills.mockResolvedValue([]);
+    mockAgentModeService.installSkills.mockResolvedValue(undefined as any);
   });
 
   describe('createBenchmarkTest', () => {

@@ -3139,12 +3139,44 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
 
 // Subscription Types endpoints
 
+// Get all available skills for subscription configuration
+router.get("/available-skills", async (req, res) => {
+  try {
+    const { skillService } = await import('../services/skillService');
+    const publishedSkills = await skillService.getPublishedSkills();
+    const { agentModeService } = await import('../services/agentModeService');
+
+    const skills = publishedSkills.map((s: any) => ({
+      skillId: s.skillId,
+      name: s.name,
+      description: s.description,
+      toolNames: s.toolNames || []
+    }));
+
+    // Add virtual __other_skills__ entry
+    const unassociatedToolNames = agentModeService.getUnassociatedToolNames(publishedSkills);
+    if (unassociatedToolNames.length > 0) {
+      skills.push({
+        skillId: '__other_skills__',
+        name: 'Other Skills',
+        description: 'Tools not associated with any published skill',
+        toolNames: unassociatedToolNames
+      });
+    }
+
+    res.json(skills);
+  } catch (error) {
+    console.error("Error getting available skills:", error);
+    res.status(500).json({ message: "Error fetching available skills" });
+  }
+});
+
 // Get all subscription types
 router.get("/subscription-types", async (req, res) => {
   try {
     const setting = await settingsService.getSetting("subscription_types");
     let subscriptionTypes = [];
-    
+
     if (setting) {
       try {
         subscriptionTypes = JSON.parse(setting.settingValue);
@@ -3153,21 +3185,21 @@ router.get("/subscription-types", async (req, res) => {
         subscriptionTypes = [];
       }
     }
-    
+
     // Import helper functions to expand "*" to actual lists if needed
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
-    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
-    
+    const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
       subscriptionTypes = [{
         name: "Basic",
         allowedPages: allAvailablePages, // All available pages (expanded)
-        allowedFunctionCalls: allAvailableFunctionCalls // All available function calls (expanded)
+        allowedSkills: allAvailableSkills // All available skills (expanded)
       }];
     }
-    
+
     // Normalize paths: remove "/marketing" prefix from allowedPages (for backward compatibility)
     // Also expand "*" to actual lists if present (for backward compatibility with old data)
     subscriptionTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -3178,25 +3210,26 @@ router.get("/subscription-types", async (req, res) => {
         }
         return page;
       });
-      
+
       // Expand "*" to actual list if present (for backward compatibility)
       if (normalizedPages.includes('*')) {
         normalizedPages = allAvailablePages;
       }
-      
-      // Expand "*" to actual list if present (for backward compatibility)
-      let normalizedFunctionCalls = type.allowedFunctionCalls || [];
-      if (normalizedFunctionCalls.includes('*')) {
-        normalizedFunctionCalls = allAvailableFunctionCalls;
+
+      // Handle allowedSkills with backward compatibility
+      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
+      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      if (normalizedSkills.includes('*')) {
+        normalizedSkills = allAvailableSkills;
       }
-      
+
       return {
-        ...type,
+        name: type.name,
         allowedPages: normalizedPages,
-        allowedFunctionCalls: normalizedFunctionCalls
+        allowedSkills: normalizedSkills
       };
     }));
-    
+
     res.json(subscriptionTypes);
   } catch (error) {
     console.error("Error getting subscription types:", error);
@@ -3208,16 +3241,16 @@ router.get("/subscription-types", async (req, res) => {
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
-    
+
     if (!Array.isArray(subscriptionTypes)) {
       return res.status(400).json({ message: "subscriptionTypes must be an array" });
     }
-    
+
     // Import helper functions to expand "*" to actual lists
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
-    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
-    
+    const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
       if (!type.name || typeof type.name !== "string") {
@@ -3226,10 +3259,10 @@ router.post("/subscription-types", async (req, res) => {
       if (!Array.isArray(type.allowedPages)) {
         throw new Error("Each subscription type must have allowedPages array");
       }
-      if (!Array.isArray(type.allowedFunctionCalls)) {
-        throw new Error("Each subscription type must have allowedFunctionCalls array");
+      if (!Array.isArray(type.allowedSkills)) {
+        throw new Error("Each subscription type must have allowedSkills array");
       }
-      
+
       // Remove "/marketing" prefix from allowedPages if present
       let normalizedPages = type.allowedPages.map((page: string) => {
         if (page.startsWith('/marketing/')) {
@@ -3237,25 +3270,25 @@ router.post("/subscription-types", async (req, res) => {
         }
         return page;
       });
-      
+
       // Expand "*" to actual list of pages
       if (normalizedPages.includes('*')) {
         normalizedPages = allAvailablePages;
       }
-      
-      // Expand "*" to actual list of function calls
-      let normalizedFunctionCalls = type.allowedFunctionCalls || [];
-      if (normalizedFunctionCalls.includes('*')) {
-        normalizedFunctionCalls = allAvailableFunctionCalls;
+
+      // Expand "*" to actual list of skills
+      let normalizedSkills = type.allowedSkills;
+      if (normalizedSkills.includes('*')) {
+        normalizedSkills = allAvailableSkills;
       }
-      
+
       return {
-        ...type,
+        name: type.name,
         allowedPages: normalizedPages,
-        allowedFunctionCalls: normalizedFunctionCalls
+        allowedSkills: normalizedSkills
       };
     }));
-    
+
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(
       "subscription_types",
@@ -3263,7 +3296,7 @@ router.post("/subscription-types", async (req, res) => {
       "Customer portal subscription types configuration",
       updatedBy
     );
-    
+
     res.json({ success: true, subscriptionTypes: normalizedTypes });
   } catch (error: any) {
     console.error("Error saving subscription types:", error);
