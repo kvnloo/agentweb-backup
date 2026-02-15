@@ -1438,11 +1438,31 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  private static readonly INFRASTRUCTURE_TOOLS = new Set(['install_skills']);
+  // Tools that are always available without installing a skill.
+  // install_skills is the skill installer itself; the rest are general-purpose primitives
+  // (search, read, plan, save) that most conversations need regardless of domain.
+  private static readonly FOUNDATION_TOOLS = new Set([
+    'install_skills',
+    'search_web',
+    'read_file_content',
+    'read_page_source',
+    'search_knowledge_base',
+    'list_knowledge_base_files',
+    'read_knowledge_base_files',
+    'create_work_plan',
+    'modify_work_plan',
+    'set_work_plan_status',
+    'save_file',
+    'describe_image',
+  ]);
+
+  // Subset of foundation tools that must execute for real in mock/benchmark mode
+  // because they modify session state (no external side effects).
+  private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
 
   /**
    * Get tools that are not associated with any published skill.
-   * Excludes infrastructure tools (install_skills).
+   * Excludes foundation tools (always available without a skill).
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
     // Collect all tool names used by any published skill
@@ -1455,7 +1475,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     const allTools = this.toolRegistry.getAllTools();
 
     return allTools
-      .filter(tool => !associatedToolNames.has(tool.name) && !AgentModeService.INFRASTRUCTURE_TOOLS.has(tool.name))
+      .filter(tool => !associatedToolNames.has(tool.name) && !AgentModeService.FOUNDATION_TOOLS.has(tool.name))
       .map(tool => ({
         name: tool.name,
         description: tool.definition?.function?.description || ''
@@ -1468,6 +1488,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
    */
   public getUnassociatedToolNames(publishedSkills: any[]): string[] {
     return this.getUnassociatedTools(publishedSkills).map(t => t.name);
+  }
+
+  /**
+   * Get the set of foundation tool names (always available, not assignable to skills).
+   */
+  public getFoundationToolNames(): Set<string> {
+    return AgentModeService.FOUNDATION_TOOLS;
   }
 
   /**
@@ -1506,7 +1533,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean }[]> {
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : Promise.resolve(["*"] as string[])
@@ -1515,13 +1542,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
-    const skills = publishedSkills
+    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = publishedSkills
       .filter(s => isWildcard || allowedSet.has(s.skillId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
         description: s.description,
-        installed: installedIds.has(s.skillId)
+        installed: installedIds.has(s.skillId),
+        toolNames: s.toolNames || []
       }));
 
     // Add virtual other_skills entry if allowed and there are unassociated tools
@@ -1531,8 +1559,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
         skills.push({
           skillId: OTHER_SKILLS_VIRTUAL_ID,
           name: 'Other Skills',
-          description: unassociatedTools.map(t => t.name).join(', '),
-          installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID)
+          description: 'Tools not associated with any specific skill',
+          installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID),
+          toolNames: unassociatedTools.map(t => t.name)
         });
       }
     }
@@ -1605,8 +1634,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     publishedSkills: any[],
     sessionAssociatedSkillIds: string[] = []
   ): { allowedToolNames: Set<string>; installedSkillContextMsg: string } {
-    const allowedToolNames = new Set<string>();
-    allowedToolNames.add('install_skills'); // Always allow install_skills
+    const allowedToolNames = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
 
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
@@ -2749,10 +2777,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
-    // In mock mode, infrastructure tools like install_skills must execute for real
-    // because they only update session state in DynamoDB (no external side effects)
+    // In mock mode, only session-state tools (install_skills) execute for real
+    // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
-    if (mockMode && !AgentModeService.INFRASTRUCTURE_TOOLS.has(toolName)) {
+    if (mockMode && !AgentModeService.MOCK_BYPASS_TOOLS.has(toolName)) {
       return this.getMockToolResult(toolName, args);
     }
 

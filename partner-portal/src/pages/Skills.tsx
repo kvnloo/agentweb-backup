@@ -98,8 +98,7 @@ export default function Skills() {
         headers: { Authorization: `Bearer ${token}` },
       });
       const allTools = (response.data.functionCalls as AvailableTool[]) || [];
-      // Filter out internal/infrastructure tools
-      setAvailableTools(allTools.filter(t => t.name !== 'install_skills'));
+      setAvailableTools(allTools);
     } catch (err) {
       console.error("Failed to fetch available tools", err);
     }

@@ -1002,7 +1002,7 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
-  skills?: { skillId: string; name: string; description: string; installed: boolean }[];
+  skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
 }> {
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
@@ -1114,7 +1114,7 @@ export async function generateSessionResponse(
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
   // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-  let skills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
+  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
   try {
     skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
   } catch (error) {
@@ -1297,7 +1297,7 @@ export const agentModeController = {
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let skills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
+      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
       try {
         skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {
@@ -1336,12 +1336,19 @@ export const agentModeController = {
       }
 
       // Extract function names and descriptions
-      const functionCalls = toolsToReturn
+      let functionCalls = toolsToReturn
         .filter((tool: any) => tool?.type === 'function' && tool?.function?.name)
         .map((tool: any) => ({
           name: tool.function.name,
           description: tool.function.description || ''
         }));
+
+      // When fetching for skill configuration, exclude foundation tools
+      // (they're always available and shouldn't be assigned to skills)
+      if (req.query?.forSkillConfig === 'true') {
+        const foundationTools = agentModeService.getFoundationToolNames();
+        functionCalls = functionCalls.filter((fc: any) => !foundationTools.has(fc.name));
+      }
 
       res.json({ functionCalls });
     } catch (error) {
@@ -1797,7 +1804,7 @@ export const agentModeController = {
       }
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
+      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
       try {
         sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {
