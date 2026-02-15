@@ -15,6 +15,8 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { skillService } from '../services/skillService';
+import { getAllowedSkills } from '../services/subscriptionService';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -435,6 +437,42 @@ export async function runVerifiedChat(
   }
   const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
 
+  // Auto-install skills that contain required function calls so the LLM has
+  // access to them from the start (avoids relying on the LLM to call install_skills).
+  if (requiredFunctions.length > 0) {
+    try {
+      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+        skillService.getPublishedSkills(),
+        getAllowedSkills(userId)
+      ]);
+      const isWildcard = userAllowedSkillIds.includes('*');
+      const requiredToolNames = new Set(requiredFunctions.map(rf => rf.functionName));
+
+      // Find skills that contain any of the required tools and are allowed
+      const skillIdsToInstall: string[] = [];
+      for (const skill of publishedSkills) {
+        const hasRequiredTool = skill.toolNames?.some(t => requiredToolNames.has(t));
+        const isAllowed = isWildcard || userAllowedSkillIds.includes(skill.skillId);
+        if (hasRequiredTool && isAllowed) {
+          skillIdsToInstall.push(skill.skillId);
+        }
+      }
+
+      // Also check if any required tools are "other" (not in any published skill)
+      const allSkillToolNames = new Set(publishedSkills.flatMap(s => s.toolNames || []));
+      const hasOtherTools = [...requiredToolNames].some(t => !allSkillToolNames.has(t));
+      if (hasOtherTools && (isWildcard || userAllowedSkillIds.includes('__other_skills__'))) {
+        skillIdsToInstall.push('__other_skills__');
+      }
+
+      if (skillIdsToInstall.length > 0) {
+        await agentModeService.installSkills(skillIdsToInstall, userId, sessionId);
+      }
+    } catch (error) {
+      console.error('AgentMode runVerifiedChat: Error auto-installing skills for required functions:', error);
+    }
+  }
+
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
   const remainingFunctionCallCounts: Record<string, number> = {};
@@ -468,13 +506,18 @@ export async function runVerifiedChat(
           const keywordText = remainingKeywords.length > 0
             ? `include these keywords: ${remainingKeywords.join(', ')}`
             : '';
+          // Use allActualFunctionCallsForReporting (never decremented) to avoid
+          // asking the LLM to re-call tools that already ran. The evaluation at
+          // lines 558-563 decrements allActualFunctionCalls when a function is
+          // matched, which zeroes out counts of already-called functions when the
+          // overall check fails due to a single missing function.
           const functionCallText = requiredFunctions
             .filter(reqFunc => {
-              const currentCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
               return currentCount < reqFunc.minCount;
             })
             .map(reqFunc => {
-              const currentCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
               const remaining = reqFunc.minCount - currentCount;
               return `${reqFunc.functionName} (${remaining} more time${remaining > 1 ? 's' : ''} needed)`;
             })

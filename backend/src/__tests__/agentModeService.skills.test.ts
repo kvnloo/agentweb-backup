@@ -451,10 +451,12 @@ describe('AgentModeService - Skills', () => {
       // Mock tools for getFilteredTools tests
       const mockTools = [
         { name: 'read_brand_guidelines', definition: { function: { name: 'read_brand_guidelines', description: 'desc' } } },
-        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } }
+        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
+        { name: 'create_work_plan', definition: { function: { name: 'create_work_plan', description: 'Create work plan' } } },
+        { name: 'search_web', definition: { function: { name: 'search_web', description: 'Search the web' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
-      
+
       await agentModeService.initialize();
     });
 
@@ -501,6 +503,35 @@ describe('AgentModeService - Skills', () => {
       // Result should be filtered based on precomputed names
       expect(result).toBeDefined();
       const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).toContain('read_brand_guidelines');
+    });
+
+    it('should include foundation tools for legacy sessions even when subscription is restrictive', async () => {
+      // Legacy sessions pass undefined for precomputedAllowedSkillToolNames,
+      // so all tools pass the context filter. But a restrictive subscription
+      // would strip foundation tools. The fix ensures FOUNDATION_TOOLS are
+      // always added to allowedFunctionCalls before the subscription filter.
+      const { resolveSkillsToToolNames, filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
+      // Subscription only allows read_brand_guidelines (no foundation tools)
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(['read_brand_guidelines']);
+      // Use realistic filter: only pass tools whose name is in allowed list
+      (mockFilterFn as jest.Mock).mockImplementationOnce((tools: any[], allowed: string[]) => {
+        if (allowed.includes('*')) return tools;
+        return tools.filter((t: any) => {
+          const name = t.function?.name || t.name;
+          return !name || allowed.includes(name);
+        });
+      });
+
+      // Legacy session: no precomputed names (undefined)
+      const result = await agentModeService.getFilteredTools('user-123', undefined);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      // Foundation tools should bypass subscription filter
+      expect(toolNames).toContain('create_work_plan');
+      expect(toolNames).toContain('search_web');
+      expect(toolNames).toContain('install_skills');
+      // Non-foundation tool allowed by subscription should also be present
       expect(toolNames).toContain('read_brand_guidelines');
     });
   });
