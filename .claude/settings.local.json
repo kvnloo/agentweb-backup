@@ -78,7 +78,9 @@
       "WebFetch(domain:start.waldium.com)",
       "WebFetch(domain:slrgkgulru.pixelflow.so)",
       "WebFetch(domain:docs.pixelflow.so)",
-      "Bash(npm ls:*)"
+      "Bash(npm ls:*)",
+      "WebFetch(domain:elasticbeanstalk-us-west-2-992382574572.s3.us-west-2.amazonaws.com)",
+      "Bash(unzip:*)"
     ]
   }
 }
