@@ -54,7 +54,7 @@ describe('AgentModeService - Tool Descriptions', () => {
       expect(createTaskFromTemplate).toBeDefined();
       expect(createTaskFromTemplate?.function?.description).toContain('web automation task');
       expect(createTaskFromTemplate?.function?.description).toBe(
-        'Create a web automation task using a specific template with the provided parameters'
+        'Create a web automation task using a specific template. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.'
       );
     });
 
