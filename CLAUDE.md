@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Working Directory Rule
+
+**NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/ruiwang/Documents/GitHub/agentweb/` — always use the actual working directory (e.g. `/Users/ruiwang/Documents/GitHub/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
+
 ## Core Architecture
 
 AgentWeb is a multi-tenant web automation platform with three main components:
@@ -10,7 +14,7 @@ AgentWeb is a multi-tenant web automation platform with three main components:
 2. **Agent Engine (Python)** - Browser automation engine using browser-use library and playwright
 3. **Frontend Applications (React/TypeScript)**:
    - Partner Portal (admin/partner interface) - in this repo at `partner-portal/`
-   - Customer Portal (end-user interface) - separate repo
+   - Customer Portal (end-user interface) - in this repo at `customer-portal/`
    - Growth Genius Chat - separate repo
 
 ### Data Flow
