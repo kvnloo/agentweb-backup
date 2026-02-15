@@ -68,6 +68,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatResultEmail: jest.fn(),
     sendDailyDigestEmail: jest.fn(),
     sendScheduledChatVariableRequestEmail: jest.fn(),
+    sendScheduledChatErrorEmail: jest.fn(),
   },
 }));
 
@@ -83,7 +84,10 @@ import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb, userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { getAllowedFunctionCalls } from '../services/subscriptionService';
 import { agentModeController } from '../controllers/agentModeController';
+
+const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -2181,6 +2185,87 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       // Should only return scheduled_chat type
       expect(mockRes.json).toHaveBeenCalledWith([scheduledChat]);
+    });
+  });
+
+  describe('subscription wildcard handling', () => {
+    const makeReqRes = () => {
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+      } as unknown as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+      return { mockReq, mockRes };
+    };
+
+    it('should allow scheduled chat to run when subscription returns wildcard ["*"]', async () => {
+      // Override the mock to return wildcard
+      mockedGetAllowedFunctionCalls.mockResolvedValueOnce(['*']);
+
+      const successfulResponse = {
+        ...mockResponse,
+        content: 'Here are some marketing strategy and tips for your business.',
+        toolCalls: [
+          { name: 'get_marketing_tips', arguments: {} },
+          { name: 'analyze_competitors', arguments: {} },
+        ],
+      };
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(successfulResponse);
+
+      const { mockReq, mockRes } = makeReqRes();
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should NOT send error email — wildcard means all tools are allowed
+      expect(mockEmailService.sendScheduledChatErrorEmail).not.toHaveBeenCalled();
+
+      // Should have run successfully (worker was called)
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalled();
+
+      // Response should indicate success, not subscription failure
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'success',
+        })
+      );
+    });
+
+    it('should block scheduled chat and send error email when required tools are disallowed', async () => {
+      // Override the mock to return a restricted set missing 'analyze_competitors'
+      mockedGetAllowedFunctionCalls.mockResolvedValueOnce(['get_marketing_tips', 'create_work_plan']);
+
+      // Set up schedule with email notifications
+      mockScheduleDb.getScheduleById.mockResolvedValueOnce({
+        ...baseSchedule,
+        requiredFunctionCalls: ['get_marketing_tips', 'analyze_competitors'],
+        emailNotifications: ['test@example.com'],
+      });
+
+      const { mockReq, mockRes } = makeReqRes();
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      // Should send error email because analyze_competitors is not allowed
+      expect(mockEmailService.sendScheduledChatErrorEmail).toHaveBeenCalledWith(
+        ['test@example.com'],
+        baseSchedule.scheduleName,
+        ['analyze_competitors'],
+        baseSchedule.scheduleId
+      );
+
+      // Should not have called the worker
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+    });
+
+    it('should block scheduled chat when subscription returns empty array', async () => {
+      mockedGetAllowedFunctionCalls.mockResolvedValueOnce([]);
+
+      const { mockReq, mockRes } = makeReqRes();
+      await agentModeController.testScheduledChat(mockReq, mockRes);
+
+      expect(mockEmailService.sendScheduledChatErrorEmail).toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
     });
   });
 });
