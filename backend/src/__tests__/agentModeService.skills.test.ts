@@ -572,4 +572,96 @@ describe('AgentModeService - Skills', () => {
       expect(messages[1].content).toContain('NEW LIST');
     });
   });
+
+  describe('getFoundationToolNames', () => {
+    it('should return a Set containing foundation tool names', () => {
+      const foundationTools = agentModeService.getFoundationToolNames();
+
+      expect(foundationTools).toBeInstanceOf(Set);
+      expect(foundationTools.has('install_skills')).toBe(true);
+      expect(foundationTools.has('search_web')).toBe(true);
+      expect(foundationTools.has('read_file_content')).toBe(true);
+      expect(foundationTools.has('read_page_source')).toBe(true);
+      expect(foundationTools.has('search_knowledge_base')).toBe(true);
+      expect(foundationTools.has('list_knowledge_base_files')).toBe(true);
+      expect(foundationTools.has('read_knowledge_base_files')).toBe(true);
+      expect(foundationTools.has('create_work_plan')).toBe(true);
+      expect(foundationTools.has('modify_work_plan')).toBe(true);
+      expect(foundationTools.has('set_work_plan_status')).toBe(true);
+      expect(foundationTools.has('save_file')).toBe(true);
+      expect(foundationTools.has('describe_image')).toBe(true);
+    });
+
+    it('should not contain domain-specific tools', () => {
+      const foundationTools = agentModeService.getFoundationToolNames();
+
+      expect(foundationTools.has('generate_image')).toBe(false);
+      expect(foundationTools.has('create_blog_article')).toBe(false);
+      expect(foundationTools.has('create_social_media_posts')).toBe(false);
+    });
+  });
+
+  describe('getSkillsForDisplay', () => {
+    it('should return published skills with installed status and toolNames', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true },
+        { skillId: 'skill-2', name: 'Image Gen', description: 'Image tools', toolNames: ['generate_image'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const result = await agentModeService.getSkillsForDisplay(['skill-1'], 'user-1');
+
+      expect(result).toEqual(expect.arrayContaining([
+        expect.objectContaining({ skillId: 'skill-1', name: 'Web Search', installed: true, toolNames: ['search_web'] }),
+        expect.objectContaining({ skillId: 'skill-2', name: 'Image Gen', installed: false, toolNames: ['generate_image'] }),
+      ]));
+    });
+
+    it('should filter skills by subscription when not wildcard', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Allowed Skill', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        { skillId: 'skill-2', name: 'Blocked Skill', description: 'Desc', toolNames: ['tool2'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['skill-1']);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'user-1');
+
+      expect(result.some(s => s.skillId === 'skill-1')).toBe(true);
+      expect(result.some(s => s.skillId === 'skill-2')).toBe(false);
+    });
+
+    it('should return all skills when no userId provided (wildcard default)', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+
+      const result = await agentModeService.getSkillsForDisplay([]);
+
+      expect(result.some(s => s.skillId === 'skill-1')).toBe(true);
+    });
+
+    it('should include __other_skills__ virtual entry when allowed', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      // Mock the tool registry to have some tools
+      const mockToolRegistry = (agentModeService as any).toolRegistry;
+      mockToolRegistry.getAllTools.mockReturnValue([
+        { name: 'orphan_tool', definition: { function: { description: 'An orphan tool' } } },
+      ]);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'user-1');
+
+      const otherSkill = result.find(s => s.skillId === '__other_skills__');
+      expect(otherSkill).toBeDefined();
+      expect(otherSkill!.name).toBe('Other Skills');
+      expect(otherSkill!.toolNames).toContain('orphan_tool');
+    });
+  });
 });

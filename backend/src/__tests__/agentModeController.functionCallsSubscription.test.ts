@@ -16,10 +16,12 @@ jest.mock('../services/agentModeService', () => ({
     getAvailableTools: () => [
       { type: 'function', function: { name: 'generate_image', description: 'Generate images' } },
       { type: 'function', function: { name: 'generate_video', description: 'Generate videos' } },
+      { type: 'function', function: { name: 'search_web', description: 'Search the web' } },
       { type: 'function', function: { description: 'Missing name' } },
       { type: 'function' },
       { type: 'non-function', other: true },
     ],
+    getFoundationToolNames: () => new Set(['search_web']),
   },
 }));
 
@@ -86,7 +88,39 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
       functionCalls: [
         { name: 'generate_image', description: 'Generate images' },
         { name: 'generate_video', description: 'Generate videos' },
+        { name: 'search_web', description: 'Search the web' },
       ],
     });
+  });
+
+  it('should exclude foundation tools when forSkillConfig=true', async () => {
+    const req = {
+      user: { userId: 'admin-1', isAdmin: true },
+      query: { forSkillConfig: 'true' },
+    } as unknown as Request;
+    const res = makeRes();
+
+    await agentModeController.getAvailableFunctionCalls(req, res);
+
+    // Foundation tools (search_web) should be excluded
+    expect(res.json).toHaveBeenCalledWith({
+      functionCalls: [
+        { name: 'generate_image', description: 'Generate images' },
+        { name: 'generate_video', description: 'Generate videos' },
+      ],
+    });
+  });
+
+  it('should include foundation tools when forSkillConfig is not set', async () => {
+    const req = {
+      user: { userId: 'admin-1', isAdmin: true },
+      query: {},
+    } as unknown as Request;
+    const res = makeRes();
+
+    await agentModeController.getAvailableFunctionCalls(req, res);
+
+    const response = (res.json as jest.Mock).mock.calls[0][0];
+    expect(response.functionCalls.some((fc: any) => fc.name === 'search_web')).toBe(true);
   });
 });

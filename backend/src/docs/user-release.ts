@@ -7,6 +7,20 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-15',
+    changes: [
+      'Agent Skills Infrastructure',
+      '- Subscription access control now operates at the skill level instead of individual function calls',
+      '- Admins configure allowed skills per subscription type; each skill groups related tools together',
+      '- Agent Mode enforces a skill-first workflow: foundation tools are always available, other tools require installing the relevant skill',
+      '- Foundation tools (search, read, plan, save) are available in every session without installing a skill',
+      '- Skills popover in Agent Mode now shows tool names when a skill is expanded',
+      '- Settings page displays allowed skills instead of raw function call names',
+      '- Worker process now pre-starts at server boot so MCP servers are ready before the first chat message',
+      '- Backward compatible with existing sessions created before the skills system',
+    ],
+  },
+  {
     date: '2026-02-14',
     changes: [
       'Faster Admin Overview Tab Loading',
