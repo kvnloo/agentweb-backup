@@ -1113,10 +1113,10 @@ export async function generateSessionResponse(
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
-  // Build skills list with installed status (includes virtual other_skills)
+  // Build skills list with installed status (includes virtual other_skills), filtered by subscription
   let skills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
   try {
-    skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || []);
+    skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
   } catch (error) {
     console.error('AgentMode generateSessionResponse: Failed to fetch skills:', error);
   }
@@ -1289,22 +1289,17 @@ export const agentModeController = {
       }
       const progressActive = hasActiveProgress(session.sessionId);
 
-      // Allow admin users to access any session for benchmark creation
-      if (user && user.isAdmin) {
-        return res.json({ ...session, hasActiveProgress: progressActive });
-      }
-
       // For non-admin users, check if they own the session
-      if (session.userId !== user?.userId) {
+      if (!user?.isAdmin && session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
-      // Build skills list with installed status (includes virtual other_skills)
+      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
       let skills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
       try {
-        skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || []);
+        skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {
         console.error('AgentMode getSession: Failed to fetch skills:', error);
       }
@@ -1801,10 +1796,10 @@ export const agentModeController = {
         // Continue without supportNote if fetch fails
       }
 
-      // Build skills list with installed status (includes virtual other_skills)
+      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
       let sharedSkills: { skillId: string; name: string; description: string; installed: boolean }[] = [];
       try {
-        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || []);
+        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {
         console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
       }

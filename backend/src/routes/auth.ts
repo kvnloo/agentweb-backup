@@ -54,10 +54,11 @@ router.get('/me', authenticateToken, async (req, res) => {
       };
     }
 
-    // Add subscription type, allowed pages, and allowed function calls for customer portal users
+    // Add subscription type, allowed pages, and allowed skills for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
-        const { getUserSubscriptionType, getAllowedPages, getAllowedFunctionCalls } = await import('../services/subscriptionService');
+        const { getUserSubscriptionType, getAllowedPages, getAllowedSkills } = await import('../services/subscriptionService');
+        const { skillService } = await import('../services/skillService');
 
         const subscriptionTypeName = await getUserSubscriptionType(userId);
 
@@ -66,15 +67,29 @@ router.get('/me', authenticateToken, async (req, res) => {
         // Get allowed pages (expands "*" to actual list)
         response.allowedPages = await getAllowedPages(userId);
 
-        // Get allowed function calls (expands "*" to actual list)
-        response.allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+        // Get allowed skills resolved to { skillId, name } for display
+        const allowedSkillIds = await getAllowedSkills(userId);
+        const publishedSkills = await skillService.getPublishedSkills();
+        const isWildcard = allowedSkillIds.includes("*");
+        const allowedSet = new Set(allowedSkillIds);
+
+        const skills = publishedSkills
+          .filter((s: any) => isWildcard || allowedSet.has(s.skillId))
+          .map((s: any) => ({ skillId: s.skillId, name: s.name }));
+
+        // Include virtual __other_skills__ entry if allowed
+        if (isWildcard || allowedSet.has('__other_skills__')) {
+          skills.push({ skillId: '__other_skills__', name: 'Other Skills' });
+        }
+
+        response.allowedSkills = skills;
       } catch (error) {
         console.error('Error fetching subscription info:', error);
-        // Default to Basic subscription with all pages and function calls on error
-        const { getAllowedPages, getAllowedFunctionCalls } = await import('../services/subscriptionService');
+        // Default to Basic subscription with all pages and all skills on error
+        const { getAllowedPages } = await import('../services/subscriptionService');
         response.subscriptionType = 'Basic';
         response.allowedPages = await getAllowedPages(userId);
-        response.allowedFunctionCalls = await getAllowedFunctionCalls(userId);
+        response.allowedSkills = [];
       }
     }
 

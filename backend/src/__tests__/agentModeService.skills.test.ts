@@ -26,7 +26,8 @@ jest.mock('../services/chatbotService', () => ({
 
 // Mock subscriptionService
 jest.mock('../services/subscriptionService', () => ({
-  getAllowedFunctionCalls: jest.fn().mockResolvedValue(['*']),
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
   filterFunctionCalls: jest.fn().mockImplementation((tools) => tools),
 }));
 
@@ -99,7 +100,7 @@ describe('AgentModeService - Skills', () => {
         'session-123'
       );
 
-      expect(result.message).toContain('No valid skills found');
+      expect(result.message).toContain('not available with your current subscription');
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
 
@@ -243,14 +244,15 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('tool2')).toBe(true);
     });
 
-    it('should filter tools by user subscription', () => {
+    it('should filter tools by user subscription (skill-level)', () => {
       const skills = [
-        { skillId: 's1', name: 'Skill', toolNames: ['tool1', 'tool2', 'tool3'], description: '', isPublished: true },
+        { skillId: 's1', name: 'Skill A', toolNames: ['tool1', 'tool2'], description: '', isPublished: true },
+        { skillId: 's2', name: 'Skill B', toolNames: ['tool3'], description: '', isPublished: true },
       ];
-      // User only has access to tool1 and tool2
-      const userAllowedTools = ['tool1', 'tool2'];
+      // User only has access to skill s1 (not s2)
+      const userAllowedSkillIds = ['s1'];
 
-      const result = (agentModeService as any).buildSkillContext(skills, userAllowedTools, [], []);
+      const result = (agentModeService as any).buildSkillContext(skills, userAllowedSkillIds, [], []);
 
       expect(result.allowedToolNames.has('tool1')).toBe(true);
       expect(result.allowedToolNames.has('tool2')).toBe(true);

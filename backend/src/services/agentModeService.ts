@@ -16,7 +16,7 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
-import { getAllowedFunctionCalls, filterFunctionCalls } from './subscriptionService';
+import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -519,12 +519,12 @@ export class AgentModeService {
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       let [
         currentSession,
-        userAllowedTools,
+        userAllowedSkillIds,
         publishedSkills,
         baseSystemPrompt
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
-        getAllowedFunctionCalls(userId),
+        getAllowedSkills(userId),
         skillService.getPublishedSkills(),
         this.getMarketingSystemPrompt()
       ]);
@@ -533,8 +533,12 @@ export class AgentModeService {
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
       // 2. Initialize Context Variables
+      // Legacy sessions (created before skills system) have associatedSkills === undefined/null.
+      // New sessions have associatedSkills initialized as [] and enforce skill-first flow.
+      const rawAssociatedSkills = currentSession?.associatedSkills;
+      const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
       let associatedSkills: any[] = [];
-      const sessionAssociatedSkillIds = currentSession?.associatedSkills || [];
+      const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
       if (sessionAssociatedSkillIds.length) {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
@@ -542,13 +546,13 @@ export class AgentModeService {
       console.log(`[Benchmark Debug] sessionId=${sessionId}, mockMode=${mockMode}, publishedSkills=${publishedSkills.length}, sessionAssociatedSkillIds=[${sessionAssociatedSkillIds.join(', ')}], associatedSkills=${associatedSkills.length}`);
 
       // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedTools, publishedSkills, sessionAssociatedSkillIds);
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
       // 3. Build Initial Messages
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
 
-      // Build the "Available Skills" message (excluding already-associated skills)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds);
+      // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
+      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds);
 
       console.log(`[Benchmark Debug] allowedToolNames=[${[...allowedToolNames].join(', ')}]`);
       console.log(`[Benchmark Debug] availableSkillContextMsg=${availableSkillContextMsg ? 'present (' + availableSkillContextMsg.length + ' chars)' : 'EMPTY'}`);
@@ -597,12 +601,12 @@ export class AgentModeService {
                 }
                 
                 // Re-build context using helper
-                const skillContext = this.buildSkillContext(associatedSkills, userAllowedTools, publishedSkills, updatedAssociatedSkillIds);
+                const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds);
                 allowedToolNames = skillContext.allowedToolNames;
                 installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
-                // Rebuild available skills (excluding newly associated ones)
-                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds);
+                // Rebuild available skills (excluding newly associated ones, filtered by subscription)
+                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds);
 
                 // Update messages using helper
                 this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
@@ -624,8 +628,12 @@ export class AgentModeService {
         }
 
         // 5. Get Tools (Cached)
+        // Legacy sessions (pre-skills): skip skill filtering, return all subscription-allowed tools.
+        // New sessions: use skill-based filtering. When no skills are installed, only install_skills
+        // is in allowedToolNames, forcing the LLM to install a skill first.
         if (!filteredToolsCache) {
-             filteredToolsCache = await this.getFilteredTools(userId, allowedToolNames, userAllowedTools);
+             const skillFilter = isLegacySession ? undefined : allowedToolNames;
+             filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
         }
 
         // Make LLM call
@@ -703,8 +711,12 @@ export class AgentModeService {
             // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
             // LLMs may hallucinate tool calls from conversation history even when the tool
             // isn't in the current tools list. Return an error so the LLM learns to install skills first.
-            // Only enforce when the skills system is active (published skills exist).
-            if (publishedSkills.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
+            // Only enforce when:
+            //   1. The skills system is active (published skills exist), AND
+            //   2. The session was created with the skills system (has associatedSkills).
+            // Sessions created before the skills implementation have no associatedSkills
+            // and should retain access to all tools for backward compatibility.
+            if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               console.log(`[Benchmark Debug] BLOCKED tool call "${toolCall.function.name}" — not in allowedToolNames=[${[...allowedToolNames].join(', ')}]`);
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
@@ -1451,21 +1463,32 @@ When a user requests client onboarding or says "onboard new client" or similar:
   }
 
   /**
-   * Build the "Available Skills" context message, excluding skills already associated with the session.
+   * Get tool names not associated with any published skill (excludes infrastructure tools).
+   * Public version of getUnassociatedTools for use by subscriptionService.resolveSkillsToToolNames.
    */
-  private buildAvailableSkillsMessage(publishedSkills: any[], associatedSkillIds: string[]): string {
+  public getUnassociatedToolNames(publishedSkills: any[]): string[] {
+    return this.getUnassociatedTools(publishedSkills).map(t => t.name);
+  }
+
+  /**
+   * Build the "Available Skills" context message, excluding skills already associated with the session.
+   * Only shows skills the user's subscription allows.
+   */
+  private buildAvailableSkillsMessage(publishedSkills: any[], associatedSkillIds: string[], userAllowedSkillIds: string[] = ["*"]): string {
     const associatedSet = new Set(associatedSkillIds);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
     const skillEntries: string[] = [];
 
-    // Add published skills that are NOT already associated
+    // Add published skills that are NOT already associated AND are allowed by subscription
     publishedSkills.forEach(s => {
-      if (!associatedSet.has(s.skillId)) {
+      if (!associatedSet.has(s.skillId) && (isWildcard || allowedSet.has(s.skillId))) {
         skillEntries.push(`${s.skillId}- ${s.name}: ${s.description}: Tools: ${s.toolNames?.join(', ')}`);
       }
     });
 
-    // Add virtual other_skills if there are unassociated tools AND it's not already installed
-    if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
+    // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
+    if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
 
       if (unassociatedTools.length > 0) {
@@ -1481,28 +1504,37 @@ When a user requests client onboarding or says "onboard new client" or similar:
   }
 
   /**
-   * Get all skills (published + virtual other_skills) with installed status for UI display.
+   * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[]): Promise<{ skillId: string; name: string; description: string; installed: boolean }[]> {
-    const publishedSkills = await skillService.getPublishedSkills();
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean }[]> {
+    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      skillService.getPublishedSkills(),
+      userId ? getAllowedSkills(userId) : Promise.resolve(["*"] as string[])
+    ]);
     const installedIds = new Set(associatedSkillIds);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
 
-    const skills = publishedSkills.map(s => ({
-      skillId: s.skillId,
-      name: s.name,
-      description: s.description,
-      installed: installedIds.has(s.skillId)
-    }));
+    const skills = publishedSkills
+      .filter(s => isWildcard || allowedSet.has(s.skillId))
+      .map(s => ({
+        skillId: s.skillId,
+        name: s.name,
+        description: s.description,
+        installed: installedIds.has(s.skillId)
+      }));
 
-    // Add virtual other_skills entry if there are unassociated tools
-    const unassociatedTools = this.getUnassociatedTools(publishedSkills);
-    if (unassociatedTools.length > 0) {
-      skills.push({
-        skillId: OTHER_SKILLS_VIRTUAL_ID,
-        name: 'Other Skills',
-        description: unassociatedTools.map(t => t.name).join(', '),
-        installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID)
-      });
+    // Add virtual other_skills entry if allowed and there are unassociated tools
+    if (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
+      const unassociatedTools = this.getUnassociatedTools(publishedSkills);
+      if (unassociatedTools.length > 0) {
+        skills.push({
+          skillId: OTHER_SKILLS_VIRTUAL_ID,
+          name: 'Other Skills',
+          description: unassociatedTools.map(t => t.name).join(', '),
+          installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID)
+        });
+      }
     }
 
     return skills;
@@ -1510,12 +1542,22 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
-        const publishedSkills = await skillService.getPublishedSkills();
+        const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+          skillService.getPublishedSkills(),
+          getAllowedSkills(userId)
+        ]);
+
+        const isWildcard = userAllowedSkillIds.includes("*");
+        const allowedSkillSet = new Set(userAllowedSkillIds);
 
         // Filter valid IDs: exists in published skills OR is the virtual other_skills ID
+        // AND is allowed by user's subscription
         const validSkillIds = skillIds.filter(id =>
-          id === OTHER_SKILLS_VIRTUAL_ID || publishedSkills.some(s => s.skillId === id)
+          (id === OTHER_SKILLS_VIRTUAL_ID || publishedSkills.some(s => s.skillId === id)) &&
+          (isWildcard || allowedSkillSet.has(id))
         );
+
+        const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
 
         const installedNames: string[] = [];
 
@@ -1534,14 +1576,23 @@ When a user requests client onboarding or says "onboard new client" or similar:
         }
 
         if (!installedNames.length) {
+          if (rejectedSkillIds.length > 0) {
+            return { message: "The requested skills are not available with your current subscription." };
+          }
           return { message: "No valid skills found for the provided IDs." };
         }
 
-        return {
+        const result: any = {
           success: true,
           message: `Successfully installed ${installedNames.length} skill(s).`,
           installedSkills: installedNames
         };
+
+        if (rejectedSkillIds.length > 0) {
+          result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        }
+
+        return result;
     } catch (error) {
         console.error('AgentMode: Error in installSkills:', error);
         return { message: "An error occurred while installing skills." };
@@ -1550,27 +1601,31 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   private buildSkillContext(
     associatedSkills: any[],
-    userAllowedTools: string[],
+    userAllowedSkillIds: string[],
     publishedSkills: any[],
     sessionAssociatedSkillIds: string[] = []
   ): { allowedToolNames: Set<string>; installedSkillContextMsg: string } {
     const allowedToolNames = new Set<string>();
     allowedToolNames.add('install_skills'); // Always allow install_skills
 
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSkillSet = new Set(userAllowedSkillIds);
+
     if (associatedSkills.length) {
       associatedSkills.forEach(s => {
-        if (s.toolNames) {
-          s.toolNames.forEach((t: string) => {
-            if (userAllowedTools.includes(t) || userAllowedTools.includes('*')) {
+        // Check if the skill itself is allowed by subscription (skill-level gating)
+        if (isWildcard || allowedSkillSet.has(s.skillId)) {
+          if (s.toolNames) {
+            s.toolNames.forEach((t: string) => {
               allowedToolNames.add(t);
-            }
-          });
+            });
+          }
         }
       });
     }
 
-    // Handle virtual other_skills
-    if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID)) {
+    // Handle virtual other_skills (gated by subscription)
+    if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
@@ -1592,42 +1647,40 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Get filtered tools based on user's subscription type AND session state
   // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
   public async getFilteredTools(
-    userId: string, 
+    userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
-    precomputedAllowedAllFunctionCalls?: string[]  // New parameter to avoid duplicate getAllowedFunctionCalls call
+    precomputedAllowedSkillIds?: string[]  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call
   ): Promise<any[]> {
     try {
-      
-      if (precomputedAllowedSkillToolNames) {
-        // 1. Get all internal tool objects (flat structure with .name)
-        const allInternalTools = this.toolRegistry.getAllTools();
 
-        // 3. Filter the internal tool objects
-        const contextAwareTools = allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name));
+      // 1. Get all internal tool objects (flat structure with .name)
+      const allInternalTools = this.toolRegistry.getAllTools();
 
-        // 4. Map back to wire-format definitions for the LLM
-        const definitions = contextAwareTools.map(t => t.definition);
+      // 2. Apply skill-based filtering if a skill filter is provided.
+      // Pre-skills sessions pass undefined to get all tools for backward compatibility.
+      const contextAwareTools = precomputedAllowedSkillToolNames
+        ? allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name))
+        : allInternalTools;
 
-        // 5. Apply Subscription Filtering
-        // IMPORTANT: Tools associated via Skills bypass subscription filtering
-        // The Skills system is now the primary access control mechanism
-        // Use pre-fetched allowedFunctionCalls if available to avoid duplicate DB call
-        const allowedFunctionCalls = precomputedAllowedAllFunctionCalls 
-        ? [...precomputedAllowedAllFunctionCalls]  // Clone to avoid mutation
-        : await getAllowedFunctionCalls(userId);
-      
-        // Add all session-associated tools to the allowed list to bypass subscription filtering
-        if (!allowedFunctionCalls.includes('*')) {
-          precomputedAllowedSkillToolNames.forEach(name => {
-            if (!allowedFunctionCalls.includes(name)) {
-              allowedFunctionCalls.push(name);
-            }
+      // 3. Map back to wire-format definitions for the LLM
+      const definitions = contextAwareTools.map(t => t.definition);
+
+      // 4. Apply Subscription Filtering
+      // Resolve skill IDs to tool names for the subscription filter step
+      const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+
+      // Add all session-associated tools to the allowed list to bypass subscription filtering
+      // (skills already installed in the session should remain usable)
+      if (precomputedAllowedSkillToolNames && !allowedFunctionCalls.includes('*')) {
+        precomputedAllowedSkillToolNames.forEach(name => {
+          if (!allowedFunctionCalls.includes(name)) {
+            allowedFunctionCalls.push(name);
+          }
         });
       }
 
       return filterFunctionCalls(definitions, allowedFunctionCalls);
-    }
-    return [];
     } catch (error) {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array

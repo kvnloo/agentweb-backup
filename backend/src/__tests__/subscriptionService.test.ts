@@ -9,6 +9,9 @@ import {
   getAllowedFunctionCalls,
   getAllowedPages,
   filterFunctionCalls,
+  getAllAvailableSkills,
+  getAllowedSkills,
+  resolveSkillsToToolNames,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -41,6 +44,7 @@ jest.mock('../services/agentModeService', () => ({
       { type: 'function' },
       { type: 'plain', other: true },
     ],
+    getUnassociatedToolNames: () => ['generate_image'],
   })),
   agentModeService: {
     getAvailableTools: () => [
@@ -50,6 +54,16 @@ jest.mock('../services/agentModeService', () => ({
       { type: 'function' },
       { type: 'plain', other: true },
     ],
+    getUnassociatedToolNames: () => ['generate_image'],
+  },
+}));
+
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn(() => [
+      { skillId: 'skill-1', name: 'Image Gen', description: 'Image generation', toolNames: ['generate_image'] },
+      { skillId: 'skill-2', name: 'Video Gen', description: 'Video generation', toolNames: ['generate_video'] },
+    ]),
   },
 }));
 
@@ -88,8 +102,7 @@ describe('subscriptionService', () => {
     expect(cfg).not.toBeNull();
     expect(cfg!.name).toBe('Basic');
     expect(cfg!.allowedPages).toEqual(getAllAvailablePages());
-    const allCalls = await getAllAvailableFunctionCalls();
-    expect(cfg!.allowedFunctionCalls.sort()).toEqual(allCalls.sort());
+    expect(cfg!.allowedSkills).toEqual(['*']);
   });
 
   it('getSubscriptionTypeConfig normalizes /marketing prefix in allowedPages', async () => {
@@ -97,7 +110,7 @@ describe('subscriptionService', () => {
       {
         name: 'Pro',
         allowedPages: ['/marketing/tasks', '/marketing/guide', '/seo'],
-        allowedFunctionCalls: ['generate_image'],
+        allowedSkills: ['skill-1'],
       },
     ];
 
@@ -111,12 +124,106 @@ describe('subscriptionService', () => {
     expect(cfg!.allowedPages).toEqual(['/tasks', '/guide', '/seo']);
   });
 
-  it('getAllowedFunctionCalls returns explicit list when configured', async () => {
+  it('getSubscriptionTypeConfig backward compat: old config with allowedFunctionCalls but no allowedSkills gets wildcard', async () => {
+    const storedTypes = [
+      {
+        name: 'Legacy',
+        allowedPages: ['/tasks'],
+        allowedFunctionCalls: ['generate_image'],
+        // Note: no allowedSkills field
+      },
+    ];
+
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify(storedTypes),
+    } as any);
+
+    const cfg = await getSubscriptionTypeConfig('Legacy');
+    expect(cfg).not.toBeNull();
+    expect(cfg!.allowedSkills).toEqual(['*']);
+  });
+
+  // ---- getAllAvailableSkills tests ----
+
+  it('getAllAvailableSkills returns published skill IDs plus __other_skills__', async () => {
+    const skills = await getAllAvailableSkills();
+    expect(skills).toEqual(['skill-1', 'skill-2', '__other_skills__']);
+  });
+
+  // ---- getAllowedSkills tests ----
+
+  it('getAllowedSkills returns explicit list when configured', async () => {
     const storedTypes = [
       {
         name: 'Pro',
         allowedPages: ['/tasks'],
-        allowedFunctionCalls: ['generate_image'],
+        allowedSkills: ['skill-1'],
+      },
+    ];
+
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Pro' } as any);
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify(storedTypes),
+    } as any);
+
+    const skills = await getAllowedSkills('u1');
+    expect(skills).toEqual(['skill-1']);
+  });
+
+  it('getAllowedSkills returns wildcard for "*" or empty', async () => {
+    const base = {
+      name: 'Pro',
+      allowedPages: ['/tasks'],
+    };
+
+    // "*"
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Pro' } as any);
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ ...base, allowedSkills: ['*'] }]),
+    } as any);
+
+    const skills1 = await getAllowedSkills('u1');
+    expect(skills1).toEqual(['*']);
+
+    // empty array
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2', subscriptionType: 'Pro' } as any);
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'subscription_types',
+      settingValue: JSON.stringify([{ ...base, allowedSkills: [] }]),
+    } as any);
+
+    const skills2 = await getAllowedSkills('u2');
+    expect(skills2).toEqual(['*']);
+  });
+
+  // ---- resolveSkillsToToolNames tests ----
+
+  it('resolveSkillsToToolNames returns wildcard for wildcard input', async () => {
+    const tools = await resolveSkillsToToolNames(['*']);
+    expect(tools).toEqual(['*']);
+  });
+
+  it('resolveSkillsToToolNames resolves skill IDs to tool names', async () => {
+    const tools = await resolveSkillsToToolNames(['skill-1', 'skill-2']);
+    expect(tools.sort()).toEqual(['generate_image', 'generate_video'].sort());
+  });
+
+  it('resolveSkillsToToolNames handles __other_skills__', async () => {
+    const tools = await resolveSkillsToToolNames(['__other_skills__']);
+    expect(tools).toContain('generate_image');
+  });
+
+  // ---- getAllowedFunctionCalls bridge tests ----
+
+  it('getAllowedFunctionCalls bridges through skills: returns tool names from allowed skills', async () => {
+    const storedTypes = [
+      {
+        name: 'Pro',
+        allowedPages: ['/tasks'],
+        allowedSkills: ['skill-1'],
       },
     ];
 
@@ -130,31 +237,12 @@ describe('subscriptionService', () => {
     expect(calls).toEqual(['generate_image']);
   });
 
-  it('getAllowedFunctionCalls expands "*" or empty to all available functions', async () => {
-    const base = {
-      name: 'Pro',
-      allowedPages: ['/tasks'],
-    };
+  it('getAllowedFunctionCalls returns wildcard when skills are wildcard', async () => {
+    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Basic' } as any);
+    mockedSettingsService.getSetting.mockResolvedValueOnce(null as any);
 
-    // "*"
-    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u1', subscriptionType: 'Pro' } as any);
-    mockedSettingsService.getSetting.mockResolvedValueOnce({
-      settingName: 'subscription_types',
-      settingValue: JSON.stringify([{ ...base, allowedFunctionCalls: ['*'] }]),
-    } as any);
-
-    const calls1 = await getAllowedFunctionCalls('u1');
-    expect(calls1.sort()).toEqual((await getAllAvailableFunctionCalls()).sort());
-
-    // empty array
-    mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2', subscriptionType: 'Pro' } as any);
-    mockedSettingsService.getSetting.mockResolvedValueOnce({
-      settingName: 'subscription_types',
-      settingValue: JSON.stringify([{ ...base, allowedFunctionCalls: [] }]),
-    } as any);
-
-    const calls2 = await getAllowedFunctionCalls('u2');
-    expect(calls2.sort()).toEqual((await getAllAvailableFunctionCalls()).sort());
+    const calls = await getAllowedFunctionCalls('u1');
+    expect(calls).toEqual(['*']);
   });
 
   it('getAllowedPages returns explicit list and strips /marketing prefix', async () => {
@@ -162,7 +250,7 @@ describe('subscriptionService', () => {
       {
         name: 'Pro',
         allowedPages: ['/marketing/tasks', '/marketing/guide', '/seo'],
-        allowedFunctionCalls: ['generate_image'],
+        allowedSkills: ['skill-1'],
       },
     ];
 
@@ -179,7 +267,7 @@ describe('subscriptionService', () => {
   it('getAllowedPages expands "*" or empty to all available pages', async () => {
     const base = {
       name: 'Pro',
-      allowedFunctionCalls: ['generate_image'],
+      allowedSkills: ['skill-1'],
     };
 
     // "*"
