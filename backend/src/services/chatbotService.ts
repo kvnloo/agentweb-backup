@@ -1103,8 +1103,8 @@ export class ChatbotDB {
   async addAssociatedSkills(sessionId: string, skillIds: string[]): Promise<void> {
     if (!skillIds || !skillIds.length) return;
 
-    // Use SET with list_append to add skills to the List-type associatedSkills attribute.
-    // Deduplicate: read current, merge, write back.
+    // Read-merge-write: read current skills, deduplicate, write back as a List.
+    // Uses SET (not ADD/list_append) to handle both List and legacy Set attribute types.
     try {
       const session = await this.getChatSession(sessionId);
       const current: string[] = Array.isArray(session?.associatedSkills) ? session!.associatedSkills : [];
@@ -1112,13 +1112,14 @@ export class ChatbotDB {
       const newSkills = skillIds.filter(id => !currentSet.has(id));
       if (newSkills.length === 0) return;
 
+      const merged = [...current, ...newSkills];
+
       const params = {
         TableName: this.tableName,
         Key: { sessionId },
-        UpdateExpression: "SET associatedSkills = list_append(if_not_exists(associatedSkills, :empty), :skills)",
+        UpdateExpression: "SET associatedSkills = :skills",
         ExpressionAttributeValues: {
-          ":skills": newSkills,
-          ":empty": [] as string[],
+          ":skills": merged,
         },
       };
 
