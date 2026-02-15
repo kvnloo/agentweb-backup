@@ -543,8 +543,6 @@ export class AgentModeService {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
 
-      console.log(`[Benchmark Debug] sessionId=${sessionId}, mockMode=${mockMode}, publishedSkills=${publishedSkills.length}, sessionAssociatedSkillIds=[${sessionAssociatedSkillIds.join(', ')}], associatedSkills=${associatedSkills.length}`);
-
       // Build initial skill context
       let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
@@ -554,10 +552,6 @@ export class AgentModeService {
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds);
 
-      console.log(`[Benchmark Debug] allowedToolNames=[${[...allowedToolNames].join(', ')}]`);
-      console.log(`[Benchmark Debug] availableSkillContextMsg=${availableSkillContextMsg ? 'present (' + availableSkillContextMsg.length + ' chars)' : 'EMPTY'}`);
-      console.log(`[Benchmark Debug] installedSkillContextMsg=${installedSkillContextMsg ? 'present (' + installedSkillContextMsg.length + ' chars)' : 'EMPTY'}`);
-
       const today = new Date().toISOString().split('T')[0];
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
@@ -566,8 +560,6 @@ export class AgentModeService {
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
       messages.push(...marketingMessages);
-
-      console.log(`[Benchmark Debug] Final message roles: [${messages.map((m: any, i: number) => `${i}:${m.role}${typeof m.content === 'string' && m.content.startsWith('Available Skills:') ? '(available-skills)' : ''}${typeof m.content === 'string' && m.content.startsWith('Installed Skills:') ? '(installed-skills)' : ''}`).join(', ')}]`);
 
       let content = '';
       const toolCalls: any[] = [];
@@ -717,7 +709,6 @@ export class AgentModeService {
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
-              console.log(`[Benchmark Debug] BLOCKED tool call "${toolCall.function.name}" — not in allowedToolNames=[${[...allowedToolNames].join(', ')}]`);
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
