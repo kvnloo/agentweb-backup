@@ -9,6 +9,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     getAllSessions: jest.fn(),
     getChatSession: jest.fn(),
+    getMessageStats: jest.fn(),
   },
 }));
 
@@ -40,6 +41,19 @@ app.use('/api/admin', adminRoutes);
 describe('Admin Agent Mode Analytics', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: getMessageStats returns empty stats for any session
+    mockChatbotDb.getMessageStats.mockResolvedValue({
+      totalMessages: 0,
+      messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
+      messagesWithAttachments: 0,
+      messagesWithToolCalls: 0,
+      successfulToolCalls: 0,
+      failedToolCalls: 0,
+      totalTokens: 0,
+      totalPromptTokens: 0,
+      totalCompletionTokens: 0,
+      messagesWithTokenData: 0,
+    });
   });
 
   const mockGetChatSession = (sessions: ChatSession[]) => {
@@ -207,40 +221,130 @@ describe('Admin Agent Mode Analytics', () => {
       }),
     ];
 
-    const sessionsWithMessages: ChatSession[] = [
-      {
-        ...mockSessions[0],
-        messages: [
-          { role: 'user', content: 'Message 1', metadata: { timestamp: new Date().toISOString(), attachments: [{ url: 'test.jpg', filename: 'test.jpg', size: 100, mimetype: 'image/jpeg', uploadedAt: new Date().toISOString() }] } },
-          { role: 'assistant', content: 'Response 1' },
-          { role: 'user', content: 'Message 2' },
-        ],
-      },
-      {
-        ...mockSessions[1],
-        messages: [
-          { role: 'user', content: 'Message 3' },
-          { role: 'assistant', content: 'Response 2', tool_calls: [{ id: '1', function: { name: 'search_web' } }], usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, estimated_cost: 0.001 } },
-        ],
-      },
-    ];
-
     mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
-    mockGetChatSession(sessionsWithMessages);
+    // Mock getMessageStats to return per-session stats
+    mockChatbotDb.getMessageStats.mockImplementation(async (sessionId: string) => {
+      if (sessionId === 'session-1') {
+        return {
+          totalMessages: 3,
+          messagesByRole: { user: 2, assistant: 1, system: 0, tool: 0 },
+          messagesWithAttachments: 1,
+          messagesWithToolCalls: 0,
+          successfulToolCalls: 0,
+          failedToolCalls: 0,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          messagesWithTokenData: 0,
+        };
+      }
+      if (sessionId === 'session-2') {
+        return {
+          totalMessages: 2,
+          messagesByRole: { user: 1, assistant: 1, system: 0, tool: 0 },
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 1,
+          successfulToolCalls: 1,
+          failedToolCalls: 0,
+          totalTokens: 150,
+          totalPromptTokens: 100,
+          totalCompletionTokens: 50,
+          messagesWithTokenData: 1,
+        };
+      }
+      return {
+        totalMessages: 0,
+        messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
+        messagesWithAttachments: 0,
+        messagesWithToolCalls: 0,
+        successfulToolCalls: 0,
+        failedToolCalls: 0,
+        totalTokens: 0,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        messagesWithTokenData: 0,
+      };
+    });
 
     const response = await request(app)
       .get('/api/admin/analytics/agent-mode')
       .query({ startDate, endDate })
       .expect(200);
 
-    expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith('session-1');
-    expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith('session-2');
+    expect(mockChatbotDb.getMessageStats).toHaveBeenCalledWith('session-1');
+    expect(mockChatbotDb.getMessageStats).toHaveBeenCalledWith('session-2');
     expect(response.body.totalMessages).toBe(5);
     expect(response.body.messagesByRole.user).toBe(3); // 2 from session 1, 1 from session 2
     expect(response.body.messagesByRole.assistant).toBe(2); // 1 from session 1, 1 from session 2
     expect(response.body.messagesWithAttachments).toBe(1); // 1 message with attachment
-    expect(response.body.messagesWithToolCalls).toBe(1); // 1 message with tool calls
+    expect(response.body.messagesWithToolCalls).toBe(1); // 1 tool role message
+    expect(response.body.successfulToolCalls).toBe(1); // 1 successful tool call
+    expect(response.body.failedToolCalls).toBe(0); // 0 failed tool calls
     expect(response.body.totalTokens).toBe(150); // From the assistant message with usage
+  });
+
+  it('should aggregate successful and failed tool calls from message stats', async () => {
+    const now = new Date();
+    const startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+
+    const mockSessions: ChatSession[] = [
+      createMockSession({ sessionId: 'session-1' }),
+      createMockSession({ sessionId: 'session-2' }),
+    ];
+
+    mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
+    mockChatbotDb.getMessageStats.mockImplementation(async (sessionId: string) => {
+      if (sessionId === 'session-1') {
+        return {
+          totalMessages: 5,
+          messagesByRole: { user: 1, assistant: 1, system: 0, tool: 3 },
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 3,
+          successfulToolCalls: 2,
+          failedToolCalls: 1,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          messagesWithTokenData: 0,
+        };
+      }
+      if (sessionId === 'session-2') {
+        return {
+          totalMessages: 4,
+          messagesByRole: { user: 1, assistant: 1, system: 0, tool: 2 },
+          messagesWithAttachments: 0,
+          messagesWithToolCalls: 2,
+          successfulToolCalls: 0,
+          failedToolCalls: 2,
+          totalTokens: 0,
+          totalPromptTokens: 0,
+          totalCompletionTokens: 0,
+          messagesWithTokenData: 0,
+        };
+      }
+      return {
+        totalMessages: 0,
+        messagesByRole: { user: 0, assistant: 0, system: 0, tool: 0 },
+        messagesWithAttachments: 0,
+        messagesWithToolCalls: 0,
+        successfulToolCalls: 0,
+        failedToolCalls: 0,
+        totalTokens: 0,
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        messagesWithTokenData: 0,
+      };
+    });
+
+    const response = await request(app)
+      .get('/api/admin/analytics/agent-mode')
+      .query({ startDate, endDate })
+      .expect(200);
+
+    expect(response.body.messagesWithToolCalls).toBe(5); // 3 + 2
+    expect(response.body.successfulToolCalls).toBe(2); // 2 + 0
+    expect(response.body.failedToolCalls).toBe(3); // 1 + 2
   });
 
   it('should calculate tool calls metrics correctly', async () => {
@@ -422,6 +526,95 @@ describe('Admin Agent Mode Analytics', () => {
       expect(dailyGrowth[0]).toHaveProperty('scheduled');
       expect(dailyGrowth[0]).toHaveProperty('nonScheduled');
     }
+  });
+
+  it('should calculate tool call details with success and failure counts', async () => {
+    const now = new Date();
+    const startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+
+    const mockSessions: ChatSession[] = [
+      createMockSession({
+        sessionId: 'session-1',
+        calledFunctions: { generate_image: 5, search_web: 3 },
+        failedFunctions: { generate_image: 1, search_web: 2 },
+      }),
+      createMockSession({
+        sessionId: 'session-2',
+        calledFunctions: { generate_video: 2 },
+        failedFunctions: { generate_video: 1, create_html: 3 },
+      }),
+    ];
+
+    mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
+
+    const response = await request(app)
+      .get('/api/admin/analytics/agent-mode')
+      .query({ startDate, endDate })
+      .expect(200);
+
+    const details = response.body.toolCallDetails;
+    expect(Array.isArray(details)).toBe(true);
+
+    // Check generate_image: 5 success + 1 failure = 6 total
+    const generateImage = details.find((d: any) => d.name === 'generate_image');
+    expect(generateImage).toEqual({ name: 'generate_image', total: 6, success: 5, failure: 1 });
+
+    // Check search_web: 3 success + 2 failure = 5 total
+    const searchWeb = details.find((d: any) => d.name === 'search_web');
+    expect(searchWeb).toEqual({ name: 'search_web', total: 5, success: 3, failure: 2 });
+
+    // Check create_html: 0 success + 3 failure = 3 total (only in failedFunctions)
+    const createHtml = details.find((d: any) => d.name === 'create_html');
+    expect(createHtml).toEqual({ name: 'create_html', total: 3, success: 0, failure: 3 });
+
+    // Check generate_video: 2 success + 1 failure = 3 total
+    const generateVideo = details.find((d: any) => d.name === 'generate_video');
+    expect(generateVideo).toEqual({ name: 'generate_video', total: 3, success: 2, failure: 1 });
+
+    // Check sorted by total descending
+    for (let i = 0; i < details.length - 1; i++) {
+      expect(details[i].total).toBeGreaterThanOrEqual(details[i + 1].total);
+    }
+  });
+
+  it('should handle sessions with no failedFunctions (backward compatibility)', async () => {
+    const now = new Date();
+    const startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const endDate = now.toISOString().split('T')[0];
+
+    const mockSessions: ChatSession[] = [
+      createMockSession({
+        sessionId: 'session-1',
+        calledFunctions: { generate_image: 3, search_web: 2 },
+      }),
+      createMockSession({
+        sessionId: 'session-2',
+        calledFunctions: { generate_video: 1 },
+      }),
+    ];
+
+    mockChatbotDb.getAllSessions.mockResolvedValue(mockSessions);
+
+    const response = await request(app)
+      .get('/api/admin/analytics/agent-mode')
+      .query({ startDate, endDate })
+      .expect(200);
+
+    const details = response.body.toolCallDetails;
+    expect(Array.isArray(details)).toBe(true);
+    expect(details.length).toBe(3);
+
+    // All entries should have failure = 0
+    details.forEach((d: any) => {
+      expect(d.failure).toBe(0);
+      expect(d.total).toBe(d.success);
+    });
+
+    // Check specific values
+    expect(details.find((d: any) => d.name === 'generate_image')).toEqual({ name: 'generate_image', total: 3, success: 3, failure: 0 });
+    expect(details.find((d: any) => d.name === 'search_web')).toEqual({ name: 'search_web', total: 2, success: 2, failure: 0 });
+    expect(details.find((d: any) => d.name === 'generate_video')).toEqual({ name: 'generate_video', total: 1, success: 1, failure: 0 });
   });
 
   it('should handle sessions without date range parameters', async () => {

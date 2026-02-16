@@ -1,3 +1,61 @@
+# February 12, 2026: ClickUp Integration via MCP
+
+## Investigation
+- ClickUp provides a remote MCP server at `https://mcp.clickup.com/mcp` (OAuth 2.1, read-only scope)
+- Supports 20+ tools: search, tasks, comments, time tracking, workspace hierarchy, members, chat, docs
+- AgentWeb already has external MCP client infrastructure (`mcpClientService.ts`) — plan is to connect to ClickUp's MCP server directly with per-user OAuth tokens
+- Main gap: current MCP client uses a single shared token per server; need to extend it to support per-user OAuth connections
+
+## Approach
+- Option A (chosen): Connect to ClickUp's remote MCP server directly, inheriting all their tools automatically
+- Add ClickUp as a connected account type with OAuth flow
+- Extend `mcpClientService` to support per-user MCP sessions
+
+## Status
+- Submitted ClickUp MCP Server Allowlist Request Form for redirect URIs:
+  - `https://api.agentweb.pro/api/auth/clickup/callback` (Production)
+  - `https://api-stage.agentweb.pro/api/auth/clickup/callback` (Staging)
+  - `http://localhost:3001/api/auth/clickup/callback` (Development)
+- Waiting for ClickUp approval before proceeding with implementation
+
+
+# February 12, 2026: PixelFlow Form Tracking Audit — start.waldium.com
+
+## Pages Checked
+- `https://start.waldium.com/` (v1)
+- `https://start.waldium.com/v2`
+
+## Result: Form submission NOT tracked on either page
+
+**Base script**: Installed correctly on both pages (same API key, site ID, endpoint).
+
+**Missing event classes** (required per [PixelFlow docs](https://docs.pixelflow.so/articles/event-classes-on-html-websites-4c49z)):
+
+| Element | Required Class | Status |
+|---|---|---|
+| Form container | `info-frm-cntr-pf` | Missing |
+| Submit button | `action-btn-lead-011-pf` | Missing |
+| Email input | `info-cust-em-pf` | Missing |
+
+Both pages share the same `LeadForm` React component. Adding the three classes to that component will fix both pages.
+
+# February 11, 2026: Staging Backend Down (Agentweb-backend-env-1)
+
+## Problem
+Staging EB environment `Agentweb-backend-env-1` was Severe/Red. Deployment of `backend_v26.6.1-staging-pr455` repeatedly failed with command timeout on instance `i-0645dba745fc59889`.
+
+## Investigation
+- Instance EC2 system checks passed (running, reachable) but EB agent was completely unresponsive
+- All EB commands timed out: deployments, log retrieval, restart — nothing got through
+- The first deployment of the version at 07:00 UTC succeeded, but a subsequent redeploy at 08:36 UTC hung and the instance never recovered
+- 4 consecutive deployment attempts all timed out (600s command timeout)
+- Root cause: `t3.small` (2GB RAM) exhausted memory — `npm install` during deployment + Node.js app exceeded available resources, freezing the EB agent
+
+## Resolution
+1. Rebooted the instance via EC2 Console — environment recovered to healthy
+2. Upgraded instance types from `t3.small` to `t3.medium` / `t3.large` to prevent recurrence
+3. Configuration update completed successfully, environment Green/Ok
+
 # February 10, 2026: CRM Web Enrichment Production Failure Investigation (v26.2.0)
 
 ## Investigation Summary

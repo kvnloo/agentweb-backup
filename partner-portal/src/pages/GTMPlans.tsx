@@ -917,10 +917,10 @@ export default function GTMPlans() {
   return (
     <Box>
       <Typography variant="h4" component="h1" gutterBottom>
-        GTM Plans
+        GTM Tracker
       </Typography>
       <Typography variant="body1" color="text.secondary" paragraph>
-        Manage GTM Plans from all users. Update status, notes, and assign PoC for plan items.
+        Track GTM plans from all users. Update status, notes, and assign PoC for plan items.
       </Typography>
 
       {error && (

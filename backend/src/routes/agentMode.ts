@@ -86,6 +86,14 @@ router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedMo
 // Run all scheduled chats that are ready to execute (called by agent-engine)
 router.post('/run-scheduled-chats', asyncHandler(agentModeController.runScheduledChats));
 
+// GET /api/agent-mode/public/scheduled-chat-variables/:accessToken
+// Get required variable metadata for a one-time public scheduled chat variable link
+router.get('/public/scheduled-chat-variables/:accessToken', asyncHandler(agentModeController.getScheduledChatVariablesByAccessToken));
+
+// POST /api/agent-mode/public/scheduled-chat-variables/:accessToken
+// Submit variable values for a one-time public scheduled chat variable link
+router.post('/public/scheduled-chat-variables/:accessToken', asyncHandler(agentModeController.submitScheduledChatVariablesByAccessToken));
+
 // Conversable routes (protected by conversable token, not authentication)
 
 // All other routes require authentication
@@ -201,6 +209,10 @@ router.get('/scheduled-chats', asyncHandler(agentModeController.getScheduledChat
 // PUT /api/agent-mode/scheduled-chats/:scheduleId
 // Update scheduled chat
 router.put('/scheduled-chats/:scheduleId', asyncHandler(agentModeController.updateScheduledChat));
+
+// POST /api/agent-mode/scheduled-chats/:scheduleId/variables
+// Submit variable values for a scheduled chat
+router.post('/scheduled-chats/:scheduleId/variables', asyncHandler(agentModeController.submitScheduledChatVariables));
 
 // POST /api/agent-mode/scheduled-chats/:scheduleId/test
 // Test scheduled chat

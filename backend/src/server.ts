@@ -230,7 +230,14 @@ createTestAccount().then(async () => {
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
     console.log('Initializing Agent Mode Tools (non-blocking)...');
     agentModeService.initialize()
-      .then(() => console.log('Agent Mode Tools initialized successfully'))
+      .then(() => {
+        console.log('Agent Mode Tools initialized successfully');
+        // Pre-start the worker process so MCP servers are ready before the first chat message
+        console.log('Pre-starting worker process...');
+        generateMarketingResponseWorkerService.ensureWorkerReady()
+          .then(() => console.log('Worker process pre-started and ready'))
+          .catch((error) => console.error('Failed to pre-start worker process:', error));
+      })
       .catch((error) => console.error('Failed to initialize Agent Mode Tools:', error));
   });
 }); 

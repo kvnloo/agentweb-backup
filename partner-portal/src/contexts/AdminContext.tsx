@@ -52,6 +52,8 @@ interface AdminContextType {
   taskAnalytics: any;
   userAnalytics: any;
   agentModeAnalytics: any;
+  gtmAnalytics: any;
+  crmAnalytics: any;
   loadUsers: () => Promise<void>;
   loadWaitlist: () => Promise<void>;
   loadAnalytics: (startDate: string, endDate: string) => Promise<void>;
@@ -94,6 +96,8 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
   const [taskAnalytics, setTaskAnalytics] = useState<any>(null);
   const [userAnalytics, setUserAnalytics] = useState<any>(null);
   const [agentModeAnalytics, setAgentModeAnalytics] = useState<any>(null);
+  const [gtmAnalytics, setGtmAnalytics] = useState<any>(null);
+  const [crmAnalytics, setCrmAnalytics] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { token, user } = useAuth();
@@ -143,7 +147,7 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
         setLoading(true);
         setError(null);
         
-        const [taskResponse, userResponse, agentModeResponse] = await Promise.all([
+        const [taskResponse, userResponse, agentModeResponse, gtmResponse, crmResponse] = await Promise.all([
           api.get("/api/admin/analytics/tasks", {
             params: { startDate, endDate },
           }),
@@ -157,11 +161,25 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
             console.error('Error loading agent mode analytics:', err);
             return { data: null };
           }),
+          api.get("/api/admin/analytics/gtm", {
+            params: { startDate, endDate },
+          }).catch((err) => {
+            console.error('Error loading GTM analytics:', err);
+            return { data: null };
+          }),
+          api.get("/api/admin/analytics/crm", {
+            params: { startDate, endDate },
+          }).catch((err) => {
+            console.error('Error loading CRM analytics:', err);
+            return { data: null };
+          }),
         ]);
-        
+
         setTaskAnalytics(taskResponse.data);
         setUserAnalytics(userResponse.data);
         setAgentModeAnalytics(agentModeResponse.data);
+        setGtmAnalytics(gtmResponse.data);
+        setCrmAnalytics(crmResponse.data);
         setError(null);
       } catch (err: any) {
         console.error('Error loading analytics:', err);
@@ -374,6 +392,8 @@ export const AdminProvider: React.FC<{ children: React.ReactNode }> = ({
     taskAnalytics,
     userAnalytics,
     agentModeAnalytics,
+    gtmAnalytics,
+    crmAnalytics,
     loadUsers,
     loadWaitlist,
     loadAnalytics,

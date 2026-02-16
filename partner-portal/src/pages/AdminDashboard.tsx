@@ -37,6 +37,7 @@ import {
   MenuItem,
   FormGroup,
   Link,
+  Collapse,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -591,6 +592,7 @@ export default function AdminDashboard() {
   };
   
   const [tabValue, setTabValue] = useState(getInitialTabValue());
+  const [toolCallsExpanded, setToolCallsExpanded] = useState(false);
   const [startDate, setStartDate] = useState<Date | null>(
     new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
   );
@@ -686,6 +688,8 @@ export default function AdminDashboard() {
     taskAnalytics,
     userAnalytics,
     agentModeAnalytics,
+    gtmAnalytics,
+    crmAnalytics,
     loadUsers,
     loadWaitlist,
     loadAnalytics,
@@ -2540,10 +2544,10 @@ export default function AdminDashboard() {
                     </Card>
                   </Grid>
                   <Grid item xs={12} md={3}>
-                    <Card>
+                    <Card sx={{ cursor: 'pointer' }} onClick={() => setToolCallsExpanded(v => !v)}>
                       <CardContent>
                         <Typography variant="h6" gutterBottom>
-                          Tool Calls
+                          Tool Calls {toolCallsExpanded ? '▲' : '▼'}
                         </Typography>
                         {agentModeAnalytics && (
                           <>
@@ -2582,7 +2586,98 @@ export default function AdminDashboard() {
                       </CardContent>
                     </Card>
                   </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          GTM Tracker
+                        </Typography>
+                        {gtmAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {gtmAnalytics.completedItemsInRange || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Completed Items (in period)
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total Completed: {gtmAnalytics.completedItems || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total Items: {gtmAnalytics.totalItems || 0}
+                            </Typography>
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
+                  <Grid item xs={12} md={3}>
+                    <Card>
+                      <CardContent>
+                        <Typography variant="h6" gutterBottom>
+                          CRM
+                        </Typography>
+                        {crmAnalytics && (
+                          <>
+                            <Typography variant="h4" color="primary">
+                              {crmAnalytics.totalLeads || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Total Leads
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              New Leads: <span style={{ color: '#4caf50' }}>+{crmAnalytics.newLeads || 0}</span>
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Lists: {crmAnalytics.totalLists || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              ICP Leads: {crmAnalytics.totalICPLeads || 0}
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              Engaged: {crmAnalytics.totalEngagedLeads || 0}
+                            </Typography>
+                          </>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </Grid>
                 </Grid>
+
+                {/* Tool Call Details Table (expanded) */}
+                <Collapse in={toolCallsExpanded}>
+                  <Card sx={{ mb: 3 }}>
+                    <CardContent>
+                      <Typography variant="h6" gutterBottom>
+                        Tool Call Details
+                      </Typography>
+                      {agentModeAnalytics && (agentModeAnalytics.toolCallDetailsInRange || agentModeAnalytics.toolCallDetails) && (
+                        <TableContainer>
+                          <Table size="small">
+                            <TableHead>
+                              <TableRow>
+                                <TableCell sx={{ fontWeight: 'bold' }}>Tool Name</TableCell>
+                                <TableCell align="right" sx={{ fontWeight: 'bold' }}>Total</TableCell>
+                                <TableCell align="right" sx={{ fontWeight: 'bold' }}>Success</TableCell>
+                                <TableCell align="right" sx={{ fontWeight: 'bold' }}>Failure</TableCell>
+                              </TableRow>
+                            </TableHead>
+                            <TableBody>
+                              {(agentModeAnalytics.toolCallDetailsInRange || agentModeAnalytics.toolCallDetails || []).map((tool: any) => (
+                                <TableRow key={tool.name}>
+                                  <TableCell>{tool.name}</TableCell>
+                                  <TableCell align="right">{tool.total}</TableCell>
+                                  <TableCell align="right" sx={{ color: 'success.main' }}>{tool.success}</TableCell>
+                                  <TableCell align="right" sx={{ color: tool.failure > 0 ? 'error.main' : 'text.secondary' }}>{tool.failure}</TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </TableContainer>
+                      )}
+                    </CardContent>
+                  </Card>
+                </Collapse>
 
                 {/* Agent Mode Growth Charts */}
                 <Grid container spacing={3} sx={{ mb: 4 }}>

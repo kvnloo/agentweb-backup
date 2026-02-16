@@ -31,6 +31,35 @@ mcpToolRegistry.register({
 
 // --- Tools from marketingTools.ts ---
 mcpToolRegistry.register({
+  name: 'install_skills',
+  definition: {
+    name: 'install_skills',
+    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skillIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of skill IDs to install.'
+        }
+      },
+      required: ['skillIds']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId || !context?.sessionId) {
+        throw new Error("Missing user or session context");
+    }
+    if (!Array.isArray(args.skillIds) || args.skillIds.length === 0) {
+        return { message: "skillIds must be a non-empty array of skill IDs." };
+    }
+    return await agentModeService.installSkills(args.skillIds, context.userId, context.sessionId);
+  }
+});
+
+// --- Tools from marketingTools.ts ---
+mcpToolRegistry.register({
   name: "call_meta_marketing_api",
   definition: {
     name: "call_meta_marketing_api",
@@ -613,7 +642,7 @@ mcpToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
-    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.).',
+    description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1744,12 +1773,12 @@ mcpToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media.',
+    description: 'Create a post on a connected social media account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
         account_id: { type: 'string', description: 'The connected account ID' },
-        content: { type: 'string', description: 'Post text content. Length limits depend on the specific platform.' },
+        content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform.' },
         media_urls: {
           type: 'array',
           items: { type: 'string' },
@@ -1824,18 +1853,34 @@ mcpToolRegistry.register({
   }
 });
 
+mcpToolRegistry.register({
+  name: 'list_task_templates',
+  definition: {
+    name: 'list_task_templates',
+    description: 'List all available web automation task templates. Returns template names, IDs, descriptions, categories, and parameters. Use this to find the right template before creating a task with create_task_from_template.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listTaskTemplates();
+  }
+});
+
 // --- Tools from taskTools.ts ---
 mcpToolRegistry.register({
   name: 'create_task_from_template',
   definition: {
     name: 'create_task_from_template',
-    description: 'Create a web automation task using a specific template with the provided parameters',
+    description: 'Create a web automation task using a specific template. IMPORTANT: You must call list_task_templates first to get the available template IDs before using this tool.',
     inputSchema: {
       type: 'object',
       properties: {
         template_id: { 
           type: 'string', 
-          description: 'The ID of the template to use for creating the task' 
+          description: 'The template ID obtained from list_task_templates. Do not guess or fabricate template IDs.'
         },
         parameters_json: { 
           type: 'string', 

@@ -9,6 +9,13 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
+jest.mock('../services/skillService', () => ({
+  skillService: {
+    getPublishedSkills: jest.fn().mockResolvedValue([]),
+    getSkillsByIds: jest.fn().mockResolvedValue([])
+  }
+}));
+
 describe('Agent Mode Controller - Session Loading', () => {
   const mockUser = {
     userId: 'user-123',
@@ -72,7 +79,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         ],
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
-        hasActiveProgress: false
+        hasActiveProgress: false,
+        skills: []
       });
     });
 
@@ -92,7 +100,7 @@ describe('Agent Mode Controller - Session Loading', () => {
       );
     });
 
-    it('should return unfiltered session for admin user', async () => {
+    it('should return filtered session for admin user (same path as regular users)', async () => {
       (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
 
       const req = mockRequest(mockAdminUser, 'session-123');
@@ -101,10 +109,15 @@ describe('Agent Mode Controller - Session Loading', () => {
       await agentModeController.getSession(req, res);
 
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith('session-123');
-      expect(res.json).toHaveBeenCalledWith({
-        ...mockSession,
-        hasActiveProgress: false
-      });
+      // Admin sessions now go through the same path as regular users (with skills and message filtering)
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: 'session-123',
+          userId: 'user-123',
+          hasActiveProgress: false,
+          skills: expect.any(Array)
+        })
+      );
     });
 
     it('should return 404 when session not found', async () => {
@@ -147,10 +160,15 @@ describe('Agent Mode Controller - Session Loading', () => {
 
       await agentModeController.getSession(req, res);
 
-      expect(res.json).toHaveBeenCalledWith({
-        ...otherUserSession,
-        hasActiveProgress: false
-      });
+      // Admin sessions now go through the same path as regular users (with skills and message filtering)
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: otherUserSession.sessionId,
+          userId: otherUserSession.userId,
+          hasActiveProgress: false,
+          skills: expect.any(Array)
+        })
+      );
     });
 
     it('should filter out tool messages correctly', async () => {
@@ -185,7 +203,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         ],
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
-        hasActiveProgress: false
+        hasActiveProgress: false,
+        skills: []
       });
     });
 
@@ -220,7 +239,8 @@ describe('Agent Mode Controller - Session Loading', () => {
         messages: [],
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T00:00:00Z',
-        hasActiveProgress: false
+        hasActiveProgress: false,
+        skills: []
       });
     });
   });

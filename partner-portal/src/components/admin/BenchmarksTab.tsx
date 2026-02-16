@@ -970,6 +970,7 @@ const BenchmarksTab: React.FC = () => {
           <Table>
             <TableHead>
               <TableRow>
+                <TableCell>Test ID</TableCell>
                 <TableCell>Test Name</TableCell>
                 <TableCell>Status</TableCell>
                 <TableCell>Runs</TableCell>
@@ -984,6 +985,11 @@ const BenchmarksTab: React.FC = () => {
             <TableBody>
               {Array.isArray(benchmarks) && benchmarks.map((benchmark) => (
                 <TableRow key={benchmark.testId}>
+                  <TableCell>
+                    <Typography variant="body2" sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>
+                      {benchmark.testId}
+                    </Typography>
+                  </TableCell>
                   <TableCell>
                     <Box>
                       <Typography variant="subtitle2">{benchmark.testName}</Typography>
@@ -1081,7 +1087,7 @@ const BenchmarksTab: React.FC = () => {
               ))}
               {(!Array.isArray(benchmarks) || benchmarks.length === 0) && (
                 <TableRow>
-                  <TableCell colSpan={9} align="center">
+                  <TableCell colSpan={10} align="center">
                     <Typography color="text.secondary">
                       No benchmark tests found. Create your first one!
                     </Typography>

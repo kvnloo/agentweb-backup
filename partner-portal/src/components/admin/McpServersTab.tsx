@@ -401,6 +401,10 @@ const McpServersTab: React.FC = () => {
         </Box>
       </Box>
 
+      <Alert severity="info" sx={{ mb: 2 }}>
+        Adding, editing, or deleting MCP servers will restart the Agent Mode worker process. Prefer making these changes during non-rush hours to reduce disruption.
+      </Alert>
+
       {error && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError("")}>
           {error}

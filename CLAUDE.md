@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Working Directory Rule
+
+**NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/ruiwang/Documents/GitHub/agentweb/` — always use the actual working directory (e.g. `/Users/ruiwang/Documents/GitHub/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
+
 ## Core Architecture
 
 AgentWeb is a multi-tenant web automation platform with three main components:
@@ -10,7 +14,7 @@ AgentWeb is a multi-tenant web automation platform with three main components:
 2. **Agent Engine (Python)** - Browser automation engine using browser-use library and playwright
 3. **Frontend Applications (React/TypeScript)**:
    - Partner Portal (admin/partner interface) - in this repo at `partner-portal/`
-   - Customer Portal (end-user interface) - separate repo
+   - Customer Portal (end-user interface) - in this repo at `customer-portal/`
    - Growth Genius Chat - separate repo
 
 ### Data Flow
@@ -55,6 +59,15 @@ npm run create-admin
 ```
 
 Backend runs on port 3001 by default.
+
+**IMPORTANT:** When taking over the backend (starting it via `npm run dev` or similar), always redirect output to `/tmp/backend.log` so logs can be reviewed later. For example:
+
+```bash
+cd backend
+npm run dev > /tmp/backend.log 2>&1 &
+```
+
+Use `tail -f /tmp/backend.log` or the Read tool on `/tmp/backend.log` to check logs during development.
 
 **IMPORTANT:** Always run `npx tsc` to verify TypeScript compilation before committing changes. This catches type errors early and prevents CI failures.
 
@@ -503,9 +516,9 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 ### Version Management
 
-- Backend and partner-portal have independent versioning in their `package.json`
+- Backend, partner-portal, and customer-portal have independent versioning in their `package.json`
 - Always bump version before merging to main for production deployment
-- Version format: `X.Y.Z` (semantic versioning)
+- Version format: `X.Y` (e.g., `26.9`, `27.0`). When the minor version reaches 10, bump the major version and reset minor to 0. For example: `26.9` → `27.0`, NOT `26.10`. Similarly: `16.9` → `17.0`.
 - No version bump needed for staging deployments (PRs)
 
 ### DynamoDB Query Optimization
@@ -596,6 +609,8 @@ npm test
 ```
 
 These checks prevent CI failures and ensure code quality. The `npx tsc` command is especially important as it catches TypeScript type errors that may not be caught during development with hot reload.
+
+**CRITICAL:** Run `npx tsc` after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
 
 ## Testing Strategy
 

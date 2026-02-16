@@ -3,6 +3,29 @@
  * Tests cover: API calls, error handling, token verification
  */
 
+// Mock puppeteer-core to prevent actual browser launches in tests
+const mockPage = {
+  setUserAgent: jest.fn(),
+  goto: jest.fn(),
+  evaluate: jest.fn(),
+};
+const mockBrowser = {
+  newPage: jest.fn().mockResolvedValue(mockPage),
+  close: jest.fn(),
+};
+jest.mock('puppeteer-core', () => ({
+  __esModule: true,
+  default: {
+    launch: jest.fn().mockResolvedValue(mockBrowser),
+  },
+}));
+
+// Mock fs.existsSync to control Chrome detection in tests
+jest.mock('fs', () => ({
+  ...jest.requireActual('fs'),
+  existsSync: jest.fn().mockReturnValue(false),
+}));
+
 // Mock axios before any imports
 jest.mock('axios', () => {
   const mockCreate = jest.fn().mockReturnValue({
@@ -27,6 +50,7 @@ jest.mock('axios', () => {
 });
 
 import axios from 'axios';
+import fs from 'fs';
 import { LinkedInService } from '../services/linkedInService';
 
 describe('LinkedInService', () => {
@@ -391,6 +415,254 @@ describe('LinkedInService', () => {
       const result = await service.createPost('token', 'urn:li:organization:123', 'Company post');
 
       expect(result).toBe('urn:li:share:789');
+    });
+
+    it('should add article content with OG metadata when post contains a URL and no images', async () => {
+      // Mock OG metadata fetch
+      (axios.get as jest.Mock).mockResolvedValueOnce({
+        data: '<html><head><meta property="og:title" content="Test Article"><meta property="og:description" content="A test description"><meta property="og:image" content="https://example.com/og-image.jpg"></head></html>',
+        headers: { 'content-type': 'text/html' },
+      });
+      // Mock image download for thumbnail upload
+      (axios.get as jest.Mock).mockResolvedValueOnce({
+        data: Buffer.from('fake-image'),
+        headers: { 'content-type': 'image/jpeg' },
+      });
+      // Mock image upload init
+      mockClient.post.mockResolvedValueOnce({
+        data: { value: { uploadUrl: 'https://upload.linkedin.com/image', image: 'urn:li:image:thumb1' } },
+      });
+      // Mock image binary upload
+      (axios.put as jest.Mock).mockResolvedValueOnce({});
+      // Mock createPost API call
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:article1' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:person:123', 'Check out https://example.com/article');
+
+      // Verify the post payload includes article content
+      const postCall = mockClient.post.mock.calls[1]; // Second call is createPost (first is image upload init)
+      expect(postCall[0]).toBe('/rest/posts');
+      expect(postCall[1].content).toEqual({
+        article: {
+          source: 'https://example.com/article',
+          title: 'Test Article',
+          description: 'A test description',
+          thumbnail: 'urn:li:image:thumb1',
+        },
+      });
+      expect(result).toBe('urn:li:share:article1');
+    });
+
+    it('should use URL-derived title when OG fetch fails and browser is unavailable', async () => {
+      // Mock OG fetch failures for both UAs
+      (axios.get as jest.Mock)
+        .mockRejectedValueOnce(new Error('401'))
+        .mockRejectedValueOnce(new Error('401'));
+      // Mock createPost API call
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:fallback1' },
+      });
+
+      const result = await service.createPost(
+        'token',
+        'urn:li:person:123',
+        'Read this https://www.example.com/blog/my-great-article'
+      );
+
+      const postCall = mockClient.post.mock.calls[0];
+      expect(postCall[1].content.article.source).toBe('https://www.example.com/blog/my-great-article');
+      expect(postCall[1].content.article.title).toBe('My Great Article');
+      expect(postCall[1].content.article.thumbnail).toBeUndefined();
+      expect(result).toBe('urn:li:share:fallback1');
+    });
+
+    it('should not add article content when images are provided even if URL is present', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:img-post' },
+      });
+
+      const result = await service.createPost(
+        'token',
+        'urn:li:person:123',
+        'Check out https://example.com/article',
+        ['urn:li:image:existing']
+      );
+
+      const postCall = mockClient.post.mock.calls[0];
+      expect(postCall[1].content).toEqual({
+        media: { id: 'urn:li:image:existing' },
+      });
+      expect(result).toBe('urn:li:share:img-post');
+    });
+
+    it('should add article content without thumbnail when OG image is missing', async () => {
+      // Mock OG fetch - no image
+      (axios.get as jest.Mock).mockResolvedValueOnce({
+        data: '<html><head><meta property="og:title" content="No Image Article"><meta property="og:description" content="Desc"></head></html>',
+        headers: { 'content-type': 'text/html' },
+      });
+      // Mock createPost API call
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:no-thumb' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:person:123', 'See https://example.com/page');
+
+      const postCall = mockClient.post.mock.calls[0];
+      expect(postCall[1].content).toEqual({
+        article: {
+          source: 'https://example.com/page',
+          title: 'No Image Article',
+          description: 'Desc',
+        },
+      });
+      expect(result).toBe('urn:li:share:no-thumb');
+    });
+
+    it('should escape LinkedIn little format reserved characters in commentary', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:escaped1' },
+      });
+
+      const textWithReservedChars = 'AI as a tool (Chatbots) & more {things} [here] | now <html> @mention *bold* _italic_ ~strike~';
+
+      await service.createPost('token', 'urn:li:person:123', textWithReservedChars);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // All reserved chars except # should be escaped with backslash
+      expect(commentary).toContain('\\(Chatbots\\)');
+      expect(commentary).toContain('\\{things\\}');
+      expect(commentary).toContain('\\[here\\]');
+      expect(commentary).toContain('\\|');
+      expect(commentary).toContain('\\<html\\>');
+      expect(commentary).toContain('\\@mention');
+      expect(commentary).toContain('\\*bold\\*');
+      expect(commentary).toContain('\\_italic\\_');
+      expect(commentary).toContain('\\~strike\\~');
+    });
+
+    it('should preserve hashtags (# not escaped) in commentary', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:hashtag1' },
+      });
+
+      const textWithHashtags = 'Great insights on AI! #MarTech #AI #Growth';
+
+      await service.createPost('token', 'urn:li:person:123', textWithHashtags);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // Hashtags should NOT be escaped
+      expect(commentary).toContain('#MarTech');
+      expect(commentary).toContain('#AI');
+      expect(commentary).toContain('#Growth');
+      expect(commentary).not.toContain('\\#');
+    });
+
+    it('should escape backslashes first to avoid double-escaping', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:backslash1' },
+      });
+
+      const textWithBackslash = 'path\\to\\file (test)';
+
+      await service.createPost('token', 'urn:li:person:123', textWithBackslash);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // Backslashes escaped first, then parens escaped
+      // 'path\to\file (test)' -> 'path\\to\\file \(test\)'
+      expect(commentary).toBe('path\\\\to\\\\file \\(test\\)');
+    });
+
+    it('should handle real-world LinkedIn post with parentheses that caused truncation', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:realworld1' },
+      });
+
+      const realWorldText = 'The "Agency Model" is dying. AI as a tool (Chatbots) won\'t save you. Here\'s why.';
+
+      await service.createPost('token', 'urn:li:organization:123', realWorldText);
+
+      const postCall = mockClient.post.mock.calls[0];
+      const commentary = postCall[1].commentary;
+      // The parentheses around "Chatbots" should be escaped
+      expect(commentary).toContain('\\(Chatbots\\)');
+      // The full text should be present (not truncated at parentheses)
+      expect(commentary).toContain("won't save you");
+      expect(commentary).toContain("Here's why.");
+    });
+
+    it('should not add article content when post has no URL', async () => {
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:plain' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:person:123', 'Just a plain text post');
+
+      const postCall = mockClient.post.mock.calls[0];
+      expect(postCall[1].content).toBeUndefined();
+      expect(result).toBe('urn:li:share:plain');
+    });
+
+    it('should use headless browser fallback when HTTP OG fetch fails and Chrome is available', async () => {
+      // Mock HTTP OG fetch failures
+      (axios.get as jest.Mock)
+        .mockRejectedValueOnce(new Error('401'))
+        .mockRejectedValueOnce(new Error('401'));
+      // Mock Chrome found
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      // Mock browser returning OG data
+      mockPage.evaluate.mockResolvedValueOnce({
+        title: 'Browser Fetched Title',
+        description: 'Browser description',
+        image: 'https://example.com/browser-og.jpg',
+      });
+      // Mock image download for thumbnail
+      (axios.get as jest.Mock).mockResolvedValueOnce({
+        data: Buffer.from('fake-image'),
+        headers: { 'content-type': 'image/jpeg' },
+      });
+      // Mock image upload init
+      mockClient.post.mockResolvedValueOnce({
+        data: { value: { uploadUrl: 'https://upload.linkedin.com/image', image: 'urn:li:image:browser-thumb' } },
+      });
+      // Mock image binary upload
+      (axios.put as jest.Mock).mockResolvedValueOnce({});
+      // Mock createPost API call
+      mockClient.post.mockResolvedValueOnce({
+        data: {},
+        headers: { 'x-restli-id': 'urn:li:share:browser1' },
+      });
+
+      const result = await service.createPost('token', 'urn:li:person:123', 'Read https://protected-site.com/article');
+
+      const postCall = mockClient.post.mock.calls[1]; // Second post call is createPost
+      expect(postCall[1].content).toEqual({
+        article: {
+          source: 'https://protected-site.com/article',
+          title: 'Browser Fetched Title',
+          description: 'Browser description',
+          thumbnail: 'urn:li:image:browser-thumb',
+        },
+      });
+      expect(mockBrowser.close).toHaveBeenCalled();
+      expect(result).toBe('urn:li:share:browser1');
+
+      // Reset fs mock for other tests
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
     });
   });
 

@@ -81,7 +81,7 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
       );
     });
 
-    it('should handle size limit error by keeping last 5 records', async () => {
+    it('should handle size limit error by keeping last 5 records plus new result', async () => {
       // First call fails with size limit error
       const sizeLimitError = {
         code: 'ValidationException',
@@ -109,8 +109,8 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
         testHistory,
       };
 
-      // Expected: keep last 5 records (indices 10-14)
-      const expectedHistory = testHistory.slice(-5);
+      // Expected: last 5 trimmed records + trimmed new result = 6 total
+      const expectedTrimmedHistory = testHistory.slice(-5);
 
       mockDocClient.update
         .mockReturnValueOnce({
@@ -120,16 +120,7 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
           promise: jest.fn().mockResolvedValue({
             Attributes: {
               testId,
-              testHistory: expectedHistory,
-              updatedAt: new Date().toISOString(),
-            },
-          }),
-        })
-        .mockReturnValueOnce({
-          promise: jest.fn().mockResolvedValue({
-            Attributes: {
-              testId,
-              testHistory: [...expectedHistory, testResult],
+              testHistory: [...expectedTrimmedHistory, testResult],
               updatedAt: new Date().toISOString(),
             },
           }),
@@ -150,19 +141,16 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
         })
       );
 
-      // Verify cleanup update was called
+      // Verify cleanup+insert update was called (replaces history with trimmed records + new result)
       expect(mockDocClient.update).toHaveBeenCalledWith(
         expect.objectContaining({
           Key: { testId },
           UpdateExpression: 'SET #testHistory = :updatedHistory, #updatedAt = :updatedAt',
-          ExpressionAttributeValues: expect.objectContaining({
-            ':updatedHistory': expectedHistory,
-          }),
         })
       );
 
-      // Verify retry update was called
-      expect(mockDocClient.update).toHaveBeenCalledTimes(3);
+      // Only 2 update calls: initial (failed) + cleanup-with-new-result
+      expect(mockDocClient.update).toHaveBeenCalledTimes(2);
       expect(result).toBeDefined();
       expect(result!.testHistory).toHaveLength(6); // 5 kept + 1 new
     });
@@ -194,9 +182,6 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
         testHistory,
       };
 
-      // Should keep all 5 records (slice(-5) keeps all if less than 5)
-      const expectedHistory = testHistory.slice(-5);
-
       mockDocClient.update
         .mockReturnValueOnce({
           promise: jest.fn().mockRejectedValue(sizeLimitError),
@@ -205,16 +190,7 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
           promise: jest.fn().mockResolvedValue({
             Attributes: {
               testId,
-              testHistory: expectedHistory,
-              updatedAt: new Date().toISOString(),
-            },
-          }),
-        })
-        .mockReturnValueOnce({
-          promise: jest.fn().mockResolvedValue({
-            Attributes: {
-              testId,
-              testHistory: [...expectedHistory, testResult],
+              testHistory: [...testHistory, testResult],
               updatedAt: new Date().toISOString(),
             },
           }),
@@ -228,7 +204,7 @@ describe('BenchmarkTestDb - Model Selection and Size Limit Handling', () => {
 
       const result = await benchmarkTestDb.addTestResult(testId, testResult);
 
-      expect(mockDocClient.update).toHaveBeenCalledTimes(3);
+      expect(mockDocClient.update).toHaveBeenCalledTimes(2);
       expect(result).toBeDefined();
       expect(result!.testHistory).toHaveLength(6); // 5 kept + 1 new
     });

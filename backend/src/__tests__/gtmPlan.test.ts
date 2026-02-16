@@ -580,6 +580,52 @@ describe('GTM Plan Route Tests', () => {
 
       expect(shouldClearCompletedAt).toBe(true);
     });
+
+    it('should set completedAt on work item when status transitions to completed', () => {
+      const originalItem = { id: 'item-1', title: 'Item 1', status: 'pending' };
+      const status = 'completed';
+
+      const updatedWorkItem = {
+        ...originalItem,
+        ...(status !== undefined && { status }),
+        ...(status === 'completed' && originalItem.status !== 'completed' && { completedAt: new Date().toISOString() }),
+        ...(status !== undefined && status !== 'completed' && originalItem.status === 'completed' && { completedAt: null }),
+      };
+
+      expect(updatedWorkItem.status).toBe('completed');
+      expect(updatedWorkItem.completedAt).toBeDefined();
+      expect(new Date(updatedWorkItem.completedAt!).getTime()).toBeLessThanOrEqual(Date.now());
+    });
+
+    it('should clear completedAt on work item when status transitions away from completed', () => {
+      const originalItem = { id: 'item-1', title: 'Item 1', status: 'completed', completedAt: '2026-01-01T00:00:00Z' };
+      const status: string = 'in_progress';
+
+      const updatedWorkItem = {
+        ...originalItem,
+        ...(status !== undefined && { status }),
+        ...(status === 'completed' && originalItem.status !== 'completed' && { completedAt: new Date().toISOString() }),
+        ...(status !== undefined && status !== 'completed' && originalItem.status === 'completed' && { completedAt: null }),
+      };
+
+      expect(updatedWorkItem.status).toBe('in_progress');
+      expect(updatedWorkItem.completedAt).toBeNull();
+    });
+
+    it('should not change completedAt when status stays completed', () => {
+      const originalItem = { id: 'item-1', title: 'Item 1', status: 'completed', completedAt: '2026-01-01T00:00:00Z' };
+      const status = 'completed';
+
+      const updatedWorkItem = {
+        ...originalItem,
+        ...(status !== undefined && { status }),
+        ...(status === 'completed' && originalItem.status !== 'completed' && { completedAt: new Date().toISOString() }),
+        ...(status !== undefined && status !== 'completed' && originalItem.status === 'completed' && { completedAt: null }),
+      };
+
+      expect(updatedWorkItem.status).toBe('completed');
+      expect(updatedWorkItem.completedAt).toBe('2026-01-01T00:00:00Z');
+    });
   });
 
   describe('Delete GTM Plan (DELETE /:planId)', () => {

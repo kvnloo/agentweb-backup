@@ -440,13 +440,158 @@ export class LinkedInService {
    * Create a post (Versioned Post API)
    * Handles both Personal and Organization posts based on authorUrn
    */
+  /**
+   * Escape reserved characters for LinkedIn's 'little' text format.
+   * The commentary field uses 'little' format where these characters are reserved:
+   * | { } @ [ ] ( ) < > # \ * _ ~
+   * Unescaped reserved chars cause LinkedIn to silently truncate the post text.
+   * We preserve # unescaped so hashtags (#word) work as HashtagElements.
+   */
+  private escapeLinkedInLittle(text: string): string {
+    // Backslash must be escaped first to avoid double-escaping
+    return text
+      .replace(/\\/g, '\\\\')
+      .replace(/\|/g, '\\|')
+      .replace(/\{/g, '\\{')
+      .replace(/\}/g, '\\}')
+      .replace(/@/g, '\\@')
+      .replace(/\[/g, '\\[')
+      .replace(/\]/g, '\\]')
+      .replace(/\(/g, '\\(')
+      .replace(/\)/g, '\\)')
+      .replace(/</g, '\\<')
+      .replace(/>/g, '\\>')
+      .replace(/\*/g, '\\*')
+      .replace(/_/g, '\\_')
+      .replace(/~/g, '\\~');
+  }
+
+  /**
+   * Extract a human-readable title from a URL path as fallback when OG metadata can't be fetched
+   */
+  private titleFromUrl(url: string): string {
+    try {
+      const parsed = new URL(url);
+      // Get last meaningful path segment (ignore trailing slash)
+      const segments = parsed.pathname.split('/').filter(Boolean);
+      const slug = segments[segments.length - 1] || parsed.hostname;
+      // Convert slug to title: replace hyphens/underscores with spaces, strip trailing date patterns, title case
+      return slug
+        .replace(/[-_]/g, ' ')
+        .replace(/\s+\d{4}\s*\d{0,2}\s*\d{0,2}\s*$/, '') // strip trailing dates like "2026 02 12"
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .trim() || parsed.hostname.replace(/^www\./, '');
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * Fetch Open Graph metadata from a URL for link previews.
+   * Uses facebookexternalhit UA (most widely whitelisted social crawler).
+   * Falls back to readable title extracted from URL path for bot-protected sites.
+   */
+  private async fetchOgMetadata(url: string): Promise<{ title: string; description?: string; image?: string }> {
+    const parseOg = (html: string) => {
+      const getMetaContent = (property: string): string | undefined => {
+        const regex = new RegExp(`<meta[^>]*property=["']${property}["'][^>]*content=["']([^"']*)["']`, 'i');
+        const match = html.match(regex);
+        if (match) return match[1];
+        const regex2 = new RegExp(`<meta[^>]*content=["']([^"']*)["'][^>]*property=["']${property}["']`, 'i');
+        const match2 = html.match(regex2);
+        return match2?.[1];
+      };
+      return {
+        title: getMetaContent('og:title') || html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim(),
+        description: getMetaContent('og:description'),
+        image: getMetaContent('og:image'),
+      };
+    };
+
+    // Try HTTP fetch with social crawler and browser UAs
+    const userAgents = [
+      'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    ];
+
+    for (const ua of userAgents) {
+      try {
+        const response = await axios.get(url, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': ua,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+        const html = typeof response.data === 'string' ? response.data : '';
+        const og = parseOg(html);
+        if (og.title) {
+          return { title: og.title, description: og.description, image: og.image };
+        }
+      } catch {
+        // Will try next UA or fall through to browser fallback
+      }
+    }
+
+    // Fallback: use headless browser to bypass bot protection (DataDome, Cloudflare, etc.)
+    try {
+      const puppeteer = await import('puppeteer-core');
+      const chromePaths = [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', // macOS
+        '/usr/bin/google-chrome-stable',  // Linux (google-chrome)
+        '/usr/bin/google-chrome',         // Linux (alt)
+        '/usr/bin/chromium-browser',      // Linux (chromium)
+        '/usr/bin/chromium',              // Linux (snap/alt)
+      ];
+      let executablePath: string | undefined;
+      const fs = await import('fs');
+      for (const p of chromePaths) {
+        if (fs.existsSync(p)) { executablePath = p; break; }
+      }
+      if (executablePath) {
+        const browser = await puppeteer.default.launch({
+          executablePath,
+          headless: true,
+          args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
+        });
+        try {
+          const page = await browser.newPage();
+          await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          const og = await page.evaluate(() => {
+            const getMeta = (prop: string) => {
+              const el = document.querySelector(`meta[property="${prop}"]`);
+              return el?.getAttribute('content') || undefined;
+            };
+            return {
+              title: getMeta('og:title') || document.title || undefined,
+              description: getMeta('og:description'),
+              image: getMeta('og:image'),
+            };
+          });
+          if (og.title) {
+            return { title: og.title, description: og.description, image: og.image };
+          }
+        } finally {
+          await browser.close();
+        }
+      }
+    } catch (error) {
+      console.error('[LinkedIn] Headless browser OG fetch failed:', error instanceof Error ? error.message : error);
+    }
+
+    // Final fallback: derive a readable title from the URL path
+    return { title: this.titleFromUrl(url) };
+  }
+
   async createPost(accessToken: string, authorUrn: string, text: string, imageUrns?: string[]): Promise<string> {
     return this.safeRequest(async () => {
-
+      console.log('[LinkedIn] createPost called for author:', authorUrn);
 
       const payload: any = {
         author: authorUrn,
-        commentary: text,
+        commentary: this.escapeLinkedInLittle(text),
         visibility: 'PUBLIC',
         lifecycleState: 'PUBLISHED',
         distribution: {
@@ -471,17 +616,59 @@ export class LinkedInService {
             }
           };
         }
-
+      } else {
+        // No images - check if text contains a URL and add article content for link preview
+        const urlMatch = text.match(/https?:\/\/[^\s)}\]]+/);
+        if (urlMatch) {
+          const articleUrl = urlMatch[0];
+          console.log('[LinkedIn] Fetching OG metadata for:', articleUrl);
+          // Race OG fetch against a timeout so it never blocks post creation for too long
+          const ogPromise = this.fetchOgMetadata(articleUrl);
+          let timeoutId: ReturnType<typeof setTimeout>;
+          const timeoutPromise = new Promise<{ title: string; description?: string; image?: string }>((resolve) => {
+            timeoutId = setTimeout(() => {
+              console.log('[LinkedIn] OG metadata fetch timed out, using URL-derived title');
+              resolve({ title: this.titleFromUrl(articleUrl) });
+            }, 12000);
+          });
+          const og = await Promise.race([ogPromise, timeoutPromise]);
+          clearTimeout(timeoutId!);
+          console.log('[LinkedIn] OG metadata result - title:', og.title, ', hasImage:', !!og.image);
+          const article: any = {
+            source: articleUrl,
+            title: og.title,
+          };
+          if (og.description) {
+            article.description = og.description;
+          }
+          if (og.image) {
+            try {
+              const thumbnailUrn = await this.uploadImageFromUrl(accessToken, authorUrn, og.image);
+              article.thumbnail = thumbnailUrn;
+            } catch (err) {
+              console.error('[LinkedIn] Failed to upload article thumbnail:', err instanceof Error ? err.message : err);
+            }
+          }
+          payload.content = { article };
+        }
       }
 
 
 
+      console.log('[LinkedIn] Sending post to LinkedIn API - commentary length:', payload.commentary?.length, ', hasArticle:', !!payload.content?.article);
       const response = await this.client.post('/rest/posts', payload, {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
 
       const postUrn = response.headers['x-restli-id'] || (response.data as any).id;
-
+      console.log('[LinkedIn] Post created successfully:', postUrn);
+      // Log if LinkedIn returned any response body (may contain modified content)
+      if (response.data && Object.keys(response.data).length > 0) {
+        const respCommentary = (response.data as any).commentary;
+        if (respCommentary && respCommentary.length !== payload.commentary?.length) {
+          console.error('[LinkedIn] WARNING: Response commentary length differs! Sent:', payload.commentary?.length, 'Received:', respCommentary.length);
+        }
+      }
 
       // LinkedIn Versioned API returns the URN in the x-restli-id header
       return postUrn;

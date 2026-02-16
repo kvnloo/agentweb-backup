@@ -13,7 +13,8 @@ jest.mock('../services/skillService', () => ({
   }
 }));
 jest.mock('../services/subscriptionService', () => ({
-  getAllowedFunctionCalls: jest.fn().mockResolvedValue(['*']),
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
   filterFunctionCalls: jest.fn().mockImplementation((tools) => tools)
 }));
 

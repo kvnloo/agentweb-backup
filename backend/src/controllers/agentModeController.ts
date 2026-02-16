@@ -15,6 +15,8 @@ import { emitProgress, registerProgressCallback, getLatestProgress, progressStor
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { skillService } from '../services/skillService';
+import { getAllowedSkills } from '../services/subscriptionService';
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -109,6 +111,94 @@ interface ScheduledChatTestResult {
   sessionId: string; // Test session ID for viewing conversation
   attempt: number; // Which attempt this was (1-3)
   createdAt: string;
+}
+
+interface ScheduledChatVariable {
+  name: string;
+  description?: string;
+}
+
+const SCHEDULED_CHAT_VARIABLE_REGEX = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+
+function extractScheduledChatVariableNames(startingMessage: string): string[] {
+  const seen = new Set<string>();
+  let match: RegExpExecArray | null;
+  SCHEDULED_CHAT_VARIABLE_REGEX.lastIndex = 0;
+  while ((match = SCHEDULED_CHAT_VARIABLE_REGEX.exec(startingMessage)) !== null) {
+    seen.add(match[1]);
+  }
+  return Array.from(seen);
+}
+
+function validateAndBuildScheduledChatVariables(
+  startingMessage: string,
+  inputVariables: unknown,
+  existingVariables: ScheduledChatVariable[] = []
+): { variables: ScheduledChatVariable[]; error?: string } {
+  const variableNames = extractScheduledChatVariableNames(startingMessage);
+  if (variableNames.length === 0) {
+    return { variables: [] };
+  }
+
+  const normalizedInputVariables: ScheduledChatVariable[] = Array.isArray(inputVariables)
+    ? inputVariables
+        .filter((v: any) => v && typeof v.name === 'string')
+        .map((v: any) => ({
+          name: v.name.trim(),
+          description: typeof v.description === 'string' ? v.description.trim() : '',
+        }))
+    : [];
+
+  const inputNames = new Set(normalizedInputVariables.map(v => v.name));
+  const unknownVariables = Array.from(inputNames).filter(name => !variableNames.includes(name));
+  if (unknownVariables.length > 0) {
+    return {
+      variables: [],
+      error: `Variables not found in startingMessage: ${unknownVariables.join(', ')}`
+    };
+  }
+
+  const existingDescriptionMap = new Map(
+    (existingVariables || []).map(variable => [variable.name, variable.description || ''])
+  );
+  const inputDescriptionMap = new Map(
+    normalizedInputVariables.map(variable => [variable.name, variable.description || ''])
+  );
+
+  const variables = variableNames.map((name) => ({
+    name,
+    description: inputDescriptionMap.has(name)
+      ? inputDescriptionMap.get(name) || ''
+      : existingDescriptionMap.get(name) || '',
+  }));
+
+  return { variables };
+}
+
+function getMissingScheduledChatVariableNames(
+  variables: ScheduledChatVariable[],
+  variableValues: Record<string, string> = {}
+): string[] {
+  return variables
+    .filter(variable => !variableValues[variable.name] || !String(variableValues[variable.name]).trim())
+    .map(variable => variable.name);
+}
+
+function applyScheduledChatVariableValues(
+  startingMessage: string,
+  variableValues: Record<string, string> = {}
+): string {
+  return startingMessage.replace(SCHEDULED_CHAT_VARIABLE_REGEX, (_, variableName: string) => {
+    const value = variableValues[variableName];
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      return `{{${variableName}}}`;
+    }
+    return value;
+  });
+}
+
+function hashScheduledChatVariableAccessToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
 }
 
 // Helper function to reconstruct actualResponse from session messages (only used when sending emails)
@@ -347,6 +437,42 @@ export async function runVerifiedChat(
   }
   const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
 
+  // Auto-install skills that contain required function calls so the LLM has
+  // access to them from the start (avoids relying on the LLM to call install_skills).
+  if (requiredFunctions.length > 0) {
+    try {
+      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+        skillService.getPublishedSkills(),
+        getAllowedSkills(userId)
+      ]);
+      const isWildcard = userAllowedSkillIds.includes('*');
+      const requiredToolNames = new Set(requiredFunctions.map(rf => rf.functionName));
+
+      // Find skills that contain any of the required tools and are allowed
+      const skillIdsToInstall: string[] = [];
+      for (const skill of publishedSkills) {
+        const hasRequiredTool = skill.toolNames?.some(t => requiredToolNames.has(t));
+        const isAllowed = isWildcard || userAllowedSkillIds.includes(skill.skillId);
+        if (hasRequiredTool && isAllowed) {
+          skillIdsToInstall.push(skill.skillId);
+        }
+      }
+
+      // Also check if any required tools are "other" (not in any published skill)
+      const allSkillToolNames = new Set(publishedSkills.flatMap(s => s.toolNames || []));
+      const hasOtherTools = [...requiredToolNames].some(t => !allSkillToolNames.has(t));
+      if (hasOtherTools && (isWildcard || userAllowedSkillIds.includes('__other_skills__'))) {
+        skillIdsToInstall.push('__other_skills__');
+      }
+
+      if (skillIdsToInstall.length > 0) {
+        await agentModeService.installSkills(skillIdsToInstall, userId, sessionId);
+      }
+    } catch (error) {
+      console.error('AgentMode runVerifiedChat: Error auto-installing skills for required functions:', error);
+    }
+  }
+
   // Track remaining keywords and function calls
   let remainingKeywords = [...keywords];
   const remainingFunctionCallCounts: Record<string, number> = {};
@@ -380,13 +506,18 @@ export async function runVerifiedChat(
           const keywordText = remainingKeywords.length > 0
             ? `include these keywords: ${remainingKeywords.join(', ')}`
             : '';
+          // Use allActualFunctionCallsForReporting (never decremented) to avoid
+          // asking the LLM to re-call tools that already ran. The evaluation at
+          // lines 558-563 decrements allActualFunctionCalls when a function is
+          // matched, which zeroes out counts of already-called functions when the
+          // overall check fails due to a single missing function.
           const functionCallText = requiredFunctions
             .filter(reqFunc => {
-              const currentCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
               return currentCount < reqFunc.minCount;
             })
             .map(reqFunc => {
-              const currentCount = allActualFunctionCalls[reqFunc.functionName] || 0;
+              const currentCount = allActualFunctionCallsForReporting.filter(call => call === reqFunc.functionName).length;
               const remaining = reqFunc.minCount - currentCount;
               return `${reqFunc.functionName} (${remaining} more time${remaining > 1 ? 's' : ''} needed)`;
             })
@@ -586,16 +717,42 @@ async function runScheduledChat(
   const now = new Date();
 
   try {
+    const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+    const scheduleVariableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
+      ? schedule.variableValues as Record<string, string>
+      : {};
+    const missingVariableNames = getMissingScheduledChatVariableNames(scheduleVariables, scheduleVariableValues);
+    if (scheduleVariables.length > 0 && missingVariableNames.length > 0) {
+      return {
+        scheduleId: schedule.scheduleId,
+        runId: require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: `Scheduled chat cannot run. Missing variable values: ${missingVariableNames.map(name => `{{${name}}}`).join(', ')}`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString()
+      };
+    }
+
     // Check if required function calls are allowed for the user's subscription
     const expectedFunctionCalls = schedule.requiredFunctionCalls || [];
     if (expectedFunctionCalls.length > 0) {
       const { getAllowedFunctionCalls } = await import('../services/subscriptionService');
       const allowedFunctionCalls = await getAllowedFunctionCalls(userId);
-      
+
+      // If wildcard is present, all function calls are allowed — skip filtering
+      const allAllowed = allowedFunctionCalls.includes("*");
+
       // Check if all required function calls are allowed
-      // getAllowedFunctionCalls now always returns an array (never null or "*")
       // If the array is empty, it means no functions are allowed (shouldn't happen, but handle it)
-      if (allowedFunctionCalls.length === 0) {
+      if (!allAllowed && allowedFunctionCalls.length === 0) {
         // This shouldn't happen, but if it does, block all function calls
         const disallowedFunctions = expectedFunctionCalls;
         
@@ -641,10 +798,10 @@ async function runScheduledChat(
         return errorResult;
       }
       
-      const disallowedFunctions = expectedFunctionCalls.filter((funcName: string) => 
+      const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
         !allowedFunctionCalls.includes(funcName)
       );
-        
+
       if (disallowedFunctions.length > 0) {
         // Get user info for email
         const { userDb } = await import('../services/db');
@@ -718,11 +875,16 @@ async function runScheduledChat(
       minCount: functionCallMinCalls[funcName] || 1
     }));
 
+    const resolvedStartingMessage = applyScheduledChatVariableValues(
+      schedule.startingMessage,
+      schedule.variableValues || {}
+    );
+
     // Run verified chat
     const result = await runVerifiedChat({
       sessionId,
       userId,
-      startingMessage: schedule.startingMessage,
+      startingMessage: resolvedStartingMessage,
       keywords: expectedKeywords,
       requiredFunctions,
       maxAttempts: 20,
@@ -885,6 +1047,7 @@ export async function generateSessionResponse(
   sources: string[];
   responseMessages: any[];
   workPlan?: any;
+  skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
 }> {
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
@@ -995,9 +1158,18 @@ export async function generateSessionResponse(
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
+  // Build skills list with installed status (includes virtual other_skills), filtered by subscription
+  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+  try {
+    skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
+  } catch (error) {
+    console.error('AgentMode generateSessionResponse: Failed to fetch skills:', error);
+  }
+
   return {
     ...response,
-    workPlan: finalSession?.workPlan
+    workPlan: finalSession?.workPlan,
+    skills
   };
 }
 
@@ -1162,23 +1334,27 @@ export const agentModeController = {
       }
       const progressActive = hasActiveProgress(session.sessionId);
 
-      // Allow admin users to access any session for benchmark creation
-      if (user && user.isAdmin) {
-        return res.json({ ...session, hasActiveProgress: progressActive });
-      }
-
       // For non-admin users, check if they own the session
-      if (session.userId !== user?.userId) {
+      if (!user?.isAdmin && session.userId !== user?.userId) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
 
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
+      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
+      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      try {
+        skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
+      } catch (error) {
+        console.error('AgentMode getSession: Failed to fetch skills:', error);
+      }
+
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSession = {
         ...session,
         messages: filterMessagesForClient(session.messages),
-        hasActiveProgress: progressActive
+        hasActiveProgress: progressActive,
+        skills
       };
 
       res.json(filteredSession);
@@ -1205,12 +1381,19 @@ export const agentModeController = {
       }
 
       // Extract function names and descriptions
-      const functionCalls = toolsToReturn
+      let functionCalls = toolsToReturn
         .filter((tool: any) => tool?.type === 'function' && tool?.function?.name)
         .map((tool: any) => ({
           name: tool.function.name,
           description: tool.function.description || ''
         }));
+
+      // When fetching for skill configuration, exclude foundation tools
+      // (they're always available and shouldn't be assigned to skills)
+      if (req.query?.forSkillConfig === 'true') {
+        const foundationTools = agentModeService.getFoundationToolNames();
+        functionCalls = functionCalls.filter((fc: any) => !foundationTools.has(fc.name));
+      }
 
       res.json({ functionCalls });
     } catch (error) {
@@ -1259,10 +1442,18 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
+
+      // Clean up progress store on error so session doesn't appear stuck in generating state
+      const sessionId = req.body?.sessionId;
+      if (sessionId) {
+        emitProgress(sessionId, { iteration: 0, status: 'complete' });
+        progressStore.delete(sessionId);
+      }
 
       // Handle specific error types
       if (error instanceof Error) {
@@ -1341,7 +1532,7 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+        if (error.message.includes('content policies') || error.message.includes('violate content policies') || error.message.includes('content management policy') || error.message.includes('content_filter')) {
           res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
@@ -1657,6 +1848,14 @@ export const agentModeController = {
         // Continue without supportNote if fetch fails
       }
 
+      // Build skills list with installed status (includes virtual other_skills), filtered by subscription
+      let sharedSkills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      try {
+        sharedSkills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
+      } catch (error) {
+        console.error('AgentMode getSharedConversation: Failed to fetch skills:', error);
+      }
+
       res.status(200).json({
         session: {
           sessionId: session.sessionId,
@@ -1670,7 +1869,8 @@ export const agentModeController = {
           llmModel: modelToUse,
           isConversable: !!conversable,
           hasActiveProgress: hasActiveProgress(session.sessionId),
-          supportNote: supportNote
+          supportNote: supportNote,
+          skills: sharedSkills
         }
       });
     } catch (error) {
@@ -1731,16 +1931,24 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
+
+      // Clean up progress store on error so session doesn't appear stuck in generating state
+      const shareId = req.params?.shareId;
+      if (shareId) {
+        emitProgress(shareId, { iteration: 0, status: 'complete' });
+        progressStore.delete(shareId);
+      }
 
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
         if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
           // Extract the actual error message from the error
-          const errorMessage = error.message.includes(':') 
+          const errorMessage = error.message.includes(':')
             ? error.message.split(':').slice(1).join(':').trim()
             : `This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`;
           res.status(413).json({
@@ -1814,7 +2022,7 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+        if (error.message.includes('content policies') || error.message.includes('violate content policies') || error.message.includes('content management policy') || error.message.includes('content_filter')) {
           res.status(400).json({
             error: 'Content policy violation',
             message: error.message,
@@ -2255,7 +2463,9 @@ export const agentModeController = {
         emailNotifications,
         emailCampaignTaskId,
         llmModel,
-        runCount
+        runCount,
+        variables,
+        variableValues
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -2296,7 +2506,7 @@ export const agentModeController = {
         scheduledNextRunTime = calculatedTime.toISOString();
       }
 
-      const scheduledChat = {
+      const scheduledChat: any = {
         scheduleId,
         taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
         userId: user.userId,
@@ -2317,8 +2527,39 @@ export const agentModeController = {
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
         llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
-        runCount: runCount !== undefined ? runCount : -1 // Default to unlimited runs if not specified
+        runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
+        variables: [] as ScheduledChatVariable[],
+        variableValues: {} as Record<string, string>,
+        variableRequestStatus: 'idle'
       };
+
+      const { variables: normalizedVariables, error: variableError } =
+        validateAndBuildScheduledChatVariables(startingMessage, variables);
+      if (variableError) {
+        return res.status(400).json({ error: variableError });
+      }
+      if (normalizedVariables.length > 0 && (!Array.isArray(emailNotifications) || emailNotifications.length === 0)) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
+      }
+
+      const normalizedVariableValues: Record<string, string> = {};
+      if (normalizedVariables.length > 0 && variableValues && typeof variableValues === 'object') {
+        normalizedVariables.forEach((variable) => {
+          const rawValue = (variableValues as Record<string, unknown>)[variable.name];
+          if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+            normalizedVariableValues[variable.name] = rawValue.trim();
+          }
+        });
+      }
+
+      scheduledChat.variables = normalizedVariables;
+      scheduledChat.variableValues = normalizedVariableValues;
+      scheduledChat.variableRequestStatus = normalizedVariables.length > 0
+        ? (getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length > 0 ? 'pending' : 'provided')
+        : 'idle';
+      if (Object.keys(normalizedVariableValues).length > 0) {
+        scheduledChat.variableValuesUpdatedAt = now.toISOString();
+      }
 
       await scheduleDb.createSchedule(scheduledChat);
 
@@ -2376,7 +2617,9 @@ export const agentModeController = {
         dailyDigest,
         emailCampaignTaskId,
         llmModel,
-        runCount
+        runCount,
+        variables,
+        variableValues
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -2426,6 +2669,52 @@ export const agentModeController = {
         llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
       };
 
+      const { variables: normalizedVariables, error: variableError } =
+        validateAndBuildScheduledChatVariables(startingMessage, variables, existingSchedule.variables || []);
+      if (variableError) {
+        return res.status(400).json({ error: variableError });
+      }
+      const effectiveEmailNotifications = Array.isArray(emailNotifications)
+        ? emailNotifications
+        : (Array.isArray(existingSchedule.emailNotifications) ? existingSchedule.emailNotifications : []);
+      if (normalizedVariables.length > 0 && effectiveEmailNotifications.length === 0) {
+        return res.status(400).json({ error: 'Email Notifications are required when using variables in startingMessage' });
+      }
+      updates.variables = normalizedVariables;
+
+      // Preserve existing values for unchanged variables unless explicitly overwritten
+      const existingValues = (existingSchedule.variableValues && typeof existingSchedule.variableValues === 'object')
+        ? existingSchedule.variableValues as Record<string, string>
+        : {};
+      const normalizedVariableValues: Record<string, string> = {};
+
+      normalizedVariables.forEach((variable) => {
+        const incomingValue = variableValues && typeof variableValues === 'object'
+          ? (variableValues as Record<string, unknown>)[variable.name]
+          : undefined;
+
+        if (typeof incomingValue === 'string') {
+          const trimmed = incomingValue.trim();
+          if (trimmed.length > 0) {
+            normalizedVariableValues[variable.name] = trimmed;
+          }
+          return;
+        }
+
+        const existingValue = existingValues[variable.name];
+        if (typeof existingValue === 'string' && existingValue.trim().length > 0) {
+          normalizedVariableValues[variable.name] = existingValue.trim();
+        }
+      });
+
+      updates.variableValues = normalizedVariableValues;
+      updates.variableRequestStatus = normalizedVariables.length > 0
+        ? (getMissingScheduledChatVariableNames(normalizedVariables, normalizedVariableValues).length > 0 ? 'pending' : 'provided')
+        : 'idle';
+      if (Object.keys(normalizedVariableValues).length > 0) {
+        updates.variableValuesUpdatedAt = now.toISOString();
+      }
+
       // Only include nextRunTime in updates if it was explicitly provided
       if (shouldUpdateNextRunTime) {
         updates.nextRunTime = scheduledNextRunTime;
@@ -2448,6 +2737,274 @@ export const agentModeController = {
     }
   },
 
+  // Submit variable values for a scheduled chat
+  async submitScheduledChatVariables(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { variableValues, triggerRun } = req.body as { variableValues?: Record<string, string>; triggerRun?: boolean };
+
+      if (!variableValues || typeof variableValues !== 'object') {
+        return res.status(400).json({ error: 'variableValues object is required' });
+      }
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      if (variables.length === 0) {
+        return res.status(400).json({ error: 'This scheduled chat has no variables' });
+      }
+
+      const sanitizedValues: Record<string, string> = {};
+      variables.forEach((variable) => {
+        const rawValue = variableValues[variable.name];
+        if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+          sanitizedValues[variable.name] = rawValue.trim();
+        }
+      });
+
+      const missingVariableNames = getMissingScheduledChatVariableNames(variables, sanitizedValues);
+      const nowIso = new Date().toISOString();
+
+      await scheduleDb.updateSchedule(scheduleId, {
+        variableValues: sanitizedValues,
+        variableRequestStatus: missingVariableNames.length > 0 ? 'pending' : 'provided',
+        variableValuesUpdatedAt: nowIso,
+        variableRequestAccessTokenConsumedAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      if (missingVariableNames.length === 0 && triggerRun !== false) {
+        const scheduleToRun: any = {
+          ...schedule,
+          variableValues: sanitizedValues,
+          variableRequestStatus: 'provided',
+          variableValuesUpdatedAt: nowIso
+        };
+
+        runScheduledChat(scheduleToRun, user.userId, false).then(async (result) => {
+          if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+            try {
+              await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+                variableValues: {},
+                variableRequestStatus: 'pending',
+                updatedAt: new Date().toISOString()
+              });
+            } catch (clearError) {
+              console.error(`Error clearing variable values after manual trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+            }
+          }
+
+          if (result.sessionId) {
+            try {
+              const emailNotifications = scheduleToRun.emailNotifications || [];
+              if (emailNotifications.length > 0) {
+                await emailService.sendScheduledChatResultEmail(
+                  emailNotifications,
+                  scheduleToRun.scheduleName,
+                  result,
+                  scheduleToRun.scheduleId
+                );
+              }
+            } catch (emailError) {
+              console.error('Error sending scheduled chat result email after manual trigger:', emailError);
+            }
+          }
+        }).catch(async (runError) => {
+          if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+            scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+              variableValues: {},
+              variableRequestStatus: 'pending',
+              updatedAt: new Date().toISOString()
+            }).catch((clearError) => {
+              console.error(`Error clearing variable values after failed manual trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+            });
+          }
+          console.error(`Error triggering scheduled chat after variable submission for ${scheduleToRun.scheduleName}:`, runError);
+        });
+      }
+
+      res.json({
+        message: missingVariableNames.length === 0
+          ? (triggerRun === false
+              ? 'Variable values saved.'
+              : 'Variable values saved. Scheduled chat run started.')
+          : 'Variable values saved, but some required variables are still missing.',
+        missingVariables: missingVariableNames
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit scheduled chat variables error:', error);
+      res.status(500).json({ error: 'Failed to submit scheduled chat variables' });
+    }
+  },
+
+  // Public endpoint: view required variables by one-time access token (no login required)
+  async getScheduledChatVariablesByAccessToken(req: Request, res: Response) {
+    try {
+      const { accessToken } = req.params;
+      if (!accessToken || typeof accessToken !== 'string') {
+        return res.status(400).json({ error: 'Access token is required' });
+      }
+
+      const tokenHash = hashScheduledChatVariableAccessToken(accessToken);
+      const schedule = await scheduleDb.getScheduledChatByVariableAccessTokenHash(tokenHash);
+      if (!schedule) {
+        return res.status(404).json({ error: 'Invalid or expired variable request link' });
+      }
+
+      const nowMs = Date.now();
+      const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
+        ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
+        : NaN;
+      const isExpired = Number.isFinite(expiresAtMs) && expiresAtMs < nowMs;
+      if (isExpired) {
+        return res.status(410).json({ error: 'This variable request link has expired' });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      const isCompleted = Boolean(schedule.variableRequestAccessTokenConsumedAt)
+        || schedule.variableRequestStatus === 'provided';
+
+      return res.json({
+        scheduleId: schedule.scheduleId,
+        scheduleName: schedule.scheduleName || 'Scheduled Chat',
+        variables,
+        status: isCompleted ? 'completed' : 'pending',
+        submittedAt: schedule.variableRequestAccessTokenConsumedAt || null,
+        expiresAt: schedule.variableRequestAccessTokenExpiresAt || null,
+      });
+    } catch (error) {
+      console.error('AgentMode: Get scheduled chat variables by access token error:', error);
+      return res.status(500).json({ error: 'Failed to load variable request' });
+    }
+  },
+
+  // Public endpoint: submit variables by one-time access token (no login required)
+  async submitScheduledChatVariablesByAccessToken(req: Request, res: Response) {
+    try {
+      const { accessToken } = req.params;
+      const { variableValues } = req.body as { variableValues?: Record<string, string> };
+
+      if (!accessToken || typeof accessToken !== 'string') {
+        return res.status(400).json({ error: 'Access token is required' });
+      }
+      if (!variableValues || typeof variableValues !== 'object') {
+        return res.status(400).json({ error: 'variableValues object is required' });
+      }
+
+      const tokenHash = hashScheduledChatVariableAccessToken(accessToken);
+      const schedule = await scheduleDb.getScheduledChatByVariableAccessTokenHash(tokenHash);
+      if (!schedule) {
+        return res.status(404).json({ error: 'Invalid or expired variable request link' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
+        ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
+        : NaN;
+      if (Number.isFinite(expiresAtMs) && expiresAtMs < Date.now()) {
+        return res.status(410).json({ error: 'This variable request link has expired' });
+      }
+
+      if (schedule.variableRequestAccessTokenConsumedAt) {
+        return res.status(409).json({
+          error: 'This variable request link has already been used',
+          status: 'completed',
+          submittedAt: schedule.variableRequestAccessTokenConsumedAt
+        });
+      }
+
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      if (variables.length === 0) {
+        return res.status(400).json({ error: 'This scheduled chat has no variables' });
+      }
+
+      const sanitizedValues: Record<string, string> = {};
+      variables.forEach((variable) => {
+        const rawValue = variableValues[variable.name];
+        if (typeof rawValue === 'string' && rawValue.trim().length > 0) {
+          sanitizedValues[variable.name] = rawValue.trim();
+        }
+      });
+
+      const missingVariableNames = getMissingScheduledChatVariableNames(variables, sanitizedValues);
+      if (missingVariableNames.length > 0) {
+        return res.status(400).json({
+          error: 'Missing values for required variables',
+          missingVariables: missingVariableNames
+        });
+      }
+
+      await scheduleDb.updateSchedule(schedule.scheduleId, {
+        variableValues: sanitizedValues,
+        variableRequestStatus: 'provided',
+        variableValuesUpdatedAt: nowIso,
+        variableRequestAccessTokenConsumedAt: nowIso,
+        updatedAt: nowIso,
+      });
+
+      const scheduleToRun: any = {
+        ...schedule,
+        variableValues: sanitizedValues,
+        variableRequestStatus: 'provided',
+        variableValuesUpdatedAt: nowIso
+      };
+
+      runScheduledChat(scheduleToRun, schedule.userId, false).then(async (result) => {
+        if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+          try {
+            await scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+              variableValues: {},
+              variableRequestStatus: 'pending',
+              updatedAt: new Date().toISOString()
+            });
+          } catch (clearError) {
+            console.error(`Error clearing variable values after public trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+          }
+        }
+
+        if (result.sessionId) {
+          try {
+            const emailNotifications = scheduleToRun.emailNotifications || [];
+            if (emailNotifications.length > 0) {
+              await emailService.sendScheduledChatResultEmail(
+                emailNotifications,
+                scheduleToRun.scheduleName,
+                result,
+                scheduleToRun.scheduleId
+              );
+            }
+          } catch (emailError) {
+            console.error('Error sending scheduled chat result email after public variable submit:', emailError);
+          }
+        }
+      }).catch((runError) => {
+        if (Array.isArray(scheduleToRun.variables) && scheduleToRun.variables.length > 0) {
+          scheduleDb.updateSchedule(scheduleToRun.scheduleId, {
+            variableValues: {},
+            variableRequestStatus: 'pending',
+            updatedAt: new Date().toISOString()
+          }).catch((clearError) => {
+            console.error(`Error clearing variable values after failed public trigger for schedule ${scheduleToRun.scheduleName}:`, clearError);
+          });
+        }
+        console.error(`Error triggering scheduled chat after public variable submission for ${scheduleToRun.scheduleName}:`, runError);
+      });
+
+      return res.json({
+        message: 'Variable values submitted successfully. Scheduled chat run started.',
+        status: 'completed',
+        submittedAt: nowIso
+      });
+    } catch (error) {
+      console.error('AgentMode: Submit scheduled chat variables by access token error:', error);
+      return res.status(500).json({ error: 'Failed to submit variable values' });
+    }
+  },
+
   async testScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
@@ -2459,8 +3016,38 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
+      const variables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+      const variableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
+        ? schedule.variableValues as Record<string, string>
+        : {};
+      const missingVariables = getMissingScheduledChatVariableNames(variables, variableValues);
+      if (variables.length > 0 && missingVariables.length > 0) {
+        return res.status(400).json({
+          error: 'Missing variable values for scheduled chat',
+          missingVariables
+        });
+      }
+
       // Run the scheduled chat as a test
       const result = await runScheduledChat(schedule, user.userId, true);
+
+      // Send notification email if requested
+      const { sendNotificationEmail } = req.body || {};
+      if (sendNotificationEmail && result.sessionId) {
+        try {
+          const emailNotifications = schedule.emailNotifications || [];
+          if (emailNotifications.length > 0) {
+            await emailService.sendScheduledChatResultEmail(
+              emailNotifications,
+              schedule.scheduleName,
+              result,
+              schedule.scheduleId
+            );
+          }
+        } catch (emailError) {
+          console.error('AgentMode: Failed to send test notification email:', emailError);
+        }
+      }
 
       res.json(result);
 
@@ -2673,6 +3260,92 @@ export const agentModeController = {
       for (const schedule of scheduledChats) {
         try {
           const now = new Date();
+          const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
+          const scheduleVariableValues = (schedule.variableValues && typeof schedule.variableValues === 'object')
+            ? schedule.variableValues as Record<string, string>
+            : {};
+          const missingVariableNames = getMissingScheduledChatVariableNames(scheduleVariables, scheduleVariableValues);
+          const hasAllVariableValues = missingVariableNames.length === 0;
+          const hasVariableRequestSentAt = typeof schedule.variableRequestSentAt === 'string' && schedule.variableRequestSentAt.length > 0;
+          const hasVariableValuesUpdatedAt = typeof schedule.variableValuesUpdatedAt === 'string' && schedule.variableValuesUpdatedAt.length > 0;
+          const hasLastRunTime = typeof schedule.lastRunTime === 'string' && schedule.lastRunTime.length > 0;
+          const variableRequestSentAtMs = hasVariableRequestSentAt ? new Date(schedule.variableRequestSentAt).getTime() : NaN;
+          const variableValuesUpdatedAtMs = hasVariableValuesUpdatedAt ? new Date(schedule.variableValuesUpdatedAt).getTime() : NaN;
+          const lastRunTimeMs = hasLastRunTime ? new Date(schedule.lastRunTime).getTime() : NaN;
+          const valuesProvidedAfterLatestRequest = Number.isFinite(variableRequestSentAtMs)
+            && Number.isFinite(variableValuesUpdatedAtMs)
+            && variableValuesUpdatedAtMs >= variableRequestSentAtMs;
+          const valuesProvidedAfterLastRun = !Number.isFinite(lastRunTimeMs)
+            || (Number.isFinite(variableValuesUpdatedAtMs) && variableValuesUpdatedAtMs > lastRunTimeMs);
+          const isVariableRequestSatisfied = schedule.variableRequestStatus === 'provided'
+            && hasAllVariableValues
+            && valuesProvidedAfterLatestRequest
+            && valuesProvidedAfterLastRun;
+
+          // Calculate next run based on the current nextRunTime to preserve the scheduled time
+          const currentNextRun = new Date(schedule.nextRunTime);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
+
+          if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
+            const requestedVariableNames = missingVariableNames.length > 0
+              ? missingVariableNames
+              : scheduleVariables.map(variable => variable.name);
+            const variableAccessToken = crypto.randomBytes(32).toString('hex');
+            const variableAccessTokenHash = hashScheduledChatVariableAccessToken(variableAccessToken);
+            const variableAccessTokenExpiresAtDate = new Date(nextRunTime.getTime() - (30 * 60 * 1000));
+            const variableAccessTokenExpiresAt = variableAccessTokenExpiresAtDate.toISOString();
+            const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+            const variableInputUrl = `${customerFrontendUrl}/scheduled-chat/variables/${variableAccessToken}`;
+
+            // Advance next run immediately. This run window is now waiting for variable submission.
+            await scheduleDb.updateScheduleAfterRun(
+              schedule.scheduleId,
+              now.toISOString(),
+              nextRunTime.toISOString(),
+              true
+            );
+
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              updatedAt: now.toISOString(),
+              variableRequestStatus: 'pending',
+              variableRequestSentAt: now.toISOString(),
+              variableRequestAccessTokenHash: variableAccessTokenHash,
+              variableRequestAccessTokenExpiresAt: variableAccessTokenExpiresAt,
+              variableRequestAccessTokenConsumedAt: ''
+            });
+
+            try {
+              const user = await userDb.getUserById(schedule.userId);
+              const emailNotifications = schedule.emailNotifications || [];
+              const recipients = emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []);
+
+              if (recipients.length > 0) {
+                await emailService.sendScheduledChatVariableRequestEmail(
+                  recipients,
+                  schedule.scheduleName,
+                  schedule.scheduleId,
+                  scheduleVariables.filter(variable => requestedVariableNames.includes(variable.name)),
+                  variableInputUrl,
+                  variableAccessTokenExpiresAt
+                );
+              } else {
+                console.log(`No recipients configured for variable request on schedule ${schedule.scheduleName}`);
+              }
+            } catch (error) {
+              console.error(`Error sending variable request email for schedule ${schedule.scheduleName}:`, error);
+            }
+
+            results.push({
+              scheduleId: schedule.scheduleId,
+              scheduleName: schedule.scheduleName,
+              status: 'waiting_for_variables',
+              nextRunTime: nextRunTime.toISOString(),
+              variableRequestExpiresAt: variableAccessTokenExpiresAt,
+              missingVariables: requestedVariableNames
+            });
+
+            continue;
+          }
 
           // Check if we've reached the concurrent run limit
           if (currentConcurrentRuns >= maxConcurrentRuns) {
@@ -2704,9 +3377,6 @@ export const agentModeController = {
 
           // Update the schedule with next run time FIRST (synchronously)
           // This prevents agent-engine from repeatedly calling the same schedule
-          // Calculate next run based on the current nextRunTime to preserve the scheduled time
-          const currentNextRun = new Date(schedule.nextRunTime);
-          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
 
           // Decrement runCount and auto-pause if it reaches 0
           // Note: Both successful and failed runs count toward the run limit
@@ -2724,6 +3394,19 @@ export const agentModeController = {
           runScheduledChat(schedule, schedule.userId, false).then(async (result) => {
             // Decrement concurrent run counter when done
             currentConcurrentRuns--;
+
+            // Clear consumed variable values so each run requests fresh values
+            if (scheduleVariables.length > 0) {
+              try {
+                await scheduleDb.updateSchedule(schedule.scheduleId, {
+                  variableValues: {},
+                  variableRequestStatus: 'pending',
+                  updatedAt: new Date().toISOString()
+                });
+              } catch (error) {
+                console.error(`Error clearing variable values for schedule ${schedule.scheduleName}:`, error);
+              }
+            }
 
             // Send email notification with the result (only if it actually ran, not if it was blocked)
             // If result.sessionId is empty, it means the run was blocked due to subscription restrictions
@@ -2766,6 +3449,16 @@ export const agentModeController = {
           }).catch((error) => {
             // Decrement concurrent run counter on error
             currentConcurrentRuns--;
+
+            if (scheduleVariables.length > 0) {
+              scheduleDb.updateSchedule(schedule.scheduleId, {
+                variableValues: {},
+                variableRequestStatus: 'pending',
+                updatedAt: new Date().toISOString()
+              }).catch((updateError) => {
+                console.error(`Error clearing variable values after failed run for schedule ${schedule.scheduleName}:`, updateError);
+              });
+            }
 
             console.error(`Error running scheduled chat ${schedule.scheduleName}:`, error);
             // Log the full error details for debugging
@@ -2869,10 +3562,18 @@ export const agentModeController = {
         toolCalls: response.toolCalls,
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
-        workPlan: response.workPlan
+        workPlan: response.workPlan,
+        skills: response.skills
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
+
+      // Clean up progress store on error so session doesn't appear stuck in generating state
+      const convSessionId = req.params?.shareId;
+      if (convSessionId) {
+        emitProgress(convSessionId, { iteration: 0, status: 'complete' });
+        progressStore.delete(convSessionId);
+      }
 
       // Handle specific error types (same as generateResponse)
       if (error instanceof Error) {
@@ -2896,7 +3597,7 @@ export const agentModeController = {
           return;
         }
 
-        if (error.message.includes('content policies') || error.message.includes('violate content policies')) {
+        if (error.message.includes('content policies') || error.message.includes('violate content policies') || error.message.includes('content management policy') || error.message.includes('content_filter')) {
           res.status(400).json({
             error: 'Content policy violation',
             message: error.message,

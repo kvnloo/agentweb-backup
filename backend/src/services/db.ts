@@ -1145,18 +1145,16 @@ export const taskDb = {
       const startDateISO = new Date(startDate).toISOString();
       const endDateISO = new Date(endDate).toISOString();
 
-      // Get all tasks with pagination
-      const tasks = await this.scanAllItems(`${TABLE_PREFIX}AW-Tasks`);
-
-      // Get all executions with pagination
-      const executions = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`);
-
-      // Get all other data with pagination
-      const schedules = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
-      const templates = await this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`);
-      const configs = await this.scanAllItems(`${TABLE_PREFIX}AW-Configs`);
-      const workflows = await this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`);
-      const workflowExecutions = await this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`);
+      // Get all data with pagination (parallel)
+      const [tasks, executions, schedules, templates, configs, workflows, workflowExecutions] = await Promise.all([
+        this.scanAllItems(`${TABLE_PREFIX}AW-Tasks`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-TaskExecutions`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-TaskTemplates`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-Configs`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-Workflows`),
+        this.scanAllItems(`${TABLE_PREFIX}AW-WorkflowExecutions`),
+      ]);
 
       // Helper function to check if date is within range
       const isDateInRange = (dateStr: string) => {
@@ -1635,6 +1633,14 @@ export const scheduleDb = {
     type?: string;
     emailCampaignTaskId?: string;
     runCount?: number; // -1 for unlimited, positive integer for limited runs
+    variables?: Array<{ name: string; description?: string }>;
+    variableValues?: { [variableName: string]: string };
+    variableRequestStatus?: 'idle' | 'pending' | 'provided';
+    variableRequestSentAt?: string;
+    variableValuesUpdatedAt?: string;
+    variableRequestAccessTokenHash?: string;
+    variableRequestAccessTokenExpiresAt?: string;
+    variableRequestAccessTokenConsumedAt?: string;
   }) {
     try {
       const params = {
@@ -1702,6 +1708,14 @@ export const scheduleDb = {
             updatedAt: string;
             emailCampaignTaskId: string;
             runCount: number;
+            variables: Array<{ name: string; description?: string }>;
+            variableValues: { [variableName: string]: string };
+            variableRequestStatus: 'idle' | 'pending' | 'provided';
+            variableRequestSentAt: string;
+            variableValuesUpdatedAt: string;
+            variableRequestAccessTokenHash: string;
+            variableRequestAccessTokenExpiresAt: string;
+            variableRequestAccessTokenConsumedAt: string;
           }>
         ) {
           try {
@@ -1867,6 +1881,39 @@ export const scheduleDb = {
             throw error;
           }
         },
+
+  async getScheduledChatByVariableAccessTokenHash(variableRequestAccessTokenHash: string) {
+    try {
+      let lastEvaluatedKey: any | undefined;
+
+      do {
+        const params: any = {
+          TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+          FilterExpression: '#type = :type AND #tokenHash = :tokenHash',
+          ExpressionAttributeNames: {
+            '#type': 'type',
+            '#tokenHash': 'variableRequestAccessTokenHash',
+          },
+          ExpressionAttributeValues: {
+            ':type': 'scheduled_chat',
+            ':tokenHash': variableRequestAccessTokenHash,
+          },
+          ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey }),
+        };
+
+        const result = await dynamodb.scan(params).promise();
+        if (result.Items && result.Items.length > 0) {
+          return result.Items[0];
+        }
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return null;
+    } catch (error) {
+      handleDynamoDbError(error, "getScheduledChatByVariableAccessTokenHash");
+      return null;
+    }
+  },
 
   async deleteSchedule(scheduleId: string) {
     try {
@@ -2661,7 +2708,24 @@ class BenchmarkTestDB {
     }
   }
 
+  /**
+   * Trim large fields from a test result to keep DynamoDB item size manageable.
+   * Truncates actualResponse and removes responseMessages (full conversation).
+   */
+  private trimTestResult(result: any): any {
+    const MAX_RESPONSE_LENGTH = 2000;
+    const trimmed = { ...result };
+    if (typeof trimmed.actualResponse === 'string' && trimmed.actualResponse.length > MAX_RESPONSE_LENGTH) {
+      trimmed.actualResponse = trimmed.actualResponse.slice(0, MAX_RESPONSE_LENGTH) + '... [truncated]';
+    }
+    // responseMessages contains the full LLM conversation and is very large — drop it from stored history
+    delete trimmed.responseMessages;
+    return trimmed;
+  }
+
   async addTestResult(testId: string, testResult: any) {
+    const trimmedResult = this.trimTestResult(testResult);
+
     const params = {
       TableName: this.tableName,
       Key: {
@@ -2673,7 +2737,7 @@ class BenchmarkTestDB {
         '#updatedAt': 'updatedAt',
       },
       ExpressionAttributeValues: {
-        ':testResult': [testResult],
+        ':testResult': [trimmedResult],
         ':emptyList': [],
         ':updatedAt': new Date().toISOString(),
       },
@@ -2686,8 +2750,8 @@ class BenchmarkTestDB {
     } catch (error: any) {
       // Handle DynamoDB item size limit error
       if (error.code === 'ValidationException' && error.message?.includes('exceeded the maximum allowed size')) {
-        console.log(`Item size limit exceeded for test ${testId}. Keeping only last 5 test history records.`);
-        
+        console.log(`Item size limit exceeded for test ${testId}. Trimming test history.`);
+
         try {
           // Get the current test to access testHistory
           const currentTest = await this.getBenchmarkTest(testId);
@@ -2696,18 +2760,20 @@ class BenchmarkTestDB {
           }
 
           const testHistory = currentTest.testHistory || [];
-          
+
           // Check if we have any history to work with
           if (testHistory.length === 0) {
             throw new Error('Item size limit exceeded but no test history to remove');
           }
-          
-          // Keep only the last 5 records (most recent)
-          const updatedHistory = testHistory.slice(-5);
-          
-          console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records.`);
-          
-          // Use a direct update to replace the entire testHistory array
+
+          // Keep only the last 5 records and trim each one
+          const updatedHistory = testHistory.slice(-5).map((r: any) => this.trimTestResult(r));
+
+          console.log(`Reducing test history from ${testHistory.length} to ${updatedHistory.length} records (trimmed).`);
+
+          // Use a direct update to replace the entire testHistory array with trimmed new result included
+          updatedHistory.push(trimmedResult);
+
           const cleanupParams = {
             TableName: this.tableName,
             Key: {
@@ -2724,19 +2790,16 @@ class BenchmarkTestDB {
             },
             ReturnValues: 'ALL_NEW',
           };
-          
-          await this.docClient.update(cleanupParams).promise();
-          
-          // Retry adding the new test result
-          const retryResult = await this.docClient.update(params).promise();
-          console.log(`Successfully added test result after cleanup. History now has ${updatedHistory.length + 1} records.`);
+
+          const retryResult = await this.docClient.update(cleanupParams).promise();
+          console.log(`Successfully added test result after cleanup. History now has ${updatedHistory.length} records.`);
           return retryResult.Attributes;
         } catch (cleanupError) {
           console.error('Error cleaning up test history:', cleanupError);
           throw new Error(`Failed to add test result and cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : 'Unknown error'}`);
         }
       }
-      
+
       handleDynamoDbError(error, "addTestResult");
       throw error;
     }

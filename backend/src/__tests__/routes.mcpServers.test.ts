@@ -40,6 +40,12 @@ jest.mock('../services/agentModeService', () => ({
   }
 }));
 
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    shutdown: jest.fn().mockResolvedValue(undefined),
+  }
+}));
+
 jest.mock('../mcp/client/mcpClientService', () => ({
   McpClientService: jest.fn().mockImplementation(() => ({
     initialize: jest.fn(),
@@ -50,6 +56,7 @@ jest.mock('../mcp/client/mcpClientService', () => ({
 
 import mcpServersRouter from '../routes/mcpServers';
 import { settingsService } from '../services/settingsService';
+import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 
 const app = express();
 app.use(express.json());
@@ -61,6 +68,8 @@ describe('MCP Servers Routes - Validation', () => {
     (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
     (settingsService.setSetting as jest.Mock).mockResolvedValue(undefined);
   });
+
+  const waitForAsyncSideEffects = () => new Promise((resolve) => setTimeout(resolve, 0));
 
   describe('POST /api/admin/mcp-servers - Name Validation', () => {
     it('should reject name with special characters', async () => {
@@ -113,6 +122,8 @@ describe('MCP Servers Routes - Validation', () => {
         });
 
       expect(res.status).toBe(201);
+      await waitForAsyncSideEffects();
+      expect(generateMarketingResponseWorkerService.shutdown).toHaveBeenCalled();
     });
   });
 
@@ -225,6 +236,27 @@ describe('MCP Servers Routes - Validation', () => {
         });
 
       expect(res.status).toBe(200);
+      await waitForAsyncSideEffects();
+      expect(generateMarketingResponseWorkerService.shutdown).toHaveBeenCalled();
+    });
+  });
+
+  describe('DELETE /api/admin/mcp-servers/:name - Worker Recycle', () => {
+    beforeEach(() => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify([
+          { name: 'existing-server', transport: 'streamable-http', url: 'http://localhost:3001' }
+        ])
+      });
+    });
+
+    it('should recycle worker after successful delete', async () => {
+      const res = await request(app)
+        .delete('/api/admin/mcp-servers/existing-server');
+
+      expect(res.status).toBe(200);
+      await waitForAsyncSideEffects();
+      expect(generateMarketingResponseWorkerService.shutdown).toHaveBeenCalled();
     });
   });
 });

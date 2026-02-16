@@ -3,6 +3,8 @@ import {
   Box,
   Button,
   Checkbox,
+  Chip,
+  Collapse,
   Dialog,
   DialogActions,
   DialogContent,
@@ -21,7 +23,6 @@ import {
   Typography,
   Alert,
   CircularProgress,
-  Chip,
 } from '@mui/material';
 import {
   Add as AddIcon,
@@ -29,6 +30,8 @@ import {
   Delete as DeleteIcon,
   Save as SaveIcon,
   Cancel as CancelIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
 } from '@mui/icons-material';
 import axios from 'axios';
 import { buildApiUrl } from '../../config';
@@ -37,12 +40,14 @@ import { useAuth } from '../../contexts/AuthContext';
 interface SubscriptionType {
   name: string;
   allowedPages: string[];
-  allowedFunctionCalls: string[];
+  allowedSkills: string[];
 }
 
-interface AvailableFunctionCall {
+interface AvailableSkill {
+  skillId: string;
   name: string;
   description: string;
+  toolNames: string[];
 }
 
 interface CustomerPortalPage {
@@ -54,7 +59,7 @@ interface CustomerPortalPage {
 const SubscriptionTypesTab: React.FC = () => {
   const { token } = useAuth();
   const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
-  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
+  const [availableSkills, setAvailableSkills] = useState<AvailableSkill[]>([]);
   const [availablePages, setAvailablePages] = useState<CustomerPortalPage[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -64,36 +69,37 @@ const SubscriptionTypesTab: React.FC = () => {
   const [formData, setFormData] = useState<SubscriptionType>({
     name: '',
     allowedPages: [],
-    allowedFunctionCalls: [],
+    allowedSkills: [],
   });
+  const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     loadSubscriptionTypes();
-    loadAvailableFunctionCalls();
+    loadAvailableSkills();
     loadAvailablePages();
   }, []);
 
-  // Update formData when availableFunctionCalls or availablePages loads (for new types or when editing types with "*")
+  // Update formData when availableSkills or availablePages loads (for new types or when editing types with "*")
   useEffect(() => {
     if (editDialogOpen) {
       if (!editingType) {
         // If creating new type, update formData when data loads
-        if (availableFunctionCalls.length > 0 && availablePages.length > 0) {
+        if (availableSkills.length > 0 && availablePages.length > 0) {
           setFormData((prev) => ({
             ...prev,
             allowedPages: availablePages.map((p) => p.path),
-            allowedFunctionCalls: availableFunctionCalls.map((f) => f.name),
+            allowedSkills: availableSkills.map((s) => s.skillId),
           }));
         }
       } else if (
-        editingType.allowedFunctionCalls.includes('*') ||
-        editingType.allowedFunctionCalls.length === 0
+        editingType.allowedSkills.includes('*') ||
+        editingType.allowedSkills.length === 0
       ) {
-        // If editing a type that had "*" and function calls just loaded, update formData
-        if (availableFunctionCalls.length > 0) {
+        // If editing a type that had "*" and skills just loaded, update formData
+        if (availableSkills.length > 0) {
           setFormData((prev) => ({
             ...prev,
-            allowedFunctionCalls: availableFunctionCalls.map((f) => f.name),
+            allowedSkills: availableSkills.map((s) => s.skillId),
           }));
         }
       }
@@ -110,7 +116,7 @@ const SubscriptionTypesTab: React.FC = () => {
         }
       }
     }
-  }, [availableFunctionCalls, availablePages, editDialogOpen, editingType]);
+  }, [availableSkills, availablePages, editDialogOpen, editingType]);
 
   const loadSubscriptionTypes = async () => {
     try {
@@ -128,21 +134,16 @@ const SubscriptionTypesTab: React.FC = () => {
     }
   };
 
-  const loadAvailableFunctionCalls = async () => {
+  const loadAvailableSkills = async () => {
     try {
-      const response = await axios.get(buildApiUrl('/api/agent-mode/function-calls'), {
+      const response = await axios.get(buildApiUrl('/api/admin/available-skills'), {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (response.data && response.data.functionCalls) {
-        // Filter out work plan management functions
-        const workPlanFunctions = ['create_work_plan', 'modify_work_plan', 'set_work_plan_status'];
-        const filtered = response.data.functionCalls.filter(
-          (func: AvailableFunctionCall) => !workPlanFunctions.includes(func.name)
-        );
-        setAvailableFunctionCalls(filtered);
+      if (response.data && Array.isArray(response.data)) {
+        setAvailableSkills(response.data);
       }
     } catch (error) {
-      console.error('Error loading available function calls:', error);
+      console.error('Error loading available skills:', error);
     }
   };
 
@@ -163,7 +164,7 @@ const SubscriptionTypesTab: React.FC = () => {
   const handleOpenEditDialog = (type?: SubscriptionType) => {
     if (type) {
       setEditingType(type);
-      // Expand "*" to all actual pages/function calls for editing
+      // Expand "*" to all actual pages/skills for editing
       // Normalize paths: remove /marketing prefix if present
       const normalizedPages = type.allowedPages.includes('*') || type.allowedPages.length === 0
         ? availablePages.map((p) => p.path)
@@ -173,24 +174,25 @@ const SubscriptionTypesTab: React.FC = () => {
             }
             return page;
           });
-      
+
       const expandedData: SubscriptionType = {
         name: type.name,
         allowedPages: normalizedPages,
-        allowedFunctionCalls: type.allowedFunctionCalls.includes('*') || type.allowedFunctionCalls.length === 0
-          ? availableFunctionCalls.map((f) => f.name)
-          : type.allowedFunctionCalls,
+        allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
+          ? availableSkills.map((s) => s.skillId)
+          : type.allowedSkills,
       };
       setFormData(expandedData);
     } else {
       setEditingType(null);
-      // When creating new, start with all pages and function calls selected
+      // When creating new, start with all pages and skills selected
       setFormData({
         name: '',
         allowedPages: availablePages.map((p) => p.path),
-        allowedFunctionCalls: availableFunctionCalls.map((f) => f.name),
+        allowedSkills: availableSkills.map((s) => s.skillId),
       });
     }
+    setExpandedSkills(new Set());
     setEditDialogOpen(true);
   };
 
@@ -200,8 +202,9 @@ const SubscriptionTypesTab: React.FC = () => {
     setFormData({
       name: '',
       allowedPages: [],
-      allowedFunctionCalls: [],
+      allowedSkills: [],
     });
+    setExpandedSkills(new Set());
   };
 
   const handleSave = async () => {
@@ -213,7 +216,7 @@ const SubscriptionTypesTab: React.FC = () => {
     try {
       setLoading(true);
       setError('');
-      
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
@@ -221,12 +224,12 @@ const SubscriptionTypesTab: React.FC = () => {
           formData.allowedPages.length === availablePages.length && availablePages.length > 0
             ? ['*']
             : formData.allowedPages,
-        allowedFunctionCalls:
-          formData.allowedFunctionCalls.length === availableFunctionCalls.length && availableFunctionCalls.length > 0
+        allowedSkills:
+          formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
             ? ['*']
-            : formData.allowedFunctionCalls,
+            : formData.allowedSkills,
       };
-      
+
       let updatedTypes = [...subscriptionTypes];
       if (editingType) {
         // Update existing
@@ -265,7 +268,7 @@ const SubscriptionTypesTab: React.FC = () => {
     try {
       setLoading(true);
       setError('');
-      
+
       const updatedTypes = subscriptionTypes.filter((t) => t.name !== typeName);
       await axios.post(
         buildApiUrl('/api/admin/subscription-types'),
@@ -307,30 +310,42 @@ const SubscriptionTypesTab: React.FC = () => {
     }
   };
 
-  const handleToggleFunctionCall = (functionName: string) => {
-    const isSelected = formData.allowedFunctionCalls.includes(functionName);
+  const handleToggleSkill = (skillId: string) => {
+    const isSelected = formData.allowedSkills.includes(skillId);
     if (isSelected) {
       setFormData({
         ...formData,
-        allowedFunctionCalls: formData.allowedFunctionCalls.filter((f) => f !== functionName),
+        allowedSkills: formData.allowedSkills.filter((s) => s !== skillId),
       });
     } else {
       setFormData({
         ...formData,
-        allowedFunctionCalls: [...formData.allowedFunctionCalls, functionName],
+        allowedSkills: [...formData.allowedSkills, skillId],
       });
     }
   };
 
-  const handleToggleAllFunctionCalls = () => {
-    if (formData.allowedFunctionCalls.length === availableFunctionCalls.length) {
-      setFormData({ ...formData, allowedFunctionCalls: [] });
+  const handleToggleAllSkills = () => {
+    if (formData.allowedSkills.length === availableSkills.length) {
+      setFormData({ ...formData, allowedSkills: [] });
     } else {
       setFormData({
         ...formData,
-        allowedFunctionCalls: availableFunctionCalls.map((f) => f.name),
+        allowedSkills: availableSkills.map((s) => s.skillId),
       });
     }
+  };
+
+  const toggleSkillExpanded = (skillId: string) => {
+    setExpandedSkills((prev) => {
+      const next = new Set(prev);
+      if (next.has(skillId)) {
+        next.delete(skillId);
+      } else {
+        next.add(skillId);
+      }
+      return next;
+    });
   };
 
   return (
@@ -359,7 +374,7 @@ const SubscriptionTypesTab: React.FC = () => {
       </Box>
 
       <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-        Configure subscription types for customer portal users. If no subscription types are defined, the default "Basic" type will be used, allowing access to all pages and function calls.
+        Configure subscription types for customer portal users. If no subscription types are defined, the default "Basic" type will be used, allowing access to all pages and skills.
       </Typography>
 
       {loading && !subscriptionTypes.length ? (
@@ -373,7 +388,7 @@ const SubscriptionTypesTab: React.FC = () => {
               <TableRow>
                 <TableCell>Name</TableCell>
                 <TableCell>Allowed Pages</TableCell>
-                <TableCell>Allowed Function Calls</TableCell>
+                <TableCell>Allowed Skills</TableCell>
                 <TableCell>Actions</TableCell>
               </TableRow>
             </TableHead>
@@ -401,8 +416,8 @@ const SubscriptionTypesTab: React.FC = () => {
                         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
                           {type.allowedPages.slice(0, 3).map((page) => {
                             // Normalize page path by removing /marketing prefix
-                            const normalizedPage = page.startsWith('/marketing/') 
-                              ? page.replace('/marketing', '') 
+                            const normalizedPage = page.startsWith('/marketing/')
+                              ? page.replace('/marketing', '')
                               : page;
                             const pageInfo = availablePages.find((p) => p.path === normalizedPage);
                             return (
@@ -425,13 +440,13 @@ const SubscriptionTypesTab: React.FC = () => {
                       )}
                     </TableCell>
                     <TableCell>
-                      {type.allowedFunctionCalls.includes('*') ||
-                      type.allowedFunctionCalls.length === 0 ? (
-                        <Chip label="All Functions" color="primary" size="small" />
+                      {type.allowedSkills.includes('*') ||
+                      type.allowedSkills.length === 0 ? (
+                        <Chip label="All Skills" color="primary" size="small" />
                       ) : (
                         <Typography variant="body2" color="text.secondary">
-                          {type.allowedFunctionCalls.length} function
-                          {type.allowedFunctionCalls.length !== 1 ? 's' : ''}
+                          {type.allowedSkills.length} skill
+                          {type.allowedSkills.length !== 1 ? 's' : ''}
                         </Typography>
                       )}
                     </TableCell>
@@ -532,14 +547,14 @@ const SubscriptionTypesTab: React.FC = () => {
             </FormGroup>
 
             <Typography variant="h6" gutterBottom sx={{ mt: 4 }}>
-              Allowed Function Calls
+              Allowed Skills
             </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-              Select which Agent Mode function calls users with this subscription type can access.
+              Select which Agent Mode skills users with this subscription type can access. Each skill groups related tools together.
             </Typography>
             <Box
               sx={{
-                maxHeight: 300,
+                maxHeight: 400,
                 overflowY: 'auto',
                 border: '1px solid',
                 borderColor: 'divider',
@@ -552,38 +567,71 @@ const SubscriptionTypesTab: React.FC = () => {
                   control={
                     <Checkbox
                       checked={
-                        formData.allowedFunctionCalls.length === availableFunctionCalls.length
+                        formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
                       }
                       indeterminate={
-                        formData.allowedFunctionCalls.length > 0 &&
-                        formData.allowedFunctionCalls.length < availableFunctionCalls.length
+                        formData.allowedSkills.length > 0 &&
+                        formData.allowedSkills.length < availableSkills.length
                       }
-                      onChange={handleToggleAllFunctionCalls}
+                      onChange={handleToggleAllSkills}
+                      disabled={availableSkills.length === 0}
                     />
                   }
-                  label="Select All Function Calls"
+                  label="Select All Skills"
                 />
-                {availableFunctionCalls.map((func) => (
-                  <FormControlLabel
-                    key={func.name}
-                    control={
-                      <Checkbox
-                        checked={formData.allowedFunctionCalls.includes(func.name)}
-                        onChange={() => handleToggleFunctionCall(func.name)}
-                      />
-                    }
-                    label={
-                      <Box>
-                        <Typography variant="body2" fontWeight="medium">
-                          {func.name}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          {func.description}
-                        </Typography>
+                {availableSkills.length === 0 ? (
+                  <Typography variant="body2" color="text.secondary" sx={{ ml: 2 }}>
+                    Loading skills...
+                  </Typography>
+                ) : (
+                  availableSkills.map((skill) => (
+                    <Box key={skill.skillId}>
+                      <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={formData.allowedSkills.includes(skill.skillId)}
+                              onChange={() => handleToggleSkill(skill.skillId)}
+                            />
+                          }
+                          label={
+                            <Box>
+                              <Typography variant="body2" fontWeight="medium">
+                                {skill.name}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {skill.description}
+                              </Typography>
+                            </Box>
+                          }
+                          sx={{ flex: 1 }}
+                        />
+                        {skill.toolNames.length > 0 && (
+                          <IconButton
+                            size="small"
+                            onClick={() => toggleSkillExpanded(skill.skillId)}
+                            sx={{ ml: 1 }}
+                          >
+                            {expandedSkills.has(skill.skillId) ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                          </IconButton>
+                        )}
                       </Box>
-                    }
-                  />
-                ))}
+                      <Collapse in={expandedSkills.has(skill.skillId)}>
+                        <Box sx={{ ml: 4, mb: 1, display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                          {skill.toolNames.map((toolName) => (
+                            <Chip
+                              key={toolName}
+                              label={toolName}
+                              size="small"
+                              variant="outlined"
+                              sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}
+                            />
+                          ))}
+                        </Box>
+                      </Collapse>
+                    </Box>
+                  ))
+                )}
               </FormGroup>
             </Box>
           </Box>

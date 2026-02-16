@@ -9,7 +9,9 @@ import { agentModeService } from '../services/agentModeService';
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadListById: jest.fn(),
+    getLeadByEmail: jest.fn(),
     createLead: jest.fn(),
+    updateLead: jest.fn(),
   },
 }));
 
@@ -48,6 +50,8 @@ app.use('/api/webhooks', webhookRouter);
 describe('Lead Forwarding API (List ID Authentication)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(null);
+    (crmDb.updateLead as jest.Mock).mockResolvedValue(undefined);
     (agentModeService.updateEmailDraftForLead as jest.Mock).mockResolvedValue({
       success: true,
       message: 'Email and message drafts created successfully',
@@ -264,11 +268,82 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
       );
     });
 
-    it('should handle duplicate email error gracefully', async () => {
+    it('should merge and return lead.updated when lead with same email exists', async () => {
+      const existingLead = {
+        leadId: 'lead_existing',
+        listId: 'list_123',
+        email: 'test@example.com',
+        firstName: 'Old',
+        lastName: 'Name',
+        phone: '',
+        company: 'Old Corp',
+        title: '',
+        notes: '',
+        linkedin: '',
+        customFields: { source: 'manual' },
+      };
+
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
-      (crmDb.createLead as jest.Mock).mockRejectedValue(
-        new Error('Lead with this email already exists')
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
+
+      const response = await request(app)
+        .post('/api/webhooks/forward-lead')
+        .send({
+          listId: 'list_123',
+          email: 'test@example.com',
+          firstName: 'John',
+          lastName: 'Doe',
+          company: 'New Corp',
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.event).toBe('lead.updated');
+      expect(response.body.leadId).toBe('lead_existing');
+
+      // Should NOT create a new lead
+      expect(crmDb.createLead).not.toHaveBeenCalled();
+
+      // Should update the existing lead with merged data
+      expect(crmDb.updateLead).toHaveBeenCalledWith(
+        'list_123',
+        'lead_existing',
+        expect.objectContaining({
+          firstName: 'John',
+          lastName: 'Doe',
+          company: 'New Corp',
+        })
       );
+
+      // Should trigger auto draft for updated leads (autoDraftEnabled is true on mockLeadList)
+      expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalledWith(
+        'list_123',
+        'lead_existing',
+        expect.any(String),
+        expect.stringMatching(/^auto_draft_/),
+        'user_123',
+        'text'
+      );
+    });
+
+    it('should return lead.unchanged and not fire alert or draft when same record sent twice', async () => {
+      const existingLead = {
+        leadId: 'lead_existing',
+        listId: 'list_123',
+        email: 'test@example.com',
+        firstName: 'John',
+        lastName: 'Doe',
+        phone: '',
+        company: '',
+        title: '',
+        notes: '',
+        linkedin: '',
+        customFields: { source: 'api' },
+      };
+
+      // Even with autoDraftEnabled on, unchanged leads should NOT trigger drafts
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockLeadList);
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue(existingLead);
 
       const response = await request(app)
         .post('/api/webhooks/forward-lead')
@@ -280,9 +355,12 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.success).toBe(true);
-      expect(response.body.duplicate).toBe(true);
-      expect(response.body.message).toContain('already exists');
+      expect(response.body.event).toBe('lead.unchanged');
+      expect(response.body.leadId).toBe('lead_existing');
+      expect(crmDb.updateLead).not.toHaveBeenCalled();
+      expect(crmDb.createLead).not.toHaveBeenCalled();
+      expect(agentModeService.updateEmailDraftForLead).not.toHaveBeenCalled();
+      expect(leadListAlertService.notifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
     });
 
     it('should not create auto draft when autoDraftEnabled is off', async () => {

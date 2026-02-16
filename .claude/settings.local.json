@@ -66,7 +66,22 @@
       "Bash(aws elasticbeanstalk retrieve-environment-info:*)",
       "Bash(aws dynamodb get-item:*)",
       "Bash(ps:*)",
-      "mcp__playwright__browser_tabs"
+      "mcp__playwright__browser_tabs",
+      "Bash(aws elasticbeanstalk describe-environment-health:*)",
+      "Bash(aws elasticbeanstalk describe-events:*)",
+      "Bash(aws elasticbeanstalk describe-instances-health:*)",
+      "Bash(aws elasticbeanstalk describe-configuration-settings:*)",
+      "Bash(aws ec2 describe-instance-status:*)",
+      "Bash(aws elasticbeanstalk describe-application-versions:*)",
+      "Bash(npx vitest:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:start.waldium.com)",
+      "WebFetch(domain:slrgkgulru.pixelflow.so)",
+      "WebFetch(domain:docs.pixelflow.so)",
+      "Bash(npm ls:*)",
+      "WebFetch(domain:elasticbeanstalk-us-west-2-992382574572.s3.us-west-2.amazonaws.com)",
+      "Bash(unzip:*)",
+      "Bash(aws dynamodb query:*)"
     ]
   }
 }

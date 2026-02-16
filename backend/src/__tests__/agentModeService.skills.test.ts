@@ -26,7 +26,8 @@ jest.mock('../services/chatbotService', () => ({
 
 // Mock subscriptionService
 jest.mock('../services/subscriptionService', () => ({
-  getAllowedFunctionCalls: jest.fn().mockResolvedValue(['*']),
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
   filterFunctionCalls: jest.fn().mockImplementation((tools) => tools),
 }));
 
@@ -99,7 +100,7 @@ describe('AgentModeService - Skills', () => {
         'session-123'
       );
 
-      expect(result.message).toContain('No valid skills found');
+      expect(result.message).toContain('not available with your current subscription');
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
 
@@ -243,14 +244,15 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('tool2')).toBe(true);
     });
 
-    it('should filter tools by user subscription', () => {
+    it('should filter tools by user subscription (skill-level)', () => {
       const skills = [
-        { skillId: 's1', name: 'Skill', toolNames: ['tool1', 'tool2', 'tool3'], description: '', isPublished: true },
+        { skillId: 's1', name: 'Skill A', toolNames: ['tool1', 'tool2'], description: '', isPublished: true },
+        { skillId: 's2', name: 'Skill B', toolNames: ['tool3'], description: '', isPublished: true },
       ];
-      // User only has access to tool1 and tool2
-      const userAllowedTools = ['tool1', 'tool2'];
+      // User only has access to skill s1 (not s2)
+      const userAllowedSkillIds = ['s1'];
 
-      const result = (agentModeService as any).buildSkillContext(skills, userAllowedTools, [], []);
+      const result = (agentModeService as any).buildSkillContext(skills, userAllowedSkillIds, [], []);
 
       expect(result.allowedToolNames.has('tool1')).toBe(true);
       expect(result.allowedToolNames.has('tool2')).toBe(true);
@@ -294,9 +296,7 @@ describe('AgentModeService - Skills', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
           { name: 'orphan_tool', definition: {} },
-          { name: 'install_skills', definition: {} },
-          { name: 'explore_skills', definition: {} },
-          { name: 'mcpservers_fetch', definition: {} }
+          { name: 'install_skills', definition: {} }
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -306,8 +306,6 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('orphan_tool')).toBe(true);
       // install_skills is always included (infrastructure but needed)
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
-      // explore_skills and mcpservers_fetch should NOT be in allowedToolNames from other_skills
-      // (they're infrastructure tools excluded from getUnassociatedTools)
     });
   });
 
@@ -334,9 +332,7 @@ describe('AgentModeService - Skills', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
         { name: 'regular_tool', definition: { function: { description: 'regular' } } },
-        { name: 'install_skills', definition: { function: { description: 'infra1' } } },
-        { name: 'explore_skills', definition: { function: { description: 'infra2' } } },
-        { name: 'mcpservers_fetch', definition: { function: { description: 'infra3' } } }
+        { name: 'install_skills', definition: { function: { description: 'infra1' } } }
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -440,8 +436,7 @@ describe('AgentModeService - Skills', () => {
     it('should return empty string when no published skills and only infrastructure tools', () => {
       const publishedSkills: any[] = [];
       const mockTools = [
-        { name: 'install_skills', definition: { function: { description: 'infra' } } },
-        { name: 'explore_skills', definition: { function: { description: 'infra' } } }
+        { name: 'install_skills', definition: { function: { description: 'infra' } } }
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
@@ -456,10 +451,12 @@ describe('AgentModeService - Skills', () => {
       // Mock tools for getFilteredTools tests
       const mockTools = [
         { name: 'read_brand_guidelines', definition: { function: { name: 'read_brand_guidelines', description: 'desc' } } },
-        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } }
+        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
+        { name: 'create_work_plan', definition: { function: { name: 'create_work_plan', description: 'Create work plan' } } },
+        { name: 'search_web', definition: { function: { name: 'search_web', description: 'Search the web' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
-      
+
       await agentModeService.initialize();
     });
 
@@ -508,6 +505,35 @@ describe('AgentModeService - Skills', () => {
       const toolNames = result.map((t: any) => t.function?.name || t.name);
       expect(toolNames).toContain('read_brand_guidelines');
     });
+
+    it('should include foundation tools for legacy sessions even when subscription is restrictive', async () => {
+      // Legacy sessions pass undefined for precomputedAllowedSkillToolNames,
+      // so all tools pass the context filter. But a restrictive subscription
+      // would strip foundation tools. The fix ensures FOUNDATION_TOOLS are
+      // always added to allowedFunctionCalls before the subscription filter.
+      const { resolveSkillsToToolNames, filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
+      // Subscription only allows read_brand_guidelines (no foundation tools)
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce(['read_brand_guidelines']);
+      // Use realistic filter: only pass tools whose name is in allowed list
+      (mockFilterFn as jest.Mock).mockImplementationOnce((tools: any[], allowed: string[]) => {
+        if (allowed.includes('*')) return tools;
+        return tools.filter((t: any) => {
+          const name = t.function?.name || t.name;
+          return !name || allowed.includes(name);
+        });
+      });
+
+      // Legacy session: no precomputed names (undefined)
+      const result = await agentModeService.getFilteredTools('user-123', undefined);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      // Foundation tools should bypass subscription filter
+      expect(toolNames).toContain('create_work_plan');
+      expect(toolNames).toContain('search_web');
+      expect(toolNames).toContain('install_skills');
+      // Non-foundation tool allowed by subscription should also be present
+      expect(toolNames).toContain('read_brand_guidelines');
+    });
   });
 
   describe('updateConversationContext', () => {
@@ -519,9 +545,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         'Installed Skills:\ns1- Skill 1: Description',
-        '', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        '' // availableSkillContextMsg
       );
 
       const installedMsg = messages.find(m => m.content?.startsWith('Installed Skills:'));
@@ -537,9 +561,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         'Installed Skills:\nNEW CONTENT',
-        '', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        '' // availableSkillContextMsg
       );
 
       const installedMsgs = messages.filter(m => m.content?.startsWith('Installed Skills:'));
@@ -555,9 +577,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         '',
-        '', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        '' // availableSkillContextMsg
       );
 
       const installedMsg = messages.find(m => m.content?.startsWith('Installed Skills:'));
@@ -573,9 +593,7 @@ describe('AgentModeService - Skills', () => {
       (agentModeService as any).updateConversationContext(
         messages,
         '',
-        'Available Skills:\nNEW LIST', // availableSkillContextMsg
-        [],
-        new Set(['install_skills'])
+        'Available Skills:\nNEW LIST' // availableSkillContextMsg
       );
 
       const availableMsgs = messages.filter(m => m.content?.startsWith('Available Skills:'));
@@ -583,6 +601,98 @@ describe('AgentModeService - Skills', () => {
       expect(availableMsgs[0].content).toContain('NEW LIST');
       // Should be placed after system prompt (index 1)
       expect(messages[1].content).toContain('NEW LIST');
+    });
+  });
+
+  describe('getFoundationToolNames', () => {
+    it('should return a Set containing foundation tool names', () => {
+      const foundationTools = agentModeService.getFoundationToolNames();
+
+      expect(foundationTools).toBeInstanceOf(Set);
+      expect(foundationTools.has('install_skills')).toBe(true);
+      expect(foundationTools.has('search_web')).toBe(true);
+      expect(foundationTools.has('read_file_content')).toBe(true);
+      expect(foundationTools.has('read_page_source')).toBe(true);
+      expect(foundationTools.has('search_knowledge_base')).toBe(true);
+      expect(foundationTools.has('list_knowledge_base_files')).toBe(true);
+      expect(foundationTools.has('read_knowledge_base_files')).toBe(true);
+      expect(foundationTools.has('create_work_plan')).toBe(true);
+      expect(foundationTools.has('modify_work_plan')).toBe(true);
+      expect(foundationTools.has('set_work_plan_status')).toBe(true);
+      expect(foundationTools.has('save_file')).toBe(true);
+      expect(foundationTools.has('describe_image')).toBe(true);
+    });
+
+    it('should not contain domain-specific tools', () => {
+      const foundationTools = agentModeService.getFoundationToolNames();
+
+      expect(foundationTools.has('generate_image')).toBe(false);
+      expect(foundationTools.has('create_blog_article')).toBe(false);
+      expect(foundationTools.has('create_social_media_posts')).toBe(false);
+    });
+  });
+
+  describe('getSkillsForDisplay', () => {
+    it('should return published skills with installed status and toolNames', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true },
+        { skillId: 'skill-2', name: 'Image Gen', description: 'Image tools', toolNames: ['generate_image'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      const result = await agentModeService.getSkillsForDisplay(['skill-1'], 'user-1');
+
+      expect(result).toEqual(expect.arrayContaining([
+        expect.objectContaining({ skillId: 'skill-1', name: 'Web Search', installed: true, toolNames: ['search_web'] }),
+        expect.objectContaining({ skillId: 'skill-2', name: 'Image Gen', installed: false, toolNames: ['generate_image'] }),
+      ]));
+    });
+
+    it('should filter skills by subscription when not wildcard', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Allowed Skill', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        { skillId: 'skill-2', name: 'Blocked Skill', description: 'Desc', toolNames: ['tool2'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['skill-1']);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'user-1');
+
+      expect(result.some(s => s.skillId === 'skill-1')).toBe(true);
+      expect(result.some(s => s.skillId === 'skill-2')).toBe(false);
+    });
+
+    it('should return all skills when no userId provided (wildcard default)', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+
+      const result = await agentModeService.getSkillsForDisplay([]);
+
+      expect(result.some(s => s.skillId === 'skill-1')).toBe(true);
+    });
+
+    it('should include __other_skills__ virtual entry when allowed', async () => {
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue([]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+
+      // Mock the tool registry to have some tools
+      const mockToolRegistry = (agentModeService as any).toolRegistry;
+      mockToolRegistry.getAllTools.mockReturnValue([
+        { name: 'orphan_tool', definition: { function: { description: 'An orphan tool' } } },
+      ]);
+
+      const result = await agentModeService.getSkillsForDisplay([], 'user-1');
+
+      const otherSkill = result.find(s => s.skillId === '__other_skills__');
+      expect(otherSkill).toBeDefined();
+      expect(otherSkill!.name).toBe('Other Skills');
+      expect(otherSkill!.toolNames).toContain('orphan_tool');
     });
   });
 });

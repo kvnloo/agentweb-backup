@@ -16,7 +16,7 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
-import { getAllowedFunctionCalls, filterFunctionCalls } from './subscriptionService';
+import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -580,14 +580,12 @@ export class AgentModeService {
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       let [
         currentSession,
-        availableTemplates,
-        userAllowedTools,
+        userAllowedSkillIds,
         publishedSkills,
         baseSystemPrompt
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
-        this.getAvailableTemplates(),
-        getAllowedFunctionCalls(userId),
+        getAllowedSkills(userId),
         skillService.getPublishedSkills(),
         this.getMarketingSystemPrompt()
       ]);
@@ -596,27 +594,31 @@ export class AgentModeService {
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
 
       // 2. Initialize Context Variables
+      // Legacy sessions (created before skills system) have associatedSkills === undefined/null.
+      // New sessions have associatedSkills initialized as [] and enforce skill-first flow.
+      const rawAssociatedSkills = currentSession?.associatedSkills;
+      const isLegacySession = rawAssociatedSkills === undefined || rawAssociatedSkills === null;
       let associatedSkills: any[] = [];
-      const sessionAssociatedSkillIds = currentSession?.associatedSkills || [];
+      const sessionAssociatedSkillIds: string[] = Array.isArray(rawAssociatedSkills) ? rawAssociatedSkills : [];
       if (sessionAssociatedSkillIds.length) {
         associatedSkills = await skillService.getSkillsByIds(sessionAssociatedSkillIds);
       }
-      
+
       // Build initial skill context
-      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedTools, publishedSkills, sessionAssociatedSkillIds);
+      let { allowedToolNames, installedSkillContextMsg } = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, sessionAssociatedSkillIds);
 
       // 3. Build Initial Messages
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
 
-      // Build the "Available Skills" message (excluding already-associated skills)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds);
+      // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
+      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds);
 
       const today = new Date().toISOString().split('T')[0];
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}` }
       ];
       // Use helper to inject installed skills and templates
-      this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg, availableTemplates, allowedToolNames);
+      this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
       messages.push(...marketingMessages);
 
@@ -652,15 +654,15 @@ export class AgentModeService {
                 }
                 
                 // Re-build context using helper
-                const skillContext = this.buildSkillContext(associatedSkills, userAllowedTools, publishedSkills, updatedAssociatedSkillIds);
+                const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds);
                 allowedToolNames = skillContext.allowedToolNames;
                 installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
-                // Rebuild available skills (excluding newly associated ones)
-                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds);
+                // Rebuild available skills (excluding newly associated ones, filtered by subscription)
+                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds);
 
                 // Update messages using helper
-                this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg, availableTemplates, allowedToolNames);
+                this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
                 // Invalidate tools cache
                 filteredToolsCache = null;
@@ -679,8 +681,12 @@ export class AgentModeService {
         }
 
         // 5. Get Tools (Cached)
+        // Legacy sessions (pre-skills): skip skill filtering, return all subscription-allowed tools.
+        // New sessions: use skill-based filtering. When no skills are installed, only install_skills
+        // is in allowedToolNames, forcing the LLM to install a skill first.
         if (!filteredToolsCache) {
-             filteredToolsCache = await this.getFilteredTools(userId, allowedToolNames, userAllowedTools);
+             const skillFilter = isLegacySession ? undefined : allowedToolNames;
+             filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
         }
 
         // Make LLM call
@@ -755,6 +761,25 @@ export class AgentModeService {
           try {
             functionArgs = JSON.parse(toolCall.function.arguments);
 
+            // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
+            // LLMs may hallucinate tool calls from conversation history even when the tool
+            // isn't in the current tools list. Return an error so the LLM learns to install skills first.
+            // Only enforce when:
+            //   1. The skills system is active (published skills exist), AND
+            //   2. The session was created with the skills system (has associatedSkills).
+            // Sessions created before the skills implementation have no associatedSkills
+            // and should retain access to all tools for backward compatibility.
+            if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
+              const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: errorMsg })
+              });
+              continue;
+            }
+
             // Check if we need to refresh skills for next iteration
             if (toolCall.function.name === 'install_skills') {
                 skillsUpdated = true;
@@ -782,7 +807,7 @@ export class AgentModeService {
             }
 
             // Collect for batched counter update instead of immediate DB write
-            pendingCounterUpdates[toolCall.function.name] = 
+            pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
             // Append the tool call result as a tool message for the model to consume next
@@ -814,6 +839,14 @@ export class AgentModeService {
               });
             }
             
+            // Update the failedFunctions counter immediately after failed tool call
+            try {
+              await chatbotDb.incrementFailedFunctions(sessionId, { [toolCall.function.name]: 1 });
+            } catch (counterError) {
+              console.error('AgentMode: Failed to update failed function call counter:', counterError);
+              // Don't fail the whole tool call if counter update fails
+            }
+
             // Ensure LLM receives the error to adjust its plan
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);
@@ -895,11 +928,9 @@ export class AgentModeService {
 
 
   private updateConversationContext(
-    messages: any[], 
-    installedSkillContextMsg: string, 
-    availableSkillContextMsg: string,
-    availableTemplates: any[], 
-    allowedToolNames: Set<string>
+    messages: any[],
+    installedSkillContextMsg: string,
+    availableSkillContextMsg: string
   ) {
     // Helper to safely check if content starts with a prefix (handles both string and Anthropic array format)
     const contentStartsWith = (content: any, prefix: string): boolean => {
@@ -945,30 +976,6 @@ export class AgentModeService {
 
       messages.splice(insertIndex, 0, { role: 'assistant', content: installedSkillContextMsg });
     }
-
-    // 3. Handle Available Templates Message
-    // Remove existing message first
-    const templatesIdx = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Templates:'));
-    if (templatesIdx !== -1) {
-      messages.splice(templatesIdx, 1);
-    }
-
-    // Insert new message if tool is allowed
-    // TODO: Following condition is commented for now, need to think about it as if user just saying do seo of this site then if emma dosn't have skill which has create_task_from_template tool then it will not show available templates
-    // if (allowedToolNames.has('create_task_from_template')) {
-      const templatesContext = this.buildTemplatesContext(availableTemplates);
-      if (templatesContext !== 'No templates are currently available.') {
-          // Find optimal insertion point
-          let insertIndex = 1;
-          const installedIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Installed Skills:'));
-          const availableIndex = messages.findIndex(m => m.role === 'assistant' && contentStartsWith(m.content, 'Available Skills:'));
-
-          if (installedIndex !== -1) insertIndex = installedIndex + 1;
-          else if (availableIndex !== -1) insertIndex = availableIndex + 1;
-
-          messages.splice(insertIndex, 0, { role: 'assistant', content: templatesContext });
-      }
-    // }
   }
 
   async getMarketingSystemPrompt(): Promise<string> {
@@ -985,27 +992,42 @@ export class AgentModeService {
     // Fallback to default system prompt
     return `
       You are Emma, an AI-powered marketing assistant from AgentWeb. You help users execute marketing campaigns through natural conversation.
-      - Market research and competitive analysis
-      - SWOT analysis for businesses
-      - Marketing strategy development
-      - Ad creative generation and campaign management
-      - Performance analysis and optimization
-      - Meta ads metrics analysis and insights
-      - Social media listening and brand monitoring
-      - Web search for current information and real-time data
-      - Analysis of attached files and documents
 
-      ## Your Capabilities
-      You can help with various marketing tasks including:
-      - Market research and competitive analysis
-      - SWOT analysis for businesses
-      - Marketing strategy development
-      - Ad creative generation and campaign management
-      - Performance analysis and optimization
-      - Meta ads metrics analysis and insights
-      - Social media listening and brand monitoring
-      - Web search for current information and real-time data
-      - Analysis of attached files and documents
+      ## Your Approach: The "Analyze-Install-Execute" Protocol
+      You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
+
+      ### 1. ANALYZE (Think Through the Complete Task)
+      Before doing anything, break down the user's request into ALL the individual actions/tools you will need:
+      - What data do you need to read? (e.g., brand guidelines, market strategy)
+      - What content do you need to create? (e.g., blog articles, work plans)
+      - What actions do you need to perform? (e.g., publishing, analytics)
+
+      ### 2. IDENTIFY ALL REQUIRED SKILLS
+      Look at the Available Skills list and identify EVERY skill that contains tools you need:
+      - Match each required action to a skill by checking the Tools list
+      - For complex tasks, you will typically need 2-4 skills
+      - Example: "read brand guidelines and create a blog" requires:
+        - Brand Strategy & Market Research (has read_brand_guidelines)
+        - Content Intelligence & Authoring (has create_blog_article)
+
+      ### 3. INSTALL ALL SKILLS AT ONCE
+      Use \`install_skills\` with an array containing ALL the skill IDs you identified:
+      - Do NOT install skills one at a time
+      - Do NOT start executing until all required skills are installed
+      - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
+
+
+      ### 4. EXECUTE
+      Once all skills are installed and tools are available:
+      - Use the tools to fulfill the user's request
+      - Do not ask for permission to use installed tools
+      - Complete the entire workflow
+
+      ## Critical Rules
+      * **Complete Task Analysis First**: Always analyze the ENTIRE task before installing any skills
+      * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
+      * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
+      * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
 
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
@@ -1029,11 +1051,45 @@ export class AgentModeService {
       - Do NOT start executing until all required skills are installed
       - Example: install_skills(["workflow-skill-id", "brand-skill-id", "content-skill-id"])
 
-      ### 4. EXECUTE
-      Once all skills are installed and tools are available:
-      - Use the tools to fulfill the user's request
-      - Do not ask for permission to use installed tools
-      - Complete the entire workflow
+## Task Creation Approach
+- **IMPORTANT**: Always confirm with the user before creating any task, as tasks can take a few minutes to complete
+- **Confirmation required**: Explain what the task will do and get explicit approval before proceeding
+- **Web Automation Tasks Only**: The 'create_task_from_template' and 'create_task_from_prompt' tools are ONLY for web automation tasks that require browser interaction (e.g., logging into websites, scraping data, filling forms). These tools cannot run generic tasks that don't involve web browsing.
+- **Primary Method**: Use the 'create_task_from_template' tool with a specific template_id and parameters_json string
+- Use the 'list_task_templates' tool to discover available templates and find the most appropriate one based on the user's request
+- Extract the required parameters from the user's message and pass them as a JSON string where keys are parameter names and values are the actual values
+- Example: {"site_url": "example.com", "business_area": "e-commerce"}
+- Templates provide structured, proven approaches to common web automation marketing tasks
+- **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
+- The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
+ - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
+ - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
+ - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
+ - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
+   - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
+- **Meta Ads Campaigns and Metrics**:
+- Use 'list_meta_ads_campaigns' to show users their available Meta ad campaigns before fetching detailed metrics
+- Use 'get_meta_ads_metrics' to fetch and analyze Meta ad performance data for selected campaigns
+- **Required parameter**: 'campaign_ids' (array of campaign IDs) is mandatory for 'get_meta_ads_metrics'
+- **Recommended workflow**: First call 'list_meta_ads_campaigns' to show available campaigns with their IDs, then let the user choose campaigns to analyze, and call 'get_meta_ads_metrics' with the selected campaign_ids array for accurate filtering
+- When metrics data is loaded, provide contextual analysis based on the conversation history and user's business goals
+- Don't just repeat the numbers - provide meaningful insights, strategic recommendations, and actionable next steps
+- Consider the user's industry, business stage, and previous conversation context when analyzing performance
+- Compare metrics against industry benchmarks and identify specific optimization opportunities
+- If a user asks about a specific ad that doesn't appear in the metrics data, explain that the ad may be disabled, paused, or have no activity in the selected timeframe
+- **Important**: You cannot pull metrics for individual ads by name - the metrics function returns all active ads in the timeframe. If a user asks for specific ad metrics, explain that you can only analyze the ads that appear in the current data set
+- **Web Search**: Use 'search_web' proactively to gather information from the internet before asking users for clarification
+- **Automatic and fast**: Web search does NOT require user confirmation - use it automatically to improve your responses
+- **When to search**: Before asking users for more details, search for market data, industry trends, competitor information, or other information available on the internet
+- **Search first, ask second**: Use web search to gather background information and context from the internet before requesting additional details from users
+- **Search topics include**: Market trends, industry benchmarks, competitor analysis, news, regulatory information, technology updates, or any information from the internet that would help provide better recommendations
+- **Search strategy**: Use specific, targeted search queries to find the most relevant information
+- **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
+- **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
+- **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
+- **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
       ## Credentials & Account IDs (CRITICAL)
       - **META ADS**: You are FORBIDDEN from guessing Ad Account IDs (e.g., "act_123456").
@@ -1042,11 +1098,135 @@ export class AgentModeService {
       - If \`list_connected_accounts\` returns no results, you MUST tell the user to connect their account in the portal settings.
       - **DO NOT** use placeholder strings like "act_placeholder" or "placeholder". If you do not have a real ID, you cannot use the marketing tools.
 
-      ## Critical Rules
-      * **Complete Task Analysis First**: Always analyze the ENTIRE task before installing any skills
-      * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
-      * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
-      * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
+## Social Media Posting (Connected Accounts)
+When posting to connected social media accounts using 'post_on_connected_account':
+- **CRITICAL: Always include the COMPLETE, FULL post content** in the content parameter. Never truncate, abbreviate, summarize, or omit any part of the text.
+- Include ALL paragraphs, line breaks, hashtags, emojis, mentions, and formatting exactly as approved by the user.
+- Do NOT use placeholders like "...", "[rest of content]", or any truncation indicators.
+- If the user approved a multi-paragraph post, include every single paragraph in full.
+- The content parameter must be an exact copy of what was shown to and approved by the user.
+
+## "whitepapers" / "research reports" / "executive summaries"
+
+      ## Handling File Attachments
+      When users attach files, you see them as markdown links: \`[filename](url)\`.
+      Analyze these files when relevant to the user's request. If you need specialized tools to process them (like data analysis), ensure the corresponding skill is installed first.
+
+      ## Response Formatting
+      Format your responses in HTML5 for direct rendering. Use:
+      - <strong> for important points
+      - <em> for emphasis
+      - <code> for technical terms and commands
+      - <ul> and <li> for lists
+      - <pre> for code blocks
+      - <a href="url" target="_blank"> for links
+      - <table> for structured data
+
+      Important formatting rules:
+      1. Use minimal spacing - no extra blank lines
+      2. Keep lists compact with minimal spacing
+      3. Use single line breaks between list items
+      4. Keep responses concise and well-structured
+      5. Always include target="_blank" for links
+      6. Use proper HTML5 semantic elements
+      7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+
+**Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
+
+**Step 4 - Create Outline**: Call 'create_book_outline' with EXACTLY 5-6 sections maximum (NOT more):
+      1. Executive Summary (length="short", ~1 page)
+      2. Introduction/Background (length="short", ~1 page)
+      3. Key Findings (length="medium", ~2 pages)
+      4. Analysis/Discussion (length="long", ~3 pages)
+      5. Conclusion & Recommendations (length="short", ~1 page)
+      6. References (length="short")
+
+      Do NOT create chapters within sections. Do NOT create more than 6 sections.
+ **Step 5 - Generate Content**: For EACH section, call 'generate_book_content' with:
+      - book_id, section_id
+      - research_url: Pass the S3 URL from Step 1 (the function will fetch research content automatically)
+      - content_description: Brief section-specific instructions. **IMPORTANT**: If this section should include charts from Step 2, add to content_description: "Include the following chart image: ![Chart Title](chart_url_from_step_2)" for each relevant chart.
+      - length: Use "short" for Executive Summary & Conclusion (~1 page), "medium" for Introduction & Key Findings (~2 pages), "long" for Analysis only (~3 pages)
+      - imagine: false (stick to research facts, don't invent details)
+
+## Task Execution
+- When you create tasks, they will show execution status in the UI (pending, running, completed, failed)
+- The tool call results will include the current status of any running tasks
+- You can reference the status information provided in the tool call results
+- If a user asks about task status, use the current status from the tool call results
+
+## Communication Style
+- Be helpful, professional, and conversational
+- **Research before asking**: Use web search to gather current information before asking users for clarification
+- **Proactive information gathering**: Search for market data, trends, and context to provide more informed recommendations
+- **Data-driven approach**: Base your advice on current, real-world data rather than general knowledge
+- Ask clarifying questions only after you've searched for available information
+- **Web search is automatic**: Use web search proactively without asking for permission - it's fast and helps provide better answers
+- **Task confirmation required**: Always explain what a task will do and ask for confirmation before creating it (tasks take time to complete)
+- **Example confirmation**: "I'd like to create a market research task that will analyze your competitors and industry trends. This task may take a few minutes to complete. Would you like me to proceed?"
+- Provide clear explanations of what you're doing and what information you've found
+- Keep responses concise but informative
+- Always confirm task creation and provide relevant details
+- When using templates, explain which template was selected and why
+- When analyzing metrics data, provide insights and recommendations rather than just repeating the numbers
+- Focus on actionable insights and strategic guidance based on current data and conversation context
+- If a user asks about a specific ad that doesn't appear in the metrics data, simply explain that the ad may be disabled, paused, or have no activity in the selected timeframe
+- **Never offer to pull metrics for individual ads by name** - you can only analyze the ads that appear in the current metrics data set
+
+## Work Plan Capabilities
+You can create and manage multi-step work plans using these tools:
+- **create_work_plan**: Create a structured plan with a title and numbered steps. Each step can include optional requiredFunctionCalls to enforce validation. **CRITICAL: Always check your context messages for an existing work plan before creating a new one. If a work plan already exists (you'll see a message starting with "⚠️ IMPORTANT: A WORK PLAN ALREADY EXISTS"), DO NOT create a new plan - use modify_work_plan instead.**
+- **modify_work_plan**: Add new steps or modify existing step details (does not change status). Can also add or modify requiredFunctionCalls for steps. Use this when a work plan already exists and you need to make changes.
+- **set_work_plan_status**: Update step status (pending/completed/skipped) with optional notes. **IMPORTANT**: If a step has requiredFunctionCalls defined, you MUST have called those functions before marking it as completed, or you'll get an error.
+
+Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
+
+## GTM Plan Capabilities
+You can read and create Go-To-Market (GTM) plans using these tools:
+- **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.
+- **read_gtm_plan**: Read a specific GTM plan by its plan ID. Returns complete plan details including all phases and work items with their statuses, durations, completion times, and DRI (Directly Responsible Individual) email addresses at plan, phase, and item levels.
+- **create_gtm_plan**: Create a new GTM plan with a title, optional description, optional DRI (Directly Responsible Individual) email at plan level, and optional phases with work items. You can create a complete plan structure in one call by including phases (each with title, description, duration, optional DRI) and work items (each with title, optional description, optional duration, optional DRI) within each phase. DRI can be specified at the plan level, phase level, or work item level. Returns the created plan with its unique identifier.
+
+**IMPORTANT RESTRICTIONS:**
+- **You CANNOT modify existing GTM plans** - You can only read existing plans and create new ones.
+- **You CANNOT update work item statuses** - You cannot mark work items as completed, skipped, or pending.
+- **You CANNOT add phases or work items to existing plans** - You cannot modify the structure of an existing GTM plan.
+- **To modify plans**: Users must go to the /gtm-plan page in the customer portal to manually add phases, work items, update statuses, and make other changes.
+
+Use GTM plans to understand the user's go-to-market strategy and provide context-aware assistance. When a user asks about their GTM plan, use read_gtm_plan to get the current state and provide insights based on the plan structure and progress. When creating a GTM plan, you can include the complete structure with phases and work items in a single call.
+
+## Lead Lists Management
+You can manage lead lists and add leads to them using these tools:
+- **get_lead_lists**: Get all lead lists for the user. Returns list IDs, names, descriptions, lead counts, and creation dates. Use this to see what lead lists exist before adding leads or creating new lists.
+- **create_lead_list**: Create a new lead list with a name and optional description. Returns the created list with its ID. Use this when the user wants to organize leads into a new list.
+- **add_leads_to_list**: Add one or more leads to an existing lead list. Each lead is a flexible object that can contain any fields you want to store. Common fields include: email (used for deduplication and merging), firstName, lastName, phone, company, title, notes, linkedin, and any custom fields. You can use any field names that make sense for your data. If a lead with the same email already exists, it will be merged with the new data. Returns counts of new and merged leads, plus any errors. **IMPORTANT**: Always use get_lead_lists first to get the correct list_id before adding leads.
+
+**Best Practices for Lead Lists:**
+- When a user wants to add leads, first check if a suitable list exists using get_lead_lists
+- If no appropriate list exists, offer to create one using create_lead_list
+- When adding leads, use field names that make sense for the data you're storing - you're not limited to predefined fields
+- The email field (if provided) is used for deduplication and merging - leads with the same email will be merged with existing records
+- Include as much information as possible to make the leads more valuable
+- You can use any field names - standard fields (email, firstName, lastName, phone, company, title, notes, linkedin) are recognized, and all other fields will be stored as custom fields
+- Always confirm the list_id with the user or use get_lead_lists to find the correct one before adding leads
+
+### Required Function Calls
+You can specify required function calls for any step to ensure proper validation:
+- Add requiredFunctionCalls array when creating or modifying steps
+- Example: \`requiredFunctionCalls: ["create_blog_article", "generate_image"]\`
+- When marking a step as completed, the system will validate that all required functions were actually called
+- If any required functions are missing, you'll get an error message listing what's missing
+- This ensures you don't skip important work before marking steps complete
+
+### Client Onboarding Workflow
+When a user requests client onboarding or says "onboard new client" or similar:
+1. **Ask for website URL**: Request their business website URL first
+2. **Create the work plan**: Use create_work_plan with title "Client Onboarding" and these steps with required function calls:
+   - Step 1: Analyze website and business (requiredFunctionCalls: ["search_web"])
+   - Step 2: Create/update brand guidelines (requiredFunctionCalls: ["update_brand_guidelines"])
+   - Step 3: Create/update marketing strategy (requiredFunctionCalls: ["update_marketing_strategy"])
+   - Step 4: Generate 3 blog articles (requiredFunctionCalls: ["create_blog_article"])
+   - Step 5: Generate social media posts (requiredFunctionCalls: ["generate_image"])
 
       ## Handling File Attachments
       When users attach files, you see them as markdown links: \`[filename](url)\`.
@@ -1294,42 +1474,6 @@ export class AgentModeService {
     return messages;
   }
 
-  private buildTemplatesContext(templates: any[]): string {
-    if (templates.length === 0) {
-      return 'No templates are currently available.';
-    }
-
-    let context = 'Available Templates:\n\n';
-
-    // Group templates by category
-    const groupedTemplates: Record<string, any[]> = {};
-    templates.forEach(template => {
-      const category = template.category || 'General';
-      if (!groupedTemplates[category]) {
-        groupedTemplates[category] = [];
-      }
-      groupedTemplates[category].push(template);
-    });
-
-    // Build context for each category
-    Object.entries(groupedTemplates).forEach(([category, categoryTemplates]) => {
-      context += `## ${category}\n`;
-      categoryTemplates.forEach(template => {
-        context += `**${template.name}** (ID: ${template.templateId})\n`;
-        context += `Description: ${template.description}\n`;
-        if (template.parameters && template.parameters.length > 0) {
-          const paramNames = template.parameters.map((p: any) => typeof p === 'string' ? p : p.name || p.id);
-          context += `Parameters: ${paramNames.join(', ')}\n`;
-        }
-        context += `\n`;
-      });
-    });
-
-    context += `\nTo use a template, call the 'create_task_from_template' tool with the template_id and parameters_json string (JSON format where keys are parameter names and values are the actual values).`;
-
-    return context;
-  }
-
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
       const publishedSkills = await skillService.getPublishedSkills();
@@ -1360,11 +1504,31 @@ export class AgentModeService {
     }
   }
 
-  private static readonly INFRASTRUCTURE_TOOLS = new Set(['install_skills', 'explore_skills', 'mcpservers_fetch']);
+  // Tools that are always available without installing a skill.
+  // install_skills is the skill installer itself; the rest are general-purpose primitives
+  // (search, read, plan, save) that most conversations need regardless of domain.
+  private static readonly FOUNDATION_TOOLS = new Set([
+    'install_skills',
+    'search_web',
+    'read_file_content',
+    'read_page_source',
+    'search_knowledge_base',
+    'list_knowledge_base_files',
+    'read_knowledge_base_files',
+    'create_work_plan',
+    'modify_work_plan',
+    'set_work_plan_status',
+    'save_file',
+    'describe_image',
+  ]);
+
+  // Subset of foundation tools that must execute for real in mock/benchmark mode
+  // because they modify session state (no external side effects).
+  private static readonly MOCK_BYPASS_TOOLS = new Set(['install_skills']);
 
   /**
    * Get tools that are not associated with any published skill.
-   * Excludes infrastructure tools (install_skills, explore_skills, mcpservers_fetch).
+   * Excludes foundation tools (always available without a skill).
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
     // Collect all tool names used by any published skill
@@ -1377,7 +1541,7 @@ export class AgentModeService {
     const allTools = this.toolRegistry.getAllTools();
 
     return allTools
-      .filter(tool => !associatedToolNames.has(tool.name) && !AgentModeService.INFRASTRUCTURE_TOOLS.has(tool.name))
+      .filter(tool => !associatedToolNames.has(tool.name) && !AgentModeService.FOUNDATION_TOOLS.has(tool.name))
       .map(tool => ({
         name: tool.name,
         description: tool.definition?.function?.description || ''
@@ -1385,21 +1549,39 @@ export class AgentModeService {
   }
 
   /**
-   * Build the "Available Skills" context message, excluding skills already associated with the session.
+   * Get tool names not associated with any published skill (excludes infrastructure tools).
+   * Public version of getUnassociatedTools for use by subscriptionService.resolveSkillsToToolNames.
    */
-  private buildAvailableSkillsMessage(publishedSkills: any[], associatedSkillIds: string[]): string {
+  public getUnassociatedToolNames(publishedSkills: any[]): string[] {
+    return this.getUnassociatedTools(publishedSkills).map(t => t.name);
+  }
+
+  /**
+   * Get the set of foundation tool names (always available, not assignable to skills).
+   */
+  public getFoundationToolNames(): Set<string> {
+    return AgentModeService.FOUNDATION_TOOLS;
+  }
+
+  /**
+   * Build the "Available Skills" context message, excluding skills already associated with the session.
+   * Only shows skills the user's subscription allows.
+   */
+  private buildAvailableSkillsMessage(publishedSkills: any[], associatedSkillIds: string[], userAllowedSkillIds: string[] = ["*"]): string {
     const associatedSet = new Set(associatedSkillIds);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
     const skillEntries: string[] = [];
 
-    // Add published skills that are NOT already associated
+    // Add published skills that are NOT already associated AND are allowed by subscription
     publishedSkills.forEach(s => {
-      if (!associatedSet.has(s.skillId)) {
+      if (!associatedSet.has(s.skillId) && (isWildcard || allowedSet.has(s.skillId))) {
         skillEntries.push(`${s.skillId}- ${s.name}: ${s.description}: Tools: ${s.toolNames?.join(', ')}`);
       }
     });
 
-    // Add virtual other_skills if there are unassociated tools AND it's not already installed
-    if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
+    // Add virtual other_skills if allowed, there are unassociated tools, AND it's not already installed
+    if (!associatedSet.has(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
 
       if (unassociatedTools.length > 0) {
@@ -1414,14 +1596,63 @@ export class AgentModeService {
     return `Available Skills:\n${skillEntries.join('\n')}`;
   }
 
+  /**
+   * Get skills with installed status for UI display, filtered by user's subscription.
+   */
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
+    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      skillService.getPublishedSkills(),
+      userId ? getAllowedSkills(userId) : Promise.resolve(["*"] as string[])
+    ]);
+    const installedIds = new Set(associatedSkillIds);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
+
+    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = publishedSkills
+      .filter(s => isWildcard || allowedSet.has(s.skillId))
+      .map(s => ({
+        skillId: s.skillId,
+        name: s.name,
+        description: s.description,
+        installed: installedIds.has(s.skillId),
+        toolNames: s.toolNames || []
+      }));
+
+    // Add virtual other_skills entry if allowed and there are unassociated tools
+    if (isWildcard || allowedSet.has(OTHER_SKILLS_VIRTUAL_ID)) {
+      const unassociatedTools = this.getUnassociatedTools(publishedSkills);
+      if (unassociatedTools.length > 0) {
+        skills.push({
+          skillId: OTHER_SKILLS_VIRTUAL_ID,
+          name: 'Other Skills',
+          description: 'Tools not associated with any specific skill',
+          installed: installedIds.has(OTHER_SKILLS_VIRTUAL_ID),
+          toolNames: unassociatedTools.map(t => t.name)
+        });
+      }
+    }
+
+    return skills;
+  }
+
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
-        const publishedSkills = await skillService.getPublishedSkills();
+        const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+          skillService.getPublishedSkills(),
+          getAllowedSkills(userId)
+        ]);
+
+        const isWildcard = userAllowedSkillIds.includes("*");
+        const allowedSkillSet = new Set(userAllowedSkillIds);
 
         // Filter valid IDs: exists in published skills OR is the virtual other_skills ID
+        // AND is allowed by user's subscription
         const validSkillIds = skillIds.filter(id =>
-          id === OTHER_SKILLS_VIRTUAL_ID || publishedSkills.some(s => s.skillId === id)
+          (id === OTHER_SKILLS_VIRTUAL_ID || publishedSkills.some(s => s.skillId === id)) &&
+          (isWildcard || allowedSkillSet.has(id))
         );
+
+        const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
 
         const installedNames: string[] = [];
 
@@ -1440,14 +1671,23 @@ export class AgentModeService {
         }
 
         if (!installedNames.length) {
+          if (rejectedSkillIds.length > 0) {
+            return { message: "The requested skills are not available with your current subscription." };
+          }
           return { message: "No valid skills found for the provided IDs." };
         }
 
-        return {
+        const result: any = {
           success: true,
           message: `Successfully installed ${installedNames.length} skill(s).`,
           installedSkills: installedNames
         };
+
+        if (rejectedSkillIds.length > 0) {
+          result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+        }
+
+        return result;
     } catch (error) {
         console.error('AgentMode: Error in installSkills:', error);
         return { message: "An error occurred while installing skills." };
@@ -1456,34 +1696,37 @@ export class AgentModeService {
 
   private buildSkillContext(
     associatedSkills: any[],
-    userAllowedTools: string[],
+    userAllowedSkillIds: string[],
     publishedSkills: any[],
     sessionAssociatedSkillIds: string[] = []
   ): { allowedToolNames: Set<string>; installedSkillContextMsg: string } {
-    const allowedToolNames = new Set<string>();
-    allowedToolNames.add('install_skills'); // Always allow install_skills
+    const allowedToolNames = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
+
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSkillSet = new Set(userAllowedSkillIds);
 
     if (associatedSkills.length) {
       associatedSkills.forEach(s => {
-        if (s.toolNames) {
-          s.toolNames.forEach((t: string) => {
-            if (userAllowedTools.includes(t) || userAllowedTools.includes('*')) {
+        // Check if the skill itself is allowed by subscription (skill-level gating)
+        if (isWildcard || allowedSkillSet.has(s.skillId)) {
+          if (s.toolNames) {
+            s.toolNames.forEach((t: string) => {
               allowedToolNames.add(t);
-            }
-          });
+            });
+          }
         }
       });
     }
 
-    // Handle virtual other_skills
-    if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID)) {
+    // Handle virtual other_skills (gated by subscription)
+    if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
     }
 
     let installedSkillContextMsg = '';
     if (associatedSkills.length) {
-      const context = associatedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt}`).join('\n');
+      const context = associatedSkills.map(s => `${s.skillId}- ${s.name}: ${s.description} ${s.systemPrompt || ''}`).join('\n');
       installedSkillContextMsg = `Installed Skills:\n${context}`;
     }
 
@@ -1498,42 +1741,50 @@ export class AgentModeService {
   // Get filtered tools based on user's subscription type AND session state
   // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
   public async getFilteredTools(
-    userId: string, 
+    userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
-    precomputedAllowedAllFunctionCalls?: string[]  // New parameter to avoid duplicate getAllowedFunctionCalls call
+    precomputedAllowedSkillIds?: string[]  // Skill IDs from subscription, to avoid duplicate getAllowedSkills call
   ): Promise<any[]> {
     try {
-      
-      if (precomputedAllowedSkillToolNames) {
-        // 1. Get all internal tool objects (flat structure with .name)
-        const allInternalTools = this.toolRegistry.getAllTools();
 
-        // 3. Filter the internal tool objects
-        const contextAwareTools = allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name));
+      // 1. Get all internal tool objects (flat structure with .name)
+      const allInternalTools = this.toolRegistry.getAllTools();
 
-        // 4. Map back to wire-format definitions for the LLM
-        const definitions = contextAwareTools.map(t => t.definition);
+      // 2. Apply skill-based filtering if a skill filter is provided.
+      // Pre-skills sessions pass undefined to get all tools for backward compatibility.
+      const contextAwareTools = precomputedAllowedSkillToolNames
+        ? allInternalTools.filter(tool => precomputedAllowedSkillToolNames.has(tool.name))
+        : allInternalTools;
 
-        // 5. Apply Subscription Filtering
-        // IMPORTANT: Tools associated via Skills bypass subscription filtering
-        // The Skills system is now the primary access control mechanism
-        // Use pre-fetched allowedFunctionCalls if available to avoid duplicate DB call
-        const allowedFunctionCalls = precomputedAllowedAllFunctionCalls 
-        ? [...precomputedAllowedAllFunctionCalls]  // Clone to avoid mutation
-        : await getAllowedFunctionCalls(userId);
-      
-        // Add all session-associated tools to the allowed list to bypass subscription filtering
-        if (!allowedFunctionCalls.includes('*')) {
-          precomputedAllowedSkillToolNames.forEach(name => {
-            if (!allowedFunctionCalls.includes(name)) {
-              allowedFunctionCalls.push(name);
-            }
+      // 3. Map back to wire-format definitions for the LLM
+      const definitions = contextAwareTools.map(t => t.definition);
+
+      // 4. Apply Subscription Filtering
+      // Resolve skill IDs to tool names for the subscription filter step
+      const skillIds = precomputedAllowedSkillIds || await getAllowedSkills(userId);
+      const allowedFunctionCalls = await resolveSkillsToToolNames(skillIds);
+
+      // Foundation tools must always bypass subscription filtering — they are
+      // core primitives (work plan, search, save) needed by every session.
+      if (!allowedFunctionCalls.includes('*')) {
+        AgentModeService.FOUNDATION_TOOLS.forEach(name => {
+          if (!allowedFunctionCalls.includes(name)) {
+            allowedFunctionCalls.push(name);
+          }
+        });
+      }
+
+      // Add all session-associated tools to the allowed list to bypass subscription filtering
+      // (skills already installed in the session should remain usable)
+      if (precomputedAllowedSkillToolNames && !allowedFunctionCalls.includes('*')) {
+        precomputedAllowedSkillToolNames.forEach(name => {
+          if (!allowedFunctionCalls.includes(name)) {
+            allowedFunctionCalls.push(name);
+          }
         });
       }
 
       return filterFunctionCalls(definitions, allowedFunctionCalls);
-    }
-    return [];
     } catch (error) {
       console.error('Error filtering tools:', error);
       // Fallback: return only install_skills to be safe, or empty array
@@ -1654,6 +1905,21 @@ export class AgentModeService {
   private getMockToolResult(toolName: string, args: any): any {
     // Return realistic mock data for different tool types
     switch (toolName) {
+      case 'list_task_templates':
+        return {
+          success: true,
+          message: 'Found 2 template(s)',
+          templates_by_category: {
+            'SEO': [
+              { template_id: 'mock-template-1', name: 'SEO Analysis', description: 'Analyze website SEO', category: 'SEO', parameters: ['site_url'] }
+            ],
+            'Research': [
+              { template_id: 'mock-template-2', name: 'Competitor Research', description: 'Research competitors', category: 'Research', parameters: ['competitor_url'] }
+            ]
+          },
+          totalTemplates: 2
+        };
+
       case 'create_task_from_template':
         return {
           success: true,
@@ -2587,8 +2853,10 @@ export class AgentModeService {
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
-    // Return mock data if in mock mode
-    if (mockMode) {
+    // In mock mode, only session-state tools (install_skills) execute for real
+    // because they modify DynamoDB session state with no external side effects
+    // and are required for the skill-gated tool flow to work during benchmark tests.
+    if (mockMode && !AgentModeService.MOCK_BYPASS_TOOLS.has(toolName)) {
       return this.getMockToolResult(toolName, args);
     }
 
@@ -2599,6 +2867,22 @@ export class AgentModeService {
         llmModel,
         service: this,
       });
+
+      // // If result is already MCP-wrapped (from external MCP tools via mcpClientService),
+      // // pass it through unchanged. External tools return { content: string, raw: { content: [...] } }
+      // if (result && typeof result.content === 'string' && result.raw) {
+      //   return result;
+      // }
+
+      // // Simulate MCP wrapping for internal tools to maintain consistent
+      // // response format with external MCP tools
+      // const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+      // return {
+      //   content: resultStr,
+      //   raw: {
+      //     content: [{ type: 'text', text: resultStr }]
+      //   }
+      // };
     } catch (error) {
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
@@ -4393,6 +4677,24 @@ Format the response as JSON with this structure:
         updatedBrandData.founders = mergedFounders;
       }
 
+      // Reject SVG files for logo/secondaryLogo assets
+      if (brandAssets !== undefined) {
+        const assetsToCheck = Array.isArray(brandAssets) ? brandAssets : [brandAssets];
+        for (const asset of assetsToCheck) {
+          if (asset && (asset.type === 'logo' || asset.type === 'secondaryLogo')) {
+            const url = (asset.url || '').toLowerCase();
+            const filename = (asset.filename || '').toLowerCase();
+            if (url.endsWith('.svg') || filename.endsWith('.svg') || url.includes('.svg?')) {
+              return {
+                success: false,
+                message: `SVG files are not supported for ${asset.type === 'logo' ? 'primary' : 'secondary'} logo. Please convert your SVG to PNG or another raster format before uploading.`,
+                error: 'SVG format not allowed for logo uploads'
+              };
+            }
+          }
+        }
+      }
+
       // Handle brandAssets update - merge by type to preserve existing assets
       let updatedAttachments = [...(existingBrand.attachments || [])];
       const updatedAssets: any[] = []; // Track which assets were actually updated
@@ -4561,11 +4863,52 @@ Format the response as JSON with this structure:
         }));
     } catch (error) {
       console.error('Error fetching templates:', error);
-      return [];
+      throw error;
     }
   }
 
+  // List task templates (used by list_task_templates MCP tool)
+  public async listTaskTemplates(): Promise<any> {
+    try {
+      const templates = await this.getAvailableTemplates();
 
+      if (templates.length === 0) {
+        return {
+          success: true,
+          message: 'No templates are currently available.',
+          templates: [],
+          totalTemplates: 0
+        };
+      }
+
+      // Group by category for organized presentation
+      const grouped: Record<string, any[]> = {};
+      templates.forEach((t: any) => {
+        const cat = t.category || 'General';
+        if (!grouped[cat]) grouped[cat] = [];
+        grouped[cat].push({
+          template_id: t.templateId,
+          name: t.name,
+          description: t.description,
+          category: cat,
+          parameters: (t.parameters || []).map((p: any) => typeof p === 'string' ? p : p.name || p.id)
+        });
+      });
+
+      return {
+        success: true,
+        message: `Found ${templates.length} template(s)`,
+        templates_by_category: grouped,
+        totalTemplates: templates.length
+      };
+    } catch (error) {
+      return {
+        success: false,
+        message: 'Failed to list task templates',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
 
   // Helper method to convert file URLs to TaskAttachment objects
   private convertUrlsToAttachments(fileUrls: string[]): any[] {

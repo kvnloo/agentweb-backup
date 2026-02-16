@@ -1233,23 +1233,13 @@ router.get("/analytics/agent-mode", async (req, res) => {
       (session) => session.portalType === "agent" && !session.archived
     );
 
-    const agentSessionsWithMessagesPromise = Promise.all(
-      agentSessions.map(async (session) => {
-        try {
-          const sessionWithMessages = await chatbotDb.getChatSession(
-            session.sessionId
-          );
-          return sessionWithMessages ?? session;
-        } catch (error) {
-          console.error(
-            `Error loading messages for session ${session.sessionId}:`,
-            error
-          );
-          return session;
-        }
-      })
+    // Fetch lightweight message stats in parallel for all agent sessions
+    const messageStatsPromise = Promise.all(
+      agentSessions.map((session) =>
+        chatbotDb.getMessageStats(session.sessionId).catch(() => null)
+      )
     );
-    
+
     // Parse date range
     const start = startDate ? new Date(startDate as string) : null;
     const end = endDate ? new Date(endDate as string) : null;
@@ -1344,76 +1334,46 @@ router.get("/analytics/agent-mode", async (req, res) => {
     // Total unique users in range (for backward compatibility)
     const uniqueUsersInRange = activeUsers;
     
-    const agentSessionsWithMessages = await agentSessionsWithMessagesPromise;
+    const messageStatsResults = await messageStatsPromise;
 
-    // Messages statistics
-    const totalMessages = agentSessionsWithMessages.reduce(
-      (sum, s) => sum + (s.messages?.length || 0),
-      0
-    );
-    const averageMessagesPerSession =
-      totalSessions > 0 ? totalMessages / totalSessions : 0;
-    
-    // Messages in date range
-    const messagesInRange = agentSessionsWithMessages.reduce(
-      (sum, s) => (isInRange(s.createdAt) ? sum + (s.messages?.length || 0) : sum),
-      0
-    );
-    const averageMessagesPerActiveUser =
-      activeUsers.size > 0 ? messagesInRange / activeUsers.size : 0;
-    
-    // Messages by role
-    const messagesByRole: Record<string, number> = {
-      user: 0,
-      assistant: 0,
-      system: 0,
-      tool: 0,
-    };
-    
-    // Messages with attachments
+    // Aggregate message statistics from lightweight stats
+    let totalMessages = 0;
+    let messagesInRange = 0;
+    const messagesByRole: Record<string, number> = { user: 0, assistant: 0, system: 0, tool: 0 };
     let messagesWithAttachments = 0;
-    
-    // Messages with tool calls
     let messagesWithToolCalls = 0;
-    
-    // Token usage statistics
+    let successfulToolCalls = 0;
+    let failedToolCalls = 0;
     let totalTokens = 0;
     let totalPromptTokens = 0;
     let totalCompletionTokens = 0;
     let messagesWithTokenData = 0;
-    
-    agentSessionsWithMessages.forEach((session) => {
-      if (session.messages) {
-        session.messages.forEach((message) => {
-          // Count by role
-          const role = message.role || "unknown";
-          if (messagesByRole[role] !== undefined) {
-            messagesByRole[role]++;
-          }
-          
-          // Count messages with attachments
-          if (message.metadata?.attachments && message.metadata.attachments.length > 0) {
-            messagesWithAttachments++;
-          }
-          
-          // Count messages with tool calls
-          if (message.tool_calls && message.tool_calls.length > 0) {
-            messagesWithToolCalls++;
-          }
-          if (message.metadata?.toolCalls && message.metadata.toolCalls.length > 0) {
-            messagesWithToolCalls++;
-          }
-          
-          // Count token usage
-          if (message.usage) {
-            totalTokens += message.usage.total_tokens || 0;
-            totalPromptTokens += message.usage.prompt_tokens || 0;
-            totalCompletionTokens += message.usage.completion_tokens || 0;
-            messagesWithTokenData++;
-          }
-        });
+
+    messageStatsResults.forEach((stats, i) => {
+      if (!stats) return;
+      totalMessages += stats.totalMessages;
+      if (isInRange(agentSessions[i].createdAt)) {
+        messagesInRange += stats.totalMessages;
       }
+      for (const [role, count] of Object.entries(stats.messagesByRole)) {
+        if (messagesByRole[role] !== undefined) {
+          messagesByRole[role] += count;
+        }
+      }
+      messagesWithAttachments += stats.messagesWithAttachments;
+      messagesWithToolCalls += stats.messagesWithToolCalls;
+      successfulToolCalls += stats.successfulToolCalls;
+      failedToolCalls += stats.failedToolCalls;
+      totalTokens += stats.totalTokens;
+      totalPromptTokens += stats.totalPromptTokens;
+      totalCompletionTokens += stats.totalCompletionTokens;
+      messagesWithTokenData += stats.messagesWithTokenData;
     });
+
+    const averageMessagesPerSession =
+      totalSessions > 0 ? totalMessages / totalSessions : 0;
+    const averageMessagesPerActiveUser =
+      activeUsers.size > 0 ? messagesInRange / activeUsers.size : 0;
     
     const averageTokensPerMessage =
       messagesWithTokenData > 0 ? totalTokens / messagesWithTokenData : 0;
@@ -1479,6 +1439,45 @@ router.get("/analytics/agent-mode", async (req, res) => {
       }
     });
     
+    // Failed tool calls by function name (breakdown)
+    const failedToolCallsByFunction: Record<string, number> = {};
+    const failedToolCallsByFunctionInRange: Record<string, number> = {};
+
+    agentSessions.forEach((session) => {
+      if (session.failedFunctions) {
+        Object.entries(session.failedFunctions).forEach(([functionName, count]) => {
+          failedToolCallsByFunction[functionName] = (failedToolCallsByFunction[functionName] || 0) + count;
+
+          if (isInRange(session.createdAt)) {
+            failedToolCallsByFunctionInRange[functionName] = (failedToolCallsByFunctionInRange[functionName] || 0) + count;
+          }
+        });
+      }
+    });
+
+    // Build tool call details with success and failure counts
+    const allToolNames = new Set([
+      ...Object.keys(toolCallsByFunction),
+      ...Object.keys(failedToolCallsByFunction),
+    ]);
+    const toolCallDetails = Array.from(allToolNames).map((name) => ({
+      name,
+      total: (toolCallsByFunction[name] || 0) + (failedToolCallsByFunction[name] || 0),
+      success: toolCallsByFunction[name] || 0,
+      failure: failedToolCallsByFunction[name] || 0,
+    })).sort((a, b) => b.total - a.total);
+
+    const allToolNamesInRange = new Set([
+      ...Object.keys(toolCallsByFunctionInRange),
+      ...Object.keys(failedToolCallsByFunctionInRange),
+    ]);
+    const toolCallDetailsInRange = Array.from(allToolNamesInRange).map((name) => ({
+      name,
+      total: (toolCallsByFunctionInRange[name] || 0) + (failedToolCallsByFunctionInRange[name] || 0),
+      success: toolCallsByFunctionInRange[name] || 0,
+      failure: failedToolCallsByFunctionInRange[name] || 0,
+    })).sort((a, b) => b.total - a.total);
+
     // Get top tools (sorted by usage)
     const topTools = Object.entries(toolCallsByFunction)
       .sort(([, a], [, b]) => b - a)
@@ -1545,6 +1544,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
       messagesByRole,
       messagesWithAttachments,
       messagesWithToolCalls,
+      successfulToolCalls,
+      failedToolCalls,
       totalTokens,
       totalPromptTokens,
       totalCompletionTokens,
@@ -1562,6 +1563,8 @@ router.get("/analytics/agent-mode", async (req, res) => {
       toolCallsByFunctionInRange,
       topTools,
       topToolsInRange,
+      toolCallDetails,
+      toolCallDetailsInRange,
       dailyGrowth: sortedDailyGrowth,
     });
   } catch (error) {
@@ -2428,6 +2431,150 @@ router.get("/knowledge-base-metrics", async (req, res) => {
   }
 });
 
+// Get GTM analytics (aggregate work item metrics across all plans)
+router.get("/analytics/gtm", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const hasDateRange = startDate && endDate;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    const result = await dynamodb.scan({
+      TableName: TABLE_NAME,
+    }).promise();
+
+    const plans = result.Items || [];
+
+    let totalItems = 0;
+    let completedItems = 0;
+    let completedItemsInRange = 0;
+
+    for (const plan of plans) {
+      const phases = plan.phases || [];
+      for (const phase of phases) {
+        const items = phase.workItems || [];
+        totalItems += items.length;
+        for (const item of items) {
+          if (item.status === "completed") {
+            completedItems++;
+            if (hasDateRange) {
+              // Use completedAt if available, otherwise infer creation date from item ID
+              // ID format: workitem-{timestampMs}-{phaseIdx}-{itemIdx}-{random}
+              // Use completedAt if available, otherwise infer creation date from item ID
+              // ID format: workitem-{timestampMs}-{phaseIdx}-{itemIdx}-{random}
+              let itemDate = item.completedAt;
+              if (!itemDate && item.id) {
+                const match = item.id.match(/^workitem-(\d+)-/);
+                if (match) {
+                  itemDate = new Date(parseInt(match[1], 10)).toISOString();
+                }
+              }
+              // Compare date portion only (startDate/endDate are yyyy-MM-dd)
+              if (itemDate) {
+                const itemDay = itemDate.slice(0, 10);
+                if (itemDay >= (startDate as string) && itemDay <= (endDate as string)) {
+                  completedItemsInRange++;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    res.json({
+      totalItems,
+      completedItems,
+      completedItemsInRange: hasDateRange ? completedItemsInRange : completedItems,
+    });
+  } catch (error: any) {
+    console.error("Error getting GTM analytics:", error);
+    res.status(500).json({ message: "Error fetching GTM analytics" });
+  }
+});
+
+// CRM analytics endpoint
+router.get("/analytics/crm", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const hasDateRange = startDate && endDate;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+
+    const scanAll = async (tableName: string) => {
+      const items: any[] = [];
+      let lastKey: any = undefined;
+      do {
+        const result: any = await dynamodb.scan({
+          TableName: tableName,
+          ...(lastKey && { ExclusiveStartKey: lastKey }),
+        }).promise();
+        items.push(...(result.Items || []));
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+      return items;
+    };
+
+    const [leadLists, leads] = await Promise.all([
+      scanAll(`${TABLE_PREFIX}AW-LeadLists`),
+      scanAll(`${TABLE_PREFIX}AW-Leads`),
+    ]);
+
+    const totalLists = leadLists.length;
+    const totalLeads = leads.length;
+    const totalICPLeads = leads.filter((l) => l.isICP === 1).length;
+    const totalEngagedLeads = leads.filter((l) => l.isEngaged === 1).length;
+
+    let newLists = totalLists;
+    let newLeads = totalLeads;
+
+    if (hasDateRange) {
+      newLists = leadLists.filter((l) => {
+        const d = (l.createdAt || "").slice(0, 10);
+        return d >= (startDate as string) && d <= (endDate as string);
+      }).length;
+
+      newLeads = leads.filter((l) => {
+        const d = (l.createdAt || "").slice(0, 10);
+        return d >= (startDate as string) && d <= (endDate as string);
+      }).length;
+    }
+
+    res.json({
+      totalLists,
+      newLists,
+      totalLeads,
+      newLeads,
+      totalICPLeads,
+      totalEngagedLeads,
+    });
+  } catch (error: any) {
+    console.error("Error getting CRM analytics:", error);
+    res.status(500).json({ message: "Error fetching CRM analytics" });
+  }
+});
+
 // Get all GTM plans from all users
 router.get("/gtm-plans", async (req, res) => {
   try {
@@ -2557,6 +2704,8 @@ router.put("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId", async (r
       ...(notes !== undefined && { notes }),
       ...(dri !== undefined && { dri: dri || null }),
       ...(dueDate !== undefined && { dueDate: dueDate && dueDate.trim() !== "" ? dueDate.trim() : null }),
+      ...(status === "completed" && originalItem.status !== "completed" && { completedAt: new Date().toISOString() }),
+      ...(status !== undefined && status !== "completed" && originalItem.status === "completed" && { completedAt: null }),
     };
 
     workItems[workItemIndex] = updatedWorkItem;
@@ -2990,12 +3139,44 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
 
 // Subscription Types endpoints
 
+// Get all available skills for subscription configuration
+router.get("/available-skills", async (req, res) => {
+  try {
+    const { skillService } = await import('../services/skillService');
+    const publishedSkills = await skillService.getPublishedSkills();
+    const { agentModeService } = await import('../services/agentModeService');
+
+    const skills = publishedSkills.map((s: any) => ({
+      skillId: s.skillId,
+      name: s.name,
+      description: s.description,
+      toolNames: s.toolNames || []
+    }));
+
+    // Add virtual __other_skills__ entry
+    const unassociatedToolNames = agentModeService.getUnassociatedToolNames(publishedSkills);
+    if (unassociatedToolNames.length > 0) {
+      skills.push({
+        skillId: '__other_skills__',
+        name: 'Other Skills',
+        description: 'Tools not associated with any published skill',
+        toolNames: unassociatedToolNames
+      });
+    }
+
+    res.json(skills);
+  } catch (error) {
+    console.error("Error getting available skills:", error);
+    res.status(500).json({ message: "Error fetching available skills" });
+  }
+});
+
 // Get all subscription types
 router.get("/subscription-types", async (req, res) => {
   try {
     const setting = await settingsService.getSetting("subscription_types");
     let subscriptionTypes = [];
-    
+
     if (setting) {
       try {
         subscriptionTypes = JSON.parse(setting.settingValue);
@@ -3004,21 +3185,21 @@ router.get("/subscription-types", async (req, res) => {
         subscriptionTypes = [];
       }
     }
-    
+
     // Import helper functions to expand "*" to actual lists if needed
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
-    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
-    
+    const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
       subscriptionTypes = [{
         name: "Basic",
         allowedPages: allAvailablePages, // All available pages (expanded)
-        allowedFunctionCalls: allAvailableFunctionCalls // All available function calls (expanded)
+        allowedSkills: allAvailableSkills // All available skills (expanded)
       }];
     }
-    
+
     // Normalize paths: remove "/marketing" prefix from allowedPages (for backward compatibility)
     // Also expand "*" to actual lists if present (for backward compatibility with old data)
     subscriptionTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -3029,25 +3210,26 @@ router.get("/subscription-types", async (req, res) => {
         }
         return page;
       });
-      
+
       // Expand "*" to actual list if present (for backward compatibility)
       if (normalizedPages.includes('*')) {
         normalizedPages = allAvailablePages;
       }
-      
-      // Expand "*" to actual list if present (for backward compatibility)
-      let normalizedFunctionCalls = type.allowedFunctionCalls;
-      if (normalizedFunctionCalls.includes('*')) {
-        normalizedFunctionCalls = allAvailableFunctionCalls;
+
+      // Handle allowedSkills with backward compatibility
+      // If old format (allowedFunctionCalls but no allowedSkills), treat as all skills
+      let normalizedSkills = type.allowedSkills || allAvailableSkills;
+      if (normalizedSkills.includes('*')) {
+        normalizedSkills = allAvailableSkills;
       }
-      
+
       return {
-        ...type,
+        name: type.name,
         allowedPages: normalizedPages,
-        allowedFunctionCalls: normalizedFunctionCalls
+        allowedSkills: normalizedSkills
       };
     }));
-    
+
     res.json(subscriptionTypes);
   } catch (error) {
     console.error("Error getting subscription types:", error);
@@ -3059,16 +3241,16 @@ router.get("/subscription-types", async (req, res) => {
 router.post("/subscription-types", async (req, res) => {
   try {
     const { subscriptionTypes } = req.body;
-    
+
     if (!Array.isArray(subscriptionTypes)) {
       return res.status(400).json({ message: "subscriptionTypes must be an array" });
     }
-    
+
     // Import helper functions to expand "*" to actual lists
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
-    const allAvailableFunctionCalls = await subscriptionService.getAllAvailableFunctionCalls();
-    
+    const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
       if (!type.name || typeof type.name !== "string") {
@@ -3077,10 +3259,10 @@ router.post("/subscription-types", async (req, res) => {
       if (!Array.isArray(type.allowedPages)) {
         throw new Error("Each subscription type must have allowedPages array");
       }
-      if (!Array.isArray(type.allowedFunctionCalls)) {
-        throw new Error("Each subscription type must have allowedFunctionCalls array");
+      if (!Array.isArray(type.allowedSkills)) {
+        throw new Error("Each subscription type must have allowedSkills array");
       }
-      
+
       // Remove "/marketing" prefix from allowedPages if present
       let normalizedPages = type.allowedPages.map((page: string) => {
         if (page.startsWith('/marketing/')) {
@@ -3088,25 +3270,25 @@ router.post("/subscription-types", async (req, res) => {
         }
         return page;
       });
-      
+
       // Expand "*" to actual list of pages
       if (normalizedPages.includes('*')) {
         normalizedPages = allAvailablePages;
       }
-      
-      // Expand "*" to actual list of function calls
-      let normalizedFunctionCalls = type.allowedFunctionCalls;
-      if (normalizedFunctionCalls.includes('*')) {
-        normalizedFunctionCalls = allAvailableFunctionCalls;
+
+      // Expand "*" to actual list of skills
+      let normalizedSkills = type.allowedSkills;
+      if (normalizedSkills.includes('*')) {
+        normalizedSkills = allAvailableSkills;
       }
-      
+
       return {
-        ...type,
+        name: type.name,
         allowedPages: normalizedPages,
-        allowedFunctionCalls: normalizedFunctionCalls
+        allowedSkills: normalizedSkills
       };
     }));
-    
+
     const updatedBy = (req as any).user?.email || "unknown";
     await settingsService.setSetting(
       "subscription_types",
@@ -3114,7 +3296,7 @@ router.post("/subscription-types", async (req, res) => {
       "Customer portal subscription types configuration",
       updatedBy
     );
-    
+
     res.json({ success: true, subscriptionTypes: normalizedTypes });
   } catch (error: any) {
     console.error("Error saving subscription types:", error);
