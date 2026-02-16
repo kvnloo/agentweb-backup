@@ -112,6 +112,11 @@ describe('llmService', () => {
       expect(ChatBedrockConverse).toHaveBeenCalled();
     });
 
+    it('should handle specific Claude opus 4.6 model ID transformation', () => {
+      new LLMService('anthropic.claude-opus-4-6-v1');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
     it('should use default API version when env var not set', () => {
       delete process.env.AZURE_OPENAI_API_VERSION;
       // Should not throw - will use default version

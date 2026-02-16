@@ -283,5 +283,22 @@ describe('s3Utils', () => {
 
       expect(result.success).toBe(true);
     });
+    it('should use default bucket when env var not set', async () => {
+      delete process.env.AWS_S3_BUCKET;
+      mockUploadPromise.mockResolvedValue({
+        Location: 'https://s3.amazonaws.com/agentweb-user-files/path/test.txt',
+        Key: 'path/test.txt'
+      });
+
+      const result = await uploadFileToS3WithPath(
+        Buffer.from('test content'),
+        'test.txt',
+        'text/plain',
+        'path'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.key).toBe('path/test.txt');
+    });
   });
 });

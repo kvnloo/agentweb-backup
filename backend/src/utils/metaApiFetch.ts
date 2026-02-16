@@ -51,7 +51,7 @@ export const fetchWithRetry = async (url: string, retries: number = 3, delayMs: 
     }
   }
   
-  // This should never be reached, but TypeScript requires it
+  /* istanbul ignore next */
   throw new Error('Unexpected: fetchWithRetry exhausted all attempts without returning');
 };
 

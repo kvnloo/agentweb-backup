@@ -69,5 +69,14 @@ describe('tokenUtils', () => {
       // 0 is not > 1, so it returns singular "minute"
       expect(formatExpiryMessage(tenSecondsFromNow)).toBe('Expires in 0 minute');
     });
+
+    it('should return "Expires in 1 hour" for 59 minutes and 59 seconds', () => {
+       // logic: minutes = Math.floor((diffMs + 500) / (60 * 1000))
+       // We want minutes >= 60.
+       // 60 * 60 * 1000 = 3600000 ms.
+       // If diffMs = 3599500 (approx 59m 59.5s). +500 = 3600000. / 60000 = 60.
+       const almostOneHour = Date.now() + 3599500;
+       expect(formatExpiryMessage(almostOneHour)).toBe('Expires in 1 hour');
+    });
   });
 });
