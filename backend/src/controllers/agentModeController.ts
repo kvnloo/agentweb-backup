@@ -3467,6 +3467,45 @@ export const agentModeController = {
               stack: error.stack,
               name: error.name
             });
+
+            // Save failure run result to database so it's visible in the UI
+            const errorResult = {
+              scheduleId: schedule.scheduleId,
+              runId: require('uuid').v4(),
+              status: 'failure' as const,
+              passed: false,
+              actualResponse: `Scheduled chat runtime error: ${error.message || 'Unknown error'}`,
+              actualFunctionCalls: [],
+              keywordMatches: [],
+              keywordMisses: [],
+              functionCallMatches: [],
+              functionCallMisses: [],
+              executionTime: 0,
+              sessionId: '',
+              attempt: 0,
+              createdAt: new Date().toISOString()
+            };
+
+            scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
+              console.error(`Error saving failure run result for schedule ${schedule.scheduleName}:`, saveError);
+            });
+
+            // Send error notification email
+            const emailNotifications = schedule.emailNotifications || [];
+            if (emailNotifications.length > 0) {
+              import('../services/emailService').then(({ emailService }) => {
+                emailService.sendScheduledChatResultEmail(
+                  emailNotifications,
+                  schedule.scheduleName,
+                  errorResult,
+                  schedule.scheduleId
+                ).catch((emailError) => {
+                  console.error(`Error sending failure email for schedule ${schedule.scheduleName}:`, emailError);
+                });
+              }).catch((importError) => {
+                console.error('Error importing emailService:', importError);
+              });
+            }
           });
 
           results.push({

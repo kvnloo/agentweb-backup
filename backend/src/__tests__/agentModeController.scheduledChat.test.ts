@@ -1345,6 +1345,51 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockTaskDb.createTaskExecution).not.toHaveBeenCalled();
     });
 
+    it('should save failure run result and send error email when runScheduledChat throws', async () => {
+      const scheduleWithEmail = {
+        ...baseSchedule,
+        frequency: 'daily',
+        emailNotifications: ['alert@example.com'],
+      };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithEmail]);
+
+      // Make createChatSession reject to simulate a runtime crash in runScheduledChat
+      mockChatbotDb.createChatSession.mockRejectedValue(new Error('LLM provider timeout'));
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      // Wait for the fire-and-forget promise (.catch handler) to settle
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Should save a failure run result to the database
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+        scheduleWithEmail.scheduleId,
+        expect.objectContaining({
+          scheduleId: scheduleWithEmail.scheduleId,
+          status: 'failure',
+          passed: false,
+          actualResponse: expect.stringContaining('LLM provider timeout'),
+          sessionId: '',
+          attempt: 0,
+          executionTime: 0,
+        })
+      );
+
+      // Should send error notification email
+      expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
+        ['alert@example.com'],
+        scheduleWithEmail.scheduleName,
+        expect.objectContaining({ status: 'failure' }),
+        scheduleWithEmail.scheduleId
+      );
+    });
+
     it('should handle sync errors gracefully without failing the run', async () => {
       const scheduleWithCampaign = { ...baseSchedule };
       mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithCampaign]);

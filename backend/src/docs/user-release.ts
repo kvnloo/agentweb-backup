@@ -16,6 +16,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Tool Call Parameters Now Visible for All Tools in Agent Mode',
       '- Image and video tool calls (generate_image, upload_image, generate_video, upload_video) now display their input parameters as expandable badges alongside the media preview',
       '- Previously these tool calls only showed the media result without the parameters used to generate them',
+      'Scheduled Chat Runtime Error Reporting',
+      '- Scheduled chat runs that crash due to runtime errors (e.g. LLM timeouts, network failures) now save a failure run result to the database',
+      '- Previously these errors were only logged to console and silently lost, making failed runs invisible in the UI',
+      '- An error notification email is now sent to configured recipients when a scheduled run fails',
     ],
   },
   {
