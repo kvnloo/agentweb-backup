@@ -63,7 +63,7 @@ describe('AgentModeService - Meta Campaign CRUD', () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
       (metaService.listCampaigns as jest.Mock).mockResolvedValue(mockCampaigns);
 
-      const result = await agentModeService.listMetaAdsCampaigns('user123');
+      const result = await agentModeService.listMetaAdsCampaignsNew('user123');
 
       expect(result.success).toBe(true);
       expect(result.message).toBe('Found 2 campaign(s)');

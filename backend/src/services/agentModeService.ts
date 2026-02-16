@@ -5320,6 +5320,86 @@ Format the response as JSON with this structure:
     }
   }
 
+  public async listMetaAdsCampaigns(userId: string): Promise<any> {
+    try {
+      // Import the Meta API functions
+      const { getMetaAccessToken } = await import('../utils/secretsManager');
+      const { userDb } = await import('./db');
+      const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
+
+      // Get user from database
+      const user = await userDb.getUserById(userId);
+      if (!user) {
+        return {
+          success: false,
+          message: 'User not found',
+          error: 'User not found'
+        };
+      }
+
+      // Check if user has ad account configured
+      if (!user.adAccount || user.adAccount.trim() === "") {
+        return {
+          success: false,
+          message: 'Ad account not configured. Please configure your Meta ad account first.',
+          error: 'Ad account not configured'
+        };
+      }
+
+      // Get Meta API access token from Secrets Manager
+      let accessToken: string;
+      try {
+        accessToken = await getMetaAccessToken();
+      } catch (error: any) {
+        console.error('AgentMode: Error fetching Meta access token:', error);
+        return {
+          success: false,
+          message: 'Meta access token not configured. Please contact your administrator.',
+          error: error.message || 'Failed to fetch access token from Secrets Manager'
+        };
+      }
+
+      // Get API version from environment or default to v18.0
+      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+
+      // Fetch campaigns
+      console.log('AgentMode: Fetching Meta ad campaigns for user:', userId);
+      const campaignsData = await fetchWithRetryAndPaging(
+        `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
+      );
+
+      if (campaignsData.error) {
+        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
+        return {
+          success: false,
+          message: `Failed to fetch campaigns: ${campaignsData.error.message}`,
+          error: campaignsData.error.message
+        };
+      }
+
+      const campaigns = (campaignsData.data || []).map((campaign: any) => ({
+        id: campaign.id,
+        name: campaign.name,
+        status: campaign.status,
+        objective: campaign.objective
+      }));
+
+      return {
+        success: true,
+        message: `Found ${campaigns.length} campaign(s)`,
+        campaigns: campaigns,
+        totalCount: campaigns.length
+      };
+    } catch (error) {
+      console.error('AgentMode: Error fetching Meta ad campaigns:', error);
+      return {
+        success: false,
+        message: 'Failed to fetch Meta ad campaigns. Please ensure your Meta ad account is properly configured.',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   private async getMetaCredentials(userId: string, accountId?: string) {
     const { userDb } = await import('./db');
     const user = await userDb.getUserById(userId);
@@ -5569,7 +5649,7 @@ Format the response as JSON with this structure:
   public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<any> {
     switch (action) {
       case 'LIST':
-        return this.listMetaAdsCampaigns(userId, account_id);
+        return this.listMetaAdsCampaignsNew(userId, account_id);
       case 'CREATE':
         return this.createMetaAdsCampaign(userId, { ...params, account_id });
       case 'UPDATE':
@@ -5660,7 +5740,7 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async listMetaAdsCampaigns(userId: string, account_id?: string): Promise<any> {
+  public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const campaigns = (await metaService.listCampaigns(accountId, accessToken)) || [];
