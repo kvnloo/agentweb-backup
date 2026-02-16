@@ -14,19 +14,7 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-jest.mock('aws-sdk', () => ({
-  DynamoDB: {
-    DocumentClient: jest.fn().mockImplementation(() => ({
-      get: jest.fn(),
-      put: jest.fn(),
-      update: jest.fn(),
-      delete: jest.fn(),
-      scan: jest.fn(),
-      query: jest.fn(),
-    })),
-  },
-  SecretsManager: jest.fn(),
-}));
+jest.mock('aws-sdk');
 
 jest.mock('../services/chatbotService');
 jest.mock('../services/settingsService');
