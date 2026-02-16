@@ -1,3 +1,19 @@
+# February 16, 2026: Scheduled Chat Silent Failure Bug
+
+## Problem
+Session `097840bc-7338-4a09-8c90-bf112230e17b` ("What's Up with AI Daily") completed steps 1–4 of its work plan but step 5 ("Publish to LinkedIn") never executed. No error was recorded — messages array was empty, no run result saved, no email sent.
+
+## Root Cause
+In `agentModeController.ts`, the `runScheduledChat()` promise's `.catch()` handler (line ~3449) only called `console.error`. It never saved a failure `runResult` to DynamoDB or sent an error notification email. Runtime crashes (LLM timeouts, network errors) were silently lost.
+
+## Fix
+Added to the `.catch()` block:
+1. Save a failure `runResult` via `scheduleDb.addRunResult()` so failures are visible in the UI
+2. Send error notification email to configured recipients
+
+Backend version bumped to 27.5.3. Unit test added to cover the new behavior.
+
+
 # February 12, 2026: ClickUp Integration via MCP
 
 ## Investigation
