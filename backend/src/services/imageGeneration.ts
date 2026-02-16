@@ -27,6 +27,7 @@ interface ImageGenerationParams {
   size?: string;
   quality?: string;
   inputImages?: string[];
+  logoImage?: string; // Separate logo image URL - will be added with emphasis on preserving exact text, shape, and color
   userId: string;
   imageModel?: string; // Optional model parameter - must be one of the supported models
   removeC2PA?: boolean; // Optional parameter to remove C2PA metadata, defaults to true
@@ -116,10 +117,20 @@ export class ImageService {
     params: ImageGenerationParams
   ): Promise<ImageGenerationResult> {
     try {
+      // If logoImage is provided, append it to inputImages and enhance the prompt
+      if (params.logoImage) {
+        if (!params.inputImages) {
+          params.inputImages = [];
+        }
+        params.inputImages.push(params.logoImage);
+        // Enhance prompt to emphasize logo precision
+        params.prompt = `${params.prompt}\n\nCRITICAL LOGO INSTRUCTION: The logo image provided must be reproduced with absolute precision. The logo's exact text (every letter, word, and character must match precisely), exact shape (all graphical elements, icons, and outlines must be identical), and exact colors (all colors, gradients, and color relationships must be preserved exactly) must be maintained. Do NOT alter, simplify, restyle, or reinterpret any aspect of the logo. The logo must appear exactly as provided in the reference image.`;
+      }
+
       // Check if we have input images for editing
       const hasInputImages = params.inputImages && params.inputImages.length > 0;
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
-      
+
       // Determine which model to use before validation
       // If model not defined, use gemini-3-pro-image-preview as default (supports multiple input images)
       if (!params.imageModel) {

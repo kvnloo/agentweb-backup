@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-16',
     changes: [
+      'Dedicated Logo Image Parameter for Image Generation',
+      '- Added a new logo_image parameter to the generate_image tool for adding logos to images',
+      '- When a logo image is provided, the generation prompt is enhanced to preserve the logo\'s exact text, shape, and colors with absolute precision',
+      '- The logo_image parameter is separate from inputImages to ensure logos receive special handling',
+      'Tool Call Parameters Now Visible for All Tools in Agent Mode',
+      '- Image and video tool calls (generate_image, upload_image, generate_video, upload_video) now display their input parameters as expandable badges alongside the media preview',
+      '- Previously these tool calls only showed the media result without the parameters used to generate them',
       'Scheduled Chat Runtime Error Reporting',
       '- Scheduled chat runs that crash due to runtime errors (e.g. LLM timeouts, network failures) now save a failure run result to the database',
       '- Previously these errors were only logged to console and silently lost, making failed runs invisible in the UI',
