@@ -437,26 +437,86 @@ mcpToolRegistry.register({
   definition: {
     name: "call_meta_ads_insights_api",
     description:
-      "Fetch performance insights from Meta. This tool fully abstracts Meta's asynchronous reporting system - it will poll internally and only return when data is ready. Returns an S3 URL to the results.",
+      "Fetch performance reporting data (impressions, clicks, spend, conversions, ROAS, etc.) from Meta Ads. Supports segmentation (breakdowns), flexible date ranges, and different aggregation levels. Automatically handles Meta's asynchronous reporting system internally and only returns when data is ready. Returns an S3 URL to the JSON results.",
     inputSchema: {
       type: "object",
       properties: {
-        node_id: {
-          type: "string",
-          description:
-            'The ID of the node to get insights for (use "account" for account-level insights)',
-        },
-        params: {
-          type: "object",
-          description:
-            "Parameters for insights (e.g., date_preset, time_range, level, fields, breakdowns)",
-        },
         account_id: {
           type: "string",
-          description: "The real ad account ID. Use list_connected_accounts to find this. DO NOT guess.",
+          description:
+            "The real ad account ID (without 'act_'). Use list_connected_accounts to retrieve this. DO NOT guess.",
+        },
+        object_type: {
+          type: "string",
+          enum: ["account", "campaign", "adset", "ad"],
+          description:
+            "The level of object to fetch insights for (account, campaign, adset, or ad).",
+        },
+        object_id: {
+          type: "string",
+          description:
+            "Required if object_type is campaign, adset, or ad. Not required for account-level insights.",
+        },
+        fields: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "List of performance metrics to retrieve (e.g., impressions, clicks, spend, ctr, actions, action_values, purchase_roas).",
+        },
+        date_preset: {
+          type: "string",
+          description:
+            "Predefined date range (e.g., today, yesterday, last_7d, last_30d). Cannot be used together with time_range.",
+        },
+        time_range: {
+          type: "object",
+          properties: {
+            since: {
+              type: "string",
+              description: "Start date in YYYY-MM-DD format.",
+            },
+            until: {
+              type: "string",
+              description: "End date in YYYY-MM-DD format.",
+            },
+          },
+          description:
+            "Custom date range. Cannot be used together with date_preset.",
+        },
+        level: {
+          type: "string",
+          enum: ["account", "campaign", "adset", "ad"],
+          description:
+            "Aggregation level of results. Controls how rows are grouped in the response.",
+        },
+        breakdowns: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Dimensions to segment results by (e.g., age, gender, country, publisher_platform, device_platform).",
+        },
+        action_breakdowns: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Further segmentation for action metrics (e.g., action_type). Used with actions and action_values fields.",
+        },
+        filtering: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              field: { type: "string" },
+              operator: { type: "string" },
+              value: {},
+            },
+          },
+          description:
+            "Optional filtering conditions to restrict results (e.g., filter by campaign name or objective).",
         },
       },
-      required: ["node_id", "account_id"],
+
+      required: ["account_id", "object_type", "fields"],
     },
   },
   execute: async (args, context) => {

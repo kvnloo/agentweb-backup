@@ -23,20 +23,37 @@ const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 import { metaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
-const ALLOWED_MARKETING_EDGES = [
-  'campaigns', 'adsets', 'ads', 'adcreatives', 'customaudiences', 'images', 'previews', 'targetingsearch', ''
+const ALLOWED_NODE_TYPES = [
+  'account',
+  'campaign',
+  'adset',
+  'ad'
 ];
-
-const ALLOWED_NODE_TYPES = ['account', 'campaign', 'adset', 'ad'];
+export type AllowedNodeType = typeof ALLOWED_NODE_TYPES[number];
 
 const ALLOWED_INSIGHTS_FIELDS = [
-  'impressions', 'clicks', 'spend', 'reach', 'frequency', 'cpc', 'ctr', 'unique_clicks',
-  'account_id', 'campaign_id', 'adset_id', 'ad_id', 'campaign_name', 'adset_name', 'ad_name',
-  'inline_link_clicks', 'cost_per_inline_link_click', 'actions', 'cost_per_action_type'
+  // Standard Metrics
+  'impressions',
+  'clicks',
+  'reach',
+  'spend',
+  'frequency',
+
+  // Action & Conversion Metrics
+  'actions',
+  'action_values',
+  'cost_per_action_type',
+  'purchase_roas'
 ];
 
 const ALLOWED_INSIGHTS_BREAKDOWNS = [
-  'age', 'gender', 'country', 'region', 'publisher_platform', 'platform_position', 'device_platform'
+  'age',
+  'gender',
+  'country',
+  'region',
+  'publisher_platform',
+  'platform_position',
+  'device_platform'
 ];
 
 /**
@@ -5022,119 +5039,186 @@ Format the response as JSON with this structure:
   }
 
   /**
-   * Secure wrapper for Meta Ads Insights API calls (with internal async polling)
-   */
+  * Secure wrapper for Meta Ads Insights API calls (always async, with internal polling)
+  */
   public async callMetaAdsInsightsApiWrapper(
     userId: string,
     args: {
-      node_id: string;
-      params: any;
-      account_id?: string;
+      account_id: string;
+      object_type: AllowedNodeType;
+      object_id?: string;
+      fields: string[];
+      date_preset?: string;
+      time_range?: { since: string; until: string };
+      level?: AllowedNodeType;
+      breakdowns?: string[];
+      action_breakdowns?: string[];
+      filtering?: any[];
     }
   ): Promise<any> {
     try {
-      const { node_id, params, account_id } = args;
-      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      const actualNodeId = node_id === 'account' ? `act_${accountId}` : node_id;
-      
-      const version = process.env.META_API_VERSION || 'v21.0';
-      const baseUrl = `https://graph.facebook.com/${version}`;
-      
-      // 1. Submit Async Job with Guardrails
-      const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
-      
-      const filteredParams = { ...params };
-      if (filteredParams.fields) {
-        const fields = Array.isArray(filteredParams.fields) ? filteredParams.fields : filteredParams.fields.split(',');
-        filteredParams.fields = fields.filter((f: string) => ALLOWED_INSIGHTS_FIELDS.includes(f.trim())).join(',');
-      }
-      if (filteredParams.breakdowns) {
-        const breakdowns = Array.isArray(filteredParams.breakdowns) ? filteredParams.breakdowns : filteredParams.breakdowns.split(',');
-        filteredParams.breakdowns = breakdowns.filter((b: string) => ALLOWED_INSIGHTS_BREAKDOWNS.includes(b.trim())).join(',');
+      const {
+        account_id,
+        object_type,
+        object_id,
+        fields,
+        date_preset,
+        time_range,
+        level,
+        breakdowns,
+        action_breakdowns,
+        filtering,
+      } = args;
+
+      if (!ALLOWED_NODE_TYPES.includes(object_type)) {
+        throw new Error(`Invalid object_type: ${object_type}`);
       }
 
-      const submitRes = await axios.post(submitUrl, {
-        ...filteredParams,
-        access_token: accessToken
-      });
-
-      const reportRunId = (submitRes.data as any).report_run_id;
-      if (!reportRunId) {
-        throw new Error('Failed to get report_run_id from Meta');
+      if (!fields?.length) {
+        throw new Error("fields array is required");
       }
 
-      // 2. Internal Polling Engine
-      let isReady = false;
-      let attempts = 0;
-      const maxAttempts = 30; // 5 minutes at 10s interval
-      
-      while (!isReady && attempts < maxAttempts) {
-        attempts++;
-        await new Promise(resolve => setTimeout(resolve, 10000)); // 10s delay
+      const invalidFields = fields.filter(
+        (f) => !ALLOWED_INSIGHTS_FIELDS.includes(f)
+      );
 
-        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
-          params: { access_token: accessToken }
-        });
+      if (invalidFields.length) {
+        throw new Error(
+          `Invalid insights fields requested: ${invalidFields.join(", ")}`
+        );
+      }
 
-        const status = (statusRes.data as any).async_status;
-        const percentComplete = (statusRes.data as any).async_percent_completion;
-        
-        console.log(`[MetaAds] Polling report ${reportRunId}: ${status} (${percentComplete}%)`);
+      if (breakdowns?.length) {
+        const invalidBreakdowns = breakdowns.filter(
+          (b) => !ALLOWED_INSIGHTS_BREAKDOWNS.includes(b)
+        );
 
-        if (status === 'Job Completed') {
-          isReady = true;
-        } else if (status === 'Job Failed' || status === 'Job Skipped') {
-          throw new Error(`Meta Insights Job failed: ${status}`);
+        if (invalidBreakdowns.length) {
+          throw new Error(
+            `Invalid breakdowns requested: ${invalidBreakdowns.join(", ")}`
+          );
         }
       }
 
-      if (!isReady) {
-        throw new Error('Meta Insights Job timed out after 5 minutes');
+      // Date validation (mutually exclusive)
+      if (date_preset && time_range) {
+        throw new Error("Provide either date_preset or time_range, not both.");
       }
 
-      // 3. Fetch Final Results (handling pagination)
+      const { accountId, accessToken } =
+        await this.getMetaCredentials(userId, account_id);
+
+      const actualNodeId =
+        object_type === "account"
+          ? `act_${accountId}`
+          : object_id ??
+            (() => {
+              throw new Error(
+                `object_id is required for object_type ${object_type}`
+              );
+            })();
+
+      const version = process.env.META_API_VERSION || "v24.0";
+      const baseUrl = `https://graph.facebook.com/${version}`;
+      const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
+
+      const filteredParams = {
+        fields: fields.join(","),
+        limit: 5000,
+
+        ...(date_preset && { date_preset }),
+        ...(time_range && { time_range }),
+        ...(level && { level }),
+        ...(breakdowns?.length && {
+          breakdowns: breakdowns.join(","),
+        }),
+        ...(action_breakdowns?.length && {
+          action_breakdowns: action_breakdowns.join(","),
+        }),
+        ...(filtering?.length && { filtering }),
+      };
+
+      const submitRes = await axios.post(submitUrl, {
+        ...filteredParams,
+        access_token: accessToken,
+      });
+
+      const reportRunId = (submitRes.data as any)?.report_run_id;
+
+      if (!reportRunId) {
+        throw new Error("Failed to get report_run_id from Meta");
+      }
+
+      // Polling Engine
+      let attempts = 0;
+      const maxAttempts = 60;
+
+      while (attempts < maxAttempts) {
+        attempts++;
+
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+
+        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
+          params: { access_token: accessToken },
+        });
+
+        const status = (statusRes.data as any)?.async_status;
+
+        if (status === "Job Completed") break;
+
+        if (status === "Job Failed" || status === "Job Skipped") {
+          throw new Error(`Meta Insights Job failed: ${status}`);
+        }
+
+        if (attempts === maxAttempts) {
+          throw new Error("Meta Insights Job timed out.");
+        }
+      }
+
+      // Fetch Paginated Results
       const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
-      
-      // Use existing fetchWithRetryAndPaging or simple loop
+
       let allData: any[] = [];
       let currentUrl: string | null = `${resultsUrl}?access_token=${accessToken}`;
-      
+
       while (currentUrl) {
-        const paginationRes: any = await axios.get(currentUrl);
-        allData = [...allData, ...(paginationRes.data.data || [])];
-        currentUrl = paginationRes.data.paging?.next || null;
+        const res: any = await axios.get(currentUrl);
+        allData.push(...(res.data?.data || []));
+        currentUrl = res.data?.paging?.next || null;
       }
 
-      // 4. Store in S3
       const envelope = {
         metadata: {
           requested_at: new Date().toISOString(),
-          tool: 'call_meta_ads_insights_api',
-          params: args,
-          report_run_id: reportRunId
+          tool: "call_meta_ads_insights_api",
+          object_type,
+          object_id: object_id || null,
+          account_id,
+          query: filteredParams,
+          report_run_id: reportRunId,
+          api_version: version,
         },
-        data: allData
+        data: allData,
       };
 
       const filename = `insights_${actualNodeId}_${Date.now()}.json`;
+
       const s3Result = await uploadFileToS3(
         JSON.stringify(envelope, null, 2),
         filename,
         userId,
-        'application/json'
+        "application/json"
       );
 
       return { s3_url: s3Result.url };
+
     } catch (error: any) {
-      console.error('AgentMode: Error in callMetaAdsInsightsApiWrapper:', error);
-      // Store error payload
-      try {
-        const errorEnvelope = { metadata: { requested_at: new Date().toISOString(), tool: 'call_meta_ads_insights_api' }, error: error.message };
-        const errS3 = await uploadFileToS3(JSON.stringify(errorEnvelope), `error_insights_${Date.now()}.json`, userId, 'application/json');
-        return { s3_url: errS3.url, error: true };
-      } catch (e) {
-        return { success: false, error: error.message };
-      }
+      console.error("Error in callMetaAdsInsightsApiWrapper:", error);
+
+      return {
+        success: false,
+        error: error.message,
+      };
     }
   }
 
@@ -5930,7 +6014,6 @@ Format the response as JSON with this structure:
             };
          }
          case 'CREATE': {
-            debugger;
             const audience = await metaService.createCustomAudience(accountId, accessToken, params);
             return {
               success: true,
@@ -5939,7 +6022,6 @@ Format the response as JSON with this structure:
             };
          }
          case 'UPLOAD_USERS': {
-            debugger;
             if (!params.id || !params.payload || !params.schema) {
               throw new Error('UPLOAD_USERS requires "id", "schema", and "payload".');
             }

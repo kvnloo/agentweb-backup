@@ -1,4 +1,4 @@
-import { FacebookAdsApi, User, AdAccount, Page, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
+import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import { MetaAdAccount, MetaPage } from '../types/meta';
 
 export interface MetaAdsCampaignParams {
@@ -75,7 +75,7 @@ export class MetaService {
   /**
    * Initialize the Facebook Ads API with the provided access token
    */
-  private initApi(accessToken: string): FacebookAdsApi {
+  private initApi(accessToken: string): InstanceType<typeof FacebookAdsApi> {
     const api = FacebookAdsApi.init(accessToken);
     return api;
   }
