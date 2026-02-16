@@ -1677,7 +1677,7 @@ mcpToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images. IMPORTANT: When adding a logo to an image, always provide the logo URL in the dedicated logo_image parameter (NOT in inputImages). The logo_image parameter ensures the logo is reproduced with exact precision in text, shape, and color.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1702,15 +1702,19 @@ mcpToolRegistry.register({
         },
         inputImages: {
           type: 'array',
-          description: 'List of input image URLs to use for image editing. Leave empty for text-to-image generation.',
+          description: 'List of input image URLs to use for image editing (e.g., background images, base images to modify). Do NOT put logo images here — use the logo_image parameter instead for logos.',
           items: {
             type: 'string'
           }
         },
+        logo_image: {
+          type: 'string',
+          description: 'URL of a logo image to add to the generated/edited image. ALWAYS use this parameter when the user wants to add a logo. The logo will be reproduced with strict precision — its exact text, shape, and colors will be preserved faithfully. This is the preferred way to include logos instead of putting them in inputImages.'
+        },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gemini-3-pro-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-          enum: ['gpt-image-1', 'gemini-2.5-flash-image-preview', 'gemini-3-pro-image-preview', 'gen4_image', 'gemini_2.5_flash']
+          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          enum: ['gemini-3-pro-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image-preview', 'gen4_image', 'gemini_2.5_flash']
         }
       },
       required: ['prompt', 'filename']
@@ -1718,14 +1722,15 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.generateImage(
-      args.prompt, 
-      args.filename, 
-      args.size || '1024x1024', 
-      args.quality || 'medium', 
-      args.inputImages || [], 
-      context?.userId, 
-      context?.sessionId, 
-      args.imageModel
+      args.prompt,
+      args.filename,
+      args.size || '1024x1024',
+      args.quality || 'medium',
+      args.inputImages || [],
+      context?.userId,
+      context?.sessionId,
+      args.imageModel,
+      args.logo_image
     );
   }
 });

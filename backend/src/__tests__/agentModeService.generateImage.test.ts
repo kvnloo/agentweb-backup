@@ -56,6 +56,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '1024:1024',
         quality: 'medium',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: 'gemini_2.5_flash'
       });
@@ -87,6 +88,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '832x1248',
         quality: 'medium',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: 'gemini_2.5_flash'
       });
@@ -117,6 +119,7 @@ describe('AgentModeService - generate_image function', () => {
         size: 'auto',
         quality: 'medium',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: undefined
       });
@@ -148,6 +151,7 @@ describe('AgentModeService - generate_image function', () => {
         size: undefined,
         quality: 'medium',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: undefined
       });
@@ -181,6 +185,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '1024x1024',
         quality: 'medium',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: 'gen4_image'
       });
@@ -246,6 +251,7 @@ describe('AgentModeService - generate_image function', () => {
           size: ratio,
           quality: 'medium',
           inputImages: [],
+          logoImage: undefined,
           userId: 'user123',
           imageModel: 'gemini-3-pro-image-preview'
         });
@@ -281,6 +287,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '1024x1024',
         quality: 'medium',
         inputImages: inputImages,
+        logoImage: undefined,
         userId: 'user123',
         imageModel: undefined
       });
@@ -311,6 +318,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '1024x1024',
         quality: 'medium',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: undefined
       });
@@ -348,6 +356,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '1024x1024',
         quality: 'medium',
         inputImages: inputImages,
+        logoImage: undefined,
         userId: 'user123',
         imageModel: 'gemini-3-pro-image-preview'
       });
@@ -475,6 +484,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '1024x1024',
         quality: 'high',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: 'gpt-image-1'
       });
@@ -506,6 +516,7 @@ describe('AgentModeService - generate_image function', () => {
         size: '16:9',
         quality: 'low',
         inputImages: [],
+        logoImage: undefined,
         userId: 'user123',
         imageModel: 'gemini-3-pro-image-preview'
       });
@@ -571,6 +582,102 @@ describe('AgentModeService - generate_image function', () => {
 
         expect(result.success).toBe(true);
       }
+    });
+  });
+
+  describe('Logo Image Parameter Handling', () => {
+    it('should pass logoImage parameter to imageService when provided', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image-with-logo.png',
+        filename: 'branded.png'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Create a banner with the company logo',
+        'branded.png',
+        '16:9',
+        'high',
+        ['https://example.com/background.jpg'],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview',
+        'https://example.com/logo.png'
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith({
+        prompt: 'Create a banner with the company logo',
+        filename: 'branded.png',
+        size: '16:9',
+        quality: 'high',
+        inputImages: ['https://example.com/background.jpg'],
+        logoImage: 'https://example.com/logo.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview'
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should pass logoImage as undefined when not provided', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/image.png',
+        filename: 'test.png'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Test prompt',
+        'test.png',
+        '1024x1024',
+        'medium',
+        [],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview'
+        // logoImage not provided
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          logoImage: undefined
+        })
+      );
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should pass logoImage with empty inputImages', async () => {
+      mockImageService.generateImage.mockResolvedValue({
+        success: true,
+        imageUrl: 'https://example.com/logo-image.png',
+        filename: 'logo-banner.png'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'Generate a social media banner with this logo',
+        'logo-banner.png',
+        '16:9',
+        'high',
+        [], // no input images
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview',
+        'https://example.com/my-logo.png'
+      );
+
+      expect(mockImageService.generateImage).toHaveBeenCalledWith({
+        prompt: 'Generate a social media banner with this logo',
+        filename: 'logo-banner.png',
+        size: '16:9',
+        quality: 'high',
+        inputImages: [],
+        logoImage: 'https://example.com/my-logo.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview'
+      });
+
+      expect(result.success).toBe(true);
     });
   });
 });
