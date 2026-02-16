@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-16',
+    changes: [
+      'Scheduled Chat Runtime Error Reporting',
+      '- Scheduled chat runs that crash due to runtime errors (e.g. LLM timeouts, network failures) now save a failure run result to the database',
+      '- Previously these errors were only logged to console and silently lost, making failed runs invisible in the UI',
+      '- An error notification email is now sent to configured recipients when a scheduled run fails',
+    ],
+  },
+  {
     date: '2026-02-15',
     changes: [
       'Agent Skills Infrastructure',
