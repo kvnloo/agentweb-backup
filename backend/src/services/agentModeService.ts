@@ -23,64 +23,14 @@ const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 import { metaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
-const ALLOWED_NODE_TYPES = [
-  'account',
-  'campaign',
-  'adset',
-  'ad'
-];
-export type AllowedNodeType = typeof ALLOWED_NODE_TYPES[number];
-
-const ALLOWED_INSIGHTS_FIELDS = [
-  // Standard Metrics
-  'impressions',
-  'clicks',
-  'reach',
-  'spend',
-  'frequency',
-
-  // Action & Conversion Metrics
-  'actions',
-  'action_values',
-  'cost_per_action_type',
-  'purchase_roas'
-];
-
-const ALLOWED_INSIGHTS_BREAKDOWNS = [
-  'age',
-  'gender',
-  'country',
-  'region',
-  'publisher_platform',
-  'platform_position',
-  'device_platform'
-];
-
-/**
- * Meta v24 Objective to Optimization Goal Compatibility Matrix
- */
-const META_OBJ_GOAL_MAP: Record<string, string[]> = {
-  OUTCOME_TRAFFIC: ['LINK_CLICKS', 'LANDING_PAGE_VIEWS'],
-  OUTCOME_AWARENESS: ['REACH', 'IMPRESSIONS', 'THRUPLAY'],
-  OUTCOME_ENGAGEMENT: ['POST_ENGAGEMENT', 'THRUPLAY', 'LINK_CLICKS'],
-  OUTCOME_SALES: ['OFFSITE_CONVERSIONS', 'VALUE'],
-  OUTCOME_LEADS: ['OFFSITE_CONVERSIONS'],
-  OUTCOME_APP_PROMOTION: ['APP_INSTALLS']
-};
-
-/**
- * Meta v24 Optimization Goal to Billing Event Compatibility Matrix
- */
-const META_GOAL_BILLING_MAP: Record<string, string[]> = {
-  LINK_CLICKS: ['LINK_CLICKS', 'IMPRESSIONS'],
-  REACH: ['IMPRESSIONS'],
-  LANDING_PAGE_VIEWS: ['IMPRESSIONS'],
-  POST_ENGAGEMENT: ['IMPRESSIONS'],
-  APP_INSTALLS: ['IMPRESSIONS'],
-  THRUPLAY: ['IMPRESSIONS'],
-  OFFSITE_CONVERSIONS: ['IMPRESSIONS'],
-  VALUE: ['IMPRESSIONS']
-};
+import { 
+  ALLOWED_NODE_TYPES, 
+  AllowedNodeType, 
+  ALLOWED_INSIGHTS_FIELDS, 
+  ALLOWED_INSIGHTS_BREAKDOWNS, 
+  META_OBJ_GOAL_MAP, 
+  META_GOAL_BILLING_MAP 
+} from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
 // Used for updateEmailDraftForLead to match generateBlogContent pattern

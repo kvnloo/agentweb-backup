@@ -482,8 +482,24 @@ mcpToolRegistry.register({
         },
         date_preset: {
           type: "string",
+          enum: [
+            "today",
+            "yesterday",
+            "this_month",
+            "last_month",
+            "this_quarter",
+            "maximum",
+            "last_3d",
+            "last_7d",
+            "last_14d",
+            "last_28d",
+            "last_30d",
+            "last_90d",
+            "this_year",
+            "last_year"
+          ],
           description:
-            "Predefined date range (e.g., today, yesterday, last_7d, last_30d). Cannot be used together with time_range.",
+            "Predefined date range. Use 'maximum' for lifetime data. Cannot be used together with time_range.",
         },
         time_range: {
           type: "object",

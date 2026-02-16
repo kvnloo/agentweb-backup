@@ -11,6 +11,12 @@ jest.mock('../services/db', () => ({
   }
 }));
 
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn().mockImplementation(() => ({
+    isReady: jest.fn().mockReturnValue(true),
+  })),
+}));
+
 describe('AgentModeService - List Meta Ads Campaigns', () => {
   let agentModeService: AgentModeService;
   let originalFetch: typeof global.fetch;

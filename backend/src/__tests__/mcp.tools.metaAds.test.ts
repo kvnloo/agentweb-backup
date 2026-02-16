@@ -1,5 +1,28 @@
 import { mcpToolRegistry } from '../mcp/server/registry';
 
+// Mock dependencies to avoid ESM import issues
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    listMetaAdsCampaigns: jest.fn(),
+    callMetaMarketingApi: jest.fn(),
+    callMetaAdsInsightsApiWrapper: jest.fn(),
+    getMetaAdsMetrics: jest.fn(),
+    getPostAnalytics: jest.fn(),
+    readBrandGuidelines: jest.fn(),
+    updateBrandGuidelines: jest.fn(),
+    readMarketStrategy: jest.fn(),
+    updateMarketStrategy: jest.fn(),
+    performDeepResearch: jest.fn(),
+    tasks: {
+      performDataAnalysis: jest.fn(),
+    }
+  }
+}));
+
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn(),
+}));
+
 // Import the tools to ensure they are registered
 import '../mcp/server/tools';
 
