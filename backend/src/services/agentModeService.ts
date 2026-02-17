@@ -23,13 +23,22 @@ const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 import { metaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
+type MetaApiResult = {
+  success: boolean;
+  message: string;
+  error?: string;
+  details?: any;
+  [key: string]: any;
+};
+
 import { 
   ALLOWED_NODE_TYPES, 
   AllowedNodeType, 
   ALLOWED_INSIGHTS_FIELDS, 
   ALLOWED_INSIGHTS_BREAKDOWNS, 
-  META_OBJ_GOAL_MAP, 
-  META_GOAL_BILLING_MAP 
+  META_OBJ_GOAL_MAP,
+  META_GOAL_BILLING_MAP,
+  META_GOAL_BID_STRATEGY_MAP
 } from '../utils/metaConstants';
 
 // Initialize Azure OpenAI client for direct chat completion (same as blog.ts)
@@ -1058,28 +1067,14 @@ When posting to connected social media accounts using 'post_on_connected_account
 
 ## "whitepapers" / "research reports" / "executive summaries"
 
-      ## Handling File Attachments
-      When users attach files, you see them as markdown links: \`[filename](url)\`.
-      Analyze these files when relevant to the user's request. If you need specialized tools to process them (like data analysis), ensure the corresponding skill is installed first.
+For whitepapers, research reports, or executive summaries (target: 8-12 pages):
 
-      ## Response Formatting
-      Format your responses in HTML5 for direct rendering. Use:
-      - <strong> for important points
-      - <em> for emphasis
-      - <code> for technical terms and commands
-      - <ul> and <li> for lists
-      - <pre> for code blocks
-      - <a href="url" target="_blank"> for links
-      - <table> for structured data
+**Step 1 - Deep Research**: Call 'perform_deep_research' with depth="detailed" (3-5 pages) or "comprehensive" (5-10 pages). This returns research_url (S3 URL).
 
-      Important formatting rules:
-      1. Use minimal spacing - no extra blank lines
-      2. Keep lists compact with minimal spacing
-      3. Use single line breaks between list items
-      4. Keep responses concise and well-structured
-      5. Always include target="_blank" for links
-      6. Use proper HTML5 semantic elements
-      7. The chat window has a fixed width of 384px. Format your responses to fit within this constraint
+**Step 2 - Generate Charts**: Call 'perform_data_analysis' with:
+  - file_urls: [research_url from Step 1]
+  - analysis_instruction: "Analyze the research data and generate 3-4 chart images that visualize key findings and data points."
+Save the chart image URLs from the response.
 
 **Step 3 - Create White Paper**: Call 'create_book' with type="whitepaper", title, description, and author. This returns a book_id.
 
@@ -5364,8 +5359,10 @@ Format the response as JSON with this structure:
     const clean = (id: string) => (id || '').replace('act_', '');
 
     // 1. Filter for valid Meta Ad Accounts
-    const fbAccounts = connectedAccounts.filter((acc: any) => 
-      (acc.platform === 'facebook' || acc.platform === 'meta') && 
+    // Check both 'facebook' and 'meta' for backward compatibility with accounts
+    // created before the platform name was standardized to 'meta'.
+    const fbAccounts = connectedAccounts.filter((acc: any) =>
+      (acc.platform === 'facebook' || acc.platform === 'meta') &&
       acc.config?.account_type === 'ad_account' &&
       acc.config?.access_token
     );
@@ -5382,6 +5379,10 @@ Format the response as JSON with this structure:
 
       if (!selected) {
         throw new Error(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
+      }
+
+      if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
+        throw new Error('Meta access token has expired. Please reconnect your Meta account in settings.');
       }
 
       return {
@@ -5403,8 +5404,13 @@ Format the response as JSON with this structure:
 
     // 4. Default to the single available account
     const selected = fbAccounts[0];
+
+    if (selected.config.token_expires_at && selected.config.token_expires_at < Date.now()) {
+      throw new Error('Meta access token has expired. Please reconnect your Meta account in settings.');
+    }
+
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
-    
+
     return {
       accountId: clean(selected.account_id || selected.config?.ad_account_id),
       accessToken: selected.config.access_token
@@ -5552,12 +5558,16 @@ Format the response as JSON with this structure:
       const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
 
       let allData: any[] = [];
-      let currentUrl: string | null = `${resultsUrl}?access_token=${accessToken}`;
+      let nextUrl: string | null = resultsUrl;
+      let isFirstRequest = true;
 
-      while (currentUrl) {
-        const res: any = await axios.get(currentUrl);
+      while (nextUrl) {
+        const res: any = isFirstRequest
+          ? await axios.get(nextUrl, { params: { access_token: accessToken } })
+          : await axios.get(nextUrl); // paging.next already includes token
         allData.push(...(res.data?.data || []));
-        currentUrl = res.data?.paging?.next || null;
+        nextUrl = res.data?.paging?.next || null;
+        isFirstRequest = false;
       }
 
       const envelope = {
@@ -5596,7 +5606,7 @@ Format the response as JSON with this structure:
   }
 
   // --- Unified Meta Ads Manager Methods ---
-  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<any> {
+  public async manageMetaAdsCampaigns(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsCampaignsNew(userId, account_id);
@@ -5614,7 +5624,7 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<any> {
+  public async manageMetaAdsAdSets(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, campaign_id?: string, ad_set_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAdSets(userId, campaign_id, account_id);
@@ -5633,7 +5643,7 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<any> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAdCreatives(userId, account_id);
@@ -5650,7 +5660,7 @@ Format the response as JSON with this structure:
     }
   }
 
-  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<any> {
+  public async manageMetaAdsAds(userId: string, action: 'LIST' | 'CREATE' | 'UPDATE' | 'DELETE', account_id: string, ad_set_id?: string, ad_id?: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
@@ -5757,31 +5767,47 @@ Format the response as JSON with this structure:
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
-      
+
       // --- Deterministic Validation Engine ---
-      
-      // 1. Budget Min/Max Guards
+
+      // 0. Fetch campaign to resolve objective and detect Advantage Campaign Budget (CBO)
+      const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);
+      const objective = args.campaign_objective || campaign.objective;
+      const campaignHasBudget = !!(campaign.daily_budget || campaign.lifetime_budget);
+
+      // 1. Budget Validation — depends on whether campaign has ACB/CBO
       const dailyBudget = args.daily_budget;
       const lifetimeBudget = args.lifetime_budget;
-      
-      if ((dailyBudget !== undefined && lifetimeBudget !== undefined)) {
-        throw new Error('Exactly one of daily_budget or lifetime_budget must be provided, not both.');
-      }
-      if (dailyBudget === undefined && lifetimeBudget === undefined) {
-        throw new Error('Either daily_budget or lifetime_budget must be provided.');
-      }
 
-      const budget = dailyBudget ?? lifetimeBudget;
-      if (budget < 1.00) {
-        throw new Error('Minimum budget must be at least $1.00 USD.');
+      if (campaignHasBudget) {
+        // Campaign has Advantage Campaign Budget (CBO) — ad set must NOT have its own budget
+        if (dailyBudget !== undefined || lifetimeBudget !== undefined) {
+          console.log(`[MetaAdSet] Campaign ${args.campaign_id} has Advantage Campaign Budget enabled (campaign budget: daily=${campaign.daily_budget}, lifetime=${campaign.lifetime_budget}). Stripping ad set budget to avoid conflict.`);
+        }
+        // Strip budget fields — CBO campaigns manage budget at campaign level
+        delete args.daily_budget;
+        delete args.lifetime_budget;
+      } else {
+        // No CBO — ad set must have its own budget
+        if (dailyBudget !== undefined && lifetimeBudget !== undefined) {
+          throw new Error('Exactly one of daily_budget or lifetime_budget must be provided, not both.');
+        }
+        if (dailyBudget === undefined && lifetimeBudget === undefined) {
+          throw new Error('Either daily_budget or lifetime_budget must be provided (campaign does not have Advantage Campaign Budget).');
+        }
+
+        const budget = dailyBudget ?? lifetimeBudget;
+        if (budget < 1.00) {
+          throw new Error('Minimum budget must be at least $1.00 USD.');
+        }
+
+        // Hallucination Guard
+        if (dailyBudget > 5000) throw new Error('Daily budget exceeds safety limit of $5,000.');
+        if (lifetimeBudget > 50000) throw new Error('Lifetime budget exceeds safety limit of $50,000.');
       }
-      
-      // Hallucination Guard
-      if (dailyBudget > 5000) throw new Error('Daily budget exceeds safety limit of $5,000.');
-      if (lifetimeBudget > 50000) throw new Error('Lifetime budget exceeds safety limit of $50,000.');
 
       // 2. Schedule Enforcement
-      if (lifetimeBudget !== undefined && !args.end_time) {
+      if (lifetimeBudget !== undefined && !campaignHasBudget && !args.end_time) {
         throw new Error('end_time is required when using a lifetime_budget.');
       }
 
@@ -5792,9 +5818,9 @@ Format the response as JSON with this structure:
         if (startTime >= endTime) {
           throw new Error('start_time must be strictly before end_time.');
         }
-        
+
         // 24h Duration Enforcement for Lifetime Budget
-        if (lifetimeBudget !== undefined) {
+        if (lifetimeBudget !== undefined && !campaignHasBudget) {
           const durationHrs = (endTime.getTime() - startTime.getTime()) / (1000 * 60 * 60);
           if (durationHrs < 24) {
             throw new Error('Lifetime budget campaigns must have a duration of at least 24 hours.');
@@ -5808,13 +5834,6 @@ Format the response as JSON with this structure:
       }
 
       // 3. Campaign Objective & Goal/Billing Compatibility
-      let objective = args.campaign_objective;
-      if (!objective) {
-        // Fetch campaign to resolve objective
-        const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);
-        objective = campaign.objective;
-      }
-
       const allowedGoals = META_OBJ_GOAL_MAP[objective];
       if (!allowedGoals || !allowedGoals.includes(args.optimization_goal)) {
         throw new Error(`Optimization goal "${args.optimization_goal}" is not compatible with campaign objective "${objective}". Allowed: ${allowedGoals?.join(', ') || 'none'}`);
@@ -5830,11 +5849,28 @@ Format the response as JSON with this structure:
       if (strategy === 'LOWEST_COST_WITH_MIN_ROAS') {
         throw new Error('ROAS bidding (LOWEST_COST_WITH_MIN_ROAS) is not yet supported.');
       }
+
+      // Validate bid strategy compatibility with optimization goal
+      const allowedStrategies = META_GOAL_BID_STRATEGY_MAP[args.optimization_goal];
+      if (allowedStrategies && !allowedStrategies.includes(strategy)) {
+        throw new Error(`Bid strategy "${strategy}" is not compatible with optimization goal "${args.optimization_goal}". Allowed: ${allowedStrategies.join(', ')}`);
+      }
+
       if (strategy === 'LOWEST_COST_WITHOUT_CAP' && args.bid_amount !== undefined) {
         throw new Error('bid_amount must not be provided for LOWEST_COST_WITHOUT_CAP strategy.');
       }
       if ((strategy === 'LOWEST_COST_WITH_BID_CAP' || strategy === 'COST_CAP') && args.bid_amount === undefined) {
         throw new Error(`bid_amount is required for ${strategy} strategy.`);
+      }
+
+      // Bid amount min/max guard
+      if (args.bid_amount !== undefined) {
+        if (args.bid_amount < 0.01) {
+          throw new Error('bid_amount must be at least $0.01.');
+        }
+        if (args.bid_amount > 1000) {
+          throw new Error('bid_amount exceeds safety limit of $1,000.');
+        }
       }
 
       // 5. Targeting Guardrails
@@ -5848,18 +5884,36 @@ Format the response as JSON with this structure:
       if (!geo.countries && !geo.regions && !geo.cities && !geo.zips) {
         throw new Error('targeting.geo_locations must contain at least one of: countries, regions, cities, or zips.');
       }
+
+      // Validate geo arrays are non-empty (e.g. countries: [] is invalid)
+      const geoFields = ['countries', 'regions', 'cities', 'zips'] as const;
+      for (const field of geoFields) {
+        if (geo[field] && Array.isArray(geo[field]) && geo[field].length === 0) {
+          throw new Error(`targeting.geo_locations.${field} cannot be an empty array. Either provide values or omit the field.`);
+        }
+      }
+
+      // Age validation
       if (args.targeting.age_min !== undefined && args.targeting.age_min < 18) {
         throw new Error('targeting.age_min must be at least 18.');
+      }
+      if (args.targeting.age_max !== undefined && args.targeting.age_max > 65) {
+        throw new Error('targeting.age_max must be at most 65.');
+      }
+      if (args.targeting.age_min !== undefined && args.targeting.age_max !== undefined) {
+        if (args.targeting.age_min > args.targeting.age_max) {
+          throw new Error(`targeting.age_min (${args.targeting.age_min}) cannot be greater than age_max (${args.targeting.age_max}).`);
+        }
       }
 
       // --- Prepared Params for SDK layer ---
       // Convert all currencies to cents
       const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
-      
+
       const normalizedParams: MetaAdsAdSetParams = {
         ...args,
-        daily_budget: toCents(args.daily_budget),
-        lifetime_budget: toCents(args.lifetime_budget),
+        daily_budget: campaignHasBudget ? undefined : toCents(args.daily_budget),
+        lifetime_budget: campaignHasBudget ? undefined : toCents(args.lifetime_budget),
         bid_amount: toCents(args.bid_amount),
         bid_strategy: strategy // Ensure we use the resolved strategy
       };
@@ -6329,7 +6383,7 @@ Format the response as JSON with this structure:
     ad_set_id?: string,
     ad_id?: string,
     params: any = {}
-  ): Promise<any> {
+  ): Promise<MetaApiResult> {
     console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
     
     // Ensure params is an object
@@ -6372,7 +6426,7 @@ Format the response as JSON with this structure:
     action: 'LIST' | 'CREATE' | 'UPLOAD_USERS',
     account_id: string,
     params: any
-  ): Promise<any> {
+  ): Promise<MetaApiResult> {
     try {
        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
@@ -6387,6 +6441,39 @@ Format the response as JSON with this structure:
             };
          }
          case 'CREATE': {
+            // Validate required fields
+            if (!params.name) {
+              throw new Error('Custom audience requires a "name".');
+            }
+            if (!params.subtype || !['CUSTOM', 'LOOKALIKE'].includes(params.subtype)) {
+              throw new Error('Custom audience requires "subtype" — must be "CUSTOM" or "LOOKALIKE".');
+            }
+
+            // Lookalike spec validation
+            if (params.subtype === 'LOOKALIKE') {
+              const spec = params.lookalike_spec;
+              if (!spec || typeof spec !== 'object') {
+                throw new Error('LOOKALIKE audiences require "lookalike_spec" with origin, ratio, and country.');
+              }
+              if (!spec.origin || !Array.isArray(spec.origin) || spec.origin.length === 0) {
+                throw new Error('lookalike_spec.origin must be a non-empty array with at least one source audience: [{ "id": "AUDIENCE_ID", "type": "custom_audience" }].');
+              }
+              for (const source of spec.origin) {
+                if (!source.id) {
+                  throw new Error('Each lookalike_spec.origin entry must have an "id" (source audience ID).');
+                }
+              }
+              if (spec.ratio === undefined || spec.ratio === null) {
+                throw new Error('lookalike_spec.ratio is required (0.01 to 0.20, e.g., 0.01 = top 1% of country population).');
+              }
+              if (spec.ratio < 0.01 || spec.ratio > 0.20) {
+                throw new Error(`lookalike_spec.ratio must be between 0.01 and 0.20 (got ${spec.ratio}). Use 0.01-0.05 for best quality.`);
+              }
+              if (!spec.country || typeof spec.country !== 'string' || spec.country.length !== 2) {
+                throw new Error('lookalike_spec.country is required and must be a 2-letter ISO country code (e.g., "US").');
+              }
+            }
+
             const audience = await metaService.createCustomAudience(accountId, accessToken, params);
             return {
               success: true,
@@ -6428,9 +6515,23 @@ Format the response as JSON with this structure:
                 console.warn('[AgentMode] Payload format unrecognized for UPLOAD_USERS, sending empty array.');
             }
 
+            // Validate schema/payload column count alignment
+            const schemaLength = params.schema.length;
+            if (parsedPayload.length === 0) {
+              throw new Error('Payload is empty — no user rows to upload.');
+            }
+            for (let i = 0; i < parsedPayload.length; i++) {
+              if (parsedPayload[i].length !== schemaLength) {
+                throw new Error(
+                  `Row ${i + 1} has ${parsedPayload[i].length} column(s) but schema expects ${schemaLength}. ` +
+                  `Schema: [${params.schema.join(', ')}]. Row data: [${parsedPayload[i].join(', ')}]`
+                );
+              }
+            }
+
             // SHA256 Hashing logic
             // Iterating through parsed payload and hashing fields based on schema
-            
+
             const hashedPayload = parsedPayload.map((row: string[]) => {
                 return row.map((cell: string, index: number) => {
                     const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';

@@ -49,405 +49,122 @@ mcpToolRegistry.register({
 // --- Tools from marketingTools.ts ---
 mcpToolRegistry.register({
   name: "call_meta_marketing_api",
-  definition: {
-    name: "call_meta_marketing_api",
-    description: `
-      Master tool for managing Meta Ads via Marketing API.
-      You operate strictly within the following hierarchy and discovery requirements.
-
-      HIERARCHY:
-      Ad Account -> Campaign -> Ad Set -> Creative -> Ad
-
-      STRUCTURAL REQUIREMENTS:
-      - ACCOUNT DISCOVERY: The VERY FIRST STEP for any Meta Ads task MUST be calling 'list_connected_accounts(platform="meta")'. 
-      - Present the list of accounts to the user and ask them to select one. 
-      - DO NOT guess or use placeholder account IDs. If you dont have an account ID, DO NOT call this tool.
-      - Parent entities (Campaigns, Ad Sets, etc.) must be resolved using LIST operations before CREATE, UPDATE, or DELETE.
-      - Users never provide raw IDs. All IDs must be internally resolved.
-      - The user must select target entities from presented options.
-      - Confirm structural scope before executing any action.
-
-      IMPORTANT:
-      - Each entity_type supports ONLY specific actions.
-      - Do NOT use actions that are not allowed for that entity.
-      - Follow the strict ACTION MATRIX below.
-    `,
-    inputSchema: {
-      type: "object",
-      properties: {
-        entity_type: {
-          type: "string",
-          enum: [
-            "CAMPAIGN",
-            "AD_SET",
-            "AD_CREATIVE",
-            "AD",
-            "CUSTOM_AUDIENCE",
-            "TARGETING",
-            "PAGE",
-          ],
-          description: `
-            ==============================
-            STRICT ACTION MATRIX
-            ==============================
-
-            CAMPAIGN:
-              LIST, CREATE, UPDATE, DELETE
-
-            AD_SET:
-              LIST, CREATE, UPDATE, DELETE
-
-            AD:
-              LIST:   'ad_set_id' (optional filter)
-              CREATE: 'ad_set_id', params: ['name', 'creative_id', 'status'(status is optional)]
-              UPDATE: 'ad_id', params: ['name', 'status'] (at least one)
-              DELETE: 'ad_id'
-
-            AD_CREATIVE:
-              LIST: [No extra params]
-              CREATE: params: ['name', 'page_id', 'body', 'title', 'link_url', 'call_to_action_type'(call_to_action_type is optional)] 
-                AND ONE OF: ['image_hash', 'image_url', 'video_id', 'carousel_cards']
-              UPLOAD_IMAGE: params: ['image_url']
-              UPLOAD_VIDEO: params: ['video_url']
-            
-            CUSTOM_AUDIENCE:
-              LIST, CREATE, UPLOAD_USERS
-
-              - LIST returns existing audiences with their 'id' and 'name'.
-              - UPLOAD_USERS requires 'id', 'schema' (fields), and 'payload' (csv content).
-              - Use the returned 'id' inside AD_SET targeting.custom_audiences.
-
-            TARGETING:
-              SEARCH
-
-            PAGE:
-              LIST - returns all Facebook Pages the user has access to. 
-              Useful for getting page_id
-
-            If an action is not listed for the selected entity_type,
-            it is INVALID and must NOT be used.
-          `,
-        },
-        action: {
-          type: "string",
-          enum: [
-            "LIST",
-            "CREATE",
-            "UPDATE",
-            "DELETE",
-            "UPLOAD_IMAGE",
-            "UPLOAD_VIDEO",
-            "UPLOAD_USERS",
-            "SEARCH",
-          ],
-          description: `
-            Operation to perform.
-
-            Validity depends on entity_type.
-            Refer to the ACTION MATRIX.
-          `,
-        },
-        account_id: {
-          type: "string",
-          description:
-            'The real Ad Account ID. Required for ALL operations. You MUST get this ID by calling the list_connected_accounts tool first. Once the user selects an account, stay on that ID for the rest of the session unless asked to switch. NEVER guess or use examples. If you do not have a real ID, you are FORBIDDEN from calling this tool.',
-        },
-        campaign_id: {
-          type: "string",
-          description: `
-            Required when:
-            - Updating/Deleting a CAMPAIGN
-            - Creating an AD_SET
-            - Filtering Ad Sets by Campaign
-          `,
-        },
-        ad_set_id: {
-          type: "string",
-          description: `
-            Required when:
-            - Updating/Deleting an AD_SET
-            - Creating an AD
-            - Filtering Ads by Ad Set
-          `,
-        },
-        ad_id: {
-          type: "string",
-          description: "Required when Updating/Deleting an AD.",
-        },
-        params: {
-          type: "object",
-          description: "Parameters specific to the entity and action.",
-          properties: {
-            // =========================
-            // COMMON
-            // =========================
-
-            name: {
-              type: "string",
-              description: "[CREATE/UPDATE] Name of entity.",
-            },
-
-            status: {
-              type: "string",
-              enum: ["ACTIVE", "PAUSED", "ARCHIVED"],
-              description: "[CREATE/UPDATE] Status of entity.",
-            },
-
-            // =========================
-            // CAMPAIGN
-            // =========================
-
-            objective: {
-              type: "string",
-              description: "[CAMPAIGN: CREATE]",
-            },
-            special_ad_categories: {
-              type: "array",
-              items: { type: "string" },
-              description:
-                '[CAMPAIGN: CREATE] Use ["NONE"] if not special category.',
-            },
-            advantage_campaign_budget: {
-              type: "boolean",
-              description: "[CAMPAIGN: CREATE]",
-            },
-            budget_amount: {
-              type: "number",
-              description: "[CAMPAIGN: CREATE] Required if Advantage+ enabled.",
-            },
-
-            // =========================
-            // AD SET
-            // =========================
-
-            optimization_goal: {
-              type: "string",
-              description: "[AD_SET: CREATE]",
-            },
-            billing_event: {
-              type: "string",
-              description: "[AD_SET: CREATE]",
-            },
-            daily_budget: {
-              type: "number",
-              description: "[AD_SET: CREATE/UPDATE]",
-            },
-            lifetime_budget: {
-              type: "number",
-              description: "[AD_SET: CREATE/UPDATE]",
-            },
-            bid_strategy: {
-              type: "string",
-              enum: [
-                "LOWEST_COST_WITHOUT_CAP",
-                "LOWEST_COST_WITH_BID_CAP",
-                "COST_CAP",
-              ],
-              description: "[AD_SET: CREATE]",
-            },
-            bid_amount: {
-              type: "number",
-              description: "[AD_SET: CREATE if using caps]",
-            },
-            targeting: {
-              type: 'object',
-              description: `
-                [AD_SET: CREATE/UPDATE] Targeting specification object.
-
-                REQUIRED:
-                - geo_locations: 
-                  {
-                    countries: ["US"],
-                    regions: [{ key: "3847" }],
-                    cities: [{ key: "2420605", radius: 10, distance_unit: "mile" }]
-                  }
-
-                OPTIONAL TARGETING METHODS:
-
-                1) DEMOGRAPHIC CONSTRAINTS:
-                  - age_min: number (e.g., 18)
-                  - age_max: number (e.g., 35)
-                  - genders: [1] (1 = Male, 2 = Female)
-                  - locales: [1000] (language codes)
-
-                2) CUSTOM OR LOOKALIKE AUDIENCES:
-                  - custom_audiences: [{ id: "AUDIENCE_ID" }]
-                  - excluded_custom_audiences: [{ id: "AUDIENCE_ID" }]
-                  (Works for Custom, Lookalike, and Website audiences.)
-
-                3) DETAILED TARGETING (INTERESTS / BEHAVIORS / DEMOGRAPHICS):
-                  Use flexible_spec:
-                  flexible_spec: [
-                    {
-                      interests: [{ id: "INTEREST_ID", name: "Interest Name" }],
-                      behaviors: [{ id: "BEHAVIOR_ID", name: "Behavior Name" }],
-                      demographics: [{ id: "DEMOGRAPHIC_ID", name: "Demographic Name" }]
-                    }
-                  ]
-
-                IMPORTANT RULES:
-                - geo_locations is mandatory.
-                - At least one targeting method must be defined (audience OR detailed targeting OR demographic constraints).
-                - Audience IDs must be obtained from:
-                    CUSTOM_AUDIENCE: LIST (to retrieve existing audience IDs)
-                    OR
-                    CUSTOM_AUDIENCE: CREATE (newly created audience ID)
-                  - The returned 'id' must be used inside targeting.custom_audiences.
-                - Interest/behavior IDs must come from TARGETING: SEARCH.
-              `
-            },
-            start_time: {
-              type: "string",
-              description: "[AD_SET: CREATE]",
-            },
-            end_time: {
-              type: "string",
-              description: "[AD_SET: CREATE if lifetime budget]",
-            },
-            promoted_object: {
-              type: "object",
-              description: "[AD_SET: CREATE]",
-            },
-
-            // =========================
-            // CREATIVE
-            // =========================
-
-            page_id: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            image_url: {
-              type: "string",
-              description: "[AD_CREATIVE: UPLOAD_IMAGE]",
-            },
-            image_hash: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            video_id: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            carousel_cards: {
-              type: "array",
-              description: "[AD_CREATIVE: CREATE]",
-              items: {
-                type: "object",
-                properties: {
-                  image_hash: { type: "string" },
-                  video_id: { type: "string" },
-                  title: { type: "string" },
-                  description: { type: "string" },
-                  link_url: { type: "string" },
-                },
-              },
-            },
-            body: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            title: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            link_url: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            call_to_action_type: {
-              type: "string",
-              description: "[AD_CREATIVE: CREATE]",
-            },
-            creative_id: {
-              type: "string",
-              description: "[AD: CREATE]",
-            },
-
-            // =========================
-            // CUSTOM AUDIENCE
-            // =========================
-
-            subtype: {
-              type: "string",
-              enum: ["CUSTOM", "LOOKALIKE"],
-              description: `
-                [CUSTOM_AUDIENCE: CREATE]
-
-                - CUSTOM → customer file audience
-                - LOOKALIKE → requires lookalike_spec
-              `,
-            },
-            description: {
-              type: "string",
-              description: "[CUSTOM_AUDIENCE: CREATE]",
-            },
-            customer_file_source: {
-              type: "string",
-              description: "[CUSTOM_AUDIENCE: CREATE for CUSTOM subtype]",
-            },
-            lookalike_spec: {
-              type: "object",
-              description: "[CUSTOM_AUDIENCE: CREATE when subtype=LOOKALIKE]",
-            },
-            schema: {
-              type: "array",
-              items: { type: "string" },
-              description: `
-                [CUSTOM_AUDIENCE: UPLOAD_USERS] REQUIRED:
-                - Must be an array of uppercase Meta PII types:
-                  EXTERN_ID, EMAIL, PHONE, GEN, DOBY, DOBM, DOBD, LN, FN, FI, CT, ST, ZIP, MADID, COUNTRY
-                - Order of fields in schema must match order of columns in payload
-                Example: ['EMAIL', 'FN', 'LN']
-              `,
-            },
-            payload: {
-              type: "string",
-              description: `
-                [CUSTOM_AUDIENCE: UPLOAD_USERS] REQUIRED:
-                - Must be CSV content formatted as array-of-arrays matching the schema
-                - Each inner array is a single row of data.
-                Example:
-                  [
-                    ["user1@example.com", "John", "Doe"],
-                    ["user2@example.com", "Jane", "Smith"]
-                  ]
-                - Emails/Phones may be raw or SHA256-hashed
-              `,
-            },
-
-            // =========================
-            // TARGETING SEARCH
-            // =========================
-
-            q: {
-              type: "string",
-              description: "[TARGETING: SEARCH]",
-            },
-            type: {
-              type: "string",
-              description: "[TARGETING: SEARCH] One of: 'adinterest', 'adbehavior', 'addemographics'",
-              enum: ["adinterest", "adbehavior", "addemographics"],
-            },
+    definition: {
+      name: "call_meta_marketing_api",
+      description:
+        "Manage Meta Ads entities (campaigns, ad sets, creatives, ads, audiences). Supports CRUD operations, media uploads, and targeting search. Requires account_id from list_connected_accounts(platform='meta'). Refer to your skill instructions for the action matrix, required params per operation, and compatibility rules.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          entity_type: {
+            type: "string",
+            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE"],
+            description: "The Meta Ads entity to operate on."
           },
+          action: {
+            type: "string",
+            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH"],
+            description: "The operation to perform. Must be valid for the chosen entity_type."
+          },
+          account_id: {
+            type: "string",
+            description: "Ad Account ID (without 'act_' prefix). Must be obtained from list_connected_accounts(platform='meta')."
+          },
+          campaign_id: {
+            type: "string",
+            description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter)."
+          },
+          ad_set_id: {
+            type: "string",
+            description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter)."
+          },
+          ad_id: {
+            type: "string",
+            description: "Ad ID. Required for: AD UPDATE/DELETE."
+          },
+          params: {
+            type: "object",
+            description: "Action-specific parameters. See skill instructions for required fields per entity_type + action combination.",
+            properties: {
+              // --- Common ---
+              name:   { type: "string", description: "Entity name." },
+              status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
+
+              // --- Campaign ---
+              objective:                  { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+              special_ad_categories:      { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
+              advantage_campaign_budget:  { type: "boolean", description: "Enable Advantage Campaign Budget." },
+              budget_amount:              { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
+
+              // --- Ad Set ---
+              optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
+              billing_event:     { type: "string", description: "Billing event (must be compatible with optimization_goal)." },
+              daily_budget:      { type: "number", description: "Daily budget in dollars. Min $1, max $5,000." },
+              lifetime_budget:   { type: "number", description: "Lifetime budget in dollars. Min $1, max $50,000. Requires end_time." },
+              bid_strategy:      { type: "string", enum: ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"], description: "Bid strategy." },
+              bid_amount:        { type: "number", description: "Bid amount in dollars. Required for BID_CAP and COST_CAP strategies." },
+              targeting: {
+                type: "object",
+                description: "Targeting specification. geo_locations is required. See skill instructions for full structure."
+              },
+              start_time:       { type: "string", description: "ISO 8601 start datetime." },
+              end_time:         { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
+              promoted_object:  { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
+
+              // --- Creative ---
+              page_id:              { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
+              image_hash:           { type: "string", description: "Image hash from UPLOAD_IMAGE." },
+              image_url:            { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
+              video_id:             { type: "string", description: "Video ID from UPLOAD_VIDEO." },
+              video_url:            { type: "string", description: "Video URL (for UPLOAD_VIDEO action)." },
+              carousel_cards: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    image_hash: { type: "string" }, video_id: { type: "string" },
+                    title: { type: "string" }, description: { type: "string" }, link_url: { type: "string" }
+                  }
+                },
+                description: "Carousel card array for multi-card creatives."
+              },
+              body:                 { type: "string", description: "Ad body / primary text." },
+              title:                { type: "string", description: "Ad headline." },
+              link_url:             { type: "string", description: "Destination URL." },
+              call_to_action_type:  { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
+              creative_id:          { type: "string", description: "Creative ID for AD CREATE." },
+
+              // --- Custom Audience ---
+              subtype:              { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
+              description:          { type: "string", description: "Audience description." },
+              customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
+              lookalike_spec:       { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
+              id:                   { type: "string", description: "Audience ID for UPLOAD_USERS." },
+              schema:               { type: "array", items: { type: "string" }, description: "PII field types for UPLOAD_USERS (e.g., ['EMAIL', 'FN', 'LN'])." },
+              payload:              { type: "string", description: "User data as JSON array-of-arrays for UPLOAD_USERS." },
+
+              // --- Targeting Search ---
+              q:    { type: "string", description: "Search query for targeting search." },
+              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." }
+            }
+          }
         },
-      },
-      required: ["entity_type", "action", "account_id"],
+        required: ["entity_type", "action", "account_id"]
+      }
     },
-  },
-  execute: async (args, context) => {
-    return await agentModeService.callMetaMarketingApi(
-      context?.userId,
-      args.entity_type,
-      args.action,
-      args.account_id,
-      args.campaign_id,
-      args.ad_set_id,
-      args.ad_id,
-      args.params,
-    );
-  },
-});
+    execute: async (args, context) => {
+      return await agentModeService.callMetaMarketingApi(
+        context?.userId,
+        args.entity_type,
+        args.action,
+        args.account_id,
+        args.campaign_id,
+        args.ad_set_id,
+        args.ad_id,
+        args.params,
+      );
+    }
+  });
 
 mcpToolRegistry.register({
   name: "call_meta_ads_insights_api",

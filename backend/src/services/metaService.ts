@@ -11,14 +11,14 @@ export interface MetaAdsCampaignParams {
 export interface MetaAdsAdSetParams {
   name: string;
   campaign_id: string;
-  daily_budget?: number; // Budget in dollars (e.g., 1.00)
-  lifetime_budget?: number; // Budget in dollars (e.g., 50.00)
+  daily_budget?: number; // Budget in CENTS (e.g., 100 = $1.00). Caller must convert.
+  lifetime_budget?: number; // Budget in CENTS (e.g., 5000 = $50.00). Caller must convert.
   start_time?: string;
   end_time?: string;
   billing_event: string;
   optimization_goal: string;
   bid_strategy?: string;
-  bid_amount?: number; // Bid amount in dollars (e.g., 0.50)
+  bid_amount?: number; // Bid in CENTS (e.g., 50 = $0.50). Caller must convert.
   targeting: any;
   status?: string;
   promoted_object?: any;
@@ -43,10 +43,6 @@ export interface MetaAdsAdCreativeParams {
   link_url: string;
   call_to_action_type?: string;
 }
-
-// ... (existing code for other interfaces) ...
-
-
 
 export interface MetaAdsAdParams {
   name: string;
@@ -92,9 +88,6 @@ export class MetaService {
       console.error(`[MetaAdsError] --- START ERROR LOG ---`);
       console.error(`[MetaAdsError] Context: ${context}`);
       
-      // Deep inspection of the error object
-      console.dir(error, { depth: null, colors: true });
-
       const fbError = error.response || error.error || error;
       const responseData = error.response?.data || error.response || {};
       
@@ -283,7 +276,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective'];
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining'];
       this.log(`Fetching campaign: ${campaignId}`);
       const result = await campaign.get(fields);
       return result._data;
@@ -407,7 +400,8 @@ export class MetaService {
       if (params.targeting !== undefined) adSetParams[AdSet.Fields.targeting] = params.targeting;
       if (params.status !== undefined) adSetParams[AdSet.Fields.status] = params.status;
       
-      // Monetary Mapping (Already converted to cents by service layer)
+      // Monetary values: Expected in CENTS (integer). Caller (agentModeService.createMetaAdsAdSet)
+      // converts dollars to cents via Math.round(val * 100) before passing to this method.
       if (params.daily_budget !== undefined) adSetParams[AdSet.Fields.daily_budget] = params.daily_budget;
       if (params.lifetime_budget !== undefined) adSetParams[AdSet.Fields.lifetime_budget] = params.lifetime_budget;
       if (params.bid_strategy !== undefined) adSetParams[AdSet.Fields.bid_strategy] = params.bid_strategy;
@@ -485,7 +479,26 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      
+
+      // --- Pre-flight Validation ---
+
+      // Media source: at least one must be provided
+      const hasMedia = params.image_hash || params.image_url || params.video_id ||
+        (params.carousel_cards && params.carousel_cards.length > 0);
+      if (!hasMedia) {
+        throw new Error('Creative requires at least one media source: image_hash, image_url, video_id, or carousel_cards.');
+      }
+
+      // Carousel card count: Meta requires 2-10
+      if (params.carousel_cards && params.carousel_cards.length > 0) {
+        if (params.carousel_cards.length < 2) {
+          throw new Error(`Carousel requires at least 2 cards (got ${params.carousel_cards.length}). Add more cards or use a single image/video creative instead.`);
+        }
+        if (params.carousel_cards.length > 10) {
+          throw new Error(`Carousel supports a maximum of 10 cards (got ${params.carousel_cards.length}).`);
+        }
+      }
+
       let objectStorySpec: any = {
         page_id: params.page_id,
       };
@@ -788,12 +801,11 @@ export class MetaService {
       const now = new Date();
       const format = (d: Date) => d.toISOString().split('T')[0];
       
-      let since = new Date();
-      since.setDate(now.getDate() - 7);
-      
-      if (params.timeframe === '14d') since.setDate(now.getDate() - 14);
-      if (params.timeframe === '30d') since.setDate(now.getDate() - 30);
-      if (params.timeframe === '90d') since.setDate(now.getDate() - 90);
+      const daysMap: Record<string, number> = {
+        '7d': 7, '14d': 14, '30d': 30, '90d': 90
+      };
+      const days = daysMap[params.timeframe] || 7;
+      const since = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
       const dateRange = { 
         since: format(since), 

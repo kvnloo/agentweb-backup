@@ -270,8 +270,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
     } catch (error: any) {
         console.error('[Meta Finalize] Error:', error);
         res.status(500).json({
-            error: 'Failed to finalize Meta OAuth',
-            details: error.message
+            error: 'Failed to finalize Meta OAuth'
         });
     }
 });
@@ -332,8 +331,7 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
     } catch (error: any) {
         console.error('[Meta Connect Ad Accounts] Error:', error);
         res.status(500).json({
-            error: 'Failed to connect Meta ad accounts',
-            details: error.message
+            error: 'Failed to connect Meta ad accounts'
         });
     }
 });

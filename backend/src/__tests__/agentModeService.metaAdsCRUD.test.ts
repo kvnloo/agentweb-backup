@@ -101,7 +101,9 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
           billing_event: 'IMPRESSIONS',
           optimization_goal: 'REACH',
           targeting: { geo_locations: { countries: ['US'] } },
-          daily_budget: 1000
+          daily_budget: 1000,
+          bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
+          bid_amount: 2.00
         };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
