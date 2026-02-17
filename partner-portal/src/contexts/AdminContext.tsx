@@ -37,6 +37,7 @@ interface User {
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
+  secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics

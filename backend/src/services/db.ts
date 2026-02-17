@@ -74,6 +74,7 @@ export interface User {
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
+  secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID (numeric, e.g., 123456789)
   clarityProjectId?: string; // Microsoft Clarity Project ID (e.g., ul13e4f7fe)

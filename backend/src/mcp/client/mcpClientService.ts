@@ -5,6 +5,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { AgentTool, ToolContext } from "./toolRegistry";
 import { settingsService } from "../../services/settingsService";
+import { userDb } from "../../services/db";
 import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
 
@@ -67,6 +68,39 @@ function resolveEnvPlaceholders(value: string): string {
 }
 
 /**
+ * Checks if a string contains user-secret placeholders ({{variable_name}} syntax).
+ */
+function hasSecretPlaceholders(value: string): boolean {
+  return /\{\{(\w+)\}\}/.test(value);
+}
+
+/**
+ * Checks if an MCP server config has any {{...}} secret placeholders in its env values.
+ */
+function configHasSecretPlaceholders(config: McpServerConfig): boolean {
+  if ('env' in config && config.env) {
+    return Object.values(config.env).some(v => hasSecretPlaceholders(v));
+  }
+  return false;
+}
+
+/**
+ * Resolves {{variable_name}} placeholders in env values using decrypted user secrets.
+ */
+function resolveUserSecrets(env: Record<string, string>, userSecrets: Record<string, string>): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    resolved[key] = value.replace(/\{\{(\w+)\}\}/g, (match, varName) => {
+      const secret = userSecrets[varName];
+      if (secret !== undefined) return secret;
+      console.warn(`MCP: Unresolved secret placeholder {{${varName}}}`);
+      return match; // Leave unresolved placeholder as-is
+    });
+  }
+  return resolved;
+}
+
+/**
  * Determines the transport type from a config.
  * Defaults to 'sse' for backward compatibility with legacy configs.
  */
@@ -93,6 +127,9 @@ export class McpClientService {
 
   // Store server configurations for creating session-specific clients
   private serverConfigs: Map<string, { config: McpServerConfig; toolPrefix?: string }> = new Map();
+
+  // Servers that have {{...}} secret placeholders and need per-user resolution
+  private serversWithSecretPlaceholders: Set<string> = new Set();
 
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
@@ -162,6 +199,16 @@ export class McpClientService {
           // Store config for creating session-specific clients later
           this.serverConfigs.set(serverName, { config: serverConfig, toolPrefix });
 
+          // Track servers with {{...}} per-user secret placeholders
+          // (getSessionClient will resolve secrets per-user at execution time)
+          if (configHasSecretPlaceholders(serverConfig)) {
+            this.serversWithSecretPlaceholders.add(serverName);
+            console.log(`MCP: Server "${serverName}" has per-user secret placeholders, will resolve at execution time`);
+          }
+
+          // Always connect for tool discovery — most MCP servers can list tools
+          // without valid credentials. Execution goes through getSessionClient
+          // which resolves per-user secrets.
           await this.connectToServer(serverName, serverConfig, toolPrefix);
       } catch (error) {
           console.error(`MCP: Failed to connect to server ${serverName}:`, error);
@@ -207,23 +254,28 @@ export class McpClientService {
   }
 
   /**
-   * Get or create a client for a specific chat session
-   * This ensures each chat session has its own isolated MCP client connection
+   * Get or create a client for a specific chat session.
+   * For servers with per-user secret placeholders, uses userId to create
+   * user-specific pool keys so different users get different processes/tokens.
    */
-  private async getSessionClient(serverName: string, chatSessionId: string): Promise<Client> {
+  private async getSessionClient(serverName: string, chatSessionId: string, userId?: string): Promise<Client> {
+    const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
+    // For servers with secret placeholders, use user-specific pool key
+    const poolKey = needsUserSecrets && userId ? `${chatSessionId}_${userId}` : chatSessionId;
+
     // Touch session to update last activity
-    this.touchSession(chatSessionId);
+    this.touchSession(poolKey);
 
     // Get or create session pool
-    if (!this.sessionClientPools.has(chatSessionId)) {
-      console.log(`[MCP-SESSION] Creating new client pool for session: ${chatSessionId.substring(0, 8)}`);
-      this.sessionClientPools.set(chatSessionId, {
+    if (!this.sessionClientPools.has(poolKey)) {
+      console.log(`[MCP-SESSION] Creating new client pool for session: ${poolKey.substring(0, 8)}`);
+      this.sessionClientPools.set(poolKey, {
         clients: new Map(),
         lastActivity: Date.now()
       });
     }
 
-    const sessionPool = this.sessionClientPools.get(chatSessionId)!;
+    const sessionPool = this.sessionClientPools.get(poolKey)!;
 
     // Check if client already exists for this session
     if (sessionPool.clients.has(serverName)) {
@@ -236,9 +288,35 @@ export class McpClientService {
       throw new Error(`MCP: Server config not found for ${serverName}`);
     }
 
-    console.log(`[MCP-SESSION] Creating new client for server "${serverName}" in session ${chatSessionId.substring(0, 8)}`);
+    console.log(`[MCP-SESSION] Creating new client for server "${serverName}" in session ${poolKey.substring(0, 8)}`);
 
-    const transport = await this.createTransport(serverName, serverConfig.config);
+    // For servers with secret placeholders, resolve user secrets into a cloned config
+    let configForTransport = serverConfig.config;
+    if (needsUserSecrets && userId) {
+      if (!('env' in configForTransport) || !configForTransport.env) {
+        throw new Error(`MCP: Server "${serverName}" marked as having secret placeholders but has no env config`);
+      }
+      const user = await userDb.getUserById(userId);
+      if (!user || !user.secrets || Object.keys(user.secrets).length === 0) {
+        throw new Error(`MCP: User "${userId}" has no secrets configured. Required for server "${serverName}".`);
+      }
+      // Decrypt all user secrets
+      const decryptedSecrets: Record<string, string> = {};
+      for (const [key, encryptedValue] of Object.entries(user.secrets as Record<string, string>)) {
+        try {
+          const decrypted = decryptPassword(encryptedValue);
+          decryptedSecrets[key] = decrypted.password;
+        } catch (e) {
+          console.error(`MCP: Failed to decrypt secret "${key}" for user "${userId}"`);
+          throw new Error(`MCP: Failed to decrypt secret "${key}" for user "${userId}"`);
+        }
+      }
+      // Clone config with resolved env
+      const resolvedEnv = resolveUserSecrets(configForTransport.env, decryptedSecrets);
+      configForTransport = { ...configForTransport, env: resolvedEnv } as McpServerConfig;
+    }
+
+    const transport = await this.createTransport(serverName, configForTransport);
     const client = new Client(
       {
         name: "AgentWeb-Backend",
@@ -255,7 +333,7 @@ export class McpClientService {
       setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), 15000)
     );
 
-    transport.onclose = () => console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${chatSessionId.substring(0, 8)}) closed`);
+    transport.onclose = () => console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
     transport.onerror = (err: any) => {
       const errorMessage = err?.message || '';
       if (
@@ -265,7 +343,7 @@ export class McpClientService {
       ) {
         return;
       }
-      console.error(`[MCP-SESSION] Transport error for ${serverName} (session ${chatSessionId.substring(0, 8)}):`, err);
+      console.error(`[MCP-SESSION] Transport error for ${serverName} (session ${poolKey.substring(0, 8)}):`, err);
     };
 
     await Promise.race([connectPromise, timeoutPromise]);
@@ -278,7 +356,70 @@ export class McpClientService {
       if (!sessionId) {
         console.warn(`[MCP-SESSION-WARN] Session ID not detected for ${serverName}`);
       } else {
-        console.log(`[MCP-SESSION] Connected to ${serverName} with MCP session ID: ${sessionId} for chat session: ${chatSessionId.substring(0, 8)}`);
+        console.log(`[MCP-SESSION] Connected to ${serverName} with MCP session ID: ${sessionId} for chat session: ${poolKey.substring(0, 8)}`);
+      }
+    }
+
+    // For servers with secret placeholders that skipped initial connection,
+    // discover tools now and register them if not already done
+    if (needsUserSecrets && this.mcpTools.every(t => !t.name.startsWith(serverConfig.toolPrefix ? `${serverConfig.toolPrefix}_` : `__never_match__`))) {
+      try {
+        const response = await client.listTools();
+        const isInternal = 'isInternal' in serverConfig.config ? serverConfig.config.isInternal : false;
+        const toolPrefix = serverConfig.toolPrefix;
+        for (const tool of response.tools) {
+          const exposedToolName = toolPrefix ? `${toolPrefix}_${tool.name}` : tool.name;
+          // Skip if tool already registered (from another user's session)
+          if (this.mcpTools.some(t => t.name === exposedToolName)) continue;
+          const originalToolName = tool.name;
+          const agentTool: AgentTool = {
+            name: exposedToolName,
+            definition: {
+              type: "function",
+              function: {
+                name: exposedToolName,
+                description: tool.description,
+                parameters: tool.inputSchema
+              }
+            },
+            execute: async (args: any, context: ToolContext) => {
+              try {
+                const toolArgs = { ...args };
+                if (isInternal) {
+                  Object.assign(toolArgs, {
+                    userId: context.userId,
+                    sessionId: context.sessionId,
+                    llmModel: context.llmModel
+                  });
+                }
+                const sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
+                const clientTransport = (sessionClient as any)._transport;
+                const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
+                console.log(`[MCP-DEBUG] Calling tool ${originalToolName} on server ${serverName}, MCP session: ${mcpSessionId}, chat sessionId: ${context.sessionId}`);
+                const result = await sessionClient.callTool({
+                  name: originalToolName,
+                  arguments: toolArgs
+                }, undefined, { timeout: 3600000 });
+                const contentArray = (result.content as any[]) || [];
+                if (result.isError) {
+                  throw new Error(contentArray.map((c: any) => (c.type === 'text' ? c.text : '')).join('\n'));
+                }
+                const content = contentArray
+                  .filter((c: any) => c.type === 'text')
+                  .map((c: any) => c.text)
+                  .join('\n');
+                return { content, raw: result };
+              } catch (error) {
+                console.error(`[MCP Tool Execution Error (${exposedToolName}):`, error);
+                throw error;
+              }
+            }
+          };
+          this.mcpTools.push(agentTool);
+        }
+        console.log(`[MCP-SESSION] Discovered tools for secret-placeholder server "${serverName}"`);
+      } catch (error) {
+        console.error(`[MCP-SESSION] Failed to discover tools for "${serverName}":`, error);
       }
     }
 
@@ -584,7 +725,7 @@ export class McpClientService {
 
             // CRITICAL FIX: Get session-specific client instead of using shared client
             // This ensures each chat session has its own isolated MCP connection
-            const sessionClient = await this.getSessionClient(name, context.sessionId);
+            const sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
 
             // Log MCP tool call with session info
             const clientTransport = (sessionClient as any)._transport;

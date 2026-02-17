@@ -628,6 +628,7 @@ const McpServersTab: React.FC = () => {
                   multiline
                   minRows={4}
                   placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                  helperText='Use ${VAR} for server env vars, {{var}} for per-user secrets (configured in Users tab)'
                 />
               </>
             )}
@@ -735,6 +736,7 @@ const McpServersTab: React.FC = () => {
                   multiline
                   minRows={4}
                   placeholder={'{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}'}
+                  helperText='Use ${VAR} for server env vars, {{var}} for per-user secrets (configured in Users tab)'
                 />
               </>
             )}
