@@ -19,31 +19,35 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     return { text: '', html: '' };
   }
 
-  const details: Array<{ label: string; value: string }> = [];
+  const details: Array<{ label: string; value: string; style?: string }> = [];
 
   // API event details
-  if (eventType === 'api.lead_added') {
+  if (eventType === 'api.lead_added' || eventType === 'api.lead_updated') {
     if (eventData.source) details.push({ label: 'Source', value: String(eventData.source) });
-    if (eventData.forwardedAt) details.push({ label: 'Forwarded At', value: new Date(eventData.forwardedAt).toLocaleString() });
+    if (eventType === 'api.lead_added' && eventData.forwardedAt) {
+      details.push({ label: 'Forwarded At', value: new Date(eventData.forwardedAt).toLocaleString() });
+    }
+    if (eventType === 'api.lead_updated' && eventData.forwardedAt) {
+      details.push({ label: 'Updated At', value: new Date(eventData.forwardedAt).toLocaleString() });
+    }
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
     if (eventData.autoDraftStatus) {
-      const autoDraftLabel = eventData.autoDraftStatus === 'created'
-        ? 'Created'
-        : eventData.autoDraftStatus === 'failed'
-          ? 'Failed'
-          : 'Queued';
-      details.push({ label: 'Auto Draft', value: autoDraftLabel });
+      if (eventData.autoSendStatus) {
+        details.push({ label: 'Email', value: 'Draft created and will be sent automatically' });
+      } else {
+        const autoDraftLabel = eventData.autoDraftStatus === 'created'
+          ? 'Created'
+          : eventData.autoDraftStatus === 'failed'
+            ? 'Failed'
+            : 'Queued';
+        details.push({ label: 'Auto Draft', value: autoDraftLabel });
+        details.push({ label: 'Warning', value: 'An email has not been sent to the lead. You could review engagement activities and message draft and decide how to engage with them.', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+      }
     }
     if (eventData.autoDraftError) {
       details.push({ label: 'Auto Draft Error', value: String(eventData.autoDraftError) });
     }
-  }
-  if (eventType === 'api.lead_updated') {
-    if (eventData.source) details.push({ label: 'Source', value: String(eventData.source) });
-    if (eventData.forwardedAt) details.push({ label: 'Updated At', value: new Date(eventData.forwardedAt).toLocaleString() });
-    if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
-    if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
   }
   if (eventType === 'api.lead_failed') {
     if (eventData.error) details.push({ label: 'Error', value: String(eventData.error) });
@@ -79,7 +83,8 @@ const buildEventDetails = (eventType: string, eventData: any) => {
   const text = details.map((detail) => `${detail.label}: ${detail.value}`).join('\n');
   const html = details
     .map((detail) => {
-      return `<div><strong>${emailService.escapeHtml(detail.label)}:</strong> ${emailService.escapeHtml(detail.value)}</div>`;
+      const styleAttr = detail.style ? ` style="${detail.style}"` : '';
+      return `<div${styleAttr}><strong>${emailService.escapeHtml(detail.label)}:</strong> ${emailService.escapeHtml(detail.value)}</div>`;
     })
     .join('');
 

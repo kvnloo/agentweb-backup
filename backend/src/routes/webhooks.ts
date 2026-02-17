@@ -6,6 +6,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
+import { resendService } from '../services/resendService';
 
 const router = express.Router();
 
@@ -265,6 +266,60 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
           );
           if (!autoDraftResult?.success) {
             console.error('Auto draft creation failed:', autoDraftResult?.error || autoDraftResult?.message || 'Unknown auto-draft error');
+            return;
+          }
+
+          // Auto-send the draft if enabled
+          if (leadList.autoSendEnabled === true && autoDraftResult?.data?.email) {
+            try {
+              const draftEmail = autoDraftResult.data.email;
+              const leadEmail = lead.email;
+              if (!leadEmail) {
+                console.error('Auto send skipped: lead has no email address');
+                return;
+              }
+
+              // Resolve sender
+              const sendersResult = await agentModeService.getCrmSenders(leadList.userId);
+              let senderEmail: string | undefined;
+              let senderFromName: string | undefined;
+
+              if (sendersResult?.success && sendersResult.senders.length > 0) {
+                // Try list-level sender, then account default, then first available
+                const sender = (leadList.listSenderId
+                  ? sendersResult.senders.find((s: any) => s.id === leadList.listSenderId)
+                  : null)
+                  || (sendersResult.defaultSenderId
+                    ? sendersResult.senders.find((s: any) => s.id === sendersResult.defaultSenderId)
+                    : null)
+                  || sendersResult.senders[0];
+
+                if (sender) {
+                  senderEmail = sender.email;
+                  senderFromName = sender.fromName;
+                }
+              }
+
+              if (!senderEmail || !senderFromName) {
+                console.error('Auto send skipped: no sender configured for user', leadList.userId);
+                return;
+              }
+
+              const from = `${senderFromName} <${senderEmail}>`;
+              await resendService.sendEmail({
+                from,
+                to: leadEmail,
+                subject: draftEmail.subject,
+                text: draftEmail.textContent,
+                html: draftEmail.htmlContent,
+              });
+
+              // Clear the draft after successful send
+              await crmDb.updateLead(leadList.listId, lead.leadId, { emailDraft: null });
+              console.log(`Auto send succeeded for lead ${lead.leadId} in list ${leadList.listId}`);
+            } catch (sendError: any) {
+              console.error('Auto send failed:', sendError?.message || 'Unknown auto-send error');
+            }
           }
         } catch (draftError: any) {
           console.error('Auto draft creation failed:', draftError?.message || 'Unknown auto-draft error');
@@ -287,6 +342,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             phone: leadData.phone,
             ...(autoDraftStatus ? { autoDraftStatus } : {}),
             ...(autoDraftError ? { autoDraftError } : {}),
+            ...(autoDraftStatus && leadList.autoSendEnabled === true ? { autoSendStatus: 'queued' } : {}),
           },
           new Date().toISOString()
         );
