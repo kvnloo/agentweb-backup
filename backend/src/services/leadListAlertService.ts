@@ -33,15 +33,23 @@ const buildEventDetails = (eventType: string, eventData: any) => {
     if (eventData.company) details.push({ label: 'Company', value: String(eventData.company) });
     if (eventData.phone) details.push({ label: 'Phone', value: String(eventData.phone) });
     if (eventData.autoDraftStatus) {
-      if (eventData.autoSendStatus) {
-        details.push({ label: 'Email', value: 'Draft created and will be sent automatically' });
-      } else {
-        const autoDraftLabel = eventData.autoDraftStatus === 'created'
-          ? 'Created'
-          : eventData.autoDraftStatus === 'failed'
-            ? 'Failed'
-            : 'Queued';
-        details.push({ label: 'Auto Draft', value: autoDraftLabel });
+      const draftLabel = eventData.autoDraftStatus === 'created'
+        ? 'Created'
+        : 'Failed';
+      details.push({ label: 'Auto Draft', value: draftLabel });
+
+      if (eventData.autoSendStatus === 'sent') {
+        details.push({ label: 'Auto Send', value: 'Email sent to the lead successfully', style: 'color:#15803d;background:#dcfce7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+      } else if (eventData.autoSendStatus === 'skipped_already_sent_today') {
+        details.push({ label: 'Auto Send', value: 'Skipped — an email was already sent to this lead today', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+      } else if (eventData.autoSendStatus === 'skipped_no_sender') {
+        details.push({ label: 'Warning', value: 'Auto send skipped — no sender email configured. Please configure a sender in CRM settings.', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+      } else if (eventData.autoSendStatus === 'skipped_no_email') {
+        details.push({ label: 'Warning', value: 'Auto send skipped — lead has no email address.', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+      } else if (eventData.autoSendStatus === 'failed') {
+        details.push({ label: 'Warning', value: 'Auto send failed. You could review engagement activities and message draft and decide how to engage with them.', style: 'color:#dc2626;background:#fef2f2;padding:6px 10px;border-radius:4px;margin-top:4px;' });
+      } else if (!eventData.autoSendStatus) {
+        // Auto-draft only (no auto-send enabled)
         details.push({ label: 'Warning', value: 'An email has not been sent to the lead. You could review engagement activities and message draft and decide how to engage with them.', style: 'color:#b45309;background:#fef3c7;padding:6px 10px;border-radius:4px;margin-top:4px;' });
       }
     }

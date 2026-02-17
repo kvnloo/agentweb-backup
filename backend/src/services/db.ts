@@ -3401,6 +3401,7 @@ export const crmDb = {
       reason: string;
       matchedAt: string;
     } | null;
+    lastAutoSendAt?: string | null;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -3505,6 +3506,15 @@ export const crmDb = {
           expressionAttributeValues[':icpMatch'] = updates.icpMatch;
           setExpressions.push('isICP = :isICP');
           expressionAttributeValues[':isICP'] = updates.icpMatch.isMatch === true ? 1 : 0;
+        }
+      }
+
+      if (updates.lastAutoSendAt !== undefined) {
+        if (updates.lastAutoSendAt === null) {
+          removeExpressions.push('lastAutoSendAt');
+        } else {
+          setExpressions.push('lastAutoSendAt = :lastAutoSendAt');
+          expressionAttributeValues[':lastAutoSendAt'] = updates.lastAutoSendAt;
         }
       }
 
