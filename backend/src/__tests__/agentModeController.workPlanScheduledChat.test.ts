@@ -30,6 +30,12 @@ jest.mock('../services/agentModeService', () => ({
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
+    getFoundationToolNames: jest.fn().mockReturnValue(new Set([
+      'install_skills', 'search_web', 'read_file_content', 'read_page_source',
+      'search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files',
+      'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
+      'save_file', 'describe_image',
+    ])),
   },
 }));
 
