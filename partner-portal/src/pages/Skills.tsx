@@ -94,7 +94,7 @@ export default function Skills() {
 
   const fetchTools = useCallback(async () => {
     try {
-      const response = await axios.get(buildApiUrl("/api/agent-mode/function-calls?forSkillConfig=true"), {
+      const response = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
         headers: { Authorization: `Bearer ${token}` },
       });
       const allTools = (response.data.functionCalls as AvailableTool[]) || [];

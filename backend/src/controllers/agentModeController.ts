@@ -750,56 +750,10 @@ async function runScheduledChat(
       // If wildcard is present, all function calls are allowed — skip filtering
       const allAllowed = allowedFunctionCalls.includes("*");
 
-      // Check if all required function calls are allowed
-      // If the array is empty, it means no functions are allowed (shouldn't happen, but handle it)
-      if (!allAllowed && allowedFunctionCalls.length === 0) {
-        // This shouldn't happen, but if it does, block all function calls
-        const disallowedFunctions = expectedFunctionCalls;
-        
-        // Get user info for email
-        const { userDb } = await import('../services/db');
-        const user = await userDb.getUserById(userId);
-        const emailNotifications = schedule.emailNotifications || [];
-        
-        // Send error email instead of running
-        const { emailService } = await import('../services/emailService');
-        await emailService.sendScheduledChatErrorEmail(
-          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
-          schedule.scheduleName,
-          disallowedFunctions,
-          schedule.scheduleId
-        );
-        
-        // Create failure result
-        const errorResult = {
-          scheduleId: schedule.scheduleId,
-          runId: require('uuid').v4(),
-          status: 'failure' as const,
-          passed: false,
-          actualResponse: `Scheduled chat cannot run: No function calls are allowed by your subscription.`,
-          actualFunctionCalls: [],
-          keywordMatches: [],
-          keywordMisses: [],
-          functionCallMatches: [],
-          functionCallMisses: disallowedFunctions,
-          executionTime: 0,
-          sessionId: '',
-          attempt: 0,
-          createdAt: new Date().toISOString()
-        };
-        
-        // Save the error result to database
-        try {
-          await scheduleDb.addRunResult(schedule.scheduleId, errorResult);
-        } catch (error) {
-          console.error('Error saving error run result:', error);
-        }
-        
-        return errorResult;
-      }
-      
+      // Foundation tools are always allowed regardless of subscription
+      const foundationTools = agentModeService.getFoundationToolNames();
       const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
-        !allowedFunctionCalls.includes(funcName)
+        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName)
       );
 
       if (disallowedFunctions.length > 0) {
@@ -1372,11 +1326,19 @@ export const agentModeController = {
       
       // For admin users, return all function calls without filtering
       // For regular users, filter tools based on subscription
+      // Foundation tools are always included regardless of subscription
       let toolsToReturn = tools;
       if (!user.isAdmin) {
         const { getAllowedFunctionCalls, filterFunctionCalls } = await import('../services/subscriptionService');
         const allowedFunctionCalls = await getAllowedFunctionCalls(user.userId);
         // getAllowedFunctionCalls now always returns an array (never null)
+        // Ensure foundation tools are always allowed
+        const foundationTools = agentModeService.getFoundationToolNames();
+        foundationTools.forEach(name => {
+          if (!allowedFunctionCalls.includes(name)) {
+            allowedFunctionCalls.push(name);
+          }
+        });
         toolsToReturn = filterFunctionCalls(tools, allowedFunctionCalls);
       }
 
@@ -1387,13 +1349,6 @@ export const agentModeController = {
           name: tool.function.name,
           description: tool.function.description || ''
         }));
-
-      // When fetching for skill configuration, exclude foundation tools
-      // (they're always available and shouldn't be assigned to skills)
-      if (req.query?.forSkillConfig === 'true') {
-        const foundationTools = agentModeService.getFoundationToolNames();
-        functionCalls = functionCalls.filter((fc: any) => !foundationTools.has(fc.name));
-      }
 
       res.json({ functionCalls });
     } catch (error) {
