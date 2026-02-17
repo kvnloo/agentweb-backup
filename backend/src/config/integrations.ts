@@ -10,7 +10,7 @@ export type LinkedInAccountType = 'personal' | 'company';
 export const INTEGRATION_CONFIG = {
   linkedin: {
     // Unified configuration for both personal and organization accounts
-    redirectUri: 'https://22c9-111-93-215-130.ngrok-free.app/api/oauth/meta/callback',
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/linkedin/callback`,
     // Combined scopes (legacy - for unified flow)
     scopes: [
       'r_basicprofile',
@@ -32,7 +32,7 @@ export const INTEGRATION_CONFIG = {
   },
 
   meta: {
-    redirectUri: 'https://2016-2409-40c1-6-e38d-af4a-12cb-c1b3-b6c.ngrok-free.app/api/oauth/meta/callback',
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/meta/callback`,
     // All scopes for unified OAuth - user can connect ad accounts AND/OR pages
     scopes: [
       'ads_management',
