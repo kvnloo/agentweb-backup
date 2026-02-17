@@ -1,13 +1,5 @@
 import AWS from 'aws-sdk';
 
-/**
- * Interface for Meta credentials returned from Secrets Manager
- */
-export interface MetaCredentials {
-  clientId: string;
-  clientSecret: string;
-}
-
 // Initialize AWS SDK
 const secretsManager = new AWS.SecretsManager({
   region: process.env.AWS_REGION || 'us-west-2'
@@ -186,4 +178,5 @@ export async function getMetaCredentials(): Promise<MetaCredentials> {
     console.error('Error fetching Meta credentials from Secrets Manager:', error);
     throw new Error('Failed to fetch Meta credentials from Secrets Manager');
   }
+  
 }
