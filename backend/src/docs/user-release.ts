@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-17',
+    changes: [
+      'Auto Send for API Lead Forwarding',
+      '- Added an Auto Send option within the Auto Draft settings for API-integrated lead lists',
+      '- When enabled, drafted emails are automatically sent to leads after creation',
+      '- Includes same-day duplicate protection to prevent multiple emails to the same lead in one day',
+      '- Alert emails now report the exact outcome: sent, skipped (already sent today), or failed',
+      '- API webhook response is returned immediately; drafting, sending, and alerting happen asynchronously',
+    ],
+  },
+  {
     date: '2026-02-16',
     changes: [
       'GitHub MCP Server with Per-User Access Token',
