@@ -1,0 +1,121 @@
+import { Router, Response } from "express";
+import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import axios from "axios";
+import { userDb } from "../services/db";
+import { decryptPassword } from "../utils/crypto";
+
+const router = Router();
+
+interface RepoInfo {
+  name: string;
+  htmlUrl: string;
+  agentMd: string;
+}
+
+// In-memory cache keyed by token hash, with 5 min TTL
+const cache = new Map<string, { repos: RepoInfo[]; timestamp: number }>();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getGitHubToken(userId: string): Promise<string | null> {
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user?.secrets) return null;
+
+    const secrets = user.secrets as Record<string, string>;
+    // Support multiple possible key names for the GitHub token
+    const encrypted = secrets["GITHUB_PERSONAL_ACCESS_TOKEN"] || secrets["github_access_token"];
+    if (!encrypted) return null;
+
+    const decrypted = decryptPassword(encrypted);
+    return decrypted.password;
+  } catch (error) {
+    console.error("[LANDING PAGES] Failed to retrieve GitHub token:", error);
+    return null;
+  }
+}
+
+async function fetchReposWithAgentMd(githubToken: string | null): Promise<RepoInfo[]> {
+  const cacheKey = githubToken ? `auth_${githubToken.slice(-8)}` : "unauth";
+  const cached = cache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+    return cached.repos;
+  }
+
+  const headers: Record<string, string> = {
+    Accept: "application/vnd.github.v3+json",
+  };
+  if (githubToken) {
+    headers.Authorization = `Bearer ${githubToken}`;
+  }
+
+  // Fetch all repos in the AgentWebPro org
+  const reposResponse = await axios.get<Array<{ name: string; html_url: string }>>(
+    "https://api.github.com/orgs/AgentWebPro/repos",
+    {
+      params: { per_page: 100, sort: "updated" },
+      headers,
+    }
+  );
+
+  const repos = reposResponse.data;
+  console.log(`[LANDING PAGES] Found ${repos.length} repos in AgentWebPro org (authenticated: ${!!githubToken})`);
+
+  // Fetch AGENT.md (or agent.md) for each repo in parallel
+  const AGENT_MD_NAMES = ["AGENT.md", "agent.md"];
+  const results = await Promise.allSettled(
+    repos.map(async (repo) => {
+      // Try each filename variant until one succeeds
+      for (const filename of AGENT_MD_NAMES) {
+        try {
+          const fileResponse = await axios.get<{ content: string }>(
+            `https://api.github.com/repos/AgentWebPro/${repo.name}/contents/${filename}`,
+            { headers }
+          );
+          const content = Buffer.from(
+            fileResponse.data.content,
+            "base64"
+          ).toString("utf-8");
+          return {
+            name: repo.name,
+            htmlUrl: repo.html_url,
+            agentMd: content,
+          };
+        } catch {
+          // Try next filename variant
+        }
+      }
+      throw new Error("No AGENT.md found");
+    })
+  );
+
+  const repoInfos: RepoInfo[] = results
+    .filter(
+      (r): r is PromiseFulfilledResult<RepoInfo> => r.status === "fulfilled"
+    )
+    .map((r) => r.value);
+
+  const failedCount = results.filter(r => r.status === "rejected").length;
+  console.log(`[LANDING PAGES] ${repoInfos.length} repos have agent.md, ${failedCount} repos skipped`);
+
+  cache.set(cacheKey, { repos: repoInfos, timestamp: now });
+  return repoInfos;
+}
+
+// GET /api/landing-pages
+router.get("/", authenticateToken, async (req, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const githubToken = userId ? await getGitHubToken(userId) : null;
+    if (!githubToken) {
+      return res.json({ repos: [], noToken: true });
+    }
+    const repos = await fetchReposWithAgentMd(githubToken);
+    res.json({ repos });
+  } catch (error) {
+    console.error("[LANDING PAGES] Error fetching repos:", error);
+    res.status(500).json({ error: "Failed to fetch landing pages" });
+  }
+});
+
+export default router;
