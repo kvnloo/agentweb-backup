@@ -4,6 +4,7 @@ import webhookRouter from '../routes/webhooks';
 import { crmDb } from '../services/db';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { agentModeService } from '../services/agentModeService';
+import { resendService } from '../services/resendService';
 
 // Mock dependencies
 jest.mock('../services/db', () => ({
@@ -12,6 +13,7 @@ jest.mock('../services/db', () => ({
     getLeadByEmail: jest.fn(),
     createLead: jest.fn(),
     updateLead: jest.fn(),
+    getLeadById: jest.fn(),
   },
 }));
 
@@ -24,6 +26,13 @@ jest.mock('../services/leadListAlertService', () => ({
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     updateEmailDraftForLead: jest.fn(),
+    getCrmSenders: jest.fn(),
+  },
+}));
+
+jest.mock('../services/resendService', () => ({
+  resendService: {
+    sendEmail: jest.fn(),
   },
 }));
 
@@ -466,6 +475,190 @@ describe('Lead Forwarding API (List ID Authentication)', () => {
 
       expect(response.headers['access-control-allow-origin']).toBe('*');
       expect(response.headers['access-control-allow-methods']).toContain('POST');
+    });
+
+    describe('Auto Send', () => {
+      const autoSendLeadList = {
+        ...mockLeadList,
+        autoDraftEnabled: true,
+        autoSendEnabled: true,
+        userId: 'user_123',
+      };
+
+      const mockDraftResult = {
+        success: true,
+        data: {
+          email: {
+            subject: 'Hello from Acme',
+            textContent: 'Hi there',
+            htmlContent: '<p>Hi there</p>',
+          },
+        },
+      };
+
+      const mockSenders = {
+        success: true,
+        senders: [{ id: 'sender_1', email: 'sales@acme.com', fromName: 'Acme Sales' }],
+        defaultSenderId: 'sender_1',
+      };
+
+      beforeEach(() => {
+        (agentModeService.updateEmailDraftForLead as jest.Mock).mockResolvedValue(mockDraftResult);
+        (agentModeService.getCrmSenders as jest.Mock).mockResolvedValue(mockSenders);
+        (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'email_123' });
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({ leadId: 'lead_auto', email: 'lead@example.com' });
+      });
+
+      it('should auto-send email after draft creation when autoSendEnabled is true', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_auto',
+          listId: 'list_123',
+          email: 'lead@example.com',
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'lead@example.com',
+            firstName: 'Auto',
+          });
+
+        expect(response.status).toBe(201);
+        expect(response.body.success).toBe(true);
+
+        // Wait for fire-and-forget to complete
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalled();
+        expect(agentModeService.getCrmSenders).toHaveBeenCalledWith('user_123');
+        expect(resendService.sendEmail).toHaveBeenCalledWith(
+          expect.objectContaining({
+            from: 'Acme Sales <sales@acme.com>',
+            to: 'lead@example.com',
+            subject: 'Hello from Acme',
+          })
+        );
+        // Should clear draft and set lastAutoSendAt
+        expect(crmDb.updateLead).toHaveBeenCalledWith(
+          'list_123',
+          'lead_auto',
+          expect.objectContaining({ emailDraft: null, lastAutoSendAt: expect.any(String) })
+        );
+      });
+
+      it('should skip auto-send if email was already sent today', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_today',
+          listId: 'list_123',
+          email: 'today@example.com',
+        });
+        (crmDb.getLeadById as jest.Mock).mockResolvedValue({
+          leadId: 'lead_today',
+          email: 'today@example.com',
+          lastAutoSendAt: new Date().toISOString(), // sent today
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'today@example.com',
+            firstName: 'Today',
+          });
+
+        expect(response.status).toBe(201);
+
+        // Wait for fire-and-forget
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalled();
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+      });
+
+      it('should skip auto-send when no sender is configured', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_nosender',
+          listId: 'list_123',
+          email: 'nosender@example.com',
+        });
+        (agentModeService.getCrmSenders as jest.Mock).mockResolvedValue({
+          success: true,
+          senders: [],
+          defaultSenderId: null,
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'nosender@example.com',
+          });
+
+        expect(response.status).toBe(201);
+
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+      });
+
+      it('should not auto-send when autoSendEnabled is false', async () => {
+        const draftOnlyList = { ...autoSendLeadList, autoSendEnabled: false };
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(draftOnlyList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_draftonly',
+          listId: 'list_123',
+          email: 'draftonly@example.com',
+        });
+
+        const response = await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'draftonly@example.com',
+          });
+
+        expect(response.status).toBe(201);
+
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(agentModeService.updateEmailDraftForLead).toHaveBeenCalled();
+        expect(resendService.sendEmail).not.toHaveBeenCalled();
+      });
+
+      it('should send alert with accurate auto-send status after completion', async () => {
+        (crmDb.getLeadListById as jest.Mock).mockResolvedValue(autoSendLeadList);
+        (crmDb.createLead as jest.Mock).mockResolvedValue({
+          leadId: 'lead_alert',
+          listId: 'list_123',
+          email: 'alert@example.com',
+        });
+
+        await request(app)
+          .post('/api/webhooks/forward-lead')
+          .send({
+            listId: 'list_123',
+            email: 'alert@example.com',
+            firstName: 'Alert',
+          });
+
+        // Wait for fire-and-forget
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(leadListAlertService.notifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.anything(),
+          'api.lead_added',
+          expect.objectContaining({
+            autoDraftStatus: 'created',
+            autoSendStatus: 'sent',
+          }),
+          expect.any(String)
+        );
+      });
     });
   });
 });

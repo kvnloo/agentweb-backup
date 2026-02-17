@@ -1485,6 +1485,59 @@ describe('CRM Routes', () => {
       expect(mockResponse.status).toHaveBeenCalledWith(400);
       expect(mockResponse.json).toHaveBeenCalledWith({ message: 'instruction must be a string' });
     });
+
+    it('should accept autoSendEnabled parameter', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({
+        ...mockList,
+        autoDraftEnabled: true,
+        autoDraftInstruction: '',
+        autoSendEnabled: true,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { enabled: true, autoSendEnabled: true };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/auto-draft' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', expect.objectContaining({
+        autoDraftEnabled: true,
+        autoSendEnabled: true,
+      }));
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          autoDraftEnabled: true,
+          autoSendEnabled: true,
+        })
+      );
+    });
+
+    it('should return 400 when autoSendEnabled is not a boolean', async () => {
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { enabled: true, autoSendEnabled: 'yes' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/auto-draft' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'autoSendEnabled must be a boolean' });
+    });
   });
 
   describe('POST /api/crm/sync-subscribers', () => {

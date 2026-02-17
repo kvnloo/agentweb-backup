@@ -2818,7 +2818,8 @@ export const crmDb = {
     alertEvents?: string[],
     listSenderId?: string | null,
     autoDraftEnabled?: boolean,
-    autoDraftInstruction?: string
+    autoDraftInstruction?: string,
+    autoSendEnabled?: boolean
   ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2844,6 +2845,7 @@ export const crmDb = {
           publicAccessEnabled: false, // Default: public access disabled
           autoDraftEnabled: autoDraftEnabled === true, // Default: auto draft disabled
           autoDraftInstruction: typeof autoDraftInstruction === 'string' ? autoDraftInstruction.trim() : '',
+          autoSendEnabled: autoSendEnabled === true, // Default: auto send disabled
           engagedOnly: false,
         },
       };
@@ -2934,6 +2936,7 @@ export const crmDb = {
       publicAccessEnabled?: boolean;
       autoDraftEnabled?: boolean;
       autoDraftInstruction?: string;
+      autoSendEnabled?: boolean;
       icpsOnly?: boolean;
       engagedOnly?: boolean;
     }
@@ -2995,6 +2998,12 @@ export const crmDb = {
         expressionAttributeNames['#autoDraftInstruction'] = 'autoDraftInstruction';
         updateExpressions.push('#autoDraftInstruction = :autoDraftInstruction');
         expressionAttributeValues[':autoDraftInstruction'] = updates.autoDraftInstruction;
+      }
+
+      if (updates.autoSendEnabled !== undefined) {
+        expressionAttributeNames['#autoSendEnabled'] = 'autoSendEnabled';
+        updateExpressions.push('#autoSendEnabled = :autoSendEnabled');
+        expressionAttributeValues[':autoSendEnabled'] = updates.autoSendEnabled;
       }
 
       if (updates.icpsOnly !== undefined) {
@@ -3392,6 +3401,7 @@ export const crmDb = {
       reason: string;
       matchedAt: string;
     } | null;
+    lastAutoSendAt?: string | null;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -3496,6 +3506,15 @@ export const crmDb = {
           expressionAttributeValues[':icpMatch'] = updates.icpMatch;
           setExpressions.push('isICP = :isICP');
           expressionAttributeValues[':isICP'] = updates.icpMatch.isMatch === true ? 1 : 0;
+        }
+      }
+
+      if (updates.lastAutoSendAt !== undefined) {
+        if (updates.lastAutoSendAt === null) {
+          removeExpressions.push('lastAutoSendAt');
+        } else {
+          setExpressions.push('lastAutoSendAt = :lastAutoSendAt');
+          expressionAttributeValues[':lastAutoSendAt'] = updates.lastAutoSendAt;
         }
       }
 

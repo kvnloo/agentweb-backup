@@ -299,6 +299,125 @@ describe('Lead List Alert Service - API Events', () => {
     });
   });
 
+  describe('Auto Send status in alerts', () => {
+    it('should show success message when auto send succeeds', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_added',
+        {
+          source: 'api',
+          forwardedAt: '2026-02-17T10:00:00.000Z',
+          autoDraftStatus: 'created',
+          autoSendStatus: 'sent',
+        },
+        '2026-02-17T10:00:00.000Z'
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const textContent = emailCall[2];
+      const htmlContent = emailCall[3];
+
+      expect(textContent).toContain('Auto Send: Email sent to the lead successfully');
+      expect(htmlContent).toContain('Email sent to the lead successfully');
+      expect(htmlContent).toContain('#15803d'); // green color
+    });
+
+    it('should show skipped message when already sent today', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_added',
+        {
+          source: 'api',
+          forwardedAt: '2026-02-17T10:00:00.000Z',
+          autoDraftStatus: 'created',
+          autoSendStatus: 'skipped_already_sent_today',
+        },
+        '2026-02-17T10:00:00.000Z'
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const textContent = emailCall[2];
+
+      expect(textContent).toContain('already sent to this lead today');
+    });
+
+    it('should show warning when no sender configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_added',
+        {
+          source: 'api',
+          forwardedAt: '2026-02-17T10:00:00.000Z',
+          autoDraftStatus: 'created',
+          autoSendStatus: 'skipped_no_sender',
+        },
+        '2026-02-17T10:00:00.000Z'
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const textContent = emailCall[2];
+
+      expect(textContent).toContain('no sender email configured');
+    });
+
+    it('should show warning when auto send is not enabled (draft only)', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_added',
+        {
+          source: 'api',
+          forwardedAt: '2026-02-17T10:00:00.000Z',
+          autoDraftStatus: 'created',
+          // no autoSendStatus = auto send not enabled
+        },
+        '2026-02-17T10:00:00.000Z'
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const textContent = emailCall[2];
+      const htmlContent = emailCall[3];
+
+      expect(textContent).toContain('An email has not been sent to the lead');
+      expect(htmlContent).toContain('#b45309'); // warning color
+    });
+
+    it('should show failure message when auto send fails', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      await leadListAlertService.notifyLeadListOwnerIfConfigured(
+        mockList,
+        mockLead,
+        'api.lead_added',
+        {
+          source: 'api',
+          forwardedAt: '2026-02-17T10:00:00.000Z',
+          autoDraftStatus: 'created',
+          autoSendStatus: 'failed',
+        },
+        '2026-02-17T10:00:00.000Z'
+      );
+
+      const emailCall = (emailService.sendEmail as jest.Mock).mock.calls[0];
+      const textContent = emailCall[2];
+      const htmlContent = emailCall[3];
+
+      expect(textContent).toContain('Auto send failed');
+      expect(htmlContent).toContain('#dc2626'); // red color
+    });
+  });
+
   describe('Event details formatting', () => {
     it('should format api.lead_added event details correctly', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
