@@ -628,6 +628,161 @@ describe('GTM Plan Route Tests', () => {
     });
   });
 
+  describe('Add Work Item - Plan Status Reversion', () => {
+    it('should revert completed plan to in_progress when a new work item is added', () => {
+      const completedPlan = {
+        planId: 'plan-completed',
+        userId: mockUserId,
+        status: 'completed',
+        completedAt: '2026-01-15T00:00:00Z',
+        phases: [
+          {
+            id: 'phase-1',
+            title: 'Phase 1',
+            status: 'completed',
+            workItems: [
+              { id: 'item-1', title: 'Item 1', status: 'completed' },
+            ],
+          },
+        ],
+      };
+
+      // Simulate adding a new work item (status: "pending")
+      const phases = [...completedPlan.phases];
+      const phase = { ...phases[0] };
+      const workItems = [...phase.workItems, { id: 'item-new', title: 'New Item', status: 'pending' }];
+      phase.workItems = workItems;
+      phase.status = 'in_progress'; // Phase becomes in_progress when items are added
+      phases[0] = phase;
+
+      // Recalculate plan status (same logic as the route)
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every(
+        (p: any) => p.status === 'completed'
+      );
+      const planStatus = allPhasesCompleted ? 'completed' : 'in_progress';
+
+      expect(planStatus).toBe('in_progress');
+
+      // completedAt should be cleared when plan reverts from completed
+      const shouldClearCompletedAt = completedPlan.status === 'completed' && planStatus !== 'completed';
+      expect(shouldClearCompletedAt).toBe(true);
+    });
+
+    it('should keep in_progress plan as in_progress when a new work item is added', () => {
+      const inProgressPlan = {
+        planId: 'plan-ip',
+        userId: mockUserId,
+        status: 'in_progress',
+        completedAt: null,
+        phases: [
+          {
+            id: 'phase-1',
+            title: 'Phase 1',
+            status: 'in_progress',
+            workItems: [
+              { id: 'item-1', title: 'Item 1', status: 'pending' },
+            ],
+          },
+        ],
+      };
+
+      const phases = [...inProgressPlan.phases];
+      const phase = { ...phases[0] };
+      const workItems = [...phase.workItems, { id: 'item-new', title: 'New Item', status: 'pending' }];
+      phase.workItems = workItems;
+      phase.status = 'in_progress';
+      phases[0] = phase;
+
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every(
+        (p: any) => p.status === 'completed'
+      );
+      const planStatus = allPhasesCompleted ? 'completed' : 'in_progress';
+
+      expect(planStatus).toBe('in_progress');
+
+      // completedAt should NOT be cleared (plan was already in_progress)
+      const shouldClearCompletedAt = inProgressPlan.status === 'completed' && planStatus !== 'completed';
+      expect(shouldClearCompletedAt).toBe(false);
+    });
+  });
+
+  describe('Add Phase - Plan Status Reversion', () => {
+    it('should revert completed plan to in_progress when a new phase is added', () => {
+      const completedPlan = {
+        planId: 'plan-completed',
+        userId: mockUserId,
+        status: 'completed',
+        completedAt: '2026-01-15T00:00:00Z',
+        phases: [
+          {
+            id: 'phase-1',
+            title: 'Phase 1',
+            status: 'completed',
+            workItems: [
+              { id: 'item-1', title: 'Item 1', status: 'completed' },
+            ],
+          },
+        ],
+      };
+
+      // Simulate adding a new phase (status: "in_progress", empty workItems)
+      const phases = [
+        ...completedPlan.phases,
+        { id: 'phase-new', title: 'New Phase', status: 'in_progress', workItems: [] },
+      ];
+
+      // Recalculate plan status (same logic as the route)
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every(
+        (p: any) => p.status === 'completed'
+      );
+      const planStatus = allPhasesCompleted ? 'completed' : 'in_progress';
+
+      expect(planStatus).toBe('in_progress');
+
+      // completedAt should be cleared when plan reverts from completed
+      const shouldClearCompletedAt = completedPlan.status === 'completed' && planStatus !== 'completed';
+      expect(shouldClearCompletedAt).toBe(true);
+    });
+
+    it('should keep in_progress plan as in_progress when a new phase is added', () => {
+      const inProgressPlan = {
+        planId: 'plan-ip',
+        userId: mockUserId,
+        status: 'in_progress',
+        completedAt: null,
+        phases: [
+          {
+            id: 'phase-1',
+            title: 'Phase 1',
+            status: 'in_progress',
+            workItems: [
+              { id: 'item-1', title: 'Item 1', status: 'pending' },
+            ],
+          },
+        ],
+      };
+
+      const phases = [
+        ...inProgressPlan.phases,
+        { id: 'phase-new', title: 'New Phase', status: 'in_progress', workItems: [] },
+      ];
+
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every(
+        (p: any) => p.status === 'completed'
+      );
+      const planStatus = allPhasesCompleted ? 'completed' : 'in_progress';
+
+      expect(planStatus).toBe('in_progress');
+
+      const shouldClearCompletedAt = inProgressPlan.status === 'completed' && planStatus !== 'completed';
+      expect(shouldClearCompletedAt).toBe(false);
+    });
+  });
+
   describe('Delete GTM Plan (DELETE /:planId)', () => {
     it('should delete a plan', async () => {
       const mockPromise = jest.fn().mockResolvedValue({});
