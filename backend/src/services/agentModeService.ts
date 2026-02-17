@@ -31,11 +31,13 @@ type MetaApiResult = {
   [key: string]: any;
 };
 
-import { 
-  ALLOWED_NODE_TYPES, 
-  AllowedNodeType, 
-  ALLOWED_INSIGHTS_FIELDS, 
-  ALLOWED_INSIGHTS_BREAKDOWNS, 
+import {
+  ALLOWED_NODE_TYPES,
+  AllowedNodeType,
+  ALLOWED_INSIGHTS_FIELDS,
+  ALLOWED_INSIGHTS_BREAKDOWNS,
+  ALLOWED_ACTION_BREAKDOWNS,
+  ALLOWED_DATE_PRESETS,
   META_OBJ_GOAL_MAP,
   META_GOAL_BILLING_MAP,
   META_GOAL_BID_STRATEGY_MAP
@@ -5304,8 +5306,8 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      // Get API version from environment or default to v24.0
+      const apiVersion = process.env.META_API_VERSION || 'v24.0';
 
       // Fetch campaigns
       console.log('AgentMode: Fetching Meta ad campaigns for user:', userId);
@@ -5474,14 +5476,54 @@ Format the response as JSON with this structure:
 
         if (invalidBreakdowns.length) {
           throw new Error(
-            `Invalid breakdowns requested: ${invalidBreakdowns.join(", ")}`
+            `Invalid breakdowns requested: ${invalidBreakdowns.join(", ")}. Allowed: ${ALLOWED_INSIGHTS_BREAKDOWNS.join(", ")}`
           );
         }
+      }
+
+      // Validate action_breakdowns
+      if (action_breakdowns?.length) {
+        const invalidActionBreakdowns = action_breakdowns.filter(
+          (ab) => !ALLOWED_ACTION_BREAKDOWNS.includes(ab)
+        );
+        if (invalidActionBreakdowns.length) {
+          throw new Error(
+            `Invalid action_breakdowns requested: ${invalidActionBreakdowns.join(", ")}. Allowed: ${ALLOWED_ACTION_BREAKDOWNS.join(", ")}`
+          );
+        }
+      }
+
+      // Validate level
+      if (level && !ALLOWED_NODE_TYPES.includes(level)) {
+        throw new Error(
+          `Invalid level: ${level}. Allowed: ${ALLOWED_NODE_TYPES.join(", ")}`
+        );
       }
 
       // Date validation (mutually exclusive)
       if (date_preset && time_range) {
         throw new Error("Provide either date_preset or time_range, not both.");
+      }
+
+      // Validate date_preset value
+      if (date_preset && !ALLOWED_DATE_PRESETS.includes(date_preset)) {
+        throw new Error(
+          `Invalid date_preset: "${date_preset}". Allowed: ${ALLOWED_DATE_PRESETS.join(", ")}`
+        );
+      }
+
+      // Validate time_range format and logic
+      if (time_range) {
+        const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+        if (!time_range.since || !dateRegex.test(time_range.since)) {
+          throw new Error(`time_range.since must be in YYYY-MM-DD format (got "${time_range.since}").`);
+        }
+        if (!time_range.until || !dateRegex.test(time_range.until)) {
+          throw new Error(`time_range.until must be in YYYY-MM-DD format (got "${time_range.until}").`);
+        }
+        if (time_range.since > time_range.until) {
+          throw new Error(`time_range.since (${time_range.since}) must be on or before time_range.until (${time_range.until}).`);
+        }
       }
 
       const { accountId, accessToken } =
@@ -5593,7 +5635,7 @@ Format the response as JSON with this structure:
         "application/json"
       );
 
-      return { s3_url: s3Result.url };
+      return { success: true, s3_url: s3Result.url, totalRows: allData.length };
 
     } catch (error: any) {
       console.error("Error in callMetaAdsInsightsApiWrapper:", error);
@@ -6209,8 +6251,8 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Get API version from environment or default to v18.0
-      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      // Get API version from environment or default to v24.0
+      const apiVersion = process.env.META_API_VERSION || 'v24.0';
 
       // Calculate date range based on timeframe
       // Exclude today since it's not fully complete - use yesterday as end date

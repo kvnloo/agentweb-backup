@@ -171,31 +171,31 @@ mcpToolRegistry.register({
   definition: {
     name: "call_meta_ads_insights_api",
     description:
-      "Fetch performance reporting data (impressions, clicks, spend, conversions, ROAS, etc.) from Meta Ads. Supports segmentation (breakdowns), flexible date ranges, and different aggregation levels. Automatically handles Meta's asynchronous reporting system internally and only returns when data is ready. Returns an S3 URL to the JSON results.",
+      "Fetch performance reporting data from Meta Ads (impressions, clicks, spend, conversions, ROAS, etc.). Use this for custom queries with specific fields, date ranges, breakdowns, or filtering. Handles Meta's async reporting internally — returns an S3 URL to JSON results when ready. You MUST provide either date_preset or time_range (defaults to all-time if omitted, which can be very large). For a quick pre-built dashboard summary of specific campaigns, use get_meta_ads_metrics instead.",
     inputSchema: {
       type: "object",
       properties: {
         account_id: {
           type: "string",
           description:
-            "The real ad account ID (without 'act_'). Use list_connected_accounts to retrieve this. DO NOT guess.",
+            "The ad account ID (numeric, without 'act_' prefix). Use list_connected_accounts to retrieve this. DO NOT guess.",
         },
         object_type: {
           type: "string",
           enum: ["account", "campaign", "adset", "ad"],
           description:
-            "The level of object to fetch insights for (account, campaign, adset, or ad).",
+            "Entity level to fetch insights for. Use 'account' for the whole account.",
         },
         object_id: {
           type: "string",
           description:
-            "Required if object_type is campaign, adset, or ad. Not required for account-level insights.",
+            "The entity ID. REQUIRED when object_type is campaign, adset, or ad. Omit for account-level.",
         },
         fields: {
           type: "array",
           items: { type: "string" },
           description:
-            "List of performance metrics to retrieve (e.g., impressions, clicks, spend, ctr, actions, action_values, purchase_roas).",
+            "Metrics to retrieve. Common: impressions, reach, clicks, spend, ctr, cpc, cpm, actions, action_values, purchase_roas, conversions, video_views, cost_per_action_type.",
         },
         date_preset: {
           type: "string",
@@ -216,56 +216,63 @@ mcpToolRegistry.register({
             "last_year"
           ],
           description:
-            "Predefined date range. Use 'maximum' for lifetime data. Cannot be used together with time_range.",
+            "Predefined date range. Recommended default: 'last_30d'. Use 'maximum' for lifetime. Mutually exclusive with time_range.",
         },
         time_range: {
           type: "object",
           properties: {
             since: {
               type: "string",
-              description: "Start date in YYYY-MM-DD format.",
+              description: "Start date (YYYY-MM-DD). Must be <= until.",
             },
             until: {
               type: "string",
-              description: "End date in YYYY-MM-DD format.",
+              description: "End date (YYYY-MM-DD). Must be >= since.",
             },
           },
+          required: ["since", "until"],
           description:
-            "Custom date range. Cannot be used together with date_preset.",
+            "Custom date range. Both since and until are required. Mutually exclusive with date_preset.",
         },
         level: {
           type: "string",
           enum: ["account", "campaign", "adset", "ad"],
           description:
-            "Aggregation level of results. Controls how rows are grouped in the response.",
+            "Row aggregation level. Example: object_type='account' + level='campaign' returns one row per campaign.",
         },
         breakdowns: {
           type: "array",
-          items: { type: "string" },
+          items: {
+            type: "string",
+            enum: ["age", "gender", "country", "region", "publisher_platform", "platform_position", "device_platform"],
+          },
           description:
-            "Dimensions to segment results by (e.g., age, gender, country, publisher_platform, device_platform).",
+            "Segment results by dimension. E.g., ['age', 'gender'] splits each row by age+gender.",
         },
         action_breakdowns: {
           type: "array",
-          items: { type: "string" },
+          items: {
+            type: "string",
+            enum: ["action_type", "action_target_id", "action_destination", "action_device", "action_reaction", "action_video_sound", "action_video_type", "action_carousel_card_id", "action_carousel_card_name"],
+          },
           description:
-            "Further segmentation for action metrics (e.g., action_type). Used with actions and action_values fields.",
+            "Segment action/conversion metrics. Use 'action_type' to break down the 'actions' and 'action_values' fields by event type (e.g., purchase, link_click).",
         },
         filtering: {
           type: "array",
           items: {
             type: "object",
             properties: {
-              field: { type: "string" },
-              operator: { type: "string" },
-              value: {},
+              field: { type: "string", description: "Field to filter on (e.g., 'campaign.name', 'adset.name', 'campaign.objective')." },
+              operator: { type: "string", enum: ["EQUAL", "NOT_EQUAL", "GREATER_THAN", "LESS_THAN", "IN", "NOT_IN", "CONTAIN", "NOT_CONTAIN"] },
+              value: { description: "Filter value. String for EQUAL/CONTAIN, array for IN/NOT_IN." },
             },
+            required: ["field", "operator", "value"],
           },
           description:
-            "Optional filtering conditions to restrict results (e.g., filter by campaign name or objective).",
+            "Server-side filters to narrow results before aggregation.",
         },
       },
-
       required: ["account_id", "object_type", "fields"],
     },
   },
@@ -281,7 +288,7 @@ mcpToolRegistry.register({
   name: 'get_meta_ads_metrics',
   definition: {
     name: 'get_meta_ads_metrics',
-    description: 'Get Meta ad performance metrics and campaign data for specific campaigns. Requires campaign_ids (array of campaign IDs). Use call_meta_marketing_api first to get available IDs.',
+    description: 'Quick pre-built dashboard: returns a formatted summary of campaign, ad set, and ad performance with demographics, placement, and device breakdowns for specific campaigns. Best for "how are my campaigns doing?" questions. For custom field selection, custom date ranges, or raw data export, use call_meta_ads_insights_api instead.',
     inputSchema: {
       type: 'object',
       properties: {

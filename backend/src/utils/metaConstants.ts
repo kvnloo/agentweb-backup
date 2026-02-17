@@ -119,6 +119,35 @@ export const ALLOWED_INSIGHTS_BREAKDOWNS = [
   'device_platform'
 ];
 
+export const ALLOWED_ACTION_BREAKDOWNS = [
+  'action_type',
+  'action_target_id',
+  'action_destination',
+  'action_device',
+  'action_reaction',
+  'action_video_sound',
+  'action_video_type',
+  'action_carousel_card_id',
+  'action_carousel_card_name'
+];
+
+export const ALLOWED_DATE_PRESETS = [
+  'today',
+  'yesterday',
+  'this_month',
+  'last_month',
+  'this_quarter',
+  'maximum',
+  'last_3d',
+  'last_7d',
+  'last_14d',
+  'last_28d',
+  'last_30d',
+  'last_90d',
+  'this_year',
+  'last_year'
+];
+
 /**
  * Meta v24 Objective to Optimization Goal Compatibility Matrix
  */
