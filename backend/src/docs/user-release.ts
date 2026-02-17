@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-17',
     changes: [
+      'Claude Sonnet 4.5 Support for Agent Mode',
+      '- Added Claude Sonnet 4.5 (anthropic.claude-sonnet-4-5-20250929-v1:0) as an available LLM for Agent Mode chat',
+      '- Uses AWS Bedrock with cross-region inference profile, following the same pattern as Claude Opus 4.6',
+      '- Lazy-loaded Bedrock client with temperature support',
+      'Fix: Agent Mode Chat Text Invisible in Dark Mode',
+      '- LLM responses containing inline HTML styles (e.g. color, background) no longer override the dark mode theme',
+      '- Inline color and background style properties are now stripped from LLM-generated HTML before rendering',
+      '- Other inline styles (margins, padding, fonts) are preserved',
       'Auto Send for API Lead Forwarding',
       '- Added an Auto Send option within the Auto Draft settings for API-integrated lead lists',
       '- When enabled, drafted emails are automatically sent to leads after creation',
