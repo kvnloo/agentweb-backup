@@ -1136,6 +1136,36 @@ External servers can be added dynamically via the Admin UI or configured in the 
   - Put API keys in the environment JSON field, e.g. `{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}`
 
 
+#### Configuring GitHub Access Token for Landing Pages
+
+Each customer who uses the **Landing Pages** feature (Brand Hub > Landing Pages) or the **Landing Page Development** skill in Agent Mode needs a GitHub fine-grained personal access token configured on their user record.
+
+**1. Create the token on GitHub:**
+
+1. Go to [github.com/settings/tokens?type=beta](https://github.com/settings/tokens?type=beta) (Fine-grained tokens)
+2. Click **Generate new token**
+3. **Token name:** `vercel-<client_name>-prod-token` (e.g., `vercel-acme-corp-prod-token`)
+4. **Expiration:** choose an appropriate duration
+5. **Resource owner:** select the `AgentWebPro` organization
+6. **Repository access:** select **Only select repositories**, then pick the repositories for the client's landing page sites
+7. **Permissions** — under *Repository permissions*, set:
+   - **Contents** — Read and write
+   - **Pull requests** — Read and write
+8. Click **Generate token** and copy the token value
+
+**2. Store the token on the user record:**
+
+1. Open the **Partner Portal** (admin) and navigate to **Users**
+2. Find the customer's user record and open the detail view
+3. In the **Secrets** section, add a new secret:
+   - **Key:** `GITHUB_PERSONAL_ACCESS_TOKEN`
+   - **Value:** paste the token generated above
+4. Save — the value is encrypted at rest and decrypted only at execution time
+
+The token is used in two places:
+- **Landing Pages page** — fetches the list of AgentWebPro repos the token can access and displays each repo's `AGENT.md`
+- **Landing Page Development skill** (Agent Mode) — reads/writes files and creates pull requests on the client's repos via the GitHub MCP server
+
 #### Configuring User CMS Type
 
 After setting up the CMS secrets, you need to configure which CMS each user should use:
