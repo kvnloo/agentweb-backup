@@ -1,4 +1,4 @@
-import { sendGTMPlanUpdateNotifications } from '../services/gtmPlanNotificationService';
+import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from '../services/gtmPlanNotificationService';
 import { resendService } from '../services/resendService';
 import { userDb } from '../services/db';
 
@@ -220,6 +220,145 @@ describe('GTM Plan Notification Service', () => {
       expect(emails).toContain('plan-poc@example.com');
       expect(emails).toContain('phase-poc@example.com');
       expect(emails).toContain('item-poc@example.com');
+    });
+  });
+
+  describe('Phase Status Report - Description and Notes', () => {
+    const mockPlanWithDetails = {
+      planId: 'plan-1',
+      userId: 'user-1',
+      title: 'Test Plan',
+      description: 'Test Description',
+      dri: 'plan-poc@example.com',
+      status: 'in_progress',
+      phases: [
+        {
+          id: 'phase-1',
+          title: 'Phase 1',
+          dri: 'phase-poc@example.com',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-1',
+              title: 'Work Item 1',
+              description: 'Detailed task description',
+              status: 'pending',
+              dri: 'item-poc@example.com',
+              notes: 'Important progress notes',
+              dueDate: '2024-12-30',
+            },
+            {
+              id: 'item-2',
+              title: 'Work Item 2',
+              status: 'completed',
+              dri: 'item-poc2@example.com',
+              dueDate: '2024-12-31',
+            },
+          ],
+        },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    };
+
+    it('should include work item description and notes in phase status report email', async () => {
+      await sendPhaseStatusReport(
+        mockPlanWithDetails,
+        'phase-1',
+        { notifyPhasePoc: true },
+      );
+
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalled();
+      const callArgs = (mockResendService.sendSystemEmail as jest.Mock).mock.calls[0][0];
+
+      // HTML should contain description under title and notes column
+      expect(callArgs.html).toContain('Detailed task description');
+      expect(callArgs.html).toContain('Important progress notes');
+
+      // Plain text should also contain them
+      expect(callArgs.text).toContain('Detailed task description');
+      expect(callArgs.text).toContain('Important progress notes');
+    });
+
+    it('should show dash for items without description or notes in phase status report', async () => {
+      await sendPhaseStatusReport(
+        mockPlanWithDetails,
+        'phase-1',
+        { notifyPhasePoc: true },
+      );
+
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalled();
+      const callArgs = (mockResendService.sendSystemEmail as jest.Mock).mock.calls[0][0];
+
+      // Item 2 has no description or notes - HTML should have dashes in those cells
+      // The notes column for item 2 should render '-'
+      expect(callArgs.html).toContain('Work Item 2');
+    });
+  });
+
+  describe('Plan Status Report - Description and Notes', () => {
+    const mockPlanWithMultiplePhases = {
+      planId: 'plan-1',
+      userId: 'user-1',
+      title: 'Test Plan',
+      description: 'Test Description',
+      dri: 'plan-poc@example.com',
+      status: 'in_progress',
+      phases: [
+        {
+          id: 'phase-1',
+          title: 'Phase 1',
+          dri: 'phase-poc@example.com',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-1',
+              title: 'Research Task',
+              description: 'Research competitor landscape',
+              status: 'completed',
+              notes: 'Found 5 key competitors',
+              dueDate: '2024-12-30',
+            },
+          ],
+        },
+        {
+          id: 'phase-2',
+          title: 'Phase 2',
+          dri: 'phase2-poc@example.com',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-2',
+              title: 'Launch Campaign',
+              description: 'Execute the marketing campaign',
+              status: 'pending',
+              dueDate: '2025-01-15',
+            },
+          ],
+        },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    };
+
+    it('should include work item descriptions and notes in plan status report email', async () => {
+      await sendPlanStatusReport(
+        mockPlanWithMultiplePhases,
+        { notifyPlanPoc: true },
+      );
+
+      expect(mockResendService.sendSystemEmail).toHaveBeenCalled();
+      const callArgs = (mockResendService.sendSystemEmail as jest.Mock).mock.calls[0][0];
+
+      // HTML should contain descriptions and notes from both phases
+      expect(callArgs.html).toContain('Research competitor landscape');
+      expect(callArgs.html).toContain('Found 5 key competitors');
+      expect(callArgs.html).toContain('Execute the marketing campaign');
+
+      // Plain text should also contain them
+      expect(callArgs.text).toContain('Research competitor landscape');
+      expect(callArgs.text).toContain('Found 5 key competitors');
+      expect(callArgs.text).toContain('Execute the marketing campaign');
     });
   });
 
