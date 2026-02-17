@@ -541,7 +541,7 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 - Backend, partner-portal, and customer-portal have independent versioning in their `package.json`
 - Always bump version before merging to main for production deployment
-- Version format: `X.Y` (e.g., `26.9`, `27.0`). When the minor version reaches 10, bump the major version and reset minor to 0. For example: `26.9` → `27.0`, NOT `26.10`. Similarly: `16.9` → `17.0`.
+- Version format: `X.Y.Z` (semver: major.minor.patch). Bump the **minor** version for each release and reset patch to 0 (e.g., `27.7.0` → `27.8.0`). Only bump patch for hotfixes. When the minor version reaches 10, bump the major version and reset minor to 0. For example: `27.9.0` → `28.0.0`, NOT `27.10.0`.
 - No version bump needed for staging deployments (PRs)
 
 ### DynamoDB Query Optimization
