@@ -19,6 +19,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Images, Videos, and Research Reports pages now show the correct generation time for each individual creative',
       '- Previously all creatives from the same Agent Mode session displayed the same timestamp',
       '- Each creative now uses the timestamp from the message that generated it, with a fallback to the execution start time',
+      '- Reports page no longer picks up HTML URLs from tool-result messages that lack timestamps, preventing all reports from sharing the session-level timestamp',
     ],
   },
   {

@@ -714,7 +714,8 @@ export class AgentModeService {
                 tool_call_id: toolCall.id,
                 role: 'tool',
                 name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg })
+                content: JSON.stringify({ error: errorMsg }),
+                metadata: { timestamp: new Date().toISOString() }
               });
               continue;
             }
@@ -755,7 +756,8 @@ export class AgentModeService {
               tool_call_id: toolCall.id,
               role: 'tool',
               name: toolCall.function.name,
-              content: toolContent
+              content: toolContent,
+              metadata: { timestamp: new Date().toISOString() }
             });
 
             // Tool results are now included in the tool message content above
@@ -795,7 +797,8 @@ export class AgentModeService {
               tool_call_id: toolCall.id,
               role: 'tool',
               name: toolCall.function.name,
-              content: errorContent
+              content: errorContent,
+              metadata: { timestamp: new Date().toISOString() }
             });
           }
         }

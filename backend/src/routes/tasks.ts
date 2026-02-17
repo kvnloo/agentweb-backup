@@ -2288,7 +2288,7 @@ async function getExecutionsWithAssets(
       const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
       const agentSessions = agentSessionsResult.sessions || [];
 
-      const addHtmlFile = (sessionKey: string, sessionWithMessages: any, url: string, filename?: string, timestamp?: string) => {
+      const addHtmlFile = (sessionKey: string, sessionWithMessages: any, url: string, filename?: string, timestamp?: string, isOwnTimestamp?: boolean) => {
         const derivedFilename = filename || url.split('/').pop() || 'report.html';
         const isArchived = sessionWithMessages.archives?.[url] || false;
         const isFavorited = sessionWithMessages.favorites?.[url] || false;
@@ -2322,8 +2322,8 @@ async function getExecutionsWithAssets(
           execution.startTime = timestamp;
         }
 
-        const alreadyAdded = execution.result_files.some((file: any) => file.url === url);
-        if (!alreadyAdded) {
+        const existingFile = execution.result_files.find((file: any) => file.url === url);
+        if (!existingFile) {
           execution.result_files.push({
             url,
             filename: derivedFilename,
@@ -2335,6 +2335,10 @@ async function getExecutionsWithAssets(
             is_favorited: isFavorited,
             is_archived: false
           });
+        } else if (isOwnTimestamp && timestamp) {
+          // A later message with a real per-message timestamp provides a more
+          // accurate generatedAt than the session-level fallback used earlier.
+          existingFile.generatedAt = timestamp;
         }
       };
 
@@ -2374,14 +2378,26 @@ async function getExecutionsWithAssets(
 
         const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
 
+        // Track the last assistant message timestamp so tool-result messages
+        // (which lack metadata.timestamp) inherit the timestamp of the assistant
+        // message that triggered them, rather than falling back to session updatedAt.
+        let lastAssistantTimestamp: string | undefined;
+
         sessionWithMessages.messages.forEach((message: any) => {
-          const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
+          const ownTimestamp = message.timestamp || message.metadata?.timestamp;
+
+          if (message.role === 'assistant' && ownTimestamp) {
+            lastAssistantTimestamp = ownTimestamp;
+          }
+
+          const timestamp = ownTimestamp || lastAssistantTimestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
+          const hasOwnTimestamp = !!ownTimestamp;
 
           if (message.metadata?.toolCalls) {
             message.metadata.toolCalls.forEach((toolCall: any) => {
               const htmlUrls = extractHtmlUrls(toolCall);
               htmlUrls.forEach(({ url, filename }) => {
-                addHtmlFile(sessionKey, sessionWithMessages, url, filename, timestamp);
+                addHtmlFile(sessionKey, sessionWithMessages, url, filename, timestamp, hasOwnTimestamp);
               });
             });
           }
@@ -2390,7 +2406,7 @@ async function getExecutionsWithAssets(
             htmlUrlRegex.lastIndex = 0;
             let match;
             while ((match = htmlUrlRegex.exec(message.content)) !== null) {
-              addHtmlFile(sessionKey, sessionWithMessages, match[1], undefined, timestamp);
+              addHtmlFile(sessionKey, sessionWithMessages, match[1], undefined, timestamp, hasOwnTimestamp);
             }
           }
         });
