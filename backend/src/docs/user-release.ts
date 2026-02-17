@@ -15,6 +15,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Includes same-day duplicate protection to prevent multiple emails to the same lead in one day',
       '- Alert emails now report the exact outcome: sent, skipped (already sent today), or failed',
       '- API webhook response is returned immediately; drafting, sending, and alerting happen asynchronously',
+      'Fix: Agent Mode Creative Timestamps',
+      '- Images, Videos, and Research Reports pages now show the correct generation time for each individual creative',
+      '- Previously all creatives from the same Agent Mode session displayed the same timestamp',
+      '- Each creative now uses the timestamp from the message that generated it, with a fallback to the execution start time',
     ],
   },
   {
