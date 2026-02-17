@@ -176,6 +176,7 @@ interface User {
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
+  secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
@@ -647,6 +648,10 @@ export default function AdminDashboard() {
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
   const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
+  const [secretsDialogOpen, setSecretsDialogOpen] = useState(false);
+  const [editingSecretsUserId, setEditingSecretsUserId] = useState<string | null>(null);
+  const [secretEntries, setSecretEntries] = useState<Array<{ name: string; value: string }>>([]);
+  const [secretsEditLoading, setSecretsEditLoading] = useState(false);
   const [seoDomainsDialogOpen, setSeoDomainsDialogOpen] = useState(false);
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
@@ -1155,6 +1160,8 @@ export default function AdminDashboard() {
         return user.workflowCount ?? 0;
       case "roles":
         return (user.roles ?? []).join(",");
+      case "secretNames":
+        return (user.secretNames ?? []).join(",");
       case "seoDomains":
         return (user.seoDomains ?? []).join(",");
       case "isOAuthUser":
@@ -1799,6 +1806,53 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update slack channel");
     } finally {
       setSlackChannelEditLoading(false);
+    }
+  };
+
+  const handleSaveSecrets = async () => {
+    if (!editingSecretsUserId) return;
+
+    setError("");
+    try {
+      setSecretsEditLoading(true);
+
+      // Validate key names
+      const keyRegex = /^[a-zA-Z0-9_]+$/;
+      const secrets: Record<string, string> = {};
+      for (const entry of secretEntries) {
+        const name = entry.name.trim();
+        if (!name) continue; // Skip empty rows
+        if (!keyRegex.test(name)) {
+          setError(`Invalid secret name: "${name}". Only alphanumeric characters and underscores are allowed.`);
+          return;
+        }
+        secrets[name] = entry.value; // Empty string = keep existing
+      }
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingSecretsUserId}/secrets`),
+        { secrets },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === editingSecretsUserId
+              ? { ...user, secretNames: response.data.secretNames }
+              : user
+          )
+        );
+        setSuccess("Secrets updated successfully!");
+        setSecretsDialogOpen(false);
+        setEditingSecretsUserId(null);
+        setSecretEntries([]);
+      }
+    } catch (error: any) {
+      console.error("Error updating secrets:", error);
+      setError(error.response?.data?.message || "Failed to update secrets");
+    } finally {
+      setSecretsEditLoading(false);
     }
   };
 
@@ -2912,6 +2966,9 @@ export default function AdminDashboard() {
                     />
                   </TableCell>
                   <TableCell>
+                    <UserSortLabel property="secretNames" label="Secrets" />
+                  </TableCell>
+                  <TableCell>
                     <UserSortLabel property="seoDomains" label="SEO/AEO" />
                   </TableCell>
                   <TableCell>
@@ -3080,6 +3137,43 @@ export default function AdminDashboard() {
                                 setSlackChannelDialogOpen(true);
                               }}
                               disabled={slackChannelEditLoading}
+                            >
+                              <EditIcon />
+                            </IconButton>
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                            <Box sx={{ flex: 1, minWidth: 120 }}>
+                              {user.secretNames && user.secretNames.length > 0 ? (
+                                <Box>
+                                  {user.secretNames.map((name: string, idx: number) => (
+                                    <Chip
+                                      key={idx}
+                                      label={name}
+                                      size="small"
+                                      sx={{ mr: 0.5, mb: 0.5 }}
+                                    />
+                                  ))}
+                                </Box>
+                              ) : (
+                                <Typography variant="body2">No secrets</Typography>
+                              )}
+                            </Box>
+                            <IconButton
+                              size="small"
+                              onClick={() => {
+                                setEditingSecretsUserId(user.userId);
+                                // Pre-populate with existing secret names (values left empty = unchanged)
+                                const existing = user.secretNames || [];
+                                setSecretEntries(
+                                  existing.length > 0
+                                    ? existing.map((n: string) => ({ name: n, value: "" }))
+                                    : [{ name: "", value: "" }]
+                                );
+                                setSecretsDialogOpen(true);
+                              }}
+                              disabled={secretsEditLoading}
                             >
                               <EditIcon />
                             </IconButton>
@@ -5432,6 +5526,115 @@ export default function AdminDashboard() {
             disabled={slackChannelEditLoading}
           >
             {slackChannelEditLoading ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Secrets Configuration Dialog */}
+      <Dialog
+        open={secretsDialogOpen}
+        onClose={() => {
+          setSecretsDialogOpen(false);
+          setEditingSecretsUserId(null);
+          setSecretEntries([]);
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Configure Secrets
+          <IconButton
+            aria-label="close"
+            onClick={() => {
+              setSecretsDialogOpen(false);
+              setEditingSecretsUserId(null);
+              setSecretEntries([]);
+            }}
+            sx={{
+              position: 'absolute',
+              right: 8,
+              top: 8,
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Enter secret variable names and values. Values are encrypted at rest. Leave value empty to keep existing value unchanged.
+          </Typography>
+          {secretEntries.map((entry, idx) => (
+            <Box key={idx} sx={{ display: "flex", gap: 1, mb: 1, alignItems: "center" }}>
+              <TextField
+                size="small"
+                label="Name"
+                value={entry.name}
+                onChange={(e) => {
+                  const updated = [...secretEntries];
+                  updated[idx] = { ...updated[idx], name: e.target.value };
+                  setSecretEntries(updated);
+                }}
+                placeholder="github_access_token"
+                disabled={secretsEditLoading}
+                sx={{ flex: 1 }}
+              />
+              <TextField
+                size="small"
+                label="Value"
+                type="password"
+                value={entry.value}
+                onChange={(e) => {
+                  const updated = [...secretEntries];
+                  updated[idx] = { ...updated[idx], value: e.target.value };
+                  setSecretEntries(updated);
+                }}
+                placeholder={
+                  editingSecretsUserId &&
+                  contextUsers.find((u: User) => u.userId === editingSecretsUserId)?.secretNames?.includes(entry.name)
+                    ? "••••••• (unchanged)"
+                    : "Enter value"
+                }
+                disabled={secretsEditLoading}
+                sx={{ flex: 1 }}
+              />
+              <IconButton
+                size="small"
+                onClick={() => {
+                  setSecretEntries(secretEntries.filter((_, i) => i !== idx));
+                }}
+                disabled={secretsEditLoading || secretEntries.length <= 1}
+              >
+                <CloseIcon fontSize="small" />
+              </IconButton>
+            </Box>
+          ))}
+          <Button
+            size="small"
+            onClick={() => setSecretEntries([...secretEntries, { name: "", value: "" }])}
+            disabled={secretsEditLoading}
+            sx={{ mt: 1 }}
+          >
+            + Add Secret
+          </Button>
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setSecretsDialogOpen(false);
+              setEditingSecretsUserId(null);
+              setSecretEntries([]);
+            }}
+            disabled={secretsEditLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSaveSecrets}
+            color="primary"
+            variant="contained"
+            disabled={secretsEditLoading}
+          >
+            {secretsEditLoading ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>

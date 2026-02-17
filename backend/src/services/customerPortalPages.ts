@@ -105,6 +105,11 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     path: '/tasks',
     label: 'Tasks',
     description: 'View and manage tasks'
+  },
+  {
+    path: '/landing-pages',
+    label: 'Landing Pages',
+    description: 'Project documentation from the AgentWebPro organization'
   }
 ];
 

@@ -9,6 +9,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-16',
     changes: [
+      'GitHub MCP Server with Per-User Access Token',
+      '- The GitHub MCP server now supports per-user personal access tokens configured via the admin Users tab',
+      '- Each user\'s token is encrypted at rest and decrypted only at execution time',
+      '- Enables private repository access scoped to individual users',
+      'Landing Pages in Brand Hub',
+      '- Added a new Landing Pages page under the Brand Hub section of the customer portal',
+      '- Dynamically fetches repositories from the AgentWebPro GitHub organization and displays each repo\'s AGENT.md content',
+      '- Supports both AGENT.md and agent.md filename conventions',
+      '- Uses the authenticated user\'s GitHub token for private repository access',
+      '- Results are cached for 5 minutes to avoid GitHub API rate limits',
+      '- Page visibility is configurable per subscription type via the admin Subscriptions tab',
+      '- Shows a helpful message prompting users to contact their admin when access is not yet configured',
       'Dedicated Logo Image Parameter for Image Generation',
       '- Added a new logo_image parameter to the generate_image tool for adding logos to images',
       '- When a logo image is provided, the generation prompt is enhanced to preserve the logo\'s exact text, shape, and colors with absolute precision',
