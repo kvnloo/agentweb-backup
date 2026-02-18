@@ -185,6 +185,7 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }
 
 // Define an interface for the task data shown in the admin tasks tab
@@ -680,6 +681,12 @@ export default function AdminDashboard() {
   const [userToCreate, setUserToCreate] = useState<string | null>(null);
   const [createUserRoles, setCreateUserRoles] = useState<string[]>(["customer"]);
   const [createUserLoading, setCreateUserLoading] = useState(false);
+  const [googleDriveFoldersDialogOpen, setGoogleDriveFoldersDialogOpen] = useState(false);
+  const [editingGoogleDriveFoldersUserId, setEditingGoogleDriveFoldersUserId] = useState<string | null>(null);
+  const [googleDriveFolderEntries, setGoogleDriveFolderEntries] = useState<Array<{ folderId: string; name: string }>>([]);
+  const [googleDriveFoldersEditLoading, setGoogleDriveFoldersEditLoading] = useState(false);
+  const [availableGoogleDriveFolders, setAvailableGoogleDriveFolders] = useState<Array<{ folderId: string; name: string }>>([]);
+  const [googleDriveFoldersListLoading, setGoogleDriveFoldersListLoading] = useState(false);
 
   // Edit Waitlist Dialog state
   const [editWaitlistDialogOpen, setEditWaitlistDialogOpen] = useState(false);
@@ -1165,6 +1172,8 @@ export default function AdminDashboard() {
         return (user.secretNames ?? []).join(",");
       case "seoDomains":
         return (user.seoDomains ?? []).join(",");
+      case "googleDriveFolders":
+        return (user.googleDriveFolders ?? []).map(f => f.name).join(",");
       case "isOAuthUser":
         return user.isOAuthUser ? 1 : 0;
       case "isAdmin":
@@ -1980,6 +1989,47 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update SEO/AEO configuration");
     } finally {
       setSeoDomainsEditLoading(false);
+    }
+  };
+
+  const handleSaveGoogleDriveFolders = async () => {
+    if (!editingGoogleDriveFoldersUserId) return;
+
+    setError("");
+
+    try {
+      setGoogleDriveFoldersEditLoading(true);
+
+      // Filter out empty entries and validate
+      const folders = googleDriveFolderEntries.filter(
+        (entry) => entry.folderId.trim() && entry.name.trim()
+      );
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${editingGoogleDriveFoldersUserId}/google-drive-folders`),
+        { googleDriveFolders: folders },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === editingGoogleDriveFoldersUserId
+              ? { ...user, googleDriveFolders: response.data.googleDriveFolders || [] }
+              : user
+          )
+        );
+        setSuccess("Google Drive folders updated successfully!");
+        setGoogleDriveFoldersDialogOpen(false);
+        setEditingGoogleDriveFoldersUserId(null);
+        setGoogleDriveFolderEntries([]);
+        setAvailableGoogleDriveFolders([]);
+      }
+    } catch (error: any) {
+      console.error("Error updating Google Drive folders:", error);
+      setError(error.response?.data?.message || "Failed to update Google Drive folders");
+    } finally {
+      setGoogleDriveFoldersEditLoading(false);
     }
   };
 
@@ -2973,6 +3023,9 @@ export default function AdminDashboard() {
                     <UserSortLabel property="seoDomains" label="SEO/AEO" />
                   </TableCell>
                   <TableCell>
+                    <UserSortLabel property="googleDriveFolders" label="Shared Folders" />
+                  </TableCell>
+                  <TableCell>
                     <UserSortLabel property="cmsType" label="CMS Type" />
                   </TableCell>
                   <TableCell>
@@ -3240,6 +3293,57 @@ export default function AdminDashboard() {
                                 setSeoDomainsDialogOpen(true);
                               }}
                               disabled={seoDomainsEditLoading}
+                            >
+                              <EditIcon />
+                            </IconButton>
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                            <Box sx={{ flex: 1, minWidth: 150 }}>
+                              {user.googleDriveFolders && user.googleDriveFolders.length > 0 ? (
+                                <Box>
+                                  {user.googleDriveFolders.map((folder: { folderId: string; name: string }, idx: number) => (
+                                    <Chip
+                                      key={idx}
+                                      label={folder.name}
+                                      size="small"
+                                      sx={{ mr: 0.5, mb: 0.5 }}
+                                    />
+                                  ))}
+                                </Box>
+                              ) : (
+                                <Typography variant="body2">
+                                  No folders
+                                </Typography>
+                              )}
+                            </Box>
+                            <IconButton
+                              size="small"
+                              onClick={async () => {
+                                setEditingGoogleDriveFoldersUserId(user.userId);
+                                setGoogleDriveFolderEntries(
+                                  user.googleDriveFolders && user.googleDriveFolders.length > 0
+                                    ? user.googleDriveFolders.map((f: { folderId: string; name: string }) => ({ folderId: f.folderId, name: f.name }))
+                                    : []
+                                );
+                                setGoogleDriveFoldersDialogOpen(true);
+                                // Fetch available folders from Google Drive
+                                setGoogleDriveFoldersListLoading(true);
+                                try {
+                                  const response = await axios.get(
+                                    buildApiUrl("/api/admin/google-drive-folders"),
+                                    { headers: { Authorization: `Bearer ${token}` } }
+                                  );
+                                  setAvailableGoogleDriveFolders(response.data.folders || []);
+                                } catch (err) {
+                                  console.error("Error fetching Google Drive folders:", err);
+                                  setAvailableGoogleDriveFolders([]);
+                                } finally {
+                                  setGoogleDriveFoldersListLoading(false);
+                                }
+                              }}
+                              disabled={googleDriveFoldersEditLoading}
                             >
                               <EditIcon />
                             </IconButton>
@@ -5485,6 +5589,104 @@ export default function AdminDashboard() {
             disabled={seoDomainsEditLoading}
           >
             {seoDomainsEditLoading ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Google Drive Shared Folders Dialog */}
+      <Dialog
+        open={googleDriveFoldersDialogOpen}
+        onClose={() => {
+          setGoogleDriveFoldersDialogOpen(false);
+          setEditingGoogleDriveFoldersUserId(null);
+          setGoogleDriveFolderEntries([]);
+          setAvailableGoogleDriveFolders([]);
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          Configure Google Drive Shared Folders
+          <IconButton
+            aria-label="close"
+            onClick={() => {
+              setGoogleDriveFoldersDialogOpen(false);
+              setEditingGoogleDriveFoldersUserId(null);
+              setGoogleDriveFolderEntries([]);
+            }}
+            sx={{
+              position: 'absolute',
+              right: 8,
+              top: 8,
+            }}
+          >
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Select folders that have been shared with the service account. These folders will appear on the customer&apos;s Knowledge Base page.
+          </Typography>
+          {googleDriveFoldersListLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}>
+              <CircularProgress size={24} />
+              <Typography variant="body2" sx={{ ml: 2 }}>Loading folders from Google Drive...</Typography>
+            </Box>
+          ) : availableGoogleDriveFolders.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 2, textAlign: "center" }}>
+              No folders found. Make sure folders have been shared with the service account.
+            </Typography>
+          ) : (
+            <Box>
+              {availableGoogleDriveFolders.map((folder) => {
+                const isSelected = googleDriveFolderEntries.some((e) => e.folderId === folder.folderId);
+                return (
+                  <FormControlLabel
+                    key={folder.folderId}
+                    control={
+                      <Checkbox
+                        checked={isSelected}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setGoogleDriveFolderEntries([...googleDriveFolderEntries, { folderId: folder.folderId, name: folder.name }]);
+                          } else {
+                            setGoogleDriveFolderEntries(googleDriveFolderEntries.filter((entry) => entry.folderId !== folder.folderId));
+                          }
+                        }}
+                        disabled={googleDriveFoldersEditLoading}
+                      />
+                    }
+                    label={
+                      <Box>
+                        <Typography variant="body2">{folder.name}</Typography>
+                        <Typography variant="caption" color="text.secondary">{folder.folderId}</Typography>
+                      </Box>
+                    }
+                    sx={{ display: "flex", alignItems: "flex-start", mb: 1, width: "100%" }}
+                  />
+                );
+              })}
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button
+            onClick={() => {
+              setGoogleDriveFoldersDialogOpen(false);
+              setEditingGoogleDriveFoldersUserId(null);
+              setGoogleDriveFolderEntries([]);
+            }}
+            disabled={googleDriveFoldersEditLoading}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={handleSaveGoogleDriveFolders}
+            color="primary"
+            variant="contained"
+            disabled={googleDriveFoldersEditLoading}
+          >
+            {googleDriveFoldersEditLoading ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
       </Dialog>

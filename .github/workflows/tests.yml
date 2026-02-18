@@ -84,23 +84,30 @@ jobs:
         run: npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary
 
       - name: Post coverage comment on PR
+        if: always() && steps.filter.outcome != 'skipped'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const coverage = JSON.parse(fs.readFileSync('backend/coverage/coverage-summary.json', 'utf8'));
+            const coveragePath = 'backend/coverage/coverage-summary.json';
+            if (!fs.existsSync(coveragePath)) {
+              console.log('Coverage summary not found, skipping comment');
+              return;
+            }
+            const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
             const { statements, branches, functions, lines } = coverage.total;
+            const allMet = statements.pct >= 90 && branches.pct >= 90 && functions.pct >= 90 && lines.pct >= 90;
 
             const body = `## 📊 Backend Test Coverage
 
-            | Metric | Coverage | Threshold |
-            |--------|----------|-----------|
-            | Statements | ${statements.pct}% | 90% |
-            | Branches | ${branches.pct}% | 90% |
-            | Functions | ${functions.pct}% | 90% |
-            | Lines | ${lines.pct}% | 90% |
+            | Metric | Coverage | Threshold | Status |
+            |--------|----------|-----------|--------|
+            | Statements | ${statements.pct}% | 90% | ${statements.pct >= 90 ? '✅' : '❌'} |
+            | Branches | ${branches.pct}% | 90% | ${branches.pct >= 90 ? '✅' : '❌'} |
+            | Functions | ${functions.pct}% | 90% | ${functions.pct >= 90 ? '✅' : '❌'} |
+            | Lines | ${lines.pct}% | 90% | ${lines.pct >= 90 ? '✅' : '❌'} |
 
-            ${branches.pct >= 90 ? '✅' : '❌'} **All thresholds must be ≥ 90%**`;
+            ${allMet ? '✅' : '❌'} **All thresholds must be ≥ 90%**`;
 
             // Find existing coverage comment
             const { data: comments } = await github.rest.issues.listComments({

@@ -519,6 +519,7 @@ Critical environment variables:
 Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Google/Search` - Google Custom Search API
 - `dev/AgentWeb/Google/SearchConsole` - Google Search Console service account JSON
+- `dev/AgentWeb/Google/Share` - Google Drive service account JSON for shared folders
 - `prod/AgentWeb/Google/PageSpeed` - PageSpeed Insights API key
 - `dev/AgentWeb/BaseHub` - BaseHub CMS credentials
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
