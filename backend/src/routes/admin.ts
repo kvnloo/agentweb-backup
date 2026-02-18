@@ -730,6 +730,88 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
   }
 });
 
+// List all folders accessible to the Google Drive service account
+router.get("/google-drive-folders", async (req, res) => {
+  try {
+    const { getSecret } = await import("../utils/secretsManager");
+    const { google } = await import("googleapis");
+
+    const environment = process.env.NODE_ENV || "development";
+    const secretName = environment === "production"
+      ? "prod/AgentWeb/Google/Share"
+      : "dev/AgentWeb/Google/Share";
+
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString);
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+    });
+
+    const drive = google.drive({ version: "v3", auth });
+
+    // List all folders shared with the service account
+    const response = await drive.files.list({
+      q: "mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+      fields: "files(id, name)",
+      orderBy: "name",
+      pageSize: 100,
+    });
+
+    const folders = (response.data.files || []).map((f) => ({
+      folderId: f.id,
+      name: f.name,
+    }));
+
+    res.json({ folders });
+  } catch (error) {
+    console.error("Error listing Google Drive folders:", error);
+    res.status(500).json({ message: "Failed to list Google Drive folders" });
+  }
+});
+
+// Update user Google Drive shared folders
+router.put("/users/:userId/google-drive-folders", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { googleDriveFolders } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Validate googleDriveFolders is an array
+    if (!Array.isArray(googleDriveFolders)) {
+      return res.status(400).json({ message: "googleDriveFolders must be an array" });
+    }
+
+    // Validate each entry has folderId and name
+    for (const folder of googleDriveFolders) {
+      if (!folder.folderId || typeof folder.folderId !== 'string' || !folder.folderId.trim()) {
+        return res.status(400).json({ message: "Each folder must have a non-empty folderId string" });
+      }
+      if (!folder.name || typeof folder.name !== 'string' || !folder.name.trim()) {
+        return res.status(400).json({ message: "Each folder must have a non-empty name string" });
+      }
+    }
+
+    // Sanitize entries
+    const sanitizedFolders = googleDriveFolders.map((f: { folderId: string; name: string }) => ({
+      folderId: f.folderId.trim(),
+      name: f.name.trim(),
+    }));
+
+    const updatedUser = await userDb.updateUser(userId, { googleDriveFolders: sanitizedFolders });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating user Google Drive folders:", error);
+    res.status(500).json({ message: "Error updating Google Drive folders" });
+  }
+});
+
 // Update user CMS Type
 router.put("/users/:userId/cms-type", async (req, res) => {
   try {

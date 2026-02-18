@@ -82,7 +82,10 @@
       "WebFetch(domain:elasticbeanstalk-us-west-2-992382574572.s3.us-west-2.amazonaws.com)",
       "Bash(unzip:*)",
       "Bash(aws dynamodb query:*)",
-      "Bash(aws dynamodb scan:*)"
+      "Bash(aws dynamodb scan:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.cloud.google.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

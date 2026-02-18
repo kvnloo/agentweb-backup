@@ -87,6 +87,7 @@ export interface User {
       color: string;
     }>;
   }; // User journey funnel configuration for SEO analytics
+  googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folder IDs
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   companyName?: string;
   useCaseCategories?: string[];

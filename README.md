@@ -125,6 +125,61 @@ Example usage in Agent Mode:
 List all available knowledge base files and then read the file about product specifications.
 ```
 
+### Google Drive Integration
+
+AgentWeb supports accessing Google Drive files as part of the knowledge base. The platform integrates with the Google Drive API directly using a service account.
+
+**Step 1: Enable the Google Drive API**
+
+1. Go to the [Google Cloud Console API Library](https://console.cloud.google.com/apis/library)
+2. Select the **knowledge-base** project from the project dropdown at the top
+3. Search for "Google Drive API" and click on it
+4. Click **Enable** (if not already enabled)
+
+**Step 2: Create a service account**
+
+1. Go to [IAM & Admin > Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts) and select the **knowledge-base** project
+2. Click **+ Create Service Account**
+3. Enter the name `agentweb-dev` (development) or `agentweb-prod` (production) and click **Create and Continue**
+4. Skip the optional role grants and click **Done**
+5. The service account emails will be:
+   - Dev: `agentweb-dev@knowledge-base.iam.gserviceaccount.com`
+   - Prod: `agentweb-prod@knowledge-base.iam.gserviceaccount.com`
+
+**Note:** If key creation is blocked with the error "Google automatically disables service account keys detected in public repositories", you need to disable the org policy first:
+
+1. Go to [IAM & Admin > Organization Policies](https://console.cloud.google.com/iam-admin/orgpolicies) and select the **knowledge-base** project
+2. Search for `iam.disableServiceAccountKeyCreation`
+3. Click on the policy, then click **Manage Policy**
+4. Set the policy source to **Override parent's policy**
+5. Under **Rules**, click **Add Rule**, set **Enforcement** to **Off**
+6. Click **Done**, then **Set Policy**
+
+Then return to the service account's **Keys** tab and create the key:
+
+6. Click **Add Key > Create new key > JSON** and download the key file
+7. Store the key JSON in AWS Secrets Manager:
+   - Dev: `dev/AgentWeb/Google/Share`
+   - Prod: `prod/AgentWeb/Google/Share`
+
+**Step 3: Share Google Drive folders with the service account**
+
+1. Open [Google Drive](https://drive.google.com) in your browser
+2. Right-click the folder you want to share and select **Share**
+3. Paste the service account email (`agentweb-dev@knowledge-base.iam.gserviceaccount.com` or `agentweb-prod@knowledge-base.iam.gserviceaccount.com`) and grant **Viewer** access (or **Editor** if write access is needed)
+4. Copy the folder ID from the URL — it's the string after `/folders/` (e.g., in `https://drive.google.com/drive/folders/1ABC2DEF3GHI`, the folder ID is `1ABC2DEF3GHI`)
+
+**Step 4: Configure shared folders in the Admin Dashboard**
+
+1. Go to the Admin Dashboard > **Users** tab
+2. Find the target customer and click the edit icon on the **Shared Folders** column
+3. Enter each folder's ID (from Step 3) and a display name (e.g., "Marketing Assets")
+4. Click **Save**
+
+Customers can then view their configured shared folders on the Knowledge Base page, with direct links to open each folder in Google Drive.
+
+> **Note:** Google's official MCP server list is at https://github.com/Google/mcp. The [Google Workspace MCP server](https://github.com/gemini-cli-extensions/workspace) was evaluated but requires interactive OAuth browser login (incompatible with service account / headless agent engine). It may be adopted in the future when per-user OAuth MCP sessions are supported. See `dev.md` for details.
+
 ### Social Media Functions
 
 In Agent Mode, Emma can create social media posts using the following function call:

@@ -1,3 +1,31 @@
+# February 18, 2026: Google Drive Integration — MCP vs Direct API
+
+## Investigation
+Explored options for integrating Google Drive into the knowledge base:
+
+1. **Anthropic's `@anthropic-ai/google-drive-mcp`** — archived, no longer maintained
+2. **Google Workspace MCP server** ([gemini-cli-extensions/workspace](https://github.com/gemini-cli-extensions/workspace)) — found via Google's official MCP list at https://github.com/Google/mcp
+   - Provides Drive, Docs, Sheets, Slides, Calendar, Gmail, and Chat access
+   - Uses OAuth with a built-in client ID — authenticates as a real Google user via browser login
+   - **Incompatible with service account approach**: the admin-configured "shared folders" model requires a service account that has access to specific folders shared with it. The Workspace MCP server authenticates as the end user, so scoping access to admin-designated folders doesn't work.
+   - Also requires an interactive browser session on first auth, which doesn't work headlessly on the agent engine
+3. **`googleapis/gcloud-mcp`** — only covers GCP infrastructure (gcloud CLI, observability, Cloud Storage buckets), not Google Drive
+
+## Decision
+Integrate with the Google Drive API directly using a service account rather than relying on an MCP server. This allows:
+- Admin configures folder IDs shared with the service account → stored on the user record
+- Backend reads files from those folders via the Drive API using service account credentials
+- No interactive browser login needed — works headlessly on the agent engine
+- Access is scoped to only the folders explicitly shared by the admin
+
+The Google Workspace MCP server can be reconsidered in the future if per-user OAuth MCP sessions are supported (see Feb 12 ClickUp investigation for similar pattern), or if a service-account-compatible Drive MCP server becomes available.
+
+## Current State
+- Admin endpoint and UI for configuring shared folder IDs on user records: done
+- Customer portal Knowledge Base page shows configured folders with Drive links: done
+- Direct Drive API integration for listing/reading files: TODO
+
+
 # February 17, 2026: Foundation Tools Blocked by Subscription Filtering
 
 ## Problem
