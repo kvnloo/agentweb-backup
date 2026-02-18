@@ -51,7 +51,10 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
     jest.clearAllMocks();
   });
 
-  it('should filter function calls based on subscription for non-admin users', async () => {
+  it('should include foundation tools for non-admin users even when not in subscription', async () => {
+    // getAllowedFunctionCalls returns only 'generate_image' — does NOT include 'search_web'
+    mockedGetAllowed.mockResolvedValueOnce(['generate_image']);
+
     const req = {
       user: { userId: 'user-1', isAdmin: false },
     } as unknown as Request;
@@ -59,16 +62,36 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
 
     await agentModeController.getAvailableFunctionCalls(req, res);
 
-    // Should have used subscriptionService helpers
-    expect(mockedGetAllowed).toHaveBeenCalledWith('user-1');
+    // filterFunctionCalls should have been called with foundation tools added to allowed list
     expect(mockedFilter).toHaveBeenCalled();
+    const allowedArg = mockedFilter.mock.calls[0][1];
+    expect(allowedArg).toContain('generate_image');
+    expect(allowedArg).toContain('search_web'); // Foundation tool injected
 
-    // Response should only contain the allowed function
-    expect(res.json).toHaveBeenCalledWith({
-      functionCalls: [
+    // Response should contain both the subscription tool and the foundation tool
+    const response = (res.json as jest.Mock).mock.calls[0][0];
+    expect(response.functionCalls).toEqual(
+      expect.arrayContaining([
         { name: 'generate_image', description: 'Generate images' },
-      ],
-    });
+        { name: 'search_web', description: 'Search the web' },
+      ])
+    );
+  });
+
+  it('should not duplicate foundation tools if already in subscription', async () => {
+    // getAllowedFunctionCalls already includes 'search_web'
+    mockedGetAllowed.mockResolvedValueOnce(['generate_image', 'search_web']);
+
+    const req = {
+      user: { userId: 'user-1', isAdmin: false },
+    } as unknown as Request;
+    const res = makeRes();
+
+    await agentModeController.getAvailableFunctionCalls(req, res);
+
+    const allowedArg = mockedFilter.mock.calls[0][1];
+    const searchWebCount = allowedArg.filter((n: string) => n === 'search_web').length;
+    expect(searchWebCount).toBe(1); // Not duplicated
   });
 
   it('should return all function calls for admin users (no subscription filtering)', async () => {
@@ -93,7 +116,7 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
     });
   });
 
-  it('should exclude foundation tools when forSkillConfig=true', async () => {
+  it('should not exclude foundation tools even with forSkillConfig=true', async () => {
     const req = {
       user: { userId: 'admin-1', isAdmin: true },
       query: { forSkillConfig: 'true' },
@@ -102,13 +125,13 @@ describe('agentModeController.getAvailableFunctionCalls subscription behaviour',
 
     await agentModeController.getAvailableFunctionCalls(req, res);
 
-    // Foundation tools (search_web) should be excluded
-    expect(res.json).toHaveBeenCalledWith({
-      functionCalls: [
-        { name: 'generate_image', description: 'Generate images' },
-        { name: 'generate_video', description: 'Generate videos' },
-      ],
-    });
+    // Foundation tools should NOT be excluded — forSkillConfig filter was removed
+    const response = (res.json as jest.Mock).mock.calls[0][0];
+    expect(response.functionCalls).toEqual(
+      expect.arrayContaining([
+        { name: 'search_web', description: 'Search the web' },
+      ])
+    );
   });
 
   it('should include foundation tools when forSkillConfig is not set', async () => {

@@ -2568,7 +2568,7 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { enabled, instruction } = req.body;
+    const { enabled, instruction, autoSendEnabled } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -2580,6 +2580,10 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
 
     if (instruction !== undefined && typeof instruction !== 'string') {
       return res.status(400).json({ message: 'instruction must be a string' });
+    }
+
+    if (autoSendEnabled !== undefined && typeof autoSendEnabled !== 'boolean') {
+      return res.status(400).json({ message: 'autoSendEnabled must be a boolean' });
     }
 
     const normalizedInstruction = typeof instruction === 'string' ? instruction.trim() : undefined;
@@ -2598,7 +2602,8 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
 
     const updatedList = await crmDb.updateLeadList(listId, {
       autoDraftEnabled: enabled,
-      ...(normalizedInstruction !== undefined ? { autoDraftInstruction: normalizedInstruction } : {})
+      ...(normalizedInstruction !== undefined ? { autoDraftInstruction: normalizedInstruction } : {}),
+      ...(autoSendEnabled !== undefined ? { autoSendEnabled } : {})
     });
 
     if (!updatedList) {
@@ -2609,6 +2614,7 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
       success: true,
       autoDraftEnabled: updatedList.autoDraftEnabled === true,
       autoDraftInstruction: typeof updatedList.autoDraftInstruction === 'string' ? updatedList.autoDraftInstruction : '',
+      autoSendEnabled: updatedList.autoSendEnabled === true,
       message: `Auto draft ${enabled ? 'enabled' : 'disabled'} successfully`
     });
   } catch (error: any) {

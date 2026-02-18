@@ -50,7 +50,8 @@ router.get('/me', authenticateToken, async (req, res) => {
     if (authenticatedReq.delegateInfo) {
       response.delegateInfo = {
         isDelegated: true,
-        adminEmail: authenticatedReq.delegateInfo.adminEmail
+        adminEmail: authenticatedReq.delegateInfo.adminEmail,
+        adminUserId: authenticatedReq.delegateInfo.adminUserId
       };
     }
 

@@ -438,13 +438,36 @@ Uses browser-use library with Playwright:
 ### Deployment Targets
 
 **Production:**
-- Backend: AWS Elastic Beanstalk (Node.js platform) → `https://api.agentweb.pro`
+- Backend: AWS Elastic Beanstalk (Node.js platform), environment `Agentweb-backend-env-prod-3` → `https://api.agentweb.pro`
 - Partner Portal: AWS Elastic Beanstalk → `https://agentweb.pro`
 - Agent Engine: Google Cloud VM (manually deployed)
 
 **Staging:**
-- Backend: AWS Elastic Beanstalk → `https://api-stage.agentweb.pro`
+- Backend: AWS Elastic Beanstalk, environment `Agentweb-backend-env-1` → `https://api-stage.agentweb.pro`
 - Frontend: Run locally pointing to staging backend
+
+### Checking Production Backend Logs
+
+To check logs from the production backend:
+
+```bash
+# Request and retrieve tail logs (last ~100 lines per log file per instance)
+aws elasticbeanstalk request-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail
+sleep 5
+aws elasticbeanstalk retrieve-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail
+
+# Request and retrieve full bundle logs (complete log files as zip)
+aws elasticbeanstalk request-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type bundle
+sleep 15
+aws elasticbeanstalk retrieve-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type bundle
+```
+
+The retrieve commands return S3 URLs for each instance. Download and inspect:
+- `web.stdout.log` - Node.js application logs (main process + worker)
+- `nginx/access.log` - HTTP request logs
+- `nginx/error.log` - Nginx error/warning logs
+
+**Note:** EB logs rotate frequently. For investigating sessions, query DynamoDB directly (`AW-ChatSessions` table) by `sessionId` to get session state, work plan status, messages, and error fields. For scheduled sessions, also check the `runResults` field on `AW-TaskSchedules`.
 
 ### Manual Deployment
 
@@ -518,7 +541,7 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 - Backend, partner-portal, and customer-portal have independent versioning in their `package.json`
 - Always bump version before merging to main for production deployment
-- Version format: `X.Y` (e.g., `26.9`, `27.0`). When the minor version reaches 10, bump the major version and reset minor to 0. For example: `26.9` → `27.0`, NOT `26.10`. Similarly: `16.9` → `17.0`.
+- Version format: `X.Y.Z` (semver: major.minor.patch). Bump the **minor** version for each release and reset patch to 0 (e.g., `27.7.0` → `27.8.0`). Only bump patch for hotfixes. When the minor version reaches 10, bump the major version and reset minor to 0. For example: `27.9.0` → `28.0.0`, NOT `27.10.0`.
 - No version bump needed for staging deployments (PRs)
 
 ### DynamoDB Query Optimization

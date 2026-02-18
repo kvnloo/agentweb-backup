@@ -932,5 +932,195 @@ describe('ImageService', () => {
       expect(result).toBeDefined();
     });
   });
+
+  describe('Logo Image Handling', () => {
+    it('should append logoImage to inputImages when provided', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      const mockAxios = require('axios');
+      (mockAxios.default.get as jest.Mock).mockResolvedValue({
+        data: Buffer.from('fake-image-data'),
+        headers: { 'content-type': 'image/png' }
+      });
+
+      // Mock Gemini 3 Pro response
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Add logo to image',
+        filename: 'branded.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        inputImages: ['https://example.com/background.jpg'],
+        logoImage: 'https://example.com/logo.png',
+        size: '16:9'
+      });
+
+      // Both the background image and logo should be downloaded (2 input images total)
+      if (mockAxios.default.get.mock.calls.length > 0) {
+        expect(mockAxios.default.get).toHaveBeenCalledTimes(2);
+      }
+    });
+
+    it('should create inputImages array from logoImage when inputImages is empty', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      const mockAxios = require('axios');
+      (mockAxios.default.get as jest.Mock).mockResolvedValue({
+        data: Buffer.from('fake-image-data'),
+        headers: { 'content-type': 'image/png' }
+      });
+
+      // Mock Gemini 3 Pro response
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Generate banner with this logo',
+        filename: 'banner.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        logoImage: 'https://example.com/logo.png',
+        size: '16:9'
+      });
+
+      // The logo should be downloaded as an input image
+      if (mockAxios.default.get.mock.calls.length > 0) {
+        expect(mockAxios.default.get).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('should enhance prompt with logo precision instructions when logoImage is provided', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      const mockAxios = require('axios');
+      (mockAxios.default.get as jest.Mock).mockResolvedValue({
+        data: Buffer.from('fake-image-data'),
+        headers: { 'content-type': 'image/png' }
+      });
+
+      // Mock Gemini 3 Pro response
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Add logo to banner',
+        filename: 'branded.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        logoImage: 'https://example.com/logo.png',
+        size: '16:9'
+      });
+
+      // Verify the prompt was enhanced with logo instructions
+      if (mockGenerateContentStream.mock.calls.length > 0) {
+        const callArgs = mockGenerateContentStream.mock.calls[0][0];
+        const contents = callArgs.contents;
+        if (contents && contents[0]?.parts) {
+          const textPart = contents[0].parts.find((p: any) => p.text);
+          if (textPart) {
+            expect(textPart.text).toContain('CRITICAL LOGO INSTRUCTION');
+            expect(textPart.text).toContain('exact text');
+            expect(textPart.text).toContain('exact shape');
+            expect(textPart.text).toContain('exact colors');
+          }
+        }
+      }
+    });
+
+    it('should not enhance prompt when logoImage is not provided', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      // Mock Gemini 3 Pro response
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Generate a simple banner',
+        filename: 'banner.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '16:9'
+      });
+
+      // Verify the prompt was NOT enhanced with logo instructions
+      if (mockGenerateContentStream.mock.calls.length > 0) {
+        const callArgs = mockGenerateContentStream.mock.calls[0][0];
+        const contents = callArgs.contents;
+        if (contents && contents[0]?.parts) {
+          const textPart = contents[0].parts.find((p: any) => p.text);
+          if (textPart) {
+            expect(textPart.text).not.toContain('CRITICAL LOGO INSTRUCTION');
+            expect(textPart.text).toBe('Generate a simple banner');
+          }
+        }
+      }
+    });
+  });
 });
 

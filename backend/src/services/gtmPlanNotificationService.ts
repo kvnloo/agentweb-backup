@@ -309,7 +309,7 @@ export async function sendPhaseStatusReport(
 
       return `
         <tr>
-          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.title}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.title}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${item.description}</div>` : ''}</td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">
             <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
               ${item.status}
@@ -317,6 +317,7 @@ export async function sendPhaseStatusReport(
           </td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${item.notes || '-'}</td>
         </tr>
       `;
     }).join('');
@@ -357,6 +358,7 @@ export async function sendPhaseStatusReport(
               <th style="padding: 12px; text-align: left;">Status</th>
               <th style="padding: 12px; text-align: left;">Due Date</th>
               <th style="padding: 12px; text-align: left;">PoC</th>
+              <th style="padding: 12px; text-align: left;">Notes</th>
             </tr>
           </thead>
           <tbody>
@@ -406,7 +408,7 @@ ${workItems.length > 0
             });
           })()
         : '-';
-      return `- ${item.title} | Status: ${item.status} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}`;
+      return `- ${item.title}${item.description ? ` | Description: ${item.description}` : ''} | Status: ${item.status} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}${item.notes ? `\n  Notes: ${item.notes}` : ''}`;
     }).join('\n')
   : 'No work items in this phase.'}
 
@@ -516,7 +518,7 @@ export async function sendPlanStatusReport(
 
         return `
           <tr>
-            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; padding-left: 24px;">${item.title}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; padding-left: 24px;">${item.title}${item.description ? `<div style="color: #666; font-size: 12px; margin-top: 4px;">${item.description}</div>` : ''}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">
               <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
                 ${item.status}
@@ -524,6 +526,7 @@ export async function sendPlanStatusReport(
             </td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e0e0e0; font-size: 13px; color: #555; white-space: pre-wrap;">${item.notes || '-'}</td>
           </tr>
         `;
       }).join('');
@@ -565,6 +568,7 @@ export async function sendPlanStatusReport(
                 <th style="padding: 10px; text-align: left;">Status</th>
                 <th style="padding: 10px; text-align: left;">Due Date</th>
                 <th style="padding: 10px; text-align: left;">PoC</th>
+                <th style="padding: 10px; text-align: left;">Notes</th>
               </tr>
             </thead>
             <tbody>
@@ -663,7 +667,7 @@ ${phases.length > 0
                   });
                 })()
               : '-';
-            return `  - ${item.title} | Status: ${item.status} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}`;
+            return `  - ${item.title}${item.description ? ` | Description: ${item.description}` : ''} | Status: ${item.status} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}${item.notes ? `\n    Notes: ${item.notes}` : ''}`;
           }).join('\n')
         : '  (No work items)';
       return `${phaseInfo}\n${workItemsText}`;

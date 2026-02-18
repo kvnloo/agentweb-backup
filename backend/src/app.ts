@@ -35,6 +35,7 @@ import connectedAccountsRoutes from "./routes/connectedAccounts";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
+import landingPagesRoutes from "./routes/landingPages";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -155,6 +156,7 @@ app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
+app.use("/api/landing-pages", landingPagesRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);

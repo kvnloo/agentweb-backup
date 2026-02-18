@@ -37,6 +37,7 @@ interface User {
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
+  secretNames?: string[]; // Names of configured secrets (values not exposed)
   seoDomains?: string[]; // SEO domains to track
   googleAnalyticsPropertyId?: string; // Google Analytics Property ID
   gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics
@@ -44,6 +45,7 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  replayUrl?: string; // Microsoft Clarity replay session URL
 }
 
 interface AdminContextType {

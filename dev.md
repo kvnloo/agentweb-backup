@@ -1,3 +1,40 @@
+# February 17, 2026: Foundation Tools Blocked by Subscription Filtering
+
+## Problem
+Scheduled chats failing with "required function calls are not allowed by your subscription" for `search_web` and other foundation tools. Multiple customer error emails sent. Additionally, foundation tools were hidden from the Skills config page and the customer-portal scheduled chat config, making them impossible to assign or select.
+
+## Root Cause
+Foundation tools (`search_web`, `read_file_content`, etc.) were never added to the allowed list returned by `getAllowedFunctionCalls()` in `subscriptionService.ts`. Three places were affected:
+1. **Scheduled chat pre-flight check** (`agentModeController.ts:744`) — rejected foundation tools as disallowed
+2. **`/api/agent-mode/function-calls` endpoint** — `filterFunctionCalls` stripped foundation tools for non-admin users, hiding them from customer-portal scheduled chat config
+3. **Skills page** (`Skills.tsx`) — `?forSkillConfig=true` query param triggered a backend filter excluding foundation tools, preventing them from being assigned to skills
+
+Bug introduced Dec 14, 2025 (`5bc0ad80`) but only surfaced after Feb 14, 2026 (`90005233`) when skills-based subscriptions replaced wildcard subscriptions.
+
+## Fix
+1. Scheduled chat check: filter out foundation tools from the disallowed list using `agentModeService.getFoundationToolNames()`
+2. `getAvailableFunctionCalls` endpoint: inject foundation tools into the allowed list before filtering for non-admin users
+3. Removed the `forSkillConfig` backend filter and frontend query param so all tools (including foundation) appear on the Skills page
+
+Backend 27.6.4, partner-portal 12.7.2. Unit tests updated.
+
+
+# February 16, 2026: Scheduled Chat Silent Failure Bug
+
+## Problem
+Session `097840bc-7338-4a09-8c90-bf112230e17b` ("What's Up with AI Daily") completed steps 1–4 of its work plan but step 5 ("Publish to LinkedIn") never executed. No error was recorded — messages array was empty, no run result saved, no email sent.
+
+## Root Cause
+In `agentModeController.ts`, the `runScheduledChat()` promise's `.catch()` handler (line ~3449) only called `console.error`. It never saved a failure `runResult` to DynamoDB or sent an error notification email. Runtime crashes (LLM timeouts, network errors) were silently lost.
+
+## Fix
+Added to the `.catch()` block:
+1. Save a failure `runResult` via `scheduleDb.addRunResult()` so failures are visible in the UI
+2. Send error notification email to configured recipients
+
+Backend version bumped to 27.5.3. Unit test added to cover the new behavior.
+
+
 # February 12, 2026: ClickUp Integration via MCP
 
 ## Investigation

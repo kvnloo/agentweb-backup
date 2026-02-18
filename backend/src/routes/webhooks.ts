@@ -6,6 +6,7 @@ import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
+import { resendService } from '../services/resendService';
 
 const router = express.Router();
 
@@ -240,62 +241,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       isNew = true;
     }
 
-    // Auto-create drafts for new and updated leads (non-blocking); skip unchanged duplicates
-    let autoDraftStatus: 'queued' | undefined;
-    let autoDraftError: string | undefined;
-    if ((isNew || isUpdated) && leadList.autoDraftEnabled === true) {
-      autoDraftStatus = 'queued';
-      const sourceLabel = String(mergedCustomFields.source || 'API form submission');
-      const configuredInstruction = typeof leadList.autoDraftInstruction === 'string'
-        ? leadList.autoDraftInstruction.trim()
-        : '';
-      const autoDraftInstruction = `Create an initial outreach message for this new lead from ${sourceLabel}. Keep it concise, personalized, and include a clear next step.${configuredInstruction ? `\n\nAdditional instruction:\n${configuredInstruction}` : ''}`;
-      const autoDraftSessionId = `auto_draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-      // Fire-and-forget so API response is not blocked by draft generation latency.
-      void (async () => {
-        try {
-          const autoDraftResult = await agentModeService.updateEmailDraftForLead(
-            leadList.listId,
-            lead.leadId,
-            autoDraftInstruction,
-            autoDraftSessionId,
-            leadList.userId,
-            'text'
-          );
-          if (!autoDraftResult?.success) {
-            console.error('Auto draft creation failed:', autoDraftResult?.error || autoDraftResult?.message || 'Unknown auto-draft error');
-          }
-        } catch (draftError: any) {
-          console.error('Auto draft creation failed:', draftError?.message || 'Unknown auto-draft error');
-        }
-      })();
-    }
-
-    // Trigger alerts: api.lead_added for new, api.lead_updated for merged, nothing for no-op
-    if (isNew || isUpdated) {
-      const alertEventType = isUpdated ? 'api.lead_updated' : 'api.lead_added';
-      try {
-        await leadListAlertService.notifyLeadListOwnerIfConfigured(
-          leadList,
-          lead,
-          alertEventType,
-          {
-            source: mergedCustomFields.source,
-            forwardedAt: mergedCustomFields.forwardedAt,
-            company: leadData.company,
-            phone: leadData.phone,
-            ...(autoDraftStatus ? { autoDraftStatus } : {}),
-            ...(autoDraftError ? { autoDraftError } : {}),
-          },
-          new Date().toISOString()
-        );
-      } catch (alertError) {
-        console.error(`Failed to send ${alertEventType} alert:`, alertError);
-        // Don't fail the request if alert fails
-      }
-    }
-
+    // Send API response immediately so caller is not blocked
     if (isNew) {
       res.status(201).json({
         success: true,
@@ -320,6 +266,135 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
         leadId: lead.leadId,
         listId: leadList.listId
       });
+    }
+
+    // After response is sent: auto-draft, auto-send, and alert (fire-and-forget, fully awaited internally)
+    if (isNew || isUpdated) {
+      void (async () => {
+        try {
+          let autoDraftStatus: string | undefined;
+          let autoDraftError: string | undefined;
+          let autoSendStatus: string | undefined;
+
+          if (leadList.autoDraftEnabled === true) {
+            const sourceLabel = String(mergedCustomFields.source || 'API form submission');
+            const configuredInstruction = typeof leadList.autoDraftInstruction === 'string'
+              ? leadList.autoDraftInstruction.trim()
+              : '';
+            const autoDraftInstruction = `Create an initial outreach message for this new lead from ${sourceLabel}. Keep it concise, personalized, and include a clear next step.${configuredInstruction ? `\n\nAdditional instruction:\n${configuredInstruction}` : ''}`;
+            const autoDraftSessionId = `auto_draft_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+            try {
+              const autoDraftResult = await agentModeService.updateEmailDraftForLead(
+                leadList.listId,
+                lead.leadId,
+                autoDraftInstruction,
+                autoDraftSessionId,
+                leadList.userId,
+                'text'
+              );
+              if (!autoDraftResult?.success) {
+                const errMsg = autoDraftResult?.error || autoDraftResult?.message || 'Unknown auto-draft error';
+                console.error('Auto draft creation failed:', errMsg);
+                autoDraftStatus = 'failed';
+                autoDraftError = errMsg;
+              } else {
+                autoDraftStatus = 'created';
+
+                // Auto-send the draft if enabled
+                if (leadList.autoSendEnabled === true && autoDraftResult?.data?.email) {
+                  const draftEmail = autoDraftResult.data.email;
+                  const leadEmail = lead.email;
+
+                  if (!leadEmail) {
+                    console.error('Auto send skipped: lead has no email address');
+                    autoSendStatus = 'skipped_no_email';
+                  } else {
+                    // Check if an email was already auto-sent to this lead today
+                    const freshLead = await crmDb.getLeadById(leadList.listId, lead.leadId);
+                    if (freshLead?.lastAutoSendAt) {
+                      const lastSendDate = new Date(freshLead.lastAutoSendAt).toDateString();
+                      const todayDate = new Date().toDateString();
+                      if (lastSendDate === todayDate) {
+                        console.log(`Auto send skipped: email already sent today to lead ${lead.leadId} in list ${leadList.listId}`);
+                        autoSendStatus = 'skipped_already_sent_today';
+                      }
+                    }
+
+                    if (!autoSendStatus) {
+                      // Resolve sender
+                      const sendersResult = await agentModeService.getCrmSenders(leadList.userId);
+                      let senderEmail: string | undefined;
+                      let senderFromName: string | undefined;
+
+                      if (sendersResult?.success && sendersResult.senders.length > 0) {
+                        const sender = (leadList.listSenderId
+                          ? sendersResult.senders.find((s: any) => s.id === leadList.listSenderId)
+                          : null)
+                          || (sendersResult.defaultSenderId
+                            ? sendersResult.senders.find((s: any) => s.id === sendersResult.defaultSenderId)
+                            : null)
+                          || sendersResult.senders[0];
+
+                        if (sender) {
+                          senderEmail = sender.email;
+                          senderFromName = sender.fromName;
+                        }
+                      }
+
+                      if (!senderEmail || !senderFromName) {
+                        console.error('Auto send skipped: no sender configured for user', leadList.userId);
+                        autoSendStatus = 'skipped_no_sender';
+                      } else {
+                        try {
+                          const from = `${senderFromName} <${senderEmail}>`;
+                          await resendService.sendEmail({
+                            from,
+                            to: leadEmail,
+                            subject: draftEmail.subject,
+                            text: draftEmail.textContent,
+                            html: draftEmail.htmlContent,
+                          });
+                          await crmDb.updateLead(leadList.listId, lead.leadId, { emailDraft: null, lastAutoSendAt: new Date().toISOString() });
+                          console.log(`Auto send succeeded for lead ${lead.leadId} in list ${leadList.listId}`);
+                          autoSendStatus = 'sent';
+                        } catch (sendError: any) {
+                          console.error('Auto send failed:', sendError?.message || 'Unknown auto-send error');
+                          autoSendStatus = 'failed';
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (draftError: any) {
+              console.error('Auto draft creation failed:', draftError?.message || 'Unknown auto-draft error');
+              autoDraftStatus = 'failed';
+              autoDraftError = draftError?.message || 'Unknown error';
+            }
+          }
+
+          // Send alert with accurate draft/send status
+          const alertEventType = isUpdated ? 'api.lead_updated' : 'api.lead_added';
+          await leadListAlertService.notifyLeadListOwnerIfConfigured(
+            leadList,
+            lead,
+            alertEventType,
+            {
+              source: mergedCustomFields.source,
+              forwardedAt: mergedCustomFields.forwardedAt,
+              company: leadData.company,
+              phone: leadData.phone,
+              ...(autoDraftStatus ? { autoDraftStatus } : {}),
+              ...(autoDraftError ? { autoDraftError } : {}),
+              ...(autoSendStatus ? { autoSendStatus } : {}),
+            },
+            new Date().toISOString()
+          );
+        } catch (err) {
+          console.error('Post-response processing error:', err);
+        }
+      })();
     }
 
   } catch (error: any) {

@@ -13,6 +13,7 @@ import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { settingsService } from "../services/settingsService";
+import { encryptPassword } from "../utils/crypto";
 
 const router = express.Router();
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
@@ -329,7 +330,34 @@ router.post("/crm-sync/:source/start", async (req, res) => {
 router.get("/users", async (req, res) => {
   try {
     const users = await userDb.getAllUsers();
-    res.json(users);
+    // Transform: replace encrypted secrets map with just key names for the frontend
+    const sanitized = users.map((user: any) => {
+      const { secrets, ...rest } = user;
+      return {
+        ...rest,
+        secretNames: secrets ? Object.keys(secrets) : [],
+      };
+    });
+
+    // Batch-fetch Clarity replay session URLs for all users
+    const replayResults = await Promise.all(
+      sanitized.map((user: any) =>
+        settingsService.getSetting(`replay_sessions_${user.userId}`).catch(() => null)
+      )
+    );
+    for (let i = 0; i < sanitized.length; i++) {
+      const setting = replayResults[i];
+      if (setting?.settingValue) {
+        try {
+          const parsed = JSON.parse(setting.settingValue);
+          sanitized[i].replayUrl = parsed.replayUrl;
+        } catch {
+          // skip malformed setting
+        }
+      }
+    }
+
+    res.json(sanitized);
   } catch (error) {
     console.error("Error getting users:", error);
     res.status(500).json({ message: "Error fetching users" });
@@ -346,7 +374,12 @@ router.get("/users/:userId", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    res.json(user);
+    // Strip encrypted secret values, expose only key names
+    const { secrets, ...rest } = user as any;
+    res.json({
+      ...rest,
+      secretNames: secrets ? Object.keys(secrets) : [],
+    });
   } catch (error) {
     console.error("Error getting user:", error);
     res.status(500).json({ message: "Error fetching user" });
@@ -467,6 +500,74 @@ router.put("/users/:userId/slack-channel", async (req, res) => {
   } catch (error) {
     console.error("Error updating user slack channel:", error);
     res.status(500).json({ message: "Error updating slack channel" });
+  }
+});
+
+// Get user secret names (keys only, not values)
+router.get("/users/:userId/secrets", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json({ secretNames: Object.keys(user.secrets || {}) });
+  } catch (error) {
+    console.error("Error getting user secrets:", error);
+    res.status(500).json({ message: "Error getting user secrets" });
+  }
+});
+
+// Update user secrets (encrypt values at rest)
+router.put("/users/:userId/secrets", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { secrets } = req.body;
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Validate secrets is an object
+    if (secrets && typeof secrets !== "object") {
+      return res.status(400).json({ message: "secrets must be an object" });
+    }
+
+    // Validate key names (alphanumeric + underscores only)
+    const keyRegex = /^[a-zA-Z0-9_]+$/;
+    for (const key of Object.keys(secrets || {})) {
+      if (!keyRegex.test(key)) {
+        return res.status(400).json({
+          message: `Invalid secret name: "${key}". Only alphanumeric characters and underscores are allowed.`
+        });
+      }
+    }
+
+    // Build encrypted secrets map
+    // If value is empty string, keep the existing encrypted value
+    const existingSecrets = user.secrets || {};
+    const encryptedSecrets: Record<string, string> = {};
+
+    for (const [key, value] of Object.entries(secrets || {})) {
+      if (typeof value === "string" && value.length > 0) {
+        // New value provided — encrypt it
+        encryptedSecrets[key] = encryptPassword(value, userId);
+      } else if (key in existingSecrets) {
+        // Empty value for existing key — keep existing encrypted value
+        encryptedSecrets[key] = existingSecrets[key];
+      }
+      // If value is empty and key doesn't exist, skip (effectively removes it)
+    }
+
+    const updatedUser = await userDb.updateUser(userId, { secrets: encryptedSecrets });
+    res.json({ secretNames: Object.keys(updatedUser.secrets || {}) });
+  } catch (error) {
+    console.error("Error updating user secrets:", error);
+    res.status(500).json({ message: "Error updating user secrets" });
   }
 });
 

@@ -314,9 +314,11 @@ export class AgentModeService {
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
-    const actualModelId = modelId === 'anthropic.claude-opus-4-6-v1'
-      ? 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1'
-      : modelId;
+    const inferenceProfileMap: Record<string, string> = {
+      'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+      'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+    };
+    const actualModelId = inferenceProfileMap[modelId] || modelId;
 
     // Create OpenAI-compatible wrapper
     return {
@@ -444,6 +446,7 @@ export class AgentModeService {
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
+    'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
@@ -736,7 +739,8 @@ export class AgentModeService {
                 tool_call_id: toolCall.id,
                 role: 'tool',
                 name: toolCall.function.name,
-                content: JSON.stringify({ error: errorMsg })
+                content: JSON.stringify({ error: errorMsg }),
+                metadata: { timestamp: new Date().toISOString() }
               });
               continue;
             }
@@ -777,7 +781,8 @@ export class AgentModeService {
               tool_call_id: toolCall.id,
               role: 'tool',
               name: toolCall.function.name,
-              content: toolContent
+              content: toolContent,
+              metadata: { timestamp: new Date().toISOString() }
             });
 
             // Tool results are now included in the tool message content above
@@ -817,7 +822,8 @@ export class AgentModeService {
               tool_call_id: toolCall.id,
               role: 'tool',
               name: toolCall.function.name,
-              content: errorContent
+              content: errorContent,
+              metadata: { timestamp: new Date().toISOString() }
             });
           }
         }
@@ -1024,7 +1030,7 @@ export class AgentModeService {
 - **Fallback Method**: If no suitable template is available, use 'create_task_from_prompt' to create a web automation task with a raw prompt
 - The 'create_task_from_prompt' tool allows you to create custom web automation tasks with specific instructions when templates don't fit
  - **Image Generation**: Use 'generate_image' for creating and revising images. This provides real-time (~30s) image generation. [DEPRECATED: 'create_image_task_from_prompt' is deprecated - use 'generate_image' instead]
- - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. For example, to add a logo to an existing image, include both the current image URL and the logo image URL in the inputImages array. The AI will combine elements from all provided images based on your prompt. This is useful for tasks like adding logos, combining multiple images, or creating composite visuals.
+ - **Image Editing Tips**: When using 'generate_image' with inputImages, you can include multiple image URLs to create combined images. **IMPORTANT: When adding a logo to an image, ALWAYS use the dedicated 'logo_image' parameter instead of putting the logo URL in inputImages.** The 'logo_image' parameter ensures the logo is reproduced with absolute precision in text, shape, and color. Use 'inputImages' for non-logo reference images (backgrounds, base images to edit). For example, to add a logo to an existing image: put the base image URL in inputImages and the logo URL in logo_image. This is critical for maintaining logo fidelity.
  - **Video Generation**: Use 'generate_video' for creating videos. This provides real-time video generation using Veo 3.1. You can optionally provide start and end frames for interpolation between two images. The generated video will be saved and returned as an S3 URL.
  - **Blog Articles**: When creating blog articles, prefer using the 'create_blog_article' tool. It generates the article content, creates a high-quality hero image via imageService, formats the article into clean HTML, uploads it to S3, and returns the final HTML URL. Avoid ad-hoc content + image flows when this tool fits the request.
    - **When to use deep_research:true**: Set 'deep_research: true' when the user explicitly asks for "deep research", "comprehensive research", "well-researched article", or mentions topics that require authoritative sources (e.g., market trends, industry analysis, scientific topics, historical events). This performs Gemini Deep Research first (takes several minutes) and embeds research images. Default to 'deep_research: false' for standard blog articles. 
@@ -8688,7 +8694,8 @@ Format the response as JSON with this structure:
     inputImages: string[],
     userId: string,
     sessionId: string,
-    imageModel?: string
+    imageModel?: string,
+    logoImage?: string
   ): Promise<any> {
     try {
       // Import the image generation service
@@ -8711,6 +8718,7 @@ Format the response as JSON with this structure:
         size,
         quality,
         inputImages: inputImages || [],
+        logoImage,
         userId,
         imageModel
       });

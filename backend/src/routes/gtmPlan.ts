@@ -548,21 +548,45 @@ router.post("/:planId/phases", authenticateToken, async (req, res) => {
 
     phases.push(newPhase);
 
+    // Recalculate plan status based on phases
+    const hasPhases = phases.length > 0;
+    const allPhasesCompleted = hasPhases && phases.every(
+      (p: any) => p.status === "completed"
+    );
+    const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+    const updateExpressions: string[] = [
+      "#phases = :phases",
+      "#status = :status",
+      "#updatedAt = :updatedAt",
+    ];
+    const expressionAttributeNames: { [key: string]: string } = {
+      "#phases": "phases",
+      "#status": "status",
+      "#updatedAt": "updatedAt",
+    };
+    const expressionAttributeValues: { [key: string]: any } = {
+      ":phases": phases,
+      ":status": planStatus,
+      ":updatedAt": new Date().toISOString(),
+    };
+
+    // Clear completedAt if plan was completed but is now back to in_progress
+    if (plan.status === "completed" && planStatus !== "completed") {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = null;
+    }
+
     // Update plan
     const updateParams = {
       TableName: TABLE_NAME,
       Key: {
         planId: planId,
       },
-      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
-      ExpressionAttributeNames: {
-        "#phases": "phases",
-        "#updatedAt": "updatedAt",
-      },
-      ExpressionAttributeValues: {
-        ":phases": phases,
-        ":updatedAt": new Date().toISOString(),
-      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW",
     };
 
@@ -654,21 +678,45 @@ router.post("/:planId/phases/:phaseId/work-items", authenticateToken, async (req
 
     phases[phaseIndex] = updatedPhase;
 
+    // Recalculate plan status based on phases
+    const hasPhases = phases.length > 0;
+    const allPhasesCompleted = hasPhases && phases.every(
+      (p: any) => p.status === "completed"
+    );
+    const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+    const updateExpressions: string[] = [
+      "#phases = :phases",
+      "#status = :status",
+      "#updatedAt = :updatedAt",
+    ];
+    const expressionAttributeNames: { [key: string]: string } = {
+      "#phases": "phases",
+      "#status": "status",
+      "#updatedAt": "updatedAt",
+    };
+    const expressionAttributeValues: { [key: string]: any } = {
+      ":phases": phases,
+      ":status": planStatus,
+      ":updatedAt": new Date().toISOString(),
+    };
+
+    // Clear completedAt if plan was completed but is now back to in_progress
+    if (plan.status === "completed" && planStatus !== "completed") {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = null;
+    }
+
     // Update plan
     const updateParams = {
       TableName: TABLE_NAME,
       Key: {
         planId: planId,
       },
-      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
-      ExpressionAttributeNames: {
-        "#phases": "phases",
-        "#updatedAt": "updatedAt",
-      },
-      ExpressionAttributeValues: {
-        ":phases": phases,
-        ":updatedAt": new Date().toISOString(),
-      },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW",
     };
 

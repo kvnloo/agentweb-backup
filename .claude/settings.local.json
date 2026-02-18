@@ -81,7 +81,8 @@
       "Bash(npm ls:*)",
       "WebFetch(domain:elasticbeanstalk-us-west-2-992382574572.s3.us-west-2.amazonaws.com)",
       "Bash(unzip:*)",
-      "Bash(aws dynamodb query:*)"
+      "Bash(aws dynamodb query:*)",
+      "Bash(aws dynamodb scan:*)"
     ]
   }
 }

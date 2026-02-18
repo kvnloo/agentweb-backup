@@ -32,6 +32,12 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
     installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
+    getFoundationToolNames: jest.fn().mockReturnValue(new Set([
+      'install_skills', 'search_web', 'read_file_content', 'read_page_source',
+      'search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files',
+      'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
+      'save_file', 'describe_image',
+    ])),
   },
 }));
 
@@ -1343,6 +1349,51 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
       // Should not create a new execution
       expect(mockTaskDb.createTaskExecution).not.toHaveBeenCalled();
+    });
+
+    it('should save failure run result and send error email when runScheduledChat throws', async () => {
+      const scheduleWithEmail = {
+        ...baseSchedule,
+        frequency: 'daily',
+        emailNotifications: ['alert@example.com'],
+      };
+      mockScheduleDb.getSchedulesReadyToRun.mockResolvedValue([scheduleWithEmail]);
+
+      // Make createChatSession reject to simulate a runtime crash in runScheduledChat
+      mockChatbotDb.createChatSession.mockRejectedValue(new Error('LLM provider timeout'));
+
+      const mockReq = {} as Request;
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.runScheduledChats(mockReq, mockRes);
+
+      // Wait for the fire-and-forget promise (.catch handler) to settle
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Should save a failure run result to the database
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
+        scheduleWithEmail.scheduleId,
+        expect.objectContaining({
+          scheduleId: scheduleWithEmail.scheduleId,
+          status: 'failure',
+          passed: false,
+          actualResponse: expect.stringContaining('LLM provider timeout'),
+          sessionId: '',
+          attempt: 0,
+          executionTime: 0,
+        })
+      );
+
+      // Should send error notification email
+      expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
+        ['alert@example.com'],
+        scheduleWithEmail.scheduleName,
+        expect.objectContaining({ status: 'failure' }),
+        scheduleWithEmail.scheduleId
+      );
     });
 
     it('should handle sync errors gracefully without failing the run', async () => {
