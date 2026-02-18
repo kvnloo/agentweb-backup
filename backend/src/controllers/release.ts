@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-02-18",
+    changes: [
+      "Added Pending @agentweb.pro and Unassigned Work Items on GTM Tracker User Cards",
+      "- Each client card now shows how many pending work items are assigned to @agentweb.pro team members, with a per-email breakdown",
+      "- Cards also display a count of unassigned pending items (no DRI) with a warning indicator",
+      "- Sections only appear when relevant, keeping cards clean for clients without pending team or unassigned items",
+    ],
+  },
+  {
     date: "2026-01-29",
     changes: [
       "Added Model Context Protocol (MCP) Support for Dynamic Agent Tool Management",
