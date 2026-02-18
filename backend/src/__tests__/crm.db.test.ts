@@ -1094,5 +1094,66 @@ describe('CRM Database Service', () => {
       );
     });
   });
+
+  describe('updateLeadList', () => {
+    it('should update csvExportHistory on a lead list', async () => {
+      const listId = 'list_123';
+      const csvExportHistory = [
+        {
+          exportId: 'exp_1',
+          recordCount: 10,
+          exportedAt: '2026-02-18T00:00:00.000Z',
+          fileUrl: 'https://s3.amazonaws.com/bucket/file.csv',
+          filename: 'export.csv',
+        },
+      ];
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: { listId, csvExportHistory },
+        }),
+      });
+
+      const result = await crmDb.updateLeadList(listId, { csvExportHistory });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.UpdateExpression).toContain('#csvExportHistory = :csvExportHistory');
+      expect(updateCall.ExpressionAttributeValues[':csvExportHistory']).toEqual(csvExportHistory);
+      expect(result).toEqual({ listId, csvExportHistory });
+    });
+
+    it('should update name on a lead list', async () => {
+      const listId = 'list_123';
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: { listId, name: 'New Name' },
+        }),
+      });
+
+      const result = await crmDb.updateLeadList(listId, { name: 'New Name' });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalled();
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.UpdateExpression).toContain('#name = :name');
+      expect(updateCall.ExpressionAttributeValues[':name']).toBe('New Name');
+    });
+
+    it('should return existing list when no updates are provided', async () => {
+      const listId = 'list_123';
+      const mockList = { listId, name: 'Test List' };
+
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: mockList }),
+      });
+
+      const result = await crmDb.updateLeadList(listId, {});
+
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
+      expect(mockDocumentClientMethods.get).toHaveBeenCalled();
+      expect(result).toEqual(mockList);
+    });
+  });
 });
 

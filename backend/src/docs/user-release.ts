@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-18',
     changes: [
+      'CSV Export for CRM Lead Lists',
+      '- Added an "Export CSV" button next to the existing "Import CSV" button on the CRM lead list view',
+      '- Exports all leads in the selected list as a CSV file with standard fields and custom fields',
+      '- CSV files are uploaded to S3 and opened in a new browser tab for download',
+      '- Export history dialog shows up to 50 previous exports with date, record count, and download link',
+      '- Previous exports can be re-downloaded at any time from the history dialog',
       'Google Drive Shared Folders',
       '- Admins can now configure Google Drive shared folder IDs per user in the Partner Portal Users tab',
       '- Configured folders appear in a dedicated "Google Drive Shared Folders" section on the customer Knowledge Base page',
