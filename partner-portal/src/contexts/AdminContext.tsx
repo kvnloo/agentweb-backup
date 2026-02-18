@@ -45,6 +45,7 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  replayUrl?: string; // Microsoft Clarity replay session URL
 }
 
 interface AdminContextType {

@@ -9,6 +9,29 @@ import request from 'supertest';
 import { ChatbotDB } from '../services/chatbotService';
 import { taskDb } from '../services/db';
 
+// Mock AWS SDK to prevent real calls when run alongside other test suites
+jest.mock('aws-sdk', () => ({
+  config: { update: jest.fn() },
+  DynamoDB: {
+    DocumentClient: jest.fn(() => ({
+      get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      query: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) }),
+      update: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      delete: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      scan: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Items: [] }) }),
+    })),
+  },
+  S3: jest.fn(() => ({
+    upload: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Location: '', Key: '' }) }),
+    getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    getSignedUrl: jest.fn(),
+  })),
+  SecretsManager: jest.fn(() => ({
+    getSecretValue: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ SecretString: '{}' }) }),
+  })),
+}));
+
 // Mock dependencies
 jest.mock('../services/chatbotService');
 jest.mock('../services/db', () => ({
