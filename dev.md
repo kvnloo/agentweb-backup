@@ -15,6 +15,18 @@ Use a CNAME record so we manage the subdomain on Vercel while the client's prima
 
 3. **SSL is automatic**: once the CNAME resolves to Vercel, they auto-provision a Let's Encrypt certificate and handle renewal every 90 days. No action needed.
 
+## Creating a Vercel Project Synced to AgentWebPro Org
+
+1. Go to [vercel.com/new](https://vercel.com/new)
+2. Under "Import Git Repository", select the **AgentWebPro** GitHub org from the dropdown
+3. Find and import the target repo (e.g. `haven-landing`)
+4. Configure build settings (framework preset, build command, output directory) and environment variables as needed
+5. Click **Deploy**
+
+The project will now auto-deploy on every push to the default branch. To add the custom subdomain, go to Project Settings > Domains and follow the steps above.
+
+**Make PR preview URLs public**: Project Settings > Deployment Protection > disable Vercel Authentication.
+
 
 # February 18, 2026: Google Drive Integration — MCP vs Direct API
 
