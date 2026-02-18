@@ -1,3 +1,21 @@
+# February 18, 2026: Subdomain Landing Page Setup for Haven (usehaven.ai)
+
+## Approach
+Use a CNAME record so we manage the subdomain on Vercel while the client's primary DNS stays untouched. No Nameserver access needed.
+
+## Steps
+
+1. **Add subdomain in Vercel**: Project Settings > Domains > add `start.usehaven.ai`. Vercel will show "Invalid Configuration" until DNS propagates.
+
+2. **Client DNS request** — ask their IT/DNS admin to add one record:
+   - **Type:** CNAME
+   - **Name (Host):** `start`
+   - **Value (Points to):** `ca0c21bca6304a7a.vercel-dns-016.com.`
+   - **TTL:** 3600 (or default)
+
+3. **SSL is automatic**: once the CNAME resolves to Vercel, they auto-provision a Let's Encrypt certificate and handle renewal every 90 days. No action needed.
+
+
 # February 18, 2026: Google Drive Integration — MCP vs Direct API
 
 ## Investigation
