@@ -11,7 +11,8 @@ import {
   secretExists,
   getMetaAccessToken,
   getGCSPPrivateKey,
-  getLinkedInCredentials
+  getLinkedInCredentials,
+  getGoogleDriveServiceAccountEmail
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -227,6 +228,78 @@ describe('secretsManager utils', () => {
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/LinkedIn/Company'
       });
+    });
+  });
+
+  describe('getGoogleDriveServiceAccountEmail', () => {
+    it('should return client_email from service account secret', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            type: 'service_account',
+            client_email: 'sa@test.iam.gserviceaccount.com'
+          })
+        })
+      });
+
+      const result = await getGoogleDriveServiceAccountEmail();
+      expect(result).toBe('sa@test.iam.gserviceaccount.com');
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ client_email: 'sa@dev.iam.gserviceaccount.com' })
+        })
+      });
+
+      await getGoogleDriveServiceAccountEmail();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/Google/Share' });
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ client_email: 'sa@prod.iam.gserviceaccount.com' })
+        })
+      });
+
+      await getGoogleDriveServiceAccountEmail();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'prod/AgentWeb/Google/Share' });
+    });
+
+    it('should throw error when secret is empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getGoogleDriveServiceAccountEmail()).rejects.toThrow(
+        'Failed to fetch Google Drive service account email from Secrets Manager'
+      );
+    });
+
+    it('should throw error when client_email is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ type: 'service_account' })
+        })
+      });
+
+      await expect(getGoogleDriveServiceAccountEmail()).rejects.toThrow(
+        'Failed to fetch Google Drive service account email from Secrets Manager'
+      );
+    });
+
+    it('should throw error when secret fetch fails', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getGoogleDriveServiceAccountEmail()).rejects.toThrow(
+        'Failed to fetch Google Drive service account email from Secrets Manager'
+      );
     });
   });
 });
