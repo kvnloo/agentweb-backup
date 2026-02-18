@@ -69,6 +69,7 @@ import {
   PersonAdd as PersonAddIcon,
   Check as CheckIcon,
   OpenInNew as OpenInNewIcon,
+  PlayCircleOutline as PlayCircleOutlineIcon,
   Lock as LockIcon,
   Add as AddIcon,
   ThumbUp as ThumbUpIcon,
@@ -3510,7 +3511,7 @@ export default function AdminDashboard() {
                                 rel="noopener noreferrer"
                                 color="primary"
                               >
-                                <OpenInNewIcon fontSize="small" />
+                                <PlayCircleOutlineIcon fontSize="small" />
                               </IconButton>
                             </Tooltip>
                           ) : (
