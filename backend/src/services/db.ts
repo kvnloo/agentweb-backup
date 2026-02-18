@@ -2940,6 +2940,7 @@ export const crmDb = {
       autoSendEnabled?: boolean;
       icpsOnly?: boolean;
       engagedOnly?: boolean;
+      csvExportHistory?: any[];
     }
   ) {
     try {
@@ -3017,6 +3018,12 @@ export const crmDb = {
         expressionAttributeNames['#engagedOnly'] = 'engagedOnly';
         updateExpressions.push('#engagedOnly = :engagedOnly');
         expressionAttributeValues[':engagedOnly'] = updates.engagedOnly;
+      }
+
+      if (updates.csvExportHistory !== undefined) {
+        expressionAttributeNames['#csvExportHistory'] = 'csvExportHistory';
+        updateExpressions.push('#csvExportHistory = :csvExportHistory');
+        expressionAttributeValues[':csvExportHistory'] = updates.csvExportHistory;
       }
 
       if (updateExpressions.length === 0) {
