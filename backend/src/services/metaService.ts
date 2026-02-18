@@ -154,6 +154,124 @@ export class MetaService {
   }
 
   /**
+   * Validate campaign params before hitting the Meta API.
+   * Throws a descriptive Error if validation fails.
+   */
+  public static validateCampaignParams(action: string, params: Partial<MetaAdsCampaignParams>): void {
+    if (action !== 'CREATE') return;
+
+    if (!params.name) {
+      throw new Error('Campaign CREATE requires "name".');
+    }
+
+    const validObjectives = [
+      'OUTCOME_TRAFFIC',
+      'OUTCOME_AWARENESS',
+      'OUTCOME_ENGAGEMENT',
+      'OUTCOME_SALES',
+      'OUTCOME_LEADS',
+      'OUTCOME_APP_PROMOTION'
+    ];
+    if (!params.objective) {
+      throw new Error(`Campaign CREATE requires "objective". Valid values: ${validObjectives.join(', ')}.`);
+    }
+    if (!validObjectives.includes(params.objective)) {
+      throw new Error(`Invalid objective "${params.objective}". Must be one of: ${validObjectives.join(', ')}.`);
+    }
+
+    if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
+      throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
+    }
+  }
+
+  /**
+   * Validate ad creative params before hitting the Meta API.
+   * Throws a descriptive Error if validation fails.
+   */
+  public static validateCreativeParams(action: string, params: Partial<MetaAdsAdCreativeParams>): void {
+    if (action !== 'CREATE') return;
+
+    // name, page_id, body are required for all creative types
+    for (const field of ['name', 'page_id', 'body'] as Array<keyof MetaAdsAdCreativeParams>) {
+      if (!params[field]) {
+        throw new Error(`Ad Creative CREATE requires "${field}".`);
+      }
+    }
+
+    const hasVideo = !!params.video_id;
+    const hasCarousel = !!params.carousel_cards;
+    const hasImage = !!(params.image_hash || params.image_url);
+
+    // title and link_url are only required for non-carousel creatives (for carousel they live per-card)
+    if (!hasCarousel) {
+      for (const field of ['title', 'link_url'] as Array<keyof MetaAdsAdCreativeParams>) {
+        if (!params[field]) {
+          throw new Error(`Ad Creative CREATE requires "${field}".`);
+        }
+      }
+    }
+
+    if (hasVideo && hasCarousel) {
+      throw new Error(
+        'Ad Creative CREATE: "video_id" and "carousel_cards" are mutually exclusive. ' +
+        'For a video creative provide video_id; for carousel provide carousel_cards (2–10 items); for image provide image_hash or image_url.'
+      );
+    }
+
+    if (hasCarousel) {
+      if (!Array.isArray(params.carousel_cards) || params.carousel_cards.length < 2 || params.carousel_cards.length > 10) {
+        throw new Error('Ad Creative CREATE: "carousel_cards" must be an array of 2–10 items.');
+      }
+      for (let i = 0; i < params.carousel_cards.length; i++) {
+        const card = params.carousel_cards[i];
+        if (!card.image_hash && !card.image_url && !card.video_id) {
+          throw new Error(`Ad Creative CREATE: carousel_cards[${i}] must have at least one of image_hash, image_url, or video_id.`);
+        }
+      }
+      return; // carousel validated
+    }
+
+    if (hasVideo) {
+      // Meta requires a thumbnail for video creatives (image_hash or image_url)
+      if (!hasImage) {
+        throw new Error(
+          'Ad Creative CREATE: video creatives require a thumbnail. ' +
+          'Provide image_hash (from UPLOAD_IMAGE) or image_url alongside video_id. ' +
+          'Upload a thumbnail image first using AD_CREATIVE UPLOAD_IMAGE, then pass the returned image_hash.'
+        );
+      }
+      return; // video + thumbnail validated
+    }
+
+    if (!hasImage) {
+      throw new Error(
+        'Ad Creative CREATE: must specify a creative type. ' +
+        'For a video creative provide video_id + image_hash/image_url (thumbnail); ' +
+        'for carousel provide carousel_cards (2–10 items); ' +
+        'for image provide image_hash or image_url.'
+      );
+    }
+  }
+
+  /**
+   * Validate ad params before hitting the Meta API.
+   * Throws a descriptive Error if validation fails.
+   */
+  public static validateAdParams(action: string, params: Partial<MetaAdsAdParams> & { adset_id?: string }): void {
+    if (action !== 'CREATE') return;
+
+    if (!params.name) {
+      throw new Error('Ad CREATE requires "name".');
+    }
+    if (!params.creative_id) {
+      throw new Error('Ad CREATE requires "creative_id". Create an ad creative first using AD_CREATIVE CREATE.');
+    }
+    if (!params.adset_id) {
+      throw new Error('Ad CREATE requires "ad_set_id" (top-level parameter). Specify which ad set this ad belongs to.');
+    }
+  }
+
+  /**
    * Get ad accounts accessible by the user using Facebook SDK
    * @param accessToken - Meta OAuth access token
    * @returns Array of ad account objects
@@ -505,9 +623,16 @@ export class MetaService {
 
       // 1. VIDEO CREATIVE
       if (params.video_id) {
-        objectStorySpec.video_data = {
+        // Meta requires exactly one thumbnail field in video_data: image_hash (preferred) or image_url.
+        // Missing thumbnail → error_subcode 1443226 "Your ad needs a video thumbnail".
+        if (!params.image_hash && !params.image_url) {
+          throw new Error(
+            'Video creative requires a thumbnail. ' +
+            'Provide image_hash (from AD_CREATIVE UPLOAD_IMAGE) or image_url alongside video_id.'
+          );
+        }
+        const videoData: any = {
           video_id: params.video_id,
-          image_url: params.image_url, // Thumbnail
           message: params.body,
           title: params.title,
           call_to_action: params.call_to_action_type ? {
@@ -515,6 +640,13 @@ export class MetaService {
             value: { link: params.link_url }
           } : undefined
         };
+        // Prefer image_hash (uploaded asset) over image_url
+        if (params.image_hash) {
+          videoData.image_hash = params.image_hash;
+        } else {
+          videoData.image_url = params.image_url;
+        }
+        objectStorySpec.video_data = videoData;
       } 
       // 2. CAROUSEL CREATIVE
       else if (params.carousel_cards && params.carousel_cards.length > 0) {

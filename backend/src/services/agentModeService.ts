@@ -20,7 +20,7 @@ import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from 
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
-import { metaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
 type MetaApiResult = {
@@ -5784,8 +5784,9 @@ Format the response as JSON with this structure:
       console.error('AgentMode: Error creating Meta ad campaign:', error);
       return {
         success: false,
-        message: error.message || 'Failed to create Meta ad campaign.',
-        error: error.message
+        message: this.enrichMetaError(error, 'create Meta ad campaign'),
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
@@ -5955,6 +5956,20 @@ Format the response as JSON with this structure:
       }
 
       // --- Prepared Params for SDK layer ---
+
+      // 6. Advantage Audience — Meta requires targeting_automation.advantage_audience to be
+      //    explicitly set to 0 or 1 (error_subcode 1870227 if missing). Default to 0 (disabled).
+      if (!args.targeting.targeting_automation || args.targeting.targeting_automation.advantage_audience === undefined) {
+        args.targeting = {
+          ...args.targeting,
+          targeting_automation: {
+            ...(args.targeting.targeting_automation || {}),
+            advantage_audience: 0
+          }
+        };
+        console.log('[MetaAdSet] Auto-set targeting_automation.advantage_audience=0 (Meta requires this field)');
+      }
+
       // Convert all currencies to cents
       const toCents = (val?: number) => val !== undefined ? Math.round(val * 100) : undefined;
 
@@ -5977,9 +5992,9 @@ Format the response as JSON with this structure:
       console.error('AgentMode: Error creating Meta ad set:', error);
       return {
         success: false,
-        message: error.message || 'Failed to create Meta ad set.',
+        message: this.enrichMetaError(error, 'create Meta ad set'),
         error: error.message,
-        details: error.structuredError // Extract structured error if available from metaService
+        details: error.structuredError
       };
     }
   }
@@ -6020,8 +6035,9 @@ Format the response as JSON with this structure:
       console.error('AgentMode: Error creating Meta ad creative:', error);
       return {
         success: false,
-        message: error.message || 'Failed to create Meta ad creative.',
-        error: error.message
+        message: this.enrichMetaError(error, 'create Meta ad creative'),
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
@@ -6062,8 +6078,9 @@ Format the response as JSON with this structure:
       console.error('AgentMode: Error creating Meta ad:', error);
       return {
         success: false,
-        message: error.message || 'Failed to create Meta ad.',
-        error: error.message
+        message: this.enrichMetaError(error, 'create Meta ad'),
+        error: error.message,
+        details: error.structuredError
       };
     }
   }
@@ -6436,6 +6453,101 @@ Format the response as JSON with this structure:
   }
 
   /**
+   * Translate known Meta API error subcodes into actionable messages for Emma.
+   * Returns an enriched message string (falls back to original if subcode unknown).
+   */
+  private enrichMetaError(error: any, context: string): string {
+    const subcode = error.structuredError?.error_subcode ?? error.response?.error_subcode;
+    const code = error.structuredError?.code ?? error.response?.code;
+    const originalMsg = error.message || `Failed to ${context}.`;
+
+    switch (subcode) {
+      case 1341012:
+        return (
+          'Page permission denied (subcode 1341012): The page_id used is not accessible with your current credentials. ' +
+          'Run PAGE LIST to get the pages you have permission to manage, pick the correct one, and retry.'
+        );
+      case 1443226:
+        return (
+          'Missing video thumbnail (subcode 1443226): Video creatives require a thumbnail. ' +
+          'Upload a thumbnail image via AD_CREATIVE UPLOAD_IMAGE and pass the returned image_hash alongside video_id.'
+        );
+      case 1870227:
+        return (
+          'Advantage Audience flag required (subcode 1870227): Add targeting_automation: { advantage_audience: 0 } ' +
+          'inside the targeting object and retry.'
+        );
+      default:
+        // Enrich with error_user_msg from Meta if available (more human-readable than raw message)
+        if (code === 10) {
+          return `Permission error: ${error.structuredError?.error_user_msg || originalMsg} — check that the entity IDs were obtained via LIST operations and not manually provided.`;
+        }
+        if (error.structuredError?.error_user_msg) {
+          return `${error.structuredError.error_user_msg} (Meta code ${code}${subcode ? `, subcode ${subcode}` : ''})`;
+        }
+        return originalMsg;
+    }
+  }
+
+  /**
+   * Pre-validate Meta Marketing API params before making any API calls.
+   * Throws a descriptive Error if required params are missing or invalid.
+   */
+  private validateMetaActionParams(
+    entity_type: string,
+    action: string,
+    campaign_id: string | undefined,
+    ad_set_id: string | undefined,
+    ad_id: string | undefined,
+    params: any
+  ): void {
+    switch (entity_type) {
+      case 'CAMPAIGN':
+        if (action === 'CREATE') {
+          MetaService.validateCampaignParams('CREATE', params);
+        } else if (action === 'UPDATE' && !campaign_id) {
+          throw new Error('CAMPAIGN UPDATE requires "campaign_id".');
+        } else if (action === 'DELETE' && !campaign_id) {
+          throw new Error('CAMPAIGN DELETE requires "campaign_id".');
+        }
+        break;
+
+      case 'AD_SET':
+        if (action === 'CREATE' && !campaign_id) {
+          throw new Error('AD_SET CREATE requires "campaign_id".');
+        } else if (action === 'UPDATE' && !ad_set_id) {
+          throw new Error('AD_SET UPDATE requires "ad_set_id".');
+        } else if (action === 'DELETE' && !ad_set_id) {
+          throw new Error('AD_SET DELETE requires "ad_set_id".');
+        }
+        break;
+
+      case 'AD_CREATIVE':
+        if (action === 'CREATE') {
+          MetaService.validateCreativeParams('CREATE', params);
+        }
+        break;
+
+      case 'AD':
+        if (action === 'CREATE') {
+          MetaService.validateAdParams('CREATE', { ...params, adset_id: ad_set_id });
+        } else if (action === 'UPDATE' && !ad_id) {
+          throw new Error('AD UPDATE requires "ad_id".');
+        } else if (action === 'DELETE' && !ad_id) {
+          throw new Error('AD DELETE requires "ad_id".');
+        }
+        break;
+
+      case 'TARGETING':
+        if (action === 'SEARCH') {
+          if (!params.q) throw new Error('TARGETING SEARCH requires "params.q" (search query).');
+          if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
+        }
+        break;
+    }
+  }
+
+  /**
    * Master method for calling Meta Marketing API.
    * Routes the request to the appropriate entity manager based on entity_type.
    */
@@ -6450,9 +6562,21 @@ Format the response as JSON with this structure:
     params: any = {}
   ): Promise<MetaApiResult> {
     console.log(`AgentMode: callMetaMarketingApi -> ${entity_type} / ${action}`);
-    
+
     // Ensure params is an object
     params = params || {};
+
+    // Pre-validate params before any API round-trip
+    try {
+      this.validateMetaActionParams(entity_type, action, campaign_id, ad_set_id, ad_id, params);
+    } catch (validationError: any) {
+      return {
+        success: false,
+        message: validationError.message,
+        error: 'PARAM_VALIDATION_ERROR',
+        hint: 'Fix the listed parameters and retry.'
+      } as any;
+    }
 
     switch (entity_type) {
       case 'CAMPAIGN':

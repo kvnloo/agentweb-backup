@@ -52,7 +52,60 @@ mcpToolRegistry.register({
     definition: {
       name: "call_meta_marketing_api",
       description:
-        "Manage Meta Ads entities (campaigns, ad sets, creatives, ads, audiences). Supports CRUD operations, media uploads, and targeting search. Requires account_id from list_connected_accounts(platform='meta'). Refer to your skill instructions for the action matrix, required params per operation, and compatibility rules.",
+        `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
+
+ACTION MATRIX (entity_type → supported actions):
+  CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
+  AD_SET        → LIST, CREATE, UPDATE, DELETE
+  AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD            → LIST, CREATE, UPDATE, DELETE
+  CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
+  TARGETING     → SEARCH
+  PAGE          → LIST
+
+REQUIRED IDs PER ACTION:
+  CAMPAIGN UPDATE/DELETE  → campaign_id required
+  AD_SET CREATE           → campaign_id required
+  AD_SET UPDATE/DELETE    → ad_set_id required
+  AD CREATE               → ad_set_id required
+  AD UPDATE/DELETE        → ad_id required
+  TARGETING SEARCH        → params.q and params.type required
+
+REQUIRED PARAMS PER ENTITY + ACTION:
+  CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
+  AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
+  AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
+  AD CREATE:            name, creative_id (plus ad_set_id top-level param)
+  CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
+  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+
+CAMPAIGN OBJECTIVES (valid values for 'objective'):
+  OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
+
+BUDGET RULES (Campaign & Ad Set):
+  - Provide daily_budget OR lifetime_budget, NEVER both
+  - lifetime_budget requires end_time (ISO 8601)
+  - advantage_campaign_budget=true enables campaign-level budget; use budget_amount instead of ad-set-level budget
+
+CREATIVE SUB-TYPES (mutually exclusive — pick exactly one):
+  IMAGE creative:    provide image_hash (from UPLOAD_IMAGE) OR image_url
+  VIDEO creative:    provide video_id (from UPLOAD_VIDEO) + REQUIRED thumbnail: image_hash or image_url
+                     (Meta API error 1443226 if thumbnail is missing — always upload thumbnail first)
+  CAROUSEL creative: provide carousel_cards array with 2–10 items; each card needs at least one of image_hash, image_url, or video_id; plus title, link_url per card
+  RULE: Cannot pass both video_id and carousel_cards — they are mutually exclusive.
+
+VIDEO CREATIVE WORKFLOW (3 steps, all required):
+  Step 1: UPLOAD_VIDEO → returns video_id
+  Step 2: UPLOAD_IMAGE → returns image_hash  (thumbnail — MANDATORY for video creatives)
+  Step 3: AD_CREATIVE CREATE with video_id + image_hash (or image_url)
+
+OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
+  OUTCOME_TRAFFIC   → LINK_CLICKS, LANDING_PAGE_VIEWS
+  OUTCOME_AWARENESS → REACH, IMPRESSIONS
+  OUTCOME_ENGAGEMENT → POST_ENGAGEMENT, PAGE_LIKES
+  OUTCOME_SALES     → OFFSITE_CONVERSIONS, VALUE
+  OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
+  OUTCOME_APP_PROMOTION → APP_INSTALLS`,
       inputSchema: {
         type: "object",
         properties: {
@@ -84,7 +137,7 @@ mcpToolRegistry.register({
           },
           params: {
             type: "object",
-            description: "Action-specific parameters. See skill instructions for required fields per entity_type + action combination.",
+            description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
             properties: {
               // --- Common ---
               name:   { type: "string", description: "Entity name." },
@@ -105,7 +158,7 @@ mcpToolRegistry.register({
               bid_amount:        { type: "number", description: "Bid amount in dollars. Required for BID_CAP and COST_CAP strategies." },
               targeting: {
                 type: "object",
-                description: "Targeting specification. geo_locations is required. See skill instructions for full structure."
+                description: "Targeting specification. geo_locations is required. targeting_automation.advantage_audience (0 or 1) is auto-injected as 0 if omitted — pass explicitly to override. Example: { geo_locations: { countries: ['US'] }, targeting_automation: { advantage_audience: 0 } }"
               },
               start_time:       { type: "string", description: "ISO 8601 start datetime." },
               end_time:         { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
