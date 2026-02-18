@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-17',
     changes: [
+      'Microsoft Clarity User Tracking',
+      '- Customer portal now calls Clarity.identify() after authentication to link sessions to user accounts',
+      '- For delegated (admin-as-customer) sessions, the admin\'s userId is used as the tracking ID',
+      '- Replay session URLs are saved to the backend so admins can view user session recordings',
+      '- Added a Replays column to the admin Users tab with direct links to Clarity session recordings',
+      '- New POST /api/settings/replay-sessions endpoint for persisting replay URLs',
+      '- Admin GET /api/admin/users now returns replayUrl for each user',
       'Claude Sonnet 4.5 Support for Agent Mode',
       '- Added Claude Sonnet 4.5 (anthropic.claude-sonnet-4-5-20250929-v1:0) as an available LLM for Agent Mode chat',
       '- Uses AWS Bedrock with cross-region inference profile, following the same pattern as Claude Opus 4.6',

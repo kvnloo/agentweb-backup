@@ -3022,13 +3022,14 @@ export default function AdminDashboard() {
                       label="Subscription Type"
                     />
                   </TableCell>
+                  <TableCell>Replays</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={20} align="center">
+                    <TableCell colSpan={21} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -3492,6 +3493,26 @@ export default function AdminDashboard() {
                                 </>
                               )}
                             </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">
+                              -
+                            </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {user.replayUrl ? (
+                            <Tooltip title="View Clarity Replays">
+                              <IconButton
+                                size="small"
+                                component="a"
+                                href={user.replayUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                color="primary"
+                              >
+                                <OpenInNewIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
                           ) : (
                             <Typography variant="body2" color="text.secondary">
                               -

@@ -98,6 +98,41 @@ router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
+// Save Clarity replay session link (customer accessible) - MUST be before /:settingName route
+router.post('/replay-sessions', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { clarityProjectId, trackingUserId } = req.body;
+    if (!clarityProjectId || !trackingUserId) {
+      return res.status(400).json({ error: 'clarityProjectId and trackingUserId are required' });
+    }
+
+    const replayUrl = `https://clarity.microsoft.com/projects/view/${clarityProjectId}/impressions?CustomUserId=is%3B${trackingUserId}`;
+    const settingName = `replay_sessions_${trackingUserId}`;
+
+    await settingsService.setSetting(
+      settingName,
+      JSON.stringify({
+        replayUrl,
+        clarityProjectId,
+        trackingUserId,
+        lastTracked: new Date().toISOString()
+      }),
+      'Clarity replay session link',
+      req.user?.email
+    );
+
+    res.json({ success: true, replayUrl });
+  } catch (error) {
+    console.error('Error saving replay session:', error);
+    res.status(500).json({ error: 'Failed to save replay session' });
+  }
+});
+
 // Email Templates endpoints (customer accessible) - MUST be before /:settingName route
 
 // Get all email templates for a user

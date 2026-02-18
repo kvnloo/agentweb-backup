@@ -338,6 +338,25 @@ router.get("/users", async (req, res) => {
         secretNames: secrets ? Object.keys(secrets) : [],
       };
     });
+
+    // Batch-fetch Clarity replay session URLs for all users
+    const replayResults = await Promise.all(
+      sanitized.map((user: any) =>
+        settingsService.getSetting(`replay_sessions_${user.userId}`).catch(() => null)
+      )
+    );
+    for (let i = 0; i < sanitized.length; i++) {
+      const setting = replayResults[i];
+      if (setting?.settingValue) {
+        try {
+          const parsed = JSON.parse(setting.settingValue);
+          sanitized[i].replayUrl = parsed.replayUrl;
+        } catch {
+          // skip malformed setting
+        }
+      }
+    }
+
     res.json(sanitized);
   } catch (error) {
     console.error("Error getting users:", error);
