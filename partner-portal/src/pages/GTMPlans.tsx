@@ -61,6 +61,7 @@ interface WorkItem {
   status: "pending" | "completed" | "skipped";
   notes?: string;
   dueDate?: string;
+  completedAt?: string;
 }
 
 interface Phase {
@@ -1328,6 +1329,11 @@ export default function GTMPlans() {
                                         color={getStatusColor(item.status) as any}
                                         size="small"
                                       />
+                                      {item.completedAt && (
+                                        <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                                          {format(new Date(item.completedAt), "MMM d, yyyy")}
+                                        </Typography>
+                                      )}
                                     </TableCell>
                                     <TableCell>
                                       {item.dueDate ? (() => {
