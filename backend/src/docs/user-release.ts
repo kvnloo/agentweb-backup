@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-19',
+    changes: [
+      'GTM Tracker: Show Completion Date for Work Items',
+      '- Completed work items now display their completion date below the status badge in both the Partner Portal and Customer Portal GTM trackers',
+      '- Phase and plan status report emails now include the completion date for completed work items',
+    ],
+  },
+  {
     date: '2026-02-18',
     changes: [
       'CSV Export for CRM Lead Lists',

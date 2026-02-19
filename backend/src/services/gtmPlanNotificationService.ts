@@ -306,6 +306,13 @@ export async function sendPhaseStatusReport(
             });
           })()
         : '-';
+      const completedAtText = item.completedAt
+        ? new Date(item.completedAt).toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric'
+          })
+        : '';
 
       return `
         <tr>
@@ -314,6 +321,7 @@ export async function sendPhaseStatusReport(
             <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
               ${item.status}
             </span>
+            ${completedAtText ? `<div style="color: #666; font-size: 11px; margin-top: 4px;">${completedAtText}</div>` : ''}
           </td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
           <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
@@ -408,7 +416,10 @@ ${workItems.length > 0
             });
           })()
         : '-';
-      return `- ${item.title}${item.description ? ` | Description: ${item.description}` : ''} | Status: ${item.status} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}${item.notes ? `\n  Notes: ${item.notes}` : ''}`;
+      const completedAtText = item.completedAt
+        ? new Date(item.completedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+        : '';
+      return `- ${item.title}${item.description ? ` | Description: ${item.description}` : ''} | Status: ${item.status}${completedAtText ? ` (${completedAtText})` : ''} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}${item.notes ? `\n  Notes: ${item.notes}` : ''}`;
     }).join('\n')
   : 'No work items in this phase.'}
 
@@ -515,6 +526,13 @@ export async function sendPlanStatusReport(
               });
             })()
           : '-';
+        const completedAtText = item.completedAt
+          ? new Date(item.completedAt).toLocaleDateString('en-US', {
+              year: 'numeric',
+              month: 'short',
+              day: 'numeric'
+            })
+          : '';
 
         return `
           <tr>
@@ -523,6 +541,7 @@ export async function sendPlanStatusReport(
               <span style="background-color: ${statusColor}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">
                 ${item.status}
               </span>
+              ${completedAtText ? `<div style="color: #666; font-size: 11px; margin-top: 4px;">${completedAtText}</div>` : ''}
             </td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${dueDateText}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e0e0e0;">${item.dri || '-'}</td>
@@ -667,7 +686,10 @@ ${phases.length > 0
                   });
                 })()
               : '-';
-            return `  - ${item.title}${item.description ? ` | Description: ${item.description}` : ''} | Status: ${item.status} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}${item.notes ? `\n    Notes: ${item.notes}` : ''}`;
+            const completedAtText = item.completedAt
+              ? new Date(item.completedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+              : '';
+            return `  - ${item.title}${item.description ? ` | Description: ${item.description}` : ''} | Status: ${item.status}${completedAtText ? ` (${completedAtText})` : ''} | Due Date: ${dueDateText} | PoC: ${item.dri || '-'}${item.notes ? `\n    Notes: ${item.notes}` : ''}`;
           }).join('\n')
         : '  (No work items)';
       return `${phaseInfo}\n${workItemsText}`;
