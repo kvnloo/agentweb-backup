@@ -303,7 +303,35 @@ router.post("/:name/discover-tools", async (req, res) => {
     }
     
     const server = servers[serverIndex];
-    
+
+    // Check if the server has per-user secret placeholders ({{...}}) in its config.
+    // These can only be resolved at execution time with a real user's secrets,
+    // so tool discovery is skipped — tools will be discovered on first use.
+    const hasPlaceholder = (v: string) => /\{\{(\w+)\}\}/.test(v);
+
+    // Access tokens are stored encrypted; decrypt to check for placeholders
+    let decryptedAccessToken: string | undefined;
+    if (server.accessToken) {
+      try {
+        const decrypted = decryptPassword(server.accessToken);
+        decryptedAccessToken = decrypted.password;
+      } catch {
+        decryptedAccessToken = server.accessToken;
+      }
+    }
+
+    const hasUserSecretPlaceholders =
+      (decryptedAccessToken && hasPlaceholder(decryptedAccessToken)) ||
+      (server.env && Object.values(server.env).some(v => hasPlaceholder(v)));
+
+    if (hasUserSecretPlaceholders) {
+      return res.json({
+        tools: [],
+        count: 0,
+        message: "Server uses per-user secret placeholders (e.g. {{...}}). Tools will be discovered at execution time for each user."
+      });
+    }
+
     // Helper to resolve environment variables
     const resolveEnv = (value: string) => {
       return value.replace(/\$\{(\w+)\}/g, (_, varName) => {
@@ -316,7 +344,7 @@ router.post("/:name/discover-tools", async (req, res) => {
         return '';
       });
     };
-    
+
     try {
       // Use McpClientService to create transport (handles decryption and env resolution)
       const mcpService = new McpClientService();

@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-19',
     changes: [
+      'ClickUp Integration',
+      '- Users can now connect their ClickUp account from the Knowledge Base page using a Personal API Token',
+      '- Connected workspaces show ClickUp Docs in an expandable card, similar to Google Drive Shared Folders',
+      '- ClickUp MCP server support: admins configure the server with a per-user {{clickup_access_token}} placeholder that is resolved at execution time',
+      '- MCP accessToken placeholder detection now works correctly with encrypted tokens stored in the database',
+      '- MCP servers with per-user secret placeholders skip startup connection and discover tools per-user at session time',
       'Onboarding Detection for New Users',
       '- New users without brand guidelines are automatically redirected to the Onboarding plan on first login',
       '- If a user navigates away before completing onboarding, a warning dialog explains that the portal won\'t work effectively without it',
