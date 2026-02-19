@@ -9,6 +9,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-19',
     changes: [
+      'Onboarding Detection for New Users',
+      '- New users without brand guidelines are automatically redirected to the Onboarding plan on first login',
+      '- If a user navigates away before completing onboarding, a warning dialog explains that the portal won\'t work effectively without it',
+      '- After dismissing the warning, a persistent banner reminds the user they can resume onboarding via Agent Mode',
+      '- Onboarding is considered complete when all work plan steps are finished; the warning and banner disappear automatically',
+      '- Admin and delegate sessions are excluded from onboarding detection',
+      'Work Plan Progress: Auto-Advance to Current Step',
+      '- The work plan progress indicator now automatically highlights the first pending step instead of staying on step 1',
+      '- As steps are completed, the selected step advances to the next pending one',
+      '- Manually selecting a step still works and pauses auto-advance',
       'GTM Tracker: Show Completion Date for Work Items',
       '- Completed work items now display their completion date below the status badge in both the Partner Portal and Customer Portal GTM trackers',
       '- Phase and plan status report emails now include the completion date for completed work items',
