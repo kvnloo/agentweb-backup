@@ -429,10 +429,10 @@ Uses browser-use library with Playwright:
 ### GitHub Actions Workflows
 
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
-  - Version check: PR version must be >= base branch version
   - Automatically deploys backend to staging after tests pass on PRs
+  - Deploys are triggered by file changes in `backend/` or `partner-portal/`
 - `.github/workflows/deploy.yml` - Deploys to production on merge to main
-  - Version check: Only deploys if version strictly higher than previous commit
+  - Deploys are triggered by file changes detected via path filters (no version bump required)
   - Separate jobs for backend and partner-portal
 
 ### Deployment Targets
@@ -475,8 +475,8 @@ The retrieve commands return S3 URLs for each instance. Download and inspect:
 ```bash
 cd backend
 npm run build
-VERSION="X.Y" && mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
+DATE=$(date +%Y%m%d) && LABEL="backend-${DATE}-manual" && mkdir -p builds && \
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
 # Upload to Elastic Beanstalk via AWS Console
 ```
 
@@ -487,8 +487,8 @@ VITE_API_URL=https://api.agentweb.pro \
 VITE_CUSTOMER_FRONTEND_URL=https://app.agentweb.pro \
 VITE_DEBUG=false \
 npm run build && \
-VERSION="X.Y" && mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+DATE=$(date +%Y%m%d) && LABEL="partner-${DATE}-manual" && mkdir -p builds && \
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json
 # Upload to Elastic Beanstalk via AWS Console
 ```
 
@@ -538,12 +538,12 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 ## Important Patterns and Conventions
 
-### Version Management
+### Build & Deploy Naming
 
-- Backend, partner-portal, and customer-portal have independent versioning in their `package.json`
-- Always bump version before merging to main for production deployment
-- Version format: `X.Y.Z` (semver: major.minor.patch). Bump the **minor** version for each release and reset patch to 0 (e.g., `27.7.0` → `27.8.0`). Only bump patch for hotfixes. When the minor version reaches 10, bump the major version and reset minor to 0. For example: `27.9.0` → `28.0.0`, NOT `27.10.0`.
-- No version bump needed for staging deployments (PRs)
+- Build artifacts and EB version labels use the format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
+- The PR number is extracted from the merge commit message; falls back to the short commit SHA if unavailable
+- Deployments are triggered automatically by file changes in `backend/` or `partner-portal/` — no manual version bump is needed
+- `package.json` versions in backend, partner-portal, and customer-portal are independent but are **not** used for deployment gating
 
 ### DynamoDB Query Optimization
 
@@ -742,3 +742,10 @@ When making changes, these files are critical to understand:
 - Real-time features use Socket.IO for WebSocket connections
 - Email notifications use both SMTP and Resend API
 - Slack integration for GTM plan approvals via webhooks
+
+## "Prep for Deploy" Command
+
+When the user says **"prep for deploy \<date\>"** (default: today's date if omitted):
+
+1. Add a user-facing release notes entry for the date at the top of `backend/src/docs/user-release.ts`, following existing format
+2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend
