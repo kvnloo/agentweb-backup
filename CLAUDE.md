@@ -749,3 +749,7 @@ When the user says **"prep for deploy \<date\>"** (default: today's date if omit
 
 1. Add a user-facing release notes entry for the date at the top of `backend/src/docs/user-release.ts`, following existing format
 2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend
+3. Commit changes and create PRs for **both** repos:
+   - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
+   - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR
+4. Return both PR URLs to the user
