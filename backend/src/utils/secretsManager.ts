@@ -214,4 +214,3 @@ export async function getGoogleDriveServiceAccountEmail(): Promise<string> {
   }
 }
 
->>>>>>> origin/main
