@@ -75,11 +75,22 @@ function hasSecretPlaceholders(value: string): boolean {
 }
 
 /**
- * Checks if an MCP server config has any {{...}} secret placeholders in its env values.
+ * Checks if an MCP server config has any {{...}} secret placeholders in its env values or accessToken.
  */
 function configHasSecretPlaceholders(config: McpServerConfig): boolean {
   if ('env' in config && config.env) {
-    return Object.values(config.env).some(v => hasSecretPlaceholders(v));
+    if (Object.values(config.env).some(v => hasSecretPlaceholders(v))) return true;
+  }
+  if ('accessToken' in config && config.accessToken) {
+    // The accessToken may be stored encrypted in the database, so try to decrypt first
+    let tokenToCheck = config.accessToken;
+    try {
+      const decrypted = decryptPassword(config.accessToken);
+      tokenToCheck = decrypted.password;
+    } catch {
+      // Not encrypted, use as-is
+    }
+    if (hasSecretPlaceholders(tokenToCheck)) return true;
   }
   return false;
 }
@@ -203,12 +214,10 @@ export class McpClientService {
           // (getSessionClient will resolve secrets per-user at execution time)
           if (configHasSecretPlaceholders(serverConfig)) {
             this.serversWithSecretPlaceholders.add(serverName);
-            console.log(`MCP: Server "${serverName}" has per-user secret placeholders, will resolve at execution time`);
+            console.log(`MCP: Server "${serverName}" has per-user secret placeholders — skipping startup connection, tools will be discovered per-user via discoverToolsForUser()`);
+            return; // Skip initial connection; can't list tools without real credentials
           }
 
-          // Always connect for tool discovery — most MCP servers can list tools
-          // without valid credentials. Execution goes through getSessionClient
-          // which resolves per-user secrets.
           await this.connectToServer(serverName, serverConfig, toolPrefix);
       } catch (error) {
           console.error(`MCP: Failed to connect to server ${serverName}:`, error);
@@ -293,8 +302,22 @@ export class McpClientService {
     // For servers with secret placeholders, resolve user secrets into a cloned config
     let configForTransport = serverConfig.config;
     if (needsUserSecrets && userId) {
-      if (!('env' in configForTransport) || !configForTransport.env) {
-        throw new Error(`MCP: Server "${serverName}" marked as having secret placeholders but has no env config`);
+      const hasEnvPlaceholders = 'env' in configForTransport && configForTransport.env &&
+        Object.values(configForTransport.env).some(v => hasSecretPlaceholders(v));
+      // accessToken may be stored encrypted in the database; decrypt before checking
+      let accessTokenToCheck = ('accessToken' in configForTransport && configForTransport.accessToken) || '';
+      if (accessTokenToCheck) {
+        try {
+          const decrypted = decryptPassword(accessTokenToCheck);
+          accessTokenToCheck = decrypted.password;
+        } catch {
+          // Not encrypted, use as-is
+        }
+      }
+      const hasAccessTokenPlaceholder = !!accessTokenToCheck && hasSecretPlaceholders(accessTokenToCheck);
+
+      if (!hasEnvPlaceholders && !hasAccessTokenPlaceholder) {
+        throw new Error(`MCP: Server "${serverName}" marked as having secret placeholders but none found in env or accessToken`);
       }
       const user = await userDb.getUserById(userId);
       if (!user || !user.secrets || Object.keys(user.secrets).length === 0) {
@@ -312,8 +335,17 @@ export class McpClientService {
         }
       }
       // Clone config with resolved env
-      const resolvedEnv = resolveUserSecrets(configForTransport.env, decryptedSecrets);
-      configForTransport = { ...configForTransport, env: resolvedEnv } as McpServerConfig;
+      if (hasEnvPlaceholders && 'env' in configForTransport && configForTransport.env) {
+        const resolvedEnv = resolveUserSecrets(configForTransport.env, decryptedSecrets);
+        configForTransport = { ...configForTransport, env: resolvedEnv } as McpServerConfig;
+      }
+      // Resolve accessToken placeholders (use the decrypted value which contains {{...}})
+      if (hasAccessTokenPlaceholder) {
+        const resolvedToken = accessTokenToCheck.replace(
+          /\{\{(\w+)\}\}/g, (match, varName) => decryptedSecrets[varName] ?? match
+        );
+        configForTransport = { ...configForTransport, accessToken: resolvedToken } as McpServerConfig;
+      }
     }
 
     const transport = await this.createTransport(serverName, configForTransport);
@@ -771,6 +803,41 @@ export class McpClientService {
    */
   getTools(): AgentTool[] {
     return this.mcpTools;
+  }
+
+  /**
+   * Discover tools from servers that have per-user secret placeholders.
+   * These servers cannot list tools during initialization (no user context),
+   * so tool discovery is deferred until a user session provides credentials.
+   * Call this once per user session before getTools().
+   */
+  async discoverToolsForUser(userId: string, chatSessionId: string): Promise<number> {
+    if (this.serversWithSecretPlaceholders.size === 0) return 0;
+
+    let discoveredCount = 0;
+    for (const serverName of this.serversWithSecretPlaceholders) {
+      const serverConfig = this.serverConfigs.get(serverName);
+      if (!serverConfig) continue;
+
+      // Skip if tools from this server are already registered
+      const prefix = serverConfig.toolPrefix;
+      const hasTools = prefix
+        ? this.mcpTools.some(t => t.name.startsWith(`${prefix}_`))
+        : false;
+      // For non-prefixed servers, check if any tool was registered from getSessionClient late-discovery
+      if (hasTools) continue;
+
+      try {
+        // getSessionClient resolves user secrets and connects; the late-discovery
+        // block inside it registers tools into mcpTools when they're missing.
+        await this.getSessionClient(serverName, chatSessionId, userId);
+        discoveredCount++;
+      } catch (error) {
+        console.warn(`[MCP-DISCOVER] Failed to discover tools for server "${serverName}" for user "${userId}":`, (error as Error).message);
+      }
+    }
+
+    return discoveredCount;
   }
 
   /**

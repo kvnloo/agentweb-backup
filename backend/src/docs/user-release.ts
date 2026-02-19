@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-19',
     changes: [
+      'ClickUp Integration',
+      '- Users can now connect their ClickUp account from the Knowledge Base page using a Personal API Token',
+      '- Connected workspaces show ClickUp Docs in an expandable card, similar to Google Drive Shared Folders',
+      '- ClickUp MCP server support: admins configure the server with a per-user {{clickup_access_token}} placeholder that is resolved at execution time',
+      '- MCP accessToken placeholder detection now works correctly with encrypted tokens stored in the database',
+      '- MCP servers with per-user secret placeholders skip startup connection and discover tools per-user at session time',
       'GTM Tracker: Show Completion Date for Work Items',
       '- Completed work items now display their completion date below the status badge in both the Partner Portal and Customer Portal GTM trackers',
       '- Phase and plan status report emails now include the completion date for completed work items',
