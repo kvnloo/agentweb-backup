@@ -1,3 +1,9 @@
+# February 18, 2026: Runaway ts-node-dev Processes Overheating Machine
+
+Two `ts-node-dev` processes (PIDs 70909, 70910) from the `agentweb` clone were stuck at 100% CPU each for ~10 hours, consuming ~200% CPU total. They were running `server.ts` via `ts-node-dev` and had accumulated 345+ minutes of CPU time. Regular `kill` was ignored; required `kill -9` to terminate. Machine cooled down immediately after.
+
+**Lesson:** When running `npm run dev` in multiple repo clones, check for orphaned `ts-node-dev` processes if the machine gets hot. Use `ps aux | sort -k3 -rn | head -10` to find CPU hogs quickly.
+
 # February 18, 2026: Subdomain Landing Page Setup for Haven (usehaven.ai)
 
 ## Approach
