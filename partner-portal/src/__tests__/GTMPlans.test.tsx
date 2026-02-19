@@ -1163,3 +1163,368 @@ describe('GTMPlans - Status and Notes Updates', () => {
     expect(dialogText).toMatch(/Notes/i);
   });
 });
+
+describe('GTMPlans - Pending AgentWeb Items', () => {
+  const mockPlansWithAgentWebDri = [
+    {
+      planId: 'plan-aw-1',
+      userId: 'user-aw-1',
+      userEmail: 'client1@example.com',
+      userName: 'Client 1',
+      supportNote: 'AgentWeb Client',
+      title: 'Plan With AgentWeb Items',
+      status: 'in_progress',
+      phases: [
+        {
+          id: 'phase-aw-1',
+          title: 'Phase AW 1',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-aw-1',
+              title: 'Pending AW Item 1',
+              status: 'pending',
+              dri: 'alice@agentweb.pro',
+            },
+            {
+              id: 'item-aw-2',
+              title: 'Pending AW Item 2',
+              status: 'pending',
+              dri: 'alice@agentweb.pro',
+            },
+            {
+              id: 'item-aw-3',
+              title: 'Pending AW Item 3',
+              status: 'pending',
+              dri: 'bob@agentweb.pro',
+            },
+            {
+              id: 'item-aw-4',
+              title: 'Completed AW Item',
+              status: 'completed',
+              dri: 'alice@agentweb.pro',
+            },
+            {
+              id: 'item-aw-5',
+              title: 'Pending External Item',
+              status: 'pending',
+              dri: 'external@other.com',
+            },
+          ],
+        },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    },
+    {
+      planId: 'plan-aw-2',
+      userId: 'user-aw-2',
+      userEmail: 'client2@example.com',
+      userName: 'Client 2',
+      supportNote: 'No AgentWeb Client',
+      title: 'Plan Without AgentWeb Items',
+      status: 'in_progress',
+      phases: [
+        {
+          id: 'phase-aw-2',
+          title: 'Phase No AW',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-ext-1',
+              title: 'External Item',
+              status: 'pending',
+              dri: 'someone@other.com',
+            },
+          ],
+        },
+      ],
+      createdAt: '2024-01-02T00:00:00Z',
+      updatedAt: '2024-01-02T00:00:00Z',
+    },
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockedAxios.get = jest.fn();
+    mockedAxios.put = jest.fn();
+
+    mockedAxios.get.mockResolvedValue({
+      data: { success: true, data: mockPlansWithAgentWebDri },
+    });
+  });
+
+  it('shows pending AgentWeb items section on cards that have them', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('AgentWeb Client')).toBeInTheDocument();
+      expect(screen.getByText('Our Pending Items:')).toBeInTheDocument();
+    });
+  });
+
+  it('displays email breakdown with individual counts', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('alice@agentweb.pro')).toBeInTheDocument();
+      expect(screen.getByText('bob@agentweb.pro')).toBeInTheDocument();
+    });
+  });
+
+  it('does not show pending items section for clients without @agentweb.pro pending items', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('No AgentWeb Client')).toBeInTheDocument();
+    });
+
+    // Find the card for "No AgentWeb Client" and verify it doesn't contain "Our Pending Items:"
+    const noAwCard = screen.getByText('No AgentWeb Client').closest('.MuiCard-root') as HTMLElement;
+    expect(noAwCard).not.toBeNull();
+    expect(within(noAwCard).queryByText('Our Pending Items:')).not.toBeInTheDocument();
+  });
+
+  it('does not count completed @agentweb.pro items', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('AgentWeb Client')).toBeInTheDocument();
+    });
+
+    // The card for AgentWeb Client should show total of 3 (2 alice + 1 bob), not 4
+    // (the completed alice item should not be counted)
+    const awCard = screen.getByText('AgentWeb Client').closest('.MuiCard-root') as HTMLElement;
+    expect(awCard).not.toBeNull();
+    const cardScope = within(awCard);
+
+    // Check the total chip (should be 3)
+    expect(cardScope.getByText('Our Pending Items:')).toBeInTheDocument();
+    // The total count chip with value "3" should exist
+    const chips = cardScope.getAllByText('3');
+    expect(chips.length).toBeGreaterThan(0);
+  });
+});
+
+describe('GTMPlans - Unassigned Pending Items', () => {
+  const mockPlansWithUnassigned = [
+    {
+      planId: 'plan-ua-1',
+      userId: 'user-ua-1',
+      userEmail: 'client-ua@example.com',
+      userName: 'UA Client',
+      supportNote: 'Unassigned Client',
+      title: 'Plan With Unassigned Items',
+      status: 'in_progress',
+      phases: [
+        {
+          id: 'phase-ua-1',
+          title: 'Phase UA 1',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-ua-1',
+              title: 'Unassigned Item 1',
+              status: 'pending',
+              // no dri
+            },
+            {
+              id: 'item-ua-2',
+              title: 'Unassigned Item 2',
+              status: 'pending',
+              dri: '',
+            },
+            {
+              id: 'item-ua-3',
+              title: 'Unassigned Item 3',
+              status: 'pending',
+              dri: '  ',
+            },
+            {
+              id: 'item-ua-4',
+              title: 'Completed Unassigned Item',
+              status: 'completed',
+              // no dri — should NOT count
+            },
+            {
+              id: 'item-ua-5',
+              title: 'Assigned AW Item',
+              status: 'pending',
+              dri: 'team@agentweb.pro',
+            },
+            {
+              id: 'item-ua-6',
+              title: 'Assigned External Item',
+              status: 'pending',
+              dri: 'external@other.com',
+            },
+          ],
+        },
+      ],
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z',
+    },
+    {
+      planId: 'plan-ua-2',
+      userId: 'user-ua-2',
+      userEmail: 'client-all-assigned@example.com',
+      userName: 'Assigned Client',
+      supportNote: 'All Assigned Client',
+      title: 'Plan With All Assigned',
+      status: 'in_progress',
+      phases: [
+        {
+          id: 'phase-ua-2',
+          title: 'Phase UA 2',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-aa-1',
+              title: 'Assigned Item',
+              status: 'pending',
+              dri: 'someone@other.com',
+            },
+          ],
+        },
+      ],
+      createdAt: '2024-01-02T00:00:00Z',
+      updatedAt: '2024-01-02T00:00:00Z',
+    },
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+
+    mockedAxios.get = jest.fn();
+    mockedAxios.put = jest.fn();
+
+    mockedAxios.get.mockResolvedValue({
+      data: { success: true, data: mockPlansWithUnassigned },
+    });
+  });
+
+  it('shows unassigned pending items count on cards that have them', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
+      expect(screen.getByText('Unassigned Pending:')).toBeInTheDocument();
+    });
+  });
+
+  it('counts items with no dri, empty dri, and whitespace-only dri as unassigned', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
+    });
+
+    const uaCard = screen.getByText('Unassigned Client').closest('.MuiCard-root') as HTMLElement;
+    expect(uaCard).not.toBeNull();
+    const cardScope = within(uaCard);
+
+    // Should count 3 unassigned items (no dri, empty dri, whitespace dri)
+    // Not the completed one, not the agentweb one, not the external one
+    expect(cardScope.getByText('Unassigned Pending:')).toBeInTheDocument();
+    const chips = cardScope.getAllByText('3');
+    expect(chips.length).toBeGreaterThan(0);
+  });
+
+  it('does not show unassigned section for clients with all items assigned', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('All Assigned Client')).toBeInTheDocument();
+    });
+
+    const assignedCard = screen.getByText('All Assigned Client').closest('.MuiCard-root') as HTMLElement;
+    expect(assignedCard).not.toBeNull();
+    expect(within(assignedCard).queryByText('Unassigned Pending:')).not.toBeInTheDocument();
+  });
+
+  it('does not count completed items without dri as unassigned', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
+    });
+
+    const uaCard = screen.getByText('Unassigned Client').closest('.MuiCard-root') as HTMLElement;
+    const cardScope = within(uaCard);
+
+    // The unassigned count should be 3 (not 4 — the completed item is excluded)
+    const unassignedChips = cardScope.getAllByText('3');
+    expect(unassignedChips.length).toBeGreaterThan(0);
+  });
+
+  it('shows both our pending items and unassigned pending on the same card', async () => {
+    render(
+      <BrowserRouter>
+        <AuthProvider>
+          <GTMPlans />
+        </AuthProvider>
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
+    });
+
+    const uaCard = screen.getByText('Unassigned Client').closest('.MuiCard-root') as HTMLElement;
+    const cardScope = within(uaCard);
+
+    // Should show both sections
+    expect(cardScope.getByText('Our Pending Items:')).toBeInTheDocument();
+    expect(cardScope.getByText('team@agentweb.pro')).toBeInTheDocument();
+    expect(cardScope.getByText('Unassigned Pending:')).toBeInTheDocument();
+  });
+});

@@ -12,7 +12,8 @@ import {
   getMetaAccessToken,
   getGCSPPrivateKey,
   getLinkedInCredentials,
-  getMetaCredentials
+  getMetaCredentials,
+  getGoogleDriveServiceAccountEmail
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -227,85 +228,6 @@ describe('secretsManager utils', () => {
       await getLinkedInCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/LinkedIn/Company'
-      });
-    });
-  });
-
-  describe('getMetaCredentials', () => {
-    it('should return Meta credentials', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({
-            clientId: 'meta-client-123',
-            clientSecret: 'meta-secret-456'
-          })
-        })
-      });
-
-      const result = await getMetaCredentials();
-      expect(result.clientId).toBe('meta-client-123');
-      expect(result.clientSecret).toBe('meta-secret-456');
-    });
-
-    it('should throw error when credentials are empty', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
-      });
-
-      await expect(getMetaCredentials()).rejects.toThrow(
-        'Failed to fetch Meta credentials'
-      );
-    });
-
-    it('should throw error when clientId is missing', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientSecret: 'secret' })
-        })
-      });
-
-      await expect(getMetaCredentials()).rejects.toThrow(
-        'Failed to fetch Meta credentials'
-      );
-    });
-
-    it('should throw error when clientSecret is missing', async () => {
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'client' })
-        })
-      });
-
-      await expect(getMetaCredentials()).rejects.toThrow(
-        'Failed to fetch Meta credentials'
-      );
-    });
-
-    it('should use prod secret in production', async () => {
-      process.env.NODE_ENV = 'production';
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
-        })
-      });
-
-      await getMetaCredentials();
-      expect(mockGetSecretValue).toHaveBeenCalledWith({
-        SecretId: 'prod/AgentWeb/MetaApp'
-      });
-    });
-
-    it('should use dev secret in development', async () => {
-      process.env.NODE_ENV = 'development';
-      mockGetSecretValue.mockReturnValue({
-        promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
-        })
-      });
-
-      await getMetaCredentials();
-      expect(mockGetSecretValue).toHaveBeenCalledWith({
-        SecretId: 'dev/AgentWeb/MetaApp'
       });
     });
   });

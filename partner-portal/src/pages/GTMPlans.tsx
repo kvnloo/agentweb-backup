@@ -61,6 +61,7 @@ interface WorkItem {
   status: "pending" | "completed" | "skipped";
   notes?: string;
   dueDate?: string;
+  completedAt?: string;
 }
 
 interface Phase {
@@ -100,6 +101,8 @@ interface UserStats {
   incompletePlans: number;
   yellowWarningPlans: number;
   redAlertPlans: number;
+  pendingAgentWebItems: Record<string, number>;
+  unassignedPendingItems: number;
   plans: GTMPlan[];
 }
 
@@ -878,6 +881,8 @@ export default function GTMPlans() {
           incompletePlans: 0,
           yellowWarningPlans: 0,
           redAlertPlans: 0,
+          pendingAgentWebItems: {},
+          unassignedPendingItems: 0,
           plans: [],
         });
       }
@@ -885,6 +890,21 @@ export default function GTMPlans() {
       const userStats = userMap.get(plan.userId)!;
       userStats.plans.push(plan);
       userStats.totalPlans++;
+
+      // Aggregate pending @agentweb.pro and unassigned work items
+      plan.phases?.forEach((phase) => {
+        phase.workItems?.forEach((workItem) => {
+          if (workItem.status === "pending") {
+            if (workItem.dri?.toLowerCase().endsWith("@agentweb.pro")) {
+              const email = workItem.dri.toLowerCase();
+              userStats.pendingAgentWebItems[email] =
+                (userStats.pendingAgentWebItems[email] || 0) + 1;
+            } else if (!workItem.dri || workItem.dri.trim() === "") {
+              userStats.unassignedPendingItems++;
+            }
+          }
+        });
+      });
 
       if (plan.status === "in_progress") {
         userStats.incompletePlans++;
@@ -997,6 +1017,47 @@ export default function GTMPlans() {
                               color="error"
                               icon={<ErrorIcon />}
                             />
+                          </Box>
+                        )}
+
+                        {(Object.keys(userStats.pendingAgentWebItems).length > 0 || userStats.unassignedPendingItems > 0) && (
+                          <Box sx={{ borderTop: 1, borderColor: "divider", pt: 1, mt: 1 }}>
+                            {Object.keys(userStats.pendingAgentWebItems).length > 0 && (
+                              <>
+                                <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>
+                                  <Typography variant="body2" color="text.secondary">
+                                    Our Pending Items:
+                                  </Typography>
+                                  <Chip
+                                    label={Object.values(userStats.pendingAgentWebItems).reduce((a, b) => a + b, 0)}
+                                    size="small"
+                                    color="primary"
+                                    icon={<PersonIcon />}
+                                  />
+                                </Box>
+                                {Object.entries(userStats.pendingAgentWebItems).map(([email, count]) => (
+                                  <Box key={email} sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", pl: 1 }}>
+                                    <Typography variant="caption" color="text.secondary">
+                                      {email}
+                                    </Typography>
+                                    <Chip label={count} size="small" variant="outlined" />
+                                  </Box>
+                                ))}
+                              </>
+                            )}
+                            {userStats.unassignedPendingItems > 0 && (
+                              <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mt: 0.5 }}>
+                                <Typography variant="body2" color="text.secondary">
+                                  Unassigned Pending:
+                                </Typography>
+                                <Chip
+                                  label={userStats.unassignedPendingItems}
+                                  size="small"
+                                  color="warning"
+                                  icon={<WarningIcon />}
+                                />
+                              </Box>
+                            )}
                           </Box>
                         )}
                       </Box>
@@ -1268,6 +1329,11 @@ export default function GTMPlans() {
                                         color={getStatusColor(item.status) as any}
                                         size="small"
                                       />
+                                      {item.completedAt && (
+                                        <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                                          {format(new Date(item.completedAt), "MMM d, yyyy")}
+                                        </Typography>
+                                      )}
                                     </TableCell>
                                     <TableCell>
                                       {item.dueDate ? (() => {

@@ -1,3 +1,67 @@
+# February 18, 2026: Runaway ts-node-dev Processes Overheating Machine
+
+Two `ts-node-dev` processes (PIDs 70909, 70910) from the `agentweb` clone were stuck at 100% CPU each for ~10 hours, consuming ~200% CPU total. They were running `server.ts` via `ts-node-dev` and had accumulated 345+ minutes of CPU time. Regular `kill` was ignored; required `kill -9` to terminate. Machine cooled down immediately after.
+
+**Lesson:** When running `npm run dev` in multiple repo clones, check for orphaned `ts-node-dev` processes if the machine gets hot. Use `ps aux | sort -k3 -rn | head -10` to find CPU hogs quickly.
+
+# February 18, 2026: Subdomain Landing Page Setup for Haven (usehaven.ai)
+
+## Approach
+Use a CNAME record so we manage the subdomain on Vercel while the client's primary DNS stays untouched. No Nameserver access needed.
+
+## Steps
+
+1. **Add subdomain in Vercel**: Project Settings > Domains > add `start.usehaven.ai`. Vercel will show "Invalid Configuration" until DNS propagates.
+
+2. **Client DNS request** — ask their IT/DNS admin to add one record:
+   - **Type:** CNAME
+   - **Name (Host):** `start`
+   - **Value (Points to):** `ca0c21bca6304a7a.vercel-dns-016.com.`
+   - **TTL:** 3600 (or default)
+
+3. **SSL is automatic**: once the CNAME resolves to Vercel, they auto-provision a Let's Encrypt certificate and handle renewal every 90 days. No action needed.
+
+## Creating a Vercel Project Synced to AgentWebPro Org
+
+1. Go to [vercel.com/new](https://vercel.com/new)
+2. Under "Import Git Repository", select the **AgentWebPro** GitHub org from the dropdown
+3. Find and import the target repo (e.g. `haven-landing`)
+4. Configure build settings (framework preset, build command, output directory) and environment variables as needed
+5. Click **Deploy**
+
+The project will now auto-deploy on every push to the default branch. To add the custom subdomain, go to Project Settings > Domains and follow the steps above.
+
+**Make PR preview URLs public**: Project Settings > Deployment Protection > disable Vercel Authentication.
+
+
+# February 18, 2026: Google Drive Integration — MCP vs Direct API
+
+## Investigation
+Explored options for integrating Google Drive into the knowledge base:
+
+1. **Anthropic's `@anthropic-ai/google-drive-mcp`** — archived, no longer maintained
+2. **Google Workspace MCP server** ([gemini-cli-extensions/workspace](https://github.com/gemini-cli-extensions/workspace)) — found via Google's official MCP list at https://github.com/Google/mcp
+   - Provides Drive, Docs, Sheets, Slides, Calendar, Gmail, and Chat access
+   - Uses OAuth with a built-in client ID — authenticates as a real Google user via browser login
+   - **Incompatible with service account approach**: the admin-configured "shared folders" model requires a service account that has access to specific folders shared with it. The Workspace MCP server authenticates as the end user, so scoping access to admin-designated folders doesn't work.
+   - Also requires an interactive browser session on first auth, which doesn't work headlessly on the agent engine
+3. **`googleapis/gcloud-mcp`** — only covers GCP infrastructure (gcloud CLI, observability, Cloud Storage buckets), not Google Drive
+
+## Decision
+Integrate with the Google Drive API directly using a service account rather than relying on an MCP server. This allows:
+- Admin configures folder IDs shared with the service account → stored on the user record
+- Backend reads files from those folders via the Drive API using service account credentials
+- No interactive browser login needed — works headlessly on the agent engine
+- Access is scoped to only the folders explicitly shared by the admin
+
+The Google Workspace MCP server can be reconsidered in the future if per-user OAuth MCP sessions are supported (see Feb 12 ClickUp investigation for similar pattern), or if a service-account-compatible Drive MCP server becomes available.
+
+## Current State
+- Admin endpoint and UI for configuring shared folder IDs on user records: done
+- Customer portal Knowledge Base page shows configured folders with Drive links: done
+- Direct Drive API integration for listing/reading files: TODO
+
+
 # February 17, 2026: Foundation Tools Blocked by Subscription Filtering
 
 ## Problem

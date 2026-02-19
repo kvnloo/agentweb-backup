@@ -316,6 +316,7 @@ export class AgentModeService {
     // Note: Newer Claude models require using inference profiles for cross-region access
     const inferenceProfileMap: Record<string, string> = {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+      'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
       'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
@@ -447,6 +448,7 @@ export class AgentModeService {
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
+    'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
     'anthropic.claude-opus-4-6-v1': { client: null, supportsTemperature: true },
   };
 
@@ -7756,6 +7758,28 @@ Format the response as JSON with this structure:
   }
 
   // Knowledge base search functionality
+  // Helper: get an authenticated Google Drive client using the service account
+  private async getGoogleDriveClient() {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Google/Share'
+      : 'dev/AgentWeb/Google/Share';
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+    });
+    return google.drive({ version: 'v3', auth });
+  }
+
+  // Helper: get Google Drive shared folders for a user
+  private async getUserGoogleDriveFolders(userId: string): Promise<Array<{ folderId: string; name: string }>> {
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(userId);
+    return user?.googleDriveFolders || [];
+  }
+
   public async searchKnowledgeBase(query: string, maxResults: number = 5, userId?: string): Promise<any> {
     try {
       console.log('AgentMode: Searching knowledge base for query:', query, 'maxResults:', maxResults);
@@ -7766,7 +7790,51 @@ Format the response as JSON with this structure:
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
-      if (!searchResults || searchResults.length === 0) {
+      const results: Array<{ content: string; source: string }> = (searchResults || []).map(result => ({
+        content: result.content,
+        source: result.metadata?.source || 'unknown'
+      }));
+
+      // Search Google Drive shared folders
+      if (userId) {
+        try {
+          const folders = await this.getUserGoogleDriveFolders(userId);
+          if (folders.length > 0) {
+            const drive = await this.getGoogleDriveClient();
+            // Build query: search across all shared folders
+            const parentClauses = folders.map(f => `'${f.folderId}' in parents`).join(' or ');
+            const driveResponse = await drive.files.list({
+              q: `(${parentClauses}) and fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`,
+              fields: 'files(id, name, mimeType, parents)',
+              pageSize: limitedMaxResults,
+            });
+
+            const driveFiles = driveResponse.data.files || [];
+            for (const file of driveFiles) {
+              // Read file content for text-based files
+              if (file.id && file.mimeType && !file.mimeType.startsWith('application/vnd.google-apps.folder')) {
+                try {
+                  const content = await this.readGoogleDriveFileContent(drive, file.id, file.name || '', file.mimeType);
+                  if (content) {
+                    const parentFolder = folders.find(f => file.parents?.includes(f.folderId));
+                    results.push({
+                      content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                      source: `google-drive/${parentFolder?.name || 'shared'}/${file.name}`
+                    });
+                  }
+                } catch (readErr) {
+                  console.log(`AgentMode: Could not read Drive file ${file.name} for search:`, readErr);
+                }
+              }
+            }
+          }
+        } catch (driveError) {
+          console.log('AgentMode: Error searching Google Drive shared folders:', driveError);
+          // Don't fail the whole search if Drive search fails
+        }
+      }
+
+      if (results.length === 0) {
         return {
           success: true,
           message: `No knowledge base results found for "${query}"`,
@@ -7778,13 +7846,10 @@ Format the response as JSON with this structure:
 
       return {
         success: true,
-        message: `Found ${searchResults.length} knowledge base results for "${query}"`,
+        message: `Found ${results.length} knowledge base results for "${query}"`,
         query,
-        results: searchResults.map(result => ({
-          content: result.content,
-          source: result.metadata?.source || 'unknown'
-        })),
-        totalResults: searchResults.length
+        results,
+        totalResults: results.length
       };
     } catch (error) {
       console.error('AgentMode: Error searching knowledge base:', error);
@@ -7863,6 +7928,44 @@ Format the response as JSON with this structure:
         };
       });
 
+      // Include Google Drive shared folders
+      try {
+        const folders = await this.getUserGoogleDriveFolders(userId);
+        if (folders.length > 0) {
+          const drive = await this.getGoogleDriveClient();
+          for (const folder of folders) {
+            try {
+              const response = await drive.files.list({
+                q: `'${folder.folderId}' in parents and trashed = false`,
+                fields: 'files(id, name, mimeType, size, modifiedTime)',
+                orderBy: 'name',
+                pageSize: 100,
+              });
+
+              const driveFiles = (response.data.files || []).map((f) => ({
+                fileName: f.name || 'unknown',
+                fileSize: f.size ? parseInt(f.size, 10) : 0,
+                mimeType: f.mimeType || 'unknown',
+                driveFileId: f.id,
+                modifiedTime: f.modifiedTime,
+              }));
+
+              knowledgeBases.push({
+                identifier: `gdrive:${folder.folderId}`,
+                name: folder.name,
+                type: 'google-drive',
+                updatedAt: driveFiles.length > 0 ? driveFiles[0].modifiedTime : undefined,
+                files: driveFiles,
+              });
+            } catch (folderErr) {
+              console.log(`AgentMode: Error listing files in Drive folder ${folder.name}:`, folderErr);
+            }
+          }
+        }
+      } catch (driveError) {
+        console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
+      }
+
       const totalFiles = knowledgeBases.reduce(
         (sum: number, kb: any) => sum + (kb.files?.length || 0),
         0
@@ -7870,7 +7973,7 @@ Format the response as JSON with this structure:
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). Ensure to use the complete file URL to access the file.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles
@@ -7965,8 +8068,48 @@ Format the response as JSON with this structure:
     return await this.readSingleKnowledgeBaseFile(kbIdentifier, fileName, userId);
   }
 
+  // Helper: read a Google Drive file's content as text
+  private async readGoogleDriveFileContent(drive: any, fileId: string, fileName: string, mimeType: string): Promise<string> {
+    let content: Buffer;
+
+    // Google Workspace files need to be exported
+    if (mimeType === 'application/vnd.google-apps.document') {
+      const res = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' });
+      content = Buffer.from(res.data);
+    } else if (mimeType === 'application/vnd.google-apps.spreadsheet') {
+      const res = await drive.files.export({ fileId, mimeType: 'text/csv' }, { responseType: 'arraybuffer' });
+      content = Buffer.from(res.data);
+    } else if (mimeType === 'application/vnd.google-apps.presentation') {
+      const res = await drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' });
+      content = Buffer.from(res.data);
+    } else {
+      // Binary files — download directly
+      const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+      content = Buffer.from(res.data);
+    }
+
+    const extension = (fileName.split('.').pop() || '').toLowerCase();
+
+    if (extension === 'pdf' || mimeType === 'application/pdf') {
+      const pdfParse = require('pdf-parse');
+      const pdfData = await pdfParse(content);
+      return pdfData.text || '';
+    } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
+               mimeType.startsWith('text/') ||
+               mimeType.startsWith('application/vnd.google-apps.')) {
+      return content.toString('utf-8');
+    } else {
+      return content.toString('base64');
+    }
+  }
+
   // Helper: read a single knowledge base file
   public async readSingleKnowledgeBaseFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    // Handle Google Drive shared folder files (identifier starts with "gdrive:")
+    if (kbIdentifier.startsWith('gdrive:')) {
+      return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
+    }
+
     // Get the task
     const task = await taskDb.getTaskById(kbIdentifier);
     if (!task) {
@@ -8056,6 +8199,61 @@ Format the response as JSON with this structure:
       type: bucketType,
       updatedAt: task.knowledgeBaseUpdatedAt || task.updatedAt || task.createdAt
     };
+  }
+
+  // Helper: read a file from a Google Drive shared folder
+  private async readGoogleDriveSharedFile(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    const folderId = kbIdentifier.replace('gdrive:', '');
+
+    // Verify the folder belongs to this user
+    const folders = await this.getUserGoogleDriveFolders(userId);
+    if (!folders.some(f => f.folderId === folderId)) {
+      return { success: false, message: 'Not authorized to access this Google Drive folder' };
+    }
+
+    const folderMeta = folders.find(f => f.folderId === folderId);
+
+    try {
+      const drive = await this.getGoogleDriveClient();
+
+      // Find the file by name in the folder
+      const listResponse = await drive.files.list({
+        q: `'${folderId}' in parents and name = '${fileName.replace(/'/g, "\\'")}' and trashed = false`,
+        fields: 'files(id, name, mimeType, size, modifiedTime)',
+        pageSize: 1,
+      });
+
+      const files = listResponse.data.files || [];
+      if (files.length === 0) {
+        return { success: false, message: `File "${fileName}" not found in Google Drive folder "${folderMeta?.name || folderId}"` };
+      }
+
+      const file = files[0];
+      const contentStr = await this.readGoogleDriveFileContent(drive, file.id!, file.name || fileName, file.mimeType || '');
+
+      const maxContentLength = 50000;
+      const truncated = contentStr.length > maxContentLength
+        ? contentStr.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : contentStr;
+
+      return {
+        success: true,
+        message: `Successfully read Google Drive file "${fileName}"`,
+        kb_identifier: kbIdentifier,
+        file_name: fileName,
+        name: folderMeta?.name || folderId,
+        content: truncated,
+        size: file.size ? parseInt(file.size, 10) : contentStr.length,
+        type: 'google-drive',
+        modifiedTime: file.modifiedTime,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading Google Drive file:', error);
+      return {
+        success: false,
+        message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
   }
 
   // Web search functionality

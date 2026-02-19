@@ -7,6 +7,39 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-19',
+    changes: [
+      'GTM Tracker: Show Completion Date for Work Items',
+      '- Completed work items now display their completion date below the status badge in both the Partner Portal and Customer Portal GTM trackers',
+      '- Phase and plan status report emails now include the completion date for completed work items',
+    ],
+  },
+  {
+    date: '2026-02-18',
+    changes: [
+      'CSV Export for CRM Lead Lists',
+      '- Added an "Export CSV" button next to the existing "Import CSV" button on the CRM lead list view',
+      '- Exports all leads in the selected list as a CSV file with standard fields and custom fields',
+      '- CSV files are uploaded to S3 and opened in a new browser tab for download',
+      '- Export history dialog shows up to 50 previous exports with date, record count, and download link',
+      '- Previous exports can be re-downloaded at any time from the history dialog',
+      'Google Drive Shared Folders',
+      '- Admins can now configure Google Drive shared folder IDs per user in the Partner Portal Users tab',
+      '- Configured folders appear in a dedicated "Google Drive Shared Folders" section on the customer Knowledge Base page',
+      '- Each folder card shows the files inside it with names, sizes, and modification dates',
+      '- Folders with more than 10 files are collapsed by default to save space',
+      '- Agent Mode knowledge base tools now include Google Drive shared folders:',
+      '  - list_knowledge_base_files returns Drive folders with gdrive: identifiers',
+      '  - read_knowledge_base_files supports reading files from shared Drive folders including Google Docs, Sheets, and Slides',
+      '  - search_knowledge_base searches across both regular knowledge bases and Google Drive shared folders',
+      '- Google Workspace files are automatically exported to readable formats (Docs to text, Sheets to CSV, Slides to text)',
+      'Claude Sonnet 4.6 Support for Agent Mode',
+      '- Added Claude Sonnet 4.6 (anthropic.claude-sonnet-4-6) as an available LLM for Agent Mode chat',
+      '- Uses AWS Bedrock with cross-region inference profile, following the same pattern as Sonnet 4.5 and Opus 4.6',
+      '- Lazy-loaded Bedrock client with temperature support',
+    ],
+  },
+  {
     date: '2026-02-17',
     changes: [
       'Microsoft Clarity User Tracking',

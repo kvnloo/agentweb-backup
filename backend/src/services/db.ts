@@ -87,6 +87,7 @@ export interface User {
       color: string;
     }>;
   }; // User journey funnel configuration for SEO analytics
+  googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folder IDs
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   companyName?: string;
   useCaseCategories?: string[];
@@ -2940,6 +2941,7 @@ export const crmDb = {
       autoSendEnabled?: boolean;
       icpsOnly?: boolean;
       engagedOnly?: boolean;
+      csvExportHistory?: any[];
     }
   ) {
     try {
@@ -3017,6 +3019,12 @@ export const crmDb = {
         expressionAttributeNames['#engagedOnly'] = 'engagedOnly';
         updateExpressions.push('#engagedOnly = :engagedOnly');
         expressionAttributeValues[':engagedOnly'] = updates.engagedOnly;
+      }
+
+      if (updates.csvExportHistory !== undefined) {
+        expressionAttributeNames['#csvExportHistory'] = 'csvExportHistory';
+        updateExpressions.push('#csvExportHistory = :csvExportHistory');
+        expressionAttributeValues[':csvExportHistory'] = updates.csvExportHistory;
       }
 
       if (updateExpressions.length === 0) {

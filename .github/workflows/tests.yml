@@ -56,21 +56,6 @@ jobs:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
-      - name: Verify version is same or higher than base
-        shell: bash
-        run: |
-          set -euo pipefail
-          BASE_BRANCH="${GITHUB_BASE_REF}"
-          CURRENT_VERSION=$(jq -r .version backend/package.json)
-          git fetch origin "$BASE_BRANCH" --depth=1
-          BASE_VERSION=$(git show "origin/$BASE_BRANCH:backend/package.json" | jq -r .version)
-          echo "Base version: $BASE_VERSION | PR version: $CURRENT_VERSION"
-          if [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            npx --yes semver -r ">=$BASE_VERSION" "$CURRENT_VERSION" >/dev/null || { echo "::error::PR version ($CURRENT_VERSION) must be same or higher than base ($BASE_VERSION)."; exit 1; }
-          else
-            echo "::warning::One of the versions is not valid semver; skipping enforcement"
-          fi
-
       - name: Install dependencies
         working-directory: backend
         run: npm ci
@@ -84,23 +69,30 @@ jobs:
         run: npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary
 
       - name: Post coverage comment on PR
+        if: always() && steps.filter.outcome != 'skipped'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const coverage = JSON.parse(fs.readFileSync('backend/coverage/coverage-summary.json', 'utf8'));
+            const coveragePath = 'backend/coverage/coverage-summary.json';
+            if (!fs.existsSync(coveragePath)) {
+              console.log('Coverage summary not found, skipping comment');
+              return;
+            }
+            const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
             const { statements, branches, functions, lines } = coverage.total;
+            const allMet = statements.pct >= 90 && branches.pct >= 90 && functions.pct >= 90 && lines.pct >= 90;
 
             const body = `## 📊 Backend Test Coverage
 
-            | Metric | Coverage | Threshold |
-            |--------|----------|-----------|
-            | Statements | ${statements.pct}% | 90% |
-            | Branches | ${branches.pct}% | 90% |
-            | Functions | ${functions.pct}% | 90% |
-            | Lines | ${lines.pct}% | 90% |
+            | Metric | Coverage | Threshold | Status |
+            |--------|----------|-----------|--------|
+            | Statements | ${statements.pct}% | 90% | ${statements.pct >= 90 ? '✅' : '❌'} |
+            | Branches | ${branches.pct}% | 90% | ${branches.pct >= 90 ? '✅' : '❌'} |
+            | Functions | ${functions.pct}% | 90% | ${functions.pct >= 90 ? '✅' : '❌'} |
+            | Lines | ${lines.pct}% | 90% | ${lines.pct >= 90 ? '✅' : '❌'} |
 
-            ${branches.pct >= 90 ? '✅' : '❌'} **All thresholds must be ≥ 90%**`;
+            ${allMet ? '✅' : '❌'} **All thresholds must be ≥ 90%**`;
 
             // Find existing coverage comment
             const { data: comments } = await github.rest.issues.listComments({
@@ -157,10 +149,10 @@ jobs:
       - name: Package artifact
         working-directory: backend
         run: |
-          VERSION=$(jq -r .version package.json)
+          DATE=$(date +%Y%m%d)
           PR_NUMBER=${{ github.event.pull_request.number }}
           mkdir -p builds
-          zip -r "builds/deploy_v${VERSION}-staging-pr${PR_NUMBER}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/deploy_v${VERSION}-staging-pr${PR_NUMBER}.zip" dist package.json package-lock.json
+          zip -r "builds/backend-${DATE}-pr${PR_NUMBER}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/backend-${DATE}-pr${PR_NUMBER}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -173,22 +165,22 @@ jobs:
         timeout-minutes: 5
         working-directory: backend
         run: |
-          VERSION=$(jq -r .version package.json)
+          DATE=$(date +%Y%m%d)
           PR_NUMBER=${{ github.event.pull_request.number }}
-          VERSION_LABEL="backend_v${VERSION}-staging-pr${PR_NUMBER}"
-          echo "Deploying backend to staging version: $VERSION_LABEL"
-          
+          VERSION_LABEL="backend-${DATE}-pr${PR_NUMBER}"
+          echo "Deploying backend to staging: $VERSION_LABEL"
+
           # Upload to S3
           echo "Uploading deployment package to S3..."
-          aws s3 cp "builds/deploy_v${VERSION}-staging-pr${PR_NUMBER}.zip" "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/backend_deploy_${VERSION_LABEL}.zip"
-          
+          aws s3 cp "builds/backend-${DATE}-pr${PR_NUMBER}.zip" "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/${VERSION_LABEL}.zip"
+
           # Create new application version
           echo "Creating new application version..."
           aws elasticbeanstalk create-application-version \
             --application-name ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }} \
             --version-label "$VERSION_LABEL" \
-            --source-bundle S3Bucket="elasticbeanstalk-${{ env.AWS_REGION }}-992382574572,S3Key=builds/backend_deploy_${VERSION_LABEL}.zip" || echo "⚠️  Version creation failed (may already exist), continuing..."
-          
+            --source-bundle S3Bucket="elasticbeanstalk-${{ env.AWS_REGION }}-992382574572,S3Key=builds/${VERSION_LABEL}.zip" || echo "⚠️  Version creation failed (may already exist), continuing..."
+
           # Deploy to environment
           echo "Deploying to staging environment..."
           aws elasticbeanstalk update-environment \
@@ -197,11 +189,11 @@ jobs:
 
       - name: Backend Staging Deployment Status
         run: |
-          VERSION=$(jq -r .version backend/package.json)
+          DATE=$(date +%Y%m%d)
           PR_NUMBER=${{ github.event.pull_request.number }}
           echo "🚀 Backend staging deployment initiated successfully!"
           echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
-          echo "✅ Version deployed: backend_v${VERSION}-staging-pr${PR_NUMBER}"
+          echo "✅ Deployed: backend-${DATE}-pr${PR_NUMBER}"
           echo "🔗 Staging URL: https://api-stage.agentweb.pro"
 
   partner-tests:
@@ -220,21 +212,6 @@ jobs:
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json
-
-      - name: Verify version is same or higher than base
-        shell: bash
-        run: |
-          set -euo pipefail
-          BASE_BRANCH="${GITHUB_BASE_REF}"
-          CURRENT_VERSION=$(jq -r .version partner-portal/package.json)
-          git fetch origin "$BASE_BRANCH" --depth=1
-          BASE_VERSION=$(git show "origin/$BASE_BRANCH:partner-portal/package.json" | jq -r .version)
-          echo "Base version: $BASE_VERSION | PR version: $CURRENT_VERSION"
-          if [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            npx --yes semver -r ">=$BASE_VERSION" "$CURRENT_VERSION" >/dev/null || { echo "::error::PR version ($CURRENT_VERSION) must be same or higher than base ($BASE_VERSION)."; exit 1; }
-          else
-            echo "::warning::One of the versions is not valid semver; skipping enforcement"
-          fi
 
       - name: Install dependencies
         working-directory: partner-portal

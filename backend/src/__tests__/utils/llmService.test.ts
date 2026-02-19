@@ -107,9 +107,31 @@ describe('llmService', () => {
       );
     });
 
-    it('should handle specific Claude sonnet model ID transformation', () => {
+    it('should map Sonnet 4.5 to its inference profile ARN', () => {
       new LLMService('anthropic.claude-sonnet-4-5-20250929-v1:0');
-      expect(ChatBedrockConverse).toHaveBeenCalled();
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        })
+      );
+    });
+
+    it('should map Sonnet 4.6 to its inference profile ARN', () => {
+      new LLMService('anthropic.claude-sonnet-4-6');
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
+        })
+      );
+    });
+
+    it('should map Opus 4.6 to its inference profile ARN', () => {
+      new LLMService('anthropic.claude-opus-4-6-v1');
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+        })
+      );
     });
 
     it('should handle specific Claude opus 4.6 model ID transformation', () => {

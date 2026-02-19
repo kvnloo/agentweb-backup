@@ -92,6 +92,11 @@ jest.mock('../services/resendService', () => ({
   }
 }));
 
+const mockUploadFileToS3 = jest.fn();
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: (...args: any[]) => mockUploadFileToS3(...args),
+}));
+
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, res: any, next: any) => {
     // Mock authenticated user
@@ -1772,6 +1777,309 @@ describe('CRM Routes', () => {
       const leadsPassed = (crmDb.batchCreateLeads as jest.Mock).mock.calls[0][1];
       expect(leadsPassed[0].customFields.subscribed).toBe('yes');
       expect(leadsPassed[1].customFields.subscribed).toBe('no');
+    });
+  });
+
+  describe('POST /api/crm/lists/:listId/leads/export', () => {
+    it('should export leads to CSV and return export entry', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+        fieldNames: ['email', 'firstName', 'customField1'],
+        csvExportHistory: [],
+      };
+
+      const mockLeads = [
+        { leadId: 'lead1', email: 'john@example.com', firstName: 'John', lastName: 'Doe', customFields: { customField1: 'value1' } },
+        { leadId: 'lead2', email: 'jane@example.com', firstName: 'Jane', lastName: 'Smith', customFields: { customField1: 'value2' } },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({});
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/test-export.csv',
+        key: 'test-export.csv',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {};
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.getLeadsByListId).toHaveBeenCalledWith('list1', 200, undefined);
+      expect(mockUploadFileToS3).toHaveBeenCalledWith(
+        expect.any(Buffer),
+        expect.stringContaining('Test_List_export_'),
+        'test-user-id',
+        'text/csv'
+      );
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', {
+        csvExportHistory: expect.arrayContaining([
+          expect.objectContaining({
+            recordCount: 2,
+            fileUrl: 'https://s3.amazonaws.com/bucket/test-export.csv',
+          }),
+        ]),
+      });
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          success: true,
+          export: expect.objectContaining({
+            recordCount: 2,
+            fileUrl: 'https://s3.amazonaws.com/bucket/test-export.csv',
+          }),
+        })
+      );
+    });
+
+    it('should return 400 if no leads to export', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {};
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'No leads to export' })
+      );
+    });
+
+    it('should return 403 if user does not own the list', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'other-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {};
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(403);
+    });
+
+    it('should return 404 if list not found', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+
+      mockRequest.params = { listId: 'nonexistent' };
+      mockRequest.body = {};
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(404);
+    });
+
+    it('should cap export history at 50 entries', async () => {
+      const existingHistory = Array.from({ length: 50 }, (_, i) => ({
+        exportId: `exp_old_${i}`,
+        recordCount: 5,
+        exportedAt: '2026-01-01T00:00:00.000Z',
+        fileUrl: `https://s3.amazonaws.com/bucket/old_${i}.csv`,
+        filename: `old_${i}.csv`,
+      }));
+
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+        csvExportHistory: existingHistory,
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', email: 'test@example.com', firstName: 'Test' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({});
+      mockUploadFileToS3.mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/new-export.csv',
+        key: 'new-export.csv',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {};
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      const updateCall = (crmDb.updateLeadList as jest.Mock).mock.calls[0];
+      const updatedHistory = updateCall[1].csvExportHistory;
+      expect(updatedHistory).toHaveLength(50);
+      expect(updatedHistory[0].fileUrl).toBe('https://s3.amazonaws.com/bucket/new-export.csv');
+    });
+
+    it('should return 500 if S3 upload fails', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
+        items: [{ leadId: 'lead1', email: 'test@example.com', firstName: 'Test' }],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      mockUploadFileToS3.mockResolvedValue({
+        success: false,
+        error: 'Upload failed',
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = {};
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/export' && r.route?.methods?.post
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(500);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Failed to upload CSV to storage' })
+      );
+    });
+  });
+
+  describe('GET /api/crm/lists/:listId/export-history', () => {
+    it('should return export history for a list', async () => {
+      const mockHistory = [
+        {
+          exportId: 'exp_1',
+          recordCount: 10,
+          exportedAt: '2026-02-18T00:00:00.000Z',
+          fileUrl: 'https://s3.amazonaws.com/bucket/export.csv',
+          filename: 'export.csv',
+        },
+      ];
+
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+        csvExportHistory: mockHistory,
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/export-history' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.json).toHaveBeenCalledWith({ history: mockHistory });
+    });
+
+    it('should return empty array when no export history exists', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/export-history' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.json).toHaveBeenCalledWith({ history: [] });
+    });
+
+    it('should return 403 if user does not own the list', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'other-user-id',
+      };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/export-history' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(403);
+    });
+
+    it('should return 404 if list not found', async () => {
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+
+      mockRequest.params = { listId: 'nonexistent' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/export-history' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(404);
     });
   });
 });

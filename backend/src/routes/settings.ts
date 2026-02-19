@@ -1,6 +1,7 @@
 import express from 'express';
 import { settingsService } from '../services/settingsService';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
+import { userDb } from '../services/db';
 
 const router = express.Router();
 
@@ -803,6 +804,175 @@ router.delete('/customer/email-campaign-tasks/:taskId', authenticateToken, async
   } catch (error) {
     console.error('Error removing customer email campaign task:', error);
     res.status(500).json({ error: 'Failed to remove email campaign task' });
+  }
+});
+
+// Get Google Drive service account email for sharing instructions
+router.get('/google-drive/service-account-email', authenticateToken, async (req, res) => {
+  try {
+    const { getGoogleDriveServiceAccountEmail } = await import('../utils/secretsManager');
+    const email = await getGoogleDriveServiceAccountEmail();
+    res.json({ email });
+  } catch (error) {
+    console.error('Error fetching Google Drive service account email:', error);
+    res.status(500).json({ error: 'Failed to fetch Google Drive service account email' });
+  }
+});
+
+// Add a Google Drive folder to the current user's account
+// Verifies the folder is accessible via the service account and fetches its name
+router.post('/google-drive/folders', authenticateToken, async (req, res) => {
+  try {
+    const { folderId } = req.body;
+    const userId = (req as any).user?.userId;
+
+    if (!folderId || typeof folderId !== 'string' || !folderId.trim()) {
+      return res.status(400).json({ error: 'folderId is required' });
+    }
+
+    const trimmedFolderId = folderId.trim();
+
+    // Verify folder is accessible and get its name via the service account
+    const { getSecret } = await import('../utils/secretsManager');
+    const { google } = await import('googleapis');
+
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Google/Share'
+      : 'dev/AgentWeb/Google/Share';
+
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString);
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+    });
+
+    const drive = google.drive({ version: 'v3', auth });
+
+    let folderName: string;
+    try {
+      const fileResponse = await drive.files.get({
+        fileId: trimmedFolderId,
+        fields: 'id, name, mimeType',
+      });
+
+      if (fileResponse.data.mimeType !== 'application/vnd.google-apps.folder') {
+        return res.status(400).json({ error: 'The provided ID is not a folder' });
+      }
+
+      folderName = fileResponse.data.name || trimmedFolderId;
+    } catch (driveError: any) {
+      if (driveError.code === 404 || driveError.status === 404) {
+        return res.status(400).json({
+          error: 'Folder not found. Make sure you have shared the folder with the service account email before adding it.'
+        });
+      }
+      throw driveError;
+    }
+
+    // Get current user and update folders
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const existingFolders = user.googleDriveFolders || [];
+
+    // Check if folder already exists
+    if (existingFolders.some((f: { folderId: string }) => f.folderId === trimmedFolderId)) {
+      return res.status(400).json({ error: 'This folder has already been added' });
+    }
+
+    const updatedFolders = [...existingFolders, { folderId: trimmedFolderId, name: folderName }];
+    await userDb.updateUser(userId, { googleDriveFolders: updatedFolders });
+
+    res.json({ folder: { folderId: trimmedFolderId, name: folderName }, googleDriveFolders: updatedFolders });
+  } catch (error) {
+    console.error('Error adding Google Drive folder:', error);
+    res.status(500).json({ error: 'Failed to add Google Drive folder' });
+  }
+});
+
+// Remove a Google Drive folder from the current user's account
+router.delete('/google-drive/folders/:folderId', authenticateToken, async (req, res) => {
+  try {
+    const { folderId } = req.params;
+    const userId = (req as any).user?.userId;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const existingFolders = user.googleDriveFolders || [];
+    const updatedFolders = existingFolders.filter((f: { folderId: string }) => f.folderId !== folderId);
+
+    await userDb.updateUser(userId, { googleDriveFolders: updatedFolders });
+
+    res.json({ googleDriveFolders: updatedFolders });
+  } catch (error) {
+    console.error('Error removing Google Drive folder:', error);
+    res.status(500).json({ error: 'Failed to remove Google Drive folder' });
+  }
+});
+
+// List files inside a Google Drive folder
+// Verifies the folder belongs to the user and is accessible via the service account
+router.get('/google-drive/folders/:folderId/files', authenticateToken, async (req, res) => {
+  try {
+    const { folderId } = req.params;
+    const userId = (req as any).user?.userId;
+
+    // Verify folder belongs to this user
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userFolders = user.googleDriveFolders || [];
+    if (!userFolders.some((f: { folderId: string }) => f.folderId === folderId)) {
+      return res.status(403).json({ error: 'Folder not found on your account' });
+    }
+
+    const { getSecret } = await import('../utils/secretsManager');
+    const { google } = await import('googleapis');
+
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Google/Share'
+      : 'dev/AgentWeb/Google/Share';
+
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString);
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+    });
+
+    const drive = google.drive({ version: 'v3', auth });
+
+    const response = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: 'files(id, name, mimeType, size, modifiedTime)',
+      orderBy: 'name',
+      pageSize: 100,
+    });
+
+    const files = (response.data.files || []).map((f) => ({
+      id: f.id,
+      name: f.name,
+      mimeType: f.mimeType,
+      size: f.size ? parseInt(f.size, 10) : undefined,
+      modifiedTime: f.modifiedTime,
+    }));
+
+    res.json({ files });
+  } catch (error) {
+    console.error('Error listing Google Drive folder files:', error);
+    res.status(500).json({ error: 'Failed to list folder files' });
   }
 });
 

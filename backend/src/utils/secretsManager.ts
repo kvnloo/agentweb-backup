@@ -180,3 +180,38 @@ export async function getMetaCredentials(): Promise<MetaCredentials> {
   }
   
 }
+
+/**
+ * Get Google Drive service account email from Secrets Manager
+ * Reads the service account JSON key and extracts the client_email field.
+ *
+ * Secret location: dev/AgentWeb/Google/Share (or prod/... for production)
+ *
+ * @returns The service account email address
+ */
+export async function getGoogleDriveServiceAccountEmail(): Promise<string> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Google/Share'
+      : 'dev/AgentWeb/Google/Share';
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Google Drive service account secret is empty');
+    }
+
+    const serviceAccount = JSON.parse(secretString);
+
+    if (!serviceAccount.client_email) {
+      throw new Error('Google Drive service account JSON missing client_email');
+    }
+
+    return serviceAccount.client_email;
+  } catch (error) {
+    console.error('Error fetching Google Drive service account email:', error);
+    throw new Error('Failed to fetch Google Drive service account email from Secrets Manager');
+  }
+}
+
+>>>>>>> origin/main

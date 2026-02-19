@@ -415,6 +415,19 @@ The agent engine supports multiple LLM providers:
 
 LLM selection is passed from backend via `aiModelConfig` in task execution record.
 
+#### Adding a New AWS Bedrock Claude Model
+
+To find the model ID and inference profile for a new Claude model on AWS Bedrock:
+
+1. **Look up the model ID** on the [Bedrock supported models page](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html). Example: `anthropic.claude-sonnet-4-6`
+2. **Look up the inference profile ID** on the [cross-region inference page](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html). Use the `global.*` prefix for cross-region access. Example: `global.anthropic.claude-sonnet-4-6`
+3. **Update these files:**
+   - `backend/src/services/agentModeService.ts` — add to `llmModels` registry and `inferenceProfileMap` in `getBedrockClient()`
+   - `backend/src/utils/llmService.ts` — add to the inference profile `if/else` chain in the constructor
+   - `backend/src/__tests__/agentModeService.sonnet45.test.ts` — add model registry, lazy-loading, and inference profile ARN tests
+4. The inference profile ARN format is: `arn:aws:bedrock:us-west-2:992382574572:inference-profile/{profile_id}`
+5. **Run benchmarks** to validate: `npm run benchmark -- --url http://localhost:3001 --model <model-id>` (requires local backend running with admin credentials in dev DB)
+
 ### Browser Automation
 
 Uses browser-use library with Playwright:
@@ -429,10 +442,10 @@ Uses browser-use library with Playwright:
 ### GitHub Actions Workflows
 
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
-  - Version check: PR version must be >= base branch version
   - Automatically deploys backend to staging after tests pass on PRs
+  - Deploys are triggered by file changes in `backend/` or `partner-portal/`
 - `.github/workflows/deploy.yml` - Deploys to production on merge to main
-  - Version check: Only deploys if version strictly higher than previous commit
+  - Deploys are triggered by file changes detected via path filters (no version bump required)
   - Separate jobs for backend and partner-portal
 
 ### Deployment Targets
@@ -475,8 +488,8 @@ The retrieve commands return S3 URLs for each instance. Download and inspect:
 ```bash
 cd backend
 npm run build
-VERSION="X.Y" && mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
+DATE=$(date +%Y%m%d) && LABEL="backend-${DATE}-manual" && mkdir -p builds && \
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
 # Upload to Elastic Beanstalk via AWS Console
 ```
 
@@ -487,8 +500,8 @@ VITE_API_URL=https://api.agentweb.pro \
 VITE_CUSTOMER_FRONTEND_URL=https://app.agentweb.pro \
 VITE_DEBUG=false \
 npm run build && \
-VERSION="X.Y" && mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+DATE=$(date +%Y%m%d) && LABEL="partner-${DATE}-manual" && mkdir -p builds && \
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json
 # Upload to Elastic Beanstalk via AWS Console
 ```
 
@@ -519,6 +532,7 @@ Critical environment variables:
 Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Google/Search` - Google Custom Search API
 - `dev/AgentWeb/Google/SearchConsole` - Google Search Console service account JSON
+- `dev/AgentWeb/Google/Share` - Google Drive service account JSON for shared folders
 - `prod/AgentWeb/Google/PageSpeed` - PageSpeed Insights API key
 - `dev/AgentWeb/BaseHub` - BaseHub CMS credentials
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
@@ -537,12 +551,12 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 ## Important Patterns and Conventions
 
-### Version Management
+### Build & Deploy Naming
 
-- Backend, partner-portal, and customer-portal have independent versioning in their `package.json`
-- Always bump version before merging to main for production deployment
-- Version format: `X.Y.Z` (semver: major.minor.patch). Bump the **minor** version for each release and reset patch to 0 (e.g., `27.7.0` → `27.8.0`). Only bump patch for hotfixes. When the minor version reaches 10, bump the major version and reset minor to 0. For example: `27.9.0` → `28.0.0`, NOT `27.10.0`.
-- No version bump needed for staging deployments (PRs)
+- Build artifacts and EB version labels use the format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
+- The PR number is extracted from the merge commit message; falls back to the short commit SHA if unavailable
+- Deployments are triggered automatically by file changes in `backend/` or `partner-portal/` — no manual version bump is needed
+- `package.json` versions in backend, partner-portal, and customer-portal are independent but are **not** used for deployment gating
 
 ### DynamoDB Query Optimization
 
@@ -741,3 +755,14 @@ When making changes, these files are critical to understand:
 - Real-time features use Socket.IO for WebSocket connections
 - Email notifications use both SMTP and Resend API
 - Slack integration for GTM plan approvals via webhooks
+
+## "Prep for Deploy" Command
+
+When the user says **"prep for deploy \<date\>"** (default: today's date if omitted):
+
+1. Add a user-facing release notes entry for the date at the top of `backend/src/docs/user-release.ts`, following existing format
+2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend. **CI requires ≥90% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
+3. Commit changes and create PRs for **both** repos:
+   - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
+   - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR
+4. Return both PR URLs to the user

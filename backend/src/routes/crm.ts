@@ -1090,6 +1090,150 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
 });
 
 /**
+ * @route POST /api/crm/lists/:listId/leads/export
+ * @desc Export leads to CSV and upload to S3
+ * @access Private
+ */
+router.post('/lists/:listId/leads/export', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Fetch all leads by paginating
+    const allLeads: any[] = [];
+    let lastKey: any = undefined;
+    do {
+      const result = await crmDb.getLeadsByListId(listId, 200, lastKey);
+      allLeads.push(...result.items);
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+
+    if (allLeads.length === 0) {
+      return res.status(400).json({ message: 'No leads to export' });
+    }
+
+    // Build columns: standard fields + custom fields from fieldNames and lead data
+    const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'linkedin', 'notes'];
+    const customFieldSet = new Set<string>();
+
+    if (list.fieldNames && Array.isArray(list.fieldNames)) {
+      for (const f of list.fieldNames) {
+        if (!standardFields.includes(f)) {
+          customFieldSet.add(f);
+        }
+      }
+    }
+
+    for (const lead of allLeads) {
+      if (lead.customFields && typeof lead.customFields === 'object') {
+        for (const key of Object.keys(lead.customFields)) {
+          customFieldSet.add(key);
+        }
+      }
+    }
+
+    const customFields = Array.from(customFieldSet).sort();
+    const allColumns = [...standardFields, ...customFields];
+
+    // Helper to escape a CSV cell value
+    const escapeCell = (value: any): string => {
+      if (value === null || value === undefined) return '';
+      const str = String(value);
+      if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+        return '"' + str.replace(/"/g, '""') + '"';
+      }
+      return str;
+    };
+
+    // Build CSV
+    const headerRow = allColumns.map(escapeCell).join(',');
+    const dataRows = allLeads.map(lead => {
+      return allColumns.map(col => {
+        if (standardFields.includes(col)) {
+          return escapeCell(lead[col]);
+        }
+        return escapeCell(lead.customFields?.[col]);
+      }).join(',');
+    });
+    const csvContent = [headerRow, ...dataRows].join('\n');
+
+    // Upload to S3
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeListName = (list.name || 'leads').replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 50);
+    const filename = `${safeListName}_export_${timestamp}.csv`;
+
+    const { uploadFileToS3 } = await import('../utils/s3Utils');
+    const uploadResult = await uploadFileToS3(Buffer.from(csvContent, 'utf-8'), filename, userId, 'text/csv');
+
+    if (!uploadResult.success || !uploadResult.url) {
+      return res.status(500).json({ message: 'Failed to upload CSV to storage' });
+    }
+
+    // Create export entry
+    const exportEntry = {
+      exportId: `exp_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+      recordCount: allLeads.length,
+      exportedAt: new Date().toISOString(),
+      fileUrl: uploadResult.url,
+      filename,
+    };
+
+    // Prepend to history, cap at 50
+    const existingHistory = list.csvExportHistory || [];
+    const updatedHistory = [exportEntry, ...existingHistory].slice(0, 50);
+    await crmDb.updateLeadList(listId, { csvExportHistory: updatedHistory });
+
+    res.json({ success: true, export: exportEntry });
+  } catch (error: any) {
+    console.error('Error exporting leads:', error);
+    res.status(500).json({ message: error.message || 'Failed to export leads' });
+  }
+});
+
+/**
+ * @route GET /api/crm/lists/:listId/export-history
+ * @desc Get CSV export history for a lead list
+ * @access Private
+ */
+router.get('/lists/:listId/export-history', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    res.json({ history: list.csvExportHistory || [] });
+  } catch (error: any) {
+    console.error('Error fetching export history:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch export history' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/import-linkedin
  * @desc Import or preview LinkedIn data export
  * @access Private

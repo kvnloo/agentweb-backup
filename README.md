@@ -125,6 +125,61 @@ Example usage in Agent Mode:
 List all available knowledge base files and then read the file about product specifications.
 ```
 
+### Google Drive Integration
+
+AgentWeb supports accessing Google Drive files as part of the knowledge base. The platform integrates with the Google Drive API directly using a service account.
+
+**Step 1: Enable the Google Drive API**
+
+1. Go to the [Google Cloud Console API Library](https://console.cloud.google.com/apis/library)
+2. Select the **knowledge-base** project from the project dropdown at the top
+3. Search for "Google Drive API" and click on it
+4. Click **Enable** (if not already enabled)
+
+**Step 2: Create a service account**
+
+1. Go to [IAM & Admin > Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts) and select the **knowledge-base** project
+2. Click **+ Create Service Account**
+3. Enter the name `agentweb-dev` (development) or `agentweb-prod` (production) and click **Create and Continue**
+4. Skip the optional role grants and click **Done**
+5. The service account emails will be:
+   - Dev: `agentweb-dev@knowledge-base.iam.gserviceaccount.com`
+   - Prod: `agentweb-prod@knowledge-base.iam.gserviceaccount.com`
+
+**Note:** If key creation is blocked with the error "Google automatically disables service account keys detected in public repositories", you need to disable the org policy first:
+
+1. Go to [IAM & Admin > Organization Policies](https://console.cloud.google.com/iam-admin/orgpolicies) and select the **knowledge-base** project
+2. Search for `iam.disableServiceAccountKeyCreation`
+3. Click on the policy, then click **Manage Policy**
+4. Set the policy source to **Override parent's policy**
+5. Under **Rules**, click **Add Rule**, set **Enforcement** to **Off**
+6. Click **Done**, then **Set Policy**
+
+Then return to the service account's **Keys** tab and create the key:
+
+6. Click **Add Key > Create new key > JSON** and download the key file
+7. Store the key JSON in AWS Secrets Manager:
+   - Dev: `dev/AgentWeb/Google/Share`
+   - Prod: `prod/AgentWeb/Google/Share`
+
+**Step 3: Share Google Drive folders with the service account**
+
+1. Open [Google Drive](https://drive.google.com) in your browser
+2. Right-click the folder you want to share and select **Share**
+3. Paste the service account email (`agentweb-dev@knowledge-base.iam.gserviceaccount.com` or `agentweb-prod@knowledge-base.iam.gserviceaccount.com`) and grant **Viewer** access (or **Editor** if write access is needed)
+4. Copy the folder ID from the URL — it's the string after `/folders/` (e.g., in `https://drive.google.com/drive/folders/1ABC2DEF3GHI`, the folder ID is `1ABC2DEF3GHI`)
+
+**Step 4: Configure shared folders in the Admin Dashboard**
+
+1. Go to the Admin Dashboard > **Users** tab
+2. Find the target customer and click the edit icon on the **Shared Folders** column
+3. Enter each folder's ID (from Step 3) and a display name (e.g., "Marketing Assets")
+4. Click **Save**
+
+Customers can then view their configured shared folders on the Knowledge Base page, with direct links to open each folder in Google Drive.
+
+> **Note:** Google's official MCP server list is at https://github.com/Google/mcp. The [Google Workspace MCP server](https://github.com/gemini-cli-extensions/workspace) was evaluated but requires interactive OAuth browser login (incompatible with service account / headless agent engine). It may be adopted in the future when per-user OAuth MCP sessions are supported. See `dev.md` for details.
+
 ### Social Media Functions
 
 In Agent Mode, Emma can create social media posts using the following function call:
@@ -1518,9 +1573,9 @@ VITE_DEBUG=false \
 VITE_LIST_FULL_LLM_NAMES="azure->openai->gpt-4.1,google->google->gemini-2.5-pro-preview-05-06,azure->openai->gpt-4o,aws->anthropic->anthropic.claude-3-5-sonnet-20241022-v2:0,openai->openai->gpt-4o,aws->anthropic->us.anthropic.claude-3-7-sonnet-20250219-v1:0,google->google->gemini-2.5-flash,google->google->gemini-2.5-flash-lite,azure->openai->gpt-5-chat,google->google->gemini-2.5-pro" \
 VITE_DEEP_RESEARCH_LLM_NAMES="azure->openai->o1-mini,azure->openai->gpt-4o" \
 npm run build && \
-VERSION="0.21" && \
+DATE=$(date +%Y%m%d) && LABEL="partner-${DATE}-manual" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json
 ```
 
 2. Create a new application in Elastic Beanstalk:
@@ -1528,7 +1583,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json
    - Click "Create application"
    - Enter application name (e.g., "agentweb-frontend")
    - Choose "Node.js" as platform
-   - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
+   - Upload the zip file from `builds/`
    - Click "Create application"
 
 Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
@@ -1550,9 +1605,9 @@ VITE_API_URL=https://api.agentweb.pro \
 VITE_PARTNER_PORTAL_URL=https://partner.agentweb.pro \
 VITE_DEBUG=false \
 npm run build && \
-VERSION="0.21" && \
+DATE=$(date +%Y%m%d) && LABEL="customer-${DATE}-manual" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json server.js
 ```
 
 3. Create a new application in Elastic Beanstalk:
@@ -1560,7 +1615,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json serve
    - Click "Create application"
    - Enter application name (e.g., "agentweb-customer-portal")
    - Choose "Node.js" as platform
-   - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
+   - Upload the zip file from `builds/`
    - Click "Create application"
 
 Note: Environment variables must be set during build time for the frontend, as Vite replaces them at build time. Runtime environment variables in Elastic Beanstalk are not used by the frontend application.
@@ -1580,9 +1635,9 @@ cd growth-genius-chat
 ```bash
 VITE_API_URL=https://api.agentweb.pro \
 npm run build && \
-VERSION="0.21" && \
+DATE=$(date +%Y%m%d) && LABEL="growth-genius-${DATE}-manual" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json server.js
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json server.js
 ```
 
 3. Create a new application in Elastic Beanstalk:
@@ -1590,7 +1645,7 @@ zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json serve
    - Click "Create application"
    - Enter application name (e.g., "agentweb-growth-genius-chat")
    - Choose "Node.js" as platform
-   - Upload the versioned zip file from `builds/deploy_v${VERSION}.zip`
+   - Upload the zip file from `builds/`
    - Click "Create application"
 
 4. Configure environment variables:
@@ -1610,9 +1665,9 @@ Note: Environment variables must be set during build time for the frontend, as V
 ```bash
 cd backend && \
 npm run build && \
-VERSION="0.21" && \
+DATE=$(date +%Y%m%d) && LABEL="backend-${DATE}-manual" && \
 mkdir -p builds && \
-zip -r "builds/deploy_v${VERSION}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
+zip -r "builds/${LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions
 ```
 
 ### AWS Elastic Beanstalk Permissions
@@ -1655,7 +1710,7 @@ Note: The managed policy grants broad permissions for development purposes. Cons
    - Click "Create application"
    - Enter application name (e.g., "agentweb-backend")
    - Choose "Node.js" as platform
-   - Upload your versioned zip file from `builds/deploy_v${VERSION}.zip`
+   - Upload the zip file from `builds/`
    - Click "Create application"
 
 3. Configure environment variables:
@@ -1694,7 +1749,7 @@ You can use the same build package created for production deployment:
 
 ```bash
 # Reference the production build from the Backend Deployment section
-# The build should already exist at: builds/deploy_v${VERSION}.zip
+# The build should already exist in builds/
 ```
 
 If you haven't created the production build yet, follow the build instructions in the Backend Deployment section above.
@@ -1705,7 +1760,7 @@ If you haven't created the production build yet, follow the build instructions i
 2. Click "Create application"
 3. Enter application name (e.g., "agentweb-backend-stage")
 4. Choose "Node.js" as platform
-5. Upload the same versioned zip file used for production from `builds/deploy_v${VERSION}.zip`
+5. Upload the same zip file used for production from `builds/`
 6. Click "Create application"
 
 #### 3. Configure environment variables
@@ -2413,24 +2468,22 @@ This repository includes CI (build verification) and CD (deploy) workflows for `
 
 - `tests.yml` — Runs on Pull Requests touching `backend/**` or `partner-portal/**`
   - Detects which project changed and runs only the relevant jobs
-  - Version rule for PRs: the `package.json` version in the PR must be the same or higher than the base branch
   - Builds the projects to verify compilation
   - Uses the runner's default Node version (no explicit `node-version`)
   - **Staging Deployment**: After backend tests pass, automatically deploys backend to staging environment
   - **Note**: Unit tests are not run in CI - run them locally before submitting PRs (see [Testing](#testing) section)
 
-- `deploy.yml` — Handles both production and staging deployments:
+- `deploy.yml` — Handles production deployments:
   - **Production deployment**: Runs on push to `main` or when a PR is merged to `main`
-    - Detects which project changed and runs only the relevant jobs
-    - Version rule for deploys: deploys only if the new version is strictly higher than the previous commit
-    - Builds production bundles using the same commands documented below
-    - Packages versioned zip files and deploys to AWS Elastic Beanstalk production environments
-  - **Staging deployment (Backend only)**: Runs automatically after backend tests pass successfully on a Pull Request
+    - Detects which project changed via path filters and runs only the relevant jobs
+    - No version bump required — deploys automatically when files change in `backend/` or `partner-portal/`
+    - Builds production bundles and deploys to AWS Elastic Beanstalk production environments
+    - Build artifacts use the naming format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`)
+  - **Staging deployment (Backend only)**: Runs automatically after backend tests pass successfully on a Pull Request (in `tests.yml`)
     - Deploys backend to staging environment for testing before merging to `main`
     - Only deploys if tests pass - ensures code quality before staging deployment
-    - No version bump required - deploys on any PR push with backend changes (after tests pass)
     - Staging backend URL: `https://api-stage.agentweb.pro`
-    - Version labels include PR number: `backend_v<version>-staging-pr<PR_NUMBER>`
+    - Version labels use the format `backend-yyyymmdd-pr<PR_NUMBER>`
     - Allows developers to test backend changes in staging
     - **Frontend testing**: Partner Portal and Customer Portal should be run locally pointing to staging backend (see [Local Development with Staging Backend](#local-development-with-staging-backend))
 
@@ -2489,18 +2542,15 @@ The workflows use region `us-west-2` by default. Update `AWS_REGION` in the work
 ### Deployment behavior
 
 - **Production deployments:**
-  - Version labels in Elastic Beanstalk:
-    - Backend: `backend_v<package.json version>`
-    - Partner Portal: `partner_v<package.json version>`
+  - Version labels in Elastic Beanstalk: `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
   - Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
-  - The deploy job will no-op if the version is the same or lower than the previous commit
+  - Deploys automatically when files change in `backend/` or `partner-portal/` (no version bump required)
   - Deploys to production environments configured in GitHub Actions
 
 - **Staging deployments (Backend only):**
-  - Version labels in Elastic Beanstalk:
-    - Backend: `backend_v<package.json version>-staging-pr<PR_NUMBER>`
+  - Version labels in Elastic Beanstalk: `backend-yyyymmdd-pr<PR_NUMBER>`
   - Artifacts uploaded to S3 bucket: `elasticbeanstalk-<region>-992382574572/builds/*`
-  - Deploys automatically after tests pass on PR push (no version bump required)
+  - Deploys automatically after tests pass on PR push
   - Only deploys if backend tests succeed - ensures code quality
   - Staging backend URL: `https://api-stage.agentweb.pro`
   - Allows developers to test backend changes in staging before merging to `main`
@@ -2510,12 +2560,12 @@ The workflows use region `us-west-2` by default. Update `AWS_REGION` in the work
 
 When you create or update a Pull Request that touches `backend/**`:
 
-1. **Tests Run First**: The workflow automatically runs backend tests (build verification, version checks)
+1. **Tests Run First**: The workflow automatically runs backend tests (build verification)
 2. **Staging Deployment After Tests Pass**: If tests pass successfully, the workflow automatically deploys to staging environment
-3. **No Version Bump Required**: Unlike production, staging deployments don't require version bumps - they deploy on any PR push (after tests pass)
+3. **No Version Bump Required**: Deployments are triggered by file changes, not version bumps
 4. **Test Your Backend Changes**: Once deployed, the staging backend is available at `https://api-stage.agentweb.pro`
-5. **Version Labels**: Each staging deployment uses a unique version label including the PR number (e.g., `backend_v1.0.0-staging-pr123`)
-6. **Production Deployment**: After your PR is merged to `main`, production deployment will run automatically (if version was bumped)
+5. **Version Labels**: Each deployment uses a unique label including the date and PR number (e.g., `backend-20260218-pr123`)
+6. **Production Deployment**: After your PR is merged to `main`, production deployment will run automatically if `backend/` or `partner-portal/` files changed
 
 **Note**: Staging deployment only runs if backend tests pass. If tests fail, staging deployment is skipped to prevent deploying broken code.
 
