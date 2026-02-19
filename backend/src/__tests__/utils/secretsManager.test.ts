@@ -81,6 +81,24 @@ describe('secretsManager utils', () => {
       const result = await secretExists('my-secret');
       expect(result).toBe(false);
     });
+
+    it('should return false and log error.message when code is absent', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue({ message: 'Connection timeout' })
+      });
+
+      const result = await secretExists('my-secret');
+      expect(result).toBe(false);
+    });
+
+    it('should return false and log raw error when neither code nor message present', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue('plain error string')
+      });
+
+      const result = await secretExists('my-secret');
+      expect(result).toBe(false);
+    });
   });
 
   describe('getMetaAccessToken', () => {
@@ -144,6 +162,16 @@ describe('secretsManager utils', () => {
 
     it('should use dev secret name in development', async () => {
       process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'key' })
+      });
+
+      await getGCSPPrivateKey();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/GCS/PK' });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({ SecretString: 'key' })
       });
@@ -228,6 +256,193 @@ describe('secretsManager utils', () => {
       await getLinkedInCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/LinkedIn/Company'
+      });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getLinkedInCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/LinkedIn/Company'
+      });
+    });
+  });
+
+  describe('getMetaCredentials', () => {
+    it('should return Meta credentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            clientId: 'meta-client-123',
+            clientSecret: 'meta-secret-456'
+          })
+        })
+      });
+
+      const result = await getMetaCredentials();
+      expect(result.clientId).toBe('meta-client-123');
+      expect(result.clientSecret).toBe('meta-secret-456');
+    });
+
+    it('should throw error when credentials are empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getMetaCredentials()).rejects.toThrow(
+        'Failed to fetch Meta credentials'
+      );
+    });
+
+    it('should throw error when clientId is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientSecret: 'secret' })
+        })
+      });
+
+      await expect(getMetaCredentials()).rejects.toThrow(
+        'Failed to fetch Meta credentials'
+      );
+    });
+
+    it('should throw error when clientSecret is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'client' })
+        })
+      });
+
+      await expect(getMetaCredentials()).rejects.toThrow(
+        'Failed to fetch Meta credentials'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getMetaCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/MetaApp'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getMetaCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/MetaApp'
+      });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getMetaCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/MetaApp'
+      });
+    });
+  });
+
+  describe('getGoogleDriveServiceAccountEmail', () => {
+    it('should return service account email', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            client_email: 'service@project.iam.gserviceaccount.com',
+            type: 'service_account'
+          })
+        })
+      });
+
+      const result = await getGoogleDriveServiceAccountEmail();
+      expect(result).toBe('service@project.iam.gserviceaccount.com');
+    });
+
+    it('should throw error when secret is empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getGoogleDriveServiceAccountEmail()).rejects.toThrow(
+        'Failed to fetch Google Drive service account email'
+      );
+    });
+
+    it('should throw error when client_email is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ type: 'service_account' })
+        })
+      });
+
+      await expect(getGoogleDriveServiceAccountEmail()).rejects.toThrow(
+        'Failed to fetch Google Drive service account email'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ client_email: 'svc@proj.iam.gserviceaccount.com' })
+        })
+      });
+
+      await getGoogleDriveServiceAccountEmail();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/Google/Share'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ client_email: 'svc@proj.iam.gserviceaccount.com' })
+        })
+      });
+
+      await getGoogleDriveServiceAccountEmail();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Google/Share'
+      });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ client_email: 'svc@proj.iam.gserviceaccount.com' })
+        })
+      });
+
+      await getGoogleDriveServiceAccountEmail();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Google/Share'
       });
     });
   });

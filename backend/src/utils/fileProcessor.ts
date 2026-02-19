@@ -30,9 +30,7 @@ export type SupportedFileType = typeof SUPPORTED_FILE_TYPES[number];
 /**
  * Get file type from MIME type
  */
-function getFileTypeFromMime(mimeType?: string): string {
-  if (!mimeType) return 'unknown';
-
+function getFileTypeFromMime(mimeType: string): string {
   const mimeMap: Record<string, string> = {
     'text/plain': 'txt',
     'text/html': 'html',
@@ -62,7 +60,7 @@ function getFileTypeFromMime(mimeType?: string): string {
  * Validate file type
  */
 export function isSupportedFileType(filename: string, mimeType?: string): boolean {
-  const extension = filename.split('.').pop()?.toLowerCase() || '';
+  const extension = (filename.split('.').pop() || '').toLowerCase();
   
   if (SUPPORTED_FILE_TYPES.includes(extension as SupportedFileType)) {
     return true;
@@ -85,7 +83,7 @@ export function isSupportedFileType(filename: string, mimeType?: string): boolea
 export function getContentType(filename: string, mimeType?: string): string {
   if (mimeType) return mimeType;
 
-  const extension = filename.split('.').pop()?.toLowerCase() || '';
+  const extension = (filename.split('.').pop() || '').toLowerCase();
   const mimeMap: Record<string, string> = {
     'txt': 'text/plain',
     'html': 'text/html',
