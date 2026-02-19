@@ -415,6 +415,19 @@ The agent engine supports multiple LLM providers:
 
 LLM selection is passed from backend via `aiModelConfig` in task execution record.
 
+#### Adding a New AWS Bedrock Claude Model
+
+To find the model ID and inference profile for a new Claude model on AWS Bedrock:
+
+1. **Look up the model ID** on the [Bedrock supported models page](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html). Example: `anthropic.claude-sonnet-4-6`
+2. **Look up the inference profile ID** on the [cross-region inference page](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html). Use the `global.*` prefix for cross-region access. Example: `global.anthropic.claude-sonnet-4-6`
+3. **Update these files:**
+   - `backend/src/services/agentModeService.ts` — add to `llmModels` registry and `inferenceProfileMap` in `getBedrockClient()`
+   - `backend/src/utils/llmService.ts` — add to the inference profile `if/else` chain in the constructor
+   - `backend/src/__tests__/agentModeService.sonnet45.test.ts` — add model registry, lazy-loading, and inference profile ARN tests
+4. The inference profile ARN format is: `arn:aws:bedrock:us-west-2:992382574572:inference-profile/{profile_id}`
+5. **Run benchmarks** to validate: `npm run benchmark -- --url http://localhost:3001 --model <model-id>` (requires local backend running with admin credentials in dev DB)
+
 ### Browser Automation
 
 Uses browser-use library with Playwright:
