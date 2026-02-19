@@ -94,6 +94,8 @@ router.get('/me', authenticateToken, async (req, res) => {
       }
     }
 
+    response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
+
     res.json(response);
   } catch (error) {
     console.error('Error fetching current user:', error);
