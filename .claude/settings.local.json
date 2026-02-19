@@ -87,8 +87,9 @@
       "WebFetch(domain:docs.cloud.google.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(gh run list:*)",
+      "Bash(gh api:*)",
       "Bash(git commit:*)",
-      "Bash(gh pr create:*)"
+      "Bash(gh pr:*)"
     ]
   }
 }
