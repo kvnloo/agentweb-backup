@@ -415,6 +415,19 @@ The agent engine supports multiple LLM providers:
 
 LLM selection is passed from backend via `aiModelConfig` in task execution record.
 
+#### Adding a New AWS Bedrock Claude Model
+
+To find the model ID and inference profile for a new Claude model on AWS Bedrock:
+
+1. **Look up the model ID** on the [Bedrock supported models page](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html). Example: `anthropic.claude-sonnet-4-6`
+2. **Look up the inference profile ID** on the [cross-region inference page](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html). Use the `global.*` prefix for cross-region access. Example: `global.anthropic.claude-sonnet-4-6`
+3. **Update these files:**
+   - `backend/src/services/agentModeService.ts` — add to `llmModels` registry and `inferenceProfileMap` in `getBedrockClient()`
+   - `backend/src/utils/llmService.ts` — add to the inference profile `if/else` chain in the constructor
+   - `backend/src/__tests__/agentModeService.sonnet45.test.ts` — add model registry, lazy-loading, and inference profile ARN tests
+4. The inference profile ARN format is: `arn:aws:bedrock:us-west-2:992382574572:inference-profile/{profile_id}`
+5. **Run benchmarks** to validate: `npm run benchmark -- --url http://localhost:3001 --model <model-id>` (requires local backend running with admin credentials in dev DB)
+
 ### Browser Automation
 
 Uses browser-use library with Playwright:
@@ -748,7 +761,7 @@ When making changes, these files are critical to understand:
 When the user says **"prep for deploy \<date\>"** (default: today's date if omitted):
 
 1. Add a user-facing release notes entry for the date at the top of `backend/src/docs/user-release.ts`, following existing format
-2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend
+2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend. **CI requires ≥90% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
 3. Commit changes and create PRs for **both** repos:
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
    - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR

@@ -87,6 +87,7 @@
       "WebFetch(domain:docs.cloud.google.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(gh run list:*)",
+      "Bash(aws bedrock list-foundation-models:*)",
       "Bash(gh api:*)",
       "Bash(git commit:*)",
       "Bash(gh pr:*)"

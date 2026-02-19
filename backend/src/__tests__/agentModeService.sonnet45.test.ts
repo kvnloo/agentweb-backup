@@ -70,6 +70,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(models).toContain('anthropic.claude-sonnet-4-5-20250929-v1:0');
     });
 
+    it('should include Claude Sonnet 4.6 in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('anthropic.claude-sonnet-4-6');
+    });
+
     it('should include Claude Opus 4.6 in the supported models', async () => {
       const models = await agentModeService.getSupportedModels();
       expect(models).toContain('anthropic.claude-opus-4-6-v1');
@@ -83,6 +88,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     it('should have null client initially for Sonnet 4.5 (lazy-loaded)', () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].client).toBeNull();
+    });
+
+    it('should have null client initially for Sonnet 4.6 (lazy-loaded)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['anthropic.claude-sonnet-4-6'].client).toBeNull();
     });
 
     it('should have null client initially for Opus 4.6 (lazy-loaded)', () => {
@@ -114,6 +124,28 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // After calling, the client should be cached (no longer null)
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].client).not.toBeNull();
+    });
+
+    it('should lazy-load Bedrock client for Sonnet 4.6 on first callLLM', async () => {
+      mockBedrockInvoke.mockResolvedValue({
+        content: 'test response',
+        response_metadata: {
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      });
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        messages
+      );
+
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['anthropic.claude-sonnet-4-6'].client).not.toBeNull();
     });
 
     it('should lazy-load Bedrock client for Opus 4.6 on first callLLM', async () => {
@@ -164,6 +196,33 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(ChatBedrockConverse).toHaveBeenCalledWith(
         expect.objectContaining({
           model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        })
+      );
+    });
+
+    it('should map Sonnet 4.6 to its inference profile ARN', async () => {
+      const { ChatBedrockConverse } = require('@langchain/aws');
+
+      mockBedrockInvoke.mockResolvedValue({
+        content: 'test response',
+        response_metadata: {
+          usage: { input_tokens: 10, output_tokens: 5 },
+        },
+      });
+
+      const messages = [
+        { role: 'system', content: 'Test' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM(
+        'anthropic.claude-sonnet-4-6',
+        messages
+      );
+
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
         })
       );
     });

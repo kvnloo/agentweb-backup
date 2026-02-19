@@ -33,6 +33,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '  - read_knowledge_base_files supports reading files from shared Drive folders including Google Docs, Sheets, and Slides',
       '  - search_knowledge_base searches across both regular knowledge bases and Google Drive shared folders',
       '- Google Workspace files are automatically exported to readable formats (Docs to text, Sheets to CSV, Slides to text)',
+      'Claude Sonnet 4.6 Support for Agent Mode',
+      '- Added Claude Sonnet 4.6 (anthropic.claude-sonnet-4-6) as an available LLM for Agent Mode chat',
+      '- Uses AWS Bedrock with cross-region inference profile, following the same pattern as Sonnet 4.5 and Opus 4.6',
+      '- Lazy-loaded Bedrock client with temperature support',
     ],
   },
   {
