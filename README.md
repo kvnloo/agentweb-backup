@@ -81,6 +81,29 @@ npm run dev
 3. Monitor task execution and results
 4. Set up alerts for task completion or failures
 
+## Agent Mode: Skills vs Work Plans
+
+Agent Mode has two places to encode process knowledge: **Skills** (via `systemPrompt` and tool bundles) and **Work Plans** (via predefined step sequences). The key question is: *is the knowledge about how to use tools, or about what steps to follow?*
+
+### Put process knowledge in a Skill when:
+
+- **The knowledge is about tool usage** — how to call tools correctly, what parameters matter, domain-specific constraints. Example: "When creating Meta ad campaigns, always set the objective before configuring the audience" belongs in the Meta Ads skill's `systemPrompt`.
+- **It applies across many workflows** — if the same guidance is relevant no matter what the user's specific goal is, it belongs in the skill. Example: "LinkedIn posts perform best under 1300 characters" applies whether the user is doing a one-off post or running a full content campaign.
+- **It's about context the AI needs to use tools well** — API quirks, field mappings, validation rules, recommended defaults. This lives in the skill so it's available any time those tools are loaded.
+
+### Put process knowledge in a Work Plan when:
+
+- **The knowledge is a specific sequence of steps** — a defined workflow where order matters and steps build on each other. Example: "Client onboarding" = analyze website → create brand guidelines → build marketing strategy → generate content.
+- **Steps have validation gates** — use `requiredFunctionCalls` to enforce that specific tools are called before a step can be marked complete. Example: step "Create brand guidelines" requires `update_brand_guidelines` to actually be called.
+- **Progress tracking matters** — the user needs to see where they are, pause, and resume later. Work plans persist in the session and show status per step.
+- **The workflow is goal-specific** — unlike skill knowledge (always relevant when tools are loaded), a work plan is tied to one specific outcome the user is trying to achieve.
+
+### Decision rule
+
+If you can express the knowledge as *"when using tool X, always/never do Y"*, put it in the **skill's `systemPrompt`**. If you can express it as *"to achieve goal X, do steps A → B → C in order"*, put it in a **predefined work plan**.
+
+They often work together: a skill provides the tools and usage guidance, and a work plan orchestrates those tools into a specific workflow.
+
 ## Audit Report PDF
 
 To convert the security audit markdown to PDF, use `pandoc`:
