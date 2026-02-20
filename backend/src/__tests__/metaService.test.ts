@@ -407,6 +407,74 @@ describe('MetaService', () => {
             }));
             expect(result).toEqual(mockCreativeData);
         });
+
+        it('should create an ad creative with optimize_creative enabled', async () => {
+            const mockCreativeData = { id: 'creative_opt', name: 'Optimized Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'Optimized Creative',
+                page_id: 'page_123',
+                image_url: 'http://example.com/image.jpg',
+                body: 'Ad Body',
+                title: 'Ad Title',
+                link_url: 'http://example.com',
+                optimize_creative: true,
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(mockCreateCreative).toHaveBeenCalledWith([], expect.objectContaining({
+                name: 'Optimized Creative',
+                degrees_of_freedom_spec: {
+                    creative_features_spec: { standard_enhancements: { enroll_status: 'OPT_IN' } },
+                },
+            }));
+            expect(result).toEqual(mockCreativeData);
+        });
+
+        it('should create an ad creative without a website URL when add_website_url is false', async () => {
+            const mockCreativeData = { id: 'creative_nourl', name: 'No URL Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'No URL Creative',
+                page_id: 'page_123',
+                image_url: 'http://example.com/image.jpg',
+                body: 'Ad Body',
+                title: 'Ad Title',
+                link_url: 'http://example.com',
+                add_website_url: false,
+                call_to_action_type: 'LEARN_MORE', // Should be omitted
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(mockCreateCreative).toHaveBeenCalledWith([], expect.objectContaining({
+                name: 'No URL Creative',
+                object_story_spec: expect.objectContaining({
+                    page_id: 'page_123',
+                    link_data: expect.objectContaining({
+                        message: 'Ad Body',
+                        name: 'Ad Title',
+                    }),
+                }),
+            }));
+
+            // Assert that link, caption, and call_to_action are NOT present in link_data
+            const createCallArgs = mockCreateCreative.mock.calls[0][1];
+            expect(createCallArgs.object_story_spec.link_data.link).toBeUndefined();
+            expect(createCallArgs.object_story_spec.link_data.caption).toBeUndefined();
+            expect(createCallArgs.object_story_spec.link_data.call_to_action).toBeUndefined();
+            
+            expect(result).toEqual(mockCreativeData);
+        });
     });
 
     describe('Ad Operations', () => {

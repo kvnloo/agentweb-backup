@@ -731,7 +731,7 @@ function applyUtmParams(url: string, utm: any): string {
 
 router.post("/create-ad", async (req, res) => {
   const userId = (req as any).user.userId;
-  const { imageUrl, campaignId, adSetId, adName, primary_texts, headlines, url_descriptions, utm_params, adCallToAction, pageId, taskId, executionId } = req.body;
+  const { imageUrl, campaignId, adSetId, adName, primary_texts, headlines, url_descriptions, utm_params, adCallToAction, pageId, taskId, executionId, link_url, add_website_url, optimize_creative } = req.body;
   
   try {
     // Validate required fields
@@ -857,25 +857,32 @@ router.post("/create-ad", async (req, res) => {
     
     // Create the ad creative with the image hash
     // Use object_story_spec for standard ad creatives (Dynamic Creative is deprecated)
-    const adLink = applyUtmParams("https://example.com", utm_params);
-    const creativeData = {
+    const withUrl = add_website_url !== false && !!(link_url?.trim());
+    const adLink = withUrl ? applyUtmParams(link_url!.trim(), utm_params) : undefined;
+    const creativeData: any = {
       name: `${adName} - Creative`,
       object_story_spec: {
         page_id: pageId,
         link_data: {
           image_hash: imageHash,
-          link: adLink,
+          // "Add a website URL" — only set link/caption when checkbox is checked
+          ...(withUrl ? { link: adLink, caption: adLink } : {}),
           message: (primary_texts?.[0]) || "",
           name: (headlines?.[0]) || "",
           description: (url_descriptions?.[0]) || "",
-          call_to_action: adCallToAction ? {
+          call_to_action: adCallToAction && withUrl ? {
             type: adCallToAction,
             value: {
               link: adLink
             }
           } : undefined
         }
-      }
+      },
+      ...(optimize_creative ? {
+        degrees_of_freedom_spec: {
+          creative_features_spec: { standard_enhancements: { enroll_status: 'OPT_IN' } },
+        },
+      } : {}),
     };
 
     // Create the creative

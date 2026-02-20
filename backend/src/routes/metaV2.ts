@@ -271,7 +271,7 @@ router.post('/create-image-ad', async (req, res) => {
   const {
     account_id, image_url, campaign_id, ad_set_id, page_id,
     ad_name, primary_texts, headlines, url_descriptions, ad_call_to_action,
-    link_url, utm_params, task_id, execution_id, session_id,
+    link_url, utm_params, add_website_url, optimize_creative, task_id, execution_id, session_id,
   } = req.body;
 
   try {
@@ -302,9 +302,11 @@ router.post('/create-image-ad', async (req, res) => {
       extra_titles: allHeadlines.slice(1),
       description: allUrlDescriptions[0] || '',
       extra_descriptions: allUrlDescriptions.slice(1),
-      link_url: applyUtmParams(link_url?.trim() || 'https://example.com', utm_params),
+      add_website_url: add_website_url !== false,
+      link_url: add_website_url !== false ? applyUtmParams(link_url?.trim() || undefined, utm_params) : undefined,
       image_hash: imageHash,
       call_to_action_type: ad_call_to_action || undefined,
+      optimize_creative: !!optimize_creative,
     });
 
     // 3. Create ad
@@ -435,7 +437,7 @@ router.post('/create-video-ad', async (req, res) => {
     account_id, video_url, thumbnail_url,
     campaign_id, ad_set_id, page_id,
     ad_name, primary_texts, headlines, url_descriptions, ad_call_to_action, link_url, utm_params,
-    execution_id, session_id,
+    add_website_url: addWebsiteUrlVideo, optimize_creative: optimizeCreativeVideo, execution_id, session_id,
   } = req.body;
 
   try {
@@ -474,10 +476,12 @@ router.post('/create-video-ad', async (req, res) => {
       extra_titles: allHeadlines.slice(1),
       description: allUrlDescriptions[0] || '',
       extra_descriptions: allUrlDescriptions.slice(1),
-      link_url: applyUtmParams(link_url?.trim() || 'https://example.com', utm_params),
+      add_website_url: addWebsiteUrlVideo !== false,
+      link_url: addWebsiteUrlVideo !== false ? applyUtmParams(link_url?.trim() || undefined, utm_params) : undefined,
       video_id: videoId,
       image_hash: imageHash,
       call_to_action_type: ad_call_to_action || undefined,
+      optimize_creative: !!optimizeCreativeVideo,
     });
 
     // 4. Create ad

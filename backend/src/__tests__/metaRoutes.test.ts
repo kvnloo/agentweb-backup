@@ -242,6 +242,7 @@ describe('Meta Legacy Routes', () => {
       primary_texts: ['Ad Body'],
       headlines: ['Ad Headline'],
       url_descriptions: ['Ad Description'],
+      link_url: 'https://example.com',
       utm_params: { utm_source: 'fb', utm_medium: 'cpc' },
       pageId: 'p1',
       taskId: 't1',
@@ -309,6 +310,50 @@ describe('Meta Legacy Routes', () => {
         expect(bodyStr).toContain('utm_source=fb');
         expect(bodyStr).toContain('utm_medium=cpc');
       }
+    });
+
+    it('should create an ad with optimize_creative enabled', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (getMetaAccessToken as jest.Mock).mockResolvedValue('mock-token');
+
+      const mockFetch = global.fetch as jest.Mock;
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ account_status: 1 }), ok: true });
+      mockFetch.mockResolvedValueOnce({ arrayBuffer: async () => Buffer.from('image'), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ images: { 'image.jpg': { hash: 'h' } } }), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ id: 'c1' }), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ id: 'a1' }), ok: true });
+
+      const payload = { ...validPayload, optimize_creative: true };
+      const response = await request(app).post('/api/meta/create-ad').send(payload);
+
+      expect(response.status).toBe(200);
+      const creativeCall = mockFetch.mock.calls.find(call => typeof call[0] === 'string' && call[0].includes('/adcreatives'));
+      const bodyStr = typeof creativeCall?.[1]?.body === 'string' ? creativeCall[1].body : '';
+      expect(bodyStr).toContain('degrees_of_freedom_spec');
+      expect(bodyStr).toContain('OPT_IN');
+    });
+
+    it('should create an ad without website URL when add_website_url is false', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (getMetaAccessToken as jest.Mock).mockResolvedValue('mock-token');
+
+      const mockFetch = global.fetch as jest.Mock;
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ account_status: 1 }), ok: true });
+      mockFetch.mockResolvedValueOnce({ arrayBuffer: async () => Buffer.from('image'), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ images: { 'image.jpg': { hash: 'h' } } }), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ id: 'c1' }), ok: true });
+      mockFetch.mockResolvedValueOnce({ json: async () => ({ id: 'a1' }), ok: true });
+
+      const payload = { ...validPayload, add_website_url: false };
+      const response = await request(app).post('/api/meta/create-ad').send(payload);
+
+      expect(response.status).toBe(200);
+      const creativeCall = mockFetch.mock.calls.find(call => typeof call[0] === 'string' && call[0].includes('/adcreatives'));
+      
+      const bodyObj = JSON.parse(creativeCall?.[1]?.body || '{}');
+      expect(bodyObj.object_story_spec?.link_data?.link).toBeUndefined();
+      expect(bodyObj.object_story_spec?.link_data?.caption).toBeUndefined();
+      expect(bodyObj.object_story_spec?.link_data?.call_to_action).toBeUndefined();
     });
 
     it('should validate required fields', async () => {

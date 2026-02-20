@@ -178,6 +178,34 @@ describe('Meta V2 Routes', () => {
       expect(metaService.createAd).toHaveBeenCalled();
     });
 
+    it('should pass add_website_url and optimize_creative flags correctly', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.uploadImage as jest.Mock).mockResolvedValue({ hash: 'mock-hash' });
+      (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative1' });
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad1' });
+
+      const payload = {
+        ...validPayload,
+        add_website_url: false,
+        optimize_creative: true
+      };
+
+      const response = await request(app)
+        .post('/api/meta/v2/create-image-ad')
+        .send(payload);
+
+      expect(response.status).toBe(200);
+      expect(metaService.createAdCreative).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          add_website_url: false,
+          link_url: undefined,
+          optimize_creative: true
+        })
+      );
+    });
+
     it('should validate required fields', async () => {
       const response = await request(app)
         .post('/api/meta/v2/create-image-ad')
@@ -305,6 +333,35 @@ describe('Meta V2 Routes', () => {
           description: 'Video Description 1',
           extra_descriptions: ['Video Description 2'],
           link_url: 'https://example.com/vid?utm_source=fb'
+        })
+      );
+    });
+
+    it('should pass add_website_url and optimize_creative flags correctly', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+      (metaService.uploadVideo as jest.Mock).mockResolvedValue({ id: 'video1' });
+      (metaService.uploadImage as jest.Mock).mockResolvedValue({ hash: 'thumb-hash' });
+      (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'creative1' });
+      (metaService.createAd as jest.Mock).mockResolvedValue({ id: 'ad1' });
+
+      const payload = {
+        ...validPayload,
+        add_website_url: false,
+        optimize_creative: true
+      };
+
+      const response = await request(app)
+        .post('/api/meta/v2/create-video-ad')
+        .send(payload);
+
+      expect(response.status).toBe(200);
+      expect(metaService.createAdCreative).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          add_website_url: false,
+          link_url: undefined,
+          optimize_creative: true
         })
       );
     });

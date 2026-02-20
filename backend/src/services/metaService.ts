@@ -41,7 +41,9 @@ export interface MetaAdsAdCreativeParams {
   body: string;
   title: string;
   description?: string;
-  link_url: string;
+  link_url?: string;
+  /** Whether to attach the website URL to the creative (Meta "Add a website URL" checkbox). Default true. */
+  add_website_url?: boolean;
   call_to_action_type?: string;
   /** Additional primary text variants (2nd–5th). When present, asset_feed_spec is used. */
   extra_bodies?: string[];
@@ -49,6 +51,8 @@ export interface MetaAdsAdCreativeParams {
   extra_titles?: string[];
   /** Additional URL description variants (2nd–5th). */
   extra_descriptions?: string[];
+  /** Advantage+ Creative — Meta optimizes creative for each person. */
+  optimize_creative?: boolean;
 }
 
 export interface MetaAdsAdParams {
@@ -123,8 +127,13 @@ export class MetaService {
       console.error(`[MetaAdsError] Structured Data:`, JSON.stringify(structuredError, null, 2));
       console.error(`[MetaAdsError] --- END ERROR LOG ---`);
       
-      // Attach structured error to the original error object before throwing
-      const enhancedError = error instanceof Error ? error : new Error(structuredError.message);
+      // Prefer the human-readable user message over the generic API message
+      const userFacingMessage =
+        structuredError.error_user_msg ||
+        structuredError.error_user_title ||
+        structuredError.message;
+      const enhancedError = error instanceof Error ? error : new Error(userFacingMessage);
+      enhancedError.message = userFacingMessage;
       (enhancedError as any).structuredError = structuredError;
       throw enhancedError;
     }
@@ -638,6 +647,9 @@ export class MetaService {
 
       let creativeParams: any;
 
+      // Whether to attach a website URL to this creative (Meta "Add a website URL" checkbox)
+      const withUrl = params.add_website_url !== false && !!params.link_url;
+
       if (useAssetFeed && params.video_id) {
         // VIDEO — multiple text variants → asset_feed_spec (Dynamic Creative)
         if (!params.image_hash && !params.image_url) {
@@ -650,18 +662,24 @@ export class MetaService {
           ad_formats: ['SINGLE_VIDEO'],
           bodies: allBodies.map(b => ({ text: b })),
           titles: allTitles.map(t => ({ text: t })),
-          link_urls: [{ website_url: params.link_url }],
           videos: [{
             video_id: params.video_id,
             ...(params.image_hash ? { thumbnail_hash: params.image_hash } : {}),
           }],
         };
+        // "Add a website URL" — only include link_urls when checkbox is checked
+        if (withUrl) assetFeedSpec.link_urls = [{ website_url: params.link_url, display_url: params.link_url }];
         if (allDescriptions.length > 0) assetFeedSpec.descriptions = allDescriptions.map(d => ({ text: d }));
         if (params.call_to_action_type) assetFeedSpec.call_to_action_types = [params.call_to_action_type];
         creativeParams = {
           [AdCreative.Fields.name]: params.name,
           [AdCreative.Fields.object_story_spec]: { page_id: params.page_id },
           asset_feed_spec: assetFeedSpec,
+          ...(params.optimize_creative ? {
+            degrees_of_freedom_spec: {
+              creative_features_spec: { standard_enhancements: { enroll_status: 'OPT_IN' } },
+            },
+          } : {}),
         };
 
       } else if (useAssetFeed) {
@@ -670,8 +688,9 @@ export class MetaService {
           ad_formats: ['SINGLE_IMAGE'],
           bodies: allBodies.map(b => ({ text: b })),
           titles: allTitles.map(t => ({ text: t })),
-          link_urls: [{ website_url: params.link_url }],
         };
+        // "Add a website URL" — only include link_urls when checkbox is checked
+        if (withUrl) assetFeedSpec.link_urls = [{ website_url: params.link_url, display_url: params.link_url }];
         if (params.image_hash) assetFeedSpec.images = [{ hash: params.image_hash }];
         else if (params.image_url) assetFeedSpec.images = [{ url: params.image_url }];
         if (allDescriptions.length > 0) assetFeedSpec.descriptions = allDescriptions.map(d => ({ text: d }));
@@ -680,6 +699,11 @@ export class MetaService {
           [AdCreative.Fields.name]: params.name,
           [AdCreative.Fields.object_story_spec]: { page_id: params.page_id },
           asset_feed_spec: assetFeedSpec,
+          ...(params.optimize_creative ? {
+            degrees_of_freedom_spec: {
+              creative_features_spec: { standard_enhancements: { enroll_status: 'OPT_IN' } },
+            },
+          } : {}),
         };
 
       } else {
@@ -699,7 +723,8 @@ export class MetaService {
             message: params.body,
             title: params.title,
             description: params.description || undefined,
-            call_to_action: params.call_to_action_type ? {
+            // "Add a website URL" — only set call_to_action link when checkbox is checked
+            call_to_action: params.call_to_action_type && withUrl ? {
               type: params.call_to_action_type,
               value: { link: params.link_url }
             } : undefined
@@ -712,21 +737,21 @@ export class MetaService {
         } else if (isCarousel) {
           objectStorySpec.link_data = {
             message: params.body,
-            link: params.link_url,
-            caption: params.link_url,
+            // "Add a website URL" — only set link/caption when checkbox is checked
+            ...(withUrl ? { link: params.link_url, caption: params.link_url } : {}),
             child_attachments: params.carousel_cards!.map(card => ({
-              link: card.link_url || params.link_url,
+              link: card.link_url || (withUrl ? params.link_url : undefined),
               image_hash: card.image_hash,
               picture: card.image_url,
               name: card.title,
               description: card.description,
               video_id: card.video_id,
-              call_to_action: params.call_to_action_type ? {
+              call_to_action: params.call_to_action_type && (card.link_url || withUrl) ? {
                 type: params.call_to_action_type,
                 value: { link: card.link_url || params.link_url }
               } : undefined
             })),
-            call_to_action: params.call_to_action_type ? {
+            call_to_action: params.call_to_action_type && withUrl ? {
               type: params.call_to_action_type,
               value: { link: params.link_url }
             } : undefined
@@ -736,11 +761,11 @@ export class MetaService {
         } else {
           objectStorySpec.link_data = {
             message: params.body,
-            link: params.link_url,
-            caption: params.link_url,
+            // "Add a website URL" — only set link/caption when checkbox is checked
+            ...(withUrl ? { link: params.link_url, caption: params.link_url } : {}),
             name: params.title,
             description: params.description || undefined,
-            call_to_action: params.call_to_action_type ? {
+            call_to_action: params.call_to_action_type && withUrl ? {
               type: params.call_to_action_type,
               value: { link: params.link_url }
             } : undefined
@@ -752,6 +777,11 @@ export class MetaService {
         creativeParams = {
           [AdCreative.Fields.name]: params.name,
           [AdCreative.Fields.object_story_spec]: objectStorySpec,
+          ...(params.optimize_creative ? {
+            degrees_of_freedom_spec: {
+              creative_features_spec: { standard_enhancements: { enroll_status: 'OPT_IN' } },
+            },
+          } : {}),
         };
       }
 
