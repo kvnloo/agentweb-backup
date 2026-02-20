@@ -1,5 +1,12 @@
 import { AgentModeService } from '../services/agentModeService';
 
+// Mock MCP client service first
+jest.mock('../mcp/client/mcpClientService', () => ({
+  McpClientService: jest.fn().mockImplementation(() => ({
+    isReady: jest.fn().mockReturnValue(true)
+  }))
+}));
+
 // Mock the dependencies
 jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
@@ -38,7 +45,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should exclude today and use yesterday as end date for 7d timeframe', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -84,7 +103,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should exclude today and use yesterday as end date for 14d timeframe', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -119,7 +150,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should exclude today and use yesterday as end date for 30d timeframe', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -156,7 +199,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should use level=campaign for breakdown API calls', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -203,7 +258,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should not include adset_id and ad_id in breakdown API calls', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -253,7 +320,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should include campaign_id in breakdown fields', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -287,7 +366,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should retry on 429 rate limit error', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -324,7 +415,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should retry on 500 server error', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -361,7 +464,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should retry on network error', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -392,7 +507,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should not retry on 404 error', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -423,7 +550,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should give up after 3 retry attempts', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -457,7 +596,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should use correct dates and parameters even after retry', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -522,7 +673,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should automatically fetch next page when paging.next is present', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -588,7 +751,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should merge data from all pages', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -659,7 +834,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should handle pagination with retry on rate limit', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -720,7 +907,19 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
     it('should not have paging info in final result', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -763,5 +962,32 @@ describe('AgentModeService - Meta Ads Metrics with Date Handling and Retry', () 
       // (This is implicit since we delete it after merging)
       expect(result.success).toBe(true);
     }, 10000);
+    it('should return error when campaign_ids is empty', async () => {
+      const mockUser = {
+        id: 'user123',
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'meta',
+            account_id: '123456789',
+            account_name: 'Test Business',
+            config: {
+              account_type: 'ad_account',
+              access_token: 'mock-access-token',
+              ad_account_id: '123456789'
+            }
+          }
+        ]
+      };
+
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+
+      const result = await agentModeService['getMetaAdsMetrics']('7d', 'user123', []);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('campaign_ids is required');
+      expect(result.error).toBe('Invalid campaign_ids');
+    });
   });
 });

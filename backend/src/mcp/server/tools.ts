@@ -46,11 +46,302 @@ mcpToolRegistry.register({
   }
 });
 
+// --- Tools from marketingTools.ts ---
+mcpToolRegistry.register({
+  name: "call_meta_marketing_api",
+    definition: {
+      name: "call_meta_marketing_api",
+      description:
+        `Manage Meta Ads entities via the Marketing API. Requires account_id from list_connected_accounts(platform='meta').
+
+ACTION MATRIX (entity_type → supported actions):
+  CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
+  AD_SET        → LIST, CREATE, UPDATE, DELETE
+  AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD            → LIST, CREATE, UPDATE, DELETE
+  CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
+  TARGETING     → SEARCH
+  PAGE          → LIST
+
+REQUIRED IDs PER ACTION:
+  CAMPAIGN UPDATE/DELETE  → campaign_id required
+  AD_SET CREATE           → campaign_id required
+  AD_SET UPDATE/DELETE    → ad_set_id required
+  AD CREATE               → ad_set_id required
+  AD UPDATE/DELETE        → ad_id required
+  TARGETING SEARCH        → params.q and params.type required
+
+REQUIRED PARAMS PER ENTITY + ACTION:
+  CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
+  AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
+  AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
+  AD CREATE:            name, creative_id (plus ad_set_id top-level param)
+  CUSTOM_AUDIENCE CREATE: name, subtype (CUSTOM or LOOKALIKE)
+  TARGETING SEARCH:     q (search query), type (adinterest | adbehavior | addemographics)
+
+CAMPAIGN OBJECTIVES (valid values for 'objective'):
+  OUTCOME_TRAFFIC, OUTCOME_AWARENESS, OUTCOME_ENGAGEMENT, OUTCOME_SALES, OUTCOME_LEADS, OUTCOME_APP_PROMOTION
+
+BUDGET RULES (Campaign & Ad Set):
+  - Provide daily_budget OR lifetime_budget, NEVER both
+  - lifetime_budget requires end_time (ISO 8601)
+  - advantage_campaign_budget=true enables campaign-level budget; use budget_amount instead of ad-set-level budget
+
+CREATIVE SUB-TYPES (mutually exclusive — pick exactly one):
+  IMAGE creative:    provide image_hash (from UPLOAD_IMAGE) OR image_url
+  VIDEO creative:    provide video_id (from UPLOAD_VIDEO) + REQUIRED thumbnail: image_hash or image_url
+                     (Meta API error 1443226 if thumbnail is missing — always upload thumbnail first)
+  CAROUSEL creative: provide carousel_cards array with 2–10 items; each card needs at least one of image_hash, image_url, or video_id; plus title, link_url per card
+  RULE: Cannot pass both video_id and carousel_cards — they are mutually exclusive.
+
+VIDEO CREATIVE WORKFLOW (3 steps, all required):
+  Step 1: UPLOAD_VIDEO → returns video_id
+  Step 2: UPLOAD_IMAGE → returns image_hash  (thumbnail — MANDATORY for video creatives)
+  Step 3: AD_CREATIVE CREATE with video_id + image_hash (or image_url)
+
+OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
+  OUTCOME_TRAFFIC   → LINK_CLICKS, LANDING_PAGE_VIEWS
+  OUTCOME_AWARENESS → REACH, IMPRESSIONS
+  OUTCOME_ENGAGEMENT → POST_ENGAGEMENT, PAGE_LIKES
+  OUTCOME_SALES     → OFFSITE_CONVERSIONS, VALUE
+  OUTCOME_LEADS     → LEAD_GENERATION, OFFSITE_CONVERSIONS
+  OUTCOME_APP_PROMOTION → APP_INSTALLS`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          entity_type: {
+            type: "string",
+            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE"],
+            description: "The Meta Ads entity to operate on."
+          },
+          action: {
+            type: "string",
+            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH"],
+            description: "The operation to perform. Must be valid for the chosen entity_type."
+          },
+          account_id: {
+            type: "string",
+            description: "Ad Account ID (without 'act_' prefix). Must be obtained from list_connected_accounts(platform='meta')."
+          },
+          campaign_id: {
+            type: "string",
+            description: "Campaign ID. Required for: CAMPAIGN UPDATE/DELETE, AD_SET CREATE, AD_SET LIST (optional filter)."
+          },
+          ad_set_id: {
+            type: "string",
+            description: "Ad Set ID. Required for: AD_SET UPDATE/DELETE, AD CREATE, AD LIST (optional filter)."
+          },
+          ad_id: {
+            type: "string",
+            description: "Ad ID. Required for: AD UPDATE/DELETE."
+          },
+          params: {
+            type: "object",
+            description: "Action-specific parameters. Required fields depend on entity_type + action (see tool description for the full matrix).",
+            properties: {
+              // --- Common ---
+              name:   { type: "string", description: "Entity name." },
+              status: { type: "string", enum: ["ACTIVE", "PAUSED", "ARCHIVED"], description: "Entity status." },
+
+              // --- Campaign ---
+              objective:                  { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+              special_ad_categories:      { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
+              advantage_campaign_budget:  { type: "boolean", description: "Enable Advantage Campaign Budget." },
+              budget_amount:              { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
+
+              // --- Ad Set ---
+              optimization_goal: { type: "string", description: "Optimization goal (must be compatible with campaign objective)." },
+              billing_event:     { type: "string", description: "Billing event (must be compatible with optimization_goal)." },
+              daily_budget:      { type: "number", description: "Daily budget in dollars. Min $1, max $5,000." },
+              lifetime_budget:   { type: "number", description: "Lifetime budget in dollars. Min $1, max $50,000. Requires end_time." },
+              bid_strategy:      { type: "string", enum: ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"], description: "Bid strategy." },
+              bid_amount:        { type: "number", description: "Bid amount in dollars. Required for BID_CAP and COST_CAP strategies." },
+              targeting: {
+                type: "object",
+                description: "Targeting specification. geo_locations is required. targeting_automation.advantage_audience (0 or 1) is auto-injected as 0 if omitted — pass explicitly to override. Example: { geo_locations: { countries: ['US'] }, targeting_automation: { advantage_audience: 0 } }"
+              },
+              start_time:       { type: "string", description: "ISO 8601 start datetime." },
+              end_time:         { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
+              promoted_object:  { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
+
+              // --- Creative ---
+              page_id:              { type: "string", description: "Facebook Page ID (from list_meta_pages or PAGE LIST)." },
+              image_hash:           { type: "string", description: "Image hash from UPLOAD_IMAGE." },
+              image_url:            { type: "string", description: "Image URL (for UPLOAD_IMAGE action or direct creative use)." },
+              video_id:             { type: "string", description: "Video ID from UPLOAD_VIDEO." },
+              video_url:            { type: "string", description: "Video URL (for UPLOAD_VIDEO action)." },
+              carousel_cards: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    image_hash: { type: "string" }, video_id: { type: "string" },
+                    title: { type: "string" }, description: { type: "string" }, link_url: { type: "string" }
+                  }
+                },
+                description: "Carousel card array for multi-card creatives."
+              },
+              body:                 { type: "string", description: "Ad body / primary text." },
+              title:                { type: "string", description: "Ad headline." },
+              link_url:             { type: "string", description: "Destination URL." },
+              call_to_action_type:  { type: "string", description: "CTA button (e.g., LEARN_MORE, SHOP_NOW, SIGN_UP)." },
+              creative_id:          { type: "string", description: "Creative ID for AD CREATE." },
+
+              // --- Custom Audience ---
+              subtype:              { type: "string", enum: ["CUSTOM", "LOOKALIKE"], description: "Audience subtype." },
+              description:          { type: "string", description: "Audience description." },
+              customer_file_source: { type: "string", description: "Source type for CUSTOM audiences (e.g., USER_PROVIDED_ONLY)." },
+              lookalike_spec:       { type: "object", description: "Lookalike config: { origin: [{ id, type }], ratio: 0.01, country: 'US' }." },
+              id:                   { type: "string", description: "Audience ID for UPLOAD_USERS." },
+              schema:               { type: "array", items: { type: "string" }, description: "PII field types for UPLOAD_USERS (e.g., ['EMAIL', 'FN', 'LN'])." },
+              payload:              { type: "string", description: "User data as JSON array-of-arrays for UPLOAD_USERS." },
+
+              // --- Targeting Search ---
+              q:    { type: "string", description: "Search query for targeting search." },
+              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." }
+            }
+          }
+        },
+        required: ["entity_type", "action", "account_id"]
+      }
+    },
+    execute: async (args, context) => {
+      return await agentModeService.callMetaMarketingApi(
+        context?.userId,
+        args.entity_type,
+        args.action,
+        args.account_id,
+        args.campaign_id,
+        args.ad_set_id,
+        args.ad_id,
+        args.params,
+      );
+    }
+  });
+
+mcpToolRegistry.register({
+  name: "call_meta_ads_insights_api",
+  definition: {
+    name: "call_meta_ads_insights_api",
+    description:
+      "Fetch performance reporting data from Meta Ads (impressions, clicks, spend, conversions, ROAS, etc.). Use this for custom queries with specific fields, date ranges, breakdowns, or filtering. Handles Meta's async reporting internally — returns an S3 URL to JSON results when ready. You MUST provide either date_preset or time_range (defaults to all-time if omitted, which can be very large). For a quick pre-built dashboard summary of specific campaigns, use get_meta_ads_metrics instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account_id: {
+          type: "string",
+          description:
+            "The ad account ID (numeric, without 'act_' prefix). Use list_connected_accounts to retrieve this. DO NOT guess.",
+        },
+        object_type: {
+          type: "string",
+          enum: ["account", "campaign", "adset", "ad"],
+          description:
+            "Entity level to fetch insights for. Use 'account' for the whole account.",
+        },
+        object_id: {
+          type: "string",
+          description:
+            "The entity ID. REQUIRED when object_type is campaign, adset, or ad. Omit for account-level.",
+        },
+        fields: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Metrics to retrieve. Common: impressions, reach, clicks, spend, ctr, cpc, cpm, actions, action_values, purchase_roas, conversions, video_views, cost_per_action_type.",
+        },
+        date_preset: {
+          type: "string",
+          enum: [
+            "today",
+            "yesterday",
+            "this_month",
+            "last_month",
+            "this_quarter",
+            "maximum",
+            "last_3d",
+            "last_7d",
+            "last_14d",
+            "last_28d",
+            "last_30d",
+            "last_90d",
+            "this_year",
+            "last_year"
+          ],
+          description:
+            "Predefined date range. Recommended default: 'last_30d'. Use 'maximum' for lifetime. Mutually exclusive with time_range.",
+        },
+        time_range: {
+          type: "object",
+          properties: {
+            since: {
+              type: "string",
+              description: "Start date (YYYY-MM-DD). Must be <= until.",
+            },
+            until: {
+              type: "string",
+              description: "End date (YYYY-MM-DD). Must be >= since.",
+            },
+          },
+          required: ["since", "until"],
+          description:
+            "Custom date range. Both since and until are required. Mutually exclusive with date_preset.",
+        },
+        level: {
+          type: "string",
+          enum: ["account", "campaign", "adset", "ad"],
+          description:
+            "Row aggregation level. Example: object_type='account' + level='campaign' returns one row per campaign.",
+        },
+        breakdowns: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["age", "gender", "country", "region", "publisher_platform", "platform_position", "device_platform"],
+          },
+          description:
+            "Segment results by dimension. E.g., ['age', 'gender'] splits each row by age+gender.",
+        },
+        action_breakdowns: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["action_type", "action_target_id", "action_destination", "action_device", "action_reaction", "action_video_sound", "action_video_type", "action_carousel_card_id", "action_carousel_card_name"],
+          },
+          description:
+            "Segment action/conversion metrics. Use 'action_type' to break down the 'actions' and 'action_values' fields by event type (e.g., purchase, link_click).",
+        },
+        filtering: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              field: { type: "string", description: "Field to filter on (e.g., 'campaign.name', 'adset.name', 'campaign.objective')." },
+              operator: { type: "string", enum: ["EQUAL", "NOT_EQUAL", "GREATER_THAN", "LESS_THAN", "IN", "NOT_IN", "CONTAIN", "NOT_CONTAIN"] },
+              value: { description: "Filter value. String for EQUAL/CONTAIN, array for IN/NOT_IN." },
+            },
+            required: ["field", "operator", "value"],
+          },
+          description:
+            "Server-side filters to narrow results before aggregation.",
+        },
+      },
+      required: ["account_id", "object_type", "fields"],
+    },
+  },
+  execute: async (args, context) => {
+    return await agentModeService.callMetaAdsInsightsApiWrapper(
+      context?.userId,
+      args as any,
+    );
+  },
+});
+
 mcpToolRegistry.register({
   name: 'get_meta_ads_metrics',
   definition: {
     name: 'get_meta_ads_metrics',
-    description: 'Get Meta ad performance metrics and campaign data for specific campaigns. Requires campaign_ids (array of campaign IDs). Use list_meta_ads_campaigns first to get available IDs.',
+    description: 'Quick pre-built dashboard: returns a formatted summary of campaign, ad set, and ad performance with demographics, placement, and device breakdowns for specific campaigns. Best for "how are my campaigns doing?" questions. For custom field selection, custom date ranges, or raw data export, use call_meta_ads_insights_api instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -64,7 +355,7 @@ mcpToolRegistry.register({
           type: 'array',
           items: { type: 'string' },
           minItems: 1,
-          description: 'Required list of campaign IDs to filter metrics by. Use list_meta_ads_campaigns to get available campaign IDs.'
+          description: 'Required list of campaign IDs to filter metrics by. Use call_meta_marketing_api to get available campaign IDs.'
         }
       },
       required: ['campaign_ids']
@@ -1199,7 +1490,7 @@ mcpToolRegistry.register({
       properties: {
         platform: {
           type: 'string',
-          description: 'Filter by platform (e.g., "linkedin", "facebook", "twitter"), or "all" for all platforms',
+          description: 'Filter by platform (e.g., "linkedin", "facebook", "meta", "twitter"), or "all" for all platforms',
           default: 'all'
         }
       },

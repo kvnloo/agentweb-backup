@@ -855,6 +855,67 @@ The SEO/GEO page can display a Technical SEO Score sourced from Google's PageSpe
 - The score is returned as a 0–100 integer (Lighthouse SEO category).
 - If the API key is missing or the API call fails, the score shows as `N/A`.
 
+### Meta (Facebook) App Configuration
+
+The Meta integration allows users to connect Facebook Ad Accounts and Pages via OAuth.
+
+#### 1. Create a Facebook App
+
+1. Go to [Facebook Developers](https://developers.facebook.com/) and create a new app (type: **Business**)
+2. Under **App Settings > Basic**, note your **App ID** and **App Secret**
+
+#### 2. Configure OAuth Redirect URIs
+
+In the Facebook app dashboard, first add the **Facebook Login for Business** product (under **App Dashboard > Add Product**). Then go to **Facebook Login for Business > Settings** and ensure:
+
+- **Client OAuth Login**: On
+- **Web OAuth Login**: On
+- Add your redirect URI to **Valid OAuth Redirect URIs**:
+  - Production: `https://api.agentweb.pro/api/oauth/meta/callback`
+  - Local dev with ngrok: `https://<your-subdomain>.ngrok-free.app/api/oauth/meta/callback`
+
+#### 3. Add Required Permissions
+
+Under **App Review > Permissions and Features**, switch `public_profile` to **Advanced Access** (required after adding Facebook Login for Business). Then request these permissions:
+
+- `ads_management`
+- `ads_read`
+- `business_management`
+- `pages_show_list`
+- `pages_read_engagement`
+- `read_insights`
+
+#### 4. Store Credentials in AWS Secrets Manager
+
+- Secret Name: `dev/AgentWeb/MetaApp` (development) or `prod/AgentWeb/MetaApp` (production)
+- Secret Value (JSON):
+```json
+{
+  "clientId": "your_facebook_app_id",
+  "clientSecret": "your_facebook_app_secret"
+}
+```
+
+#### 5. Configure Backend Environment
+
+The redirect URI is built from the `BACKEND_URL` environment variable (`backend/src/config/integrations.ts`):
+
+```
+redirect_uri = ${BACKEND_URL}/api/oauth/meta/callback
+```
+
+Set `BACKEND_URL` in your backend `.env` to match the domain you whitelisted in the Facebook app:
+
+```bash
+# Production
+BACKEND_URL=https://api.agentweb.pro
+
+# Local dev with ngrok
+BACKEND_URL=https://<your-subdomain>.ngrok-free.app
+```
+
+Restart the backend after changing `BACKEND_URL`.
+
 ### CMS Configuration (BaseHub and Webflow)
 
 The blog publishing feature supports publishing to both BaseHub and Webflow CMS. Users can be configured with a CMS Type in the admin dashboard, and the system will automatically route blog posts to the appropriate CMS.

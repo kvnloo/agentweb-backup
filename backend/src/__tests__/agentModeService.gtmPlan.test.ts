@@ -24,6 +24,10 @@ jest.mock('aws-sdk', () => {
         promise: jest.fn().mockResolvedValue({ SecretString: '{}' }),
       }),
     })),
+    S3: jest.fn(() => ({
+      upload: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Location: 'https://mock-s3-url.com/file', Key: 'mock-key' }) }),
+      getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    })),
   };
 });
 

@@ -35,7 +35,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'facebook',
+            account_name: 'Test Account',
+            config: {
+              account_type: 'ad_account',
+              ad_account_id: '123456789',
+              access_token: 'mock-access-token'
+            }
+          }
+        ]
       };
 
       // Mock the userDb.getUserById to return the mock user
@@ -164,7 +175,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'facebook',
+            account_name: 'Test Account',
+            config: {
+              account_type: 'ad_account',
+              ad_account_id: '123456789',
+              access_token: 'mock-access-token'
+            }
+          }
+        ]
       };
 
       // Mock the userDb.getUserById to return the mock user
@@ -477,7 +499,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
     it('should accept legacy single campaign ID string input', async () => {
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'facebook',
+            account_name: 'Test Account',
+            config: {
+              account_type: 'ad_account',
+              ad_account_id: '123456789',
+              access_token: 'mock-access-token'
+            }
+          }
+        ]
       };
 
       const { userDb } = await import('../services/db');
@@ -504,7 +537,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'facebook',
+            account_name: 'Test Account',
+            config: {
+              account_type: 'ad_account',
+              ad_account_id: '123456789',
+              access_token: 'mock-access-token'
+            }
+          }
+        ]
       };
 
       // Mock the userDb.getUserById to return the mock user
@@ -540,7 +584,18 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       // Mock user data
       const mockUser = {
         id: 'user123',
-        adAccount: '123456789'
+        adAccount: '123456789',
+        connected_accounts: [
+          {
+            platform: 'facebook',
+            account_name: 'Test Account',
+            config: {
+              account_type: 'ad_account',
+              ad_account_id: '123456789',
+              access_token: 'mock-access-token'
+            }
+          }
+        ]
       };
 
       // Mock the userDb.getUserById to return the mock user

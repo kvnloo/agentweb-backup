@@ -151,7 +151,8 @@ export interface User {
   resetPasswordExpires?: string;
   subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
   connected_accounts?: Array<{
-    platform: 'linkedin' | 'facebook' | 'twitter' | 'instagram';
+    platform: 'linkedin' | 'facebook' 
+    | 'meta' | 'twitter' | 'instagram';
     account_id: string;
     account_name: string;
     config: {

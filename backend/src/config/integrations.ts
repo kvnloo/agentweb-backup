@@ -1,5 +1,7 @@
+import { getLinkedInCredentials, getMetaCredentials } from '../utils/secretsManager';
 
-import { getLinkedInCredentials } from '../utils/secretsManager';
+// Graph API version for Auth/Token exchange - decoupled from SDK version
+const META_GRAPH_VERSION = 'v24.0';
 
 // LinkedIn account type for OAuth
 export type LinkedInAccountType = 'personal' | 'company';
@@ -22,11 +24,26 @@ export const INTEGRATION_CONFIG = {
       'r_organization_followers',
       'r_organization_social_feed'
     ],
-    
+
     // LinkedIn OAuth V2 Endpoints
     authorizationUrl: 'https://www.linkedin.com/oauth/v2/authorization',
     tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken',
     profileUrl: 'https://api.linkedin.com/v2/userinfo'
+  },
+
+  meta: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/meta/callback`,
+    // All scopes for unified OAuth - user can connect ad accounts AND/OR pages
+    scopes: [
+      'ads_management',
+      'ads_read',
+      'business_management',
+      'pages_show_list',
+      'pages_read_engagement'
+    ],
+    authorizationUrl: `https://www.facebook.com/${META_GRAPH_VERSION}/dialog/oauth`,
+    tokenUrl: `https://graph.facebook.com/${META_GRAPH_VERSION}/oauth/access_token`,
+    apiBaseUrl: `https://graph.facebook.com/${META_GRAPH_VERSION}`
   }
 };
 
@@ -65,6 +82,27 @@ export async function getLinkedInConfig(): Promise<LinkedInConfig> {
     authorizationUrl: INTEGRATION_CONFIG.linkedin.authorizationUrl,
     tokenUrl: INTEGRATION_CONFIG.linkedin.tokenUrl,
     profileUrl: INTEGRATION_CONFIG.linkedin.profileUrl
+  };
+}
+
+import { MetaConfig } from '../types/meta';
+
+/**
+ * Fetches Meta OAuth configuration from AWS Secrets Manager.
+ * Credentials are stored at dev/AgentWeb/Meta (or prod/... for production)
+ */
+export async function getMetaConfig(): Promise<MetaConfig> {
+  // Fetch credentials from AWS Secrets Manager
+  const credentials = await getMetaCredentials();
+
+  return {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.meta.redirectUri,
+    scopes: INTEGRATION_CONFIG.meta.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.meta.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.meta.tokenUrl,
+    apiBaseUrl: INTEGRATION_CONFIG.meta.apiBaseUrl
   };
 }
 

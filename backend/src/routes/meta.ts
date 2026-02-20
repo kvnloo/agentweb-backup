@@ -1,6 +1,6 @@
 import express from "express";
 import { authenticateToken } from "../middleware/auth";
-import { userDb } from "../services/db";
+import { userDb, taskDb } from "../services/db";
 import { getMetaAccessToken } from "../utils/secretsManager";
 
 const router = express.Router();
@@ -679,7 +679,43 @@ router.get("/campaigns-and-adsets", async (req, res) => {
   }
 });
 
-// Create Meta ad
+// ---------------------------------------------------------------------------
+// GET /api/meta/ads-history/:taskId
+// Returns all Meta ads created from result_files of the given task's executions.
+// ---------------------------------------------------------------------------
+router.get("/ads-history/:taskId", async (req, res) => {
+  const userId = (req as any).user.userId;
+  const { taskId } = req.params;
+
+  try {
+    const executions = await taskDb.getTaskExecutions(taskId);
+    if (!executions) return res.json([]);
+
+    const ads: any[] = [];
+    for (const exec of executions) {
+      if (exec.userId !== userId) continue;
+      for (const file of exec.result_files || []) {
+        if (file.meta_ad) {
+          ads.push({
+            ...file.meta_ad,
+            imageUrl: file.url,
+            filename: file.filename,
+            executionId: exec.executionId,
+          });
+        }
+      }
+    }
+
+    // Sort newest first
+    ads.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    res.json(ads);
+  } catch (error: any) {
+    console.error("Error fetching Meta ads history:", error);
+    res.status(500).json({ message: "Error fetching ads history", error: error.message });
+  }
+});
+
+// Create Meta ad (legacy — uses shared server token + user.adAccount)
 router.post("/create-ad", async (req, res) => {
   const userId = (req as any).user.userId;
   const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, pageId, taskId, executionId } = req.body;

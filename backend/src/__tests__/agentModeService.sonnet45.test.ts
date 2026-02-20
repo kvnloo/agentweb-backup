@@ -22,6 +22,11 @@ jest.mock('aws-sdk', () => ({
     })),
   },
   SecretsManager: jest.fn(),
+  S3: jest.fn().mockImplementation(() => ({
+    upload: jest.fn().mockReturnValue({
+      promise: jest.fn().mockResolvedValue({ Location: 'mock-url', Key: 'mock-key' }),
+    }),
+  })),
 }));
 
 jest.mock('../services/chatbotService');

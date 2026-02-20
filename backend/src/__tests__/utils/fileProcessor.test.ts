@@ -80,6 +80,14 @@ describe('fileProcessor utils', () => {
       expect(isSupportedFileType('file.xyz', 'application/x-unknown-type')).toBe(false);
     });
 
+    it('should handle filename ending with dot (empty extension, covers || "" branch)', () => {
+      expect(isSupportedFileType('file.')).toBe(false);
+    });
+
+    it('should return true for dot-terminated filename when mime type is supported', () => {
+      expect(isSupportedFileType('file.', 'application/pdf')).toBe(true);
+    });
+
     it('should support all office document mime types', () => {
       expect(isSupportedFileType('file.unknown', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')).toBe(true);
       expect(isSupportedFileType('file.unknown', 'application/vnd.openxmlformats-officedocument.presentationml.presentation')).toBe(true);
@@ -147,6 +155,10 @@ describe('fileProcessor utils', () => {
 
     it('should return content type for m4v files', () => {
       expect(getContentType('file.m4v')).toBe('video/x-m4v');
+    });
+
+    it('should handle filename ending with dot (empty extension, covers || "" branch)', () => {
+      expect(getContentType('file.')).toBe('application/octet-stream');
     });
   });
 });
