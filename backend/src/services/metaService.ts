@@ -43,6 +43,12 @@ export interface MetaAdsAdCreativeParams {
   description?: string;
   link_url: string;
   call_to_action_type?: string;
+  /** Additional primary text variants (2nd–5th). When present, asset_feed_spec is used. */
+  extra_bodies?: string[];
+  /** Additional headline variants (2nd–5th). When present, asset_feed_spec is used. */
+  extra_titles?: string[];
+  /** Additional URL description variants (2nd–5th). */
+  extra_descriptions?: string[];
 }
 
 export interface MetaAdsAdParams {
@@ -491,7 +497,7 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
-      const fields = ['id', 'name', 'status', 'campaign_id', 'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting'];
+      const fields = ['id', 'name', 'status', 'campaign_id', 'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting', 'is_dynamic_creative'];
       const params = campaignId ? { campaign_id: campaignId } : {};
       this.log(`Listing ad sets for account: ${adAccountId}`, { fields, ...params });
       const adSets = await account.getAdSets(fields, params);
@@ -618,87 +624,136 @@ export class MetaService {
         }
       }
 
-      let objectStorySpec: any = {
-        page_id: params.page_id,
-      };
+      // Aggregate all text variants across single + extra arrays
+      const allBodies = [params.body, ...(params.extra_bodies || [])].filter(Boolean);
+      const allTitles = [params.title, ...(params.extra_titles || [])].filter(Boolean);
+      const allDescriptions = [
+        ...(params.description ? [params.description] : []),
+        ...(params.extra_descriptions || []),
+      ].filter(Boolean);
 
-      // 1. VIDEO CREATIVE
-      if (params.video_id) {
-        // Meta requires exactly one thumbnail field in video_data: image_hash (preferred) or image_url.
-        // Missing thumbnail → error_subcode 1443226 "Your ad needs a video thumbnail".
+      const isCarousel = !!(params.carousel_cards && params.carousel_cards.length > 0);
+      // Use asset_feed_spec (Dynamic Creative) when >1 variant for image/video ads
+      const useAssetFeed = !isCarousel && (allBodies.length > 1 || allTitles.length > 1 || allDescriptions.length > 1);
+
+      let creativeParams: any;
+
+      if (useAssetFeed && params.video_id) {
+        // VIDEO — multiple text variants → asset_feed_spec (Dynamic Creative)
         if (!params.image_hash && !params.image_url) {
           throw new Error(
             'Video creative requires a thumbnail. ' +
             'Provide image_hash (from AD_CREATIVE UPLOAD_IMAGE) or image_url alongside video_id.'
           );
         }
-        const videoData: any = {
-          video_id: params.video_id,
-          message: params.body,
-          title: params.title,
-          description: params.description || undefined,
-          call_to_action: params.call_to_action_type ? {
-            type: params.call_to_action_type,
-            value: { link: params.link_url }
-          } : undefined
+        const assetFeedSpec: any = {
+          ad_formats: ['SINGLE_VIDEO'],
+          bodies: allBodies.map(b => ({ text: b })),
+          titles: allTitles.map(t => ({ text: t })),
+          link_urls: [{ website_url: params.link_url }],
+          videos: [{
+            video_id: params.video_id,
+            ...(params.image_hash ? { thumbnail_hash: params.image_hash } : {}),
+          }],
         };
-        // Prefer image_hash (uploaded asset) over image_url
-        if (params.image_hash) {
-          videoData.image_hash = params.image_hash;
-        } else {
-          videoData.image_url = params.image_url;
-        }
-        objectStorySpec.video_data = videoData;
-      } 
-      // 2. CAROUSEL CREATIVE
-      else if (params.carousel_cards && params.carousel_cards.length > 0) {
-        objectStorySpec.link_data = {
-          message: params.body,
-          link: params.link_url, // Fallback/Main link
-          caption: params.link_url,
-          child_attachments: params.carousel_cards.map(card => ({
-            link: card.link_url || params.link_url,
-            image_hash: card.image_hash,
-            picture: card.image_url,
-            name: card.title,
-            description: card.description,
-            video_id: card.video_id,
-            call_to_action: params.call_to_action_type ? { // Inherit CTA or customize per card if needed
-                type: params.call_to_action_type, 
-                value: { link: card.link_url || params.link_url }
+        if (allDescriptions.length > 0) assetFeedSpec.descriptions = allDescriptions.map(d => ({ text: d }));
+        if (params.call_to_action_type) assetFeedSpec.call_to_action_types = [params.call_to_action_type];
+        creativeParams = {
+          [AdCreative.Fields.name]: params.name,
+          [AdCreative.Fields.object_story_spec]: { page_id: params.page_id },
+          asset_feed_spec: assetFeedSpec,
+        };
+
+      } else if (useAssetFeed) {
+        // SINGLE IMAGE — multiple text variants → asset_feed_spec (Dynamic Creative)
+        const assetFeedSpec: any = {
+          ad_formats: ['SINGLE_IMAGE'],
+          bodies: allBodies.map(b => ({ text: b })),
+          titles: allTitles.map(t => ({ text: t })),
+          link_urls: [{ website_url: params.link_url }],
+        };
+        if (params.image_hash) assetFeedSpec.images = [{ hash: params.image_hash }];
+        else if (params.image_url) assetFeedSpec.images = [{ url: params.image_url }];
+        if (allDescriptions.length > 0) assetFeedSpec.descriptions = allDescriptions.map(d => ({ text: d }));
+        if (params.call_to_action_type) assetFeedSpec.call_to_action_types = [params.call_to_action_type];
+        creativeParams = {
+          [AdCreative.Fields.name]: params.name,
+          [AdCreative.Fields.object_story_spec]: { page_id: params.page_id },
+          asset_feed_spec: assetFeedSpec,
+        };
+
+      } else {
+        // SINGLE CREATIVE (one variant, or carousel) → object_story_spec
+        let objectStorySpec: any = { page_id: params.page_id };
+
+        // 1. VIDEO CREATIVE
+        if (params.video_id) {
+          if (!params.image_hash && !params.image_url) {
+            throw new Error(
+              'Video creative requires a thumbnail. ' +
+              'Provide image_hash (from AD_CREATIVE UPLOAD_IMAGE) or image_url alongside video_id.'
+            );
+          }
+          const videoData: any = {
+            video_id: params.video_id,
+            message: params.body,
+            title: params.title,
+            description: params.description || undefined,
+            call_to_action: params.call_to_action_type ? {
+              type: params.call_to_action_type,
+              value: { link: params.link_url }
             } : undefined
-          })),
-          call_to_action: params.call_to_action_type ? {
-            type: params.call_to_action_type,
-            value: { link: params.link_url }
-          } : undefined
-        };
-      } 
-      // 3. SINGLE IMAGE CREATIVE (Default)
-      else {
-        objectStorySpec.link_data = {
-          message: params.body,
-          link: params.link_url,
-          caption: params.link_url, // Link data caption must be a URL string
-          name: params.title,    // Large headline title
-          description: params.description || undefined,
-          call_to_action: params.call_to_action_type ? {
-            type: params.call_to_action_type,
-            value: { link: params.link_url }
-          } : undefined
-        };
+          };
+          if (params.image_hash) videoData.image_hash = params.image_hash;
+          else videoData.image_url = params.image_url;
+          objectStorySpec.video_data = videoData;
 
-        if (params.image_hash) {
-          objectStorySpec.link_data.image_hash = params.image_hash;
-        } else if (params.image_url) {
-          objectStorySpec.link_data.picture = params.image_url;
+        // 2. CAROUSEL CREATIVE
+        } else if (isCarousel) {
+          objectStorySpec.link_data = {
+            message: params.body,
+            link: params.link_url,
+            caption: params.link_url,
+            child_attachments: params.carousel_cards!.map(card => ({
+              link: card.link_url || params.link_url,
+              image_hash: card.image_hash,
+              picture: card.image_url,
+              name: card.title,
+              description: card.description,
+              video_id: card.video_id,
+              call_to_action: params.call_to_action_type ? {
+                type: params.call_to_action_type,
+                value: { link: card.link_url || params.link_url }
+              } : undefined
+            })),
+            call_to_action: params.call_to_action_type ? {
+              type: params.call_to_action_type,
+              value: { link: params.link_url }
+            } : undefined
+          };
+
+        // 3. SINGLE IMAGE CREATIVE (Default)
+        } else {
+          objectStorySpec.link_data = {
+            message: params.body,
+            link: params.link_url,
+            caption: params.link_url,
+            name: params.title,
+            description: params.description || undefined,
+            call_to_action: params.call_to_action_type ? {
+              type: params.call_to_action_type,
+              value: { link: params.link_url }
+            } : undefined
+          };
+          if (params.image_hash) objectStorySpec.link_data.image_hash = params.image_hash;
+          else if (params.image_url) objectStorySpec.link_data.picture = params.image_url;
         }
-      }
 
-      const creativeParams: any = {
-        [AdCreative.Fields.name]: params.name,
-        [AdCreative.Fields.object_story_spec]: objectStorySpec
-      };
+        creativeParams = {
+          [AdCreative.Fields.name]: params.name,
+          [AdCreative.Fields.object_story_spec]: objectStorySpec,
+        };
+      }
 
       this.log(`Creating ad creative in account: ${adAccountId}`, creativeParams);
       const creative = await account.createAdCreative([], creativeParams);

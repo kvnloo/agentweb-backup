@@ -251,6 +251,7 @@ router.get('/campaigns-and-adsets', async (req, res) => {
         status: as.status,
         daily_budget: as.daily_budget,
         lifetime_budget: as.lifetime_budget,
+        is_dynamic_creative: as.is_dynamic_creative || false,
       })),
       pages: (pages || []).map((p: any) => ({ id: p.id, name: p.name })),
     });
@@ -289,12 +290,18 @@ router.post('/create-image-ad', async (req, res) => {
     const imageHash = await uploadImageGetHash(accountId, accessToken, image_url, 'ad-image.jpg');
 
     // 2. Create ad creative
+    const allPrimaryTexts = (primary_texts || []).map((t: string) => t.trim()).filter(Boolean);
+    const allHeadlines = (headlines || []).map((h: string) => h.trim()).filter(Boolean);
+    const allUrlDescriptions = (url_descriptions || []).map((d: string) => d.trim()).filter(Boolean);
     const creative = await metaService.createAdCreative(accountId, accessToken, {
       name: `${ad_name.trim()} - Creative`,
       page_id,
-      body: (primary_texts?.[0])?.trim() || '',
-      title: (headlines?.[0])?.trim() || ad_name.trim(),
-      description: (url_descriptions?.[0])?.trim() || '',
+      body: allPrimaryTexts[0] || '',
+      extra_bodies: allPrimaryTexts.slice(1),
+      title: allHeadlines[0] || ad_name.trim(),
+      extra_titles: allHeadlines.slice(1),
+      description: allUrlDescriptions[0] || '',
+      extra_descriptions: allUrlDescriptions.slice(1),
       link_url: applyUtmParams(link_url?.trim() || 'https://example.com', utm_params),
       image_hash: imageHash,
       call_to_action_type: ad_call_to_action || undefined,
@@ -455,12 +462,18 @@ router.post('/create-video-ad', async (req, res) => {
     const imageHash = await uploadImageGetHash(accountId, accessToken, thumbnail_url, 'thumbnail.jpg');
 
     // 3. Create video creative (thumbnail required by Meta)
+    const allPrimaryTexts = (primary_texts || []).map((t: string) => t.trim()).filter(Boolean);
+    const allHeadlines = (headlines || []).map((h: string) => h.trim()).filter(Boolean);
+    const allUrlDescriptions = (url_descriptions || []).map((d: string) => d.trim()).filter(Boolean);
     const creative = await metaService.createAdCreative(accountId, accessToken, {
       name: `${ad_name.trim()} - Video Creative`,
       page_id,
-      body: (primary_texts?.[0])?.trim() || '',
-      title: (headlines?.[0])?.trim() || ad_name.trim(),
-      description: (url_descriptions?.[0])?.trim() || '',
+      body: allPrimaryTexts[0] || '',
+      extra_bodies: allPrimaryTexts.slice(1),
+      title: allHeadlines[0] || ad_name.trim(),
+      extra_titles: allHeadlines.slice(1),
+      description: allUrlDescriptions[0] || '',
+      extra_descriptions: allUrlDescriptions.slice(1),
       link_url: applyUtmParams(link_url?.trim() || 'https://example.com', utm_params),
       video_id: videoId,
       image_hash: imageHash,

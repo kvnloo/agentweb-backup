@@ -111,7 +111,7 @@ describe('Meta V2 Routes', () => {
     it('should return campaigns, adsets, and pages', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
       (metaService.listCampaigns as jest.Mock).mockResolvedValue([{ id: 'camp1', name: 'Campaign 1' }]);
-      (metaService.listAdSets as jest.Mock).mockResolvedValue([{ id: 'adset1', name: 'Ad Set 1' }]);
+      (metaService.listAdSets as jest.Mock).mockResolvedValue([{ id: 'adset1', name: 'Ad Set 1', is_dynamic_creative: true }]);
       (metaService.getPages as jest.Mock).mockResolvedValue([{ id: 'page1', name: 'Page 1' }]);
 
       const response = await request(app).get('/api/meta/v2/campaigns-and-adsets');
@@ -119,6 +119,7 @@ describe('Meta V2 Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.campaigns).toHaveLength(1);
       expect(response.body.adSets).toHaveLength(1);
+      expect(response.body.adSets[0]).toHaveProperty('is_dynamic_creative', true);
       expect(response.body.pages).toHaveLength(1);
     });
 
@@ -140,9 +141,9 @@ describe('Meta V2 Routes', () => {
       page_id: 'page1',
       ad_name: 'Test Ad',
       account_id: '123456789',
-      primary_texts: ['Ad Body'],
-      headlines: ['Ad Headline'],
-      url_descriptions: ['Ad Description'],
+      primary_texts: ['Ad Body 1', 'Ad Body 2'],
+      headlines: ['Ad Headline 1', 'Ad Headline 2'],
+      url_descriptions: ['Ad Description 1', 'Ad Description 2'],
       link_url: 'https://example.com',
       utm_params: { utm_source: 'fb', utm_medium: 'cpc' },
     };
@@ -165,9 +166,12 @@ describe('Meta V2 Routes', () => {
         expect.any(String),
         expect.any(String),
         expect.objectContaining({
-          body: 'Ad Body',
-          title: 'Ad Headline',
-          description: 'Ad Description',
+          body: 'Ad Body 1',
+          extra_bodies: ['Ad Body 2'],
+          title: 'Ad Headline 1',
+          extra_titles: ['Ad Headline 2'],
+          description: 'Ad Description 1',
+          extra_descriptions: ['Ad Description 2'],
           link_url: 'https://example.com/?utm_source=fb&utm_medium=cpc'
         })
       );
@@ -268,9 +272,9 @@ describe('Meta V2 Routes', () => {
       page_id: 'page1',
       ad_name: 'Video Ad',
       account_id: '123456789',
-      primary_texts: ['Video Body'],
-      headlines: ['Video Headline'],
-      url_descriptions: ['Video Description'],
+      primary_texts: ['Video Body 1', 'Video Body 2'],
+      headlines: ['Video Headline 1', 'Video Headline 2'],
+      url_descriptions: ['Video Description 1', 'Video Description 2'],
       link_url: 'https://example.com/vid',
       utm_params: { utm_source: 'fb' },
     };
@@ -294,9 +298,12 @@ describe('Meta V2 Routes', () => {
         expect.any(String),
         expect.any(String),
         expect.objectContaining({
-          body: 'Video Body',
-          title: 'Video Headline',
-          description: 'Video Description',
+          body: 'Video Body 1',
+          extra_bodies: ['Video Body 2'],
+          title: 'Video Headline 1',
+          extra_titles: ['Video Headline 2'],
+          description: 'Video Description 1',
+          extra_descriptions: ['Video Description 2'],
           link_url: 'https://example.com/vid?utm_source=fb'
         })
       );

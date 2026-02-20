@@ -268,7 +268,7 @@ describe('MetaService', () => {
             expect(result).toEqual([{ id: 'creative_1', name: 'Creative 1' }]);
         });
 
-        it('should create an ad creative', async () => {
+        it('should create a basic single image ad creative', async () => {
             const mockCreativeData = { id: 'creative_new', name: 'New Creative' };
             const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
@@ -298,6 +298,111 @@ describe('MetaService', () => {
                         description: 'Ad Description',
                         link: 'http://example.com',
                     }),
+                }),
+            }));
+            expect(result).toEqual(mockCreativeData);
+        });
+
+        it('should create an ad creative with asset_feed_spec for multiple text variants', async () => {
+            const mockCreativeData = { id: 'creative_dyn', name: 'Dynamic Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'Dynamic Creative',
+                page_id: 'page_123',
+                image_url: 'http://example.com/image.jpg',
+                body: 'Ad Body 1',
+                extra_bodies: ['Ad Body 2'],
+                title: 'Ad Title 1',
+                extra_titles: ['Ad Title 2'],
+                description: 'Ad Desc 1',
+                extra_descriptions: ['Ad Desc 2'],
+                link_url: 'http://example.com',
+                call_to_action_type: 'LEARN_MORE',
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(mockCreateCreative).toHaveBeenCalledWith([], expect.objectContaining({
+                name: 'Dynamic Creative',
+                object_story_spec: { page_id: 'page_123' },
+                asset_feed_spec: expect.objectContaining({
+                    ad_formats: ['SINGLE_IMAGE'],
+                    bodies: [{ text: 'Ad Body 1' }, { text: 'Ad Body 2' }],
+                    titles: [{ text: 'Ad Title 1' }, { text: 'Ad Title 2' }],
+                    descriptions: [{ text: 'Ad Desc 1' }, { text: 'Ad Desc 2' }],
+                    images: [{ url: 'http://example.com/image.jpg' }],
+                }),
+            }));
+            expect(result).toEqual(mockCreativeData);
+        });
+
+        it('should create a basic video ad creative', async () => {
+            const mockCreativeData = { id: 'creative_vid', name: 'Video Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'Video Creative',
+                page_id: 'page_123',
+                video_id: 'vid_123',
+                image_hash: 'thumb_hash_123',
+                body: 'Video Body',
+                title: 'Video Title',
+                link_url: 'http://example.com',
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(mockCreateCreative).toHaveBeenCalledWith([], expect.objectContaining({
+                name: 'Video Creative',
+                object_story_spec: expect.objectContaining({
+                    page_id: 'page_123',
+                    video_data: expect.objectContaining({
+                        video_id: 'vid_123',
+                        image_hash: 'thumb_hash_123',
+                        message: 'Video Body',
+                        title: 'Video Title',
+                    }),
+                }),
+            }));
+            expect(result).toEqual(mockCreativeData);
+        });
+
+        it('should create a video ad creative with asset_feed_spec for multiple text variants', async () => {
+            const mockCreativeData = { id: 'creative_vid_dyn', name: 'Dynamic Video Creative' };
+            const mockCreateCreative = jest.fn().mockResolvedValue({ _data: mockCreativeData });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdCreative: mockCreateCreative,
+            }));
+
+            const params = {
+                name: 'Dynamic Video Creative',
+                page_id: 'page_123',
+                video_id: 'vid_123',
+                image_hash: 'thumb_hash_123',
+                body: 'Video Body 1',
+                extra_bodies: ['Video Body 2'],
+                title: 'Video Title 1',
+                extra_titles: ['Video Title 2'],
+                link_url: 'http://example.com',
+            };
+
+            const result = await service.createAdCreative(mockAdAccountId, mockAccessToken, params);
+
+            expect(mockCreateCreative).toHaveBeenCalledWith([], expect.objectContaining({
+                name: 'Dynamic Video Creative',
+                object_story_spec: { page_id: 'page_123' },
+                asset_feed_spec: expect.objectContaining({
+                    ad_formats: ['SINGLE_VIDEO'],
+                    bodies: [{ text: 'Video Body 1' }, { text: 'Video Body 2' }],
+                    titles: [{ text: 'Video Title 1' }, { text: 'Video Title 2' }],
+                    videos: [{ video_id: 'vid_123', thumbnail_hash: 'thumb_hash_123' }],
                 }),
             }));
             expect(result).toEqual(mockCreativeData);

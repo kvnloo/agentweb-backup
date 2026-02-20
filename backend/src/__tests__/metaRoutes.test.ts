@@ -154,7 +154,7 @@ describe('Meta Legacy Routes', () => {
       });
       // 2. AdSets
       mockFetch.mockResolvedValueOnce({
-        json: async () => ({ data: [{ id: 'as1', name: 'AdSet 1' }] }),
+        json: async () => ({ data: [{ id: 'as1', name: 'AdSet 1', status: 'ACTIVE', is_dynamic_creative: true }] }),
         ok: true,
       });
       // 3. Business Account
@@ -173,6 +173,7 @@ describe('Meta Legacy Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.campaigns).toHaveLength(1);
       expect(response.body.adSets).toHaveLength(1);
+      expect(response.body.adSets[0]).toHaveProperty('is_dynamic_creative', true);
       expect(response.body.pages).toHaveLength(1);
     });
 

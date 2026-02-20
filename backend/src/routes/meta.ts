@@ -599,7 +599,7 @@ router.get("/campaigns-and-adsets", async (req, res) => {
     }
     
     // Fetch ad sets
-    const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,campaign_id,status&access_token=${accessToken}`;
+    const adSetsUrl = `https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,campaign_id,status,is_dynamic_creative&access_token=${accessToken}`;
     const adSetsResponse = await fetch(adSetsUrl);
     const adSetsData = await adSetsResponse.json();
     
@@ -652,11 +652,12 @@ router.get("/campaigns-and-adsets", async (req, res) => {
       name: campaign.name,
       status: campaign.status 
     }));
-    const allAdSets = (adSetsData.data || []).map((adSet: any) => ({ 
-      id: adSet.id, 
+    const allAdSets = (adSetsData.data || []).map((adSet: any) => ({
+      id: adSet.id,
       name: adSet.name,
       campaign_id: adSet.campaign_id,
-      status: adSet.status 
+      status: adSet.status,
+      is_dynamic_creative: adSet.is_dynamic_creative || false,
     }));
     const pages = (pagesData.data || []).map((page: any) => ({ id: page.id, name: page.name }));
     
