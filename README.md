@@ -1191,6 +1191,33 @@ External servers can be added dynamically via the Admin UI or configured in the 
   - Put API keys in the environment JSON field, e.g. `{"env":{"BRAVE_API_KEY":"${BRAVE_API_KEY}"}}`
 
 
+#### Configuring ClickUp MCP Server
+
+Each customer who uses ClickUp can connect their workspace so AI agents can read tasks, lists, and spaces via the official [ClickUp MCP server](https://developer.clickup.com/docs/connect-an-ai-assistant-to-clickups-mcp-server-1).
+
+**1. Add the ClickUp MCP server in Admin Dashboard:**
+
+1. Open the **Partner Portal** (admin) and navigate to **Admin Dashboard > MCP Servers**
+2. Add a new server with the following settings:
+   - **Name:** `clickup`
+   - **Transport:** `Streamable HTTP`
+   - **URL:** `https://mcp.clickup.com/mcp`
+   - **Access Token:** `{{clickup_access_token}}`
+
+The `{{clickup_access_token}}` placeholder is resolved per-user at execution time — the backend decrypts the token from the user's secrets and injects it into the MCP connection. This is the same pattern used by the GitHub MCP server with `{{GITHUB_PERSONAL_ACCESS_TOKEN}}`.
+
+**2. Users add their ClickUp Personal API Token:**
+
+Each user provides their ClickUp Personal API Token from the **Knowledge Base** page in the customer portal:
+
+1. Navigate to **Knowledge Base**
+2. In the **ClickUp Shared Folders** section, paste a Personal API Token (generated from [ClickUp Settings → Apps](https://app.clickup.com/settings/apps))
+3. Click **Connect** — the page verifies the token and shows connected workspaces
+
+The token is stored as `clickup_access_token` in the user's secrets (encrypted at rest, decrypted only at execution time).
+
+To disconnect, click **Disconnect** in the ClickUp Shared Folders section — this removes the encrypted token from the user's secrets.
+
 #### Configuring GitHub Access Token for Landing Pages
 
 Each customer who uses the **Landing Pages** feature (Brand Hub > Landing Pages) or the **Landing Page Development** skill in Agent Mode needs a GitHub fine-grained personal access token configured on their user record.

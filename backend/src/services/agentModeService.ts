@@ -651,6 +651,24 @@ export class AgentModeService {
         // New sessions: use skill-based filtering. When no skills are installed, only install_skills
         // is in allowedToolNames, forcing the LLM to install a skill first.
         if (!filteredToolsCache) {
+             // Discover tools from MCP servers that require per-user secrets (e.g. ClickUp).
+             // These servers can't list tools during startup (no user context), so we
+             // discover them here once per session and register into the tool registry.
+             try {
+               const discovered = await this.mcpClientService.discoverToolsForUser(userId, sessionId);
+               if (discovered > 0) {
+                 const newTools = this.mcpClientService.getTools();
+                 for (const tool of newTools) {
+                   if (!this.toolRegistry.getTool(tool.name)) {
+                     this.toolRegistry.register(tool);
+                   }
+                 }
+                 console.log(`[MCP-DISCOVER] Registered tools from ${discovered} per-user MCP server(s) for user ${userId}`);
+               }
+             } catch (e) {
+               console.warn('[MCP-DISCOVER] Error discovering per-user MCP tools:', (e as Error).message);
+             }
+
              const skillFilter = isLegacySession ? undefined : allowedToolNames;
              filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
         }

@@ -171,7 +171,11 @@ const McpServersTab: React.FC = () => {
       );
 
       setExpandedServer(serverName);
-      setSuccess(`Discovered ${response.data.count} tools from ${serverName}`);
+      setSuccess(
+        response.data.message && response.data.count === 0
+          ? response.data.message
+          : `Discovered ${response.data.count} tools from ${serverName}`
+      );
       loadServers(); // Reload to get updated discoveredTools
     } catch (err: any) {
       setError(err.response?.data?.message || `Failed to discover tools from ${serverName}`);
