@@ -40,6 +40,7 @@ export interface MetaAdsAdCreativeParams {
   }>;
   body: string;
   title: string;
+  description?: string;
   link_url: string;
   call_to_action_type?: string;
 }
@@ -635,6 +636,7 @@ export class MetaService {
           video_id: params.video_id,
           message: params.body,
           title: params.title,
+          description: params.description || undefined,
           call_to_action: params.call_to_action_type ? {
             type: params.call_to_action_type,
             value: { link: params.link_url }
@@ -679,6 +681,7 @@ export class MetaService {
           link: params.link_url,
           caption: params.link_url, // Link data caption must be a URL string
           name: params.title,    // Large headline title
+          description: params.description || undefined,
           call_to_action: params.call_to_action_type ? {
             type: params.call_to_action_type,
             value: { link: params.link_url }

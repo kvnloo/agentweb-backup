@@ -716,9 +716,21 @@ router.get("/ads-history/:taskId", async (req, res) => {
 });
 
 // Create Meta ad (legacy — uses shared server token + user.adAccount)
+function applyUtmParams(url: string, utm: any): string {
+  if (!utm || !url) return url;
+  try {
+    const parsed = new URL(url);
+    if (utm.utm_source) parsed.searchParams.set('utm_source', utm.utm_source);
+    if (utm.utm_medium) parsed.searchParams.set('utm_medium', utm.utm_medium);
+    if (utm.utm_campaign) parsed.searchParams.set('utm_campaign', utm.utm_campaign);
+    if (utm.utm_content) parsed.searchParams.set('utm_content', utm.utm_content);
+    return parsed.toString();
+  } catch { return url; }
+}
+
 router.post("/create-ad", async (req, res) => {
   const userId = (req as any).user.userId;
-  const { imageUrl, campaignId, adSetId, adName, adText, adHeadline, adDescription, adCallToAction, pageId, taskId, executionId } = req.body;
+  const { imageUrl, campaignId, adSetId, adName, primary_texts, headlines, url_descriptions, utm_params, adCallToAction, pageId, taskId, executionId } = req.body;
   
   try {
     // Validate required fields
@@ -844,20 +856,21 @@ router.post("/create-ad", async (req, res) => {
     
     // Create the ad creative with the image hash
     // Use object_story_spec for standard ad creatives (Dynamic Creative is deprecated)
+    const adLink = applyUtmParams("https://example.com", utm_params);
     const creativeData = {
       name: `${adName} - Creative`,
       object_story_spec: {
         page_id: pageId,
         link_data: {
           image_hash: imageHash,
-          link: "https://example.com", // Placeholder link
-          message: adText || "",
-          name: adHeadline || "",
-          description: adDescription || "",
+          link: adLink,
+          message: (primary_texts?.[0]) || "",
+          name: (headlines?.[0]) || "",
+          description: (url_descriptions?.[0]) || "",
           call_to_action: adCallToAction ? {
             type: adCallToAction,
             value: {
-              link: "https://example.com"
+              link: adLink
             }
           } : undefined
         }

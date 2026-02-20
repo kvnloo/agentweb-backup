@@ -238,8 +238,10 @@ describe('Meta Legacy Routes', () => {
       campaignId: 'c1',
       adSetId: 'as1',
       adName: 'Test Ad',
-      adText: 'Ad Body',
-      adHeadline: 'Ad Headline',
+      primary_texts: ['Ad Body'],
+      headlines: ['Ad Headline'],
+      url_descriptions: ['Ad Description'],
+      utm_params: { utm_source: 'fb', utm_medium: 'cpc' },
       pageId: 'p1',
       taskId: 't1',
       executionId: 'e1'
@@ -295,6 +297,17 @@ describe('Meta Legacy Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.adId).toBe('ad1');
       expect(response.body.success).toBe(true);
+
+      const fetchCalls = mockFetch.mock.calls;
+      const creativeCall = fetchCalls.find(call => typeof call[0] === 'string' && call[0].includes('/adcreatives'));
+      if (creativeCall) {
+        const bodyStr = typeof creativeCall[1]?.body === 'string' ? creativeCall[1].body : '';
+        expect(bodyStr).toContain('Ad Body');
+        expect(bodyStr).toContain('Ad Headline');
+        expect(bodyStr).toContain('Ad Description');
+        expect(bodyStr).toContain('utm_source=fb');
+        expect(bodyStr).toContain('utm_medium=cpc');
+      }
     });
 
     it('should validate required fields', async () => {

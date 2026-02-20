@@ -140,6 +140,11 @@ describe('Meta V2 Routes', () => {
       page_id: 'page1',
       ad_name: 'Test Ad',
       account_id: '123456789',
+      primary_texts: ['Ad Body'],
+      headlines: ['Ad Headline'],
+      url_descriptions: ['Ad Description'],
+      link_url: 'https://example.com',
+      utm_params: { utm_source: 'fb', utm_medium: 'cpc' },
     };
 
     it('should create an image ad successfully', async () => {
@@ -156,7 +161,16 @@ describe('Meta V2 Routes', () => {
       expect(response.body.success).toBe(true);
       expect(response.body.adId).toBe('ad1');
       expect(metaService.uploadImage).toHaveBeenCalled();
-      expect(metaService.createAdCreative).toHaveBeenCalled();
+      expect(metaService.createAdCreative).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          body: 'Ad Body',
+          title: 'Ad Headline',
+          description: 'Ad Description',
+          link_url: 'https://example.com/?utm_source=fb&utm_medium=cpc'
+        })
+      );
       expect(metaService.createAd).toHaveBeenCalled();
     });
 
@@ -193,7 +207,7 @@ describe('Meta V2 Routes', () => {
   describe('POST /create-carousel-ad', () => {
     const validPayload = {
       images: [
-        { url: 'https://example.com/img1.jpg' },
+        { url: 'https://example.com/img1.jpg', link_url: 'https://example.com/1' },
         { url: 'https://example.com/img2.jpg' },
       ],
       campaign_id: 'camp1',
@@ -201,6 +215,9 @@ describe('Meta V2 Routes', () => {
       page_id: 'page1',
       ad_name: 'Carousel Ad',
       account_id: '123456789',
+      primary_texts: ['Carousel Body'],
+      default_link_url: 'https://example.com/def',
+      utm_params: { utm_source: 'test' },
     };
 
     it('should create a carousel ad successfully', async () => {
@@ -216,7 +233,18 @@ describe('Meta V2 Routes', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
       expect(metaService.uploadImage).toHaveBeenCalledTimes(2);
-      expect(metaService.createAdCreative).toHaveBeenCalled();
+      expect(metaService.createAdCreative).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          body: 'Carousel Body',
+          link_url: 'https://example.com/def?utm_source=test',
+          carousel_cards: expect.arrayContaining([
+            expect.objectContaining({ link_url: 'https://example.com/1?utm_source=test' }),
+            expect.objectContaining({ link_url: 'https://example.com/def?utm_source=test' }),
+          ])
+        })
+      );
     });
 
     it('should require at least 2 images', async () => {
@@ -240,6 +268,11 @@ describe('Meta V2 Routes', () => {
       page_id: 'page1',
       ad_name: 'Video Ad',
       account_id: '123456789',
+      primary_texts: ['Video Body'],
+      headlines: ['Video Headline'],
+      url_descriptions: ['Video Description'],
+      link_url: 'https://example.com/vid',
+      utm_params: { utm_source: 'fb' },
     };
 
     it('should create a video ad successfully', async () => {
@@ -257,7 +290,16 @@ describe('Meta V2 Routes', () => {
       expect(response.body.success).toBe(true);
       expect(metaService.uploadVideo).toHaveBeenCalled();
       expect(metaService.uploadImage).toHaveBeenCalled();
-      expect(metaService.createAdCreative).toHaveBeenCalled();
+      expect(metaService.createAdCreative).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          body: 'Video Body',
+          title: 'Video Headline',
+          description: 'Video Description',
+          link_url: 'https://example.com/vid?utm_source=fb'
+        })
+      );
     });
 
     it('should validate required fields', async () => {

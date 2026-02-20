@@ -88,6 +88,21 @@ function getMetaAccountCredentials(
 }
 
 /**
+ * Append UTM parameters to a URL query string.
+ */
+function applyUtmParams(url: string, utm: any): string {
+  if (!utm || !url) return url;
+  try {
+    const parsed = new URL(url);
+    if (utm.utm_source) parsed.searchParams.set('utm_source', utm.utm_source);
+    if (utm.utm_medium) parsed.searchParams.set('utm_medium', utm.utm_medium);
+    if (utm.utm_campaign) parsed.searchParams.set('utm_campaign', utm.utm_campaign);
+    if (utm.utm_content) parsed.searchParams.set('utm_content', utm.utm_content);
+    return parsed.toString();
+  } catch { return url; }
+}
+
+/**
  * Download a remote image and return a Buffer + resolved filename.
  * Converts WebP/GIF/BMP/TIFF → JPEG for Meta compatibility.
  */
@@ -254,8 +269,8 @@ router.post('/create-image-ad', async (req, res) => {
   const userId = (req as any).user.userId;
   const {
     account_id, image_url, campaign_id, ad_set_id, page_id,
-    ad_name, ad_text, ad_headline, ad_description, ad_call_to_action,
-    link_url, task_id, execution_id, session_id,
+    ad_name, primary_texts, headlines, url_descriptions, ad_call_to_action,
+    link_url, utm_params, task_id, execution_id, session_id,
   } = req.body;
 
   try {
@@ -277,9 +292,10 @@ router.post('/create-image-ad', async (req, res) => {
     const creative = await metaService.createAdCreative(accountId, accessToken, {
       name: `${ad_name.trim()} - Creative`,
       page_id,
-      body: ad_text?.trim() || '',
-      title: ad_headline?.trim() || ad_name.trim(),
-      link_url: link_url?.trim() || 'https://example.com',
+      body: (primary_texts?.[0])?.trim() || '',
+      title: (headlines?.[0])?.trim() || ad_name.trim(),
+      description: (url_descriptions?.[0])?.trim() || '',
+      link_url: applyUtmParams(link_url?.trim() || 'https://example.com', utm_params),
       image_hash: imageHash,
       call_to_action_type: ad_call_to_action || undefined,
     });
@@ -332,7 +348,7 @@ router.post('/create-carousel-ad', async (req, res) => {
     account_id,
     images,       // Array<{ url: string; title?: string; link_url?: string }>
     campaign_id, ad_set_id, page_id,
-    ad_name, ad_text, ad_call_to_action, default_link_url,
+    ad_name, primary_texts, ad_call_to_action, default_link_url, utm_params,
     session_id,
   } = req.body;
 
@@ -351,7 +367,7 @@ router.post('/create-carousel-ad', async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     const { accountId, accessToken } = getMetaAccountCredentials(user, account_id);
-    const fallbackLink = default_link_url?.trim() || 'https://example.com';
+    const fallbackLink = applyUtmParams(default_link_url?.trim() || 'https://example.com', utm_params);
 
     // Upload all images in parallel and build carousel_cards
     const carousel_cards = await Promise.all(
@@ -362,7 +378,7 @@ router.post('/create-carousel-ad', async (req, res) => {
         return {
           image_hash: imageHash,
           title: img.title || undefined,
-          link_url: img.link_url?.trim() || fallbackLink,
+          link_url: img.link_url?.trim() ? applyUtmParams(img.link_url.trim(), utm_params) : fallbackLink,
         };
       })
     );
@@ -371,7 +387,7 @@ router.post('/create-carousel-ad', async (req, res) => {
     const creative = await metaService.createAdCreative(accountId, accessToken, {
       name: `${ad_name.trim()} - Carousel Creative`,
       page_id,
-      body: ad_text?.trim() || '',
+      body: (primary_texts?.[0])?.trim() || '',
       title: ad_name.trim(),
       link_url: fallbackLink,
       carousel_cards,
@@ -411,7 +427,7 @@ router.post('/create-video-ad', async (req, res) => {
   const {
     account_id, video_url, thumbnail_url,
     campaign_id, ad_set_id, page_id,
-    ad_name, ad_text, ad_headline, ad_call_to_action, link_url,
+    ad_name, primary_texts, headlines, url_descriptions, ad_call_to_action, link_url, utm_params,
     execution_id, session_id,
   } = req.body;
 
@@ -442,9 +458,10 @@ router.post('/create-video-ad', async (req, res) => {
     const creative = await metaService.createAdCreative(accountId, accessToken, {
       name: `${ad_name.trim()} - Video Creative`,
       page_id,
-      body: ad_text?.trim() || '',
-      title: ad_headline?.trim() || ad_name.trim(),
-      link_url: link_url?.trim() || 'https://example.com',
+      body: (primary_texts?.[0])?.trim() || '',
+      title: (headlines?.[0])?.trim() || ad_name.trim(),
+      description: (url_descriptions?.[0])?.trim() || '',
+      link_url: applyUtmParams(link_url?.trim() || 'https://example.com', utm_params),
       video_id: videoId,
       image_hash: imageHash,
       call_to_action_type: ad_call_to_action || undefined,

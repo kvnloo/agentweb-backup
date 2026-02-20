@@ -281,6 +281,7 @@ describe('MetaService', () => {
                 image_url: 'http://example.com/image.jpg',
                 body: 'Ad Body',
                 title: 'Ad Title',
+                description: 'Ad Description',
                 link_url: 'http://example.com',
                 call_to_action_type: 'LEARN_MORE',
             };
@@ -293,6 +294,8 @@ describe('MetaService', () => {
                     page_id: 'page_123',
                     link_data: expect.objectContaining({
                         message: 'Ad Body',
+                        name: 'Ad Title',
+                        description: 'Ad Description',
                         link: 'http://example.com',
                     }),
                 }),
