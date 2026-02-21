@@ -34,6 +34,8 @@ import {
   CardContent,
   CardActionArea,
   Grid,
+  Tabs,
+  Tab,
 } from "@mui/material";
 import {
   ExpandMore as ExpandMoreIcon,
@@ -45,6 +47,11 @@ import {
   ArrowBack as ArrowBackIcon,
   Business as BusinessIcon,
   Assessment as AssessmentIcon,
+  Add as AddIcon,
+  Edit as EditIcon,
+  Delete as DeleteIcon,
+  ArrowUpward as ArrowUpwardIcon,
+  ArrowDownward as ArrowDownwardIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
@@ -106,8 +113,32 @@ interface UserStats {
   plans: GTMPlan[];
 }
 
+interface GTMCommonItem {
+  id: string;
+  title: string;
+  description?: string;
+  sortOrder: number;
+}
+
+interface GTMCommonCategory {
+  id: string;
+  name: string;
+  description?: string;
+  sortOrder: number;
+  items: GTMCommonItem[];
+}
+
+function TabPanel({ children, value, index }: { children?: React.ReactNode; value: number; index: number }) {
+  return (
+    <div role="tabpanel" hidden={value !== index}>
+      {value === index && <Box sx={{ pt: 3 }}>{children}</Box>}
+    </div>
+  );
+}
+
 export default function GTMPlans() {
   const { token } = useAuth();
+  const [tabValue, setTabValue] = useState(0);
   const [plans, setPlans] = useState<GTMPlan[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -171,6 +202,21 @@ export default function GTMPlans() {
   });
   const [sendingStatusReport, setSendingStatusReport] = useState(false);
 
+  // Common Items state
+  const [commonCategories, setCommonCategories] = useState<GTMCommonCategory[]>([]);
+  const [commonLoading, setCommonLoading] = useState(false);
+  const [commonError, setCommonError] = useState<string | null>(null);
+  const [commonSaving, setCommonSaving] = useState(false);
+  const [categoryDialogOpen, setCategoryDialogOpen] = useState(false);
+  const [editingCategory, setEditingCategory] = useState<GTMCommonCategory | null>(null);
+  const [categoryName, setCategoryName] = useState("");
+  const [categoryDescription, setCategoryDescription] = useState("");
+  const [itemDialogOpen, setItemDialogOpen] = useState(false);
+  const [editingItemInCategory, setEditingItemInCategory] = useState<string>(""); // category id
+  const [editingCommonItem, setEditingCommonItem] = useState<GTMCommonItem | null>(null);
+  const [commonItemTitle, setCommonItemTitle] = useState("");
+  const [commonItemDescription, setCommonItemDescription] = useState("");
+
   useEffect(() => {
     fetchPlans();
     // Load notification preferences from localStorage
@@ -206,6 +252,186 @@ export default function GTMPlans() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Common Items functions
+  const fetchCommonItems = async () => {
+    try {
+      setCommonLoading(true);
+      setCommonError(null);
+      const response = await axios.get(buildApiUrl("/api/admin/gtm-common-items"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (response.data.success) {
+        setCommonCategories(response.data.data || []);
+      }
+    } catch (err: any) {
+      console.error("Error fetching common items:", err);
+      setCommonError(err.response?.data?.error || "Failed to fetch common items");
+    } finally {
+      setCommonLoading(false);
+    }
+  };
+
+  const saveCommonItems = async (categories: GTMCommonCategory[]) => {
+    try {
+      setCommonSaving(true);
+      setCommonError(null);
+      const response = await axios.put(
+        buildApiUrl("/api/admin/gtm-common-items"),
+        { categories },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.data.success) {
+        setCommonCategories(response.data.data || []);
+      }
+    } catch (err: any) {
+      console.error("Error saving common items:", err);
+      setCommonError(err.response?.data?.error || "Failed to save common items");
+    } finally {
+      setCommonSaving(false);
+    }
+  };
+
+  const handleAddCategory = () => {
+    setEditingCategory(null);
+    setCategoryName("");
+    setCategoryDescription("");
+    setCategoryDialogOpen(true);
+  };
+
+  const handleEditCategory = (category: GTMCommonCategory) => {
+    setEditingCategory(category);
+    setCategoryName(category.name);
+    setCategoryDescription(category.description || "");
+    setCategoryDialogOpen(true);
+  };
+
+  const handleSaveCategory = () => {
+    if (!categoryName.trim()) return;
+
+    let updated: GTMCommonCategory[];
+    if (editingCategory) {
+      updated = commonCategories.map((cat) =>
+        cat.id === editingCategory.id
+          ? { ...cat, name: categoryName.trim(), description: categoryDescription.trim() || undefined }
+          : cat
+      );
+    } else {
+      const maxSortOrder = commonCategories.reduce((max, cat) => Math.max(max, cat.sortOrder), 0);
+      const newCategory: GTMCommonCategory = {
+        id: `cat-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+        name: categoryName.trim(),
+        description: categoryDescription.trim() || undefined,
+        sortOrder: maxSortOrder + 1,
+        items: [],
+      };
+      updated = [...commonCategories, newCategory];
+    }
+    saveCommonItems(updated);
+    setCategoryDialogOpen(false);
+  };
+
+  const handleDeleteCategory = (categoryId: string) => {
+    const updated = commonCategories.filter((cat) => cat.id !== categoryId);
+    saveCommonItems(updated);
+  };
+
+  const handleMoveCategoryUp = (index: number) => {
+    if (index <= 0) return;
+    const sorted = [...commonCategories].sort((a, b) => a.sortOrder - b.sortOrder);
+    const temp = sorted[index].sortOrder;
+    sorted[index].sortOrder = sorted[index - 1].sortOrder;
+    sorted[index - 1].sortOrder = temp;
+    saveCommonItems(sorted);
+  };
+
+  const handleMoveCategoryDown = (index: number) => {
+    const sorted = [...commonCategories].sort((a, b) => a.sortOrder - b.sortOrder);
+    if (index >= sorted.length - 1) return;
+    const temp = sorted[index].sortOrder;
+    sorted[index].sortOrder = sorted[index + 1].sortOrder;
+    sorted[index + 1].sortOrder = temp;
+    saveCommonItems(sorted);
+  };
+
+  const handleAddItem = (categoryId: string) => {
+    setEditingItemInCategory(categoryId);
+    setEditingCommonItem(null);
+    setCommonItemTitle("");
+    setCommonItemDescription("");
+    setItemDialogOpen(true);
+  };
+
+  const handleEditItem = (categoryId: string, item: GTMCommonItem) => {
+    setEditingItemInCategory(categoryId);
+    setEditingCommonItem(item);
+    setCommonItemTitle(item.title);
+    setCommonItemDescription(item.description || "");
+    setItemDialogOpen(true);
+  };
+
+  const handleSaveItem = () => {
+    if (!commonItemTitle.trim()) return;
+
+    const updated = commonCategories.map((cat) => {
+      if (cat.id !== editingItemInCategory) return cat;
+
+      let newItems: GTMCommonItem[];
+      if (editingCommonItem) {
+        newItems = cat.items.map((item) =>
+          item.id === editingCommonItem.id
+            ? { ...item, title: commonItemTitle.trim(), description: commonItemDescription.trim() || undefined }
+            : item
+        );
+      } else {
+        const maxSortOrder = cat.items.reduce((max, item) => Math.max(max, item.sortOrder), 0);
+        const newItem: GTMCommonItem = {
+          id: `ci-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`,
+          title: commonItemTitle.trim(),
+          description: commonItemDescription.trim() || undefined,
+          sortOrder: maxSortOrder + 1,
+        };
+        newItems = [...cat.items, newItem];
+      }
+      return { ...cat, items: newItems };
+    });
+    saveCommonItems(updated);
+    setItemDialogOpen(false);
+  };
+
+  const handleDeleteItem = (categoryId: string, itemId: string) => {
+    const updated = commonCategories.map((cat) => {
+      if (cat.id !== categoryId) return cat;
+      return { ...cat, items: cat.items.filter((item) => item.id !== itemId) };
+    });
+    saveCommonItems(updated);
+  };
+
+  const handleMoveItemUp = (categoryId: string, index: number) => {
+    if (index <= 0) return;
+    const updated = commonCategories.map((cat) => {
+      if (cat.id !== categoryId) return cat;
+      const sorted = [...cat.items].sort((a, b) => a.sortOrder - b.sortOrder);
+      const temp = sorted[index].sortOrder;
+      sorted[index].sortOrder = sorted[index - 1].sortOrder;
+      sorted[index - 1].sortOrder = temp;
+      return { ...cat, items: sorted };
+    });
+    saveCommonItems(updated);
+  };
+
+  const handleMoveItemDown = (categoryId: string, index: number) => {
+    const updated = commonCategories.map((cat) => {
+      if (cat.id !== categoryId) return cat;
+      const sorted = [...cat.items].sort((a, b) => a.sortOrder - b.sortOrder);
+      if (index >= sorted.length - 1) return cat;
+      const temp = sorted[index].sortOrder;
+      sorted[index].sortOrder = sorted[index + 1].sortOrder;
+      sorted[index + 1].sortOrder = temp;
+      return { ...cat, items: sorted };
+    });
+    saveCommonItems(updated);
   };
 
   const handleEditClick = (
@@ -926,14 +1152,6 @@ export default function GTMPlans() {
     ? userStatsList.find((stats) => stats.userId === selectedUserId)
     : null;
 
-  if (loading) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="60vh">
-        <CircularProgress />
-      </Box>
-    );
-  }
-
   return (
     <Box>
       <Typography variant="h4" component="h1" gutterBottom>
@@ -943,6 +1161,23 @@ export default function GTMPlans() {
         Track GTM plans from all users. Update status, notes, and assign PoC for plan items.
       </Typography>
 
+      <Box sx={{ borderBottom: 1, borderColor: "divider", mb: 0 }}>
+        <Tabs value={tabValue} onChange={(_, v) => {
+          setTabValue(v);
+          if (v === 1 && commonCategories.length === 0) fetchCommonItems();
+        }}>
+          <Tab label="Plans" />
+          <Tab label="Common Items" />
+        </Tabs>
+      </Box>
+
+      <TabPanel value={tabValue} index={0}>
+      {loading ? (
+        <Box display="flex" justifyContent="center" alignItems="center" minHeight="40vh">
+          <CircularProgress />
+        </Box>
+      ) : (
+      <>
       {error && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
           {error}
@@ -1746,6 +1981,212 @@ export default function GTMPlans() {
           </Button>
           <Button onClick={handleConstraintConfirm} variant="contained" color="warning" disabled={saving}>
             {saving ? <CircularProgress size={20} /> : "Proceed Anyway"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      </>
+      )}
+      </TabPanel>
+
+      <TabPanel value={tabValue} index={1}>
+        {commonLoading ? (
+          <Box display="flex" justifyContent="center" py={4}>
+            <CircularProgress />
+          </Box>
+        ) : (
+          <>
+            {commonError && (
+              <Alert severity="error" sx={{ mb: 2 }} onClose={() => setCommonError(null)}>
+                {commonError}
+              </Alert>
+            )}
+
+            {[...commonCategories].sort((a, b) => a.sortOrder - b.sortOrder).map((category, catIndex) => (
+              <Accordion key={category.id} defaultExpanded>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, width: "100%", mr: 2 }}>
+                    <Typography variant="subtitle1" sx={{ flexGrow: 1, fontWeight: "medium" }}>
+                      {category.name}
+                    </Typography>
+                    {category.description && (
+                      <Typography variant="body2" color="text.secondary" sx={{ mr: 1 }}>
+                        {category.description}
+                      </Typography>
+                    )}
+                    <Chip label={`${category.items.length} items`} size="small" />
+                    <Box onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()}>
+                      <Tooltip title="Move Up">
+                        <span>
+                          <IconButton size="small" disabled={catIndex === 0 || commonSaving} onClick={(e) => { e.stopPropagation(); handleMoveCategoryUp(catIndex); }}>
+                            <ArrowUpwardIcon fontSize="small" />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                      <Tooltip title="Move Down">
+                        <span>
+                          <IconButton size="small" disabled={catIndex === [...commonCategories].sort((a, b) => a.sortOrder - b.sortOrder).length - 1 || commonSaving} onClick={(e) => { e.stopPropagation(); handleMoveCategoryDown(catIndex); }}>
+                            <ArrowDownwardIcon fontSize="small" />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                      <Tooltip title="Edit Category">
+                        <IconButton size="small" onClick={(e) => { e.stopPropagation(); handleEditCategory(category); }}>
+                          <EditIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                      <Tooltip title="Delete Category">
+                        <IconButton size="small" color="error" onClick={(e) => { e.stopPropagation(); handleDeleteCategory(category.id); }}>
+                          <DeleteIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    </Box>
+                  </Box>
+                </AccordionSummary>
+                <AccordionDetails>
+                  {category.items.length > 0 ? (
+                    <TableContainer>
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>Title</TableCell>
+                            <TableCell>Description</TableCell>
+                            <TableCell align="right">Actions</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {[...category.items].sort((a, b) => a.sortOrder - b.sortOrder).map((item, itemIndex) => (
+                            <TableRow key={item.id}>
+                              <TableCell>
+                                <Typography variant="body2" fontWeight="medium">
+                                  {item.title}
+                                </Typography>
+                              </TableCell>
+                              <TableCell>
+                                <Typography variant="body2" color="text.secondary">
+                                  {item.description || "-"}
+                                </Typography>
+                              </TableCell>
+                              <TableCell align="right">
+                                <Box sx={{ display: "flex", gap: 0.5, justifyContent: "flex-end" }}>
+                                  <Tooltip title="Move Up">
+                                    <span>
+                                      <IconButton size="small" disabled={itemIndex === 0 || commonSaving} onClick={() => handleMoveItemUp(category.id, itemIndex)}>
+                                        <ArrowUpwardIcon fontSize="small" />
+                                      </IconButton>
+                                    </span>
+                                  </Tooltip>
+                                  <Tooltip title="Move Down">
+                                    <span>
+                                      <IconButton size="small" disabled={itemIndex === category.items.length - 1 || commonSaving} onClick={() => handleMoveItemDown(category.id, itemIndex)}>
+                                        <ArrowDownwardIcon fontSize="small" />
+                                      </IconButton>
+                                    </span>
+                                  </Tooltip>
+                                  <Tooltip title="Edit Item">
+                                    <IconButton size="small" onClick={() => handleEditItem(category.id, item)}>
+                                      <EditIcon fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                  <Tooltip title="Delete Item">
+                                    <IconButton size="small" color="error" onClick={() => handleDeleteItem(category.id, item.id)}>
+                                      <DeleteIcon fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                </Box>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  ) : (
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                      No items in this category.
+                    </Typography>
+                  )}
+                  <Button
+                    startIcon={<AddIcon />}
+                    size="small"
+                    onClick={() => handleAddItem(category.id)}
+                    disabled={commonSaving}
+                    sx={{ mt: 1 }}
+                  >
+                    Add Item
+                  </Button>
+                </AccordionDetails>
+              </Accordion>
+            ))}
+
+            <Button
+              variant="outlined"
+              startIcon={<AddIcon />}
+              onClick={handleAddCategory}
+              disabled={commonSaving}
+              sx={{ mt: 2 }}
+            >
+              Add Category
+            </Button>
+          </>
+        )}
+      </TabPanel>
+
+      {/* Category Dialog */}
+      <Dialog open={categoryDialogOpen} onClose={() => setCategoryDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{editingCategory ? "Edit Category" : "Add Category"}</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth
+            label="Category Name"
+            value={categoryName}
+            onChange={(e) => setCategoryName(e.target.value)}
+            sx={{ mt: 2 }}
+            placeholder="e.g., Paid Ads"
+          />
+          <TextField
+            fullWidth
+            label="Description (optional)"
+            value={categoryDescription}
+            onChange={(e) => setCategoryDescription(e.target.value)}
+            sx={{ mt: 2 }}
+            placeholder="Brief description of this category"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCategoryDialogOpen(false)}>Cancel</Button>
+          <Button onClick={handleSaveCategory} variant="contained" disabled={!categoryName.trim() || commonSaving}>
+            {commonSaving ? <CircularProgress size={20} /> : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Item Dialog */}
+      <Dialog open={itemDialogOpen} onClose={() => setItemDialogOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{editingCommonItem ? "Edit Item" : "Add Item"}</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth
+            label="Item Title"
+            value={commonItemTitle}
+            onChange={(e) => setCommonItemTitle(e.target.value)}
+            sx={{ mt: 2 }}
+            placeholder="e.g., Set up Google Ads account"
+          />
+          <TextField
+            fullWidth
+            label="Description (optional)"
+            value={commonItemDescription}
+            onChange={(e) => setCommonItemDescription(e.target.value)}
+            sx={{ mt: 2 }}
+            multiline
+            rows={3}
+            placeholder="Brief description of this work item"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setItemDialogOpen(false)}>Cancel</Button>
+          <Button onClick={handleSaveItem} variant="contained" disabled={!commonItemTitle.trim() || commonSaving}>
+            {commonSaving ? <CircularProgress size={20} /> : "Save"}
           </Button>
         </DialogActions>
       </Dialog>

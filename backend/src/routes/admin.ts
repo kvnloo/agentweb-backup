@@ -3537,4 +3537,54 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
   }
 });
 
+// Get GTM common items (categories with items)
+router.get("/gtm-common-items", async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting("gtm_common_items");
+    const categories = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+    return res.json({ success: true, data: categories });
+  } catch (error) {
+    console.error("Error fetching GTM common items:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch GTM common items" });
+  }
+});
+
+// Save GTM common items (full replacement)
+router.put("/gtm-common-items", async (req, res) => {
+  try {
+    const { categories } = req.body;
+
+    if (!Array.isArray(categories)) {
+      return res.status(400).json({ success: false, error: "categories must be an array" });
+    }
+
+    // Validate each category has a name and each item has a title
+    for (const category of categories) {
+      if (!category.name || typeof category.name !== "string" || !category.name.trim()) {
+        return res.status(400).json({ success: false, error: "Each category must have a name" });
+      }
+      if (Array.isArray(category.items)) {
+        for (const item of category.items) {
+          if (!item.title || typeof item.title !== "string" || !item.title.trim()) {
+            return res.status(400).json({ success: false, error: "Each item must have a title" });
+          }
+        }
+      }
+    }
+
+    const adminEmail = req.user?.email || "admin";
+    await settingsService.setSetting(
+      "gtm_common_items",
+      JSON.stringify(categories),
+      "GTM common work items by category",
+      adminEmail
+    );
+
+    return res.json({ success: true, data: categories });
+  } catch (error) {
+    console.error("Error saving GTM common items:", error);
+    return res.status(500).json({ success: false, error: "Failed to save GTM common items" });
+  }
+});
+
 export default router;

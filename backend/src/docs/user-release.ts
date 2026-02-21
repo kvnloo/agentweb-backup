@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-20',
+    changes: [
+      'GTM Tracker: Common Work Items Library',
+      '- Admins can now define reusable common GTM work items organized by category (e.g., "Paid Ads", "Content Marketing", "SEO") in the Partner Portal',
+      '- New "Common Items" tab on the GTM Tracker page for managing categories and items with drag-to-reorder support',
+      '- Customers can browse the common items library and add items to their GTM plans via a new "+ Add from Common Items" button',
+      '- Items can be added to an existing phase or used to create a new phase in one step',
+      '- Category and item selection uses checkboxes with category-level select/deselect all',
+    ],
+  },
+  {
     date: '2026-02-19',
     changes: [
       'ClickUp Integration',
