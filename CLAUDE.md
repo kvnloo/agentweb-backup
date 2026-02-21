@@ -772,7 +772,7 @@ cd test-env
 This creates:
 - **Secrets Manager secret** (`agentweb/test-env/backend-env`) — stores backend `.env`
 - **IAM role + instance profile** — EC2 can read the secret
-- **Security group** — ports 22, 3001, 5173, 5174
+- Security groups are created per-instance at launch time, locked to the developer's IP
 
 ### Developer IAM Policy
 
@@ -789,13 +789,19 @@ KEY_FILE=~/.ssh/my-keypair.pem
 
 ### Usage
 
+**IMPORTANT:** When a test environment is active (check with `./test-env/test-env.sh list`), run `./test-env/test-env.sh sync` after making code changes to deploy them to the instance. Sync the specific service that changed (e.g., `sync backend`) or `sync` for all. There is no automatic file watcher — sync must be run explicitly.
+
 ```bash
-# Launch environment
+# Launch environment (auto-detects your IP and locks access to it)
 ./test-env/test-env.sh launch
 
-# Sync local code changes and rebuild
+# Sync local code changes and rebuild (run after every code change)
 ./test-env/test-env.sh sync              # all services
 ./test-env/test-env.sh sync backend      # just backend
+
+# Grant/revoke access for other people
+./test-env/test-env.sh allow-ip 203.0.113.50
+./test-env/test-env.sh revoke-ip 203.0.113.50
 
 # View logs
 ./test-env/test-env.sh logs backend
@@ -809,13 +815,14 @@ KEY_FILE=~/.ssh/my-keypair.pem
 # Show this folder's environment
 ./test-env/test-env.sh list
 
-# Tear down
+# Tear down (also deletes the per-instance security group)
 ./test-env/test-env.sh teardown
 ```
 
 ### Architecture
 
 - Three Docker containers on one EC2 instance (t3.large)
+- **IP-restricted** — per-instance security group locked to developer's IP at launch; use `allow-ip`/`revoke-ip` to manage access
 - Backend `.env` fetched from Secrets Manager at launch (developers never see it)
 - Code synced via `rsync` — only changed files transferred
 - Auto-terminates after **7 days of inactivity** (watchdog cron)

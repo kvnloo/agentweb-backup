@@ -1730,7 +1730,7 @@ aws iam put-user-policy \
 ./test-env/setup-infra.sh
 ```
 
-This creates a Secrets Manager secret (stores backend `.env`), an IAM instance profile (EC2 can read the secret), and a security group (ports 22, 3001, 5173, 5174).
+This creates a Secrets Manager secret (stores backend `.env`) and an IAM instance profile (EC2 can read the secret). Per-instance security groups are created automatically at launch time, locked to the developer's IP.
 
 3. **Remove the temporary policy** after setup completes:
 
@@ -1756,9 +1756,22 @@ aws iam put-user-policy \
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
         "ec2:DescribeKeyPairs",
         "ec2:DescribeSecurityGroups",
-        "ec2:DescribeImages"
+        "ec2:DescribeImages",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSecurityGroupManagement",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress"
       ],
       "Resource": "*"
     },
@@ -1788,15 +1801,10 @@ aws iam put-user-policy \
       ]
     },
     {
-      "Sid": "AllowTagOnCreate",
+      "Sid": "AllowTagging",
       "Effect": "Allow",
       "Action": "ec2:CreateTags",
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "ec2:CreateAction": "RunInstances"
-        }
-      }
+      "Resource": "*"
     },
     {
       "Sid": "AllowTerminateTestEnvOnly",
@@ -1838,12 +1846,6 @@ aws iam put-user-policy \
       "Effect": "Allow",
       "Action": "sts:GetCallerIdentity",
       "Resource": "*"
-    },
-    {
-      "Sid": "AllowWaitForInstance",
-      "Effect": "Allow",
-      "Action": "ec2:DescribeInstanceStatus",
-      "Resource": "*"
     }
   ]
 }'
@@ -1874,6 +1876,8 @@ KEY_FILE=~/.ssh/my-keypair.pem
 ./test-env/test-env.sh launch              # Spin up environment
 ./test-env/test-env.sh sync                # Sync all code changes
 ./test-env/test-env.sh sync backend        # Sync just backend
+./test-env/test-env.sh allow-ip 203.0.113.50  # Grant another person access
+./test-env/test-env.sh revoke-ip 203.0.113.50 # Revoke their access
 ./test-env/test-env.sh logs backend        # View backend logs
 ./test-env/test-env.sh ssh                 # SSH into instance
 ./test-env/test-env.sh status              # Check status
@@ -1881,6 +1885,7 @@ KEY_FILE=~/.ssh/my-keypair.pem
 ./test-env/test-env.sh teardown            # Terminate instance
 ```
 
+- **IP-restricted by default** — only the developer's IP (auto-detected at launch) can access the instance. Use `allow-ip` / `revoke-ip` to manage access for others.
 - Backend `.env` is fetched from Secrets Manager automatically (developers never see it)
 - Code is synced via `rsync` (only changed files)
 - Instance auto-terminates after **7 days of inactivity**

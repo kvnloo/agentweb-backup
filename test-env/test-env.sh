@@ -13,10 +13,12 @@ set -euo pipefail
 #   ./test-env.sh teardown
 #   ./test-env.sh sync     [backend|partner-portal|customer-portal]
 #   ./test-env.sh status
+#   ./test-env.sh allow-ip <IP>         # grant another IP access
+#   ./test-env.sh revoke-ip <IP>        # revoke an IP's access
 #   ./test-env.sh ssh
 #   ./test-env.sh logs     [backend|partner-portal|customer-portal]
-#   ./test-env.sh list                  # list all active environments
-#   ./test-env.sh teardown-all          # terminate all environments
+#   ./test-env.sh list                  # list active environment
+#   ./test-env.sh teardown-all          # terminate environment
 ###############################################################################
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +30,6 @@ CONFIG_FILE="$REPO_ROOT/.test-env.config"
 REGION="${AWS_REGION:-us-west-2}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
 SECRET_NAME="${SECRET_NAME:-agentweb/test-env/backend-env}"
-SG_NAME="agentweb-test-env-sg"
 PROFILE_NAME="agentweb-test-env-profile"
 SSH_USER="ec2-user"
 
@@ -75,6 +76,7 @@ INSTANCE_ID=$INSTANCE_ID
 PUBLIC_IP=$PUBLIC_IP
 KEY_NAME=$KEY_NAME
 KEY_FILE=$KEY_FILE
+SG_ID=$SG_ID
 LAUNCH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 }
@@ -190,6 +192,15 @@ EOF
 
   log "Launching environment: ${CYAN}$name${NC}"
 
+  # Detect developer's public IP
+  log "Detecting your public IP..."
+  MY_IP=$(curl -s --max-time 5 https://checkip.amazonaws.com | tr -d '[:space:]')
+  if [[ -z "$MY_IP" ]]; then
+    err "Could not detect public IP. Check your internet connection."
+    exit 1
+  fi
+  log "Your IP: $MY_IP"
+
   log "Resolving latest Amazon Linux 2023 AMI..."
   AMI_ID=$(aws ssm get-parameters \
     --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
@@ -197,16 +208,41 @@ EOF
     --query 'Parameters[0].Value' --output text)
   log "AMI: $AMI_ID"
 
-  # Look up security group
-  SG_ID=$(aws ec2 describe-security-groups \
-    --filters "Name=group-name,Values=$SG_NAME" \
+  # Get default VPC
+  VPC_ID=$(aws ec2 describe-vpcs \
+    --filters "Name=isDefault,Values=true" \
     --region "$REGION" \
-    --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+    --query 'Vpcs[0].VpcId' --output text 2>/dev/null || true)
 
-  if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
-    err "Security group '$SG_NAME' not found. Run setup-infra.sh first."
+  if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+    err "No default VPC found in $REGION."
     exit 1
   fi
+
+  # Create per-instance security group locked to developer's IP
+  local sg_name="agentweb-test-env-${name}"
+  log "Creating security group '$sg_name' (locked to $MY_IP)..."
+  SG_ID=$(aws ec2 create-security-group \
+    --group-name "$sg_name" \
+    --description "AgentWeb test-env for $name - IP-restricted" \
+    --vpc-id "$VPC_ID" \
+    --region "$REGION" \
+    --query 'GroupId' --output text)
+
+  # Tag the SG for IAM policy and cleanup
+  aws ec2 create-tags \
+    --resources "$SG_ID" \
+    --tags Key=purpose,Value=test-env Key=env-name,Value="$name" \
+    --region "$REGION"
+
+  for PORT in 22 3001 5173 5174; do
+    aws ec2 authorize-security-group-ingress \
+      --group-id "$SG_ID" \
+      --protocol tcp \
+      --port "$PORT" \
+      --cidr "$MY_IP/32" \
+      --region "$REGION" > /dev/null
+  done
   log "Security group: $SG_ID"
 
   # Look up instance profile
@@ -331,6 +367,15 @@ cmd_teardown() {
     --instance-ids "$INSTANCE_ID" \
     --region "$REGION" > /dev/null
 
+  # Delete per-instance security group (must wait for instance to detach)
+  if [[ -n "${SG_ID:-}" ]]; then
+    log "Waiting for instance to terminate before deleting security group..."
+    aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true
+    log "Deleting security group $SG_ID..."
+    aws ec2 delete-security-group --group-id "$SG_ID" --region "$REGION" 2>/dev/null || \
+      warn "Could not delete security group $SG_ID (may need manual cleanup)"
+  fi
+
   rm -f "$(state_file_for "$name")"
   log "Instance terminated. Environment '$name' removed."
 }
@@ -360,8 +405,15 @@ cmd_teardown_all() {
   aws ec2 terminate-instances \
     --instance-ids "$INSTANCE_ID" \
     --region "$REGION" > /dev/null 2>&1 || warn "Failed to terminate $INSTANCE_ID"
-  rm -f "$sf"
 
+  if [[ -n "${SG_ID:-}" ]]; then
+    log "Waiting for instance to terminate before deleting security group..."
+    aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true
+    aws ec2 delete-security-group --group-id "$SG_ID" --region "$REGION" 2>/dev/null || \
+      warn "Could not delete security group $SG_ID"
+  fi
+
+  rm -f "$sf"
   log "Environment terminated."
 }
 
@@ -491,6 +543,75 @@ cmd_list() {
 }
 
 ###############################################################################
+# allow-ip / revoke-ip
+###############################################################################
+cmd_allow_ip() {
+  local name
+  name="$(resolve_env_name)"
+  load_state "$name"
+
+  local ip="${1:-}"
+  if [[ -z "$ip" ]]; then
+    err "Usage: test-env.sh allow-ip <IP_ADDRESS>"
+    exit 1
+  fi
+
+  # Strip trailing /32 if provided
+  ip="${ip%/32}"
+
+  if [[ -z "${SG_ID:-}" ]]; then
+    err "No security group found in state. Re-launch the environment."
+    exit 1
+  fi
+
+  log "Allowing $ip access to environment '$name' (SG: $SG_ID)..."
+  for PORT in 22 3001 5173 5174; do
+    aws ec2 authorize-security-group-ingress \
+      --group-id "$SG_ID" \
+      --protocol tcp \
+      --port "$PORT" \
+      --cidr "$ip/32" \
+      --region "$REGION" > /dev/null 2>&1 || true
+  done
+
+  log "Done. $ip can now access:"
+  echo -e " ${CYAN}Backend:${NC}          http://$PUBLIC_IP:3001"
+  echo -e " ${CYAN}Partner Portal:${NC}   http://$PUBLIC_IP:5173"
+  echo -e " ${CYAN}Customer Portal:${NC}  http://$PUBLIC_IP:5174"
+}
+
+cmd_revoke_ip() {
+  local name
+  name="$(resolve_env_name)"
+  load_state "$name"
+
+  local ip="${1:-}"
+  if [[ -z "$ip" ]]; then
+    err "Usage: test-env.sh revoke-ip <IP_ADDRESS>"
+    exit 1
+  fi
+
+  ip="${ip%/32}"
+
+  if [[ -z "${SG_ID:-}" ]]; then
+    err "No security group found in state. Re-launch the environment."
+    exit 1
+  fi
+
+  log "Revoking $ip access from environment '$name' (SG: $SG_ID)..."
+  for PORT in 22 3001 5173 5174; do
+    aws ec2 revoke-security-group-ingress \
+      --group-id "$SG_ID" \
+      --protocol tcp \
+      --port "$PORT" \
+      --cidr "$ip/32" \
+      --region "$REGION" > /dev/null 2>&1 || true
+  done
+
+  log "Done. $ip access revoked."
+}
+
+###############################################################################
 # ssh
 ###############################################################################
 cmd_ssh() {
@@ -530,6 +651,8 @@ case "$CMD" in
   sync)         cmd_sync "${1:-all}" ;;
   status)       cmd_status ;;
   list)         cmd_list ;;
+  allow-ip)     cmd_allow_ip "${1:-}" ;;
+  revoke-ip)    cmd_revoke_ip "${1:-}" ;;
   ssh)          cmd_ssh ;;
   logs)         cmd_logs "${1:-}" ;;
   help|*)
@@ -542,16 +665,23 @@ case "$CMD" in
     echo "  sync         Sync code and rebuild [backend|partner-portal|customer-portal|all]"
     echo "  status       Show environment status"
     echo "  list         List all active environments"
+    echo "  allow-ip IP  Grant another IP access to this environment"
+    echo "  revoke-ip IP Revoke an IP's access"
     echo "  ssh          Open SSH session to the instance"
     echo "  logs         View container logs [service]"
     echo ""
     echo "The environment name is derived automatically from your AWS username"
     echo "and the repo folder name (e.g., myuser-agentweb)."
     echo ""
+    echo "By default, only the developer's IP (detected at launch) can access"
+    echo "the instance. Use 'allow-ip' to grant access to others."
+    echo ""
     echo "Examples:"
     echo "  ./test-env.sh launch                    # launch environment"
     echo "  ./test-env.sh sync                      # sync all services"
     echo "  ./test-env.sh sync backend              # sync just backend"
+    echo "  ./test-env.sh allow-ip 203.0.113.50     # grant IP access"
+    echo "  ./test-env.sh revoke-ip 203.0.113.50    # revoke IP access"
     echo "  ./test-env.sh list                      # show all environments"
     echo "  ./test-env.sh teardown                  # terminate environment"
     echo "  ./test-env.sh teardown-all              # terminate everything"

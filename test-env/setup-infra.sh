@@ -16,7 +16,6 @@ REGION="${AWS_REGION:-us-west-2}"
 SECRET_NAME="agentweb/test-env/backend-env"
 ROLE_NAME="agentweb-test-env-ec2-role"
 PROFILE_NAME="agentweb-test-env-profile"
-SG_NAME="agentweb-test-env-sg"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 RED='\033[0;31m'
@@ -125,49 +124,11 @@ fi
 echo ""
 
 ###############################################################################
-# 3. Security group
+# 3. Security groups (info only — created per-instance at launch time)
 ###############################################################################
-log "=== Security Group ==="
-
-# Get default VPC
-VPC_ID=$(aws ec2 describe-vpcs \
-  --filters "Name=isDefault,Values=true" \
-  --region "$REGION" \
-  --query 'Vpcs[0].VpcId' --output text)
-
-if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
-  err "No default VPC found in $REGION. Create one or modify this script."
-  exit 1
-fi
-
-SG_ID=$(aws ec2 describe-security-groups \
-  --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
-  --region "$REGION" \
-  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
-
-if [[ -n "$SG_ID" && "$SG_ID" != "None" ]]; then
-  log "Security group '$SG_NAME' already exists: $SG_ID"
-else
-  log "Creating security group '$SG_NAME'..."
-  SG_ID=$(aws ec2 create-security-group \
-    --group-name "$SG_NAME" \
-    --description "AgentWeb test environment - SSH + app ports" \
-    --vpc-id "$VPC_ID" \
-    --region "$REGION" \
-    --query 'GroupId' --output text)
-
-  # Open ports
-  for PORT in 22 3001 5173 5174; do
-    aws ec2 authorize-security-group-ingress \
-      --group-id "$SG_ID" \
-      --protocol tcp \
-      --port "$PORT" \
-      --cidr 0.0.0.0/0 \
-      --region "$REGION" > /dev/null
-  done
-
-  log "Security group created: $SG_ID (ports: 22, 3001, 5173, 5174)"
-fi
+log "=== Security Groups ==="
+log "Per-instance security groups are created at launch time, locked to the"
+log "developer's IP. No shared security group is needed."
 echo ""
 
 ###############################################################################
@@ -180,7 +141,7 @@ echo ""
 echo "  Secret:           $SECRET_NAME"
 echo "  IAM Role:         $ROLE_NAME"
 echo "  Instance Profile: $PROFILE_NAME"
-echo "  Security Group:   $SG_NAME ($SG_ID)"
+echo "  Security Groups:  Created per-instance at launch (IP-restricted)"
 echo ""
 echo "Next steps for developers:"
 echo "  1. Create .test-env.config with their SSH key pair:"
