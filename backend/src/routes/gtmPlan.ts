@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
+import { settingsService } from "../services/settingsService";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient({
@@ -18,6 +19,23 @@ const dynamodb = new DynamoDB.DocumentClient({
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
+
+// Get GTM common items (read-only for customers) - MUST be before /:planId routes
+router.get("/common-items", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    const setting = await settingsService.getSetting("gtm_common_items");
+    const categories = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+    return res.json({ success: true, data: categories });
+  } catch (error) {
+    console.error("Error fetching GTM common items:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch GTM common items" });
+  }
+});
 
 // Get all GTM plans for user
 router.get("/", authenticateToken, async (req, res) => {
@@ -1078,6 +1096,156 @@ router.post("/:planId/send-status-report", authenticateToken, async (req, res) =
     res.status(500).json({
       success: false,
       message: "Error sending plan status report",
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Add common items to a GTM plan (batch)
+router.post("/:planId/add-common-items", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId } = req.params;
+    const { items, targetPhaseId, newPhaseName } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: "items must be a non-empty array" });
+    }
+
+    if (!targetPhaseId && !newPhaseName) {
+      return res.status(400).json({ success: false, error: "Either targetPhaseId or newPhaseName is required" });
+    }
+
+    // Validate each item has a title
+    for (const item of items) {
+      if (!item.title || typeof item.title !== "string" || !item.title.trim()) {
+        return res.status(400).json({ success: false, error: "Each item must have a title" });
+      }
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: { planId },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Create work items from the provided items
+    const newWorkItems = items.map((item: { title: string; description?: string }) => ({
+      id: `item-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+      title: item.title.trim(),
+      description: item.description?.trim() || null,
+      dri: null,
+      status: "pending",
+      notes: null,
+      dueDate: null,
+    }));
+
+    let targetPhase: any;
+
+    if (targetPhaseId) {
+      // Add to existing phase
+      const phaseIndex = phases.findIndex((p: any) => p.id === targetPhaseId);
+      if (phaseIndex === -1) {
+        return res.status(404).json({ error: "Target phase not found" });
+      }
+
+      targetPhase = phases[phaseIndex];
+      const workItems = targetPhase.workItems || [];
+      workItems.push(...newWorkItems);
+
+      // Recalculate phase status
+      const hasWorkItems = workItems.length > 0;
+      const allItemsDone = hasWorkItems && workItems.every(
+        (item: any) => item.status === "completed" || item.status === "skipped"
+      );
+
+      phases[phaseIndex] = {
+        ...targetPhase,
+        workItems,
+        status: allItemsDone ? "completed" : "in_progress",
+      };
+    } else if (newPhaseName) {
+      // Create new phase with items
+      const phaseId = `phase-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+      targetPhase = {
+        id: phaseId,
+        title: newPhaseName.trim(),
+        description: null,
+        dri: null,
+        status: "in_progress",
+        workItems: newWorkItems,
+        dueDate: null,
+      };
+      phases.push(targetPhase);
+    }
+
+    // Recalculate plan status
+    const hasPhases = phases.length > 0;
+    const allPhasesCompleted = hasPhases && phases.every(
+      (p: any) => p.status === "completed"
+    );
+    const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+    const updateExpressions: string[] = [
+      "#phases = :phases",
+      "#status = :status",
+      "#updatedAt = :updatedAt",
+    ];
+    const expressionAttributeNames: { [key: string]: string } = {
+      "#phases": "phases",
+      "#status": "status",
+      "#updatedAt": "updatedAt",
+    };
+    const expressionAttributeValues: { [key: string]: any } = {
+      ":phases": phases,
+      ":status": planStatus,
+      ":updatedAt": new Date().toISOString(),
+    };
+
+    // Clear completedAt if plan was completed but is now back to in_progress
+    if (plan.status === "completed" && planStatus !== "completed") {
+      updateExpressions.push("#completedAt = :completedAt");
+      expressionAttributeNames["#completedAt"] = "completedAt";
+      expressionAttributeValues[":completedAt"] = null;
+    }
+
+    const updateParams = {
+      TableName: TABLE_NAME,
+      Key: { planId },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW",
+    };
+
+    const result = await dynamodb.update(updateParams).promise();
+
+    return res.json({
+      success: true,
+      data: result.Attributes,
+      message: "Common items added successfully",
+    });
+  } catch (error: any) {
+    console.error("Error adding common items:", error);
+    return res.status(500).json({
+      success: false,
       error: error?.message || "Internal server error",
     });
   }
