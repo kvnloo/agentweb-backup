@@ -446,6 +446,7 @@ export class AgentModeService {
     // List gemini models - client will be lazy-loaded
     'gemini-3-pro-preview': { client: null, supportsTemperature: true },
     'gemini-3-flash-preview': { client: null, supportsTemperature: true },
+    'gemini-3.1-pro-preview': { client: null, supportsTemperature: true },
     // List Claude models via AWS Bedrock - client will be lazy-loaded
     'anthropic.claude-sonnet-4-5-20250929-v1:0': { client: null, supportsTemperature: true },
     'anthropic.claude-sonnet-4-6': { client: null, supportsTemperature: true },
@@ -510,7 +511,7 @@ export class AgentModeService {
     // Get the client - lazy-load Gemini or Bedrock client if needed
     let client = this.llmModels[model].client;
     if (!client) {
-      if (model === 'gemini-3-pro-preview' || model === 'gemini-3-flash-preview') {
+      if (model === 'gemini-3-pro-preview' || model === 'gemini-3-flash-preview' || model === 'gemini-3.1-pro-preview') {
         client = await this.getGeminiClient();
         // Update the cached client for future use
         this.llmModels[model].client = client;

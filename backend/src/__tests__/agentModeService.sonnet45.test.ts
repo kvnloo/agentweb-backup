@@ -104,6 +104,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-opus-4-6-v1'].client).toBeNull();
     });
+
+    it('should include Gemini 3.1 Pro Preview in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('gemini-3.1-pro-preview');
+    });
+
+    it('should have temperature support enabled for Gemini 3.1 Pro Preview', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-pro-preview'].supportsTemperature).toBe(true);
+    });
+
+    it('should have null client initially for Gemini 3.1 Pro Preview (lazy-loaded)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-pro-preview'].client).toBeNull();
+    });
   });
 
   describe('Bedrock client lazy-loading', () => {
@@ -173,6 +188,33 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-opus-4-6-v1'].client).not.toBeNull();
+    });
+  });
+
+  describe('Gemini client lazy-loading', () => {
+    it('should lazy-load Gemini client for gemini-3.1-pro-preview on first callLLM', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'test response' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
+
+      // Spy on getGeminiClient to return our mock
+      jest.spyOn(agentModeService as any, 'getGeminiClient').mockResolvedValue(mockGeminiClient);
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM('gemini-3.1-pro-preview', messages);
+
+      // getGeminiClient should have been called
+      expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
+
+      // After calling, the client should be cached (no longer null)
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-pro-preview'].client).toBe(mockGeminiClient);
     });
   });
 

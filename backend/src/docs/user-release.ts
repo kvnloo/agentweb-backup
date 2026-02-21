@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-20',
+    changes: [
+      'Gemini 3.1 Pro Preview Support for Agent Mode',
+      '- Added Gemini 3.1 Pro (gemini-3.1-pro-preview) as an available LLM for Agent Mode chat',
+      '- Uses the same Gemini client as existing Gemini 3 models with temperature support',
+    ],
+  },
+  {
     date: '2026-02-19',
     changes: [
       'ClickUp Integration',
