@@ -774,6 +774,10 @@ This creates:
 - **IAM role + instance profile** — EC2 can read the secret
 - **Security group** — ports 22, 3001, 5173, 5174
 
+### Developer IAM Policy
+
+Each developer needs the `AgentWebTestEnvDeveloper` inline policy on their IAM user. See `README.md` → "Cloud Test Environment" → "Developer IAM Policy" for the full policy JSON. The policy uses tag-based conditions so developers can only launch/terminate instances tagged `purpose=test-env` (production instances are protected).
+
 ### Developer Setup
 
 On first `launch`, the script interactively creates `.test-env.config` and an EC2 key pair. Or create the config manually in repo root:

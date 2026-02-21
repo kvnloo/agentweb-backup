@@ -1763,15 +1763,29 @@ aws iam put-user-policy \
       "Resource": "*"
     },
     {
-      "Sid": "AllowLaunchTestEnvOnly",
+      "Sid": "AllowLaunchTestEnvInstance",
       "Effect": "Allow",
       "Action": "ec2:RunInstances",
-      "Resource": "*",
+      "Resource": "arn:aws:ec2:us-west-2:992382574572:instance/*",
       "Condition": {
         "StringEquals": {
           "aws:RequestTag/purpose": "test-env"
         }
       }
+    },
+    {
+      "Sid": "AllowLaunchTestEnvResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-west-2:992382574572:volume/*",
+        "arn:aws:ec2:us-west-2:992382574572:network-interface/*",
+        "arn:aws:ec2:us-west-2:992382574572:key-pair/*",
+        "arn:aws:ec2:us-west-2:992382574572:security-group/*",
+        "arn:aws:ec2:us-west-2:992382574572:subnet/*",
+        "arn:aws:ec2:us-west-2::image/*",
+        "arn:aws:ec2:us-west-2::snapshot/*"
+      ]
     },
     {
       "Sid": "AllowTagOnCreate",
@@ -1812,6 +1826,24 @@ aws iam put-user-policy \
       "Effect": "Allow",
       "Action": "ssm:GetParameters",
       "Resource": "arn:aws:ssm:us-west-2::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "AllowGetInstanceProfile",
+      "Effect": "Allow",
+      "Action": "iam:GetInstanceProfile",
+      "Resource": "arn:aws:iam::992382574572:instance-profile/agentweb-test-env-profile"
+    },
+    {
+      "Sid": "AllowGetCallerIdentity",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowWaitForInstance",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstanceStatus",
+      "Resource": "*"
     }
   ]
 }'
