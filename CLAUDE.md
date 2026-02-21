@@ -756,6 +756,68 @@ When making changes, these files are critical to understand:
 - Email notifications use both SMTP and Resend API
 - Slack integration for GTM plan approvals via webhooks
 
+## Cloud Test Environment
+
+Ephemeral test environments can be launched on EC2 for manual testing. All files live in `test-env/`.
+
+Each environment is automatically named from the developer's AWS username and repo folder name (e.g., `myuser-agentweb`). Scripts in each clone can only operate that clone's instance — `agentweb/` and `agentweb1/` are fully isolated.
+
+### Prerequisites (One-Time Admin Setup)
+
+```bash
+cd test-env
+./setup-infra.sh
+```
+
+This creates:
+- **Secrets Manager secret** (`agentweb/test-env/backend-env`) — stores backend `.env`
+- **IAM role + instance profile** — EC2 can read the secret
+- **Security group** — ports 22, 3001, 5173, 5174
+
+### Developer Setup
+
+On first `launch`, the script interactively creates `.test-env.config` and an EC2 key pair. Or create the config manually in repo root:
+
+```
+KEY_NAME=my-keypair
+KEY_FILE=~/.ssh/my-keypair.pem
+```
+
+### Usage
+
+```bash
+# Launch environment
+./test-env/test-env.sh launch
+
+# Sync local code changes and rebuild
+./test-env/test-env.sh sync              # all services
+./test-env/test-env.sh sync backend      # just backend
+
+# View logs
+./test-env/test-env.sh logs backend
+
+# SSH into instance
+./test-env/test-env.sh ssh
+
+# Check status
+./test-env/test-env.sh status
+
+# Show this folder's environment
+./test-env/test-env.sh list
+
+# Tear down
+./test-env/test-env.sh teardown
+```
+
+### Architecture
+
+- Three Docker containers on one EC2 instance (t3.large)
+- Backend `.env` fetched from Secrets Manager at launch (developers never see it)
+- Code synced via `rsync` — only changed files transferred
+- Auto-terminates after **7 days of inactivity** (watchdog cron)
+- Per-clone isolation enforced via name-based state files and validation guards
+- Ports: backend=3001, partner-portal=5173, customer-portal=5174
+
 ## "Prep for Deploy" Command
 
 When the user says **"prep for deploy \<date\>"** (default: today's date if omitted):
