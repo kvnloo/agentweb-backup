@@ -7,6 +7,20 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-21',
+    changes: [
+      'Cloud Test Environment',
+      '- Developers can now launch ephemeral test environments on EC2 with a single command (`test-env.sh launch`)',
+      '- Runs backend, partner-portal, and customer-portal as Docker containers on a single instance',
+      '- Backend secrets are securely fetched from AWS Secrets Manager at launch (developers never see the .env file)',
+      '- Each repo clone gets its own isolated instance, named automatically from the developer\'s AWS username and folder name',
+      '- Instances are IP-restricted by default; use `allow-ip` / `revoke-ip` to grant or remove access for other people',
+      '- Code changes are synced to the instance via `test-env.sh sync` and services are rebuilt automatically',
+      '- Instances auto-terminate after 7 days of inactivity',
+      '- Tag-based IAM policy ensures developers cannot access production EC2 instances',
+    ],
+  },
+  {
     date: '2026-02-20',
     changes: [
       'GTM Tracker: Common Work Items Library',

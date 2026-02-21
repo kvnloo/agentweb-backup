@@ -90,7 +90,12 @@
       "Bash(aws bedrock list-foundation-models:*)",
       "Bash(gh api:*)",
       "Bash(git commit:*)",
-      "Bash(gh pr:*)"
+      "Bash(gh pr:*)",
+      "Bash(./test-env/test-env.sh list:*)",
+      "Bash(./test-env/test-env.sh launch:*)",
+      "Bash(./test-env/test-env.sh allow-ip:*)",
+      "Bash(./test-env/test-env.sh ssh:*)",
+      "Bash(./test-env/test-env.sh sync:*)"
     ]
   }
 }
