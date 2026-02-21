@@ -15,6 +15,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Customers can browse the common items library and add items to their GTM plans via a new "+ Add from Common Items" button',
       '- Items can be added to an existing phase or used to create a new phase in one step',
       '- Category and item selection uses checkboxes with category-level select/deselect all',
+      'Gemini 3.1 Pro Preview Support for Agent Mode',
+      '- Added Gemini 3.1 Pro (gemini-3.1-pro-preview) as an available LLM for Agent Mode chat',
+      '- Uses the same Gemini client as existing Gemini 3 models with temperature support',
     ],
   },
   {
