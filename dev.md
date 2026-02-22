@@ -14,10 +14,13 @@ The assistant message between DB indices 22 (user "yes.") and 23 (tool result) w
 1. Adjust `initialMessageCount += delta` after each `updateConversationContext` call
 2. Retry `UnprocessedItems` with exponential backoff (up to 3 retries)
 
-## Copied Session in Dev
-Session was copied to dev tables (`Dev-AW-ChatSessions`, `Dev-AW-ChatMessages`) with userId `6c2ef3ca-c9fa-432e-b510-85127a0752f4` for testing.
+## Production Repair
+After deploying the fix, the session still crashed because the corrupted data remained. Ran `/tmp/repair-session.py` to insert a synthetic assistant message at index 23 (with the two orphaned `tool_call_id`s) and shifted all subsequent messages up by 1. Session is now functional.
 
-**TODO: Delete the copied session from dev tables after the fix has been confirmed in production.**
+## Copied Session in Dev
+Session was copied to dev tables (`Dev-AW-ChatSessions`, `Dev-AW-ChatMessages`) with userId `6c2ef3ca-c9fa-432e-b510-85127a0752f4` for testing. The dev copy was NOT repaired (same corrupted data as prod pre-repair).
+
+**TODO: Delete the copied session from dev tables.**
 
 ---
 
