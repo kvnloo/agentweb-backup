@@ -602,6 +602,114 @@ describe('AgentModeService - Skills', () => {
       // Should be placed after system prompt (index 1)
       expect(messages[1].content).toContain('NEW LIST');
     });
+
+    it('should have net 0 change when both old and new context messages exist', () => {
+      const messages: any[] = [
+        { role: 'system', content: 'System prompt' },
+        { role: 'assistant', content: 'Available Skills:\nOLD' },
+        { role: 'assistant', content: 'Installed Skills:\nOLD' },
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'response' },
+      ];
+      const before = messages.length;
+
+      (agentModeService as any).updateConversationContext(
+        messages,
+        'Installed Skills:\nNEW',
+        'Available Skills:\nNEW'
+      );
+
+      expect(messages.length).toBe(before);
+    });
+
+    it('should have net +1 when Installed Skills is added for the first time', () => {
+      // Simulates the first install_skills call in a session that started with no installed skills
+      const messages: any[] = [
+        { role: 'system', content: 'System prompt' },
+        { role: 'assistant', content: 'Available Skills:\nOLD' },
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'I will help' },
+      ];
+      const before = messages.length;
+
+      (agentModeService as any).updateConversationContext(
+        messages,
+        'Installed Skills:\nBrand Strategy',
+        'Available Skills:\nNEW'
+      );
+
+      expect(messages.length).toBe(before + 1);
+    });
+
+    it('should have net -1 when Available Skills becomes empty (all skills installed)', () => {
+      const messages: any[] = [
+        { role: 'system', content: 'System prompt' },
+        { role: 'assistant', content: 'Available Skills:\nSome skills' },
+        { role: 'assistant', content: 'Installed Skills:\nOLD' },
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'response' },
+      ];
+      const before = messages.length;
+
+      (agentModeService as any).updateConversationContext(
+        messages,
+        'Installed Skills:\nNEW',
+        '' // empty — all skills now installed
+      );
+
+      expect(messages.length).toBe(before - 1);
+    });
+
+    it('net -1 should not cause first response message to be dropped when initialMessageCount is adjusted', () => {
+      // This test reproduces the production bug scenario:
+      // 1. Session has both Available Skills and Installed Skills context
+      // 2. LLM makes tool calls, assistant message pushed to array
+      // 3. install_skills called, skillsUpdated = true
+      // 4. updateConversationContext removes Available Skills (empty), net -1
+      // 5. Without the fix, messages.slice(initialMessageCount) skips the first assistant message
+      const messages: any[] = [
+        { role: 'system', content: 'System prompt' },
+        { role: 'assistant', content: 'Available Skills:\nMeta Ads, Landing Page' },
+        { role: 'assistant', content: 'Installed Skills:\nBrand Strategy' },
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'previous response' },
+        { role: 'user', content: 'yes.' },
+      ];
+
+      let initialMessageCount = messages.length; // 6
+
+      // Simulate iteration 1: LLM returns assistant + tool_calls
+      const firstAssistantMsg = { role: 'assistant', content: '', tool_calls: [{ id: 'tc1', function: { name: 'update_brand', arguments: '{}' } }] };
+      messages.push(firstAssistantMsg);
+      messages.push({ role: 'tool', tool_call_id: 'tc1', content: 'success' });
+
+      // Simulate install_skills call
+      messages.push({ role: 'assistant', content: '', tool_calls: [{ id: 'tc2', function: { name: 'install_skills', arguments: '{}' } }] });
+      messages.push({ role: 'tool', tool_call_id: 'tc2', content: 'installed' });
+
+      // Simulate skillsUpdated: updateConversationContext with empty availableSkillContextMsg
+      const preUpdateLen = messages.length;
+      (agentModeService as any).updateConversationContext(
+        messages,
+        'Installed Skills:\nBrand Strategy + Other Skills',
+        '' // all skills now installed
+      );
+      const delta = messages.length - preUpdateLen;
+      initialMessageCount += delta; // THE FIX: adjust initialMessageCount
+
+      // Simulate final assistant response
+      messages.push({ role: 'assistant', content: 'Done!' });
+
+      // Slice response messages (same as production code)
+      const responseMessages = messages.slice(initialMessageCount).filter(
+        (msg: any) => msg.role !== 'user'
+      );
+
+      // The first response message MUST be the assistant with tool_calls
+      expect(responseMessages[0]).toBe(firstAssistantMsg);
+      expect(responseMessages[0].role).toBe('assistant');
+      expect(responseMessages[0].tool_calls).toBeDefined();
+    });
   });
 
   describe('getFoundationToolNames', () => {
