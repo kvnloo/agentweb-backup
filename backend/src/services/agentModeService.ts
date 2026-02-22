@@ -628,8 +628,13 @@ export class AgentModeService {
                 // Rebuild available skills (excluding newly associated ones, filtered by subscription)
                 availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds);
 
-                // Update messages using helper
+                // Update messages using helper — track length change to keep initialMessageCount accurate
+                const preUpdateLen = messages.length;
                 this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
+                const delta = messages.length - preUpdateLen;
+                if (delta !== 0) {
+                  initialMessageCount += delta;
+                }
 
                 // Invalidate tools cache
                 filteredToolsCache = null;

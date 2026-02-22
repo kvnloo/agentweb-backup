@@ -508,13 +508,30 @@ export class ChatbotDB {
           },
         }));
 
-        const params = {
-          RequestItems: {
-            [this.messagesTableName]: writeRequests,
-          },
-        };
+        let unprocessed: any = writeRequests;
+        let retries = 0;
+        const maxRetries = 3;
 
-        await dynamodb.batchWrite(params).promise();
+        while (unprocessed.length > 0 && retries <= maxRetries) {
+          const params = {
+            RequestItems: {
+              [this.messagesTableName]: unprocessed,
+            },
+          };
+
+          const result = await dynamodb.batchWrite(params).promise();
+          unprocessed = result.UnprocessedItems?.[this.messagesTableName] || [];
+
+          if (unprocessed.length > 0) {
+            retries++;
+            if (retries <= maxRetries) {
+              // Exponential backoff before retry
+              await new Promise(resolve => setTimeout(resolve, 100 * Math.pow(2, retries)));
+            } else {
+              console.error(`Failed to write ${unprocessed.length} messages after ${maxRetries} retries for session ${sessionId}`);
+            }
+          }
+        }
       }
     } catch (error) {
       // If table doesn't exist yet, log and continue (table will be created later)

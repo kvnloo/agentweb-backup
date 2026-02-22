@@ -28,6 +28,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Code changes are synced to the instance via `test-env.sh sync` and services are rebuilt automatically',
       '- Instances auto-terminate after 7 days of inactivity',
       '- Tag-based IAM policy ensures developers cannot access production EC2 instances',
+      'Agent Mode: Conversation Reliability Fixes',
+      '- Fixed a bug where the first assistant message in a response could be silently dropped when skills were installed mid-conversation, causing "400 Bad Request" errors on all subsequent messages',
+      '- Fixed DynamoDB batch writes to retry unprocessed items with exponential backoff, preventing silent message loss under throttling',
     ],
   },
   {

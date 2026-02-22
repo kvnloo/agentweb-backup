@@ -95,7 +95,11 @@
       "Bash(./test-env/test-env.sh launch:*)",
       "Bash(./test-env/test-env.sh allow-ip:*)",
       "Bash(./test-env/test-env.sh ssh:*)",
-      "Bash(./test-env/test-env.sh sync:*)"
+      "Bash(./test-env/test-env.sh sync:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh list:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh sync:*)",
+      "Bash(tail:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh ssh:*)"
     ]
   }
 }
