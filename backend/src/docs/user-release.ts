@@ -9,8 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-22',
     changes: [
+      'Agent Mode: Markdown Rendering',
+      '- Chat messages from AI assistants now render full markdown: headers, bullet lists, numbered lists, links, code blocks, tables, bold, and italic',
+      '- Links in assistant messages open in a new tab automatically',
+      '- User messages continue to render as plain text with line breaks',
       'Agent Mode: Chat Input Fix',
       '- Fixed a bug where the typed message stayed visible in the chat input while a new session was being created, instead of clearing immediately after sending',
+      'Settings: Show User ID',
+      '- Your Profile now displays your User ID with a copy-to-clipboard button for easy reference',
     ],
   },
   {
