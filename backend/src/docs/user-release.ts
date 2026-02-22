@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-22',
     changes: [
+      'Agent Mode: LinkedIn Post Formatting',
+      '- LinkedIn posts created via Agent Mode now use LinkedIn-native plain text formatting instead of markdown',
+      '- Prevents raw markdown syntax (asterisks, brackets, hashes) from appearing in published LinkedIn posts',
       'Agent Mode: Markdown Rendering',
       '- Chat messages from AI assistants now render full markdown: headers, bullet lists, numbered lists, links, code blocks, tables, bold, and italic',
       '- Links in assistant messages open in a new tab automatically',
