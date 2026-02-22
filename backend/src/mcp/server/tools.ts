@@ -1073,7 +1073,7 @@ mcpToolRegistry.register({
               },
               content: {
                 type: 'string',
-                description: 'Rich text content for the post (supports markdown formatting). IMPORTANT: Do not include image URLs in the content text as the format will not look good. Use the image_url parameter separately for images.'
+                description: 'Rich text content for the post. IMPORTANT: Do not include image URLs in the content text as the format will not look good. Use the image_url parameter separately for images. CRITICAL FOR LINKEDIN POSTS: LinkedIn does NOT support markdown rendering. Never use markdown syntax like **bold**, *italic*, - bullet lists, [links](url), or # headings. Instead use LinkedIn-native plain text formatting: line breaks for structure, unicode bullets (•) or dashes (—) for lists, UPPERCASE or emojis for emphasis, and paste full URLs directly (LinkedIn auto-links them). Markdown will appear as raw text and look unprofessional.'
               },
               image_url: {
                 type: 'string',
@@ -1897,7 +1897,7 @@ mcpToolRegistry.register({
       type: 'object',
       properties: {
         account_id: { type: 'string', description: 'The connected account ID' },
-        content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform.' },
+        content: { type: 'string', description: 'The COMPLETE post text content. MUST include the full, untruncated text exactly as approved by the user. Do NOT abbreviate, summarize, or omit any part of the content. Include all paragraphs, hashtags, emojis, and formatting. Length limits depend on the specific platform. CRITICAL FOR LINKEDIN: LinkedIn does NOT render markdown. Never use **bold**, *italic*, - bullets, [links](url), or # headings — they appear as raw text. Use LinkedIn-native plain text: line breaks, unicode bullets (•), emojis for emphasis, and full URLs (LinkedIn auto-links them).' },
         media_urls: {
           type: 'array',
           items: { type: 'string' },
