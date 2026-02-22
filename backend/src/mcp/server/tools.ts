@@ -1470,13 +1470,351 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.updateEmailDraftForLead(
-      args.list_id, 
-      args.lead_id, 
-      args.instruction, 
-      context?.sessionId, 
-      context?.userId, 
+      args.list_id,
+      args.lead_id,
+      args.instruction,
+      context?.sessionId,
+      context?.userId,
       args.email_format
     );
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_leads',
+  definition: {
+    name: 'get_leads',
+    description: 'Browse and list leads from a lead list with optional text search and ICP/engaged filters. Returns compact lead summaries. Use search_leads for structured field-level filtering.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list to browse'
+        },
+        search: {
+          type: 'string',
+          description: 'Optional text search query to filter leads across all fields (name, email, company, title, etc.)'
+        },
+        icp_only: {
+          type: 'boolean',
+          description: 'If true, only return leads that match ICP criteria'
+        },
+        engaged_only: {
+          type: 'boolean',
+          description: 'If true, only return leads that have engagement activity'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of leads to return (default 20, max 50)'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeads(args.list_id, context?.userId, {
+      search: args.search,
+      icpOnly: args.icp_only,
+      engagedOnly: args.engaged_only,
+      limit: args.limit
+    });
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'search_leads',
+  definition: {
+    name: 'search_leads',
+    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin), ICP fields (icpScore, icpMatch), engagementCount, and any custom field names. All filters use AND logic.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list to search'
+        },
+        filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              field: {
+                type: 'string',
+                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin; ICP: icpScore, icpMatch; engagement: engagementCount; or any custom field name)'
+              },
+              operator: {
+                type: 'string',
+                enum: ['equals', 'contains', 'starts_with', 'greater_than', 'less_than', 'not_equals', 'is_empty', 'is_not_empty'],
+                description: 'Comparison operator'
+              },
+              value: {
+                description: 'The value to compare against (not required for is_empty/is_not_empty)'
+              }
+            },
+            required: ['field', 'operator']
+          },
+          description: 'Array of filter criteria (AND logic — all must match)'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of matching leads to return (default 20, max 50)'
+        }
+      },
+      required: ['list_id', 'filters']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.searchLeads(args.list_id, args.filters, context?.userId, args.limit);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_lead_details',
+  definition: {
+    name: 'get_lead_details',
+    description: 'Get full details for a single lead including all fields, ICP match info, email drafts, and recent engagement history.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead to get details for'
+        }
+      },
+      required: ['list_id', 'lead_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadDetails(args.list_id, args.lead_id, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_lead',
+  definition: {
+    name: 'update_lead',
+    description: 'Update fields on a lead. Supports standard fields (email, firstName, lastName, phone, company, title, notes, linkedin) and any custom fields.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead to update'
+        },
+        updates: {
+          type: 'object',
+          description: 'Object with field names and new values. Standard fields: email, firstName, lastName, phone, company, title, notes, linkedin. Any other fields are stored as custom fields.',
+          additionalProperties: true
+        }
+      },
+      required: ['list_id', 'lead_id', 'updates']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.updateLead(args.list_id, args.lead_id, args.updates, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_leads',
+  definition: {
+    name: 'delete_leads',
+    description: 'Delete one or more leads from a lead list. Maximum 100 leads per call.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the leads'
+        },
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of lead IDs to delete (max 100)'
+        }
+      },
+      required: ['list_id', 'lead_ids']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.deleteLeads(args.list_id, args.lead_ids, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_lead_list',
+  definition: {
+    name: 'update_lead_list',
+    description: 'Update a lead list\'s name, description, filter settings, or auto-draft configuration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list to update'
+        },
+        name: {
+          type: 'string',
+          description: 'New name for the lead list'
+        },
+        description: {
+          type: 'string',
+          description: 'New description for the lead list'
+        },
+        icps_only: {
+          type: 'boolean',
+          description: 'If true, list only shows ICP-matching leads by default'
+        },
+        engaged_only: {
+          type: 'boolean',
+          description: 'If true, list only shows engaged leads by default'
+        },
+        auto_draft_enabled: {
+          type: 'boolean',
+          description: 'Enable or disable automatic email draft generation for new leads'
+        },
+        auto_draft_instruction: {
+          type: 'string',
+          description: 'Instructions for automatic email draft generation'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.updateLeadList(args.list_id, {
+      name: args.name,
+      description: args.description,
+      icpsOnly: args.icps_only,
+      engagedOnly: args.engaged_only,
+      autoDraftEnabled: args.auto_draft_enabled,
+      autoDraftInstruction: args.auto_draft_instruction
+    }, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_lead_list',
+  definition: {
+    name: 'delete_lead_list',
+    description: 'Permanently delete a lead list and all its leads. This action cannot be undone.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list to delete'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.deleteLeadList(args.list_id, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_lead_engagements',
+  definition: {
+    name: 'get_lead_engagements',
+    description: 'Get engagement history for a lead including emails sent/received, LinkedIn messages, and manual engagement events.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead to get engagements for'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of engagement events to return (default 20)'
+        }
+      },
+      required: ['list_id', 'lead_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadEngagements(args.list_id, args.lead_id, context?.userId, args.limit);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'add_lead_engagement',
+  definition: {
+    name: 'add_lead_engagement',
+    description: 'Record a manual engagement event for a lead (e.g., phone calls, meetings, notes). The event_type must start with "custom." prefix.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead to record engagement for'
+        },
+        event_type: {
+          type: 'string',
+          description: 'Type of engagement event (must start with "custom.", e.g., "custom.phone_call", "custom.meeting", "custom.note")'
+        },
+        event_data: {
+          type: 'object',
+          description: 'Optional data associated with the event (e.g., { "notes": "Discussed pricing", "duration": "30 min" })',
+          additionalProperties: true
+        },
+        event_date: {
+          type: 'string',
+          description: 'Optional ISO date string for when the engagement occurred (defaults to now)'
+        }
+      },
+      required: ['list_id', 'lead_id', 'event_type']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.addLeadEngagement(
+      args.list_id, args.lead_id, args.event_type,
+      context?.userId, args.event_data, args.event_date
+    );
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'send_email_to_lead',
+  definition: {
+    name: 'send_email_to_lead',
+    description: 'Send the existing email draft to a lead using the configured CRM sender. The lead must have an email address and an email draft already created.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead to send the email to'
+        }
+      },
+      required: ['list_id', 'lead_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.sendEmailToLead(args.list_id, args.lead_id, context?.userId);
   }
 });
 

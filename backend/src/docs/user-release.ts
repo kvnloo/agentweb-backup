@@ -7,6 +7,21 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-21',
+    changes: [
+      'CRM Management Tools in Agent Mode',
+      '- 10 new CRM tools let you manage your entire lead pipeline through Agent Mode chat',
+      '- Browse and search leads: "get_leads" supports text search with ICP and engaged filters; "search_leads" supports structured field-level criteria (equals, contains, starts_with, greater_than, less_than, etc.)',
+      '- View full lead details including ICP match info, email drafts, and recent engagement history',
+      '- Update any standard or custom field on a lead, or delete leads in bulk (up to 100 per call)',
+      '- Update lead list settings: rename, change description, toggle ICP/engaged filters, and configure auto-draft',
+      '- Delete a lead list and all its leads permanently',
+      '- View engagement history for a lead (emails, LinkedIn, manual events) with summary counts',
+      '- Record manual engagements like phone calls and meetings with custom event types',
+      '- Send a lead\'s existing email draft through the configured CRM sender with automatic sender resolution (lead → list → account default)',
+    ],
+  },
+  {
     date: '2026-02-20',
     changes: [
       'GTM Tracker: Common Work Items Library',
