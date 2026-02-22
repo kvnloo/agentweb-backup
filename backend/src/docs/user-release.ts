@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-22',
+    changes: [
+      'Agent Mode: Chat Input Fix',
+      '- Fixed a bug where the typed message stayed visible in the chat input while a new session was being created, instead of clearing immediately after sending',
+    ],
+  },
+  {
     date: '2026-02-21',
     changes: [
       'CRM Management Tools in Agent Mode',
