@@ -4232,6 +4232,667 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  public async getLeads(listId: string, userId: string, options: {
+    search?: string;
+    icpOnly?: boolean;
+    engagedOnly?: boolean;
+    limit?: number;
+  } = {}): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const limit = Math.min(Math.max(options.limit || 20, 1), 50);
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const searchQuery = (options.search || '').trim().toLowerCase();
+      const matchingLeads: any[] = [];
+      let cursor: any = undefined;
+
+      // Use flag indexes for efficiency when filtering by ICP or engaged
+      const useIcpIndex = options.icpOnly && !options.engagedOnly;
+      const useEngagedIndex = options.engagedOnly && !options.icpOnly;
+
+      while (matchingLeads.length < limit) {
+        const pageSize = 200;
+        let pageResult: any;
+
+        if (useIcpIndex) {
+          pageResult = await crmDb.getLeadsByICPFlag(listId, 1, pageSize, cursor);
+        } else if (useEngagedIndex) {
+          pageResult = await crmDb.getLeadsByEngagedFlag(listId, 1, pageSize, cursor);
+        } else {
+          pageResult = await crmDb.getLeadsByListId(listId, pageSize, cursor);
+        }
+
+        const leads = pageResult.items || [];
+
+        for (const lead of leads) {
+          if (matchingLeads.length >= limit) break;
+
+          // Apply ICP filter (if using general index)
+          if (options.icpOnly && !useIcpIndex && !lead.icpMatch?.isMatch) continue;
+          // Apply engaged filter (if using general index)
+          if (options.engagedOnly && !useEngagedIndex && !lead.isEngaged) continue;
+          // Apply both filters when using ICP index but also need engaged
+          if (options.icpOnly && options.engagedOnly && useIcpIndex && !lead.isEngaged) continue;
+          if (options.icpOnly && options.engagedOnly && useEngagedIndex && !lead.icpMatch?.isMatch) continue;
+
+          // Apply text search
+          if (searchQuery) {
+            const fields = [
+              lead.email, lead.firstName, lead.lastName,
+              `${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+              lead.company, lead.phone, lead.title, lead.notes, lead.linkedin
+            ];
+            const standardMatch = fields.some((v: any) => String(v || '').toLowerCase().includes(searchQuery));
+            if (!standardMatch) {
+              const customFields = lead.customFields && typeof lead.customFields === 'object' ? lead.customFields : {};
+              const customMatch = Object.values(customFields).some((v: any) => String(v || '').toLowerCase().includes(searchQuery))
+                || Object.keys(customFields).some((k: string) => k.toLowerCase().includes(searchQuery));
+              if (!customMatch) continue;
+            }
+          }
+
+          matchingLeads.push(lead);
+        }
+
+        cursor = pageResult.lastEvaluatedKey;
+        if (!cursor) break;
+      }
+
+      return {
+        success: true,
+        message: `Found ${matchingLeads.length} lead(s)`,
+        leads: matchingLeads.map((lead: any) => ({
+          leadId: lead.leadId,
+          email: lead.email || '',
+          firstName: lead.firstName || '',
+          lastName: lead.lastName || '',
+          company: lead.company || '',
+          title: lead.title || '',
+          icpMatch: lead.icpMatch?.isMatch || false,
+          icpScore: lead.icpMatch?.score || null,
+          engagementCount: lead.engagementCount || 0,
+          isEngaged: lead.isEngaged || false
+        })),
+        matchCount: matchingLeads.length,
+        listName: list.name
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting leads:', error);
+      return { success: false, message: 'Failed to get leads', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async searchLeads(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, limit?: number): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const effectiveLimit = Math.min(Math.max(limit || 20, 1), 50);
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      if (!filters || filters.length === 0) {
+        return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
+      }
+
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin'];
+      const matchingLeads: any[] = [];
+      let cursor: any = undefined;
+
+      while (matchingLeads.length < effectiveLimit) {
+        const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
+        const leads = pageResult.items || [];
+
+        for (const lead of leads) {
+          if (matchingLeads.length >= effectiveLimit) break;
+
+          const allMatch = filters.every((filter: any) => {
+            const { field, operator, value } = filter;
+
+            // Resolve the field value
+            let fieldValue: any;
+            if (field === 'icpScore') {
+              fieldValue = lead.icpMatch?.score;
+            } else if (field === 'icpMatch') {
+              fieldValue = lead.icpMatch?.isMatch;
+            } else if (field === 'engagementCount') {
+              fieldValue = lead.engagementCount;
+            } else if (standardFields.includes(field)) {
+              fieldValue = lead[field];
+            } else {
+              // Custom field
+              fieldValue = lead.customFields?.[field];
+            }
+
+            // Evaluate operator
+            switch (operator) {
+              case 'is_empty':
+                return fieldValue === null || fieldValue === undefined || fieldValue === '';
+              case 'is_not_empty':
+                return fieldValue !== null && fieldValue !== undefined && fieldValue !== '';
+              case 'equals':
+                if (typeof fieldValue === 'boolean') return fieldValue === value;
+                return String(fieldValue || '').toLowerCase() === String(value || '').toLowerCase();
+              case 'not_equals':
+                return String(fieldValue || '').toLowerCase() !== String(value || '').toLowerCase();
+              case 'contains':
+                return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
+              case 'starts_with':
+                return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
+              case 'greater_than':
+                return Number(fieldValue) > Number(value);
+              case 'less_than':
+                return Number(fieldValue) < Number(value);
+              default:
+                return false;
+            }
+          });
+
+          if (allMatch) {
+            matchingLeads.push(lead);
+          }
+        }
+
+        cursor = pageResult.lastEvaluatedKey;
+        if (!cursor) break;
+      }
+
+      return {
+        success: true,
+        message: `Found ${matchingLeads.length} matching lead(s)`,
+        leads: matchingLeads.map((lead: any) => ({
+          leadId: lead.leadId,
+          email: lead.email || '',
+          firstName: lead.firstName || '',
+          lastName: lead.lastName || '',
+          company: lead.company || '',
+          title: lead.title || '',
+          icpMatch: lead.icpMatch?.isMatch || false,
+          icpScore: lead.icpMatch?.score || null,
+          engagementCount: lead.engagementCount || 0,
+          isEngaged: lead.isEngaged || false,
+          customFields: lead.customFields || {}
+        })),
+        matchCount: matchingLeads.length,
+        listName: list.name
+      };
+    } catch (error) {
+      console.error('AgentMode: Error searching leads:', error);
+      return { success: false, message: 'Failed to search leads', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async getLeadDetails(listId: string, leadId: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+
+      // Get engagement count and recent engagements
+      const [engagementCount, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId),
+        crmDb.getLeadEngagements(listId, leadId, userId)
+      ]);
+      const engagements = engagementsResult.engagements || [];
+
+      // Truncate HTML email drafts to text preview
+      let emailDraftPreview = null;
+      if (lead.emailDraft) {
+        const draft = lead.emailDraft;
+        emailDraftPreview = {
+          subject: draft.subject || '',
+          format: draft.format || 'text',
+          contentPreview: draft.htmlContent
+            ? draft.htmlContent.replace(/<[^>]*>/g, '').substring(0, 200) + (draft.htmlContent.length > 200 ? '...' : '')
+            : (draft.textContent || '').substring(0, 200) + ((draft.textContent || '').length > 200 ? '...' : ''),
+          hasFullContent: true
+        };
+      }
+
+      return {
+        success: true,
+        message: `Lead details for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        lead: {
+          leadId: lead.leadId,
+          email: lead.email || '',
+          firstName: lead.firstName || '',
+          lastName: lead.lastName || '',
+          company: lead.company || '',
+          title: lead.title || '',
+          phone: lead.phone || '',
+          notes: lead.notes || '',
+          linkedin: lead.linkedin || '',
+          customFields: lead.customFields || {},
+          icpMatch: lead.icpMatch || null,
+          isEngaged: lead.isEngaged || false,
+          emailDraft: emailDraftPreview,
+          messageDraft: lead.messageDraft || null,
+          selectedSenderId: lead.selectedSenderId || null,
+          createdAt: lead.createdAt,
+          updatedAt: lead.updatedAt
+        },
+        engagementSummary: {
+          total: engagementCount.total,
+          last7Days: engagementCount.last7Days,
+          totalAllMessages: engagementCount.totalAllMessages
+        },
+        recentEngagements: engagements.slice(0, 10).map((eng: any) => ({
+          eventType: eng.eventType,
+          createdAt: eng.createdAt,
+          eventData: eng.eventData || {},
+          // Truncate email content for preview
+          emailContentPreview: eng.emailContent
+            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 150) + '...'
+            : undefined
+        })),
+        listName: list.name
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting lead details:', error);
+      return { success: false, message: 'Failed to get lead details', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async updateLead(listId: string, leadId: string, updates: Record<string, any>, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+      }
+
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+
+      if (!updates || Object.keys(updates).length === 0) {
+        return { success: false, message: 'No updates provided', error: 'Provide at least one field to update' };
+      }
+
+      // Separate standard fields from custom fields
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const dbUpdates: any = {};
+      const customFieldUpdates: Record<string, any> = {};
+
+      Object.entries(updates).forEach(([key, value]) => {
+        if (standardFields.includes(key)) {
+          dbUpdates[key] = value;
+        } else {
+          customFieldUpdates[key] = value;
+        }
+      });
+
+      // Merge custom fields with existing ones
+      if (Object.keys(customFieldUpdates).length > 0) {
+        dbUpdates.customFields = {
+          ...(lead.customFields || {}),
+          ...customFieldUpdates
+        };
+      }
+
+      await crmDb.updateLead(listId, leadId, dbUpdates);
+
+      return {
+        success: true,
+        message: `Lead updated successfully (${Object.keys(updates).join(', ')})`,
+        updatedFields: Object.keys(updates)
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating lead:', error);
+      return { success: false, message: 'Failed to update lead', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async deleteLeads(listId: string, leadIds: string[], userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+      }
+
+      if (!leadIds || leadIds.length === 0) {
+        return { success: false, message: 'No lead IDs provided', error: 'Provide at least one lead ID to delete' };
+      }
+
+      if (leadIds.length > 100) {
+        return { success: false, message: 'Too many leads', error: 'Maximum 100 leads can be deleted per call' };
+      }
+
+      let successCount = 0;
+      let failCount = 0;
+      const errors: string[] = [];
+
+      // Delete sequentially to avoid lead count race conditions
+      for (const id of leadIds) {
+        try {
+          await crmDb.deleteLead(listId, id);
+          successCount++;
+        } catch (err) {
+          failCount++;
+          errors.push(`Failed to delete lead ${id}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
+      }
+
+      return {
+        success: successCount > 0,
+        message: `Deleted ${successCount} lead(s)${failCount > 0 ? `, ${failCount} failed` : ''}`,
+        successCount,
+        failCount,
+        errors: errors.length > 0 ? errors : undefined
+      };
+    } catch (error) {
+      console.error('AgentMode: Error deleting leads:', error);
+      return { success: false, message: 'Failed to delete leads', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async updateLeadList(listId: string, updates: {
+    name?: string;
+    description?: string;
+    icpsOnly?: boolean;
+    engagedOnly?: boolean;
+    autoDraftEnabled?: boolean;
+    autoDraftInstruction?: string;
+  }, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+      }
+
+      // Filter out undefined values
+      const filteredUpdates: any = {};
+      if (updates.name !== undefined) {
+        if (!updates.name.trim()) {
+          return { success: false, message: 'Invalid name', error: 'List name cannot be empty' };
+        }
+        filteredUpdates.name = updates.name;
+      }
+      if (updates.description !== undefined) filteredUpdates.description = updates.description;
+      if (updates.icpsOnly !== undefined) filteredUpdates.icpsOnly = updates.icpsOnly;
+      if (updates.engagedOnly !== undefined) filteredUpdates.engagedOnly = updates.engagedOnly;
+      if (updates.autoDraftEnabled !== undefined) filteredUpdates.autoDraftEnabled = updates.autoDraftEnabled;
+      if (updates.autoDraftInstruction !== undefined) filteredUpdates.autoDraftInstruction = updates.autoDraftInstruction;
+
+      if (Object.keys(filteredUpdates).length === 0) {
+        return { success: false, message: 'No updates provided', error: 'Provide at least one field to update' };
+      }
+
+      await crmDb.updateLeadList(listId, filteredUpdates);
+
+      return {
+        success: true,
+        message: `Lead list "${updates.name || list.name}" updated successfully`,
+        updatedFields: Object.keys(filteredUpdates)
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating lead list:', error);
+      return { success: false, message: 'Failed to update lead list', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async deleteLeadList(listId: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
+      }
+
+      const listName = list.name;
+      const leadCount = list.leadCount || 0;
+
+      await crmDb.deleteLeadList(listId);
+
+      return {
+        success: true,
+        message: `Lead list "${listName}" and its ${leadCount} lead(s) have been permanently deleted`,
+        deletedListName: listName,
+        deletedLeadCount: leadCount
+      };
+    } catch (error) {
+      console.error('AgentMode: Error deleting lead list:', error);
+      return { success: false, message: 'Failed to delete lead list', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async getLeadEngagements(listId: string, leadId: string, userId: string, limit?: number): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+      }
+
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+
+      const [engagementCount, engagementsResult] = await Promise.all([
+        crmDb.getLeadEngagementCount(listId, leadId, userId),
+        crmDb.getLeadEngagements(listId, leadId, userId)
+      ]);
+      const engagements = engagementsResult.engagements || [];
+
+      const limitedEngagements = engagements.slice(0, effectiveLimit);
+
+      return {
+        success: true,
+        message: `Found ${limitedEngagements.length} engagement(s) for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        engagementSummary: {
+          total: engagementCount.total,
+          last7Days: engagementCount.last7Days,
+          totalAllMessages: engagementCount.totalAllMessages
+        },
+        engagements: limitedEngagements.map((eng: any) => ({
+          eventId: eng.eventId,
+          eventType: eng.eventType,
+          createdAt: eng.createdAt,
+          eventData: eng.eventData || {},
+          // Truncate HTML email content to text preview
+          emailContentPreview: eng.emailContent
+            ? eng.emailContent.replace(/<[^>]*>/g, '').substring(0, 200) + (eng.emailContent.length > 200 ? '...' : '')
+            : undefined
+        })),
+        leadName: `${lead.firstName || ''} ${lead.lastName || ''}`.trim()
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting lead engagements:', error);
+      return { success: false, message: 'Failed to get lead engagements', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async addLeadEngagement(
+    listId: string, leadId: string, eventType: string,
+    userId: string, eventData?: any, eventDate?: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Validate event type
+      if (!eventType.startsWith('custom.')) {
+        return { success: false, message: 'Invalid event type', error: 'Event type must start with "custom." prefix (e.g., "custom.phone_call", "custom.meeting")' };
+      }
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+      }
+
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+
+      await crmDb.addLeadEngagement(listId, leadId, {
+        eventType,
+        eventData: eventData || {},
+        createdAt: eventDate || new Date().toISOString()
+      });
+
+      return {
+        success: true,
+        message: `Engagement "${eventType}" recorded for ${lead.firstName || ''} ${lead.lastName || ''}`.trim(),
+        eventType,
+        leadName: `${lead.firstName || ''} ${lead.lastName || ''}`.trim()
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding lead engagement:', error);
+      return { success: false, message: 'Failed to add lead engagement', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async sendEmailToLead(listId: string, leadId: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
+      }
+
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist in this list' };
+      }
+
+      if (!lead.email) {
+        return { success: false, message: 'No email address', error: 'This lead does not have an email address' };
+      }
+
+      if (!lead.emailDraft) {
+        return { success: false, message: 'No email draft', error: 'This lead does not have an email draft. Use update_email_draft_for_lead to create one first.' };
+      }
+
+      const draft = lead.emailDraft;
+      if (!draft.subject) {
+        return { success: false, message: 'Incomplete draft', error: 'The email draft is missing a subject line' };
+      }
+
+      if (!draft.htmlContent && !draft.textContent) {
+        return { success: false, message: 'Incomplete draft', error: 'The email draft has no content' };
+      }
+
+      // Resolve sender: lead → list → account default → first available
+      const sendersResult = await this.getCrmSenders(userId);
+      if (!sendersResult.success || sendersResult.senders.length === 0) {
+        return { success: false, message: 'No senders configured', error: 'No CRM sender emails are configured. Please set up a sender email in CRM settings first.' };
+      }
+
+      let sender = null;
+      if (lead.selectedSenderId) {
+        sender = sendersResult.senders.find((s: any) => s.id === lead.selectedSenderId);
+      }
+      if (!sender && list.listSenderId) {
+        sender = sendersResult.senders.find((s: any) => s.id === list.listSenderId);
+      }
+      if (!sender) {
+        const defaultSenderId = sendersResult.defaultSenderId;
+        sender = defaultSenderId
+          ? sendersResult.senders.find((s: any) => s.id === defaultSenderId)
+          : sendersResult.senders[0];
+      }
+
+      if (!sender) {
+        return { success: false, message: 'No valid sender', error: 'Could not resolve a valid sender email' };
+      }
+
+      // Send via Resend
+      const { resendService } = await import('./resendService');
+      const from = `${sender.fromName} <${sender.email}>`;
+      const result = await resendService.sendEmail({
+        from,
+        to: lead.email,
+        subject: draft.subject,
+        html: draft.htmlContent,
+        text: draft.textContent
+      });
+
+      if (!result) {
+        return { success: false, message: 'Email send failed', error: 'Failed to send email via Resend' };
+      }
+
+      // Clear the draft after successful send
+      await crmDb.updateLead(listId, leadId, { emailDraft: null });
+
+      return {
+        success: true,
+        message: `Email sent successfully to ${lead.email}`,
+        emailId: result.id,
+        to: lead.email,
+        from: sender.email,
+        subject: draft.subject
+      };
+    } catch (error) {
+      console.error('AgentMode: Error sending email to lead:', error);
+      return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   public async updateEmailDraftForLead(listId: string, leadId: string, instruction: string, sessionId: string, userId: string, emailFormat?: 'text' | 'html'): Promise<any> {
     try {
       const { crmDb } = await import('./db');
