@@ -81,6 +81,29 @@ npm run dev
 3. Monitor task execution and results
 4. Set up alerts for task completion or failures
 
+## Agent Mode: Skills vs Work Plans
+
+Agent Mode has two places to encode process knowledge: **Skills** (via `systemPrompt` and tool bundles) and **Work Plans** (via predefined step sequences). The key question is: *is the knowledge about how to use tools, or about what steps to follow?*
+
+### Put process knowledge in a Skill when:
+
+- **The knowledge is about tool usage** — how to call tools correctly, what parameters matter, domain-specific constraints. Example: "When creating Meta ad campaigns, always set the objective before configuring the audience" belongs in the Meta Ads skill's `systemPrompt`.
+- **It applies across many workflows** — if the same guidance is relevant no matter what the user's specific goal is, it belongs in the skill. Example: "LinkedIn posts perform best under 1300 characters" applies whether the user is doing a one-off post or running a full content campaign.
+- **It's about context the AI needs to use tools well** — API quirks, field mappings, validation rules, recommended defaults. This lives in the skill so it's available any time those tools are loaded.
+
+### Put process knowledge in a Work Plan when:
+
+- **The knowledge is a specific sequence of steps** — a defined workflow where order matters and steps build on each other. Example: "Client onboarding" = analyze website → create brand guidelines → build marketing strategy → generate content.
+- **Steps have validation gates** — use `requiredFunctionCalls` to enforce that specific tools are called before a step can be marked complete. Example: step "Create brand guidelines" requires `update_brand_guidelines` to actually be called.
+- **Progress tracking matters** — the user needs to see where they are, pause, and resume later. Work plans persist in the session and show status per step.
+- **The workflow is goal-specific** — unlike skill knowledge (always relevant when tools are loaded), a work plan is tied to one specific outcome the user is trying to achieve.
+
+### Decision rule
+
+If you can express the knowledge as *"when using tool X, always/never do Y"*, put it in the **skill's `systemPrompt`**. If you can express it as *"to achieve goal X, do steps A → B → C in order"*, put it in a **predefined work plan**.
+
+They often work together: a skill provides the tools and usage guidance, and a work plan orchestrates those tools into a specific workflow.
+
 ## Audit Report PDF
 
 To convert the security audit markdown to PDF, use `pandoc`:
@@ -1641,6 +1664,244 @@ The tests are located in `backend/src/__tests__/` and include:
    - Check that mocks are properly configured in test files
 
 **Note**: Tests are not run automatically in the CI/CD pipeline to avoid complexity and reduce build times. Run tests locally before submitting pull requests.
+
+## Cloud Test Environment
+
+Ephemeral test environments on EC2 for manual testing. Runs backend, partner-portal, and customer-portal as Docker containers on a single instance.
+
+### One-Time Admin Setup
+
+1. **Grant yourself temporary permissions** by adding an inline IAM policy:
+
+```bash
+aws iam put-user-policy \
+  --user-name YOUR_IAM_USERNAME \
+  --policy-name SetupAgentWebTestInfra \
+  --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:PutSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:agentweb/test-env/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:PutRolePolicy",
+        "iam:CreateInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::992382574572:role/agentweb-test-env-ec2-role",
+        "arn:aws:iam::992382574572:instance-profile/agentweb-test-env-profile"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}'
+```
+
+2. **Run the infrastructure setup script:**
+
+```bash
+./test-env/setup-infra.sh
+```
+
+This creates a Secrets Manager secret (stores backend `.env`) and an IAM instance profile (EC2 can read the secret). Per-instance security groups are created automatically at launch time, locked to the developer's IP.
+
+3. **Remove the temporary policy** after setup completes:
+
+```bash
+aws iam delete-user-policy \
+  --user-name YOUR_IAM_USERNAME \
+  --policy-name SetupAgentWebTestInfra
+```
+
+### Developer IAM Policy
+
+Each developer needs the `AgentWebTestEnvDeveloper` policy attached to their IAM user. This grants permission to launch and terminate test-env instances only (production instances are protected via tag-based conditions).
+
+```bash
+aws iam put-user-policy \
+  --user-name DEVELOPER_IAM_USERNAME \
+  --policy-name AgentWebTestEnvDeveloper \
+  --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowDescribeOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeKeyPairs",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeImages",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSecurityGroupManagement",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowLaunchTestEnvInstance",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-west-2:992382574572:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/purpose": "test-env"
+        }
+      }
+    },
+    {
+      "Sid": "AllowLaunchTestEnvResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-west-2:992382574572:volume/*",
+        "arn:aws:ec2:us-west-2:992382574572:network-interface/*",
+        "arn:aws:ec2:us-west-2:992382574572:key-pair/*",
+        "arn:aws:ec2:us-west-2:992382574572:security-group/*",
+        "arn:aws:ec2:us-west-2:992382574572:subnet/*",
+        "arn:aws:ec2:us-west-2::image/*",
+        "arn:aws:ec2:us-west-2::snapshot/*"
+      ]
+    },
+    {
+      "Sid": "AllowTagging",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowTerminateTestEnvOnly",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:ResourceTag/purpose": "test-env"
+        }
+      }
+    },
+    {
+      "Sid": "AllowCreateKeyPair",
+      "Effect": "Allow",
+      "Action": "ec2:CreateKeyPair",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowPassTestEnvRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::992382574572:role/agentweb-test-env-ec2-role"
+    },
+    {
+      "Sid": "AllowSSMForAMI",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameters",
+      "Resource": "arn:aws:ssm:us-west-2::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "AllowGetInstanceProfile",
+      "Effect": "Allow",
+      "Action": "iam:GetInstanceProfile",
+      "Resource": "arn:aws:iam::992382574572:instance-profile/agentweb-test-env-profile"
+    },
+    {
+      "Sid": "AllowGetCallerIdentity",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}'
+```
+
+To remove the policy later:
+
+```bash
+aws iam delete-user-policy \
+  --user-name DEVELOPER_IAM_USERNAME \
+  --policy-name AgentWebTestEnvDeveloper
+```
+
+### Developer Usage
+
+Each environment is automatically named from your AWS username and repo folder name (e.g., `myuser-agentweb`). This means each clone gets its own isolated instance — scripts in `agentweb/` can only operate the `agentweb` instance, and scripts in `agentweb1/` can only operate the `agentweb1` instance.
+
+1. On first launch, the script will interactively create `.test-env.config` and an EC2 key pair if needed. Or create it manually in the repo root:
+
+```
+KEY_NAME=my-keypair
+KEY_FILE=~/.ssh/my-keypair.pem
+```
+
+2. Launch and use:
+
+```bash
+./test-env/test-env.sh launch              # Spin up environment
+./test-env/test-env.sh sync                # Sync all code changes
+./test-env/test-env.sh sync backend        # Sync just backend
+./test-env/test-env.sh allow-ip 203.0.113.50  # Grant another person access
+./test-env/test-env.sh revoke-ip 203.0.113.50 # Revoke their access
+./test-env/test-env.sh logs backend        # View backend logs
+./test-env/test-env.sh ssh                 # SSH into instance
+./test-env/test-env.sh status              # Check status
+./test-env/test-env.sh list                # Show this folder's environment
+./test-env/test-env.sh teardown            # Terminate instance
+```
+
+- **IP-restricted by default** — only the developer's IP (auto-detected at launch) can access the instance. Use `allow-ip` / `revoke-ip` to manage access for others.
+- Backend `.env` is fetched from Secrets Manager automatically (developers never see it)
+- Code is synced via `rsync` (only changed files)
+- Instance auto-terminates after **7 days of inactivity**
+- Ports: backend=3001, partner-portal=5173, customer-portal=5174
+- Multiple clones (e.g., `agentweb/`, `agentweb1/`) run fully independent environments
+
+### Updating the Backend .env Secret
+
+When backend environment variables change, an admin can update the stored secret:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id agentweb/test-env/backend-env \
+  --secret-string "$(cat backend/.env)" \
+  --region us-west-2
+```
 
 ## Deployment to AWS Elastic Beanstalk
 

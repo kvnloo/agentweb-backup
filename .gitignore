@@ -113,6 +113,12 @@ OAI_CONFIG_LIST
 growth-chat/
 customer-portal/
 
+# Test environment local state
+.test-env-state
+.test-env/
+.test-env.config
+.env.test-env
+
 # Force include Claude Code settings for team
 !.claude/
 !.claude/settings.local.json 

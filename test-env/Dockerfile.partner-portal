@@ -1,0 +1,24 @@
+FROM node:20-alpine AS build
+
+WORKDIR /app
+
+COPY partner-portal/package.json partner-portal/package-lock.json ./
+RUN npm ci
+
+COPY partner-portal/ .
+
+ARG VITE_API_URL
+ARG VITE_CUSTOMER_FRONTEND_URL
+ARG VITE_DEBUG=true
+ARG VITE_LIST_FULL_LLM_NAMES
+
+RUN npm run build
+
+# Production stage — serve static files
+FROM node:20-alpine
+WORKDIR /app
+RUN npm install -g serve
+COPY --from=build /app/dist ./dist
+
+EXPOSE 5173
+CMD ["serve", "-s", "dist", "-l", "5173"]
