@@ -1,7 +1,11 @@
 import { getLinkedInCredentials, getMetaCredentials } from '../utils/secretsManager';
+import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
 const META_GRAPH_VERSION = 'v24.0';
+const META_INSTAGRAM_VERSION = 'v21.0';
+
+export type MetaFlowType = 'marketing' | 'instagram';
 
 // LinkedIn account type for OAuth
 export type LinkedInAccountType = 'personal' | 'company';
@@ -33,17 +37,33 @@ export const INTEGRATION_CONFIG = {
 
   meta: {
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/meta/callback`,
-    // All scopes for unified OAuth - user can connect ad accounts AND/OR pages
-    scopes: [
+
+    // Flow 1: Marketing API — Facebook + Instagram ads
+    marketingScopes: [
       'ads_management',
       'ads_read',
       'business_management',
       'pages_show_list',
       'pages_read_engagement'
     ],
+
+    instagramScopes: [
+      'instagram_business_basic',
+      'instagram_business_content_publish',
+      'instagram_business_manage_comments',
+      'instagram_business_manage_insights'
+    ],
+
+    // Facebook Login endpoints (flows: marketing, pages)
     authorizationUrl: `https://www.facebook.com/${META_GRAPH_VERSION}/dialog/oauth`,
     tokenUrl: `https://graph.facebook.com/${META_GRAPH_VERSION}/oauth/access_token`,
-    apiBaseUrl: `https://graph.facebook.com/${META_GRAPH_VERSION}`
+    apiBaseUrl: `https://graph.facebook.com/${META_GRAPH_VERSION}`,
+    pagesApiBaseUrl: `https://graph.facebook.com/${META_GRAPH_VERSION}`,
+
+    // Instagram Business Login endpoints (flow: instagram)
+    instagramAuthorizationUrl: `https://api.instagram.com/oauth/authorize`,
+    instagramTokenUrl: `https://api.instagram.com/oauth/access_token`,
+    instagramApiBaseUrl: `https://graph.instagram.com/${META_INSTAGRAM_VERSION}`
   }
 };
 
@@ -85,24 +105,49 @@ export async function getLinkedInConfig(): Promise<LinkedInConfig> {
   };
 }
 
-import { MetaConfig } from '../types/meta';
+/**
+ * Returns scopes and auth/token URLs for a given Meta OAuth flow.
+ */
+export function getMetaFlowConfig(flow: MetaFlowType): {
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  apiBaseUrl: string;
+} {
+  const cfg = INTEGRATION_CONFIG.meta;
+  if (flow === 'instagram') {
+    return {
+      scopes: cfg.instagramScopes,
+      authorizationUrl: cfg.instagramAuthorizationUrl,
+      tokenUrl: cfg.instagramTokenUrl,
+      apiBaseUrl: cfg.instagramApiBaseUrl
+    };
+  }
+  // default: marketing
+  return {
+    scopes: cfg.marketingScopes,
+    authorizationUrl: cfg.authorizationUrl,
+    tokenUrl: cfg.tokenUrl,
+    apiBaseUrl: cfg.apiBaseUrl
+  };
+}
 
 /**
  * Fetches Meta OAuth configuration from AWS Secrets Manager.
  * Credentials are stored at dev/AgentWeb/Meta (or prod/... for production)
  */
-export async function getMetaConfig(): Promise<MetaConfig> {
-  // Fetch credentials from AWS Secrets Manager
+export async function getMetaConfig(flow?: MetaFlowType): Promise<MetaConfig> {
   const credentials = await getMetaCredentials();
+  const flowCfg = getMetaFlowConfig(flow || 'marketing');
 
   return {
     clientId: credentials.clientId,
     clientSecret: credentials.clientSecret,
     redirectUri: INTEGRATION_CONFIG.meta.redirectUri,
-    scopes: INTEGRATION_CONFIG.meta.scopes,
-    authorizationUrl: INTEGRATION_CONFIG.meta.authorizationUrl,
-    tokenUrl: INTEGRATION_CONFIG.meta.tokenUrl,
-    apiBaseUrl: INTEGRATION_CONFIG.meta.apiBaseUrl
+    scopes: flowCfg.scopes,
+    authorizationUrl: flowCfg.authorizationUrl,
+    tokenUrl: flowCfg.tokenUrl,
+    apiBaseUrl: flowCfg.apiBaseUrl
   };
 }
 

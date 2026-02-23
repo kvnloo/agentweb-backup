@@ -13,6 +13,7 @@ import {
   getGCSPPrivateKey,
   getLinkedInCredentials,
   getMetaCredentials,
+  getInstagramCredentials,
   getGoogleDriveServiceAccountEmail
 } from '../../utils/secretsManager';
 
@@ -363,6 +364,85 @@ describe('secretsManager utils', () => {
       await getMetaCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/MetaApp'
+      });
+    });
+  });
+
+  describe('getInstagramCredentials', () => {
+    it('should return Instagram credentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            clientId: 'ig-client-123',
+            clientSecret: 'ig-secret-456'
+          })
+        })
+      });
+
+      const result = await getInstagramCredentials();
+      expect(result.clientId).toBe('ig-client-123');
+      expect(result.clientSecret).toBe('ig-secret-456');
+    });
+
+    it('should throw error when credentials are empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getInstagramCredentials()).rejects.toThrow(
+        'Failed to fetch Instagram credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when clientId is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientSecret: 'secret' })
+        })
+      });
+
+      await expect(getInstagramCredentials()).rejects.toThrow(
+        'Failed to fetch Instagram credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when clientSecret is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'client' })
+        })
+      });
+
+      await expect(getInstagramCredentials()).rejects.toThrow(
+        'Failed to fetch Instagram credentials from Secrets Manager'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getInstagramCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/InstagramApp'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getInstagramCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/InstagramApp'
       });
     });
   });

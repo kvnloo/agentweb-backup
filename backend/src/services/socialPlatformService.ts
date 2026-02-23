@@ -1,5 +1,6 @@
 import { SocialPlatformAdapter } from './adapters/socialPlatformTypes';
 import { LinkedInAdapter } from './adapters/linkedInAdapter';
+import { InstagramAdapter } from './adapters/instagramAdapter';
 
 // Re-export types for consumers
 export * from './adapters/socialPlatformTypes';
@@ -10,16 +11,17 @@ export * from './adapters/socialPlatformTypes';
 export const socialPlatformService = {
   adapters: {
     linkedin: new LinkedInAdapter(),
+    instagram: new InstagramAdapter(),
     // Future adapters:
     // twitter: new TwitterAdapter(),
-    // facebook: new FacebookAdapter(),
-    // instagram: new InstagramAdapter(),
   } as Record<string, SocialPlatformAdapter>,
 
   getAdapter(platform: string): SocialPlatformAdapter {
-    const adapter = this.adapters[platform];
+    const adapterName = platform.toLowerCase();
+
+    const adapter = this.adapters[adapterName];
     if (!adapter) {
-      throw new Error(`Platform ${platform} is not supported`);
+      throw new Error(`Platform ${adapterName} is not supported`);
     }
     return adapter;
   }

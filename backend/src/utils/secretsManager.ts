@@ -178,7 +178,51 @@ export async function getMetaCredentials(): Promise<MetaCredentials> {
     console.error('Error fetching Meta credentials from Secrets Manager:', error);
     throw new Error('Failed to fetch Meta credentials from Secrets Manager');
   }
-  
+
+}
+
+/**
+ * Interface for Instagram Business Login credentials.
+ * These are separate from the Facebook App credentials and are used
+ * exclusively for the Instagram Business Login OAuth flow.
+ */
+export interface InstagramCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Instagram Business Login OAuth credentials from AWS Secrets Manager.
+ * Reads instagramClientId and instagramClientSecret from the Meta secret.
+ *
+ * Secret location: dev/AgentWeb/Meta (or prod/... for production)
+ *
+ * @returns The Instagram client credentials (clientId and clientSecret)
+ */
+export async function getInstagramCredentials(): Promise<InstagramCredentials> {
+  try {
+     const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/InstagramApp'
+      : 'dev/AgentWeb/InstagramApp';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Instagram credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as InstagramCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Instagram credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Instagram credentials:', error);
+    throw new Error('Failed to fetch Instagram credentials from Secrets Manager');
+  }
 }
 
 /**
@@ -212,5 +256,5 @@ export async function getGoogleDriveServiceAccountEmail(): Promise<string> {
     console.error('Error fetching Google Drive service account email:', error);
     throw new Error('Failed to fetch Google Drive service account email from Secrets Manager');
   }
-}
 
+}
