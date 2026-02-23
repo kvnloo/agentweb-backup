@@ -37,6 +37,7 @@ export const INTEGRATION_CONFIG = {
 
   meta: {
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/meta/callback`,
+    instagramRedirectUri: `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/oauth/instagram/callback`,
 
     // Flow 1: Marketing API — Facebook + Instagram ads
     marketingScopes: [

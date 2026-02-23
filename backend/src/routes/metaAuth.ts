@@ -120,7 +120,9 @@ router.get('/init', authenticateToken, async (req: any, res) => {
             ? await getInstagramCredentials()
             : await getMetaCredentials();
         const flowCfg = getMetaFlowConfig(flow);
-        const redirectUri = INTEGRATION_CONFIG.meta.redirectUri;
+        const redirectUri = flow === 'instagram' 
+            ? INTEGRATION_CONFIG.meta.instagramRedirectUri 
+            : INTEGRATION_CONFIG.meta.redirectUri;
 
 
         const state = generateState(userId, { flow });
@@ -149,10 +151,23 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 router.get('/callback', async (req, res) => {
     try {
         const { code, state } = req.query;
-        if (!code || !state) {
-            return res.redirect(`${process.env.CUSTOMER_FRONTEND_URL}/oauth/meta/callback?error=missing_parameters`);
+        let flow = 'marketing';
+        
+        if (state) {
+            try {
+                const stateData = verifyState(state as string);
+                if (stateData.flow) flow = stateData.flow;
+            } catch (e) {
+                // Ignore state errors here, will be caught in /finalize
+            }
         }
-        res.redirect(`${process.env.CUSTOMER_FRONTEND_URL}/oauth/meta/callback?code=${code}&state=${state}`);
+        
+        const frontendPath = flow === 'instagram' ? '/oauth/instagram/callback' : '/oauth/meta/callback';
+        
+        if (!code || !state) {
+            return res.redirect(`${process.env.CUSTOMER_FRONTEND_URL}${frontendPath}?error=missing_parameters`);
+        }
+        res.redirect(`${process.env.CUSTOMER_FRONTEND_URL}${frontendPath}?code=${code}&state=${state}`);
     } catch (error) {
         console.error('[Meta Callback] Error:', error);
         res.redirect(`${process.env.CUSTOMER_FRONTEND_URL}/oauth/meta/callback?error=server_error`);
@@ -194,7 +209,9 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             ? await getInstagramCredentials()
             : await getMetaCredentials();
         const flowCfg = getMetaFlowConfig(flow);
-        const redirectUri = INTEGRATION_CONFIG.meta.redirectUri;
+        const redirectUri = flow === 'instagram' 
+            ? INTEGRATION_CONFIG.meta.instagramRedirectUri 
+            : INTEGRATION_CONFIG.meta.redirectUri;
 
         console.log(`[Meta Finalize] flow=${flow} — exchanging code for token...`);
 
