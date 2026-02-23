@@ -4127,10 +4127,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  public async createLeadList(name: string, description: string, userId: string): Promise<any> {
+  public async createLeadList(name: string, description: string, userId: string, listType?: 'sales' | 'customers'): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const list = await crmDb.createLeadList(userId, name, description);
+      const list = await crmDb.createLeadList(userId, name, description, undefined, undefined, undefined, undefined, undefined, undefined, listType);
 
       return {
         success: true,
@@ -4177,7 +4177,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
       // Convert leads array to the format expected by batchCreateLeads
       // Extract standard fields and put everything else in customFields
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       const formattedLeads = leads.map((lead: any) => {
         const formatted: any = {};
         const customFields: Record<string, any> = {};
@@ -4241,6 +4241,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     search?: string;
     icpOnly?: boolean;
     engagedOnly?: boolean;
+    status?: string;
     limit?: number;
   } = {}): Promise<any> {
     try {
@@ -4288,6 +4289,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
           // Apply both filters when using ICP index but also need engaged
           if (options.icpOnly && options.engagedOnly && useIcpIndex && !lead.isEngaged) continue;
           if (options.icpOnly && options.engagedOnly && useEngagedIndex && !lead.icpMatch?.isMatch) continue;
+          // Apply status filter
+          if (options.status && (lead.status || null) !== options.status) continue;
 
           // Apply text search
           if (searchQuery) {
@@ -4322,6 +4325,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
           lastName: lead.lastName || '',
           company: lead.company || '',
           title: lead.title || '',
+          status: lead.status || null,
+          dealValue: lead.dealValue ?? null,
+          dealCurrency: lead.dealCurrency || 'USD',
           icpMatch: lead.icpMatch?.isMatch || false,
           icpScore: lead.icpMatch?.score || null,
           engagementCount: lead.engagementCount || 0,
@@ -4354,7 +4360,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       const matchingLeads: any[] = [];
       let cursor: any = undefined;
 
@@ -4547,7 +4553,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
       }
 
       // Separate standard fields from custom fields
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       const dbUpdates: any = {};
       const customFieldUpdates: Record<string, any> = {};
 
@@ -4565,6 +4571,20 @@ When a user requests client onboarding or says "onboard new client" or similar:
           ...(lead.customFields || {}),
           ...customFieldUpdates
         };
+      }
+
+      // Auto-create status change engagement if status changed
+      if (dbUpdates.status !== undefined && (lead.status || null) !== dbUpdates.status) {
+        await crmDb.addLeadEngagement(listId, leadId, {
+          eventType: 'status.changed',
+          eventData: {
+            from: lead.status || null,
+            to: dbUpdates.status,
+            dealValue: dbUpdates.dealValue ?? lead.dealValue ?? null,
+            dealCurrency: dbUpdates.dealCurrency ?? lead.dealCurrency ?? 'USD',
+          },
+          createdAt: new Date().toISOString(),
+        });
       }
 
       await crmDb.updateLead(listId, leadId, dbUpdates);
@@ -4636,6 +4656,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
     engagedOnly?: boolean;
     autoDraftEnabled?: boolean;
     autoDraftInstruction?: string;
+    statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+    listType?: 'sales' | 'customers';
   }, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -4662,6 +4684,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
       if (updates.engagedOnly !== undefined) filteredUpdates.engagedOnly = updates.engagedOnly;
       if (updates.autoDraftEnabled !== undefined) filteredUpdates.autoDraftEnabled = updates.autoDraftEnabled;
       if (updates.autoDraftInstruction !== undefined) filteredUpdates.autoDraftInstruction = updates.autoDraftInstruction;
+      if (updates.statusConfig !== undefined) filteredUpdates.statusConfig = updates.statusConfig;
+      if (updates.listType !== undefined) {
+        if (list.listType) {
+          return { success: false, message: 'List type already set', error: 'listType is already set and cannot be changed' };
+        }
+        filteredUpdates.listType = updates.listType;
+      }
 
       if (Object.keys(filteredUpdates).length === 0) {
         return { success: false, message: 'No updates provided', error: 'Provide at least one field to update' };
@@ -4677,6 +4706,150 @@ When a user requests client onboarding or says "onboard new client" or similar:
     } catch (error) {
       console.error('AgentMode: Error updating lead list:', error);
       return { success: false, message: 'Failed to update lead list', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async updateLeadStatus(
+    listId: string,
+    leadId: string,
+    status: string,
+    userId: string,
+    dealValue?: number | null,
+    dealCurrency?: string,
+    notes?: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+      }
+
+      // Fetch current lead
+      const existingLead = await crmDb.getLeadById(listId, leadId);
+      if (!existingLead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist' };
+      }
+
+      const previousStatus = existingLead.status || null;
+      const updates: any = { status };
+      if (dealValue !== undefined) updates.dealValue = dealValue;
+      if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
+
+      await crmDb.updateLead(listId, leadId, updates);
+
+      // Auto-create status change engagement
+      if (previousStatus !== status) {
+        await crmDb.addLeadEngagement(listId, leadId, {
+          eventType: 'status.changed',
+          eventData: {
+            from: previousStatus,
+            to: status,
+            dealValue: dealValue ?? existingLead.dealValue ?? null,
+            dealCurrency: dealCurrency ?? existingLead.dealCurrency ?? 'USD',
+            ...(notes ? { notes } : {}),
+          },
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      const leadName = [existingLead.firstName, existingLead.lastName].filter(Boolean).join(' ') || existingLead.email || leadId;
+      return {
+        success: true,
+        message: `Status for "${leadName}" updated from "${previousStatus || 'unset'}" to "${status}"`,
+        previousStatus,
+        newStatus: status,
+        leadName,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating lead status:', error);
+      return { success: false, message: 'Failed to update lead status', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async getLeadListStatuses(listId: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
+      }
+
+      const defaultStatuses = [
+        { value: 'new', label: 'New', color: 'gray', type: 'active' },
+        { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
+        { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
+        { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
+        { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
+        { value: 'won', label: 'Won', color: 'green', type: 'won' },
+        { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
+        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+      ];
+
+      return {
+        success: true,
+        statuses: list.statusConfig || defaultStatuses,
+        listName: list.name,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting lead list statuses:', error);
+      return { success: false, message: 'Failed to get lead list statuses', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async configureLeadStatuses(
+    listId: string,
+    statusConfig: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
+    userId: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+      }
+
+      // Validate statusConfig entries
+      for (const entry of statusConfig) {
+        if (!entry.value || !entry.label || !entry.color || !entry.type) {
+          return { success: false, message: 'Invalid status config', error: 'Each status entry must have value, label, color, and type' };
+        }
+        if (!['active', 'won', 'lost', 'churned'].includes(entry.type)) {
+          return { success: false, message: 'Invalid status type', error: `Status type must be one of: active, won, lost, churned. Got: "${entry.type}"` };
+        }
+      }
+
+      // Check for duplicate values
+      const values = statusConfig.map(s => s.value);
+      const uniqueValues = new Set(values);
+      if (values.length !== uniqueValues.size) {
+        return { success: false, message: 'Duplicate status values', error: 'Each status value must be unique' };
+      }
+
+      await crmDb.updateLeadList(listId, { statusConfig });
+
+      return {
+        success: true,
+        message: `Status configuration updated for list "${list.name}" with ${statusConfig.length} statuses`,
+        statuses: statusConfig,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error configuring lead statuses:', error);
+      return { success: false, message: 'Failed to configure lead statuses', error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
 

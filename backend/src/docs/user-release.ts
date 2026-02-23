@@ -7,6 +7,27 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-23',
+    changes: [
+      'CRM: Prospect Status Tracking',
+      '- Leads now have a configurable status pipeline with stages like New, Contacted, Qualified, Proposal Sent, Negotiating, Won, Lost, and Churned',
+      '- Each lead list has its own status configuration that can be customized in the Edit Lead List dialog — add, remove, or reorder stages with color and type (active/won/lost/churned)',
+      '- Quick status updates via an inline dropdown directly in the leads table; no need to open the lead details',
+      '- Deal value and currency tracking for won, lost, and negotiating stages, displayed inline next to the status badge',
+      '- Status filter dropdown above the leads table for server-side filtering using a dedicated DynamoDB Global Secondary Index',
+      '- Status changes are automatically recorded in the engagement timeline as "status.changed" events with before/after values',
+      'CRM: Sales vs. Customers List Types',
+      '- Lead lists can now be designated as "Sales" or "Customers" when created, each with a default pipeline (sales stages vs. customer lifecycle: Onboarding, Active, At Risk, Churned)',
+      '- A colored badge (blue for Sales, purple for Customers) is shown next to the list name in the sidebar',
+      '- Pipeline description text updates dynamically based on list type',
+      'CRM: Agent Mode Status Tools',
+      '- New "update_lead_status" tool to change a lead\'s status and optionally set deal value/currency',
+      '- New "get_lead_list_statuses" tool to retrieve the configured statuses for a list',
+      '- New "configure_lead_statuses" tool to customize the status pipeline for a list',
+      '- Existing tools (get_leads, search_leads, update_lead, create_lead_list, update_lead_list) now support status, deal value, and list type fields',
+    ],
+  },
+  {
     date: '2026-02-21',
     changes: [
       'CRM Management Tools in Agent Mode',
