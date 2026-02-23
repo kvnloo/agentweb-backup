@@ -99,7 +99,8 @@
       "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh list:*)",
       "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh sync:*)",
       "Bash(tail:*)",
-      "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh ssh:*)"
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh ssh:*)",
+      "Bash(gh repo:*)"
     ]
   }
 }
