@@ -1,3 +1,11 @@
+# February 23, 2026: Enabled Branch Protection on Main
+
+Neither `AgentWebPro/agentweb` nor `AgentWebPro/agentweb-customer-portal` had branch protection on `main`. Enabled protection on both repos via GitHub API with: strict status checks, force pushes blocked, branch deletion blocked, and enforce admins enabled. Required PR reviews was initially set to 1 but later removed.
+
+**Verification:** After each change, read back the protection settings via `gh api repos/{owner}/{repo}/branches/main/protection` and confirmed `protected: true`, correct rule values, and `enforce_admins.enabled: true`. Also confirmed `required_pull_request_reviews` was absent from the response after removing the review requirement.
+
+---
+
 # February 21, 2026: Agent Mode — Dropped Assistant Messages (Aaron's Session)
 
 ## Problem
