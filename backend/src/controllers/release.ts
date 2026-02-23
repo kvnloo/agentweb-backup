@@ -8,6 +8,15 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-02-23",
+    changes: [
+      "Repository Security",
+      "- Enabled branch protection on main for both agentweb and customer-portal repos",
+      "- Direct pushes to main are now blocked; all changes require a pull request",
+      "- Force pushes and branch deletion are blocked, including for admins",
+    ],
+  },
+  {
     date: "2026-02-18",
     changes: [
       "Simplified CI/CD Deployment",

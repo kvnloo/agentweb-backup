@@ -1,3 +1,9 @@
+# February 23, 2026: Enabled Branch Protection on Main
+
+Neither `AgentWebPro/agentweb` nor `AgentWebPro/agentweb-customer-portal` had branch protection on `main`. Enabled protection on both repos via GitHub API with: 1 required approving PR review, strict status checks, force pushes blocked, branch deletion blocked, and enforce admins enabled.
+
+---
+
 # February 21, 2026: Agent Mode — Dropped Assistant Messages (Aaron's Session)
 
 ## Problem
