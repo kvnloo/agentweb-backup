@@ -11,7 +11,7 @@ set -euo pipefail
 # Usage:
 #   ./test-env.sh launch   [--key-name K] [--key-file F] [--instance-type T]
 #   ./test-env.sh teardown
-#   ./test-env.sh sync     [backend|partner-portal|customer-portal]
+#   ./test-env.sh sync     [backend|partner-portal|customer-portal|test-env-access]
 #   ./test-env.sh status
 #   ./test-env.sh allow-ip <IP>         # grant another IP access
 #   ./test-env.sh revoke-ip <IP>        # revoke an IP's access
@@ -30,6 +30,7 @@ CONFIG_FILE="$REPO_ROOT/.test-env.config"
 REGION="${AWS_REGION:-us-west-2}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
 SECRET_NAME="${SECRET_NAME:-agentweb/test-env/backend-env}"
+SECRET_NAME_ACCESS="${SECRET_NAME_ACCESS:-agentweb/test-env/test-env-access-env}"
 PROFILE_NAME="agentweb-test-env-profile"
 SSH_USER="ec2-user"
 
@@ -243,6 +244,14 @@ EOF
       --cidr "$MY_IP/32" \
       --region "$REGION" > /dev/null
   done
+
+  # IP allowlist service must be publicly accessible so users can self-register
+  aws ec2 authorize-security-group-ingress \
+    --group-id "$SG_ID" \
+    --protocol tcp \
+    --port 5175 \
+    --cidr "0.0.0.0/0" \
+    --region "$REGION" > /dev/null
   log "Security group: $SG_ID"
 
   # Look up instance profile
@@ -320,7 +329,7 @@ EOF
   log "Instance ready. Syncing code..."
   _do_sync "all"
 
-  # Fetch .env from Secrets Manager and start services
+  # Fetch .env files from Secrets Manager
   log "Fetching backend .env from Secrets Manager..."
   remote "aws secretsmanager get-secret-value \
     --secret-id '$SECRET_NAME' \
@@ -328,9 +337,18 @@ EOF
     --query SecretString --output text \
     > /home/ec2-user/agentweb/.env.test-env"
 
+  log "Fetching test-env-access .env from Secrets Manager..."
+  remote "aws secretsmanager get-secret-value \
+    --secret-id '$SECRET_NAME_ACCESS' \
+    --region '$REGION' \
+    --query SecretString --output text \
+    > /home/ec2-user/agentweb/.env.test-env-access"
+
   log "Building and starting services (this may take a few minutes on first run)..."
   remote "cd /home/ec2-user/agentweb/test-env && \
     export PUBLIC_IP='$PUBLIC_IP' && \
+    export SG_ID='$SG_ID' && \
+    export AWS_REGION='$REGION' && \
     docker compose build && \
     docker compose up -d"
 
@@ -347,6 +365,7 @@ EOF
   echo -e " ${CYAN}Backend:${NC}          http://$PUBLIC_IP:3001"
   echo -e " ${CYAN}Partner Portal:${NC}   http://$PUBLIC_IP:5173"
   echo -e " ${CYAN}Customer Portal:${NC}  http://$PUBLIC_IP:5174"
+  echo -e " ${CYAN}IP Allowlist:${NC}     http://$PUBLIC_IP:5175"
   echo -e " ${CYAN}SSH:${NC}              ssh -i $KEY_FILE $SSH_USER@$PUBLIC_IP"
   echo ""
   echo -e " ${YELLOW}Auto-shutdown:${NC}    After 7 days of inactivity"
@@ -426,13 +445,13 @@ _do_sync() {
 
   case "$service" in
     all)
-      targets=("backend" "partner-portal" "customer-portal" "test-env")
+      targets=("backend" "partner-portal" "customer-portal" "test-env-access" "test-env")
       ;;
-    backend|partner-portal|customer-portal)
+    backend|partner-portal|customer-portal|test-env-access)
       targets=("$service" "test-env")
       ;;
     *)
-      err "Unknown service: $service (use backend, partner-portal, or customer-portal)"
+      err "Unknown service: $service (use backend, partner-portal, customer-portal, or test-env-access)"
       exit 1
       ;;
   esac
@@ -481,11 +500,15 @@ cmd_sync() {
     log "Rebuilding all services..."
     remote "cd /home/ec2-user/agentweb/test-env && \
       export PUBLIC_IP='$PUBLIC_IP' && \
+      export SG_ID='$SG_ID' && \
+      export AWS_REGION='$REGION' && \
       docker compose up -d --build"
   else
     log "Rebuilding $service..."
     remote "cd /home/ec2-user/agentweb/test-env && \
       export PUBLIC_IP='$PUBLIC_IP' && \
+      export SG_ID='$SG_ID' && \
+      export AWS_REGION='$REGION' && \
       docker compose up -d --build $service"
   fi
 
@@ -578,6 +601,7 @@ cmd_allow_ip() {
   echo -e " ${CYAN}Backend:${NC}          http://$PUBLIC_IP:3001"
   echo -e " ${CYAN}Partner Portal:${NC}   http://$PUBLIC_IP:5173"
   echo -e " ${CYAN}Customer Portal:${NC}  http://$PUBLIC_IP:5174"
+  echo -e " ${CYAN}IP Allowlist:${NC}     http://$PUBLIC_IP:5175"
 }
 
 cmd_revoke_ip() {
@@ -662,7 +686,7 @@ case "$CMD" in
     echo "  launch       Launch a new test environment"
     echo "  teardown     Terminate a test environment"
     echo "  teardown-all Terminate ALL test environments"
-    echo "  sync         Sync code and rebuild [backend|partner-portal|customer-portal|all]"
+    echo "  sync         Sync code and rebuild [backend|partner-portal|customer-portal|test-env-access|all]"
     echo "  status       Show environment status"
     echo "  list         List all active environments"
     echo "  allow-ip IP  Grant another IP access to this environment"

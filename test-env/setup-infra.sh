@@ -14,6 +14,7 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-2}"
 SECRET_NAME="agentweb/test-env/backend-env"
+SECRET_NAME_ACCESS="agentweb/test-env/test-env-access-env"
 ROLE_NAME="agentweb-test-env-ec2-role"
 PROFILE_NAME="agentweb-test-env-profile"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -65,6 +66,41 @@ else
 fi
 echo ""
 
+log "=== Secrets Manager (test-env-access) ==="
+
+if aws secretsmanager describe-secret --secret-id "$SECRET_NAME_ACCESS" --region "$REGION" &>/dev/null; then
+  log "Secret '$SECRET_NAME_ACCESS' already exists."
+  echo ""
+  warn "To update it, run:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_ACCESS' \\"
+  warn "    --secret-string \"\$(cat test-env-access/.env)\" \\"
+  warn "    --region $REGION"
+else
+  log "Creating secret '$SECRET_NAME_ACCESS'..."
+
+  if [[ -f "test-env-access/.env" ]]; then
+    aws secretsmanager create-secret \
+      --name "$SECRET_NAME_ACCESS" \
+      --description "test-env-access .env (Resend API key) for test environments" \
+      --secret-string "$(cat test-env-access/.env)" \
+      --region "$REGION" > /dev/null
+    log "Secret created from test-env-access/.env"
+  else
+    aws secretsmanager create-secret \
+      --name "$SECRET_NAME_ACCESS" \
+      --description "test-env-access .env (Resend API key) for test environments" \
+      --secret-string "RESEND_API_KEY=re_xxxx" \
+      --region "$REGION" > /dev/null
+    warn "Secret created with placeholder. Update it with:"
+    warn "  aws secretsmanager put-secret-value \\"
+    warn "    --secret-id '$SECRET_NAME_ACCESS' \\"
+    warn "    --secret-string \"\$(cat test-env-access/.env)\" \\"
+    warn "    --region $REGION"
+  fi
+fi
+echo ""
+
 ###############################################################################
 # 2. IAM role + instance profile
 ###############################################################################
@@ -83,11 +119,24 @@ TRUST_POLICY='{
 # Permissions — read the specific secret
 PERMISSIONS_POLICY='{
   "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["secretsmanager:GetSecretValue"],
-    "Resource": "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME"'*"
-  }]
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": [
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME"'*",
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_ACCESS"'*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ec2:AuthorizeSecurityGroupIngress"],
+      "Resource": "arn:aws:ec2:'"$REGION"':'"$ACCOUNT_ID"':security-group/*",
+      "Condition": {
+        "StringEquals": { "ec2:ResourceTag/purpose": "test-env" }
+      }
+    }
+  ]
 }'
 
 if aws iam get-role --role-name "$ROLE_NAME" &>/dev/null; then
@@ -98,14 +147,16 @@ else
     --role-name "$ROLE_NAME" \
     --assume-role-policy-document "$TRUST_POLICY" \
     --description "EC2 role for agentweb test environments" > /dev/null
-
-  aws iam put-role-policy \
-    --role-name "$ROLE_NAME" \
-    --policy-name "test-env-secrets-access" \
-    --policy-document "$PERMISSIONS_POLICY"
-
-  log "IAM role created with Secrets Manager read access."
+  log "IAM role created."
 fi
+
+# Always update the inline policy to ensure it covers all secrets
+log "Updating IAM policy on '$ROLE_NAME'..."
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "test-env-secrets-access" \
+  --policy-document "$PERMISSIONS_POLICY"
+log "IAM policy updated (Secrets Manager read access)."
 
 if aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" &>/dev/null; then
   log "Instance profile '$PROFILE_NAME' already exists."
