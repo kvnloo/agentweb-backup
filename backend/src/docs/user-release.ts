@@ -7,6 +7,24 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-23',
+    changes: [
+      'GTM Tracker: Full Plan Management in Agent Mode',
+      '- 9 new GTM tools bring the total to 12, enabling complete plan lifecycle management through Agent Mode chat',
+      '- Update plan metadata (title, description, DRI, due date) with "update_gtm_plan"',
+      '- Add phases and work items to existing plans with "add_gtm_phase" and "add_gtm_work_items"',
+      '- Update individual work items (status, notes, DRI, due date) and phases with "update_gtm_work_item" and "update_gtm_phase"',
+      '- Delete plans, phases, or individual work items with "delete_gtm_items"',
+      '- Browse and import common work item templates into plans with "get_gtm_common_items" and "add_gtm_common_items"',
+      '- Send status reports for an entire plan or a single phase via email with "send_gtm_status_report"',
+      '- Optional per-update email notifications to plan owner, plan DRI, phase DRI, or work item DRI',
+      'Partner Portal: Paste Tools in Skill Editor',
+      '- New "Paste Tools" button in the skill editor lets admins paste a comma- or newline-separated list of tool names instead of selecting each one from the dropdown',
+      '- Live feedback shows how many tool names were recognized and lists any unrecognized names',
+      '- Pasting directly into the tool search field also works — multi-tool paste is auto-detected and parsed',
+    ],
+  },
+  {
     date: '2026-02-22',
     changes: [
       'Agent Mode: LinkedIn Post Formatting',

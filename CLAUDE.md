@@ -785,6 +785,13 @@ When making changes, these files are critical to understand:
 - Email notifications use both SMTP and Resend API
 - Slack integration for GTM plan approvals via webhooks
 
+## Test Account
+
+For manual testing on test/staging environments:
+
+- **Email:** `test@example.com`
+- **Password:** `Test123!`
+
 ## Cloud Test Environment
 
 Ephemeral test environments can be launched on EC2 for manual testing. All files live in `test-env/`.

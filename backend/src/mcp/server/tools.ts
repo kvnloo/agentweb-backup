@@ -1363,6 +1363,443 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'update_gtm_plan',
+  definition: {
+    name: 'update_gtm_plan',
+    description: 'Update a GTM plan\'s title, description, DRI (Directly Responsible Individual), or due date. Only provided fields will be updated.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan to update'
+        },
+        title: {
+          type: 'string',
+          description: 'New title for the plan'
+        },
+        description: {
+          type: 'string',
+          description: 'New description for the plan'
+        },
+        dri: {
+          type: 'string',
+          description: 'New DRI (Directly Responsible Individual) email address. Pass empty string to remove.'
+        },
+        due_date: {
+          type: 'string',
+          description: 'New due date for the plan (ISO date string). Pass empty string to remove.'
+        }
+      },
+      required: ['plan_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.updateGTMPlan(args.plan_id, {
+      title: args.title,
+      description: args.description,
+      dri: args.dri,
+      dueDate: args.due_date,
+    }, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'add_gtm_phase',
+  definition: {
+    name: 'add_gtm_phase',
+    description: 'Add a new phase to an existing GTM plan. Optionally include work items for the phase.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        title: {
+          type: 'string',
+          description: 'Title of the new phase'
+        },
+        description: {
+          type: 'string',
+          description: 'Optional description of the phase'
+        },
+        dri: {
+          type: 'string',
+          description: 'Optional DRI email address for the phase'
+        },
+        due_date: {
+          type: 'string',
+          description: 'Optional due date for the phase (ISO date string)'
+        },
+        work_items: {
+          type: 'array',
+          description: 'Optional array of work items to add to the phase',
+          items: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the work item'
+              },
+              description: {
+                type: 'string',
+                description: 'Optional description of the work item'
+              },
+              dri: {
+                type: 'string',
+                description: 'Optional DRI email address for the work item'
+              },
+              due_date: {
+                type: 'string',
+                description: 'Optional due date for the work item (ISO date string)'
+              }
+            },
+            required: ['title']
+          }
+        }
+      },
+      required: ['plan_id', 'title']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.addGTMPhase(args.plan_id, {
+      title: args.title,
+      description: args.description,
+      dri: args.dri,
+      dueDate: args.due_date,
+      workItems: args.work_items,
+    }, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'add_gtm_work_items',
+  definition: {
+    name: 'add_gtm_work_items',
+    description: 'Add one or more work items to an existing phase in a GTM plan.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        phase_id: {
+          type: 'string',
+          description: 'The unique identifier of the phase to add work items to'
+        },
+        work_items: {
+          type: 'array',
+          description: 'Array of work items to add',
+          items: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the work item'
+              },
+              description: {
+                type: 'string',
+                description: 'Optional description of the work item'
+              },
+              dri: {
+                type: 'string',
+                description: 'Optional DRI email address for the work item'
+              },
+              due_date: {
+                type: 'string',
+                description: 'Optional due date for the work item (ISO date string)'
+              }
+            },
+            required: ['title']
+          }
+        }
+      },
+      required: ['plan_id', 'phase_id', 'work_items']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.addGTMWorkItems(args.plan_id, args.phase_id, args.work_items, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_gtm_work_item',
+  definition: {
+    name: 'update_gtm_work_item',
+    description: 'Update a specific work item in a GTM plan. Can change status, notes, DRI, title, description, or due date. Optionally send notifications about the changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        phase_id: {
+          type: 'string',
+          description: 'The unique identifier of the phase containing the work item'
+        },
+        work_item_id: {
+          type: 'string',
+          description: 'The unique identifier of the work item to update'
+        },
+        status: {
+          type: 'string',
+          description: 'New status: "pending", "in_progress", "completed", or "skipped"'
+        },
+        notes: {
+          type: 'string',
+          description: 'Notes for the work item. Pass empty string to clear.'
+        },
+        dri: {
+          type: 'string',
+          description: 'New DRI email address. Pass empty string to remove.'
+        },
+        title: {
+          type: 'string',
+          description: 'New title for the work item'
+        },
+        description: {
+          type: 'string',
+          description: 'New description for the work item. Pass empty string to clear.'
+        },
+        due_date: {
+          type: 'string',
+          description: 'New due date (ISO date string). Pass empty string to remove.'
+        },
+        notify_user: {
+          type: 'boolean',
+          description: 'Whether to notify the plan owner about the change'
+        },
+        notify_item_poc: {
+          type: 'boolean',
+          description: 'Whether to notify the work item DRI about the change'
+        },
+        notify_phase_poc: {
+          type: 'boolean',
+          description: 'Whether to notify the phase DRI about the change'
+        },
+        notify_plan_poc: {
+          type: 'boolean',
+          description: 'Whether to notify the plan DRI about the change'
+        },
+        notification_message: {
+          type: 'string',
+          description: 'Optional custom message to include in the notification'
+        }
+      },
+      required: ['plan_id', 'phase_id', 'work_item_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.updateGTMWorkItem(args.plan_id, args.phase_id, args.work_item_id, {
+      status: args.status,
+      notes: args.notes,
+      dri: args.dri,
+      title: args.title,
+      description: args.description,
+      dueDate: args.due_date,
+    }, {
+      notifyUser: args.notify_user,
+      notifyItemPoc: args.notify_item_poc,
+      notifyPhasePoc: args.notify_phase_poc,
+      notifyPlanPoc: args.notify_plan_poc,
+      message: args.notification_message,
+    }, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_gtm_phase',
+  definition: {
+    name: 'update_gtm_phase',
+    description: 'Update a phase in a GTM plan. Can change title, description, DRI, or due date. Phase status is auto-calculated from work items and cannot be set manually.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        phase_id: {
+          type: 'string',
+          description: 'The unique identifier of the phase to update'
+        },
+        title: {
+          type: 'string',
+          description: 'New title for the phase'
+        },
+        description: {
+          type: 'string',
+          description: 'New description for the phase. Pass empty string to clear.'
+        },
+        dri: {
+          type: 'string',
+          description: 'New DRI email address. Pass empty string to remove.'
+        },
+        due_date: {
+          type: 'string',
+          description: 'New due date (ISO date string). Pass empty string to remove.'
+        }
+      },
+      required: ['plan_id', 'phase_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.updateGTMPhase(args.plan_id, args.phase_id, {
+      title: args.title,
+      description: args.description,
+      dri: args.dri,
+      dueDate: args.due_date,
+    }, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_gtm_items',
+  definition: {
+    name: 'delete_gtm_items',
+    description: 'Delete a GTM plan, phase, or work item. Provide only plan_id to delete the entire plan. Add phase_id to delete a specific phase. Add both phase_id and work_item_id to delete a specific work item.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        phase_id: {
+          type: 'string',
+          description: 'Optional phase ID. If provided with plan_id, deletes the phase. If provided with work_item_id, targets the work item in this phase.'
+        },
+        work_item_id: {
+          type: 'string',
+          description: 'Optional work item ID. Requires phase_id. Deletes the specific work item from the phase.'
+        }
+      },
+      required: ['plan_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.deleteGTMItems(args.plan_id, args.phase_id, args.work_item_id, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_gtm_common_items',
+  definition: {
+    name: 'get_gtm_common_items',
+    description: 'Fetch the catalog of common GTM items (template work items) organized by category. Users can select items from this catalog to add to their plans.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getGTMCommonItems();
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'add_gtm_common_items',
+  definition: {
+    name: 'add_gtm_common_items',
+    description: 'Import selected template items from the common items catalog into a GTM plan phase. Items can be added to an existing phase or a new phase.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        items: {
+          type: 'array',
+          description: 'Array of items to add (each with title and optional description)',
+          items: {
+            type: 'object',
+            properties: {
+              title: {
+                type: 'string',
+                description: 'Title of the item'
+              },
+              description: {
+                type: 'string',
+                description: 'Optional description of the item'
+              }
+            },
+            required: ['title']
+          }
+        },
+        target_phase_id: {
+          type: 'string',
+          description: 'ID of an existing phase to add items to. Either this or new_phase_name must be provided.'
+        },
+        new_phase_name: {
+          type: 'string',
+          description: 'Name for a new phase to create and add items to. Either this or target_phase_id must be provided.'
+        }
+      },
+      required: ['plan_id', 'items']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.addGTMCommonItems(args.plan_id, args.items, args.target_phase_id, args.new_phase_name, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'send_gtm_status_report',
+  definition: {
+    name: 'send_gtm_status_report',
+    description: 'Send a status report email for a GTM plan or a specific phase. Choose recipients from plan owner, plan DRI, phase DRI(s). Omit phase_id for a plan-level report.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        plan_id: {
+          type: 'string',
+          description: 'The unique identifier (planId) of the GTM plan'
+        },
+        phase_id: {
+          type: 'string',
+          description: 'Optional phase ID. If provided, sends a phase-level report. If omitted, sends a plan-level report.'
+        },
+        notify_user: {
+          type: 'boolean',
+          description: 'Whether to send the report to the plan owner'
+        },
+        notify_plan_poc: {
+          type: 'boolean',
+          description: 'Whether to send the report to the plan DRI'
+        },
+        notify_phase_poc: {
+          type: 'boolean',
+          description: 'For phase reports: whether to send to the phase DRI'
+        },
+        notify_phase_pocs: {
+          type: 'boolean',
+          description: 'For plan reports: whether to send to all phase DRIs'
+        },
+        message: {
+          type: 'string',
+          description: 'Optional custom message to include in the status report'
+        }
+      },
+      required: ['plan_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.sendGTMStatusReport(args.plan_id, args.phase_id, {
+      notifyUser: args.notify_user,
+      notifyPlanPoc: args.notify_plan_poc,
+      notifyPhasePoc: args.notify_phase_poc,
+      notifyPhasePocs: args.notify_phase_pocs,
+      message: args.message,
+    }, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'get_lead_lists',
   definition: {
     name: 'get_lead_lists',

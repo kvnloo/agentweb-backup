@@ -7,7 +7,9 @@ jest.mock('aws-sdk', () => {
   const mockQuery = jest.fn();
   const mockGet = jest.fn();
   const mockPut = jest.fn();
-  
+  const mockUpdate = jest.fn();
+  const mockDelete = jest.fn();
+
   return {
     config: {
       update: jest.fn(),
@@ -17,6 +19,8 @@ jest.mock('aws-sdk', () => {
         query: mockQuery,
         get: mockGet,
         put: mockPut,
+        update: mockUpdate,
+        delete: mockDelete,
       })),
     },
     SecretsManager: jest.fn(() => ({
@@ -56,25 +60,47 @@ jest.mock('../utils/secretsManager', () => ({
   getGCSPPrivateKey: jest.fn().mockResolvedValue('mock-private-key'),
 }));
 
+// Mock GTM plan notification service
+jest.mock('../services/gtmPlanNotificationService', () => ({
+  sendGTMPlanUpdateNotifications: jest.fn().mockResolvedValue(undefined),
+  sendPhaseStatusReport: jest.fn().mockResolvedValue(undefined),
+  sendPlanStatusReport: jest.fn().mockResolvedValue(undefined),
+}));
+
+// Mock settings service
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(),
+    setSetting: jest.fn(),
+  },
+}));
+
 const { DynamoDB } = require('aws-sdk');
 const { chatbotDb } = require('../services/chatbotService');
 const { userDb } = require('../services/db');
+const { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } = require('../services/gtmPlanNotificationService');
+const { settingsService } = require('../services/settingsService');
 
 describe('Agent Mode Service - GTM Plan Functions', () => {
   let agentModeService: AgentModeService;
   let mockQuery: jest.Mock;
   let mockGet: jest.Mock;
   let mockPut: jest.Mock;
+  let mockUpdate: jest.Mock;
+  let mockDelete: jest.Mock;
 
   const mockUserId = 'user-123';
   const mockSessionId = 'session-123';
   const mockUserEmail = 'user@example.com';
   const mockPlanId = 'plan-123';
+  const mockPhaseId = 'phase-1';
+  const mockWorkItemId = 'item-1';
   const mockPlan = {
     planId: mockPlanId,
     userId: mockUserId,
     title: 'Test GTM Plan',
     description: 'Test Description',
+    status: 'in_progress',
     phases: [
       {
         id: 'phase-1',
@@ -104,11 +130,15 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
     mockQuery = jest.fn().mockReturnValue({ promise: jest.fn() });
     mockGet = jest.fn().mockReturnValue({ promise: jest.fn() });
     mockPut = jest.fn().mockReturnValue({ promise: jest.fn() });
+    mockUpdate = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: mockPlan }) });
+    mockDelete = jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
 
     const mockDynamoDB = {
       query: mockQuery,
       get: mockGet,
       put: mockPut,
+      update: mockUpdate,
+      delete: mockDelete,
     };
 
     (DynamoDB.DocumentClient as jest.Mock).mockImplementation(() => mockDynamoDB);
@@ -930,6 +960,770 @@ describe('Agent Mode Service - GTM Plan Functions', () => {
           }),
         })
       );
+    });
+  });
+
+  // Helper to set up mockGet to return a plan (deep-cloned to avoid cross-test mutation)
+  function setupMockGet(plan: any) {
+    mockGet.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: JSON.parse(JSON.stringify(plan)) }) });
+  }
+
+  function setupMockGetNotFound() {
+    mockGet.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: undefined }) });
+  }
+
+  function setupMockUpdate(attributes: any = mockPlan) {
+    mockUpdate.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: JSON.parse(JSON.stringify(attributes)) }) });
+  }
+
+  function setupMockDelete() {
+    mockDelete.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+  }
+
+  describe('Tool Definitions - New Tools', () => {
+    const newToolNames = [
+      'update_gtm_plan',
+      'add_gtm_phase',
+      'add_gtm_work_items',
+      'update_gtm_work_item',
+      'update_gtm_phase',
+      'delete_gtm_items',
+      'get_gtm_common_items',
+      'add_gtm_common_items',
+      'send_gtm_status_report',
+    ];
+
+    newToolNames.forEach((toolName) => {
+      it(`should include ${toolName} in available tools`, () => {
+        const tools = agentModeService.getAvailableTools();
+        const tool = tools.find((t: any) => t.function?.name === toolName);
+        expect(tool).toBeDefined();
+        expect(tool?.function?.name).toBe(toolName);
+      });
+    });
+
+    it('should require plan_id for update_gtm_plan', () => {
+      const tools = agentModeService.getAvailableTools();
+      const tool = tools.find((t: any) => t.function?.name === 'update_gtm_plan');
+      expect(tool?.function?.parameters?.required).toContain('plan_id');
+    });
+
+    it('should require plan_id and title for add_gtm_phase', () => {
+      const tools = agentModeService.getAvailableTools();
+      const tool = tools.find((t: any) => t.function?.name === 'add_gtm_phase');
+      expect(tool?.function?.parameters?.required).toContain('plan_id');
+      expect(tool?.function?.parameters?.required).toContain('title');
+    });
+
+    it('should require plan_id, phase_id, work_items for add_gtm_work_items', () => {
+      const tools = agentModeService.getAvailableTools();
+      const tool = tools.find((t: any) => t.function?.name === 'add_gtm_work_items');
+      expect(tool?.function?.parameters?.required).toContain('plan_id');
+      expect(tool?.function?.parameters?.required).toContain('phase_id');
+      expect(tool?.function?.parameters?.required).toContain('work_items');
+    });
+
+    it('should require plan_id, phase_id, work_item_id for update_gtm_work_item', () => {
+      const tools = agentModeService.getAvailableTools();
+      const tool = tools.find((t: any) => t.function?.name === 'update_gtm_work_item');
+      expect(tool?.function?.parameters?.required).toContain('plan_id');
+      expect(tool?.function?.parameters?.required).toContain('phase_id');
+      expect(tool?.function?.parameters?.required).toContain('work_item_id');
+    });
+
+    it('should require plan_id and items for add_gtm_common_items', () => {
+      const tools = agentModeService.getAvailableTools();
+      const tool = tools.find((t: any) => t.function?.name === 'add_gtm_common_items');
+      expect(tool?.function?.parameters?.required).toContain('plan_id');
+      expect(tool?.function?.parameters?.required).toContain('items');
+    });
+  });
+
+  describe('updateGTMPlan', () => {
+    it('should update plan title successfully', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate({ ...mockPlan, title: 'Updated Title' });
+
+      const result = await (agentModeService as any).updateGTMPlan(mockPlanId, { title: 'Updated Title' }, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('updated successfully');
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Key: { planId: mockPlanId },
+        })
+      );
+    });
+
+    it('should update multiple fields at once', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMPlan(mockPlanId, {
+        title: 'New Title',
+        description: 'New Description',
+        dri: 'new-dri@example.com',
+        dueDate: '2024-06-01',
+      }, mockUserId);
+
+      expect(result.success).toBe(true);
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).updateGTMPlan(mockPlanId, { title: 'New' }, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).updateGTMPlan(mockPlanId, { title: 'New' }, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error when no fields to update', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).updateGTMPlan(mockPlanId, {}, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('No fields to update');
+    });
+
+    it('should allow clearing dri by passing empty string', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMPlan(mockPlanId, { dri: '' }, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ExpressionAttributeValues: expect.objectContaining({
+            ':dri': null,
+          }),
+        })
+      );
+    });
+  });
+
+  describe('addGTMPhase', () => {
+    it('should add a phase without work items', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).addGTMPhase(mockPlanId, {
+        title: 'New Phase',
+        description: 'New Phase Description',
+      }, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('New Phase');
+      expect(result.phaseId).toBeDefined();
+    });
+
+    it('should add a phase with work items', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).addGTMPhase(mockPlanId, {
+        title: 'New Phase',
+        workItems: [
+          { title: 'Item A' },
+          { title: 'Item B', description: 'Desc B' },
+        ],
+      }, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('2 work item(s)');
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).addGTMPhase(mockPlanId, { title: 'Phase' }, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).addGTMPhase(mockPlanId, { title: 'Phase' }, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should clear completedAt when adding phase to completed plan', async () => {
+      const completedPlan = { ...mockPlan, status: 'completed', completedAt: '2024-01-02T00:00:00Z' };
+      setupMockGet(completedPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).addGTMPhase(mockPlanId, { title: 'Phase' }, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ExpressionAttributeValues: expect.objectContaining({
+            ':completedAt': null,
+          }),
+        })
+      );
+    });
+  });
+
+  describe('addGTMWorkItems', () => {
+    it('should add work items to a phase', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).addGTMWorkItems(mockPlanId, mockPhaseId, [
+        { title: 'New Item 1' },
+        { title: 'New Item 2', description: 'Desc' },
+      ], mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('2 work item(s)');
+      expect(result.addedItems).toHaveLength(2);
+    });
+
+    it('should return error when phase not found', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).addGTMWorkItems(mockPlanId, 'non-existent-phase', [
+        { title: 'Item' },
+      ], mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Phase not found');
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).addGTMWorkItems(mockPlanId, mockPhaseId, [
+        { title: 'Item' },
+      ], mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).addGTMWorkItems(mockPlanId, mockPhaseId, [
+        { title: 'Item' },
+      ], mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+  });
+
+  describe('updateGTMWorkItem', () => {
+    it('should update work item status', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'completed' },
+        {},
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('updated successfully');
+    });
+
+    it('should set completedAt when status changes to completed', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'completed' },
+        {},
+        mockUserId
+      );
+
+      // Verify phases passed to update contain completedAt on the work item
+      const updateCall = mockUpdate.mock.calls[0][0];
+      const updatedPhases = updateCall.ExpressionAttributeValues[':phases'];
+      const workItem = updatedPhases[0].workItems[0];
+      expect(workItem.completedAt).toBeDefined();
+      expect(workItem.status).toBe('completed');
+    });
+
+    it('should clear completedAt when status changes from completed', async () => {
+      const planWithCompletedItem = {
+        ...mockPlan,
+        phases: [{
+          ...mockPlan.phases[0],
+          workItems: [{
+            ...mockPlan.phases[0].workItems[0],
+            status: 'completed',
+            completedAt: '2024-01-02T00:00:00Z',
+          }],
+        }],
+      };
+      setupMockGet(planWithCompletedItem);
+      setupMockUpdate();
+
+      await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'in_progress' },
+        {},
+        mockUserId
+      );
+
+      const updateCall = mockUpdate.mock.calls[0][0];
+      const updatedPhases = updateCall.ExpressionAttributeValues[':phases'];
+      const workItem = updatedPhases[0].workItems[0];
+      expect(workItem.completedAt).toBeNull();
+    });
+
+    it('should send notifications when requested', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'completed' },
+        { notifyUser: true, notifyPlanPoc: true, message: 'Done!' },
+        mockUserId
+      );
+
+      expect(sendGTMPlanUpdateNotifications).toHaveBeenCalled();
+    });
+
+    it('should not send notifications when not requested', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'completed' },
+        {},
+        mockUserId
+      );
+
+      expect(sendGTMPlanUpdateNotifications).not.toHaveBeenCalled();
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'completed' }, {}, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { status: 'completed' }, {}, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error when phase not found', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, 'non-existent-phase', mockWorkItemId,
+        { status: 'completed' }, {}, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Phase not found');
+    });
+
+    it('should return error when work item not found', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, 'non-existent-item',
+        { status: 'completed' }, {}, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Work item not found');
+    });
+
+    it('should update work item notes and dri', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMWorkItem(
+        mockPlanId, mockPhaseId, mockWorkItemId,
+        { notes: 'Updated notes', dri: 'new@example.com' },
+        {},
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      const updateCall = mockUpdate.mock.calls[0][0];
+      const updatedPhases = updateCall.ExpressionAttributeValues[':phases'];
+      const workItem = updatedPhases[0].workItems[0];
+      expect(workItem.notes).toBe('Updated notes');
+      expect(workItem.dri).toBe('new@example.com');
+    });
+  });
+
+  describe('updateGTMPhase', () => {
+    it('should update phase title', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMPhase(
+        mockPlanId, mockPhaseId, { title: 'Updated Phase Title' }, mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Updated Phase Title');
+    });
+
+    it('should update phase description and dri', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMPhase(
+        mockPlanId, mockPhaseId, { description: 'New desc', dri: 'phase@example.com' }, mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      const updateCall = mockUpdate.mock.calls[0][0];
+      const updatedPhases = updateCall.ExpressionAttributeValues[':phases'];
+      expect(updatedPhases[0].description).toBe('New desc');
+      expect(updatedPhases[0].dri).toBe('phase@example.com');
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).updateGTMPhase(
+        mockPlanId, mockPhaseId, { title: 'New' }, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).updateGTMPhase(
+        mockPlanId, mockPhaseId, { title: 'New' }, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error when phase not found', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).updateGTMPhase(
+        mockPlanId, 'non-existent-phase', { title: 'New' }, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Phase not found');
+    });
+
+    it('should allow clearing due date by passing empty string', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).updateGTMPhase(
+        mockPlanId, mockPhaseId, { dueDate: '' }, mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      const updateCall = mockUpdate.mock.calls[0][0];
+      const updatedPhases = updateCall.ExpressionAttributeValues[':phases'];
+      expect(updatedPhases[0].dueDate).toBeNull();
+    });
+  });
+
+  describe('deleteGTMItems', () => {
+    it('should delete entire plan when only plan_id provided', async () => {
+      setupMockGet(mockPlan);
+      setupMockDelete();
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, undefined, undefined, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Test GTM Plan');
+      expect(mockDelete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Key: { planId: mockPlanId },
+        })
+      );
+    });
+
+    it('should delete a phase when plan_id and phase_id provided', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, mockPhaseId, undefined, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Phase 1');
+      expect(mockUpdate).toHaveBeenCalled();
+    });
+
+    it('should delete a work item when all three IDs provided', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, mockPhaseId, mockWorkItemId, mockUserId);
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Work Item 1');
+      expect(mockUpdate).toHaveBeenCalled();
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, undefined, undefined, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, undefined, undefined, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error when phase not found for phase deletion', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, 'non-existent-phase', undefined, mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Phase not found');
+    });
+
+    it('should return error when work item not found for work item deletion', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).deleteGTMItems(mockPlanId, mockPhaseId, 'non-existent-item', mockUserId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Work item not found');
+    });
+  });
+
+  describe('getGTMCommonItems', () => {
+    it('should return common items from settings', async () => {
+      const mockCategories = [
+        { name: 'Marketing', items: [{ title: 'Blog Post' }] },
+        { name: 'Sales', items: [{ title: 'Demo Prep' }] },
+      ];
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: JSON.stringify(mockCategories),
+      });
+
+      const result = await (agentModeService as any).getGTMCommonItems();
+
+      expect(result.success).toBe(true);
+      expect(result.categories).toHaveLength(2);
+      expect(result.message).toContain('2 category(ies)');
+    });
+
+    it('should return empty array when no common items configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+
+      const result = await (agentModeService as any).getGTMCommonItems();
+
+      expect(result.success).toBe(true);
+      expect(result.categories).toEqual([]);
+    });
+
+    it('should handle errors gracefully', async () => {
+      (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('DB error'));
+
+      const result = await (agentModeService as any).getGTMCommonItems();
+
+      expect(result.success).toBe(false);
+      expect(result.categories).toEqual([]);
+    });
+  });
+
+  describe('addGTMCommonItems', () => {
+    it('should add items to an existing phase', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId,
+        [{ title: 'Common Item 1' }, { title: 'Common Item 2' }],
+        mockPhaseId,
+        undefined,
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('2 common item(s)');
+    });
+
+    it('should create a new phase with items', async () => {
+      setupMockGet(mockPlan);
+      setupMockUpdate();
+
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId,
+        [{ title: 'Common Item 1' }],
+        undefined,
+        'New Common Phase',
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('1 common item(s)');
+    });
+
+    it('should return error when items array is empty', async () => {
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId, [], mockPhaseId, undefined, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('non-empty');
+    });
+
+    it('should return error when neither target_phase_id nor new_phase_name provided', async () => {
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId, [{ title: 'Item' }], undefined, undefined, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('target_phase_id or new_phase_name');
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId, [{ title: 'Item' }], mockPhaseId, undefined, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId, [{ title: 'Item' }], mockPhaseId, undefined, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error when target phase not found', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).addGTMCommonItems(
+        mockPlanId, [{ title: 'Item' }], 'non-existent-phase', undefined, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Target phase not found');
+    });
+  });
+
+  describe('sendGTMStatusReport', () => {
+    it('should send a phase-level status report', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, mockPhaseId,
+        { notifyUser: true, notifyPhasePoc: true },
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Phase 1');
+      expect(sendPhaseStatusReport).toHaveBeenCalled();
+    });
+
+    it('should send a plan-level status report', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, undefined,
+        { notifyUser: true, notifyPlanPoc: true },
+        mockUserId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.message).toContain('Test GTM Plan');
+      expect(sendPlanStatusReport).toHaveBeenCalled();
+    });
+
+    it('should return error when plan not found', async () => {
+      setupMockGetNotFound();
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, undefined, { notifyUser: true }, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found');
+    });
+
+    it('should return error when access denied', async () => {
+      setupMockGet({ ...mockPlan, userId: 'different-user' });
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, undefined, { notifyUser: true }, mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+
+    it('should return error when phase not found for phase report', async () => {
+      setupMockGet(mockPlan);
+
+      const result = await (agentModeService as any).sendGTMStatusReport(
+        mockPlanId, 'non-existent-phase',
+        { notifyUser: true },
+        mockUserId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Phase not found');
     });
   });
 });
