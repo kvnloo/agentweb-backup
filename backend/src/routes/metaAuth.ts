@@ -247,7 +247,21 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             });
         }
 
-        const { access_token, expires_in } = tokenResponse.data as { access_token: string; expires_in?: number };
+        let { access_token, expires_in } = tokenResponse.data as { access_token: string; expires_in?: number };
+
+        if (flow === 'instagram') {
+            try {
+                console.log('[Meta Finalize] Exchanging short-lived Instagram token for a long-lived one...');
+                const longLived = await instagramService.getLongLivedToken(access_token, clientSecret);
+                if (longLived && longLived.access_token) {
+                    access_token = longLived.access_token;
+                    expires_in = longLived.expires_in;
+                    console.log(`[Meta Finalize] Successfully obtained long-lived token (expires_in: ${expires_in})`);
+                }
+            } catch (err: any) {
+                console.warn('[Meta Finalize] Failed to exchange for long-lived token, falling back to short-lived:', err?.message || err);
+            }
+        }
 
         const tokenSessionId = storeTokenSession(userId, {
             access_token,

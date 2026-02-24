@@ -18,8 +18,8 @@ jest.mock('../utils/secretsManager', () => ({
         clientSecret: 'test_client_secret',
     }),
     getInstagramCredentials: jest.fn().mockResolvedValue({
-        clientId: 'test_client_id',
-        clientSecret: 'test_client_secret',
+        instagramClientId: 'test_client_id',
+        instagramClientSecret: 'test_client_secret',
     })
 }));
 jest.mock('../middleware/auth', () => ({
@@ -191,6 +191,48 @@ describe('Meta Auth Routes', () => {
             expect(response.body.url).toBeDefined();
             // It should be injected with the specific IG scopes
             expect(response.body.url).toContain('instagram_business_basic');
+        });
+    });
+
+    describe('POST /finalize', () => {
+        let integrations: any;
+        beforeEach(() => {
+            jest.clearAllMocks();
+            integrations = require('../config/integrations');
+        });
+
+        it('should exchange short-lived token for long-lived one if flow is instagram', async () => {
+            const mockMetaTokenResponse = {
+                data: {
+                    access_token: 'short_lived_token',
+                    expires_in: 3600
+                }
+            };
+
+            const mockLongLivedResponse = {
+                access_token: 'long_lived_token',
+                expires_in: 5184000
+            };
+
+            (axios.get as jest.Mock).mockResolvedValue(mockMetaTokenResponse);
+            (axios.post as jest.Mock).mockResolvedValue(mockMetaTokenResponse);
+            const { instagramService } = require('../services/instagramService');
+            instagramService.getLongLivedToken.mockResolvedValue(mockLongLivedResponse);
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id', flow: 'instagram' } as any);
+
+            const response = await request(app)
+                .post('/auth/meta/finalize')
+                .send({
+                    code: 'valid_code',
+                    state: 'valid_state',
+                    flow: 'instagram'
+                });
+
+            expect(response.status).toBe(200);
+            expect(instagramService.getLongLivedToken).toHaveBeenCalledWith('short_lived_token', 'test_client_secret');
+            
+            // Note: Since storeTokenSession stores in memory map, we can check if response implies success
+            expect(response.body.tokenSessionId).toBeDefined();
         });
     });
 

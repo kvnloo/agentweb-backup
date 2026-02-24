@@ -41,6 +41,8 @@ export interface PostAnalytics {
   error?: string;
   /** Detailed errors for individual metrics that failed */
   metricErrors?: { metric: string; error: string; status?: number }[];
+  /** Optional container for framework/platform-specific extra metrics */
+  extendedMetrics?: Record<string, any>;
 }
 
 export interface AccountMetrics {
