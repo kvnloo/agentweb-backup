@@ -285,6 +285,83 @@ describe('AgentModeService - createHtmlFromTemplate', () => {
       expect(result.message).toContain('Failed to parse LLM response');
     });
 
+    it('should handle JSON wrapped in markdown code block (```json)', async () => {
+      const wrappedJson = '```json\n' + JSON.stringify({
+        final_html: '<html><body><h1>Test Title</h1><p>Test Content</p></body></html>',
+        final_subject: 'Test Subject: Test Title'
+      }) + '\n```';
+
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+        choices: [{
+          message: {
+            content: wrappedJson
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.s3_url).toBe('https://s3.amazonaws.com/bucket/test-template.html');
+      expect(result.final_subject).toBe('Test Subject: Test Title');
+    });
+
+    it('should handle JSON wrapped in plain markdown code block (```)', async () => {
+      const wrappedJson = '```\n' + JSON.stringify({
+        final_html: '<html><body><h1>Test Title</h1><p>Test Content</p></body></html>',
+        final_subject: 'Test Subject: Test Title'
+      }) + '\n```';
+
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+        choices: [{
+          message: {
+            content: wrappedJson
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.s3_url).toBe('https://s3.amazonaws.com/bucket/test-template.html');
+    });
+
+    it('should fail when code block contains invalid JSON', async () => {
+      jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
+        choices: [{
+          message: {
+            content: '```json\nnot valid json here\n```'
+          }
+        }]
+      });
+
+      const result = await (agentModeService as any).createHtmlFromTemplate(
+        agentModeService.default_model,
+        'test-template',
+        { title: 'Test Title', content: 'Test Content' },
+        {},
+        'user123',
+        'session123'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to parse LLM response');
+    });
+
     it('should handle missing final_html in LLM response', async () => {
       jest.spyOn(agentModeService as any, 'callLLM').mockResolvedValue({
         choices: [{

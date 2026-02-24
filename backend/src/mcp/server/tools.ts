@@ -1172,7 +1172,7 @@ mcpToolRegistry.register({
       };
     }
 
-    return await agentModeService.createHtmlFromTemplate(args.llmModel, args.template_name, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
+    return await agentModeService.createHtmlFromTemplate(context?.llmModel, args.template_name, variableValues, arrayVariableValues, context?.userId, context?.sessionId);
   }
 });
 

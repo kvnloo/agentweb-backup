@@ -457,6 +457,10 @@ export class AgentModeService {
   async getSupportedModels() {
     return Object.keys(this.llmModels);
   }
+
+  async getReportsModelOptions(): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.'));
+  }
   /**
    * Make an LLM call with the specified model and parameters
    * @param model - The model to use (e.g., 'gpt-5.1', 'gemini-3-pro-preview')
@@ -13236,7 +13240,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         }
       ], {
         temperature: 0.1,
-        response_format: { type: 'json_object' }
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 16384
       });
 
       const substitutionResult = substitutionResponse.choices[0].message.content;
@@ -13248,7 +13253,19 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       try {
         substitutionData = JSON.parse(substitutionResult);
       } catch (parseError) {
-        throw new Error('LLM returned invalid JSON for variable substitution');
+        // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
+        const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+        if (codeBlockMatch) {
+          try {
+            substitutionData = JSON.parse(codeBlockMatch[1].trim());
+          } catch (innerParseError) {
+            console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+            throw new Error('LLM returned invalid JSON for variable substitution');
+          }
+        } else {
+          console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+          throw new Error('LLM returned invalid JSON for variable substitution');
+        }
       }
 
       if (!substitutionData.final_html || !substitutionData.final_subject) {

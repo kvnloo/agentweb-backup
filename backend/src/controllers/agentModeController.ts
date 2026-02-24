@@ -1555,6 +1555,16 @@ export const agentModeController = {
     }
   },
 
+  async getReportsModelOptions(req: Request, res: Response) {
+    try {
+      const models = await agentModeService.getReportsModelOptions();
+      res.json(models);
+    } catch (error) {
+      console.error('AgentMode: Get reports model options error:', error);
+      res.status(500).json({ error: 'Failed to get reports model options' });
+    }
+  },
+
   // Get system prompt
   async getSystemPrompt(req: Request, res: Response) {
     try {
