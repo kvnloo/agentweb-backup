@@ -4111,6 +4111,757 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  // Update a GTM plan (title, description, dri, dueDate)
+  public async updateGTMPlan(planId: string, updates: { title?: string; description?: string; dri?: string; dueDate?: string }, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: { [key: string]: string } = {};
+      const expressionAttributeValues: { [key: string]: any } = {};
+
+      if (updates.title !== undefined) {
+        updateExpressions.push("#title = :title");
+        expressionAttributeNames["#title"] = "title";
+        expressionAttributeValues[":title"] = updates.title;
+      }
+
+      if (updates.description !== undefined) {
+        updateExpressions.push("#description = :description");
+        expressionAttributeNames["#description"] = "description";
+        expressionAttributeValues[":description"] = updates.description;
+      }
+
+      if (updates.dri !== undefined) {
+        updateExpressions.push("#dri = :dri");
+        expressionAttributeNames["#dri"] = "dri";
+        expressionAttributeValues[":dri"] = updates.dri || null;
+      }
+
+      if (updates.dueDate !== undefined) {
+        updateExpressions.push("#dueDate = :dueDate");
+        expressionAttributeNames["#dueDate"] = "dueDate";
+        expressionAttributeValues[":dueDate"] = updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null;
+      }
+
+      if (updateExpressions.length === 0) {
+        return { success: false, message: 'No fields to update', error: 'No fields to update' };
+      }
+
+      updateExpressions.push("#updatedAt = :updatedAt");
+      expressionAttributeNames["#updatedAt"] = "updatedAt";
+      expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: 'GTM plan updated successfully',
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating GTM plan:', error);
+      return { success: false, message: 'Failed to update GTM plan', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Add a phase to a GTM plan
+  public async addGTMPhase(planId: string, phaseData: { title: string; description?: string; dri?: string; dueDate?: string; workItems?: any[] }, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+
+      const phaseId = `phase-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+
+      // Process work items if provided
+      const processedWorkItems = (phaseData.workItems || []).map((item: any, itemIndex: number) => ({
+        id: `item-${Date.now()}-${itemIndex}-${Math.random().toString(36).substring(2, 11)}`,
+        title: item.title,
+        description: item.description || null,
+        dri: item.dri || null,
+        status: "pending",
+        notes: null,
+        dueDate: item.due_date && item.due_date.trim() !== "" ? item.due_date.trim() : null,
+      }));
+
+      const newPhase = {
+        id: phaseId,
+        title: phaseData.title,
+        description: phaseData.description || null,
+        dri: phaseData.dri || null,
+        status: "in_progress" as const,
+        workItems: processedWorkItems,
+        dueDate: phaseData.dueDate && phaseData.dueDate.trim() !== "" ? phaseData.dueDate.trim() : null,
+      };
+
+      phases.push(newPhase);
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (plan.status === "completed" && planStatus !== "completed") {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `Phase "${phaseData.title}" added successfully with ${processedWorkItems.length} work item(s)`,
+        plan: updateResult.Attributes,
+        phaseId,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding GTM phase:', error);
+      return { success: false, message: 'Failed to add phase', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Add work items to a phase
+  public async addGTMWorkItems(planId: string, phaseId: string, workItems: any[], userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      const phase = phases[phaseIndex];
+      const existingWorkItems = phase.workItems || [];
+
+      const newWorkItems = workItems.map((item: any, itemIndex: number) => ({
+        id: `item-${Date.now()}-${itemIndex}-${Math.random().toString(36).substring(2, 11)}`,
+        title: item.title,
+        description: item.description || null,
+        dri: item.dri || null,
+        status: "pending",
+        notes: null,
+        dueDate: item.due_date && item.due_date.trim() !== "" ? item.due_date.trim() : null,
+      }));
+
+      existingWorkItems.push(...newWorkItems);
+
+      // Recalculate phase status
+      const hasWorkItems = existingWorkItems.length > 0;
+      const allItemsDone = hasWorkItems && existingWorkItems.every(
+        (item: any) => item.status === "completed" || item.status === "skipped"
+      );
+
+      phases[phaseIndex] = {
+        ...phase,
+        workItems: existingWorkItems,
+        status: allItemsDone ? "completed" : "in_progress",
+      };
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (plan.status === "completed" && planStatus !== "completed") {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `${newWorkItems.length} work item(s) added to phase "${phase.title}"`,
+        plan: updateResult.Attributes,
+        addedItems: newWorkItems.map((item: any) => ({ id: item.id, title: item.title })),
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding GTM work items:', error);
+      return { success: false, message: 'Failed to add work items', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Update a work item in a GTM plan
+  public async updateGTMWorkItem(
+    planId: string,
+    phaseId: string,
+    workItemId: string,
+    updates: { status?: string; notes?: string; dri?: string; title?: string; description?: string; dueDate?: string },
+    notifications: { notifyUser?: boolean; notifyItemPoc?: boolean; notifyPhasePoc?: boolean; notifyPlanPoc?: boolean; message?: string },
+    userId: string
+  ): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      const phase = phases[phaseIndex];
+      const workItems = phase.workItems || [];
+      const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+
+      if (workItemIndex === -1) {
+        return { success: false, message: 'Work item not found', error: 'Work item not found' };
+      }
+
+      const originalItem = workItems[workItemIndex];
+      const changes: any = {};
+
+      // Build updated work item
+      const updatedWorkItem = {
+        ...originalItem,
+        ...(updates.status !== undefined && { status: updates.status }),
+        ...(updates.notes !== undefined && { notes: updates.notes || null }),
+        ...(updates.dri !== undefined && { dri: updates.dri || null }),
+        ...(updates.title !== undefined && { title: updates.title }),
+        ...(updates.description !== undefined && { description: updates.description || null }),
+        ...(updates.dueDate !== undefined && { dueDate: updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null }),
+        ...(updates.status === "completed" && originalItem.status !== "completed" && { completedAt: new Date().toISOString() }),
+        ...(updates.status !== undefined && updates.status !== "completed" && originalItem.status === "completed" && { completedAt: null }),
+      };
+
+      // Track changes for notifications
+      if (updates.status !== undefined && updates.status !== originalItem.status) {
+        changes.status = updates.status;
+      }
+      if (updates.notes !== undefined && updates.notes !== originalItem.notes) {
+        changes.notes = updates.notes || null;
+      }
+      if (updates.dri !== undefined && updates.dri !== originalItem.dri) {
+        changes.dri = updates.dri || null;
+      }
+      if (updates.dueDate !== undefined) {
+        const newDueDate = updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null;
+        const oldDueDate = originalItem.dueDate || null;
+        if (newDueDate !== oldDueDate) {
+          changes.dueDate = newDueDate;
+        }
+      }
+
+      workItems[workItemIndex] = updatedWorkItem;
+
+      // Recalculate phase status
+      const hasWorkItems = workItems.length > 0;
+      const allItemsDone = hasWorkItems && workItems.every(
+        (item: any) => item.status === "completed" || item.status === "skipped"
+      );
+      phases[phaseIndex] = { ...phase, workItems, status: allItemsDone ? "completed" : "in_progress" };
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const wasCompleted = plan.status === "completed";
+      const isNowCompleted = planStatus === "completed";
+      const justCompleted = !wasCompleted && isNowCompleted;
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (justCompleted) {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = new Date().toISOString();
+      } else if (wasCompleted && !isNowCompleted) {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      // Handle notifications if requested
+      if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
+        try {
+          const { sendGTMPlanUpdateNotifications } = await import('./gtmPlanNotificationService');
+          const updatedPlan = updateResult.Attributes as any;
+          if (updatedPlan) {
+            await sendGTMPlanUpdateNotifications(updatedPlan, phaseId, workItemId, changes, notifications);
+          }
+        } catch (notificationError: any) {
+          console.error("Error sending GTM work item notifications:", notificationError);
+        }
+      }
+
+      return {
+        success: true,
+        message: 'Work item updated successfully',
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating GTM work item:', error);
+      return { success: false, message: 'Failed to update work item', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Update a phase in a GTM plan
+  public async updateGTMPhase(planId: string, phaseId: string, updates: { title?: string; description?: string; dri?: string; dueDate?: string }, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      const phase = phases[phaseIndex];
+
+      if (updates.title !== undefined) phase.title = updates.title;
+      if (updates.description !== undefined) phase.description = updates.description || null;
+      if (updates.dri !== undefined) phase.dri = updates.dri || null;
+      if (updates.dueDate !== undefined) phase.dueDate = updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null;
+
+      phases[phaseIndex] = phase;
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#phases": "phases", "#updatedAt": "updatedAt" },
+        ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `Phase "${phase.title}" updated successfully`,
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating GTM phase:', error);
+      return { success: false, message: 'Failed to update phase', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Delete a GTM plan, phase, or work item
+  public async deleteGTMItems(planId: string, phaseId?: string, workItemId?: string, userId?: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+
+      // Delete entire plan
+      if (!phaseId) {
+        await dynamodb.delete({ TableName: TABLE_NAME, Key: { planId } }).promise();
+        return { success: true, message: `GTM plan "${plan.title}" deleted successfully` };
+      }
+
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      // Delete work item from phase
+      if (workItemId) {
+        const phase = phases[phaseIndex];
+        const workItems = phase.workItems || [];
+        const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+
+        if (workItemIndex === -1) {
+          return { success: false, message: 'Work item not found', error: 'Work item not found' };
+        }
+
+        const deletedItem = workItems[workItemIndex];
+        workItems.splice(workItemIndex, 1);
+        phases[phaseIndex] = { ...phase, workItems };
+
+        await dynamodb.update({
+          TableName: TABLE_NAME,
+          Key: { planId },
+          UpdateExpression: "SET phases = :phases, updatedAt = :updatedAt",
+          ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+        }).promise();
+
+        return { success: true, message: `Work item "${deletedItem.title}" deleted successfully` };
+      }
+
+      // Delete phase
+      const deletedPhase = phases[phaseIndex];
+      phases.splice(phaseIndex, 1);
+
+      await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: "SET phases = :phases, updatedAt = :updatedAt",
+        ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+      }).promise();
+
+      return { success: true, message: `Phase "${deletedPhase.title}" deleted successfully` };
+    } catch (error) {
+      console.error('AgentMode: Error deleting GTM items:', error);
+      return { success: false, message: 'Failed to delete GTM items', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Get GTM common items catalog
+  public async getGTMCommonItems(): Promise<any> {
+    try {
+      const setting = await settingsService.getSetting("gtm_common_items");
+      const categories = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+      return { success: true, message: `Found ${categories.length} category(ies)`, categories };
+    } catch (error) {
+      console.error('AgentMode: Error fetching GTM common items:', error);
+      return { success: false, message: 'Failed to fetch GTM common items', error: error instanceof Error ? error.message : 'Unknown error', categories: [] };
+    }
+  }
+
+  // Add common items to a GTM plan phase
+  public async addGTMCommonItems(planId: string, items: { title: string; description?: string }[], targetPhaseId?: string, newPhaseName?: string, userId?: string): Promise<any> {
+    try {
+      if (!items || items.length === 0) {
+        return { success: false, message: 'Items array must be non-empty', error: 'Items array must be non-empty' };
+      }
+
+      if (!targetPhaseId && !newPhaseName) {
+        return { success: false, message: 'Either target_phase_id or new_phase_name is required', error: 'Either target_phase_id or new_phase_name is required' };
+      }
+
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+
+      const newWorkItems = items.map((item: { title: string; description?: string }) => ({
+        id: `item-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+        title: item.title.trim(),
+        description: item.description?.trim() || null,
+        dri: null,
+        status: "pending",
+        notes: null,
+        dueDate: null,
+      }));
+
+      if (targetPhaseId) {
+        const phaseIndex = phases.findIndex((p: any) => p.id === targetPhaseId);
+        if (phaseIndex === -1) {
+          return { success: false, message: 'Target phase not found', error: 'Target phase not found' };
+        }
+
+        const targetPhase = phases[phaseIndex];
+        const workItems = targetPhase.workItems || [];
+        workItems.push(...newWorkItems);
+
+        const hasWorkItems = workItems.length > 0;
+        const allItemsDone = hasWorkItems && workItems.every(
+          (item: any) => item.status === "completed" || item.status === "skipped"
+        );
+
+        phases[phaseIndex] = { ...targetPhase, workItems, status: allItemsDone ? "completed" : "in_progress" };
+      } else if (newPhaseName) {
+        const phaseId = `phase-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+        phases.push({
+          id: phaseId,
+          title: newPhaseName.trim(),
+          description: null,
+          dri: null,
+          status: "in_progress",
+          workItems: newWorkItems,
+          dueDate: null,
+        });
+      }
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (plan.status === "completed" && planStatus !== "completed") {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `${items.length} common item(s) added successfully`,
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding GTM common items:', error);
+      return { success: false, message: 'Failed to add common items', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Send GTM status report
+  public async sendGTMStatusReport(
+    planId: string,
+    phaseId: string | undefined,
+    notifications: { notifyUser?: boolean; notifyPlanPoc?: boolean; notifyPhasePoc?: boolean; notifyPhasePocs?: boolean; message?: string },
+    userId: string
+  ): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+
+      if (phaseId) {
+        // Phase-level report
+        const phase = plan.phases?.find((p: any) => p.id === phaseId);
+        if (!phase) {
+          return { success: false, message: 'Phase not found', error: 'Phase not found' };
+        }
+
+        const { sendPhaseStatusReport } = await import('./gtmPlanNotificationService');
+        await sendPhaseStatusReport(plan as any, phaseId, notifications, process.env.CUSTOMER_FRONTEND_URL);
+
+        return { success: true, message: `Phase status report for "${phase.title}" sent successfully` };
+      } else {
+        // Plan-level report
+        const { sendPlanStatusReport } = await import('./gtmPlanNotificationService');
+        await sendPlanStatusReport(plan as any, notifications, process.env.CUSTOMER_FRONTEND_URL);
+
+        return { success: true, message: `Plan status report for "${plan.title}" sent successfully` };
+      }
+    } catch (error) {
+      console.error('AgentMode: Error sending GTM status report:', error);
+      return { success: false, message: 'Failed to send status report', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');

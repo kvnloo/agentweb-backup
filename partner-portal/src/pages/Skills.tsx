@@ -38,6 +38,7 @@ import {
   CheckBoxOutlineBlank as CheckBoxOutlineBlankIcon,
   CheckBox as CheckBoxIcon,
   Search as SearchIcon,
+  ContentPaste as ContentPasteIcon,
 } from "@mui/icons-material";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
@@ -76,6 +77,8 @@ export default function Skills() {
   const [isPublished, setIsPublished] = useState(false);
   const [toolSearchText, setToolSearchText] = useState("");
   const [saving, setSaving] = useState(false);
+  const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
 
   const { token } = useAuth();
 
@@ -192,7 +195,35 @@ export default function Skills() {
 
 
 
-  const filteredSkills = skills.filter(skill => 
+  // Paste tools helpers
+  const parsePasteText = (text: string) => {
+    const names = text
+      .split(/[\n,]+/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    const availableNameMap = new Map(availableTools.map(t => [t.name.toLowerCase(), t.name]));
+    const matched: string[] = [];
+    const unmatched: string[] = [];
+    for (const n of names) {
+      const canonical = availableNameMap.get(n.toLowerCase());
+      if (canonical) {
+        matched.push(canonical);
+      } else {
+        unmatched.push(n);
+      }
+    }
+    return { matched: [...new Set(matched)], unmatched };
+  };
+
+  const handlePasteConfirm = () => {
+    const { matched } = parsePasteText(pasteText);
+    const merged = [...new Set([...toolNames, ...matched])];
+    setToolNames(merged);
+    setPasteDialogOpen(false);
+    setPasteText("");
+  };
+
+  const filteredSkills = skills.filter(skill =>
     skill.name.toLowerCase().includes(searchText.toLowerCase()) || 
     skill.description.toLowerCase().includes(searchText.toLowerCase()) ||
     (skill.toolNames && skill.toolNames.some(tool => tool.toLowerCase().includes(searchText.toLowerCase())))
@@ -403,9 +434,20 @@ export default function Skills() {
           
           <Box sx={{ mb: 2 }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-              <Typography variant="subtitle2" color="text.secondary">
-                Tools Configuration
-              </Typography>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Typography variant="subtitle2" color="text.secondary">
+                  Tools Configuration
+                </Typography>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<ContentPasteIcon />}
+                  onClick={() => setPasteDialogOpen(true)}
+                  sx={{ textTransform: 'none', fontSize: '0.75rem' }}
+                >
+                  Paste Tools
+                </Button>
+              </Stack>
               <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 'bold' }}>
                 {toolNames.length} of {availableTools.length} tools selected
               </Typography>
@@ -446,6 +488,17 @@ export default function Skills() {
                   label="Select Tools"
                   placeholder="Search tools..."
                   helperText="Search and assign tools that this skill provides access to."
+                  onPaste={(e) => {
+                    const text = e.clipboardData.getData("text");
+                    if (text.includes(",") || text.includes("\n")) {
+                      e.preventDefault();
+                      const { matched } = parsePasteText(text);
+                      if (matched.length > 0) {
+                        setToolNames(prev => [...new Set([...prev, ...matched])]);
+                        setToolSearchText("");
+                      }
+                    }
+                  }}
                 />
               )}
               renderOption={(props, option, { selected }) => (
@@ -520,6 +573,61 @@ export default function Skills() {
           <Button onClick={handleCloseDeleteDialog} color="inherit">Cancel</Button>
           <Button onClick={handleDelete} variant="contained" color="error">
             Delete Skill
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Paste Tool Names Dialog */}
+      <Dialog
+        open={pasteDialogOpen}
+        onClose={() => { setPasteDialogOpen(false); setPasteText(""); }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Paste Tool Names</DialogTitle>
+        <DialogContent>
+          <TextField
+            autoFocus
+            fullWidth
+            multiline
+            rows={6}
+            margin="dense"
+            placeholder="Paste tool names, one per line or comma-separated..."
+            value={pasteText}
+            onChange={(e) => setPasteText(e.target.value)}
+          />
+          {pasteText.trim() && (() => {
+            const { matched, unmatched } = parsePasteText(pasteText);
+            const newTools = matched.filter(m => !toolNames.includes(m));
+            return (
+              <Box sx={{ mt: 2 }}>
+                <Typography variant="body2" color="text.secondary">
+                  {matched.length} of {matched.length + unmatched.length} tool name(s) recognized
+                  {newTools.length > 0 && newTools.length < matched.length
+                    ? ` (${newTools.length} new, ${matched.length - newTools.length} already selected)`
+                    : ""}
+                </Typography>
+                {unmatched.length > 0 && (
+                  <Alert severity="warning" sx={{ mt: 1 }}>
+                    <Typography variant="caption">
+                      Unrecognized: {unmatched.join(", ")}
+                    </Typography>
+                  </Alert>
+                )}
+              </Box>
+            );
+          })()}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setPasteDialogOpen(false); setPasteText(""); }} color="inherit">
+            Cancel
+          </Button>
+          <Button
+            onClick={handlePasteConfirm}
+            variant="contained"
+            disabled={!pasteText.trim() || parsePasteText(pasteText).matched.length === 0}
+          >
+            Add {pasteText.trim() ? parsePasteText(pasteText).matched.length : 0} Tool(s)
           </Button>
         </DialogActions>
       </Dialog>
