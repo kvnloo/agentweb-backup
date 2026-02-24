@@ -1382,7 +1382,7 @@ mcpToolRegistry.register({
   name: 'create_lead_list',
   definition: {
     name: 'create_lead_list',
-    description: 'Create a new lead list with a name and optional description. Returns the created lead list with its ID.',
+    description: 'Create a new lead list with a name and optional description. Returns the created lead list with its ID. You can specify a list_type to determine default pipeline stages.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1393,13 +1393,18 @@ mcpToolRegistry.register({
         description: {
           type: 'string',
           description: 'Optional description of the lead list'
+        },
+        list_type: {
+          type: 'string',
+          enum: ['sales', 'customers'],
+          description: 'Type of the list. "sales" lists use sales pipeline stages (new, contacted, qualified, etc.). "customers" lists use customer lifecycle stages (onboarding, active, at_risk, churned). Determines default status configuration.'
         }
       },
       required: ['name']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.createLeadList(args.name, args.description || '', context?.userId);
+    return await agentModeService.createLeadList(args.name, args.description || '', context?.userId, args.list_type);
   }
 });
 
@@ -1484,7 +1489,7 @@ mcpToolRegistry.register({
   name: 'get_leads',
   definition: {
     name: 'get_leads',
-    description: 'Browse and list leads from a lead list with optional text search and ICP/engaged filters. Returns compact lead summaries. Use search_leads for structured field-level filtering.',
+    description: 'Browse and list leads from a lead list with optional text search, status, and ICP/engaged filters. Returns compact lead summaries including status and deal value. Use search_leads for structured field-level filtering.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1495,6 +1500,10 @@ mcpToolRegistry.register({
         search: {
           type: 'string',
           description: 'Optional text search query to filter leads across all fields (name, email, company, title, etc.)'
+        },
+        status: {
+          type: 'string',
+          description: 'Optional status filter — only return leads with this exact status (e.g. "qualified", "won", "lost")'
         },
         icp_only: {
           type: 'boolean',
@@ -1515,6 +1524,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context?: any) => {
     return await agentModeService.getLeads(args.list_id, context?.userId, {
       search: args.search,
+      status: args.status,
       icpOnly: args.icp_only,
       engagedOnly: args.engaged_only,
       limit: args.limit
@@ -1526,7 +1536,7 @@ mcpToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
-    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin), ICP fields (icpScore, icpMatch), engagementCount, and any custom field names. All filters use AND logic.',
+    description: 'Find leads matching structured field-level criteria within a list. Supports standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency), ICP fields (icpScore, icpMatch), engagementCount, and any custom field names. All filters use AND logic.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1541,7 +1551,7 @@ mcpToolRegistry.register({
             properties: {
               field: {
                 type: 'string',
-                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin; ICP: icpScore, icpMatch; engagement: engagementCount; or any custom field name)'
+                description: 'Field name to filter on (standard: email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency; ICP: icpScore, icpMatch; engagement: engagementCount; or any custom field name)'
               },
               operator: {
                 type: 'string',
@@ -1598,7 +1608,7 @@ mcpToolRegistry.register({
   name: 'update_lead',
   definition: {
     name: 'update_lead',
-    description: 'Update fields on a lead. Supports standard fields (email, firstName, lastName, phone, company, title, notes, linkedin) and any custom fields.',
+    description: 'Update fields on a lead. Supports standard fields (email, firstName, lastName, phone, company, title, notes, linkedin, status, dealValue, dealCurrency) and any custom fields. Changing status auto-creates a status.changed engagement event.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1612,7 +1622,7 @@ mcpToolRegistry.register({
         },
         updates: {
           type: 'object',
-          description: 'Object with field names and new values. Standard fields: email, firstName, lastName, phone, company, title, notes, linkedin. Any other fields are stored as custom fields.',
+          description: 'Object with field names and new values. Standard fields: email, firstName, lastName, phone, company, title, notes, linkedin, status, dealValue, dealCurrency. Any other fields are stored as custom fields.',
           additionalProperties: true
         }
       },
@@ -1654,7 +1664,7 @@ mcpToolRegistry.register({
   name: 'update_lead_list',
   definition: {
     name: 'update_lead_list',
-    description: 'Update a lead list\'s name, description, filter settings, or auto-draft configuration.',
+    description: 'Update a lead list\'s name, description, filter settings, auto-draft configuration, or status pipeline configuration.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1685,6 +1695,25 @@ mcpToolRegistry.register({
         auto_draft_instruction: {
           type: 'string',
           description: 'Instructions for automatic email draft generation'
+        },
+        status_config: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              value: { type: 'string', description: 'Machine key (e.g. "qualified")' },
+              label: { type: 'string', description: 'Display name (e.g. "Qualified")' },
+              color: { type: 'string', description: 'Tailwind color name (e.g. "blue")' },
+              type: { type: 'string', enum: ['active', 'won', 'lost', 'churned'], description: 'Status category' }
+            },
+            required: ['value', 'label', 'color', 'type']
+          },
+          description: 'Configure the status pipeline stages for this list. Each entry defines a pipeline stage with value, label, color, and type (active/won/lost/churned).'
+        },
+        list_type: {
+          type: 'string',
+          enum: ['sales', 'customers'],
+          description: 'Set the list type. Can only be set once — once defined, it cannot be changed. "sales" lists track prospects through a sales pipeline; "customers" lists track existing customers through lifecycle stages.'
         }
       },
       required: ['list_id']
@@ -1697,7 +1726,9 @@ mcpToolRegistry.register({
       icpsOnly: args.icps_only,
       engagedOnly: args.engaged_only,
       autoDraftEnabled: args.auto_draft_enabled,
-      autoDraftInstruction: args.auto_draft_instruction
+      autoDraftInstruction: args.auto_draft_instruction,
+      statusConfig: args.status_config,
+      listType: args.list_type
     }, context?.userId);
   }
 });
@@ -1720,6 +1751,106 @@ mcpToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.deleteLeadList(args.list_id, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_lead_status',
+  definition: {
+    name: 'update_lead_status',
+    description: 'Update a lead\'s pipeline status (e.g. new → contacted → qualified → won/lost). Auto-creates a status.changed engagement event for audit trail.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the lead'
+        },
+        lead_id: {
+          type: 'string',
+          description: 'The ID of the lead to update'
+        },
+        status: {
+          type: 'string',
+          description: 'The new status value (must match a value from the list\'s statusConfig, e.g. "qualified", "won", "lost")'
+        },
+        deal_value: {
+          type: 'number',
+          description: 'Optional monetary deal amount (relevant for won/lost/negotiating statuses)'
+        },
+        deal_currency: {
+          type: 'string',
+          description: 'ISO 4217 currency code (default: USD)'
+        },
+        notes: {
+          type: 'string',
+          description: 'Optional notes about this status change'
+        }
+      },
+      required: ['list_id', 'lead_id', 'status']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.updateLeadStatus(
+      args.list_id, args.lead_id, args.status, context?.userId,
+      args.deal_value, args.deal_currency, args.notes
+    );
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_lead_list_statuses',
+  definition: {
+    name: 'get_lead_list_statuses',
+    description: 'Get the configured pipeline status stages for a lead list. Returns the status options with their labels, colors, and types (active/won/lost/churned).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list'
+        }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.getLeadListStatuses(args.list_id, context?.userId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'configure_lead_statuses',
+  definition: {
+    name: 'configure_lead_statuses',
+    description: 'Configure the pipeline status stages for a lead list. Replaces the entire status configuration. Each status has a machine key (value), display name (label), color, and type (active/won/lost/churned).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list to configure'
+        },
+        statuses: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              value: { type: 'string', description: 'Machine key (e.g. "qualified")' },
+              label: { type: 'string', description: 'Display name (e.g. "Qualified")' },
+              color: { type: 'string', description: 'Tailwind color name (e.g. "blue", "green", "red")' },
+              type: { type: 'string', enum: ['active', 'won', 'lost', 'churned'], description: 'Status category for grouping/reporting' }
+            },
+            required: ['value', 'label', 'color', 'type']
+          },
+          description: 'Array of status stage definitions in pipeline order'
+        }
+      },
+      required: ['list_id', 'statuses']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.configureLeadStatuses(args.list_id, args.statuses, context?.userId);
   }
 });
 
