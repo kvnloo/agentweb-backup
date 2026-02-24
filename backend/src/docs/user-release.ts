@@ -25,6 +25,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- New "get_lead_list_statuses" tool to retrieve the configured statuses for a list',
       '- New "configure_lead_statuses" tool to customize the status pipeline for a list',
       '- Existing tools (get_leads, search_leads, update_lead, create_lead_list, update_lead_list) now support status, deal value, and list type fields',
+    ],
+  },
+  {
     date: '2026-02-22',
     changes: [
       'Agent Mode: LinkedIn Post Formatting',
