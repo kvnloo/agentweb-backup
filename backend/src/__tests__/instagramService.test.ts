@@ -133,15 +133,21 @@ describe('InstagramService', () => {
 
             const promise = instagramService.createInstagramPost('ig_123', 'valid_token', 'https://img.com', 'Caption');
 
-            // Advance timers to trigger the retry
-            await Promise.resolve(); // flush microtasks
-            jest.advanceTimersByTime(3000); // advance 3s for retry
+            // Flush microtasks so the first post attempt and retry scheduling run
+            for (let i = 0; i < 10; i++) {
+                await Promise.resolve();
+            }
+            jest.advanceTimersByTime(5000);
+            // Flush again so the retry attempt resolves
+            for (let i = 0; i < 10; i++) {
+                await Promise.resolve();
+            }
 
             const result = await promise;
             expect(result.id).toBe('published_123');
 
             jest.useRealTimers();
-        });
+        }, 15000);
     });
 
     describe('getInstagramMediaInsights', () => {
@@ -156,7 +162,7 @@ describe('InstagramService', () => {
             const result = await instagramService.getInstagramMediaInsights('media_1', 'valid_token');
             expect(mockAxios.get).toHaveBeenCalledWith(
                 'https://graph.instagram.com/v18.0/media_1/insights',
-                expect.objectContaining({ params: expect.objectContaining({ metric: 'impressions,reach,saved,engagement' }) })
+                expect.objectContaining({ params: expect.objectContaining({ metric: 'impressions,reach,saved,likes,comments,shares,total_interactions' }) })
             );
             expect(result[0].name).toBe('impressions');
         });

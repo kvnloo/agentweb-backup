@@ -232,6 +232,37 @@ describe('Meta Auth Routes', () => {
             expect(secondRequest.status).toBe(200);
         });
 
+        it('should reject connect-instagram without instagramAccount', async () => {
+            const response = await request(app)
+                .post('/auth/meta/connect-instagram')
+                .send({ tokenSessionId: testSessionId });
+
+            expect(response.status).toBe(400);
+            expect(response.body.error).toBe('No Instagram account provided');
+        });
+
+        it('should reject connect-instagram without tokenSessionId', async () => {
+            const response = await request(app)
+                .post('/auth/meta/connect-instagram')
+                .send({ instagramAccount: { id: 'ig_123', username: 'test' } });
+
+            expect(response.status).toBe(400);
+            expect(response.body.error).toBe('Missing token session ID');
+        });
+
+        it('should reject connect-instagram with invalid tokenSessionId', async () => {
+            const consoleSpy = jest.spyOn(console, 'warn').mockImplementation(() => { });
+
+            const response = await request(app)
+                .post('/auth/meta/connect-instagram')
+                .send({ tokenSessionId: 'invalid_session', instagramAccount: { id: 'ig_123', username: 'test' } });
+
+            expect(response.status).toBe(400);
+            expect(response.body.error).toBe('Invalid or expired token session');
+
+            consoleSpy.mockRestore();
+        });
+
         it('should apply dynamic token_expires_at arithmetic logic natively for instagram accounts', async () => {
             (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({});
 
@@ -250,7 +281,5 @@ describe('Meta Auth Routes', () => {
                 })
             );
         });
-
-
     });
 });

@@ -373,15 +373,15 @@ describe('secretsManager utils', () => {
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
           SecretString: JSON.stringify({
-            clientId: 'ig-client-123',
-            clientSecret: 'ig-secret-456'
+            instagramClientId: 'ig-client-123',
+            instagramClientSecret: 'ig-secret-456'
           })
         })
       });
 
       const result = await getInstagramCredentials();
-      expect(result.clientId).toBe('ig-client-123');
-      expect(result.clientSecret).toBe('ig-secret-456');
+      expect(result.instagramClientId).toBe('ig-client-123');
+      expect(result.instagramClientSecret).toBe('ig-secret-456');
     });
 
     it('should throw error when credentials are empty', async () => {
@@ -394,10 +394,10 @@ describe('secretsManager utils', () => {
       );
     });
 
-    it('should throw error when clientId is missing', async () => {
+    it('should throw error when instagramClientId is missing', async () => {
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientSecret: 'secret' })
+          SecretString: JSON.stringify({ instagramClientSecret: 'secret' })
         })
       });
 
@@ -406,10 +406,10 @@ describe('secretsManager utils', () => {
       );
     });
 
-    it('should throw error when clientSecret is missing', async () => {
+    it('should throw error when instagramClientSecret is missing', async () => {
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'client' })
+          SecretString: JSON.stringify({ instagramClientId: 'client' })
         })
       });
 
@@ -422,13 +422,13 @@ describe('secretsManager utils', () => {
       process.env.NODE_ENV = 'production';
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+          SecretString: JSON.stringify({ instagramClientId: 'id', instagramClientSecret: 'secret' })
         })
       });
 
       await getInstagramCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
-        SecretId: 'prod/AgentWeb/InstagramApp'
+        SecretId: 'prod/AgentWeb/MetaApp'
       });
     });
 
@@ -436,13 +436,13 @@ describe('secretsManager utils', () => {
       process.env.NODE_ENV = 'development';
       mockGetSecretValue.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
-          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+          SecretString: JSON.stringify({ instagramClientId: 'id', instagramClientSecret: 'secret' })
         })
       });
 
       await getInstagramCredentials();
       expect(mockGetSecretValue).toHaveBeenCalledWith({
-        SecretId: 'dev/AgentWeb/InstagramApp'
+        SecretId: 'dev/AgentWeb/MetaApp'
       });
     });
   });

@@ -2,8 +2,8 @@ import { getLinkedInCredentials, getMetaCredentials } from '../utils/secretsMana
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
-const META_GRAPH_VERSION = 'v24.0';
-const META_INSTAGRAM_VERSION = 'v21.0';
+const META_GRAPH_VERSION = process.env.META_API_VERSION || 'v24.0';
+const META_INSTAGRAM_VERSION = process.env.META_API_VERSION || 'v24.0';
 
 export type MetaFlowType = 'marketing' | 'instagram';
 

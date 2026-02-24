@@ -10,6 +10,7 @@ jest.mock('../services/instagramService', () => ({
         getInstagramMedia: jest.fn(),
         getInstagramMediaInsights: jest.fn(),
         getInstagramUserInsights: jest.fn(),
+        getInstagramBusinessMe: jest.fn(),
     },
 }));
 
@@ -92,6 +93,12 @@ describe('InstagramAdapter', () => {
         });
     });
 
+    describe('getPostMetrics', () => {
+        it('should throw an error for invalid account type', async () => {
+            await expect(adapter.getPostMetrics(mockInvalidAccount, ['123'])).rejects.toThrow('This account must be connected via Instagram Direct Login to get post metrics.');
+        });
+    });
+
     describe('getAccountMetrics', () => {
         it('should throw an error for invalid account type', async () => {
             await expect(adapter.getAccountMetrics(mockInvalidAccount)).rejects.toThrow('This account must be connected via Instagram Direct Login to get account metrics.');
@@ -103,11 +110,32 @@ describe('InstagramAdapter', () => {
             const result = await adapter.verifyToken(mockInvalidAccount);
             expect(result).toBe(false);
         });
+
+        it('should return true when getInstagramBusinessMe succeeds', async () => {
+            mockInstagramService.getInstagramBusinessMe.mockResolvedValue({ id: '123', username: 'test' } as any);
+            const result = await adapter.verifyToken(mockValidAccount);
+            expect(result).toBe(true);
+            expect(mockInstagramService.getInstagramBusinessMe).toHaveBeenCalledWith('valid_token');
+        });
+
+        it('should return false when getInstagramBusinessMe fails', async () => {
+            mockInstagramService.getInstagramBusinessMe.mockRejectedValue(new Error('Token expired'));
+            const result = await adapter.verifyToken(mockValidAccount);
+            expect(result).toBe(false);
+        });
     });
 
     describe('getPostAnalytics', () => {
         it('should throw an error for invalid account type', async () => {
             await expect(adapter.getPostAnalytics(mockInvalidAccount, ['123'])).rejects.toThrow('This account must be connected via Instagram Direct Login to get post analytics.');
+        });
+    });
+
+    describe('createPost - carousel', () => {
+        it('should throw an error when multiple media URLs are provided', async () => {
+            await expect(
+                adapter.createPost(mockValidAccount, 'Test', ['https://img1.jpg', 'https://img2.jpg'])
+            ).rejects.toThrow('Instagram carousel posts are not yet supported.');
         });
     });
 });

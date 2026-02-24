@@ -145,6 +145,8 @@ export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
 export interface MetaCredentials {
   clientId: string;
   clientSecret: string;
+  instagramClientId: string;
+  instagramClientSecret: string;
 }
 
 /**
@@ -178,18 +180,8 @@ export async function getMetaCredentials(): Promise<MetaCredentials> {
     console.error('Error fetching Meta credentials from Secrets Manager:', error);
     throw new Error('Failed to fetch Meta credentials from Secrets Manager');
   }
-
 }
 
-/**
- * Interface for Instagram Business Login credentials.
- * These are separate from the Facebook App credentials and are used
- * exclusively for the Instagram Business Login OAuth flow.
- */
-export interface InstagramCredentials {
-  clientId: string;
-  clientSecret: string;
-}
 
 /**
  * Get Instagram Business Login OAuth credentials from AWS Secrets Manager.
@@ -199,12 +191,12 @@ export interface InstagramCredentials {
  *
  * @returns The Instagram client credentials (clientId and clientSecret)
  */
-export async function getInstagramCredentials(): Promise<InstagramCredentials> {
+export async function getInstagramCredentials(): Promise<MetaCredentials> {
   try {
-     const environment = process.env.NODE_ENV || 'development';
+    const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
-      ? 'prod/AgentWeb/InstagramApp'
-      : 'dev/AgentWeb/InstagramApp';
+      ? 'prod/AgentWeb/MetaApp'
+      : 'dev/AgentWeb/MetaApp';
 
     const secretString = await getSecret(secretName);
 
@@ -212,10 +204,10 @@ export async function getInstagramCredentials(): Promise<InstagramCredentials> {
       throw new Error('Instagram credentials secret is empty');
     }
 
-    const credentials = JSON.parse(secretString) as InstagramCredentials;
+    const credentials = JSON.parse(secretString) as MetaCredentials;
 
-    if (!credentials.clientId || !credentials.clientSecret) {
-      throw new Error('Instagram credentials missing clientId or clientSecret');
+    if (!credentials.instagramClientId || !credentials.instagramClientSecret) {
+      throw new Error('Instagram credentials missing instagramClientId or instagramClientSecret');
     }
 
     return credentials;
@@ -256,5 +248,4 @@ export async function getGoogleDriveServiceAccountEmail(): Promise<string> {
     console.error('Error fetching Google Drive service account email:', error);
     throw new Error('Failed to fetch Google Drive service account email from Secrets Manager');
   }
-
 }

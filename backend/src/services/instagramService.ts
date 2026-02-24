@@ -14,7 +14,7 @@ export class InstagramService {
         return InstagramService.instance;
     }
 
-    private handleError(error: any, context?: string): void {
+    private handleError(error: any, context?: string): never {
         console.error(`[InstagramServiceError] Context: ${context || 'Unknown'}`);
         console.error(error?.response?.data || error?.message || error);
 
@@ -64,9 +64,8 @@ export class InstagramService {
                 name: data.name,
                 profile_picture_url: data.profile_picture_url
             };
-        } catch (error: any) {
-            console.error('[InstagramService] getInstagramBusinessMe failed:', error?.response?.data || error?.message);
-            throw error;
+        } catch (error) {
+            this.handleError(error, 'getInstagramBusinessMe');
         }
     }
 
@@ -86,7 +85,6 @@ export class InstagramService {
             return response.data?.data || [];
         } catch (error) {
             this.handleError(error, 'getInstagramMedia');
-            throw error;
         }
     }
 
@@ -105,7 +103,6 @@ export class InstagramService {
             return response.data;
         } catch (error) {
             this.handleError(error, 'getInstagramMediaObject');
-            throw error;
         }
     }
 
@@ -163,7 +160,6 @@ export class InstagramService {
             throw new Error('Failed to publish Instagram media after maximum retries. Media might still be processing.');
         } catch (error) {
             this.handleError(error, 'createInstagramPost');
-            throw error;
         }
     }
 
@@ -175,14 +171,13 @@ export class InstagramService {
             const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
             const url = `${instagramApiBaseUrl}/${mediaId}/insights`;
             const params = {
-                metric: 'impressions,reach,saved,engagement',
+                metric: 'impressions,reach,saved,likes,comments,shares,total_interactions',
                 access_token: userToken
             };
             const response = await axios.get<any>(url, { params });
             return response.data?.data || [];
         } catch (error) {
             this.handleError(error, 'getInstagramMediaInsights');
-            throw error;
         }
     }
 
@@ -202,7 +197,6 @@ export class InstagramService {
             return response.data?.data || [];
         } catch (error) {
             this.handleError(error, 'getInstagramUserInsights');
-            throw error;
         }
     }
 }

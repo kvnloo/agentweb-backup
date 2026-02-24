@@ -1,6 +1,10 @@
 import { instagramService } from '../instagramService';
-import { ConnectedAccount } from '../connectedAccountsDb';
+import { ConnectedAccount, MetaInstagramBusinessConfig } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+
+function isInstagramBusiness(config: any): config is MetaInstagramBusinessConfig {
+    return config.account_type === 'instagram_business';
+}
 
 /**
  * Instagram Business Adapter Implementation
@@ -9,8 +13,8 @@ import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnal
 export class InstagramAdapter implements SocialPlatformAdapter {
 
     async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
-        const config = account.config as any;
-        if (config.account_type !== 'instagram_business') {
+        const config = account.config;
+        if (!isInstagramBusiness(config)) {
             throw new Error('This account must be connected via Instagram Direct Login to post organically.');
         }
 
@@ -24,9 +28,10 @@ export class InstagramAdapter implements SocialPlatformAdapter {
             if (!mediaUrls || mediaUrls.length === 0) {
                 throw new Error('Instagram requires at least one image/video URL to create a post.');
             }
+            if (mediaUrls.length > 1) {
+                throw new Error('Instagram carousel posts are not yet supported. Please provide a single image/video URL.');
+            }
 
-            // Graph API currently supports single media posting simply via the endpoint
-            // Carousels require children arrays
             const result = await instagramService.createInstagramPost(igUserId, userToken, mediaUrls[0], content);
 
             // Fetch the permalink for the newly created post
@@ -52,8 +57,8 @@ export class InstagramAdapter implements SocialPlatformAdapter {
     }
 
     async listPosts(account: ConnectedAccount, options?: { limit?: number }, userId?: string): Promise<any[]> {
-        const config = account.config as any;
-        if (config.account_type !== 'instagram_business') {
+        const config = account.config;
+        if (!isInstagramBusiness(config)) {
             throw new Error('This account must be connected via Instagram Direct Login to list posts.');
         }
 
@@ -76,7 +81,10 @@ export class InstagramAdapter implements SocialPlatformAdapter {
     }
 
     async getPostMetrics(account: ConnectedAccount, postIds: string[], userId?: string): Promise<PostMetric[]> {
-        const config = account.config as any;
+        const config = account.config;
+        if (!isInstagramBusiness(config)) {
+            throw new Error('This account must be connected via Instagram Direct Login to get post metrics.');
+        }
         const userToken = config.access_token;
 
         const metrics = await Promise.all(
@@ -107,8 +115,8 @@ export class InstagramAdapter implements SocialPlatformAdapter {
     }
 
     async getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics> {
-        const config = account.config as any;
-        if (config.account_type !== 'instagram_business') {
+        const config = account.config;
+        if (!isInstagramBusiness(config)) {
             throw new Error('This account must be connected via Instagram Direct Login to get account metrics.');
         }
 
@@ -151,14 +159,14 @@ export class InstagramAdapter implements SocialPlatformAdapter {
     }
 
     async verifyToken(account: ConnectedAccount): Promise<boolean> {
-        const config = account.config as any;
+        const config = account.config;
+        if (!isInstagramBusiness(config)) return false;
         const userToken = config.access_token;
-        if (!userToken || config.account_type !== 'instagram_business') return false;
+        if (!userToken) return false;
 
         try {
-            // Basic call to ensure token works
-            const igUserId = config.instagram_account_id || account.account_id;
-            await instagramService.getInstagramUserInsights(igUserId, userToken);
+            // Lightweight call — only needs instagram_business_basic scope
+            await instagramService.getInstagramBusinessMe(userToken);
             return true;
         } catch (error) {
             return false;
@@ -170,8 +178,8 @@ export class InstagramAdapter implements SocialPlatformAdapter {
         postIds: string[],
         userId?: string
     ): Promise<PostAnalytics[]> {
-        const config = account.config as any;
-        if (config.account_type !== 'instagram_business') {
+        const config = account.config;
+        if (!isInstagramBusiness(config)) {
             throw new Error('This account must be connected via Instagram Direct Login to get post analytics.');
         }
 
@@ -186,40 +194,43 @@ export class InstagramAdapter implements SocialPlatformAdapter {
         const analytics = await Promise.all(
             postIds.map(async (mediaId) => {
                 try {
-                    // Fetch Insights (reach, impressions, saved, engagement)
-                    // For Image/Video organic posts
                     const insights = await instagramService.getInstagramMediaInsights(mediaId, userToken);
 
                     let impressions = 0;
-                    let engagements = 0;
+                    let totalInteractions = 0;
                     let saved = 0;
+                    let insightLikes = 0;
+                    let insightComments = 0;
+                    let insightShares = 0;
 
-                    // Insights map is slightly different per media type (video vs image) so we look generically
                     for (const insight of insights) {
-                        if (insight.name === 'impressions' && insight.values && insight.values.length > 0) {
-                            impressions = insight.values[0].value || 0;
-                        }
-                        if (insight.name === 'engagement' && insight.values && insight.values.length > 0) {
-                            engagements = insight.values[0].value || 0;
-                        }
-                        if (insight.name === 'saved' && insight.values && insight.values.length > 0) {
-                            saved = insight.values[0].value || 0;
+                        const val = insight.values?.[0]?.value || 0;
+                        switch (insight.name) {
+                            case 'impressions': impressions = val; break;
+                            case 'total_interactions': totalInteractions = val; break;
+                            case 'saved': saved = val; break;
+                            case 'likes': insightLikes = val; break;
+                            case 'comments': insightComments = val; break;
+                            case 'shares': insightShares = val; break;
                         }
                     }
 
-                    // Fetch basic interactions to complete the PostAnalytics interface
-                    const postData = await instagramService.getInstagramMediaObject(mediaId, userToken);
-
-                    const likes = postData.like_count || 0;
-                    const comments = postData.comments_count || 0;
+                    // Fall back to media object counts if insights don't include likes/comments
+                    let likes = insightLikes;
+                    let comments = insightComments;
+                    if (!likes || !comments) {
+                        const postData = await instagramService.getInstagramMediaObject(mediaId, userToken);
+                        likes = likes || postData.like_count || 0;
+                        comments = comments || postData.comments_count || 0;
+                    }
 
                     return {
                         postId: mediaId,
                         likes,
                         comments,
-                        shares: saved, // representing interaction as saves
+                        shares: insightShares || saved,
                         impressions,
-                        engagement: engagements || (likes + comments + saved),
+                        engagement: totalInteractions || (likes + comments + saved),
                         fetchedAt,
                     };
                 } catch (error: any) {

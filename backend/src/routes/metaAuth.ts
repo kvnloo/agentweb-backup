@@ -1,4 +1,3 @@
-
 import express from 'express';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
@@ -9,7 +8,7 @@ import { getMetaFlowConfig, INTEGRATION_CONFIG, MetaFlowType } from '../config/i
 import { metaService } from '../services/metaService';
 import { instagramService } from '../services/instagramService';
 import { createAccount } from '../services/connectedAccountsDb';
-import { MetaAdAccount, MetaPage, MetaInstagramAccount } from '../types/meta';
+import { MetaAdAccount, MetaInstagramAccount } from '../types/meta';
 
 const router = express.Router();
 
@@ -102,34 +101,34 @@ function retrieveTokenSession(sessionId: string, userId: string) {
 // ============================================
 
 /**
- * Initialize Meta OAuth flow
-    * Query param: ? flow = marketing | instagram
-        *
- * marketing  → Facebook Login, ads scopes
-    * instagram  → Instagram Business Login(instagram.com dialog), IG - specific scopes
-        */
+ * Initialize Meta OAuth flow.
+ * Query param: ?flow=marketing|instagram
+ *
+ * marketing  — Facebook Login, ads scopes
+ * instagram  — Instagram Business Login (instagram.com dialog), IG-specific scopes
+ */
 router.get('/init', authenticateToken, async (req: any, res) => {
     try {
         const userId = req.user.userId;
-        const flow: MetaFlowType = (req.query.flow as MetaFlowType) || 'marketing';
-
-
+        const rawFlow = req.query.flow as string | undefined;
+        const flow: MetaFlowType = (rawFlow === 'instagram' || rawFlow === 'marketing') ? rawFlow : 'marketing';
 
         // Use Instagram credentials for Instagram Business Login, Facebook App creds for marketing/pages
         const creds = flow === 'instagram'
             ? await getInstagramCredentials()
             : await getMetaCredentials();
         const flowCfg = getMetaFlowConfig(flow);
-        const redirectUri = flow === 'instagram' 
-            ? INTEGRATION_CONFIG.meta.instagramRedirectUri 
+        const redirectUri = flow === 'instagram'
+            ? INTEGRATION_CONFIG.meta.instagramRedirectUri
             : INTEGRATION_CONFIG.meta.redirectUri;
-
-
+        const clientId = flow === 'instagram'
+            ? creds.instagramClientId
+            : creds.clientId;
         const state = generateState(userId, { flow });
 
         const url = buildOAuthUrl({
             authorizationUrl: flowCfg.authorizationUrl,
-            clientId: creds.clientId,
+            clientId: clientId,
             redirectUri,
             scopes: flowCfg.scopes,
             state
@@ -212,7 +211,12 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         const redirectUri = flow === 'instagram' 
             ? INTEGRATION_CONFIG.meta.instagramRedirectUri 
             : INTEGRATION_CONFIG.meta.redirectUri;
-
+        const clientId = flow === 'instagram'
+            ? creds.instagramClientId
+            : creds.clientId;
+        const clientSecret = flow === 'instagram'
+            ? creds.instagramClientSecret
+            : creds.clientSecret;
         console.log(`[Meta Finalize] flow=${flow} — exchanging code for token...`);
 
         // Exchange code for access token
@@ -221,8 +225,8 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         let tokenResponse: any;
         if (flow === 'instagram') {
             const params = new URLSearchParams();
-            params.append('client_id', creds.clientId);
-            params.append('client_secret', creds.clientSecret);
+            params.append('client_id', clientId);
+            params.append('client_secret', clientSecret);
             params.append('grant_type', 'authorization_code');
             params.append('redirect_uri', redirectUri);
             params.append('code', code as string);
@@ -336,7 +340,6 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
         res.status(500).json({ error: 'Failed to connect Meta ad accounts' });
     }
 });
-
 
 /**
  * Connect Instagram Business Account (flow=instagram)
