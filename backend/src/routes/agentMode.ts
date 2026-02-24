@@ -81,6 +81,10 @@ router.post('/public/plan/:planTitle/session', asyncHandler(agentModeController.
 // Get supported LLM models (public)
 router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedModels));
 
+// GET /api/agent-mode/public/reports-model-options
+// Get models suitable for report generation (public)
+router.get('/public/reports-model-options', asyncHandler(agentModeController.getReportsModelOptions));
+
 
 // POST /api/agent-mode/run-scheduled-chats
 // Run all scheduled chats that are ready to execute (called by agent-engine)

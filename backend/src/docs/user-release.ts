@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-24',
+    changes: [
+      'Agent Mode: Template HTML Generation Fix',
+      '- Fixed create_html_from_template failing with "invalid JSON" when using Gemini models that wrap JSON responses in markdown code blocks',
+      '- Template generation now correctly uses the session\'s LLM model instead of potentially passing an undefined model',
+      '- Added output token limit (16K) to prevent template generation from being silently truncated',
+      'Admin: Reports Model Dropdown',
+      '- Reports Model selector in the Agent Mode admin tab now shows only models suitable for report generation (Claude models) instead of all 8 agent mode models',
+    ],
+  },
+  {
     date: '2026-02-23',
     changes: [
       'GTM Planning Form: Instant Redirect',
