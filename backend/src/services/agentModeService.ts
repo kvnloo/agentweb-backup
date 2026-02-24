@@ -6,6 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent } from './clickupService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -1080,7 +1081,7 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, and ClickUp docs. This is complementary to web search - use knowledge base for stored information and web search for information from the internet
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
@@ -8529,6 +8530,46 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Search ClickUp docs (name match + content match)
+      if (userId) {
+        try {
+          const clickUpToken = await getClickUpAccessToken(userId);
+          if (clickUpToken) {
+            const workspaces = await getClickUpWorkspaces(clickUpToken);
+            const queryLower = query.toLowerCase();
+            for (const workspace of workspaces) {
+              try {
+                const docs = await listClickUpDocs(clickUpToken, workspace.id);
+                let clickUpResultCount = 0;
+                for (const doc of docs) {
+                  if (clickUpResultCount >= limitedMaxResults) break;
+                  try {
+                    const nameMatch = doc.name.toLowerCase().includes(queryLower);
+                    const content = await readClickUpDocContent(clickUpToken, workspace.id, doc.id);
+                    if (!content) continue;
+                    const contentMatch = content.toLowerCase().includes(queryLower);
+                    if (nameMatch || contentMatch) {
+                      results.push({
+                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                        source: `clickup/${workspace.name}/${doc.name}`
+                      });
+                      clickUpResultCount++;
+                    }
+                  } catch (readErr) {
+                    console.log(`AgentMode: Could not read ClickUp doc ${doc.name} for search:`, readErr);
+                  }
+                }
+              } catch (wsErr) {
+                console.log(`AgentMode: Error searching ClickUp docs in workspace ${workspace.name}:`, wsErr);
+              }
+            }
+          }
+        } catch (clickUpError) {
+          console.log('AgentMode: Error searching ClickUp docs:', clickUpError);
+          // Don't fail the whole search if ClickUp search fails
+        }
+      }
+
       if (results.length === 0) {
         return {
           success: true,
@@ -8585,17 +8626,7 @@ Format the response as JSON with this structure:
         }
       }
 
-      if (!allKnowledgeBaseTasks || allKnowledgeBaseTasks.length === 0) {
-        return {
-          success: true,
-          message: 'No knowledge bases found',
-          knowledge_bases: [],
-          totalKnowledgeBases: 0,
-          totalFiles: 0
-        };
-      }
-
-      const knowledgeBases = allKnowledgeBaseTasks.map((task: any) => {
+      const knowledgeBases = (allKnowledgeBaseTasks || []).map((task: any) => {
         const taskId = task.taskId;
         const taskName = task.name;
         const kbType = task.knowledgeBaseType || 'private';
@@ -8661,14 +8692,56 @@ Format the response as JSON with this structure:
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
       }
 
+      // Include ClickUp docs
+      try {
+        const clickUpToken = await getClickUpAccessToken(userId);
+        if (clickUpToken) {
+          const workspaces = await getClickUpWorkspaces(clickUpToken);
+          for (const workspace of workspaces) {
+            try {
+              const docs = await listClickUpDocs(clickUpToken, workspace.id);
+              const clickUpFiles = docs.map(doc => ({
+                fileName: doc.name,
+                fileSize: 0,
+                docId: doc.id,
+                dateCreated: doc.dateCreated,
+                dateUpdated: doc.dateUpdated,
+              }));
+
+              knowledgeBases.push({
+                identifier: `clickup:${workspace.id}`,
+                name: `ClickUp - ${workspace.name}`,
+                type: 'clickup',
+                updatedAt: clickUpFiles.length > 0 ? clickUpFiles[0].dateUpdated : undefined,
+                files: clickUpFiles,
+              });
+            } catch (wsErr) {
+              console.log(`AgentMode: Error listing ClickUp docs in workspace ${workspace.name}:`, wsErr);
+            }
+          }
+        }
+      } catch (clickUpError) {
+        console.error('AgentMode: Error listing ClickUp docs:', clickUpError);
+      }
+
       const totalFiles = knowledgeBases.reduce(
         (sum: number, kb: any) => sum + (kb.files?.length || 0),
         0
       );
 
+      if (knowledgeBases.length === 0) {
+        return {
+          success: true,
+          message: 'No knowledge bases found',
+          knowledge_bases: [],
+          totalKnowledgeBases: 0,
+          totalFiles: 0
+        };
+      }
+
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles
@@ -8803,6 +8876,11 @@ Format the response as JSON with this structure:
     // Handle Google Drive shared folder files (identifier starts with "gdrive:")
     if (kbIdentifier.startsWith('gdrive:')) {
       return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
+    }
+
+    // Handle ClickUp docs (identifier starts with "clickup:")
+    if (kbIdentifier.startsWith('clickup:')) {
+      return await this.readClickUpSharedDoc(kbIdentifier, fileName, userId);
     }
 
     // Get the task
@@ -8947,6 +9025,58 @@ Format the response as JSON with this structure:
       return {
         success: false,
         message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Helper: read a document from a ClickUp workspace
+  private async readClickUpSharedDoc(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    const workspaceId = kbIdentifier.replace('clickup:', '');
+
+    try {
+      const clickUpToken = await getClickUpAccessToken(userId);
+      if (!clickUpToken) {
+        return { success: false, message: 'ClickUp not connected' };
+      }
+
+      // Verify user has access to this workspace
+      const workspaces = await getClickUpWorkspaces(clickUpToken);
+      const workspace = workspaces.find(w => w.id === workspaceId);
+      if (!workspace) {
+        return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      }
+
+      // Find the doc by name in the workspace
+      const docs = await listClickUpDocs(clickUpToken, workspaceId);
+      const doc = docs.find(d => d.name === fileName);
+      if (!doc) {
+        return { success: false, message: `Document "${fileName}" not found in ClickUp workspace "${workspace.name}"` };
+      }
+
+      // Read doc content (all pages concatenated)
+      const content = await readClickUpDocContent(clickUpToken, workspaceId, doc.id);
+
+      const maxContentLength = 50000;
+      const truncated = content.length > maxContentLength
+        ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : content;
+
+      return {
+        success: true,
+        message: `Successfully read ClickUp document "${fileName}"`,
+        kb_identifier: kbIdentifier,
+        file_name: fileName,
+        name: workspace.name,
+        content: truncated,
+        size: content.length,
+        type: 'clickup',
+        dateUpdated: doc.dateUpdated,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading ClickUp doc:', error);
+      return {
+        success: false,
+        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }

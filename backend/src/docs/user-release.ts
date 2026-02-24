@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-23',
+    changes: [
+      'Agent Mode: ClickUp Knowledge Base Integration',
+      '- ClickUp Docs are now searchable, listable, and readable through the Knowledge Base tools in Agent Mode',
+      '- search_knowledge_base matches ClickUp docs by both document name and content (not just name)',
+      '- list_knowledge_base_files includes ClickUp docs alongside Google Drive and task-based knowledge bases',
+      '- read_knowledge_base_files supports reading full ClickUp doc content via the clickup: identifier',
+      '- ClickUp API handling improved: correctly parses the v3 pages endpoint raw array response and fetches individual page content when needed',
+      '- Shared ClickUp service layer eliminates duplicate API logic between Knowledge Base page and Agent Mode',
+    ],
+  },
+  {
     date: '2026-02-22',
     changes: [
       'Agent Mode: LinkedIn Post Formatting',
