@@ -867,11 +867,26 @@ KEY_FILE=~/.ssh/my-keypair.pem
 - Per-clone isolation enforced via name-based state files and validation guards
 - Ports: backend=3001, partner-portal=5173, customer-portal=5174
 
+## "Prep Branch for \<topic\>" Command
+
+When the user says **"prep branch for \<topic\>"**:
+
+1. Convert `<topic>` to a branch name: `rui/<topic>` (lowercase, spaces replaced with hyphens)
+2. **This repo (agentweb):**
+   - `git fetch origin main`
+   - `git checkout -b rui/<topic> origin/main`
+3. **Customer portal (separate repo at `customer-portal/`):**
+   - `git -C customer-portal fetch origin main`
+   - `git -C customer-portal checkout -b rui/<topic> origin/main`
+4. Confirm both branches are created and ready for development
+
 ## "Prep for Deploy" Command
 
 When the user says **"prep for deploy \<date\>"** (default: today's date if omitted):
 
-1. Add a user-facing release notes entry for the date at the top of `backend/src/docs/user-release.ts`, following existing format
+1. Add release notes entries for the date, following existing format in each file:
+   - **Backend changes:** `backend/src/docs/user-release.ts`
+   - **Partner portal changes:** `partner-portal/src/docs/release.ts`
 2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend. **CI requires ≥90% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
 3. Commit changes and create PRs for **both** repos:
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
