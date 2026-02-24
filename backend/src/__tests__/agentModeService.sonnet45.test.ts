@@ -119,6 +119,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['gemini-3.1-pro-preview'].client).toBeNull();
     });
+
+    it('should return only anthropic models from getReportsModelOptions', async () => {
+      const reportsModels = await agentModeService.getReportsModelOptions();
+      expect(reportsModels.length).toBeGreaterThan(0);
+      reportsModels.forEach(model => {
+        expect(model).toMatch(/^anthropic\./);
+      });
+      // Verify it excludes non-anthropic models
+      const allModels = await agentModeService.getSupportedModels();
+      const nonAnthropicModels = allModels.filter(m => !m.startsWith('anthropic.'));
+      expect(nonAnthropicModels.length).toBeGreaterThan(0);
+      nonAnthropicModels.forEach(model => {
+        expect(reportsModels).not.toContain(model);
+      });
+    });
   });
 
   describe('Bedrock client lazy-loading', () => {
