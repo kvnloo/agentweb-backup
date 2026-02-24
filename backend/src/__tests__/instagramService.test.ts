@@ -417,7 +417,7 @@ describe('InstagramService', () => {
             const result = await instagramService.getInstagramUserInsights('ig_123', 'valid_token');
             expect(mockAxios.get).toHaveBeenCalledWith(
                 `${BASE_URL}/ig_123/insights`,
-                expect.objectContaining({ params: expect.objectContaining({ metric: 'impressions,reach,profile_views', period: 'day' }) })
+                expect.objectContaining({ params: expect.objectContaining({ metric: 'reach,profile_views,website_clicks,accounts_engaged,total_interactions', period: 'day' }) })
             );
             expect(result[0].name).toBe('profile_views');
         });
