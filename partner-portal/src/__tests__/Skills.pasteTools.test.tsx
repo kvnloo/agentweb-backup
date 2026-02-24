@@ -264,7 +264,6 @@ describe('Skills - Paste Tools Feature', () => {
   });
 
   it('should handle newline-separated tool names', async () => {
-    const user = userEvent.setup();
     renderSkills();
 
     await waitFor(() => {
