@@ -2564,7 +2564,7 @@ mcpToolRegistry.register({
   name: "search_knowledge_base",
   definition: {
     name: "search_knowledge_base",
-    description: 'Search the knowledge base for relevant information. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), and Google Drive shared folders. This is complementary to web search - use knowledge base for stored information and web search for information from the internet.',
+    description: 'Search the knowledge base for relevant information. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, and ClickUp docs. This is complementary to web search - use knowledge base for stored information and web search for information from the internet.',
     inputSchema: {
       type: "object",
       properties: {
@@ -2590,7 +2590,7 @@ mcpToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
-    description: 'List all available knowledge base files for the current user, including private (user-specific), public (shared by all users) knowledge bases, and Google Drive shared folders. Google Drive entries have identifiers starting with "gdrive:" followed by the folder ID. Returns a list of files with their unique identifiers, names, sizes, types (public/private/google-drive), and last updated timestamps.',
+    description: 'List all available knowledge base files for the current user, including private (user-specific), public (shared by all users) knowledge bases, Google Drive shared folders, and ClickUp docs. Google Drive entries have identifiers starting with "gdrive:" followed by the folder ID. ClickUp entries have identifiers starting with "clickup:" followed by the workspace ID. Returns a list of files with their unique identifiers, names, sizes, types (public/private/google-drive/clickup), and last updated timestamps.',
     inputSchema: {
       type: "object",
       properties: {},
@@ -2606,7 +2606,7 @@ mcpToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
-    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
+    description: 'Read one or more knowledge base files. Each entry requires a knowledge base identifier (kb_identifier) and a file name (file_name). For Google Drive shared folders, use the identifier from list_knowledge_base_files (e.g., "gdrive:FOLDER_ID") and the file name. For ClickUp docs, use the identifier (e.g., "clickup:WORKSPACE_ID") and the doc name. Public knowledge base files can be accessed by any user, while private files require ownership. Returns the content for each requested file.',
     inputSchema: {
       type: "object",
       properties: {

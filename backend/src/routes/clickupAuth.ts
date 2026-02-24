@@ -2,7 +2,8 @@ import express from 'express';
 import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { userDb } from '../services/db';
-import { encryptPassword, decryptPassword } from '../utils/crypto';
+import { encryptPassword } from '../utils/crypto';
+import { getAccessToken, getWorkspaces, listDocs } from '../services/clickupService';
 
 const router = express.Router();
 
@@ -63,32 +64,13 @@ router.get('/status', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
   try {
-    const user = await userDb.getUserById(userId);
-    const secrets = (user?.secrets as Record<string, string>) || {};
-
-    if (!secrets.clickup_access_token) {
-      return res.json({ connected: false, workspaces: [] });
-    }
-
-    // Decrypt the token
-    let accessToken: string;
-    try {
-      const decrypted = decryptPassword(secrets.clickup_access_token);
-      accessToken = decrypted.password;
-    } catch {
+    const accessToken = await getAccessToken(userId);
+    if (!accessToken) {
       return res.json({ connected: false, workspaces: [] });
     }
 
     // Verify token by fetching workspaces
-    const teamsResponse = await axios.get<{ teams: any[] }>(CLICKUP_TEAM_URL, {
-      headers: { Authorization: accessToken },
-    });
-
-    const workspaces = (teamsResponse.data.teams || []).map((team: any) => ({
-      id: team.id,
-      name: team.name,
-      avatar: team.avatar || null,
-    }));
+    const workspaces = await getWorkspaces(accessToken);
 
     res.json({ connected: true, workspaces });
   } catch (error: any) {
@@ -106,45 +88,12 @@ router.get('/workspace/:teamId/docs', authenticateToken, async (req: any, res) =
   const { teamId } = req.params;
 
   try {
-    const user = await userDb.getUserById(userId);
-    const secrets = (user?.secrets as Record<string, string>) || {};
-
-    if (!secrets.clickup_access_token) {
+    const accessToken = await getAccessToken(userId);
+    if (!accessToken) {
       return res.status(401).json({ error: 'ClickUp not connected' });
     }
 
-    let accessToken: string;
-    try {
-      const decrypted = decryptPassword(secrets.clickup_access_token);
-      accessToken = decrypted.password;
-    } catch {
-      return res.status(401).json({ error: 'Failed to decrypt ClickUp token' });
-    }
-
-    const headers = { Authorization: accessToken };
-
-    // Fetch docs using ClickUp v3 API (paginated, up to 100 per page)
-    const allDocs: any[] = [];
-    let cursor: string | undefined;
-    do {
-      const params = new URLSearchParams({ limit: '100' });
-      if (cursor) params.set('cursor', cursor);
-      const docsRes = await axios.get<{ docs: any[]; next_cursor?: string }>(
-        `https://api.clickup.com/api/v3/workspaces/${teamId}/docs?${params.toString()}`,
-        { headers }
-      );
-      allDocs.push(...(docsRes.data.docs || []));
-      cursor = docsRes.data.next_cursor || undefined;
-    } while (cursor);
-
-    const docs = allDocs
-      .filter((doc: any) => !doc.deleted && !doc.archived)
-      .map((doc: any) => ({
-        id: doc.id,
-        name: doc.name,
-        dateCreated: doc.date_created,
-        dateUpdated: doc.date_updated || doc.date_created,
-      }));
+    const docs = await listDocs(accessToken, teamId);
 
     res.json({ docs });
   } catch (error: any) {

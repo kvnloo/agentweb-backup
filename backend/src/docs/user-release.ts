@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-23',
     changes: [
+      'Agent Mode: ClickUp Knowledge Base Integration',
+      '- ClickUp Docs are now searchable, listable, and readable through the Knowledge Base tools in Agent Mode',
+      '- search_knowledge_base matches ClickUp docs by both document name and content (not just name)',
+      '- list_knowledge_base_files includes ClickUp docs alongside Google Drive and task-based knowledge bases',
+      '- read_knowledge_base_files supports reading full ClickUp doc content via the clickup: identifier',
+      '- ClickUp API handling improved: correctly parses the v3 pages endpoint raw array response and fetches individual page content when needed',
+      '- Shared ClickUp service layer eliminates duplicate API logic between Knowledge Base page and Agent Mode',
       'CRM: Prospect Status Tracking',
       '- Leads now have a configurable status pipeline with stages like New, Contacted, Qualified, Proposal Sent, Negotiating, Won, Lost, and Churned',
       '- Each lead list has its own status configuration that can be customized in the Edit Lead List dialog — add, remove, or reorder stages with color and type (active/won/lost/churned)',

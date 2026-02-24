@@ -390,7 +390,7 @@ describe('ClickUp Auth Routes', () => {
         .get('/api/oauth/clickup/workspace/team-123/docs')
         .expect(401);
 
-      expect(response.body.error).toBe('Failed to decrypt ClickUp token');
+      expect(response.body.error).toBe('ClickUp not connected');
     });
 
     it('should fetch docs and filter out deleted/archived', async () => {
