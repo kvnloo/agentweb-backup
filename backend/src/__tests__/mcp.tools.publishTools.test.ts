@@ -116,6 +116,37 @@ describe('MCP Publishing Tools', () => {
       expect(description?.toLowerCase()).toContain('review');
       expect(description?.toLowerCase()).toContain('approval');
     });
+
+    it('should have content description that warns against markdown for LinkedIn', () => {
+      const tool = mcpToolRegistry.getTool('post_on_connected_account');
+      const contentDesc = tool?.definition.inputSchema?.properties?.content?.description;
+
+      expect(contentDesc).toBeDefined();
+      expect(contentDesc).toContain('CRITICAL FOR LINKEDIN');
+      expect(contentDesc).toContain('does NOT render markdown');
+      expect(contentDesc).toContain('**bold**');
+      expect(contentDesc).toContain('unicode bullets');
+    });
+  });
+
+  describe('create_social_media_posts tool', () => {
+    it('should be registered in the tool registry', () => {
+      const tool = mcpToolRegistry.getTool('create_social_media_posts');
+      expect(tool).toBeDefined();
+      expect(tool?.name).toBe('create_social_media_posts');
+    });
+
+    it('should have content description that warns against markdown for LinkedIn', () => {
+      const tool = mcpToolRegistry.getTool('create_social_media_posts');
+      const contentDesc = tool?.definition.inputSchema?.properties?.posts?.items?.properties?.content?.description;
+
+      expect(contentDesc).toBeDefined();
+      expect(contentDesc).toContain('CRITICAL FOR LINKEDIN');
+      expect(contentDesc).toContain('does NOT support markdown');
+      expect(contentDesc).toContain('**bold**');
+      expect(contentDesc).toContain('unicode bullets');
+      expect(contentDesc).toContain('LinkedIn-native plain text');
+    });
   });
 
   describe('Tool execution', () => {

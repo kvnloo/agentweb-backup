@@ -1099,6 +1099,16 @@ When posting to connected social media accounts using 'post_on_connected_account
 - If the user approved a multi-paragraph post, include every single paragraph in full.
 - The content parameter must be an exact copy of what was shown to and approved by the user.
 
+### LinkedIn Post Formatting (CRITICAL)
+LinkedIn does NOT support markdown rendering. When creating or posting LinkedIn content, NEVER use markdown syntax:
+- No **bold** or *italic* markers — they appear as raw asterisks
+- No - or * bullet lists — use unicode bullets (•) or em dashes (—) instead
+- No [text](url) links — paste full URLs directly (LinkedIn auto-links them)
+- No # headings — use UPPERCASE, emojis, or line breaks for structure
+- Use blank lines between paragraphs for readability
+- Use emojis strategically for visual emphasis and section breaks
+This applies to BOTH 'create_social_media_posts' and 'post_on_connected_account' when the platform is LinkedIn.
+
 ## "whitepapers" / "research reports" / "executive summaries"
 
 For whitepapers, research reports, or executive summaries (target: 8-12 pages):

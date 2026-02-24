@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Test Environment Access</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet" />
+  <style>
+    body { background: #f5f5fa; min-height: 100vh; }
+    .badge-allowed { background: #d1fae5; color: #065f46; }
+    .badge-denied  { background: #fee2e2; color: #991b1b; }
+    .code-input { letter-spacing: 0.5em; text-align: center; font-size: 1.5rem; font-weight: 600; }
+    .fade-in { animation: fadeIn 0.3s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body class="flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-lg max-w-lg w-full p-8">
+    <h1 class="text-2xl font-bold text-gray-900 mb-1">Test Environment Access</h1>
+    <p class="text-gray-500 text-sm mb-6">Self-service IP allowlist for the cloud test environment.</p>
+
+    <!-- Status Section -->
+    <div id="status-section" class="mb-6">
+      <div class="flex items-center gap-2 mb-3">
+        <span class="text-sm text-gray-500">Your IP:</span>
+        <code id="client-ip" class="bg-gray-100 px-2 py-0.5 rounded text-sm font-mono">—</code>
+      </div>
+      <div id="services-list" class="space-y-2"></div>
+    </div>
+
+    <!-- Step: Email Input -->
+    <div id="step-email" class="hidden fade-in">
+      <h2 class="text-lg font-semibold text-gray-800 mb-2">Request Access</h2>
+      <p class="text-gray-500 text-sm mb-3">Enter your work email to receive a verification code.</p>
+      <form id="email-form" class="space-y-3">
+        <input
+          id="email-input"
+          type="email"
+          placeholder="you@agentweb.pro"
+          required
+          class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+        />
+        <button
+          type="submit"
+          id="email-btn"
+          class="w-full bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg px-4 py-2.5 text-sm font-medium transition"
+        >
+          Send Verification Code
+        </button>
+      </form>
+      <p id="email-error" class="text-red-600 text-sm mt-2 hidden"></p>
+    </div>
+
+    <!-- Step: Code Verification -->
+    <div id="step-code" class="hidden fade-in">
+      <h2 class="text-lg font-semibold text-gray-800 mb-2">Enter Verification Code</h2>
+      <p class="text-gray-500 text-sm mb-3">A 6-digit code was sent to <strong id="sent-email"></strong>.</p>
+      <form id="code-form" class="space-y-3">
+        <input
+          id="code-input"
+          type="text"
+          inputmode="numeric"
+          maxlength="6"
+          pattern="[0-9]{6}"
+          placeholder="000000"
+          required
+          class="w-full border border-gray-300 rounded-lg px-4 py-2.5 code-input focus:outline-none focus:ring-2 focus:ring-indigo-400"
+        />
+        <button
+          type="submit"
+          id="code-btn"
+          class="w-full bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg px-4 py-2.5 text-sm font-medium transition"
+        >
+          Verify &amp; Allowlist My IP
+        </button>
+      </form>
+      <p id="code-error" class="text-red-600 text-sm mt-2 hidden"></p>
+      <button
+        id="resend-btn"
+        class="text-indigo-600 hover:underline text-sm mt-3"
+        type="button"
+      >
+        Resend code
+      </button>
+    </div>
+
+    <!-- Step: Success -->
+    <div id="step-success" class="hidden fade-in text-center py-4">
+      <div class="text-green-500 text-5xl mb-3">&#10003;</div>
+      <h2 class="text-lg font-semibold text-gray-800 mb-1">Access Granted</h2>
+      <p class="text-gray-500 text-sm">Your IP has been added to the allowlist.</p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+
+    let currentEmail = "";
+
+    async function fetchStatus() {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      $("#client-ip").textContent = `${data.ip} (subnet: ${data.subnet})`;
+
+      const list = $("#services-list");
+      list.innerHTML = "";
+      for (const [svc, allowed] of Object.entries(data.services)) {
+        const row = document.createElement("div");
+        row.className = "flex items-center justify-between bg-gray-50 rounded-lg px-4 py-2";
+        row.innerHTML = `
+          <span class="text-sm font-medium text-gray-700">${svc}</span>
+          <span class="text-xs font-semibold px-2.5 py-0.5 rounded-full ${allowed ? "badge-allowed" : "badge-denied"}">
+            ${allowed ? "Allowed" : "Not Allowed"}
+          </span>
+        `;
+        list.appendChild(row);
+      }
+
+      if (data.allowed) {
+        hide("step-email");
+        hide("step-code");
+      } else {
+        show("step-email");
+      }
+    }
+
+    function show(id) { document.getElementById(id).classList.remove("hidden"); }
+    function hide(id) { document.getElementById(id).classList.add("hidden"); }
+
+    function showError(id, msg) {
+      const el = document.getElementById(id);
+      el.textContent = msg;
+      el.classList.remove("hidden");
+    }
+    function hideError(id) {
+      document.getElementById(id).classList.add("hidden");
+    }
+
+    function setLoading(btnId, loading) {
+      const btn = document.getElementById(btnId);
+      btn.disabled = loading;
+      if (loading) {
+        btn.dataset.originalText = btn.textContent;
+        btn.textContent = "Please wait\u2026";
+        btn.classList.add("opacity-60", "cursor-not-allowed");
+      } else {
+        btn.textContent = btn.dataset.originalText || btn.textContent;
+        btn.classList.remove("opacity-60", "cursor-not-allowed");
+      }
+    }
+
+    $("#email-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      hideError("email-error");
+      const email = $("#email-input").value.trim();
+      const domain = email.split("@")[1]?.toLowerCase();
+      if (!["agentweb.pro", "argusoft.com"].includes(domain)) {
+        showError("email-error", "Email must be @agentweb.pro or @argusoft.com.");
+        return;
+      }
+      setLoading("email-btn", true);
+      try {
+        const res = await fetch("/api/request-code", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showError("email-error", data.error);
+          return;
+        }
+        currentEmail = email;
+        $("#sent-email").textContent = email;
+        hide("step-email");
+        show("step-code");
+      } catch {
+        showError("email-error", "Network error. Try again.");
+      } finally {
+        setLoading("email-btn", false);
+      }
+    });
+
+    $("#code-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      hideError("code-error");
+      const code = $("#code-input").value.trim();
+      if (!/^\d{6}$/.test(code)) {
+        showError("code-error", "Enter a valid 6-digit code.");
+        return;
+      }
+      setLoading("code-btn", true);
+      try {
+        const res = await fetch("/api/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showError("code-error", data.error);
+          return;
+        }
+        hide("step-code");
+        show("step-success");
+        fetchStatus();
+      } catch {
+        showError("code-error", "Network error. Try again.");
+      } finally {
+        setLoading("code-btn", false);
+      }
+    });
+
+    $("#resend-btn").addEventListener("click", () => {
+      hide("step-code");
+      show("step-email");
+      $("#email-input").value = currentEmail;
+    });
+
+    fetchStatus();
+  </script>
+</body>
+</html>
