@@ -2821,7 +2821,9 @@ export const crmDb = {
     listSenderId?: string | null,
     autoDraftEnabled?: boolean,
     autoDraftInstruction?: string,
-    autoSendEnabled?: boolean
+    autoSendEnabled?: boolean,
+    statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
+    listType?: 'sales' | 'customers'
   ) {
     try {
       const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -2849,6 +2851,22 @@ export const crmDb = {
           autoDraftInstruction: typeof autoDraftInstruction === 'string' ? autoDraftInstruction.trim() : '',
           autoSendEnabled: autoSendEnabled === true, // Default: auto send disabled
           engagedOnly: false,
+          statusConfig: statusConfig || (listType === 'customers' ? [
+            { value: 'onboarding', label: 'Onboarding', color: 'blue', type: 'active' },
+            { value: 'active', label: 'Active', color: 'green', type: 'active' },
+            { value: 'at_risk', label: 'At Risk', color: 'yellow', type: 'active' },
+            { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+          ] : [
+            { value: 'new', label: 'New', color: 'gray', type: 'active' },
+            { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
+            { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
+            { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
+            { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
+            { value: 'won', label: 'Won', color: 'green', type: 'won' },
+            { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
+            { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+          ]),
+          ...(listType ? { listType } : {}),
         },
       };
 
@@ -2942,6 +2960,8 @@ export const crmDb = {
       icpsOnly?: boolean;
       engagedOnly?: boolean;
       csvExportHistory?: any[];
+      statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      listType?: 'sales' | 'customers';
     }
   ) {
     try {
@@ -3025,6 +3045,18 @@ export const crmDb = {
         expressionAttributeNames['#csvExportHistory'] = 'csvExportHistory';
         updateExpressions.push('#csvExportHistory = :csvExportHistory');
         expressionAttributeValues[':csvExportHistory'] = updates.csvExportHistory;
+      }
+
+      if (updates.statusConfig !== undefined) {
+        expressionAttributeNames['#statusConfig'] = 'statusConfig';
+        updateExpressions.push('#statusConfig = :statusConfig');
+        expressionAttributeValues[':statusConfig'] = updates.statusConfig;
+      }
+
+      if (updates.listType !== undefined) {
+        expressionAttributeNames['#listType'] = 'listType';
+        updateExpressions.push('#listType = :listType');
+        expressionAttributeValues[':listType'] = updates.listType;
       }
 
       if (updateExpressions.length === 0) {
@@ -3167,6 +3199,9 @@ export const crmDb = {
     linkedin?: string;
     customFields?: Record<string, any>;
     selectedSenderId?: string | null;
+    status?: string | null;
+    dealValue?: number | null;
+    dealCurrency?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3205,6 +3240,15 @@ export const crmDb = {
       if (leadData.selectedSenderId) {
         item.selectedSenderId = leadData.selectedSenderId;
       }
+      if (leadData.status) {
+        item.status = leadData.status;
+      }
+      if (leadData.dealValue != null) {
+        item.dealValue = leadData.dealValue;
+      }
+      if (leadData.dealCurrency) {
+        item.dealCurrency = leadData.dealCurrency;
+      }
 
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
@@ -3212,10 +3256,10 @@ export const crmDb = {
       };
 
       await dynamodb.put(params).promise();
-      
+
       // Extract field names from lead data
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       standardFields.forEach(field => {
         if (leadData[field as keyof typeof leadData] && String(leadData[field as keyof typeof leadData]).trim()) {
           fieldNames.push(field);
@@ -3339,6 +3383,40 @@ export const crmDb = {
     }
   },
 
+  async getLeadsByStatus(listId: string, status: string, limit?: number, lastEvaluatedKey?: any) {
+    try {
+      const params: any = {
+        TableName: `${TABLE_PREFIX}AW-Leads`,
+        IndexName: 'listId-status-index',
+        KeyConditionExpression: 'listId = :listId AND #status = :status',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+        },
+        ExpressionAttributeValues: {
+          ':listId': listId,
+          ':status': status,
+        },
+      };
+
+      if (limit !== undefined && limit > 0) {
+        params.Limit = limit;
+      }
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return {
+        items: result.Items || [],
+        lastEvaluatedKey: result.LastEvaluatedKey || null,
+        hasMore: !!result.LastEvaluatedKey,
+      };
+    } catch (error) {
+      handleDynamoDbError(error, "getLeadsByStatus");
+      throw error;
+    }
+  },
+
   async getLeadById(listId: string, leadId: string) {
     try {
       const params = {
@@ -3411,11 +3489,15 @@ export const crmDb = {
       matchedAt: string;
     } | null;
     lastAutoSendAt?: string | null;
+    status?: string | null;
+    dealValue?: number | null;
+    dealCurrency?: string;
   }) {
     try {
       const setExpressions: string[] = [];
       const removeExpressions: string[] = [];
       const expressionAttributeValues: any = {};
+      const expressionAttributeNames: Record<string, string> = {};
 
       if (updates.email !== undefined) {
         const emailValue = updates.email.trim().toLowerCase();
@@ -3527,6 +3609,33 @@ export const crmDb = {
         }
       }
 
+      if (updates.status !== undefined) {
+        if (updates.status === null) {
+          removeExpressions.push('#status');
+          expressionAttributeNames['#status'] = 'status';
+        } else {
+          setExpressions.push('#status = :status');
+          expressionAttributeNames['#status'] = 'status';
+          expressionAttributeValues[':status'] = updates.status;
+        }
+      }
+
+      if (updates.dealValue !== undefined) {
+        if (updates.dealValue === null) {
+          removeExpressions.push('#dealValue');
+          expressionAttributeNames['#dealValue'] = 'dealValue';
+        } else {
+          setExpressions.push('#dealValue = :dealValue');
+          expressionAttributeNames['#dealValue'] = 'dealValue';
+          expressionAttributeValues[':dealValue'] = updates.dealValue;
+        }
+      }
+
+      if (updates.dealCurrency !== undefined) {
+        setExpressions.push('dealCurrency = :dealCurrency');
+        expressionAttributeValues[':dealCurrency'] = updates.dealCurrency;
+      }
+
       // Always update updatedAt
       setExpressions.push('updatedAt = :updatedAt');
       expressionAttributeValues[':updatedAt'] = new Date().toISOString();
@@ -3544,7 +3653,7 @@ export const crmDb = {
         updateExpressionParts.push(`REMOVE ${removeExpressions.join(', ')}`);
       }
 
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
           listId,
@@ -3554,12 +3663,15 @@ export const crmDb = {
         ExpressionAttributeValues: Object.keys(expressionAttributeValues).length > 0 ? expressionAttributeValues : undefined,
         ReturnValues: 'ALL_NEW' as const,
       };
+      if (Object.keys(expressionAttributeNames).length > 0) {
+        params.ExpressionAttributeNames = expressionAttributeNames;
+      }
 
       const result = await dynamodb.update(params).promise();
-      
+
       // Extract field names from updates
       const fieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       standardFields.forEach(field => {
         if (updates[field as keyof typeof updates] !== undefined && String(updates[field as keyof typeof updates]).trim()) {
           fieldNames.push(field);
@@ -3572,7 +3684,7 @@ export const crmDb = {
           }
         });
       }
-      
+
       // Update field names in list
       if (fieldNames.length > 0) {
         const list = await this.getLeadListById(listId);
@@ -3580,7 +3692,7 @@ export const crmDb = {
         const allFieldNames = [...existingFieldNames, ...fieldNames];
         await this.updateFieldNames(listId, allFieldNames);
       }
-      
+
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "updateLead");
@@ -3620,6 +3732,9 @@ export const crmDb = {
     notes?: string;
     linkedin?: string;
     customFields?: Record<string, any>;
+    status?: string | null;
+    dealValue?: number | null;
+    dealCurrency?: string;
   }>) {
     try {
       const results = {
@@ -3712,7 +3827,16 @@ export const crmDb = {
           if (emailValue) {
             item.email = emailValue;
           }
-          
+          if (lead.status) {
+            item.status = lead.status;
+          }
+          if (lead.dealValue != null) {
+            item.dealValue = lead.dealValue;
+          }
+          if (lead.dealCurrency) {
+            item.dealCurrency = lead.dealCurrency;
+          }
+
           return {
             PutRequest: {
               Item: item,
@@ -3740,7 +3864,7 @@ export const crmDb = {
 
       // Extract all field names from imported leads (both new and updated)
       const allFieldNames: string[] = [];
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       
       // Extract from new leads
       newLeads.forEach(lead => {
