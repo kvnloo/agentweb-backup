@@ -1,3 +1,9 @@
+# February 24, 2026: SEO/GEO Engagement Time Is Total, Not Average
+
+The "Top Pages by Engagement" table on the SEO/GEO page displays **total** engagement time, not average. The backend (`seo.ts`) requests GA4's `userEngagementDuration` metric, which is cumulative across all sessions. The frontend (`SEO.tsx`) renders it directly via `formatTime()` with no averaging. For product metrics, the backend separately computes `avgDuration` by dividing `totalDuration` by `pageViews`, but this is not used in the top pages table.
+
+---
+
 # February 24, 2026: `create_html_from_template` JSON Failure + Reports Model Admin Bug
 
 ## Problem 1 — Amino Daily News Template Failure
