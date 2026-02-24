@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-23',
     changes: [
+      'GTM Planning Form: Instant Redirect',
+      '- Submitting the GTM planning form now redirects to the session page immediately instead of blocking for 2+ minutes while the plan generates',
+      '- The backend fires off plan generation asynchronously; the session page shows real-time progress via SSE (Thinking, Executing: search_web, etc.)',
+      '- Eliminates duplicate sessions caused by users refreshing during the long wait',
       'GTM Tracker: Full Plan Management in Agent Mode',
       '- 9 new GTM tools bring the total to 12, enabling complete plan lifecycle management through Agent Mode chat',
       '- Update plan metadata (title, description, DRI, due date) with "update_gtm_plan"',
