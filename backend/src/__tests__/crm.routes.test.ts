@@ -40,6 +40,7 @@ jest.mock('../services/db', () => ({
     getLeadsByListId: jest.fn(),
     getLeadsByICPFlag: jest.fn(),
     getLeadsByEngagedFlag: jest.fn(),
+    getLeadsByStatus: jest.fn(),
     createLead: jest.fn(),
     getLeadById: jest.fn(),
     updateLead: jest.fn(),
@@ -185,7 +186,7 @@ describe('CRM Routes', () => {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
       
-      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined, null, false);
+      expect(crmDb.createLeadList).toHaveBeenCalledWith('test-user-id', 'New List', 'Test description', undefined, null, false, undefined, undefined, undefined, undefined);
       expect(mockResponse.status).toHaveBeenCalledWith(201);
       expect(mockResponse.json).toHaveBeenCalledWith(mockList);
     });
@@ -220,7 +221,11 @@ describe('CRM Routes', () => {
         'Alert description',
         ['email.received', 'email.clicked'],
         null,
-        false
+        false,
+        undefined,
+        undefined,
+        undefined,
+        undefined
       );
       expect(mockResponse.status).toHaveBeenCalledWith(201);
     });
@@ -318,7 +323,11 @@ describe('CRM Routes', () => {
         undefined,
         undefined,
         'sender-1',
-        false
+        false,
+        undefined,
+        undefined,
+        undefined,
+        undefined
       );
       expect(mockResponse.status).toHaveBeenCalledWith(201);
     });
@@ -2080,6 +2089,298 @@ describe('CRM Routes', () => {
       }
 
       expect(mockResponse.status).toHaveBeenCalledWith(404);
+    });
+  });
+
+  describe('PUT /api/crm/lists/:listId - statusConfig', () => {
+    it('should update statusConfig for a lead list', async () => {
+      const mockList = {
+        listId: 'list1',
+        name: 'Test List',
+        userId: 'test-user-id',
+      };
+
+      const statusConfig = [
+        { value: 'new', label: 'New', color: 'gray', type: 'active' },
+        { value: 'won', label: 'Won', color: 'green', type: 'won' },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({ ...mockList, statusConfig });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { statusConfig };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', { statusConfig });
+    });
+
+    it('should return 400 if statusConfig is not an array', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { statusConfig: 'not-an-array' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'statusConfig must be an array' });
+    });
+
+    it('should return 400 if statusConfig entry missing required fields', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { statusConfig: [{ value: 'new', label: 'New' }] };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'Each statusConfig entry must have value, label, color, and type' });
+    });
+
+    it('should return 400 if statusConfig type is invalid', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { statusConfig: [{ value: 'x', label: 'X', color: 'gray', type: 'invalid' }] };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'statusConfig type must be one of: active, won, lost, churned' });
+    });
+  });
+
+  describe('PUT /api/crm/lists/:listId - listType', () => {
+    it('should set listType when not already set', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.updateLeadList as jest.Mock).mockResolvedValue({ ...mockList, listType: 'customers' });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: 'customers' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.updateLeadList).toHaveBeenCalledWith('list1', { listType: 'customers' });
+    });
+
+    it('should return 400 if listType already set', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id', listType: 'sales' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: 'customers' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType is already set and cannot be changed' });
+    });
+
+    it('should return 400 if listType is invalid', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.body = { listType: 'invalid' };
+
+      const handler = router.stack.find((r: any) => r.route?.path === '/lists/:listId' && r.route?.methods?.put);
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(mockResponse.status).toHaveBeenCalledWith(400);
+      expect(mockResponse.json).toHaveBeenCalledWith({ message: 'listType must be "sales" or "customers"' });
+    });
+  });
+
+  describe('PUT /api/crm/lists/:listId/leads/:leadId - status change', () => {
+    it('should create status.changed engagement when status changes', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = { leadId: 'lead1', status: 'new', email: 'test@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({ ...existingLead, status: 'qualified' });
+      (crmDb.addLeadEngagement as jest.Mock).mockResolvedValue({});
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = { status: 'qualified' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.addLeadEngagement).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
+        eventType: 'status.changed',
+        eventData: expect.objectContaining({
+          from: 'new',
+          to: 'qualified',
+        }),
+      }));
+      expect(crmDb.updateLead).toHaveBeenCalled();
+    });
+
+    it('should not create engagement when status is unchanged', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = { leadId: 'lead1', status: 'new', email: 'test@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue(existingLead);
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = { status: 'new' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.addLeadEngagement).not.toHaveBeenCalled();
+      expect(crmDb.updateLead).toHaveBeenCalled();
+    });
+
+    it('should update lead with dealValue and dealCurrency', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const existingLead = { leadId: 'lead1', status: 'negotiating', email: 'test@example.com' };
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadById as jest.Mock).mockResolvedValue(existingLead);
+      (crmDb.updateLead as jest.Mock).mockResolvedValue({ ...existingLead, status: 'won', dealValue: 10000, dealCurrency: 'USD' });
+      (crmDb.addLeadEngagement as jest.Mock).mockResolvedValue({});
+
+      mockRequest.params = { listId: 'list1', leadId: 'lead1' };
+      mockRequest.body = { status: 'won', dealValue: 10000, dealCurrency: 'USD' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads/:leadId' && r.route?.methods?.put
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.addLeadEngagement).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
+        eventType: 'status.changed',
+        eventData: expect.objectContaining({
+          from: 'negotiating',
+          to: 'won',
+          dealValue: 10000,
+          dealCurrency: 'USD',
+        }),
+      }));
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
+        status: 'won',
+        dealValue: 10000,
+        dealCurrency: 'USD',
+      }));
+    });
+  });
+
+  describe('GET /api/crm/lists/:listId/leads - status filtering', () => {
+    it('should use status GSI when status filter is provided alone', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id' };
+      const mockLeads = [
+        { leadId: 'lead1', email: 'a@test.com', status: 'qualified' },
+        { leadId: 'lead2', email: 'b@test.com', status: 'qualified' },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByStatus as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
+        total: 0, last7Days: 0, totalAllMessages: 0,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { page: '1', limit: '50', status: 'qualified' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      expect(crmDb.getLeadsByStatus).toHaveBeenCalledWith('list1', 'qualified', expect.any(Number), undefined);
+      expect(mockResponse.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          leads: expect.arrayContaining([
+            expect.objectContaining({ leadId: 'lead1' }),
+            expect.objectContaining({ leadId: 'lead2' }),
+          ]),
+          totalFilteredCount: 2,
+        })
+      );
+    });
+
+    it('should filter by status in-memory when combined with ICP filter', async () => {
+      const mockList = { listId: 'list1', name: 'Test', userId: 'test-user-id', icpsOnly: true };
+      const mockLeads = [
+        { leadId: 'lead1', email: 'a@test.com', status: 'qualified', isICP: 1 },
+        { leadId: 'lead2', email: 'b@test.com', status: 'new', isICP: 1 },
+      ];
+
+      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
+      (crmDb.getLeadsByICPFlag as jest.Mock).mockResolvedValue({
+        items: mockLeads,
+        lastEvaluatedKey: null,
+        hasMore: false,
+      });
+      (crmDb.getLeadEngagementCount as jest.Mock).mockResolvedValue({
+        total: 0, last7Days: 0, totalAllMessages: 0,
+      });
+
+      mockRequest.params = { listId: 'list1' };
+      mockRequest.query = { page: '1', limit: '50', status: 'qualified' };
+
+      const handler = router.stack.find((r: any) =>
+        r.route?.path === '/lists/:listId/leads' && r.route?.methods?.get
+      );
+      if (handler && handler.route) {
+        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
+      }
+
+      // Should use ICP index, not status index
+      expect(crmDb.getLeadsByICPFlag).toHaveBeenCalled();
+      expect(crmDb.getLeadsByStatus).not.toHaveBeenCalled();
+
+      const responsePayload = (mockResponse.json as jest.Mock).mock.calls[0][0];
+      expect(responsePayload.leads).toHaveLength(1);
+      expect(responsePayload.leads[0].leadId).toBe('lead1');
+      expect(responsePayload.totalFilteredCount).toBe(1);
     });
   });
 });

@@ -31,6 +31,8 @@ The backend manages tasks and schedules, stores them in DynamoDB, and the agent 
 
 ## Development Commands
 
+**CRITICAL: Do NOT run the backend, partner-portal, or customer-portal locally for manual testing.** Always use the cloud test environment (`./test-env/test-env.sh launch` then `./test-env/test-env.sh sync`) for testing changes. The commands below (`npm run dev`) are documented for reference only. Local runs should be limited to `npx tsc` (compilation checks) and `npm test` (unit tests).
+
 ### Backend
 
 ```bash
@@ -825,7 +827,7 @@ KEY_FILE=~/.ssh/my-keypair.pem
 
 ### Usage
 
-**IMPORTANT:** When a test environment is active (check with `./test-env/test-env.sh list`), run `./test-env/test-env.sh sync` after making code changes to deploy them to the instance. Sync the specific service that changed (e.g., `sync backend`) or `sync` for all. There is no automatic file watcher — sync must be run explicitly.
+**CRITICAL:** When a test environment is active (check with `./test-env/test-env.sh list`), you MUST run `./test-env/test-env.sh sync` after EVERY code change to deploy it to the instance. Always sync immediately after making changes — do not wait for the user to ask. Sync the specific service that changed (e.g., `sync backend`, `sync customer-portal`) or `sync` for all. There is no automatic file watcher — sync must be run explicitly after each change.
 
 ```bash
 # Launch environment (auto-detects your IP and locks access to it)

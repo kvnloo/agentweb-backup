@@ -1091,7 +1091,8 @@ const createLeadsTable = async () => {
       { AttributeName: 'leadId', AttributeType: 'S' },
       { AttributeName: 'email', AttributeType: 'S' },
       { AttributeName: 'isICP', AttributeType: 'N' },
-      { AttributeName: 'isEngaged', AttributeType: 'N' }
+      { AttributeName: 'isEngaged', AttributeType: 'N' },
+      { AttributeName: 'status', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'listId', KeyType: 'HASH' },
@@ -1131,6 +1132,20 @@ const createLeadsTable = async () => {
         KeySchema: [
           { AttributeName: 'listId', KeyType: 'HASH' },
           { AttributeName: 'isEngaged', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5
+        }
+      },
+      {
+        IndexName: 'listId-status-index',
+        KeySchema: [
+          { AttributeName: 'listId', KeyType: 'HASH' },
+          { AttributeName: 'status', KeyType: 'RANGE' }
         ],
         Projection: {
           ProjectionType: 'ALL'
