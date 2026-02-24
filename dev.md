@@ -1,3 +1,40 @@
+# February 24, 2026: `create_html_from_template` JSON Failure + Reports Model Admin Bug
+
+## Problem 1 — Amino Daily News Template Failure
+
+Production session `8400bace-...` (Daily AI News - Amino) using `gemini-3.1-pro-preview` failed 25 times on `create_html_from_template` with "LLM returned invalid JSON for variable substitution".
+
+### Root Cause
+
+Three issues combined:
+
+1. **`tools.ts:1175` used `args.llmModel` but `llmModel` is in `context`, not `args`** — the model passed to `createHtmlFromTemplate` was undefined/wrong.
+2. **Gemini doesn't reliably honor `response_format: { type: 'json_object' }`** — it returns JSON wrapped in markdown code blocks (`` ```json ... ``` ``), causing `JSON.parse()` to fail.
+3. **No `max_completion_tokens` was set** — risking output truncation on large templates.
+
+### Fix
+
+- Changed `args.llmModel` → `context?.llmModel` in `tools.ts:1175`
+- Added JSON code-block stripping fallback: first tries `JSON.parse`, then strips `` ```json ``` `` wrappers and retries, with raw response logging on failure
+- Added `max_completion_tokens: 16384` to the `callLLM` call (matching `createHtmlFile` and `createHtmlTemplate`)
+
+## Problem 2 — Reports Model Dropdown Shows All Models
+
+The Reports Model dropdown in the admin page's Agent Mode tab showed all 8 agent mode models (GPT, Gemini, Claude) when it should only show models suitable for report generation.
+
+### Root Cause
+
+The `<Select>` at `AdminDashboard.tsx:7199` used `supportedModels` (from `/api/agent-mode/public/llm-models`) which returns all models in `llmModels`. This was always the case since commit `e324fb8f` (Jan 13), but became worse as models were added:
+- Jan 13: 4 models → Feb 20: 8 models (every new model automatically appeared)
+
+### Fix
+
+- Added `getReportsModelOptions()` to `agentModeService.ts` — filters `llmModels` to `anthropic.*` keys only
+- Added `GET /api/agent-mode/public/reports-model-options` endpoint
+- Updated `AdminDashboard.tsx` to load and use the filtered list for the Reports Model dropdown (with fallback to `supportedModels` if endpoint fails)
+
+---
+
 # February 23, 2026: Updated User Guide — ClickUp & Google Drive Documentation
 
 Added sections to the user-facing guide (Notion) documenting the ClickUp Knowledge Base integration and Google Drive Shared Folders integration. Covers setup instructions, agent capabilities, supported file types, and security.
