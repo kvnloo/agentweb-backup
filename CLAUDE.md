@@ -651,6 +651,18 @@ These checks prevent CI failures and ensure code quality. The `npx tsc` command 
 
 **CRITICAL:** Run `npx tsc` after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
 
+## Commit Granularity
+
+**Each commit should cover one logical change.** Separate commits for different types of work so the git history is clear and reviewable:
+
+- A bug fix is its own commit
+- A new feature is its own commit
+- Unit tests are their own commit
+- User release notes updates are their own commit
+- Documentation changes (dev.md, CLAUDE.md) are their own commit
+
+For example, a PR that fixes a bug and adds a feature should have at minimum: one commit for the bug fix, one for the feature, one for tests, one for release notes, and one for any dev.md investigation notes — not a single commit bundling everything together.
+
 ## Testing Strategy
 
 ### Backend Tests
