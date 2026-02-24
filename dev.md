@@ -1,3 +1,9 @@
+# February 23, 2026: Updated User Guide — ClickUp & Google Drive Documentation
+
+Added sections to the user-facing guide (Notion) documenting the ClickUp Knowledge Base integration and Google Drive Shared Folders integration. Covers setup instructions, agent capabilities, supported file types, and security.
+
+---
+
 # February 23, 2026: Enabled Branch Protection on Main
 
 Neither `AgentWebPro/agentweb` nor `AgentWebPro/agentweb-customer-portal` had branch protection on `main`. Enabled protection on both repos via GitHub API with: strict status checks, force pushes blocked, branch deletion blocked, and enforce admins enabled. Required PR reviews was initially set to 1 but later removed.
