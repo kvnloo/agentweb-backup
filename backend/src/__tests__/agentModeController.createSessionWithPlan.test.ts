@@ -14,6 +14,8 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionWorkPlan: jest.fn(),
     updateSessionInteractiveShareMetadata: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    getChatSession: jest.fn(),
+    addChatMessage: jest.fn(),
   }
 }));
 
@@ -83,12 +85,13 @@ describe('AgentModeController - createSessionWithPlan', () => {
     pageIdentifier: `plan-${mockPlanTitle}`
   };
 
-  const mockRequest = (planTitle: string, headers: Record<string, string> = {}) => ({
+  const mockRequest = (planTitle: string, headers: Record<string, string> = {}, body: Record<string, any> = {}) => ({
     params: { planTitle },
     headers: {
       'content-type': 'application/json',
       ...headers
-    }
+    },
+    body
   } as unknown as Request);
 
   const mockResponse = () => {
@@ -746,6 +749,139 @@ describe('AgentModeController - createSessionWithPlan', () => {
         'test-session-123',
         'gpt-5-chat'
       );
+    });
+  });
+
+  describe('startingMessage handling', () => {
+    beforeEach(() => {
+      mockGetUserFromToken.mockResolvedValue({ user: null });
+      mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
+      // getChatSession is called by generateSessionResponse (fire-and-forget)
+      mockChatbotDb.getChatSession = jest.fn().mockResolvedValue({
+        ...mockSession,
+        messages: []
+      });
+    });
+
+    it('should return response immediately when startingMessage is provided', async () => {
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui, company is AgentWeb' });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // Response should be sent with session data
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'test-session-123',
+        conversableToken: 'mock-conversable-token-123'
+      }));
+    });
+
+    it('should fire-and-forget generateSessionResponse when startingMessage is provided', async () => {
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui, company is AgentWeb' });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // Wait for the fire-and-forget promise to start executing
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // generateSessionResponse calls getChatSession as its first operation
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith('test-session-123');
+    });
+
+    it('should not call generateSessionResponse when startingMessage is not provided', async () => {
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // Wait to ensure no async call was made
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // getChatSession should NOT be called (no fire-and-forget)
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+
+    it('should not call generateSessionResponse when startingMessage is empty string', async () => {
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: '' });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+
+    it('should not call generateSessionResponse when startingMessage is whitespace only', async () => {
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: '   ' });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+
+    it('should not call generateSessionResponse when startingMessage is not a string', async () => {
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 123 });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+    });
+
+    it('should handle generateSessionResponse failure gracefully', async () => {
+      // Make getChatSession throw to simulate generateSessionResponse failure
+      mockChatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('Session not found'));
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // Response should still be sent successfully
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'test-session-123'
+      }));
+
+      // Wait for the fire-and-forget to execute and fail
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Error should be logged, not thrown
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Error sending starting message'),
+        'test-session-123',
+        expect.any(Error)
+      );
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle missing req.body gracefully', async () => {
+      // Create request without body property
+      const req = {
+        params: { planTitle: mockPlanTitle },
+        headers: { 'content-type': 'application/json' }
+      } as unknown as Request;
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      // Should still return response successfully
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'test-session-123'
+      }));
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // No fire-and-forget should have been triggered
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
     });
   });
 });

@@ -100,9 +100,10 @@
       "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh sync:*)",
       "Bash(tail:*)",
       "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh ssh:*)",
-      "Bash(/Users/ruiwang/Documents/GitHub/agentweb3/test-env/test-env.sh launch:*)",
-      "Bash(/Users/ruiwang/Documents/GitHub/agentweb3/test-env/test-env.sh sync:*)",
-      "Bash(ssh:*)"
+      "Bash(gh repo:*)",
+      "Bash(./test-env/test-env.sh status:*)",
+      "Bash(printf {\"email\":\"test@example.com\",\"password\":\"Test123!\"}:*)",
+      "Bash(cat:*)"
     ]
   }
 }
