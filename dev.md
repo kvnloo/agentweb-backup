@@ -1,3 +1,28 @@
+# February 24, 2026: Growth Estimate — Month-over-Month Comparison
+
+Ran `node src/scripts/growth-comparison.js 2026-02-24` to compare 3 rolling 30-day periods.
+
+| Metric | Jan 25 - Feb 24 | Dec 25 - Jan 24 | Nov 25 - Dec 24 |
+|---|--:|--:|--:|
+| Agent Mode Sessions | 1,033 (+130, +14%) | 903 (+143, +19%) | 760 |
+| Generated Articles | 989 (+485, +96%) | 504 (+264, +110%) | 240 |
+| Approved Articles | 15 (+9, +150%) | 6 (+6, new) | 0 |
+| Published Articles | 62 (+53, +589%) | 9 (+9, new) | 0 |
+| Generated Posts | 298 (+37, +14%) | 261 (+198, +314%) | 63 |
+| Approved Posts | 7 (-2, -22%) | 9 (+9, new) | 0 |
+| Published Posts | 27 (+16, +145%) | 11 (+11, new) | 0 |
+| Generated Images | 345 (+5, +1%) | 340 (+182, +115%) | 158 |
+| Approved Images | 10 (-14, -58%) | 24 (+24, new) | 0 |
+
+**Data sources:**
+- Sessions & tool call counts: `AW-ChatSessions` (`calledFunctions` on each session, bucketed by session `createdAt`)
+- Approved articles/posts/images: `AW-AssetApprovals` (status=`approved`, bucketed by `updatedAt`)
+- Article = `blog-*` filename; Post = `social-media-post*`, `linkedin-post*`, `x_thread*`, `twitter-thread*` filenames; Image = `assetType=image`
+
+**Script:** `backend/src/scripts/growth-comparison.js` — accepts an optional end date argument (defaults to today). Run from the `backend/` directory.
+
+---
+
 # February 24, 2026: SEO/GEO Engagement Time Is Total, Not Average
 
 The "Top Pages by Engagement" table on the SEO/GEO page displays **total** engagement time, not average. The backend (`seo.ts`) requests GA4's `userEngagementDuration` metric, which is cumulative across all sessions. The frontend (`SEO.tsx`) renders it directly via `formatTime()` with no averaging. For product metrics, the backend separately computes `avgDuration` by dividing `totalDuration` by `pageViews`, but this is not used in the top pages table.

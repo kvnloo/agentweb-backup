@@ -21,6 +21,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Pin/unpin sessions from the sidebar with the pin icon',
       '- Inline rename tabs by clicking the active tab or double-clicking any tab',
       '- Close tabs with the X button; "+" button to start a new chat (disabled at 5-tab limit)',
+      'Admin: Growth Comparison Script',
+      '- New script to compare month-over-month growth metrics across 3 rolling 30-day periods',
+      '- Tracks Agent Mode sessions, generated/approved/published articles, posts, and images',
+      '- Data sourced from AW-ChatSessions (calledFunctions) and AW-AssetApprovals (status=approved)',
+      '- Usage: node src/scripts/growth-comparison.js [end-date]',
     ],
   },
   {
