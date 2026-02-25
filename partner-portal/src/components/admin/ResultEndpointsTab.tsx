@@ -2,11 +2,14 @@ import { useState, useEffect } from 'react';
 import {
   Box,
   Button,
+  Checkbox,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
   FormControl,
+  FormControlLabel,
   IconButton,
   InputLabel,
   MenuItem,
@@ -38,6 +41,7 @@ interface ResultEndpointConfig {
   prompt: string;
   outputFormat: 'html' | 'image' | 'video';
   reviewerEmail: string;
+  skipReview?: boolean;
 }
 
 const EMPTY_FORM: ResultEndpointConfig = {
@@ -46,6 +50,7 @@ const EMPTY_FORM: ResultEndpointConfig = {
   prompt: '',
   outputFormat: 'html',
   reviewerEmail: '',
+  skipReview: false,
 };
 
 export default function ResultEndpointsTab() {
@@ -151,6 +156,7 @@ export default function ResultEndpointsTab() {
               <TableCell>Name</TableCell>
               <TableCell>Result Title</TableCell>
               <TableCell>Output Format</TableCell>
+              <TableCell>Review</TableCell>
               <TableCell>Reviewer Email</TableCell>
               <TableCell>Prompt</TableCell>
               <TableCell>Actions</TableCell>
@@ -159,7 +165,7 @@ export default function ResultEndpointsTab() {
           <TableBody>
             {configs.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} align="center">
+                <TableCell colSpan={7} align="center">
                   No result endpoints configured
                 </TableCell>
               </TableRow>
@@ -169,6 +175,13 @@ export default function ResultEndpointsTab() {
                   <TableCell>{config.name}</TableCell>
                   <TableCell>{config.resultTitle || '-'}</TableCell>
                   <TableCell>{config.outputFormat}</TableCell>
+                  <TableCell>
+                    <Chip
+                      label={config.skipReview ? 'Auto-send' : 'Required'}
+                      color={config.skipReview ? 'warning' : 'primary'}
+                      size="small"
+                    />
+                  </TableCell>
                   <TableCell>{config.reviewerEmail}</TableCell>
                   <TableCell sx={{ maxWidth: 300 }}>
                     {config.prompt.length > 80
@@ -244,6 +257,15 @@ export default function ResultEndpointsTab() {
             onChange={(e) => setFormData({ ...formData, reviewerEmail: e.target.value })}
             fullWidth
             required
+          />
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={!!formData.skipReview}
+                onChange={(e) => setFormData({ ...formData, skipReview: e.target.checked })}
+              />
+            }
+            label="No review required (auto-send directly to lead, reviewer gets notified only)"
           />
         </DialogContent>
         <DialogActions>

@@ -172,6 +172,7 @@ export interface ChatSession {
     leadId?: string;
     externalSessionId?: string;
     reviewerEmail: string;
+    skipReview?: boolean;
     outputFormat: 'html' | 'image' | 'video';
     args: Record<string, string>;
     contentUrl?: string;
@@ -1723,6 +1724,7 @@ export class ChatbotDB {
       leadId?: string;
       externalSessionId?: string;
       reviewerEmail: string;
+      skipReview?: boolean;
       outputFormat: 'html' | 'image' | 'video';
       args: Record<string, string>;
       contentUrl?: string;

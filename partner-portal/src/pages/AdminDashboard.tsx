@@ -136,7 +136,7 @@ interface AdminChatSession {
   pageContent?: string;
   contextChunks?: any[];
   portalType?: "customer" | "partner";
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation";
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint";
   shareMetadata?: {
     isShared: boolean;
     sharedAt?: string;
@@ -4469,6 +4469,8 @@ export default function AdminDashboard() {
                                   ? "Book Generation"
                                   : session.sessionType === "report_generation"
                                   ? "Report Generation"
+                                  : session.sessionType === "result-endpoint"
+                                  ? "Result Endpoint"
                                   : "Regular"
                               }
                               color={
@@ -4483,6 +4485,8 @@ export default function AdminDashboard() {
                                   : session.sessionType === "book-generation"
                                   ? "info"
                                   : session.sessionType === "report_generation"
+                                  ? "warning"
+                                  : session.sessionType === "result-endpoint"
                                   ? "warning"
                                   : "default"
                               }

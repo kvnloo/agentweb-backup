@@ -230,13 +230,17 @@ reviewRouter.post('/:sessionId/send', async (req, res) => {
         </div>
       </div>`;
 
-    // Send via Resend with no-reply@updates.agentweb.pro
+    // Send via Resend with no-reply@updates.agentweb.pro, CC reviewer
     const fromAddress = `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`;
+    const ccEmail = metadata.reviewerEmail && metadata.reviewerEmail !== recipientEmail.trim()
+      ? metadata.reviewerEmail
+      : undefined;
     await resendService.sendEmail({
       from: fromAddress,
       to: recipientEmail.trim(),
       subject,
       html: emailHtml,
+      cc: ccEmail,
       replyTo: replyToEmail,
     });
 

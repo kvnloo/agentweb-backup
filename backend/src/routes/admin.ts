@@ -3602,7 +3602,7 @@ router.get("/result-endpoints", async (req, res) => {
 
 router.post("/result-endpoints", async (req, res) => {
   try {
-    const { name, resultTitle, prompt, outputFormat, reviewerEmail, llmModel, requiredSkills } = req.body;
+    const { name, resultTitle, prompt, outputFormat, reviewerEmail, skipReview, llmModel, requiredSkills } = req.body;
 
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ success: false, error: "name is required" });
@@ -3627,6 +3627,7 @@ router.post("/result-endpoints", async (req, res) => {
       prompt: prompt.trim(),
       outputFormat,
       reviewerEmail: reviewerEmail.trim(),
+      skipReview: !!skipReview,
       llmModel: llmModel || undefined,
       requiredSkills: requiredSkills || undefined,
     };

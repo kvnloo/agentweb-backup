@@ -7,6 +7,26 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-25',
+    changes: [
+      'Result Endpoints: Automated Content Generation & Delivery',
+      '- New "Result Endpoints" system allows external triggers (e.g., form submissions, webhooks) to kick off AI-powered content generation sessions',
+      '- Configurable via the admin dashboard under the new Result Endpoints tab: set a name, prompt template with {{variable}} placeholders, output format (HTML/image/video), and reviewer email',
+      '- Trigger URL pattern: /r/<name>/new?leadEmail=...&param=value — creates a session, generates content, and sends for review',
+      '- Review page (/review/:sessionId) displays all generated assets (images, videos, HTML files) collected from session tool results',
+      '- Per-asset email sending with formal branded template, reviewer CC\'d automatically',
+      '- "No review required" option: when enabled, results are sent directly to the lead with the reviewer CC\'d instead of gating on manual approval',
+      '- Reply-To set to reviewer email so lead replies go to the right person',
+      '- Interactive revision link (ishare) included on the review page for follow-up edits via chat',
+      'Partner Portal: Result Endpoints Admin Tab',
+      '- New admin tab for creating, editing, and deleting result endpoint configurations',
+      '- Table shows name, result title, output format, review mode (Required vs Auto-send), reviewer email, and prompt preview',
+      '- "No review required" checkbox in the create/edit dialog',
+      'Admin Dashboard: Result Endpoint Session Type',
+      '- Chat history now shows "Result Endpoint" chip for sessions created by result endpoints instead of "Regular"',
+    ],
+  },
+  {
     date: '2026-02-24',
     changes: [
       'Agent Mode: Template HTML Generation Fix',

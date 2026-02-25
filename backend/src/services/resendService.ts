@@ -9,6 +9,7 @@ interface SendEmailParams {
   subject: string;
   html?: string;
   text?: string;
+  cc?: string | string[];
   inReplyTo?: string;
   replyTo?: string;
 }
@@ -186,6 +187,7 @@ class ResendService {
     subject,
     html,
     text,
+    cc,
     inReplyTo,
     replyTo
   }: SendEmailParams) {
@@ -208,6 +210,11 @@ class ResendService {
     }
     if (text) {
       emailOptions.text = text;
+    }
+
+    // Add CC if provided
+    if (cc) {
+      emailOptions.cc = Array.isArray(cc) ? cc : [cc];
     }
 
     // Add reply-to if provided

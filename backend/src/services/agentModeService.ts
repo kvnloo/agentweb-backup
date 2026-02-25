@@ -1514,7 +1514,6 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'set_work_plan_status',
     'save_file',
     'describe_image',
-    'send_generated_result',
   ]);
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
@@ -5853,7 +5852,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
       const metadata = session.resultEndpointMetadata;
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      const toEmail = metadata.reviewerEmail || (metadata as any).testEmail;
+      const reviewerEmail = metadata.reviewerEmail || (metadata as any).testEmail;
 
       // Store content references and subject on session metadata for the review page
       const updatedMetadata = {
@@ -5864,10 +5863,92 @@ When a user requests client onboarding or says "onboard new client" or similar:
       };
       await chatbotDb.updateSessionResultEndpointMetadata(sessionId, updatedMetadata);
 
-      // Build review page URL
       const reviewUrl = `${customerFrontendUrl}/review/${sessionId}`;
 
-      // Build content preview section
+      // --- skipReview mode: auto-send to lead, CC reviewer ---
+      if (metadata.skipReview && metadata.leadEmail) {
+        const { resendService: resendSvc } = await import('./resendService');
+        const { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } = await import('../config');
+
+        // Collect assets from session messages to send the latest one
+        const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+        let latestAssetUrl: string | undefined;
+        for (const msg of messages) {
+          if (msg.role === 'tool' && msg.content && msg.name) {
+            let result: any;
+            try { result = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch { continue; }
+            if (!result || result.success === false) continue;
+            if (result.s3_url) latestAssetUrl = result.s3_url;
+            if (result.imageUrl) latestAssetUrl = result.imageUrl;
+            if (result.videoUrl) latestAssetUrl = result.videoUrl;
+          }
+        }
+
+        const assetUrl = contentUrl || latestAssetUrl;
+        const resultLabel = metadata.resultTitle || metadata.resultName || 'your report';
+        const replyToAddr = reviewerEmail || RESEND_SYSTEM_EMAIL;
+
+        // Build asset block
+        let assetBlock = '';
+        if (assetUrl) {
+          if (assetUrl.match(/\.(png|jpg|jpeg|gif|webp)$/i) || assetUrl.includes('image')) {
+            assetBlock = `<p style="text-align: center;"><img src="${assetUrl}" alt="${resultLabel}" style="max-width: 100%; border-radius: 8px;" /></p>`;
+          } else if (assetUrl.match(/\.(mp4|webm|mov)$/i) || assetUrl.includes('video')) {
+            assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">Watch Video</a></div>`;
+          } else {
+            assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">View Your Result</a></div>`;
+          }
+        }
+
+        // Formal email to lead, CC reviewer
+        const leadEmailHtml = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+              <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+              <p style="color: #666; margin: 5px 0;">${resultLabel}</p>
+            </div>
+            <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+              <h2 style="color: #1B2549; margin-top: 0;">Your ${resultLabel} is Ready!</h2>
+              <p style="color: #333; line-height: 1.6;">We're excited to send you the requested ${resultLabel}. Our team has prepared this content specifically for you.</p>
+              ${assetBlock}
+              <p style="color: #333; line-height: 1.6; margin-top: 20px;">
+                If you have any questions or would like to request changes, simply reply to this email or reach out to us at
+                <a href="mailto:${replyToAddr}" style="color: #643B7E; text-decoration: none;">${replyToAddr}</a>
+                and we'll be happy to assist.
+              </p>
+            </div>
+            <div style="text-align: center; color: #666; font-size: 12px;">
+              <p>Powered by <a href="https://agentweb.pro" style="color: #643B7E; text-decoration: none;">AgentWeb</a></p>
+            </div>
+          </div>`;
+
+        const leadSubject = metadata.contentSubject || `Your ${resultLabel} is ready`;
+        await resendSvc.sendEmail({
+          from: `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`,
+          to: metadata.leadEmail,
+          subject: leadSubject,
+          html: leadEmailHtml,
+          cc: reviewerEmail,
+          replyTo: replyToAddr,
+        });
+
+        // Record in send history
+        const sendHistoryEntry = {
+          assetUrl: assetUrl || '__auto_sent__',
+          recipientEmail: metadata.leadEmail,
+          customMessage: 'Auto-sent (no review required)',
+          sentAt: new Date().toISOString(),
+        };
+        await chatbotDb.updateSessionResultEndpointMetadata(sessionId, {
+          ...updatedMetadata,
+          sendHistory: [...(updatedMetadata.sendHistory || []), sendHistoryEntry],
+        });
+
+        return { success: true, message: `Result sent to ${metadata.leadEmail} (reviewer ${reviewerEmail} CC'd)`, to: metadata.leadEmail };
+      }
+
+      // --- Standard review mode: send review email to reviewer ---
+      const { emailService: emailSvc } = await import('./emailService');
       let contentSection = '';
       if (contentUrl) {
         contentSection = `<p><a href="${contentUrl}" style="color: #1976d2;">View Generated Content</a></p>`;
@@ -5876,7 +5957,6 @@ When a user requests client onboarding or says "onboard new client" or similar:
         contentSection += `<div style="margin: 16px 0; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;">${contentHtml}</div>`;
       }
 
-      // Build parameters summary
       const argsEntries = Object.entries(metadata.args || {});
       const paramsSummary = argsEntries.length > 0
         ? `<table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
@@ -5901,9 +5981,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
           </div>
         </div>`;
 
-      const { emailService: emailSvc } = await import('./emailService');
-      await emailSvc.sendEmail(toEmail, `Review: ${subject}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
-      return { success: true, message: `Review email sent to ${toEmail}`, to: toEmail };
+      await emailSvc.sendEmail(reviewerEmail, `Review: ${subject}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
+      return { success: true, message: `Review email sent to ${reviewerEmail}`, to: reviewerEmail };
 
     } catch (error) {
       console.error('AgentMode: Error sending for review:', error);

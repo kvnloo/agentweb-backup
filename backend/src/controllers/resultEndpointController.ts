@@ -11,6 +11,7 @@ export interface ResultEndpointConfig {
   prompt: string;
   outputFormat: 'html' | 'image' | 'video';
   reviewerEmail: string;
+  skipReview?: boolean;
   llmModel?: string;
   requiredSkills?: string[];
 }
@@ -134,6 +135,7 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       leadId,
       externalSessionId,
       reviewerEmail: config.reviewerEmail,
+      skipReview: config.skipReview || false,
       outputFormat: config.outputFormat,
       args,
     });
