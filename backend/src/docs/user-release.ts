@@ -27,6 +27,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- "No review required" checkbox in the create/edit dialog',
       'Admin Dashboard: Result Endpoint Session Type',
       '- Chat history now shows "Result Endpoint" chip for sessions created by result endpoints instead of "Regular"',
+      'Result Endpoints: "While You Are Waiting" Engagement',
+      '- Admins can now configure optional waiting content (YouTube video, external URL, or custom HTML) per result endpoint',
+      '- The status page shown to leads after triggering a result endpoint now displays this content while the report generates',
+      '- Status page polls for completion and shows a non-disruptive "Your report is ready!" banner with a View Report link when done, without interrupting the waiting content',
+      '- New public API endpoint GET /r/:name/status/:sessionId for polling session completion',
     ],
   },
   {
