@@ -15,6 +15,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Added output token limit (16K) to prevent template generation from being silently truncated',
       'Admin: Reports Model Dropdown',
       '- Reports Model selector in the Agent Mode admin tab now shows only models suitable for report generation (Claude models) instead of all 8 agent mode models',
+      'Agent Mode: Multi-Tab Sessions',
+      '- Pin up to 5 chat sessions as tabs for instant switching without reloading',
+      '- Tab state (messages, scroll position, input) is cached in memory — switching is instant',
+      '- Pin/unpin sessions from the sidebar with the pin icon',
+      '- Inline rename tabs by clicking the active tab or double-clicking any tab',
+      '- Close tabs with the X button; "+" button to start a new chat (disabled at 5-tab limit)',
     ],
   },
   {
