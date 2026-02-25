@@ -1514,6 +1514,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'set_work_plan_status',
     'save_file',
     'describe_image',
+    'send_generated_result',
   ]);
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
@@ -5834,6 +5835,79 @@ When a user requests client onboarding or says "onboard new client" or similar:
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
       return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async sendForReview(
+    subject: string,
+    sessionId: string,
+    userId: string,
+    contentUrl?: string,
+    contentHtml?: string
+  ): Promise<{ success: boolean; message: string; to?: string }> {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session?.resultEndpointMetadata) {
+        return { success: false, message: 'No result endpoint metadata found on session' };
+      }
+
+      const metadata = session.resultEndpointMetadata;
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const toEmail = metadata.reviewerEmail || (metadata as any).testEmail;
+
+      // Store content references and subject on session metadata for the review page
+      const updatedMetadata = {
+        ...metadata,
+        contentUrl: contentUrl || metadata.contentUrl,
+        contentHtml: contentHtml || metadata.contentHtml,
+        contentSubject: subject,
+      };
+      await chatbotDb.updateSessionResultEndpointMetadata(sessionId, updatedMetadata);
+
+      // Build review page URL
+      const reviewUrl = `${customerFrontendUrl}/review/${sessionId}`;
+
+      // Build content preview section
+      let contentSection = '';
+      if (contentUrl) {
+        contentSection = `<p><a href="${contentUrl}" style="color: #1976d2;">View Generated Content</a></p>`;
+      }
+      if (contentHtml) {
+        contentSection += `<div style="margin: 16px 0; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;">${contentHtml}</div>`;
+      }
+
+      // Build parameters summary
+      const argsEntries = Object.entries(metadata.args || {});
+      const paramsSummary = argsEntries.length > 0
+        ? `<table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
+            <tr style="background: #f5f5f5;"><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Parameter</th><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Value</th></tr>
+            ${argsEntries.map(([k, v]) => `<tr><td style="padding: 8px; border: 1px solid #e0e0e0;">${k}</td><td style="padding: 8px; border: 1px solid #e0e0e0;">${v}</td></tr>`).join('')}
+          </table>`
+        : '';
+
+      const reviewHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
+          <div style="background: #1976d2; color: white; padding: 12px 20px; border-radius: 8px 8px 0 0; font-weight: bold;">
+            Review: ${subject}
+          </div>
+          <div style="padding: 20px; border: 1px solid #e0e0e0; border-top: none;">
+            <p style="color: #666;">A new result has been generated for "<strong>${metadata.resultTitle || metadata.resultName}</strong>". Please review the content below.</p>
+            ${contentSection}
+            ${paramsSummary ? `<h3 style="margin-top: 20px; color: #333;">Parameters</h3>${paramsSummary}` : ''}
+            ${metadata.leadEmail ? `<p><strong>Lead email:</strong> ${metadata.leadEmail}</p>` : ''}
+            <div style="margin-top: 24px; text-align: center;">
+              <a href="${reviewUrl}" style="display: inline-block; background: #1976d2; color: white; padding: 12px 32px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">Review & Send Result</a>
+            </div>
+          </div>
+        </div>`;
+
+      const { emailService: emailSvc } = await import('./emailService');
+      await emailSvc.sendEmail(toEmail, `Review: ${subject}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
+      return { success: true, message: `Review email sent to ${toEmail}`, to: toEmail };
+
+    } catch (error) {
+      console.error('AgentMode: Error sending for review:', error);
+      return { success: false, message: 'Failed to send for review', error: error instanceof Error ? error.message : 'Unknown error' } as any;
     }
   }
 
