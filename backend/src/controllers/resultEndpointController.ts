@@ -5,6 +5,12 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { runVerifiedChat } from './agentModeController';
 
+export interface WaitingContent {
+  type: 'youtube' | 'url' | 'html';
+  value: string;   // YouTube URL, iframe URL, or raw HTML
+  title?: string;   // Optional heading above the content
+}
+
 export interface ResultEndpointConfig {
   name: string;
   resultTitle?: string;
@@ -14,6 +20,7 @@ export interface ResultEndpointConfig {
   skipReview?: boolean;
   llmModel?: string;
   requiredSkills?: string[];
+  waitingContent?: WaitingContent;
 }
 
 const SETTINGS_KEY = 'result-endpoints-config';

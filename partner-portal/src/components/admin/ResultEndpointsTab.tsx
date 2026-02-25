@@ -35,6 +35,12 @@ import axios from 'axios';
 import { buildApiUrl, CUSTOMER_FRONTEND_URL } from '../../config';
 import { useAuth } from '../../contexts/AuthContext';
 
+interface WaitingContent {
+  type: 'youtube' | 'url' | 'html';
+  value: string;
+  title?: string;
+}
+
 interface ResultEndpointConfig {
   name: string;
   resultTitle?: string;
@@ -42,6 +48,7 @@ interface ResultEndpointConfig {
   outputFormat: 'html' | 'image' | 'video';
   reviewerEmail: string;
   skipReview?: boolean;
+  waitingContent?: WaitingContent;
 }
 
 const EMPTY_FORM: ResultEndpointConfig = {
@@ -51,6 +58,13 @@ const EMPTY_FORM: ResultEndpointConfig = {
   outputFormat: 'html',
   reviewerEmail: '',
   skipReview: false,
+  waitingContent: undefined,
+};
+
+const WAITING_CONTENT_LABELS: Record<string, string> = {
+  youtube: 'YouTube Video',
+  url: 'External URL',
+  html: 'Custom HTML',
 };
 
 export default function ResultEndpointsTab() {
@@ -157,6 +171,7 @@ export default function ResultEndpointsTab() {
               <TableCell>Result Title</TableCell>
               <TableCell>Output Format</TableCell>
               <TableCell>Review</TableCell>
+              <TableCell>Waiting Content</TableCell>
               <TableCell>Reviewer Email</TableCell>
               <TableCell>Prompt</TableCell>
               <TableCell>Actions</TableCell>
@@ -165,7 +180,7 @@ export default function ResultEndpointsTab() {
           <TableBody>
             {configs.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} align="center">
+                <TableCell colSpan={8} align="center">
                   No result endpoints configured
                 </TableCell>
               </TableRow>
@@ -181,6 +196,16 @@ export default function ResultEndpointsTab() {
                       color={config.skipReview ? 'warning' : 'primary'}
                       size="small"
                     />
+                  </TableCell>
+                  <TableCell>
+                    {config.waitingContent ? (
+                      <Chip
+                        label={WAITING_CONTENT_LABELS[config.waitingContent.type] || config.waitingContent.type}
+                        color="info"
+                        size="small"
+                        variant="outlined"
+                      />
+                    ) : '-'}
                   </TableCell>
                   <TableCell>{config.reviewerEmail}</TableCell>
                   <TableCell sx={{ maxWidth: 300 }}>
@@ -267,6 +292,84 @@ export default function ResultEndpointsTab() {
             }
             label="No review required (auto-send directly to lead, reviewer gets notified only)"
           />
+
+          {/* While You Are Waiting section */}
+          <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>
+            While You Are Waiting (optional)
+          </Typography>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+            Content shown to the user on the status page while the result is being generated.
+          </Typography>
+          <FormControl fullWidth>
+            <InputLabel>Waiting Content Type</InputLabel>
+            <Select
+              value={formData.waitingContent?.type || ''}
+              label="Waiting Content Type"
+              onChange={(e) => {
+                const type = e.target.value as 'youtube' | 'url' | 'html' | '';
+                if (!type) {
+                  setFormData({ ...formData, waitingContent: undefined });
+                } else {
+                  setFormData({
+                    ...formData,
+                    waitingContent: {
+                      type,
+                      value: formData.waitingContent?.value || '',
+                      title: formData.waitingContent?.title,
+                    },
+                  });
+                }
+              }}
+            >
+              <MenuItem value="">None</MenuItem>
+              <MenuItem value="youtube">YouTube Video</MenuItem>
+              <MenuItem value="url">External URL (iframe)</MenuItem>
+              <MenuItem value="html">Custom HTML</MenuItem>
+            </Select>
+          </FormControl>
+          {formData.waitingContent?.type && (
+            <>
+              <TextField
+                label="Title (optional)"
+                value={formData.waitingContent.title || ''}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    waitingContent: { ...formData.waitingContent!, title: e.target.value || undefined },
+                  })
+                }
+                fullWidth
+                placeholder="e.g. Watch this while we prepare your report"
+              />
+              <TextField
+                label={
+                  formData.waitingContent.type === 'youtube'
+                    ? 'YouTube URL'
+                    : formData.waitingContent.type === 'url'
+                    ? 'URL to embed'
+                    : 'HTML content'
+                }
+                value={formData.waitingContent.value}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    waitingContent: { ...formData.waitingContent!, value: e.target.value },
+                  })
+                }
+                multiline={formData.waitingContent.type === 'html'}
+                rows={formData.waitingContent.type === 'html' ? 4 : 1}
+                fullWidth
+                required
+                placeholder={
+                  formData.waitingContent.type === 'youtube'
+                    ? 'https://www.youtube.com/watch?v=...'
+                    : formData.waitingContent.type === 'url'
+                    ? 'https://example.com/page'
+                    : '<div>Your custom HTML here</div>'
+                }
+              />
+            </>
+          )}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setDialogOpen(false)}>Cancel</Button>

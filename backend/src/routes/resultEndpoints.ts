@@ -21,9 +21,51 @@ router.get('/:resultName/info', async (req, res) => {
       success: true,
       name: config.name,
       resultTitle: config.resultTitle || config.name,
+      waitingContent: config.waitingContent || null,
     });
   } catch (error) {
     console.error('Error fetching result endpoint info:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET status for polling from the waiting page
+router.get('/:resultName/status/:sessionId', async (req, res) => {
+  try {
+    const { resultName, sessionId } = req.params;
+
+    // Verify the endpoint exists
+    const configs = await getResultEndpointConfigs();
+    const config = configs.find(c => c.name === resultName);
+    if (!config) {
+      return res.status(404).json({ error: `Result endpoint "${resultName}" not found` });
+    }
+
+    // Load session
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const metadata = session.resultEndpointMetadata;
+    const isCompleted = !!(metadata?.contentUrl || metadata?.contentHtml);
+
+    const response: Record<string, any> = {
+      status: isCompleted ? 'completed' : 'pending',
+      resultTitle: config.resultTitle || config.name,
+      waitingContent: config.waitingContent || null,
+    };
+
+    if (isCompleted) {
+      // Build the review page URL
+      const customerBaseUrl = (process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174').replace(/\/$/, '');
+      response.reportUrl = `${customerBaseUrl}/review/${sessionId}`;
+      response.leadEmail = metadata?.leadEmail || null;
+    }
+
+    return res.json(response);
+  } catch (error) {
+    console.error('Error fetching result endpoint status:', error);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });

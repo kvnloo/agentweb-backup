@@ -3602,7 +3602,7 @@ router.get("/result-endpoints", async (req, res) => {
 
 router.post("/result-endpoints", async (req, res) => {
   try {
-    const { name, resultTitle, prompt, outputFormat, reviewerEmail, skipReview, llmModel, requiredSkills } = req.body;
+    const { name, resultTitle, prompt, outputFormat, reviewerEmail, skipReview, llmModel, requiredSkills, waitingContent } = req.body;
 
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ success: false, error: "name is required" });
@@ -3621,6 +3621,20 @@ router.post("/result-endpoints", async (req, res) => {
     const configs = await getResultEndpointConfigs();
 
     const existingIndex = configs.findIndex(c => c.name === name.trim());
+    // Build waitingContent if provided
+    let parsedWaitingContent: { type: 'youtube' | 'url' | 'html'; value: string; title?: string } | undefined;
+    if (waitingContent && waitingContent.type && waitingContent.value) {
+      const validTypes = ['youtube', 'url', 'html'];
+      if (!validTypes.includes(waitingContent.type)) {
+        return res.status(400).json({ success: false, error: "waitingContent.type must be youtube, url, or html" });
+      }
+      parsedWaitingContent = {
+        type: waitingContent.type,
+        value: waitingContent.value,
+        title: waitingContent.title || undefined,
+      };
+    }
+
     const newConfig = {
       name: name.trim(),
       resultTitle: resultTitle?.trim() || undefined,
@@ -3630,6 +3644,7 @@ router.post("/result-endpoints", async (req, res) => {
       skipReview: !!skipReview,
       llmModel: llmModel || undefined,
       requiredSkills: requiredSkills || undefined,
+      waitingContent: parsedWaitingContent,
     };
 
     if (existingIndex >= 0) {
