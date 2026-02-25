@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-25',
+    changes: [
+      'Test Environment: Faster Auto-Shutdown',
+      '- Cloud test environments now auto-terminate after 24 hours of inactivity instead of 7 days',
+      '- Reduces idle EC2 costs for forgotten environments',
+    ],
+  },
+  {
     date: '2026-02-24',
     changes: [
       'Agent Mode: Template HTML Generation Fix',
