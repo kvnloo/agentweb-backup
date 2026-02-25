@@ -363,6 +363,179 @@ describe('Result Endpoints', () => {
     });
   });
 
+  describe('GET /r/:resultName/info (waitingContent)', () => {
+    it('should return waitingContent when configured', async () => {
+      const configWithWaiting = {
+        ...sampleConfig,
+        waitingContent: { type: 'youtube', value: 'https://www.youtube.com/watch?v=abc123', title: 'Watch this' },
+      };
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([configWithWaiting]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      const res = await request(app)
+        .get('/r/gtm/info')
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.waitingContent).toEqual({
+        type: 'youtube',
+        value: 'https://www.youtube.com/watch?v=abc123',
+        title: 'Watch this',
+      });
+    });
+
+    it('should return null waitingContent when not configured', async () => {
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      const res = await request(app)
+        .get('/r/gtm/info')
+        .expect(200);
+
+      expect(res.body.waitingContent).toBeNull();
+    });
+  });
+
+  describe('GET /r/:resultName/status/:sessionId', () => {
+    it('should return pending status when session has no contentUrl or contentHtml', async () => {
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      mockedChatbot.getChatSession.mockResolvedValue({
+        sessionId: 'sess-pending',
+        resultEndpointMetadata: {
+          resultName: 'gtm',
+          leadEmail: 'lead@example.com',
+        },
+      } as any);
+
+      const res = await request(app)
+        .get('/r/gtm/status/sess-pending')
+        .expect(200);
+
+      expect(res.body.status).toBe('pending');
+      expect(res.body.resultTitle).toBe('gtm');
+      expect(res.body.reportUrl).toBeUndefined();
+    });
+
+    it('should return completed status when contentUrl is set', async () => {
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      mockedChatbot.getChatSession.mockResolvedValue({
+        sessionId: 'sess-done',
+        resultEndpointMetadata: {
+          resultName: 'gtm',
+          leadEmail: 'lead@example.com',
+          contentUrl: 'https://s3.example.com/result.html',
+        },
+      } as any);
+
+      const res = await request(app)
+        .get('/r/gtm/status/sess-done')
+        .expect(200);
+
+      expect(res.body.status).toBe('completed');
+      expect(res.body.reportUrl).toContain('/review/sess-done');
+      expect(res.body.leadEmail).toBe('lead@example.com');
+    });
+
+    it('should return completed status when contentHtml is set', async () => {
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      mockedChatbot.getChatSession.mockResolvedValue({
+        sessionId: 'sess-html',
+        resultEndpointMetadata: {
+          resultName: 'gtm',
+          leadEmail: 'lead@example.com',
+          contentHtml: '<h1>Report</h1>',
+        },
+      } as any);
+
+      const res = await request(app)
+        .get('/r/gtm/status/sess-html')
+        .expect(200);
+
+      expect(res.body.status).toBe('completed');
+      expect(res.body.reportUrl).toContain('/review/sess-html');
+    });
+
+    it('should return 404 when result endpoint not found', async () => {
+      mockedSettings.getSetting.mockResolvedValue(null);
+
+      const res = await request(app)
+        .get('/r/nonexistent/status/sess-123')
+        .expect(404);
+
+      expect(res.body.error).toContain('not found');
+    });
+
+    it('should return 404 when session not found', async () => {
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([sampleConfig]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      mockedChatbot.getChatSession.mockResolvedValue(null as any);
+
+      const res = await request(app)
+        .get('/r/gtm/status/nonexistent')
+        .expect(404);
+
+      expect(res.body.error).toContain('Session not found');
+    });
+
+    it('should include waitingContent in status response', async () => {
+      const configWithWaiting = {
+        ...sampleConfig,
+        waitingContent: { type: 'url', value: 'https://example.com/promo' },
+      };
+      mockedSettings.getSetting.mockResolvedValue({
+        settingName: 'result-endpoints-config',
+        settingValue: JSON.stringify([configWithWaiting]),
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      });
+
+      mockedChatbot.getChatSession.mockResolvedValue({
+        sessionId: 'sess-wait',
+        resultEndpointMetadata: { resultName: 'gtm' },
+      } as any);
+
+      const res = await request(app)
+        .get('/r/gtm/status/sess-wait')
+        .expect(200);
+
+      expect(res.body.waitingContent).toEqual({
+        type: 'url',
+        value: 'https://example.com/promo',
+      });
+    });
+  });
+
   describe('send_for_review (via agentModeService)', () => {
     it('should send review email to reviewer', async () => {
       mockedAgentMode.sendForReview.mockResolvedValue({
@@ -537,6 +710,83 @@ describe('Result Endpoints', () => {
         .expect(404);
 
       expect(res.body.success).toBe(false);
+    });
+
+    it('POST should save waitingContent when provided', async () => {
+      mockedSettings.getSetting.mockResolvedValue(null);
+      mockedSettings.setSetting.mockResolvedValue({} as any);
+
+      const res = await request(app)
+        .post('/api/admin/result-endpoints')
+        .set('Authorization', 'Bearer test-token')
+        .send({
+          name: 'with-waiting',
+          prompt: 'Generate something',
+          outputFormat: 'html',
+          reviewerEmail: 'test@example.com',
+          waitingContent: {
+            type: 'youtube',
+            value: 'https://www.youtube.com/watch?v=abc123',
+            title: 'Watch this',
+          },
+        })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.waitingContent).toEqual({
+        type: 'youtube',
+        value: 'https://www.youtube.com/watch?v=abc123',
+        title: 'Watch this',
+      });
+
+      // Verify it was persisted
+      const savedValue = JSON.parse(mockedSettings.setSetting.mock.calls[0][1]);
+      expect(savedValue[0].waitingContent).toEqual({
+        type: 'youtube',
+        value: 'https://www.youtube.com/watch?v=abc123',
+        title: 'Watch this',
+      });
+    });
+
+    it('POST should omit waitingContent when not provided', async () => {
+      mockedSettings.getSetting.mockResolvedValue(null);
+      mockedSettings.setSetting.mockResolvedValue({} as any);
+
+      const res = await request(app)
+        .post('/api/admin/result-endpoints')
+        .set('Authorization', 'Bearer test-token')
+        .send({
+          name: 'no-waiting',
+          prompt: 'Generate something',
+          outputFormat: 'html',
+          reviewerEmail: 'test@example.com',
+        })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      // waitingContent should be undefined (not sent in response)
+      expect(res.body.data.waitingContent).toBeUndefined();
+    });
+
+    it('POST should reject invalid waitingContent type', async () => {
+      mockedSettings.getSetting.mockResolvedValue(null);
+
+      const res = await request(app)
+        .post('/api/admin/result-endpoints')
+        .set('Authorization', 'Bearer test-token')
+        .send({
+          name: 'bad-waiting',
+          prompt: 'Generate something',
+          outputFormat: 'html',
+          reviewerEmail: 'test@example.com',
+          waitingContent: {
+            type: 'invalid',
+            value: 'some-value',
+          },
+        })
+        .expect(400);
+
+      expect(res.body.error).toContain('waitingContent.type');
     });
   });
 });
