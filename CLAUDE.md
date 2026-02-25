@@ -875,7 +875,7 @@ KEY_FILE=~/.ssh/my-keypair.pem
 - **IP-restricted** — per-instance security group locked to developer's IP at launch; use `allow-ip`/`revoke-ip` to manage access
 - Backend `.env` fetched from Secrets Manager at launch (developers never see it)
 - Code synced via `rsync` — only changed files transferred
-- Auto-terminates after **7 days of inactivity** (watchdog cron)
+- Auto-terminates after **24 hours of inactivity** (watchdog cron)
 - Per-clone isolation enforced via name-based state files and validation guards
 - Ports: backend=3001, partner-portal=5173, customer-portal=5174
 
