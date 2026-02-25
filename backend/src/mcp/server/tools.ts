@@ -3418,3 +3418,41 @@ mcpToolRegistry.register({
     return await agentModeService.setWorkPlanStatus(args.updates, context?.sessionId);
   }
 });
+
+mcpToolRegistry.register({
+  name: 'send_for_review',
+  definition: {
+    name: 'send_for_review',
+    description: 'Send the generated result content to the configured reviewer for approval. Sends a review email with a link to view and send the final result. You MUST call this after generating the content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        subject: {
+          type: 'string',
+          description: 'Email subject line for the result.'
+        },
+        content_url: {
+          type: 'string',
+          description: 'Optional URL to the generated content (e.g., S3 link to HTML file, image, or video).'
+        },
+        content_html: {
+          type: 'string',
+          description: 'Optional inline HTML content to include in the email body.'
+        }
+      },
+      required: ['subject']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId || !context?.sessionId) {
+      throw new Error("Missing user or session context");
+    }
+    return await agentModeService.sendForReview(
+      args.subject,
+      context.sessionId,
+      context.userId,
+      args.content_url,
+      args.content_html
+    );
+  }
+});
