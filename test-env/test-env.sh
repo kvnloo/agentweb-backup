@@ -9,7 +9,7 @@ set -euo pipefail
 # folder name (e.g., myuser-agentweb), so each clone gets its own instance.
 #
 # Usage:
-#   ./test-env.sh launch   [--key-name K] [--key-file F] [--instance-type T]
+#   ./test-env.sh launch   [--key-name K] [--key-file F] [--instance-type T] [--no-watchdog]
 #   ./test-env.sh teardown
 #   ./test-env.sh sync     [backend|partner-portal|customer-portal|test-env-access]
 #   ./test-env.sh status
@@ -111,6 +111,7 @@ remote() {
 cmd_launch() {
   local name
   name="$(resolve_env_name)"
+  local NO_WATCHDOG=false
 
   # Parse flags
   while [[ $# -gt 0 ]]; do
@@ -118,6 +119,7 @@ cmd_launch() {
       --key-name)      KEY_NAME="$2"; shift 2 ;;
       --key-file)      KEY_FILE="$2"; shift 2 ;;
       --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
+      --no-watchdog)   NO_WATCHDOG=true; shift ;;
       *) err "Unknown flag: $1"; exit 1 ;;
     esac
   done
@@ -352,11 +354,23 @@ EOF
     docker compose build && \
     docker compose up -d"
 
-  # Set up watchdog cron
-  log "Setting up inactivity watchdog..."
-  remote "sudo cp /home/ec2-user/agentweb/test-env/watchdog.sh /opt/watchdog.sh && \
-    sudo chmod +x /opt/watchdog.sh && \
-    echo '0 * * * * /opt/watchdog.sh >> /var/log/watchdog.log 2>&1' | sudo crontab -"
+  # Seed IP allowlist with developer's IP so the UI shows correct status
+  local dev_subnet dev_now
+  dev_subnet="$(echo "$MY_IP" | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"
+  dev_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  log "Seeding IP allowlist with developer IP ($MY_IP)..."
+  remote "printf '%s' '{\"ips\":[{\"ip\":\"$MY_IP\",\"subnet\":\"$dev_subnet\",\"email\":\"launcher\",\"addedAt\":\"$dev_now\"}]}' | \
+    docker compose -f /home/ec2-user/agentweb/test-env/docker-compose.yml exec -T test-env-access sh -c 'cat > /app/data/allowlist.json'"
+
+  # Set up watchdog cron (unless --no-watchdog)
+  if [[ "$NO_WATCHDOG" == "true" ]]; then
+    log "Skipping inactivity watchdog (--no-watchdog). Instance will run until manually torn down."
+  else
+    log "Setting up inactivity watchdog..."
+    remote "sudo cp /home/ec2-user/agentweb/test-env/watchdog.sh /opt/watchdog.sh && \
+      sudo chmod +x /opt/watchdog.sh && \
+      echo '0 * * * * /opt/watchdog.sh >> /var/log/watchdog.log 2>&1' | sudo crontab -"
+  fi
 
   echo ""
   log "========================================="
@@ -368,7 +382,11 @@ EOF
   echo -e " ${CYAN}IP Allowlist:${NC}     http://$PUBLIC_IP:5175"
   echo -e " ${CYAN}SSH:${NC}              ssh -i $KEY_FILE $SSH_USER@$PUBLIC_IP"
   echo ""
-  echo -e " ${YELLOW}Auto-shutdown:${NC}    After 24 hours of inactivity"
+  if [[ "$NO_WATCHDOG" == "true" ]]; then
+    echo -e " ${YELLOW}Auto-shutdown:${NC}    DISABLED (manual teardown required)"
+  else
+    echo -e " ${YELLOW}Auto-shutdown:${NC}    After 24 hours of inactivity"
+  fi
   echo -e " ${YELLOW}Teardown:${NC}         ./test-env.sh teardown"
   log "========================================="
 }
@@ -702,6 +720,7 @@ case "$CMD" in
     echo ""
     echo "Examples:"
     echo "  ./test-env.sh launch                    # launch environment"
+    echo "  ./test-env.sh launch --no-watchdog      # launch without auto-shutdown"
     echo "  ./test-env.sh sync                      # sync all services"
     echo "  ./test-env.sh sync backend              # sync just backend"
     echo "  ./test-env.sh allow-ip 203.0.113.50     # grant IP access"

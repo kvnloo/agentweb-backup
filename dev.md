@@ -1,3 +1,10 @@
+# February 25, 2026: Long-Running Test Env & IP Allowlist Fix
+
+- Added `--no-watchdog` flag to `./test-env/test-env.sh launch` to skip the 24-hour auto-shutdown cron. Use for long-running test environments that you teardown manually.
+- Fixed bug where the test-env-access UI showed the developer's IP as "not accessible" on launch. The launch script added the IP to the AWS security group but not to `allowlist.json`. Now seeds the allowlist at launch.
+
+---
+
 # February 24, 2026: Growth Estimate — Month-over-Month Comparison
 
 Ran `node src/scripts/growth-comparison.js 2026-02-24` to compare 3 rolling 30-day periods.
