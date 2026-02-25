@@ -1,5 +1,5 @@
 #!/bin/bash
-# watchdog.sh — Shuts down the instance after 7 days of inactivity.
+# watchdog.sh — Shuts down the instance after 24 hours of inactivity.
 # Runs via cron every hour. Combined with instance-initiated-shutdown-behavior=terminate,
 # a shutdown will terminate the instance.
 #
@@ -7,10 +7,10 @@
 
 set -euo pipefail
 
-IDLE_LIMIT=$((7 * 24 * 3600))  # 7 days in seconds
+IDLE_LIMIT=$((24 * 3600))  # 24 hours in seconds
 ACTIVITY_FILE="/tmp/test-env-last-activity"
 
-# Check if any container has produced logs in the last 7 days.
+# Check if any container has produced logs in the last 24 hours.
 # docker compose logs --since outputs nothing if no logs in that window.
 COMPOSE_DIR="/home/ec2-user/agentweb/test-env"
 
@@ -18,7 +18,7 @@ if [[ ! -d "$COMPOSE_DIR" ]]; then
   exit 0
 fi
 
-RECENT_LOGS=$(cd "$COMPOSE_DIR" && docker compose logs --since 168h 2>/dev/null | head -1)
+RECENT_LOGS=$(cd "$COMPOSE_DIR" && docker compose logs --since 24h 2>/dev/null | head -1)
 
 if [[ -n "$RECENT_LOGS" ]]; then
   # Activity detected — update timestamp

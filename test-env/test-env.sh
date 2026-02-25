@@ -368,7 +368,7 @@ EOF
   echo -e " ${CYAN}IP Allowlist:${NC}     http://$PUBLIC_IP:5175"
   echo -e " ${CYAN}SSH:${NC}              ssh -i $KEY_FILE $SSH_USER@$PUBLIC_IP"
   echo ""
-  echo -e " ${YELLOW}Auto-shutdown:${NC}    After 7 days of inactivity"
+  echo -e " ${YELLOW}Auto-shutdown:${NC}    After 24 hours of inactivity"
   echo -e " ${YELLOW}Teardown:${NC}         ./test-env.sh teardown"
   log "========================================="
 }

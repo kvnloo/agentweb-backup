@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-25',
     changes: [
+      'Test Environment: Faster Auto-Shutdown',
+      '- Cloud test environments now auto-terminate after 24 hours of inactivity instead of 7 days',
+      '- Reduces idle EC2 costs for forgotten environments',
       'Result Endpoints: Automated Content Generation & Delivery',
       '- New "Result Endpoints" system allows external triggers (e.g., form submissions, webhooks) to kick off AI-powered content generation sessions',
       '- Configurable via the admin dashboard under the new Result Endpoints tab: set a name, prompt template with {{variable}} placeholders, output format (HTML/image/video), and reviewer email',
