@@ -879,6 +879,10 @@ KEY_FILE=~/.ssh/my-keypair.pem
 - Per-clone isolation enforced via name-based state files and validation guards
 - Ports: backend=3001, partner-portal=5173, customer-portal=5174
 
+## Browser Testing with Playwright MCP
+
+A Playwright MCP server is configured via `.mcp.json` in each repo root. Use the `mcp__playwright__browser_*` tools to drive a real browser against the cloud test environment for manual verification (login, delegation, UI interactions). If the tools are not available, restart the Claude Code session to reload MCP servers.
+
 ## "Prep Branch for \<topic\>" Command
 
 When the user says **"prep branch for \<topic\>"**:
