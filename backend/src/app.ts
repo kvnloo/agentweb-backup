@@ -38,6 +38,7 @@ import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
 import landingPagesRoutes from "./routes/landingPages";
+import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -182,6 +183,8 @@ app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/r", resultEndpointsRoutes);
+app.use("/review", reviewRouter);
 
 
 

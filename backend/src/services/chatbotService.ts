@@ -164,7 +164,27 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation"; // Type of session based on how it was created
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint"; // Type of session based on how it was created
+  resultEndpointMetadata?: {
+    resultName: string;
+    resultTitle?: string;
+    leadEmail?: string;
+    leadId?: string;
+    externalSessionId?: string;
+    reviewerEmail: string;
+    skipReview?: boolean;
+    outputFormat: 'html' | 'image' | 'video';
+    args: Record<string, string>;
+    contentUrl?: string;
+    contentHtml?: string;
+    contentSubject?: string;
+    sendHistory?: Array<{
+      assetUrl: string;
+      recipientEmail: string;
+      customMessage?: string;
+      sentAt: string;
+    }>;
+  };
   llmModel?: string; // Selected LLM model for this session
   delegateInfo?: {
     adminUserId: string;
@@ -399,7 +419,7 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
@@ -1691,6 +1711,52 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session interactive share metadata:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionResultEndpointMetadata(
+    sessionId: string,
+    resultEndpointMetadata: {
+      resultName: string;
+      resultTitle?: string;
+      leadEmail?: string;
+      leadId?: string;
+      externalSessionId?: string;
+      reviewerEmail: string;
+      skipReview?: boolean;
+      outputFormat: 'html' | 'image' | 'video';
+      args: Record<string, string>;
+      contentUrl?: string;
+      contentHtml?: string;
+      contentSubject?: string;
+      sendHistory?: Array<{
+        assetUrl: string;
+        recipientEmail: string;
+        customMessage?: string;
+        sentAt: string;
+      }>;
+    }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET resultEndpointMetadata = :resultEndpointMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":resultEndpointMetadata": resultEndpointMetadata,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session result endpoint metadata:", error);
       throw error;
     }
   }
