@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-25',
     changes: [
+      'Scheduled Chats: Variable Type Support (Text, Long Text, File Attachment)',
+      '- Variables in scheduled chats now support three types: Text (single-line input), Long Text (multi-line textarea), and File Attachment (file upload to S3)',
+      '- Variable type is configurable per-variable in the schedule form via a dropdown selector',
+      '- File attachments uploaded through variables are automatically passed to the AI session as attachments',
+      '- File variable placeholders in the starting message are replaced with markdown links ([filename](url))',
+      '- Public variable request page renders the correct input for each type: text input, textarea, or file upload button with progress indicator',
+      '- Variable run dialog (test run) also supports all three types with the authenticated upload endpoint',
+      '- New public file upload endpoint validates access token before accepting uploads',
       'Test Environment: Faster Auto-Shutdown',
       '- Cloud test environments now auto-terminate after 24 hours of inactivity instead of 7 days',
       '- Reduces idle EC2 costs for forgotten environments',
