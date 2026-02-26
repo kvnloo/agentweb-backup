@@ -3017,3 +3017,43 @@ For registration/signup forms, use `action-btn-reg-007-pf` on the submit button 
 4. **Verify events fire**: In the Network tab, filter by `api.pixelflow.so`. Submit the form and confirm a request is sent to the event endpoint with the form data.
 
 If any of the classes in step 3 are missing, form submissions will **not** be tracked by PixelFlow even if the base script is installed.
+
+## Steps to Set Up a Facebook Developer App for Instagram
+
+### 1. Create / Open Facebook Developer App
+
+Go to the [Facebook Developer Portal](https://developers.facebook.com/).
+Create a new app or open the existing one.
+
+### 2. Add Instagram Product
+
+If Instagram is not already added, click **"Add Product"**.
+Select **Instagram** and complete the setup.
+
+### 3. Configure Instagram API with Instagram Login
+
+- After adding the Instagram product, you will see Instagram in the left sidebar.
+- Click on **API Setup with Instagram Login**.
+- Under this section, you will find:
+  - **Instagram App ID**
+  - **Instagram App Secret**
+
+### 4. Update Application Secrets
+
+Add the following values under:
+
+```
+prod/AgentWeb/MetaApp
+```
+
+Map them as:
+- `instagramClientId` → Instagram App ID
+- `instagramClientSecret` → Instagram App Secret
+
+### 5. Set Up Instagram Business Login
+
+In the **Set Up Instagram Business Login** section, configure the redirect URL:
+
+```
+{base_url}/api/oauth/instagram/callback
+```
