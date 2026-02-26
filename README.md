@@ -1888,7 +1888,7 @@ KEY_FILE=~/.ssh/my-keypair.pem
 - **IP-restricted by default** — only the developer's IP (auto-detected at launch) can access the instance. Use `allow-ip` / `revoke-ip` to manage access for others.
 - Backend `.env` is fetched from Secrets Manager automatically (developers never see it)
 - Code is synced via `rsync` (only changed files)
-- Instance auto-terminates after **7 days of inactivity**
+- Instance auto-terminates after **24 hours of inactivity**
 - Ports: backend=3001, partner-portal=5173, customer-portal=5174
 - Multiple clones (e.g., `agentweb/`, `agentweb1/`) run fully independent environments
 

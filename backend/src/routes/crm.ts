@@ -363,6 +363,26 @@ const fetchAllLeadsByFlagIndex = async (
   }
 };
 
+const fetchAllLeadsByStatusIndex = async (
+  listId: string,
+  status: string,
+  pageSize: number
+): Promise<any[]> => {
+  let lastKey: any = undefined;
+  const items: any[] = [];
+  try {
+    do {
+      const result = await crmDb.getLeadsByStatus(listId, status, pageSize, lastKey);
+      items.push(...result.items);
+      lastKey = result.lastEvaluatedKey;
+    } while (lastKey);
+    return items;
+  } catch (error: any) {
+    console.warn(`Falling back from status index for list ${listId}:`, error?.message || error);
+    return fetchAllLeadsByList(listId, pageSize);
+  }
+};
+
 // Lead List Routes
 
 /**
@@ -401,10 +421,14 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, alertEvents, listSenderId, autoDraftEnabled } = req.body;
+    const { name, description, alertEvents, listSenderId, autoDraftEnabled, statusConfig, listType } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ message: 'List name is required' });
+    }
+
+    if (listType !== undefined && listType !== 'sales' && listType !== 'customers') {
+      return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
     }
 
     let normalizedAlertEvents: string[] | undefined;
@@ -435,7 +459,11 @@ router.post('/lists', async (req: Request, res: Response) => {
       description?.trim(),
       normalizedAlertEvents,
       normalizedListSenderId,
-      autoDraftEnabled === true
+      autoDraftEnabled === true,
+      undefined, // autoDraftInstruction
+      undefined, // autoSendEnabled
+      statusConfig,
+      listType
     );
     res.status(201).json(list);
   } catch (error: any) {
@@ -487,7 +515,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -513,6 +541,8 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       autoDraftEnabled?: boolean;
       icpsOnly?: boolean;
       engagedOnly?: boolean;
+      statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+      listType?: 'sales' | 'customers';
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -600,6 +630,31 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       updates.autoDraftEnabled = autoDraftEnabled;
     }
 
+    if (statusConfig !== undefined) {
+      if (!Array.isArray(statusConfig)) {
+        return res.status(400).json({ message: 'statusConfig must be an array' });
+      }
+      for (const entry of statusConfig) {
+        if (!entry.value || !entry.label || !entry.color || !entry.type) {
+          return res.status(400).json({ message: 'Each statusConfig entry must have value, label, color, and type' });
+        }
+        if (!['active', 'won', 'lost', 'churned'].includes(entry.type)) {
+          return res.status(400).json({ message: 'statusConfig type must be one of: active, won, lost, churned' });
+        }
+      }
+      updates.statusConfig = statusConfig;
+    }
+
+    if (listType !== undefined) {
+      if (listType !== 'sales' && listType !== 'customers') {
+        return res.status(400).json({ message: 'listType must be "sales" or "customers"' });
+      }
+      if (list.listType) {
+        return res.status(400).json({ message: 'listType is already set and cannot be changed' });
+      }
+      updates.listType = listType;
+    }
+
     const updatedList = await crmDb.updateLeadList(listId, updates);
     res.json(updatedList);
   } catch (error: any) {
@@ -660,6 +715,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
     const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
     const engagedOnlyQuery = req.query.engagedOnly;
+    const statusQuery = typeof req.query.status === 'string' ? req.query.status.trim() : '';
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -695,7 +751,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
       }
     }
 
-    if (list.icpsOnly || search || effectiveEngagedOnly) {
+    if (list.icpsOnly || search || effectiveEngagedOnly || statusQuery) {
       // Filtered mode: use flag indexes when possible, then apply remaining filters in-memory.
       const fetchLimit = Math.max(validLimit, 200);
 
@@ -706,6 +762,8 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
         candidateLeads = await fetchAllLeadsByFlagIndex(listId, 'icp', fetchLimit);
       } else if (effectiveEngagedOnly) {
         candidateLeads = await fetchAllLeadsByFlagIndex(listId, 'engaged', fetchLimit);
+      } else if (statusQuery) {
+        candidateLeads = await fetchAllLeadsByStatusIndex(listId, statusQuery, fetchLimit);
       } else {
         candidateLeads = await fetchAllLeadsByList(listId, fetchLimit);
       }
@@ -724,6 +782,9 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
           return false;
         }
         if (search && !leadMatchesSearch(lead, search)) {
+          return false;
+        }
+        if (statusQuery && (lead.status || null) !== statusQuery) {
           return false;
         }
         return true;
@@ -930,6 +991,23 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     }
 
     const updateData = updates;
+
+    // Auto-create status change engagement if status changed
+    if (updates.status !== undefined) {
+      const existingLead = await crmDb.getLeadById(listId, leadId);
+      if (existingLead && existingLead.status !== updates.status) {
+        await crmDb.addLeadEngagement(listId, leadId, {
+          eventType: 'status.changed',
+          eventData: {
+            from: existingLead.status || null,
+            to: updates.status,
+            dealValue: updates.dealValue ?? existingLead.dealValue ?? null,
+            dealCurrency: updates.dealCurrency ?? existingLead.dealCurrency ?? 'USD',
+          },
+          createdAt: new Date().toISOString(),
+        });
+      }
+    }
 
     const updatedLead = await crmDb.updateLead(listId, leadId, updateData);
     res.json(updatedLead);

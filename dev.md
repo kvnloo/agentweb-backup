@@ -1,3 +1,92 @@
+# February 25, 2026: Long-Running Test Env & IP Allowlist Fix
+
+- Added `--no-watchdog` flag to `./test-env/test-env.sh launch` to skip the 24-hour auto-shutdown cron. Use for long-running test environments that you teardown manually.
+- Fixed bug where the test-env-access UI showed the developer's IP as "not accessible" on launch. The launch script added the IP to the AWS security group but not to `allowlist.json`. Now seeds the allowlist at launch.
+
+---
+
+# February 24, 2026: Growth Estimate — Month-over-Month Comparison
+
+Ran `node src/scripts/growth-comparison.js 2026-02-24` to compare 3 rolling 30-day periods.
+
+| Metric | Jan 25 - Feb 24 | Dec 25 - Jan 24 | Nov 25 - Dec 24 |
+|---|--:|--:|--:|
+| Agent Mode Sessions | 1,033 (+130, +14%) | 903 (+143, +19%) | 760 |
+| Generated Articles | 989 (+485, +96%) | 504 (+264, +110%) | 240 |
+| Approved Articles | 15 (+9, +150%) | 6 (+6, new) | 0 |
+| Published Articles | 62 (+53, +589%) | 9 (+9, new) | 0 |
+| Generated Posts | 298 (+37, +14%) | 261 (+198, +314%) | 63 |
+| Approved Posts | 7 (-2, -22%) | 9 (+9, new) | 0 |
+| Published Posts | 27 (+16, +145%) | 11 (+11, new) | 0 |
+| Generated Images | 345 (+5, +1%) | 340 (+182, +115%) | 158 |
+| Approved Images | 10 (-14, -58%) | 24 (+24, new) | 0 |
+
+**Data sources:**
+- Sessions & tool call counts: `AW-ChatSessions` (`calledFunctions` on each session, bucketed by session `createdAt`)
+- Approved articles/posts/images: `AW-AssetApprovals` (status=`approved`, bucketed by `updatedAt`)
+- Article = `blog-*` filename; Post = `social-media-post*`, `linkedin-post*`, `x_thread*`, `twitter-thread*` filenames; Image = `assetType=image`
+
+**Script:** `backend/src/scripts/growth-comparison.js` — accepts an optional end date argument (defaults to today). Run from the `backend/` directory.
+
+---
+
+# February 24, 2026: SEO/GEO Engagement Time Is Total, Not Average
+
+The "Top Pages by Engagement" table on the SEO/GEO page displays **total** engagement time, not average. The backend (`seo.ts`) requests GA4's `userEngagementDuration` metric, which is cumulative across all sessions. The frontend (`SEO.tsx`) renders it directly via `formatTime()` with no averaging. For product metrics, the backend separately computes `avgDuration` by dividing `totalDuration` by `pageViews`, but this is not used in the top pages table.
+
+---
+
+# February 24, 2026: `create_html_from_template` JSON Failure + Reports Model Admin Bug
+
+## Problem 1 — Amino Daily News Template Failure
+
+Production session `8400bace-...` (Daily AI News - Amino) using `gemini-3.1-pro-preview` failed 25 times on `create_html_from_template` with "LLM returned invalid JSON for variable substitution".
+
+### Root Cause
+
+Three issues combined:
+
+1. **`tools.ts:1175` used `args.llmModel` but `llmModel` is in `context`, not `args`** — the model passed to `createHtmlFromTemplate` was undefined/wrong.
+2. **Gemini doesn't reliably honor `response_format: { type: 'json_object' }`** — it returns JSON wrapped in markdown code blocks (`` ```json ... ``` ``), causing `JSON.parse()` to fail.
+3. **No `max_completion_tokens` was set** — risking output truncation on large templates.
+
+### Fix
+
+- Changed `args.llmModel` → `context?.llmModel` in `tools.ts:1175`
+- Added JSON code-block stripping fallback: first tries `JSON.parse`, then strips `` ```json ``` `` wrappers and retries, with raw response logging on failure
+- Added `max_completion_tokens: 16384` to the `callLLM` call (matching `createHtmlFile` and `createHtmlTemplate`)
+
+## Problem 2 — Reports Model Dropdown Shows All Models
+
+The Reports Model dropdown in the admin page's Agent Mode tab showed all 8 agent mode models (GPT, Gemini, Claude) when it should only show models suitable for report generation.
+
+### Root Cause
+
+The `<Select>` at `AdminDashboard.tsx:7199` used `supportedModels` (from `/api/agent-mode/public/llm-models`) which returns all models in `llmModels`. This was always the case since commit `e324fb8f` (Jan 13), but became worse as models were added:
+- Jan 13: 4 models → Feb 20: 8 models (every new model automatically appeared)
+
+### Fix
+
+- Added `getReportsModelOptions()` to `agentModeService.ts` — filters `llmModels` to `anthropic.*` keys only
+- Added `GET /api/agent-mode/public/reports-model-options` endpoint
+- Updated `AdminDashboard.tsx` to load and use the filtered list for the Reports Model dropdown (with fallback to `supportedModels` if endpoint fails)
+
+---
+
+# February 23, 2026: Updated User Guide — ClickUp & Google Drive Documentation
+
+Added sections to the user-facing guide (Notion) documenting the ClickUp Knowledge Base integration and Google Drive Shared Folders integration. Covers setup instructions, agent capabilities, supported file types, and security.
+
+---
+
+# February 23, 2026: Enabled Branch Protection on Main
+
+Neither `AgentWebPro/agentweb` nor `AgentWebPro/agentweb-customer-portal` had branch protection on `main`. Enabled protection on both repos via GitHub API with: strict status checks, force pushes blocked, branch deletion blocked, and enforce admins enabled. Required PR reviews was initially set to 1 but later removed.
+
+**Verification:** After each change, read back the protection settings via `gh api repos/{owner}/{repo}/branches/main/protection` and confirmed `protected: true`, correct rule values, and `enforce_admins.enabled: true`. Also confirmed `required_pull_request_reviews` was absent from the response after removing the review requirement.
+
+---
+
 # February 21, 2026: Agent Mode — Dropped Assistant Messages (Aaron's Session)
 
 ## Problem

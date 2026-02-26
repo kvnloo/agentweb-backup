@@ -3587,4 +3587,102 @@ router.put("/gtm-common-items", async (req, res) => {
   }
 });
 
+// --- Result Endpoint Config CRUD ---
+
+router.get("/result-endpoints", async (req, res) => {
+  try {
+    const { getResultEndpointConfigs } = await import("../controllers/resultEndpointController");
+    const configs = await getResultEndpointConfigs();
+    return res.json({ success: true, data: configs });
+  } catch (error) {
+    console.error("Error fetching result endpoint configs:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch result endpoint configs" });
+  }
+});
+
+router.post("/result-endpoints", async (req, res) => {
+  try {
+    const { name, resultTitle, prompt, outputFormat, reviewerEmail, skipReview, llmModel, requiredSkills, waitingContent } = req.body;
+
+    if (!name || typeof name !== "string" || !name.trim()) {
+      return res.status(400).json({ success: false, error: "name is required" });
+    }
+    if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+      return res.status(400).json({ success: false, error: "prompt is required" });
+    }
+    if (!outputFormat || !["html", "image", "video"].includes(outputFormat)) {
+      return res.status(400).json({ success: false, error: "outputFormat must be html, image, or video" });
+    }
+    if (!reviewerEmail || typeof reviewerEmail !== "string" || !reviewerEmail.trim()) {
+      return res.status(400).json({ success: false, error: "reviewerEmail is required" });
+    }
+
+    const { getResultEndpointConfigs, saveResultEndpointConfigs } = await import("../controllers/resultEndpointController");
+    const configs = await getResultEndpointConfigs();
+
+    const existingIndex = configs.findIndex(c => c.name === name.trim());
+    // Build waitingContent if provided
+    let parsedWaitingContent: { type: 'youtube' | 'url' | 'html'; value: string; title?: string } | undefined;
+    if (waitingContent && waitingContent.type && waitingContent.value) {
+      const validTypes = ['youtube', 'url', 'html'];
+      if (!validTypes.includes(waitingContent.type)) {
+        return res.status(400).json({ success: false, error: "waitingContent.type must be youtube, url, or html" });
+      }
+      parsedWaitingContent = {
+        type: waitingContent.type,
+        value: waitingContent.value,
+        title: waitingContent.title || undefined,
+      };
+    }
+
+    const newConfig = {
+      name: name.trim(),
+      resultTitle: resultTitle?.trim() || undefined,
+      prompt: prompt.trim(),
+      outputFormat,
+      reviewerEmail: reviewerEmail.trim(),
+      skipReview: !!skipReview,
+      llmModel: llmModel || undefined,
+      requiredSkills: requiredSkills || undefined,
+      waitingContent: parsedWaitingContent,
+    };
+
+    if (existingIndex >= 0) {
+      configs[existingIndex] = newConfig;
+    } else {
+      configs.push(newConfig);
+    }
+
+    const adminEmail = req.user?.email || "admin";
+    await saveResultEndpointConfigs(configs, adminEmail);
+
+    return res.json({ success: true, data: newConfig });
+  } catch (error) {
+    console.error("Error saving result endpoint config:", error);
+    return res.status(500).json({ success: false, error: "Failed to save result endpoint config" });
+  }
+});
+
+router.delete("/result-endpoints/:name", async (req, res) => {
+  try {
+    const { name } = req.params;
+
+    const { getResultEndpointConfigs, saveResultEndpointConfigs } = await import("../controllers/resultEndpointController");
+    const configs = await getResultEndpointConfigs();
+    const filtered = configs.filter(c => c.name !== name);
+
+    if (filtered.length === configs.length) {
+      return res.status(404).json({ success: false, error: `Result endpoint "${name}" not found` });
+    }
+
+    const adminEmail = req.user?.email || "admin";
+    await saveResultEndpointConfigs(filtered, adminEmail);
+
+    return res.json({ success: true, message: `Result endpoint "${name}" deleted` });
+  } catch (error) {
+    console.error("Error deleting result endpoint config:", error);
+    return res.status(500).json({ success: false, error: "Failed to delete result endpoint config" });
+  }
+});
+
 export default router;

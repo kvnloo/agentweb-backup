@@ -1555,6 +1555,16 @@ export const agentModeController = {
     }
   },
 
+  async getReportsModelOptions(req: Request, res: Response) {
+    try {
+      const models = await agentModeService.getReportsModelOptions();
+      res.json(models);
+    } catch (error) {
+      console.error('AgentMode: Get reports model options error:', error);
+      res.status(500).json({ error: 'Failed to get reports model options' });
+    }
+  },
+
   // Get system prompt
   async getSystemPrompt(req: Request, res: Response) {
     try {
@@ -3677,6 +3687,7 @@ export const agentModeController = {
   async createSessionWithPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
+      const { startingMessage } = req.body || {};
 
       if (!planTitle) {
         return res.status(400).json({ error: 'Plan title is required' });
@@ -3785,6 +3796,18 @@ export const agentModeController = {
         conversableToken,
         userId: session.userId
       });
+
+      // Fire-and-forget: send starting message after response is returned
+      if (startingMessage && typeof startingMessage === 'string' && startingMessage.trim()) {
+        generateSessionResponse(
+          session.sessionId,
+          startingMessage.trim(),
+          userId,
+          selectedModel
+        ).catch((err: any) => {
+          console.error('AgentMode: Error sending starting message for session', session.sessionId, err);
+        });
+      }
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);
       res.status(500).json({ error: 'Failed to create session with plan' });

@@ -31,6 +31,8 @@ The backend manages tasks and schedules, stores them in DynamoDB, and the agent 
 
 ## Development Commands
 
+**CRITICAL: Do NOT run the backend, partner-portal, or customer-portal locally for manual testing.** Always use the cloud test environment (`./test-env/test-env.sh launch` then `./test-env/test-env.sh sync`) for testing changes. The commands below (`npm run dev`) are documented for reference only. Local runs should be limited to `npx tsc` (compilation checks) and `npm test` (unit tests).
+
 ### Backend
 
 ```bash
@@ -649,6 +651,18 @@ These checks prevent CI failures and ensure code quality. The `npx tsc` command 
 
 **CRITICAL:** Run `npx tsc` after **every** edit to any `.ts` file in the backend, including test files (`__tests__/*.test.ts`). Do not wait until all edits are done — verify compilation after each file change.
 
+## Commit Granularity
+
+**Each commit should cover one logical change.** Separate commits for different types of work so the git history is clear and reviewable:
+
+- A bug fix is its own commit
+- A new feature is its own commit
+- Unit tests are their own commit
+- User release notes updates are their own commit
+- Documentation changes (dev.md, CLAUDE.md) are their own commit
+
+For example, a PR that fixes a bug and adds a feature should have at minimum: one commit for the bug fix, one for the feature, one for tests, one for release notes, and one for any dev.md investigation notes — not a single commit bundling everything together.
+
 ## Testing Strategy
 
 ### Backend Tests
@@ -785,6 +799,13 @@ When making changes, these files are critical to understand:
 - Email notifications use both SMTP and Resend API
 - Slack integration for GTM plan approvals via webhooks
 
+## Test Account
+
+For manual testing on test/staging environments:
+
+- **Email:** `test@example.com`
+- **Password:** `Test123!`
+
 ## Cloud Test Environment
 
 Ephemeral test environments can be launched on EC2 for manual testing. All files live in `test-env/`.
@@ -818,7 +839,7 @@ KEY_FILE=~/.ssh/my-keypair.pem
 
 ### Usage
 
-**IMPORTANT:** When a test environment is active (check with `./test-env/test-env.sh list`), run `./test-env/test-env.sh sync` after making code changes to deploy them to the instance. Sync the specific service that changed (e.g., `sync backend`) or `sync` for all. There is no automatic file watcher — sync must be run explicitly.
+**CRITICAL:** When a test environment is active (check with `./test-env/test-env.sh list`), you MUST run `./test-env/test-env.sh sync` after EVERY code change to deploy it to the instance. Always sync immediately after making changes — do not wait for the user to ask. Sync the specific service that changed (e.g., `sync backend`, `sync customer-portal`) or `sync` for all. There is no automatic file watcher — sync must be run explicitly after each change.
 
 ```bash
 # Launch environment (auto-detects your IP and locks access to it)
@@ -854,15 +875,34 @@ KEY_FILE=~/.ssh/my-keypair.pem
 - **IP-restricted** — per-instance security group locked to developer's IP at launch; use `allow-ip`/`revoke-ip` to manage access
 - Backend `.env` fetched from Secrets Manager at launch (developers never see it)
 - Code synced via `rsync` — only changed files transferred
-- Auto-terminates after **7 days of inactivity** (watchdog cron)
+- Auto-terminates after **24 hours of inactivity** (watchdog cron)
 - Per-clone isolation enforced via name-based state files and validation guards
 - Ports: backend=3001, partner-portal=5173, customer-portal=5174
+
+## Browser Testing with Playwright MCP
+
+A Playwright MCP server is configured via `.mcp.json` in each repo root. Use the `mcp__playwright__browser_*` tools to drive a real browser against the cloud test environment for manual verification (login, delegation, UI interactions). If the tools are not available, restart the Claude Code session to reload MCP servers.
+
+## "Prep Branch for \<topic\>" Command
+
+When the user says **"prep branch for \<topic\>"**:
+
+1. Convert `<topic>` to a branch name: `rui/<topic>` (lowercase, spaces replaced with hyphens)
+2. **This repo (agentweb):**
+   - `git fetch origin main`
+   - `git checkout -b rui/<topic> origin/main`
+3. **Customer portal (separate repo at `customer-portal/`):**
+   - `git -C customer-portal fetch origin main`
+   - `git -C customer-portal checkout -b rui/<topic> origin/main`
+4. Confirm both branches are created and ready for development
 
 ## "Prep for Deploy" Command
 
 When the user says **"prep for deploy \<date\>"** (default: today's date if omitted):
 
-1. Add a user-facing release notes entry for the date at the top of `backend/src/docs/user-release.ts`, following existing format
+1. Add release notes entries for the date, following existing format in each file:
+   - **Backend changes:** `backend/src/docs/user-release.ts`
+   - **Partner portal changes:** `partner-portal/src/docs/release.ts`
 2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend. **CI requires ≥90% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
 3. Commit changes and create PRs for **both** repos:
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`

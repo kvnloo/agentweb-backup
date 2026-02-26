@@ -41,3 +41,22 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+  test-env-access:
+    build:
+      context: ..
+      dockerfile: test-env/Dockerfile.test-env-access
+    ports:
+      - "5175:5175"
+    env_file:
+      - ../.env.test-env-access
+    environment:
+      - PORT=5175
+      - SG_ID=${SG_ID}
+      - AWS_REGION=${AWS_REGION:-us-west-2}
+    volumes:
+      - test-env-access-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  test-env-access-data:

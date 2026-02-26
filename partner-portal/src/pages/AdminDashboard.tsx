@@ -49,6 +49,7 @@ import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
+import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -135,7 +136,7 @@ interface AdminChatSession {
   pageContent?: string;
   contextChunks?: any[];
   portalType?: "customer" | "partner";
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation";
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint";
   shareMetadata?: {
     isShared: boolean;
     sharedAt?: string;
@@ -584,6 +585,7 @@ export default function AdminDashboard() {
     'benchmarks': 11,
     'subscriptions': 12,
     'mcp-servers': 13,
+    'result-endpoints': 14,
   };
   
   // Get initial tab value from URL or default to Users
@@ -2265,6 +2267,7 @@ export default function AdminDashboard() {
             <Tab label="Benchmarks" {...a11yProps(11)} />
             <Tab label="Subscriptions" {...a11yProps(12)} />
             <Tab label="MCP Servers" {...a11yProps(13)} />
+            <Tab label="Result Endpoints" {...a11yProps(14)} />
           </Tabs>
         </Box>
 
@@ -4466,6 +4469,8 @@ export default function AdminDashboard() {
                                   ? "Book Generation"
                                   : session.sessionType === "report_generation"
                                   ? "Report Generation"
+                                  : session.sessionType === "result-endpoint"
+                                  ? "Result Endpoint"
                                   : "Regular"
                               }
                               color={
@@ -4480,6 +4485,8 @@ export default function AdminDashboard() {
                                   : session.sessionType === "book-generation"
                                   ? "info"
                                   : session.sessionType === "report_generation"
+                                  ? "warning"
+                                  : session.sessionType === "result-endpoint"
                                   ? "warning"
                                   : "default"
                               }
@@ -4851,6 +4858,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={13}>
           <McpServersTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={14}>
+          <ResultEndpointsTab />
         </TabPanel>
       </Paper>
 
@@ -6186,6 +6197,7 @@ const AgentModeSettings = () => {
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [contentModel, setContentModel] = useState('');
   const [reportsModel, setReportsModel] = useState('');
+  const [reportsModelOptions, setReportsModelOptions] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
@@ -6596,6 +6608,18 @@ const AgentModeSettings = () => {
   const loadReportsModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
+      // Load reports-specific model options from dedicated endpoint
+      try {
+        const optionsResponse = await axios.get(buildApiUrl('/api/agent-mode/public/reports-model-options'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (Array.isArray(optionsResponse.data) && optionsResponse.data.length > 0) {
+          setReportsModelOptions(optionsResponse.data);
+        }
+      } catch (optionsError) {
+        console.error('Error loading reports model options:', optionsError);
+      }
+
       try {
         // Try to get reports model from settings
         const response = await axios.get(buildApiUrl('/api/settings/agent_mode_reports_model'), {
@@ -7196,7 +7220,7 @@ const AgentModeSettings = () => {
               onChange={(e) => setReportsModel(e.target.value)}
               label="Reports Model"
             >
-              {supportedModels.map((model) => (
+              {(reportsModelOptions.length > 0 ? reportsModelOptions : supportedModels).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
                 </MenuItem>
@@ -7205,7 +7229,7 @@ const AgentModeSettings = () => {
           </FormControl>
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            Select the default LLM model for the Reports page in Agent Mode. This model will be used when creating new reports and as the default when revising existing reports. This uses the same models available for Agent Mode sessions.
+            Select the default LLM model for the Reports page in Agent Mode. This model will be used when creating new reports and as the default when revising existing reports. Only models suitable for report generation are shown.
           </Typography>
         </CardContent>
       </Card>

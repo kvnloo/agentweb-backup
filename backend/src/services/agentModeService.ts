@@ -6,6 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent } from './clickupService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -455,6 +456,10 @@ export class AgentModeService {
 
   async getSupportedModels() {
     return Object.keys(this.llmModels);
+  }
+
+  async getReportsModelOptions(): Promise<string[]> {
+    return Object.keys(this.llmModels).filter(m => m.startsWith('anthropic.'));
   }
   /**
    * Make an LLM call with the specified model and parameters
@@ -1080,7 +1085,7 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific) and public knowledge (shared by all users and the platform). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, and ClickUp docs. This is complementary to web search - use knowledge base for stored information and web search for information from the internet
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
@@ -4110,6 +4115,757 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  // Update a GTM plan (title, description, dri, dueDate)
+  public async updateGTMPlan(planId: string, updates: { title?: string; description?: string; dri?: string; dueDate?: string }, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: { [key: string]: string } = {};
+      const expressionAttributeValues: { [key: string]: any } = {};
+
+      if (updates.title !== undefined) {
+        updateExpressions.push("#title = :title");
+        expressionAttributeNames["#title"] = "title";
+        expressionAttributeValues[":title"] = updates.title;
+      }
+
+      if (updates.description !== undefined) {
+        updateExpressions.push("#description = :description");
+        expressionAttributeNames["#description"] = "description";
+        expressionAttributeValues[":description"] = updates.description;
+      }
+
+      if (updates.dri !== undefined) {
+        updateExpressions.push("#dri = :dri");
+        expressionAttributeNames["#dri"] = "dri";
+        expressionAttributeValues[":dri"] = updates.dri || null;
+      }
+
+      if (updates.dueDate !== undefined) {
+        updateExpressions.push("#dueDate = :dueDate");
+        expressionAttributeNames["#dueDate"] = "dueDate";
+        expressionAttributeValues[":dueDate"] = updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null;
+      }
+
+      if (updateExpressions.length === 0) {
+        return { success: false, message: 'No fields to update', error: 'No fields to update' };
+      }
+
+      updateExpressions.push("#updatedAt = :updatedAt");
+      expressionAttributeNames["#updatedAt"] = "updatedAt";
+      expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: 'GTM plan updated successfully',
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating GTM plan:', error);
+      return { success: false, message: 'Failed to update GTM plan', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Add a phase to a GTM plan
+  public async addGTMPhase(planId: string, phaseData: { title: string; description?: string; dri?: string; dueDate?: string; workItems?: any[] }, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+
+      const phaseId = `phase-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+
+      // Process work items if provided
+      const processedWorkItems = (phaseData.workItems || []).map((item: any, itemIndex: number) => ({
+        id: `item-${Date.now()}-${itemIndex}-${Math.random().toString(36).substring(2, 11)}`,
+        title: item.title,
+        description: item.description || null,
+        dri: item.dri || null,
+        status: "pending",
+        notes: null,
+        dueDate: item.due_date && item.due_date.trim() !== "" ? item.due_date.trim() : null,
+      }));
+
+      const newPhase = {
+        id: phaseId,
+        title: phaseData.title,
+        description: phaseData.description || null,
+        dri: phaseData.dri || null,
+        status: "in_progress" as const,
+        workItems: processedWorkItems,
+        dueDate: phaseData.dueDate && phaseData.dueDate.trim() !== "" ? phaseData.dueDate.trim() : null,
+      };
+
+      phases.push(newPhase);
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (plan.status === "completed" && planStatus !== "completed") {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `Phase "${phaseData.title}" added successfully with ${processedWorkItems.length} work item(s)`,
+        plan: updateResult.Attributes,
+        phaseId,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding GTM phase:', error);
+      return { success: false, message: 'Failed to add phase', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Add work items to a phase
+  public async addGTMWorkItems(planId: string, phaseId: string, workItems: any[], userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      const phase = phases[phaseIndex];
+      const existingWorkItems = phase.workItems || [];
+
+      const newWorkItems = workItems.map((item: any, itemIndex: number) => ({
+        id: `item-${Date.now()}-${itemIndex}-${Math.random().toString(36).substring(2, 11)}`,
+        title: item.title,
+        description: item.description || null,
+        dri: item.dri || null,
+        status: "pending",
+        notes: null,
+        dueDate: item.due_date && item.due_date.trim() !== "" ? item.due_date.trim() : null,
+      }));
+
+      existingWorkItems.push(...newWorkItems);
+
+      // Recalculate phase status
+      const hasWorkItems = existingWorkItems.length > 0;
+      const allItemsDone = hasWorkItems && existingWorkItems.every(
+        (item: any) => item.status === "completed" || item.status === "skipped"
+      );
+
+      phases[phaseIndex] = {
+        ...phase,
+        workItems: existingWorkItems,
+        status: allItemsDone ? "completed" : "in_progress",
+      };
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (plan.status === "completed" && planStatus !== "completed") {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `${newWorkItems.length} work item(s) added to phase "${phase.title}"`,
+        plan: updateResult.Attributes,
+        addedItems: newWorkItems.map((item: any) => ({ id: item.id, title: item.title })),
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding GTM work items:', error);
+      return { success: false, message: 'Failed to add work items', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Update a work item in a GTM plan
+  public async updateGTMWorkItem(
+    planId: string,
+    phaseId: string,
+    workItemId: string,
+    updates: { status?: string; notes?: string; dri?: string; title?: string; description?: string; dueDate?: string },
+    notifications: { notifyUser?: boolean; notifyItemPoc?: boolean; notifyPhasePoc?: boolean; notifyPlanPoc?: boolean; message?: string },
+    userId: string
+  ): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      const phase = phases[phaseIndex];
+      const workItems = phase.workItems || [];
+      const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+
+      if (workItemIndex === -1) {
+        return { success: false, message: 'Work item not found', error: 'Work item not found' };
+      }
+
+      const originalItem = workItems[workItemIndex];
+      const changes: any = {};
+
+      // Build updated work item
+      const updatedWorkItem = {
+        ...originalItem,
+        ...(updates.status !== undefined && { status: updates.status }),
+        ...(updates.notes !== undefined && { notes: updates.notes || null }),
+        ...(updates.dri !== undefined && { dri: updates.dri || null }),
+        ...(updates.title !== undefined && { title: updates.title }),
+        ...(updates.description !== undefined && { description: updates.description || null }),
+        ...(updates.dueDate !== undefined && { dueDate: updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null }),
+        ...(updates.status === "completed" && originalItem.status !== "completed" && { completedAt: new Date().toISOString() }),
+        ...(updates.status !== undefined && updates.status !== "completed" && originalItem.status === "completed" && { completedAt: null }),
+      };
+
+      // Track changes for notifications
+      if (updates.status !== undefined && updates.status !== originalItem.status) {
+        changes.status = updates.status;
+      }
+      if (updates.notes !== undefined && updates.notes !== originalItem.notes) {
+        changes.notes = updates.notes || null;
+      }
+      if (updates.dri !== undefined && updates.dri !== originalItem.dri) {
+        changes.dri = updates.dri || null;
+      }
+      if (updates.dueDate !== undefined) {
+        const newDueDate = updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null;
+        const oldDueDate = originalItem.dueDate || null;
+        if (newDueDate !== oldDueDate) {
+          changes.dueDate = newDueDate;
+        }
+      }
+
+      workItems[workItemIndex] = updatedWorkItem;
+
+      // Recalculate phase status
+      const hasWorkItems = workItems.length > 0;
+      const allItemsDone = hasWorkItems && workItems.every(
+        (item: any) => item.status === "completed" || item.status === "skipped"
+      );
+      phases[phaseIndex] = { ...phase, workItems, status: allItemsDone ? "completed" : "in_progress" };
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const wasCompleted = plan.status === "completed";
+      const isNowCompleted = planStatus === "completed";
+      const justCompleted = !wasCompleted && isNowCompleted;
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (justCompleted) {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = new Date().toISOString();
+      } else if (wasCompleted && !isNowCompleted) {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      // Handle notifications if requested
+      if (notifications && (notifications.notifyUser || notifications.notifyItemPoc || notifications.notifyPhasePoc || notifications.notifyPlanPoc)) {
+        try {
+          const { sendGTMPlanUpdateNotifications } = await import('./gtmPlanNotificationService');
+          const updatedPlan = updateResult.Attributes as any;
+          if (updatedPlan) {
+            await sendGTMPlanUpdateNotifications(updatedPlan, phaseId, workItemId, changes, notifications);
+          }
+        } catch (notificationError: any) {
+          console.error("Error sending GTM work item notifications:", notificationError);
+        }
+      }
+
+      return {
+        success: true,
+        message: 'Work item updated successfully',
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating GTM work item:', error);
+      return { success: false, message: 'Failed to update work item', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Update a phase in a GTM plan
+  public async updateGTMPhase(planId: string, phaseId: string, updates: { title?: string; description?: string; dri?: string; dueDate?: string }, userId: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      const phase = phases[phaseIndex];
+
+      if (updates.title !== undefined) phase.title = updates.title;
+      if (updates.description !== undefined) phase.description = updates.description || null;
+      if (updates.dri !== undefined) phase.dri = updates.dri || null;
+      if (updates.dueDate !== undefined) phase.dueDate = updates.dueDate && updates.dueDate.trim() !== "" ? updates.dueDate.trim() : null;
+
+      phases[phaseIndex] = phase;
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#phases": "phases", "#updatedAt": "updatedAt" },
+        ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `Phase "${phase.title}" updated successfully`,
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating GTM phase:', error);
+      return { success: false, message: 'Failed to update phase', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Delete a GTM plan, phase, or work item
+  public async deleteGTMItems(planId: string, phaseId?: string, workItemId?: string, userId?: string): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+
+      // Delete entire plan
+      if (!phaseId) {
+        await dynamodb.delete({ TableName: TABLE_NAME, Key: { planId } }).promise();
+        return { success: true, message: `GTM plan "${plan.title}" deleted successfully` };
+      }
+
+      const phases = plan.phases || [];
+      const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+
+      if (phaseIndex === -1) {
+        return { success: false, message: 'Phase not found', error: 'Phase not found' };
+      }
+
+      // Delete work item from phase
+      if (workItemId) {
+        const phase = phases[phaseIndex];
+        const workItems = phase.workItems || [];
+        const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+
+        if (workItemIndex === -1) {
+          return { success: false, message: 'Work item not found', error: 'Work item not found' };
+        }
+
+        const deletedItem = workItems[workItemIndex];
+        workItems.splice(workItemIndex, 1);
+        phases[phaseIndex] = { ...phase, workItems };
+
+        await dynamodb.update({
+          TableName: TABLE_NAME,
+          Key: { planId },
+          UpdateExpression: "SET phases = :phases, updatedAt = :updatedAt",
+          ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+        }).promise();
+
+        return { success: true, message: `Work item "${deletedItem.title}" deleted successfully` };
+      }
+
+      // Delete phase
+      const deletedPhase = phases[phaseIndex];
+      phases.splice(phaseIndex, 1);
+
+      await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: "SET phases = :phases, updatedAt = :updatedAt",
+        ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+      }).promise();
+
+      return { success: true, message: `Phase "${deletedPhase.title}" deleted successfully` };
+    } catch (error) {
+      console.error('AgentMode: Error deleting GTM items:', error);
+      return { success: false, message: 'Failed to delete GTM items', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Get GTM common items catalog
+  public async getGTMCommonItems(): Promise<any> {
+    try {
+      const setting = await settingsService.getSetting("gtm_common_items");
+      const categories = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+      return { success: true, message: `Found ${categories.length} category(ies)`, categories };
+    } catch (error) {
+      console.error('AgentMode: Error fetching GTM common items:', error);
+      return { success: false, message: 'Failed to fetch GTM common items', error: error instanceof Error ? error.message : 'Unknown error', categories: [] };
+    }
+  }
+
+  // Add common items to a GTM plan phase
+  public async addGTMCommonItems(planId: string, items: { title: string; description?: string }[], targetPhaseId?: string, newPhaseName?: string, userId?: string): Promise<any> {
+    try {
+      if (!items || items.length === 0) {
+        return { success: false, message: 'Items array must be non-empty', error: 'Items array must be non-empty' };
+      }
+
+      if (!targetPhaseId && !newPhaseName) {
+        return { success: false, message: 'Either target_phase_id or new_phase_name is required', error: 'Either target_phase_id or new_phase_name is required' };
+      }
+
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+      const phases = plan.phases || [];
+
+      const newWorkItems = items.map((item: { title: string; description?: string }) => ({
+        id: `item-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`,
+        title: item.title.trim(),
+        description: item.description?.trim() || null,
+        dri: null,
+        status: "pending",
+        notes: null,
+        dueDate: null,
+      }));
+
+      if (targetPhaseId) {
+        const phaseIndex = phases.findIndex((p: any) => p.id === targetPhaseId);
+        if (phaseIndex === -1) {
+          return { success: false, message: 'Target phase not found', error: 'Target phase not found' };
+        }
+
+        const targetPhase = phases[phaseIndex];
+        const workItems = targetPhase.workItems || [];
+        workItems.push(...newWorkItems);
+
+        const hasWorkItems = workItems.length > 0;
+        const allItemsDone = hasWorkItems && workItems.every(
+          (item: any) => item.status === "completed" || item.status === "skipped"
+        );
+
+        phases[phaseIndex] = { ...targetPhase, workItems, status: allItemsDone ? "completed" : "in_progress" };
+      } else if (newPhaseName) {
+        const phaseId = `phase-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+        phases.push({
+          id: phaseId,
+          title: newPhaseName.trim(),
+          description: null,
+          dri: null,
+          status: "in_progress",
+          workItems: newWorkItems,
+          dueDate: null,
+        });
+      }
+
+      // Recalculate plan status
+      const hasPhases = phases.length > 0;
+      const allPhasesCompleted = hasPhases && phases.every((p: any) => p.status === "completed");
+      const planStatus = allPhasesCompleted ? "completed" : "in_progress";
+
+      const updateExpressions: string[] = ["#phases = :phases", "#status = :status", "#updatedAt = :updatedAt"];
+      const expressionAttributeNames: { [key: string]: string } = { "#phases": "phases", "#status": "status", "#updatedAt": "updatedAt" };
+      const expressionAttributeValues: { [key: string]: any } = { ":phases": phases, ":status": planStatus, ":updatedAt": new Date().toISOString() };
+
+      if (plan.status === "completed" && planStatus !== "completed") {
+        updateExpressions.push("#completedAt = :completedAt");
+        expressionAttributeNames["#completedAt"] = "completedAt";
+        expressionAttributeValues[":completedAt"] = null;
+      }
+
+      const updateResult = await dynamodb.update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      }).promise();
+
+      return {
+        success: true,
+        message: `${items.length} common item(s) added successfully`,
+        plan: updateResult.Attributes,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error adding GTM common items:', error);
+      return { success: false, message: 'Failed to add common items', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  // Send GTM status report
+  public async sendGTMStatusReport(
+    planId: string,
+    phaseId: string | undefined,
+    notifications: { notifyUser?: boolean; notifyPlanPoc?: boolean; notifyPhasePoc?: boolean; notifyPhasePocs?: boolean; message?: string },
+    userId: string
+  ): Promise<any> {
+    try {
+      const { DynamoDB } = await import('aws-sdk');
+      const dynamodb = new DynamoDB.DocumentClient({
+        region: process.env.AWS_REGION || "us-west-2",
+        ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+          credentials: {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          },
+        }),
+      });
+
+      const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+      const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+      const result = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+
+      if (!result.Item) {
+        return { success: false, message: 'GTM plan not found', error: 'GTM plan not found' };
+      }
+
+      if (result.Item.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'Access denied' };
+      }
+
+      const plan = result.Item;
+
+      if (phaseId) {
+        // Phase-level report
+        const phase = plan.phases?.find((p: any) => p.id === phaseId);
+        if (!phase) {
+          return { success: false, message: 'Phase not found', error: 'Phase not found' };
+        }
+
+        const { sendPhaseStatusReport } = await import('./gtmPlanNotificationService');
+        await sendPhaseStatusReport(plan as any, phaseId, notifications, process.env.CUSTOMER_FRONTEND_URL);
+
+        return { success: true, message: `Phase status report for "${phase.title}" sent successfully` };
+      } else {
+        // Plan-level report
+        const { sendPlanStatusReport } = await import('./gtmPlanNotificationService');
+        await sendPlanStatusReport(plan as any, notifications, process.env.CUSTOMER_FRONTEND_URL);
+
+        return { success: true, message: `Plan status report for "${plan.title}" sent successfully` };
+      }
+    } catch (error) {
+      console.error('AgentMode: Error sending GTM status report:', error);
+      return { success: false, message: 'Failed to send status report', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   public async getLeadLists(userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -4137,10 +4893,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  public async createLeadList(name: string, description: string, userId: string): Promise<any> {
+  public async createLeadList(name: string, description: string, userId: string, listType?: 'sales' | 'customers'): Promise<any> {
     try {
       const { crmDb } = await import('./db');
-      const list = await crmDb.createLeadList(userId, name, description);
+      const list = await crmDb.createLeadList(userId, name, description, undefined, undefined, undefined, undefined, undefined, undefined, listType);
 
       return {
         success: true,
@@ -4187,7 +4943,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
       // Convert leads array to the format expected by batchCreateLeads
       // Extract standard fields and put everything else in customFields
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       const formattedLeads = leads.map((lead: any) => {
         const formatted: any = {};
         const customFields: Record<string, any> = {};
@@ -4251,6 +5007,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     search?: string;
     icpOnly?: boolean;
     engagedOnly?: boolean;
+    status?: string;
     limit?: number;
   } = {}): Promise<any> {
     try {
@@ -4298,6 +5055,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
           // Apply both filters when using ICP index but also need engaged
           if (options.icpOnly && options.engagedOnly && useIcpIndex && !lead.isEngaged) continue;
           if (options.icpOnly && options.engagedOnly && useEngagedIndex && !lead.icpMatch?.isMatch) continue;
+          // Apply status filter
+          if (options.status && (lead.status || null) !== options.status) continue;
 
           // Apply text search
           if (searchQuery) {
@@ -4332,6 +5091,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
           lastName: lead.lastName || '',
           company: lead.company || '',
           title: lead.title || '',
+          status: lead.status || null,
+          dealValue: lead.dealValue ?? null,
+          dealCurrency: lead.dealCurrency || 'USD',
           icpMatch: lead.icpMatch?.isMatch || false,
           icpScore: lead.icpMatch?.score || null,
           engagementCount: lead.engagementCount || 0,
@@ -4364,7 +5126,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
-      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       const matchingLeads: any[] = [];
       let cursor: any = undefined;
 
@@ -4557,7 +5319,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
       }
 
       // Separate standard fields from custom fields
-      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin'];
+      const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
       const dbUpdates: any = {};
       const customFieldUpdates: Record<string, any> = {};
 
@@ -4575,6 +5337,20 @@ When a user requests client onboarding or says "onboard new client" or similar:
           ...(lead.customFields || {}),
           ...customFieldUpdates
         };
+      }
+
+      // Auto-create status change engagement if status changed
+      if (dbUpdates.status !== undefined && (lead.status || null) !== dbUpdates.status) {
+        await crmDb.addLeadEngagement(listId, leadId, {
+          eventType: 'status.changed',
+          eventData: {
+            from: lead.status || null,
+            to: dbUpdates.status,
+            dealValue: dbUpdates.dealValue ?? lead.dealValue ?? null,
+            dealCurrency: dbUpdates.dealCurrency ?? lead.dealCurrency ?? 'USD',
+          },
+          createdAt: new Date().toISOString(),
+        });
       }
 
       await crmDb.updateLead(listId, leadId, dbUpdates);
@@ -4646,6 +5422,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
     engagedOnly?: boolean;
     autoDraftEnabled?: boolean;
     autoDraftInstruction?: string;
+    statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
+    listType?: 'sales' | 'customers';
   }, userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -4672,6 +5450,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
       if (updates.engagedOnly !== undefined) filteredUpdates.engagedOnly = updates.engagedOnly;
       if (updates.autoDraftEnabled !== undefined) filteredUpdates.autoDraftEnabled = updates.autoDraftEnabled;
       if (updates.autoDraftInstruction !== undefined) filteredUpdates.autoDraftInstruction = updates.autoDraftInstruction;
+      if (updates.statusConfig !== undefined) filteredUpdates.statusConfig = updates.statusConfig;
+      if (updates.listType !== undefined) {
+        if (list.listType) {
+          return { success: false, message: 'List type already set', error: 'listType is already set and cannot be changed' };
+        }
+        filteredUpdates.listType = updates.listType;
+      }
 
       if (Object.keys(filteredUpdates).length === 0) {
         return { success: false, message: 'No updates provided', error: 'Provide at least one field to update' };
@@ -4687,6 +5472,150 @@ When a user requests client onboarding or says "onboard new client" or similar:
     } catch (error) {
       console.error('AgentMode: Error updating lead list:', error);
       return { success: false, message: 'Failed to update lead list', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async updateLeadStatus(
+    listId: string,
+    leadId: string,
+    status: string,
+    userId: string,
+    dealValue?: number | null,
+    dealCurrency?: string,
+    notes?: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+      }
+
+      // Fetch current lead
+      const existingLead = await crmDb.getLeadById(listId, leadId);
+      if (!existingLead) {
+        return { success: false, message: 'Lead not found', error: 'The specified lead does not exist' };
+      }
+
+      const previousStatus = existingLead.status || null;
+      const updates: any = { status };
+      if (dealValue !== undefined) updates.dealValue = dealValue;
+      if (dealCurrency !== undefined) updates.dealCurrency = dealCurrency;
+
+      await crmDb.updateLead(listId, leadId, updates);
+
+      // Auto-create status change engagement
+      if (previousStatus !== status) {
+        await crmDb.addLeadEngagement(listId, leadId, {
+          eventType: 'status.changed',
+          eventData: {
+            from: previousStatus,
+            to: status,
+            dealValue: dealValue ?? existingLead.dealValue ?? null,
+            dealCurrency: dealCurrency ?? existingLead.dealCurrency ?? 'USD',
+            ...(notes ? { notes } : {}),
+          },
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      const leadName = [existingLead.firstName, existingLead.lastName].filter(Boolean).join(' ') || existingLead.email || leadId;
+      return {
+        success: true,
+        message: `Status for "${leadName}" updated from "${previousStatus || 'unset'}" to "${status}"`,
+        previousStatus,
+        newStatus: status,
+        leadName,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error updating lead status:', error);
+      return { success: false, message: 'Failed to update lead status', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async getLeadListStatuses(listId: string, userId: string): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to view this list' };
+      }
+
+      const defaultStatuses = [
+        { value: 'new', label: 'New', color: 'gray', type: 'active' },
+        { value: 'contacted', label: 'Contacted', color: 'blue', type: 'active' },
+        { value: 'qualified', label: 'Qualified', color: 'indigo', type: 'active' },
+        { value: 'proposal_sent', label: 'Proposal Sent', color: 'purple', type: 'active' },
+        { value: 'negotiating', label: 'Negotiating', color: 'yellow', type: 'active' },
+        { value: 'won', label: 'Won', color: 'green', type: 'won' },
+        { value: 'lost', label: 'Lost', color: 'red', type: 'lost' },
+        { value: 'churned', label: 'Churned', color: 'orange', type: 'churned' },
+      ];
+
+      return {
+        success: true,
+        statuses: list.statusConfig || defaultStatuses,
+        listName: list.name,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error getting lead list statuses:', error);
+      return { success: false, message: 'Failed to get lead list statuses', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async configureLeadStatuses(
+    listId: string,
+    statusConfig: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
+    userId: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+      }
+
+      // Validate statusConfig entries
+      for (const entry of statusConfig) {
+        if (!entry.value || !entry.label || !entry.color || !entry.type) {
+          return { success: false, message: 'Invalid status config', error: 'Each status entry must have value, label, color, and type' };
+        }
+        if (!['active', 'won', 'lost', 'churned'].includes(entry.type)) {
+          return { success: false, message: 'Invalid status type', error: `Status type must be one of: active, won, lost, churned. Got: "${entry.type}"` };
+        }
+      }
+
+      // Check for duplicate values
+      const values = statusConfig.map(s => s.value);
+      const uniqueValues = new Set(values);
+      if (values.length !== uniqueValues.size) {
+        return { success: false, message: 'Duplicate status values', error: 'Each status value must be unique' };
+      }
+
+      await crmDb.updateLeadList(listId, { statusConfig });
+
+      return {
+        success: true,
+        message: `Status configuration updated for list "${list.name}" with ${statusConfig.length} statuses`,
+        statuses: statusConfig,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error configuring lead statuses:', error);
+      return { success: false, message: 'Failed to configure lead statuses', error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
 
@@ -4905,6 +5834,159 @@ When a user requests client onboarding or says "onboard new client" or similar:
     } catch (error) {
       console.error('AgentMode: Error sending email to lead:', error);
       return { success: false, message: 'Failed to send email', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async sendForReview(
+    subject: string,
+    sessionId: string,
+    userId: string,
+    contentUrl?: string,
+    contentHtml?: string
+  ): Promise<{ success: boolean; message: string; to?: string }> {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (!session?.resultEndpointMetadata) {
+        return { success: false, message: 'No result endpoint metadata found on session' };
+      }
+
+      const metadata = session.resultEndpointMetadata;
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const reviewerEmail = metadata.reviewerEmail || (metadata as any).testEmail;
+
+      // Store content references and subject on session metadata for the review page
+      const updatedMetadata = {
+        ...metadata,
+        contentUrl: contentUrl || metadata.contentUrl,
+        contentHtml: contentHtml || metadata.contentHtml,
+        contentSubject: subject,
+      };
+      await chatbotDb.updateSessionResultEndpointMetadata(sessionId, updatedMetadata);
+
+      const reviewUrl = `${customerFrontendUrl}/review/${sessionId}`;
+
+      // --- skipReview mode: auto-send to lead, CC reviewer ---
+      if (metadata.skipReview && metadata.leadEmail) {
+        const { resendService: resendSvc } = await import('./resendService');
+        const { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } = await import('../config');
+
+        // Collect assets from session messages to send the latest one
+        const messages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+        let latestAssetUrl: string | undefined;
+        for (const msg of messages) {
+          if (msg.role === 'tool' && msg.content && msg.name) {
+            let result: any;
+            try { result = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch { continue; }
+            if (!result || result.success === false) continue;
+            if (result.s3_url) latestAssetUrl = result.s3_url;
+            if (result.imageUrl) latestAssetUrl = result.imageUrl;
+            if (result.videoUrl) latestAssetUrl = result.videoUrl;
+          }
+        }
+
+        const assetUrl = contentUrl || latestAssetUrl;
+        const resultLabel = metadata.resultTitle || metadata.resultName || 'your report';
+        const replyToAddr = reviewerEmail || RESEND_SYSTEM_EMAIL;
+
+        // Build asset block
+        let assetBlock = '';
+        if (assetUrl) {
+          if (assetUrl.match(/\.(png|jpg|jpeg|gif|webp)$/i) || assetUrl.includes('image')) {
+            assetBlock = `<p style="text-align: center;"><img src="${assetUrl}" alt="${resultLabel}" style="max-width: 100%; border-radius: 8px;" /></p>`;
+          } else if (assetUrl.match(/\.(mp4|webm|mov)$/i) || assetUrl.includes('video')) {
+            assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">Watch Video</a></div>`;
+          } else {
+            assetBlock = `<div style="text-align: center; margin: 20px 0;"><a href="${assetUrl}" style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">View Your Result</a></div>`;
+          }
+        }
+
+        // Formal email to lead, CC reviewer
+        const leadEmailHtml = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="text-align: center; margin-bottom: 30px;">
+              <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+              <p style="color: #666; margin: 5px 0;">${resultLabel}</p>
+            </div>
+            <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+              <h2 style="color: #1B2549; margin-top: 0;">Your ${resultLabel} is Ready!</h2>
+              <p style="color: #333; line-height: 1.6;">We're excited to send you the requested ${resultLabel}. Our team has prepared this content specifically for you.</p>
+              ${assetBlock}
+              <p style="color: #333; line-height: 1.6; margin-top: 20px;">
+                If you have any questions or would like to request changes, simply reply to this email or reach out to us at
+                <a href="mailto:${replyToAddr}" style="color: #643B7E; text-decoration: none;">${replyToAddr}</a>
+                and we'll be happy to assist.
+              </p>
+            </div>
+            <div style="text-align: center; color: #666; font-size: 12px;">
+              <p>Powered by <a href="https://agentweb.pro" style="color: #643B7E; text-decoration: none;">AgentWeb</a></p>
+            </div>
+          </div>`;
+
+        const leadSubject = metadata.contentSubject || `Your ${resultLabel} is ready`;
+        await resendSvc.sendEmail({
+          from: `${RESEND_SYSTEM_NAME} <${RESEND_SYSTEM_EMAIL}>`,
+          to: metadata.leadEmail,
+          subject: leadSubject,
+          html: leadEmailHtml,
+          cc: reviewerEmail,
+          replyTo: replyToAddr,
+        });
+
+        // Record in send history
+        const sendHistoryEntry = {
+          assetUrl: assetUrl || '__auto_sent__',
+          recipientEmail: metadata.leadEmail,
+          customMessage: 'Auto-sent (no review required)',
+          sentAt: new Date().toISOString(),
+        };
+        await chatbotDb.updateSessionResultEndpointMetadata(sessionId, {
+          ...updatedMetadata,
+          sendHistory: [...(updatedMetadata.sendHistory || []), sendHistoryEntry],
+        });
+
+        return { success: true, message: `Result sent to ${metadata.leadEmail} (reviewer ${reviewerEmail} CC'd)`, to: metadata.leadEmail };
+      }
+
+      // --- Standard review mode: send review email to reviewer ---
+      const { emailService: emailSvc } = await import('./emailService');
+      let contentSection = '';
+      if (contentUrl) {
+        contentSection = `<p><a href="${contentUrl}" style="color: #1976d2;">View Generated Content</a></p>`;
+      }
+      if (contentHtml) {
+        contentSection += `<div style="margin: 16px 0; padding: 16px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa;">${contentHtml}</div>`;
+      }
+
+      const argsEntries = Object.entries(metadata.args || {});
+      const paramsSummary = argsEntries.length > 0
+        ? `<table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
+            <tr style="background: #f5f5f5;"><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Parameter</th><th style="text-align: left; padding: 8px; border: 1px solid #e0e0e0;">Value</th></tr>
+            ${argsEntries.map(([k, v]) => `<tr><td style="padding: 8px; border: 1px solid #e0e0e0;">${k}</td><td style="padding: 8px; border: 1px solid #e0e0e0;">${v}</td></tr>`).join('')}
+          </table>`
+        : '';
+
+      const reviewHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 700px; margin: 0 auto;">
+          <div style="background: #1976d2; color: white; padding: 12px 20px; border-radius: 8px 8px 0 0; font-weight: bold;">
+            Review: ${subject}
+          </div>
+          <div style="padding: 20px; border: 1px solid #e0e0e0; border-top: none;">
+            <p style="color: #666;">A new result has been generated for "<strong>${metadata.resultTitle || metadata.resultName}</strong>". Please review the content below.</p>
+            ${contentSection}
+            ${paramsSummary ? `<h3 style="margin-top: 20px; color: #333;">Parameters</h3>${paramsSummary}` : ''}
+            ${metadata.leadEmail ? `<p><strong>Lead email:</strong> ${metadata.leadEmail}</p>` : ''}
+            <div style="margin-top: 24px; text-align: center;">
+              <a href="${reviewUrl}" style="display: inline-block; background: #1976d2; color: white; padding: 12px 32px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 16px;">Review & Send Result</a>
+            </div>
+          </div>
+        </div>`;
+
+      await emailSvc.sendEmail(reviewerEmail, `Review: ${subject}`, `Review result for ${metadata.resultTitle || metadata.resultName}`, reviewHtml);
+      return { success: true, message: `Review email sent to ${reviewerEmail}`, to: reviewerEmail };
+
+    } catch (error) {
+      console.error('AgentMode: Error sending for review:', error);
+      return { success: false, message: 'Failed to send for review', error: error instanceof Error ? error.message : 'Unknown error' } as any;
     }
   }
 
@@ -8529,6 +9611,46 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Search ClickUp docs (name match + content match)
+      if (userId) {
+        try {
+          const clickUpToken = await getClickUpAccessToken(userId);
+          if (clickUpToken) {
+            const workspaces = await getClickUpWorkspaces(clickUpToken);
+            const queryLower = query.toLowerCase();
+            for (const workspace of workspaces) {
+              try {
+                const docs = await listClickUpDocs(clickUpToken, workspace.id);
+                let clickUpResultCount = 0;
+                for (const doc of docs) {
+                  if (clickUpResultCount >= limitedMaxResults) break;
+                  try {
+                    const nameMatch = doc.name.toLowerCase().includes(queryLower);
+                    const content = await readClickUpDocContent(clickUpToken, workspace.id, doc.id);
+                    if (!content) continue;
+                    const contentMatch = content.toLowerCase().includes(queryLower);
+                    if (nameMatch || contentMatch) {
+                      results.push({
+                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                        source: `clickup/${workspace.name}/${doc.name}`
+                      });
+                      clickUpResultCount++;
+                    }
+                  } catch (readErr) {
+                    console.log(`AgentMode: Could not read ClickUp doc ${doc.name} for search:`, readErr);
+                  }
+                }
+              } catch (wsErr) {
+                console.log(`AgentMode: Error searching ClickUp docs in workspace ${workspace.name}:`, wsErr);
+              }
+            }
+          }
+        } catch (clickUpError) {
+          console.log('AgentMode: Error searching ClickUp docs:', clickUpError);
+          // Don't fail the whole search if ClickUp search fails
+        }
+      }
+
       if (results.length === 0) {
         return {
           success: true,
@@ -8585,17 +9707,7 @@ Format the response as JSON with this structure:
         }
       }
 
-      if (!allKnowledgeBaseTasks || allKnowledgeBaseTasks.length === 0) {
-        return {
-          success: true,
-          message: 'No knowledge bases found',
-          knowledge_bases: [],
-          totalKnowledgeBases: 0,
-          totalFiles: 0
-        };
-      }
-
-      const knowledgeBases = allKnowledgeBaseTasks.map((task: any) => {
+      const knowledgeBases = (allKnowledgeBaseTasks || []).map((task: any) => {
         const taskId = task.taskId;
         const taskName = task.name;
         const kbType = task.knowledgeBaseType || 'private';
@@ -8661,14 +9773,56 @@ Format the response as JSON with this structure:
         console.error('AgentMode: Error listing Google Drive shared folders:', driveError);
       }
 
+      // Include ClickUp docs
+      try {
+        const clickUpToken = await getClickUpAccessToken(userId);
+        if (clickUpToken) {
+          const workspaces = await getClickUpWorkspaces(clickUpToken);
+          for (const workspace of workspaces) {
+            try {
+              const docs = await listClickUpDocs(clickUpToken, workspace.id);
+              const clickUpFiles = docs.map(doc => ({
+                fileName: doc.name,
+                fileSize: 0,
+                docId: doc.id,
+                dateCreated: doc.dateCreated,
+                dateUpdated: doc.dateUpdated,
+              }));
+
+              knowledgeBases.push({
+                identifier: `clickup:${workspace.id}`,
+                name: `ClickUp - ${workspace.name}`,
+                type: 'clickup',
+                updatedAt: clickUpFiles.length > 0 ? clickUpFiles[0].dateUpdated : undefined,
+                files: clickUpFiles,
+              });
+            } catch (wsErr) {
+              console.log(`AgentMode: Error listing ClickUp docs in workspace ${workspace.name}:`, wsErr);
+            }
+          }
+        }
+      } catch (clickUpError) {
+        console.error('AgentMode: Error listing ClickUp docs:', clickUpError);
+      }
+
       const totalFiles = knowledgeBases.reduce(
         (sum: number, kb: any) => sum + (kb.files?.length || 0),
         0
       );
 
+      if (knowledgeBases.length === 0) {
+        return {
+          success: true,
+          message: 'No knowledge bases found',
+          knowledge_bases: [],
+          totalKnowledgeBases: 0,
+          totalFiles: 0
+        };
+      }
+
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles
@@ -8803,6 +9957,11 @@ Format the response as JSON with this structure:
     // Handle Google Drive shared folder files (identifier starts with "gdrive:")
     if (kbIdentifier.startsWith('gdrive:')) {
       return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
+    }
+
+    // Handle ClickUp docs (identifier starts with "clickup:")
+    if (kbIdentifier.startsWith('clickup:')) {
+      return await this.readClickUpSharedDoc(kbIdentifier, fileName, userId);
     }
 
     // Get the task
@@ -8947,6 +10106,58 @@ Format the response as JSON with this structure:
       return {
         success: false,
         message: `Failed to read Google Drive file "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Helper: read a document from a ClickUp workspace
+  private async readClickUpSharedDoc(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    const workspaceId = kbIdentifier.replace('clickup:', '');
+
+    try {
+      const clickUpToken = await getClickUpAccessToken(userId);
+      if (!clickUpToken) {
+        return { success: false, message: 'ClickUp not connected' };
+      }
+
+      // Verify user has access to this workspace
+      const workspaces = await getClickUpWorkspaces(clickUpToken);
+      const workspace = workspaces.find(w => w.id === workspaceId);
+      if (!workspace) {
+        return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      }
+
+      // Find the doc by name in the workspace
+      const docs = await listClickUpDocs(clickUpToken, workspaceId);
+      const doc = docs.find(d => d.name === fileName);
+      if (!doc) {
+        return { success: false, message: `Document "${fileName}" not found in ClickUp workspace "${workspace.name}"` };
+      }
+
+      // Read doc content (all pages concatenated)
+      const content = await readClickUpDocContent(clickUpToken, workspaceId, doc.id);
+
+      const maxContentLength = 50000;
+      const truncated = content.length > maxContentLength
+        ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : content;
+
+      return {
+        success: true,
+        message: `Successfully read ClickUp document "${fileName}"`,
+        kb_identifier: kbIdentifier,
+        file_name: fileName,
+        name: workspace.name,
+        content: truncated,
+        size: content.length,
+        type: 'clickup',
+        dateUpdated: doc.dateUpdated,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading ClickUp doc:', error);
+      return {
+        success: false,
+        message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }
@@ -12182,7 +13393,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         }
       ], {
         temperature: 0.1,
-        response_format: { type: 'json_object' }
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 16384
       });
 
       const substitutionResult = substitutionResponse.choices[0].message.content;
@@ -12194,7 +13406,19 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       try {
         substitutionData = JSON.parse(substitutionResult);
       } catch (parseError) {
-        throw new Error('LLM returned invalid JSON for variable substitution');
+        // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
+        const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+        if (codeBlockMatch) {
+          try {
+            substitutionData = JSON.parse(codeBlockMatch[1].trim());
+          } catch (innerParseError) {
+            console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+            throw new Error('LLM returned invalid JSON for variable substitution');
+          }
+        } else {
+          console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+          throw new Error('LLM returned invalid JSON for variable substitution');
+        }
       }
 
       if (!substitutionData.final_html || !substitutionData.final_subject) {
