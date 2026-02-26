@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-26',
+    changes: [
+      'Connected Accounts: Instagram Connection Fix',
+      '- Fixed Instagram Business account connection failing in production with "Unsupported request" error',
+      '- Decoupled Instagram Graph API version from Facebook Graph API version to prevent version mismatch',
+    ],
+  },
+  {
     date: '2026-02-25',
     changes: [
       'Scheduled Chats: Variable Type Support (Text, Long Text, File Attachment)',
