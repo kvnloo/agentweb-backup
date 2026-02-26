@@ -118,9 +118,11 @@ export class InstagramService {
      */
     async getInstagramBusinessMe(accessToken: string): Promise<MetaInstagramAccount & { followers_count?: number }> {
         const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
+        const url = `${instagramApiBaseUrl}/me`;
+        console.log(`[Instagram] getInstagramBusinessMe URL: ${url}`);
         try {
             const response = await axios.get(
-                `${instagramApiBaseUrl}/me`,
+                url,
                 {
                     params: {
                         fields: 'id,username,name,profile_picture_url,followers_count',
@@ -149,6 +151,7 @@ export class InstagramService {
         try {
             const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
             const url = `${instagramApiBaseUrl}/access_token`;
+            console.log(`[Instagram] getLongLivedToken URL: ${url}`);
             const params = {
                 grant_type: 'ig_exchange_token',
                 client_secret: clientSecret,

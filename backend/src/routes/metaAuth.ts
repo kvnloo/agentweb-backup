@@ -248,6 +248,10 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
         }
 
         let { access_token, expires_in } = tokenResponse.data as { access_token: string; expires_in?: number };
+        if (flow === 'instagram') {
+            console.log(`[Meta Finalize] Instagram token exchange response keys: ${Object.keys(tokenResponse.data).join(', ')}`);
+            console.log(`[Meta Finalize] access_token length: ${access_token?.length}, expires_in: ${expires_in}, token prefix: ${access_token?.substring(0, 10)}...`);
+        }
 
         if (flow === 'instagram') {
             try {
