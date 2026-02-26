@@ -147,7 +147,8 @@ export class InstagramService {
      */
     public async getLongLivedToken(shortLivedToken: string, clientSecret: string): Promise<{ access_token: string, expires_in: number }> {
         try {
-            const url = `https://graph.instagram.com/access_token`;
+            const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
+            const url = `${instagramApiBaseUrl}/access_token`;
             const params = {
                 grant_type: 'ig_exchange_token',
                 client_secret: clientSecret,
@@ -168,7 +169,8 @@ export class InstagramService {
      */
     public async refreshLongLivedToken(longLivedToken: string): Promise<{ access_token: string, expires_in: number }> {
         try {
-            const url = `https://graph.instagram.com/refresh_access_token`;
+            const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
+            const url = `${instagramApiBaseUrl}/refresh_access_token`;
             const params = {
                 grant_type: 'ig_refresh_token',
                 access_token: longLivedToken
