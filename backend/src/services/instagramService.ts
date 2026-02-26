@@ -113,21 +113,19 @@ export class InstagramService {
      * Called after token exchange with api.instagram.com/oauth/access_token.
      * Instagram Graph API has no FB SDK equivalent — uses axios with config URL.
      *
-     * Call: GET {instagramApiBaseUrl}/me?fields=id,username,name,profile_picture_url
+     * Call: POST {instagramApiBaseUrl}/me
      * Token: Instagram User token (instagram_business_basic scope required)
      */
     async getInstagramBusinessMe(accessToken: string): Promise<MetaInstagramAccount & { followers_count?: number }> {
         const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
         try {
-            const response = await axios.get(
+            const response = await axios.post(
                 `${instagramApiBaseUrl}/me`,
                 {
-                    params: {
-                        fields: 'id,username,name,profile_picture_url,followers_count',
-                        access_token: accessToken
-                    },
-                    timeout: 15000
-                }
+                    fields: 'id,username,name,profile_picture_url,followers_count',
+                    access_token: accessToken
+                },
+                { timeout: 15000 }
             );
             const data = response.data as any;
             return {
@@ -148,12 +146,11 @@ export class InstagramService {
     public async getLongLivedToken(shortLivedToken: string, clientSecret: string): Promise<{ access_token: string, expires_in: number }> {
         try {
             const url = `https://graph.instagram.com/access_token`;
-            const params = {
+            const response = await axios.post<any>(url, {
                 grant_type: 'ig_exchange_token',
                 client_secret: clientSecret,
                 access_token: shortLivedToken
-            };
-            const response = await axios.get<any>(url, { params });
+            });
             return {
                 access_token: response.data.access_token,
                 expires_in: response.data.expires_in
@@ -169,11 +166,10 @@ export class InstagramService {
     public async refreshLongLivedToken(longLivedToken: string): Promise<{ access_token: string, expires_in: number }> {
         try {
             const url = `https://graph.instagram.com/refresh_access_token`;
-            const params = {
+            const response = await axios.post<any>(url, {
                 grant_type: 'ig_refresh_token',
                 access_token: longLivedToken
-            };
-            const response = await axios.get<any>(url, { params });
+            });
             return {
                 access_token: response.data.access_token,
                 expires_in: response.data.expires_in
