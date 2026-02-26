@@ -7,11 +7,15 @@
 - The code 100 "Unsupported request" error is not a version issue — it's specific to the access token being returned by the OAuth flow.
 - Decoupled `META_INSTAGRAM_API_VERSION` from `META_API_VERSION` (PR #565) — did not fix the issue.
 
-**Root cause:** The Instagram Business account must be added in the **"Generate access tokens"** section under **API Setup with Instagram Login** in the Facebook Developer App settings. Without this, the OAuth flow still completes and returns a token, but that token cannot be used with `graph.instagram.com` API endpoints — all GET requests fail with code 100.
+**Root cause:** The Facebook Developer App must have Instagram Business Login permissions approved through **App Review** for production use. Without approval, the OAuth flow still completes and returns a token, but that token cannot be used with `graph.instagram.com` API endpoints — all GET requests fail with code 100.
 
-**Fix:** In the Facebook Developer portal → your app → Instagram → API Setup with Instagram Login → "Generate access tokens" section: add the Instagram Business account that users will connect. This must be done for **each** Facebook Developer App (staging and production separately).
+For **development/testing only**, adding the Instagram Business account in the "Generate access tokens" section under API Setup with Instagram Login allows the token to work without App Review. This is limited to accounts explicitly added in that section.
 
-**Key takeaway:** This is an app-level configuration, not a code issue. The OAuth flow succeeds without this setup, but the returned token is non-functional for API calls — making the error misleading.
+**Fix:**
+- **Development/Testing:** In the Facebook Developer portal → your app → Instagram → API Setup with Instagram Login → "Generate access tokens" section: add the Instagram Business account. This grants test access for that specific account.
+- **Production:** Submit the app for App Review with the required Instagram Business Login permissions (`instagram_business_basic`, `instagram_business_content_publish`, `instagram_business_manage_comments`, `instagram_business_manage_insights`). Once approved, any Instagram Business account can connect without being manually added.
+
+**Key takeaway:** This is an app-level configuration, not a code issue. The OAuth flow succeeds without proper permissions setup, but the returned token is non-functional for API calls — making the error misleading.
 
 ---
 
