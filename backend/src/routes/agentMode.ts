@@ -98,6 +98,10 @@ router.get('/public/scheduled-chat-variables/:accessToken', asyncHandler(agentMo
 // Submit variable values for a one-time public scheduled chat variable link
 router.post('/public/scheduled-chat-variables/:accessToken', asyncHandler(agentModeController.submitScheduledChatVariablesByAccessToken));
 
+// POST /api/agent-mode/public/scheduled-chat-variables/:accessToken/upload
+// Upload a file for a file-type variable (public, validated by access token)
+router.post('/public/scheduled-chat-variables/:accessToken/upload', upload.single('file'), asyncHandler(agentModeController.uploadScheduledChatVariableFile));
+
 // Conversable routes (protected by conversable token, not authentication)
 
 // All other routes require authentication

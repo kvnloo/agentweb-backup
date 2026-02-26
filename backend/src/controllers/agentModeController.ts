@@ -116,6 +116,7 @@ interface ScheduledChatTestResult {
 interface ScheduledChatVariable {
   name: string;
   description?: string;
+  type?: 'text' | 'long_text' | 'file';
 }
 
 const SCHEDULED_CHAT_VARIABLE_REGEX = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
@@ -140,12 +141,14 @@ function validateAndBuildScheduledChatVariables(
     return { variables: [] };
   }
 
+  const VALID_VARIABLE_TYPES = new Set(['text', 'long_text', 'file']);
   const normalizedInputVariables: ScheduledChatVariable[] = Array.isArray(inputVariables)
     ? inputVariables
         .filter((v: any) => v && typeof v.name === 'string')
         .map((v: any) => ({
           name: v.name.trim(),
           description: typeof v.description === 'string' ? v.description.trim() : '',
+          ...(typeof v.type === 'string' && VALID_VARIABLE_TYPES.has(v.type) ? { type: v.type as 'text' | 'long_text' | 'file' } : {}),
         }))
     : [];
 
@@ -158,19 +161,24 @@ function validateAndBuildScheduledChatVariables(
     };
   }
 
-  const existingDescriptionMap = new Map(
-    (existingVariables || []).map(variable => [variable.name, variable.description || ''])
+  const existingMap = new Map(
+    (existingVariables || []).map(variable => [variable.name, variable])
   );
-  const inputDescriptionMap = new Map(
-    normalizedInputVariables.map(variable => [variable.name, variable.description || ''])
+  const inputMap = new Map(
+    normalizedInputVariables.map(variable => [variable.name, variable])
   );
 
-  const variables = variableNames.map((name) => ({
-    name,
-    description: inputDescriptionMap.has(name)
-      ? inputDescriptionMap.get(name) || ''
-      : existingDescriptionMap.get(name) || '',
-  }));
+  const variables: ScheduledChatVariable[] = variableNames.map((name) => {
+    const input = inputMap.get(name);
+    const existing = existingMap.get(name);
+    const description = input ? (input.description || '') : (existing?.description || '');
+    const type = input?.type || existing?.type;
+    return {
+      name,
+      description,
+      ...(type ? { type } : {}),
+    };
+  });
 
   return { variables };
 }
@@ -184,17 +192,57 @@ function getMissingScheduledChatVariableNames(
     .map(variable => variable.name);
 }
 
+function parseFileVariableValue(value: string): { url: string; filename: string; size: number; mimetype: string } | null {
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed.url === 'string' && typeof parsed.filename === 'string') {
+      return parsed;
+    }
+  } catch {
+    // not a file variable JSON
+  }
+  return null;
+}
+
 function applyScheduledChatVariableValues(
   startingMessage: string,
-  variableValues: Record<string, string> = {}
+  variableValues: Record<string, string> = {},
+  variables: ScheduledChatVariable[] = []
 ): string {
+  const variableTypeMap = new Map(variables.map(v => [v.name, v.type || 'text']));
   return startingMessage.replace(SCHEDULED_CHAT_VARIABLE_REGEX, (_, variableName: string) => {
     const value = variableValues[variableName];
     if (typeof value !== 'string' || value.trim().length === 0) {
       return `{{${variableName}}}`;
     }
+    // For file variables, replace with a markdown link
+    if (variableTypeMap.get(variableName) === 'file') {
+      const fileMeta = parseFileVariableValue(value);
+      if (fileMeta) {
+        return `[${fileMeta.filename}](${fileMeta.url})`;
+      }
+    }
     return value;
   });
+}
+
+function extractFileAttachmentsFromVariables(
+  variables: ScheduledChatVariable[],
+  variableValues: Record<string, string> = {}
+): Array<{ url: string; filename: string; size: number; mimetype: string }> {
+  const attachments: Array<{ url: string; filename: string; size: number; mimetype: string }> = [];
+  for (const variable of variables) {
+    if (variable.type === 'file') {
+      const value = variableValues[variable.name];
+      if (typeof value === 'string') {
+        const fileMeta = parseFileVariableValue(value);
+        if (fileMeta) {
+          attachments.push(fileMeta);
+        }
+      }
+    }
+  }
+  return attachments;
 }
 
 function hashScheduledChatVariableAccessToken(token: string): string {
@@ -831,8 +879,20 @@ async function runScheduledChat(
 
     const resolvedStartingMessage = applyScheduledChatVariableValues(
       schedule.startingMessage,
-      schedule.variableValues || {}
+      schedule.variableValues || {},
+      scheduleVariables
     );
+
+    // Extract file attachments from file-type variables
+    const fileAttachments = extractFileAttachmentsFromVariables(
+      scheduleVariables,
+      schedule.variableValues || {}
+    ).map(f => ({
+      url: f.url,
+      filename: f.filename,
+      size: f.size,
+      mimetype: f.mimetype,
+    }));
 
     // Run verified chat
     const result = await runVerifiedChat({
@@ -842,7 +902,7 @@ async function runScheduledChat(
       keywords: expectedKeywords,
       requiredFunctions,
       maxAttempts: 20,
-      attachments: [],
+      attachments: fileAttachments,
       llmModel: schedule.llmModel || defaultModel
     });
 
@@ -2967,6 +3027,59 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Submit scheduled chat variables by access token error:', error);
       return res.status(500).json({ error: 'Failed to submit variable values' });
+    }
+  },
+
+  // Public endpoint: upload a file for a file-type variable (no login required, access token validates)
+  async uploadScheduledChatVariableFile(req: Request, res: Response) {
+    try {
+      const { accessToken } = req.params;
+      if (!accessToken || typeof accessToken !== 'string') {
+        return res.status(400).json({ error: 'Access token is required' });
+      }
+
+      const tokenHash = hashScheduledChatVariableAccessToken(accessToken);
+      const schedule = await scheduleDb.getScheduledChatByVariableAccessTokenHash(tokenHash);
+      if (!schedule) {
+        return res.status(404).json({ error: 'Invalid or expired variable request link' });
+      }
+
+      const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
+        ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
+        : NaN;
+      if (Number.isFinite(expiresAtMs) && expiresAtMs < Date.now()) {
+        return res.status(410).json({ error: 'This variable request link has expired' });
+      }
+
+      if (schedule.variableRequestAccessTokenConsumedAt) {
+        return res.status(409).json({ error: 'This variable request link has already been used' });
+      }
+
+      const file = (req as any).file;
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      const uploadResult = await uploadFileToS3(
+        file.buffer,
+        file.originalname,
+        schedule.userId,
+        file.mimetype
+      );
+
+      if (!uploadResult.success) {
+        return res.status(500).json({ error: 'Failed to upload file' });
+      }
+
+      return res.json({
+        url: uploadResult.url,
+        filename: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype,
+      });
+    } catch (error) {
+      console.error('AgentMode: Public variable file upload error:', error);
+      return res.status(500).json({ error: 'Failed to upload file' });
     }
   },
 
