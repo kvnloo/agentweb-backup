@@ -63,7 +63,14 @@ export interface MetaPageConfig extends BaseOAuthConfig {
   category?: string;
 }
 
-export type MetaConfig = MetaAdAccountConfig | MetaPageConfig;
+
+export interface MetaInstagramBusinessConfig extends BaseOAuthConfig {
+  account_type: 'instagram_business';
+  instagram_account_id: string;
+  username?: string;
+}
+
+export type MetaConfig = MetaAdAccountConfig | MetaPageConfig | MetaInstagramBusinessConfig;
 
 /**
  * Union type for all platform-specific configurations.
