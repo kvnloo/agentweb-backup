@@ -118,9 +118,10 @@ export class InstagramService {
      */
     async getInstagramBusinessMe(accessToken: string): Promise<MetaInstagramAccount & { followers_count?: number }> {
         const { instagramApiBaseUrl } = INTEGRATION_CONFIG.meta;
+        const url = `${instagramApiBaseUrl}/me`;
         try {
             const response = await axios.get(
-                `${instagramApiBaseUrl}/me`,
+                url,
                 {
                     params: {
                         fields: 'id,username,name,profile_picture_url,followers_count',
