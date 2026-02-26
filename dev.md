@@ -1,3 +1,20 @@
+# February 26, 2026: Instagram Business Login — "Unsupported request" in Production
+
+**Symptom:** Connecting an Instagram Business account via Connected Accounts failed in production with `IGApiException` code 100: `"Unsupported request - method type: get"`. Both `getLongLivedToken` (`graph.instagram.com/.../access_token`) and `getInstagramBusinessMe` (`graph.instagram.com/.../me`) returned the same error. The initial OAuth token exchange (POST to `api.instagram.com/oauth/access_token`) succeeded.
+
+**Investigation:**
+- Confirmed `graph.instagram.com/v24.0/me` and `graph.instagram.com/v23.0/me` are valid endpoints (curl with invalid token returns code 190, not code 100).
+- The code 100 "Unsupported request" error is not a version issue — it's specific to the access token being returned by the OAuth flow.
+- Decoupled `META_INSTAGRAM_API_VERSION` from `META_API_VERSION` (PR #565) — did not fix the issue.
+
+**Root cause:** The Instagram Business account must be added in the **"Generate access tokens"** section under **API Setup with Instagram Login** in the Facebook Developer App settings. Without this, the OAuth flow still completes and returns a token, but that token cannot be used with `graph.instagram.com` API endpoints — all GET requests fail with code 100.
+
+**Fix:** In the Facebook Developer portal → your app → Instagram → API Setup with Instagram Login → "Generate access tokens" section: add the Instagram Business account that users will connect. This must be done for **each** Facebook Developer App (staging and production separately).
+
+**Key takeaway:** This is an app-level configuration, not a code issue. The OAuth flow succeeds without this setup, but the returned token is non-functional for API calls — making the error misleading.
+
+---
+
 # February 25, 2026: Long-Running Test Env & IP Allowlist Fix
 
 - Added `--no-watchdog` flag to `./test-env/test-env.sh launch` to skip the 24-hour auto-shutdown cron. Use for long-running test environments that you teardown manually.
