@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-25',
+    changes: [
+      'Connected Accounts: Instagram Business Page Support',
+      '- Connect your Instagram Business account through the Connected Accounts page',
+      '- Links via your Facebook Page — any Facebook Page with a connected Instagram Business account is supported',
+    ],
+  },
+  {
     date: '2026-02-22',
     changes: [
       'Agent Mode: LinkedIn Post Formatting',
