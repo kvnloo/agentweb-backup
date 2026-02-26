@@ -145,6 +145,8 @@ export async function getLinkedInCredentials(): Promise<LinkedInCredentials> {
 export interface MetaCredentials {
   clientId: string;
   clientSecret: string;
+  instagramClientId: string;
+  instagramClientSecret: string;
 }
 
 /**
@@ -178,7 +180,41 @@ export async function getMetaCredentials(): Promise<MetaCredentials> {
     console.error('Error fetching Meta credentials from Secrets Manager:', error);
     throw new Error('Failed to fetch Meta credentials from Secrets Manager');
   }
-  
+}
+
+
+/**
+ * Get Instagram Business Login OAuth credentials from AWS Secrets Manager.
+ * Reads instagramClientId and instagramClientSecret from the Meta secret.
+ *
+ * Secret location: dev/AgentWeb/Meta (or prod/... for production)
+ *
+ * @returns The Instagram client credentials (clientId and clientSecret)
+ */
+export async function getInstagramCredentials(): Promise<MetaCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/MetaApp'
+      : 'dev/AgentWeb/MetaApp';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Instagram credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as MetaCredentials;
+
+    if (!credentials.instagramClientId || !credentials.instagramClientSecret) {
+      throw new Error('Instagram credentials missing instagramClientId or instagramClientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Instagram credentials:', error);
+    throw new Error('Failed to fetch Instagram credentials from Secrets Manager');
+  }
 }
 
 /**
@@ -213,4 +249,3 @@ export async function getGoogleDriveServiceAccountEmail(): Promise<string> {
     throw new Error('Failed to fetch Google Drive service account email from Secrets Manager');
   }
 }
-

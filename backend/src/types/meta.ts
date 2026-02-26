@@ -12,6 +12,19 @@ export interface MetaAdAccount {
   };
 }
 
+/**
+ * Instagram Professional account (Business or Creator).
+ * Used in two contexts:
+ *  - Method A: linked to an ad account via /act_{id}/instagram_accounts — for instagram_user_id in ads
+ *  - Method C: returned by Instagram Business Login via /me — for organic publishing
+ */
+export interface MetaInstagramAccount {
+  id: string;
+  username: string;
+  name?: string;
+  profile_picture_url?: string;
+}
+
 export interface MetaPage {
   id: string;
   name: string;
