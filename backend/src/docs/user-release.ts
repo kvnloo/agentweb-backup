@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-27',
+    changes: [
+      'Images: Background Jobs Survive Page Reloads',
+      '- Image revision jobs (batch and individual) now persist across page reloads instead of being marked as "Interrupted by page reload"',
+      '- Jobs in progress at reload time are automatically resumed once the Images page loads',
+      '- Already-processed items are skipped on resume so no duplicate work is performed',
+    ],
+  },
+  {
     date: '2026-02-26',
     changes: [
       'Connected Accounts: Instagram Connection Fix',
