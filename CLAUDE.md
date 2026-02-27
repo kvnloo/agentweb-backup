@@ -940,7 +940,7 @@ KEY_FILE=~/.ssh/my-keypair.pem
 ./test-env/test-env.sh sync              # all services
 ./test-env/test-env.sh sync backend      # just backend
 
-# Grant/revoke access for other people
+# Grant/revoke access for other people (MUST use IPv4 — see note below)
 ./test-env/test-env.sh allow-ip 203.0.113.50
 ./test-env/test-env.sh revoke-ip 203.0.113.50
 
@@ -960,10 +960,24 @@ KEY_FILE=~/.ssh/my-keypair.pem
 ./test-env/test-env.sh teardown
 ```
 
+### IPv4 Requirement for allow-ip
+
+**CRITICAL:** The EC2 security group only works with IPv4 addresses. When allowing an IP, always force IPv4:
+
+```bash
+# CORRECT — force IPv4
+./test-env/test-env.sh allow-ip $(curl -4 -s ifconfig.me)
+
+# WRONG — may return IPv6 which won't work with EC2 security groups
+./test-env/test-env.sh allow-ip $(curl -s ifconfig.me)
+```
+
+`curl ifconfig.me` (without `-4`) can return an IPv6 address on dual-stack networks. IPv6 rules won't grant access to IPv4-only EC2 instances, causing silent connectivity failures (SSH hangs, browser timeouts).
+
 ### Architecture
 
 - Three Docker containers on one EC2 instance (t3.large)
-- **IP-restricted** — per-instance security group locked to developer's IP at launch; use `allow-ip`/`revoke-ip` to manage access
+- **IP-restricted (IPv4 only)** — per-instance security group locked to developer's IP at launch; use `allow-ip`/`revoke-ip` to manage access
 - Backend `.env` fetched from Secrets Manager at launch (developers never see it)
 - Code synced via `rsync` — only changed files transferred
 - Auto-terminates after **24 hours of inactivity** (watchdog cron)
