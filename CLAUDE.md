@@ -15,7 +15,10 @@ Before writing implementation code:
 
 ### Rule 2: TDD - Tests Before Implementation
 
-For every task:
+**Applies to:** Backend service/logic changes (routes, services, utilities, database operations)
+**Does not apply to:** Frontend UI components, configuration files, documentation, CLAUDE.md itself
+
+For backend logic changes:
 1. Write FAIL test cases first (minimum 3: invalid inputs, boundary conditions, error paths)
 2. Write SUCCESS test cases (minimum 1: happy path)
 3. Verify all new tests FAIL (no implementation yet)
@@ -24,7 +27,11 @@ For every task:
 
 **A task is NOT done until all tests pass.** Never skip tests. Never delete failing tests. Never mark a task complete with failing tests.
 
+For frontend and other changes, follow the existing testing strategy section below.
+
 ### Rule 3: Workflow Orchestration
+
+**Note:** The system prompt already handles plan mode (EnterPlanMode tool) and subagent usage (Task tool). These rules complement those built-in behaviors with project-specific guidance.
 
 **Plan Mode Default:**
 - Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
@@ -42,13 +49,13 @@ For every task:
 - After ANY correction from the user: update `tasks/lessons.md` with the pattern
 - Write rules for yourself that prevent the same mistake
 - Ruthlessly iterate on these lessons until mistake rate drops
-- Review lessons at session start for relevant project
+- Review `tasks/lessons.md` at session start for relevant patterns
 
 **Verification Before Done:**
 - Never mark a task complete without proving it works
-- Diff behavior between main and your changes when relevant
+- Run verification checks (see "Pre-Commit Checks" section below)
 - Ask yourself: "Would a staff engineer approve this?"
-- Run tests, check logs, demonstrate correctness
+- For test environment: always sync after changes (see "Cloud Test Environment" section)
 
 **Demand Elegance (Balanced):**
 - For non-trivial changes: pause and ask "is there a more elegant way?"
@@ -64,12 +71,21 @@ For every task:
 
 ### Rule 4: Task Management
 
-1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
-2. **Verify Plan**: Check in before starting implementation
-3. **Track Progress**: Mark items complete as you go
-4. **Explain Changes**: High-level summary at each step
-5. **Document Results**: Add review section to `tasks/todo.md`
-6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+**Note:** Use the TodoWrite tool (from system prompt) for session-level task tracking. Use `tasks/todo.md` for project-level task planning that persists across sessions.
+
+**Session-Level Tasks (TodoWrite tool):**
+1. Use TodoWrite for multi-step tasks within a conversation
+2. Mark items as in_progress, completed as you work
+3. Keep exactly ONE task in_progress at a time
+
+**Project-Level Tasks (tasks/todo.md file):**
+1. Document parked tasks, active features, completed work
+2. Maintain checkable items for complex features
+3. Add design docs and success metrics for major initiatives
+
+**Always:**
+- Capture lessons in `tasks/lessons.md` after ANY user correction
+- Verify work is complete before marking tasks done (see "Pre-Commit Checks" section)
 
 ### Rule 5: Core Principles
 
