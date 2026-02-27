@@ -2,6 +2,81 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Global Development Rules
+
+**IMPORTANT:** This project follows the global development rules defined in `~/.claude/CLAUDE.md`. When conflicts arise, these project-specific rules take precedence.
+
+### Rule 1: Design Before Code
+
+Before writing implementation code:
+1. Ask clarifying questions if requirements are unclear
+2. Produce a design or plan and get explicit approval
+3. No approval = no code
+
+### Rule 2: TDD - Tests Before Implementation
+
+For every task:
+1. Write FAIL test cases first (minimum 3: invalid inputs, boundary conditions, error paths)
+2. Write SUCCESS test cases (minimum 1: happy path)
+3. Verify all new tests FAIL (no implementation yet)
+4. Implement the minimum code to pass all tests
+5. Verify ALL tests pass (new + existing)
+
+**A task is NOT done until all tests pass.** Never skip tests. Never delete failing tests. Never mark a task complete with failing tests.
+
+### Rule 3: Workflow Orchestration
+
+**Plan Mode Default:**
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something goes sideways, STOP and re-plan immediately – don't keep pushing
+- Use plan mode for verification steps, not just building
+- Write detailed specs upfront to reduce ambiguity
+
+**Subagent Strategy:**
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, throw more compute at it via subagents
+- One task per subagent for focused execution
+
+**Self-Improvement Loop:**
+- After ANY correction from the user: update `tasks/lessons.md` with the pattern
+- Write rules for yourself that prevent the same mistake
+- Ruthlessly iterate on these lessons until mistake rate drops
+- Review lessons at session start for relevant project
+
+**Verification Before Done:**
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this?"
+- Run tests, check logs, demonstrate correctness
+
+**Demand Elegance (Balanced):**
+- For non-trivial changes: pause and ask "is there a more elegant way?"
+- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
+- Skip this for simple, obvious fixes – don't over-engineer
+- Challenge your own work before presenting it
+
+**Autonomous Bug Fixing:**
+- When given a bug report: just fix it. Don't ask for hand-holding
+- Point at logs, errors, failing tests – then resolve them
+- Zero context switching required from the user
+- Go fix failing CI tests without being told how
+
+### Rule 4: Task Management
+
+1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
+2. **Verify Plan**: Check in before starting implementation
+3. **Track Progress**: Mark items complete as you go
+4. **Explain Changes**: High-level summary at each step
+5. **Document Results**: Add review section to `tasks/todo.md`
+6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+
+### Rule 5: Core Principles
+
+- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
+- **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
+- **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
 ## CRITICAL: Working Directory Rule
 
 **NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/ruiwang/Documents/GitHub/agentweb/` — always use the actual working directory (e.g. `/Users/ruiwang/Documents/GitHub/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.
