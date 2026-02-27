@@ -118,6 +118,12 @@
       "Bash(gh run:*)",
       "mcp__playwright__browser_hover",
       "Bash(gh release:*)"
+      "Bash(grep META_API_VERSION:*)",
+      "Bash(cd:*)",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_hover",
+      "Bash(./test-env/test-env.sh status:*)",
+      "Bash(./test-env/test-env.sh logs:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

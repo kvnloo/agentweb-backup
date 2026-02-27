@@ -1122,5 +1122,275 @@ describe('ImageService', () => {
       }
     });
   });
+
+  describe('Retry with Exponential Backoff', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      // Speed up tests by reducing real timers
+      jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
+      jest.spyOn(Math, 'random').mockReturnValue(0.5);
+    });
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('should retry Gemini 3 Pro on 503 error and succeed on next attempt', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      let callCount = 0;
+      mockGenerateContentStream.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          const err: any = new Error('This model is currently experiencing high demand. Please try again later.');
+          err.status = 503;
+          throw err;
+        }
+        // Second call succeeds
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            yield {
+              candidates: [{
+                content: {
+                  parts: [{
+                    inlineData: { mimeType: 'image/png', data: 'base64data' }
+                  }]
+                }
+              }]
+            };
+          }
+        };
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test retry',
+        filename: 'retry-test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '1:1'
+      });
+
+      expect(callCount).toBe(2);
+      expect(result.success).toBe(true);
+    });
+
+    it('should retry Gemini 3 Pro on 429 rate limit error', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      let callCount = 0;
+      mockGenerateContentStream.mockImplementation(() => {
+        callCount++;
+        if (callCount <= 2) {
+          const err: any = new Error('Too Many Requests');
+          err.status = 429;
+          throw err;
+        }
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            yield {
+              candidates: [{
+                content: {
+                  parts: [{
+                    inlineData: { mimeType: 'image/png', data: 'base64data' }
+                  }]
+                }
+              }]
+            };
+          }
+        };
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test retry 429',
+        filename: 'retry-429.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '1:1'
+      });
+
+      expect(callCount).toBe(3);
+      expect(result.success).toBe(true);
+    });
+
+    it('should retry on "UNAVAILABLE" error message', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      let callCount = 0;
+      mockGenerateContentStream.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('UNAVAILABLE: Service temporarily unavailable');
+        }
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            yield {
+              candidates: [{
+                content: {
+                  parts: [{
+                    inlineData: { mimeType: 'image/png', data: 'base64data' }
+                  }]
+                }
+              }]
+            };
+          }
+        };
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test unavailable',
+        filename: 'retry-unavailable.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '1:1'
+      });
+
+      expect(callCount).toBe(2);
+      expect(result.success).toBe(true);
+    });
+
+    it('should retry on "high demand" error message', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      let callCount = 0;
+      mockGenerateContentStream.mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('This model is currently experiencing high demand');
+        }
+        return {
+          [Symbol.asyncIterator]: async function* () {
+            yield {
+              candidates: [{
+                content: {
+                  parts: [{
+                    inlineData: { mimeType: 'image/png', data: 'base64data' }
+                  }]
+                }
+              }]
+            };
+          }
+        };
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test high demand',
+        filename: 'retry-demand.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '1:1'
+      });
+
+      expect(callCount).toBe(2);
+      expect(result.success).toBe(true);
+    });
+
+    it('should NOT retry on non-retryable errors (e.g. 400 bad request)', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+
+      let callCount = 0;
+      mockGenerateContentStream.mockImplementation(() => {
+        callCount++;
+        const err: any = new Error('Invalid request: prompt too long');
+        err.status = 400;
+        throw err;
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test no retry on 400',
+        filename: 'no-retry.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '1:1'
+      });
+
+      // Should only be called once — no retry on 400
+      expect(callCount).toBe(1);
+      expect(result.success).toBe(false);
+    });
+
+    it('should fail after exhausting all retries', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+
+      let callCount = 0;
+      mockGenerateContentStream.mockImplementation(() => {
+        callCount++;
+        const err: any = new Error('This model is currently experiencing high demand');
+        err.status = 503;
+        throw err;
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test exhaust retries',
+        filename: 'exhaust.png',
+        userId: 'user123',
+        imageModel: 'gemini-3-pro-image-preview',
+        size: '1:1'
+      });
+
+      // maxRetries=3, so 3 total attempts
+      expect(callCount).toBe(3);
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('high demand');
+    });
+
+    it('should retry Azure AI (gpt-image-1) on 503 error', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
+        success: true,
+        url: 'https://s3.amazonaws.com/bucket/image.png'
+      });
+
+      const mockAxios = require('axios');
+      let callCount = 0;
+      (mockAxios.default.post as jest.Mock).mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          const err: any = new Error('Service Unavailable');
+          err.status = 503;
+          throw err;
+        }
+        return {
+          status: 200,
+          data: {
+            data: [{ b64_json: 'base64encodedimagedata' }]
+          }
+        };
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test Azure retry',
+        filename: 'azure-retry.png',
+        userId: 'user123',
+        imageModel: 'gpt-image-1',
+        size: '1024x1024'
+      });
+
+      expect(callCount).toBe(2);
+      expect(result.success).toBe(true);
+    });
+  });
 });
 
