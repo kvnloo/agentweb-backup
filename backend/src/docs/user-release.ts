@@ -13,6 +13,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Image revision jobs (batch and individual) now persist across page reloads instead of being marked as "Interrupted by page reload"',
       '- Jobs in progress at reload time are automatically resumed once the Images page loads',
       '- Already-processed items are skipped on resume so no duplicate work is performed',
+      'Images: Automatic Retry on API Errors',
+      '- Image generation now automatically retries on transient API errors (503 overload, 429 rate limit) with exponential backoff',
+      '- Up to 3 attempts with increasing delays (3s → 6s → 12s) before failing, reducing "high demand" errors during peak usage',
+      '- Applies to all image generation providers (Gemini, GPT Image, Azure AI)',
     ],
   },
   {
