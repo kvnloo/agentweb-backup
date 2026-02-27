@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-27',
     changes: [
+      'Agent Mode: Show Plan Name in Work Plan Progress',
+      '- The horizontal plan progress bar now displays the work plan name above the step dots',
+      '- The full plan card also formats plan names with underscores replaced by spaces for readability',
       'Images: Background Jobs Survive Page Reloads',
       '- Image revision jobs (batch and individual) now persist across page reloads instead of being marked as "Interrupted by page reload"',
       '- Jobs in progress at reload time are automatically resumed once the Images page loads',
