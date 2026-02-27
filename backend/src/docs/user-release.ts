@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-27',
+    changes: [
+      'Agent Mode: Show Plan Name in Work Plan Progress',
+      '- The horizontal plan progress bar now displays the work plan name above the step dots',
+      '- The full plan card also formats plan names with underscores replaced by spaces for readability',
+    ],
+  },
+  {
     date: '2026-02-26',
     changes: [
       'Connected Accounts: Instagram Connection Fix',

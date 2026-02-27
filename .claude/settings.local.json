@@ -100,10 +100,28 @@
       "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh sync:*)",
       "Bash(tail:*)",
       "Bash(/Users/ruiwang/Documents/GitHub/agentweb/test-env/test-env.sh ssh:*)",
-      "WebFetch(domain:developers.facebook.com)",
-      "WebFetch(domain:stackoverflow.com)",
+      "Bash(gh repo:*)",
+      "Bash(./test-env/test-env.sh status:*)",
+      "Bash(printf {\"email\":\"test@example.com\",\"password\":\"Test123!\"}:*)",
+      "Bash(cat:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb4/test-env/test-env.sh list:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb4/test-env/test-env.sh sync:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb4/test-env/test-env.sh status:*)",
+      "Bash(aws ec2:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb4/test-env/test-env.sh ssh:*)",
+      "Bash(head:*)",
       "Bash(ssh:*)",
-      "Bash(grep META_API_VERSION:*)"
+      "mcp__playwright__browser_fill_form",
+      "Bash(./test-env/test-env.sh logs:*)",
+      "Bash(pkill:*)",
+      "Bash(git:*)",
+      "Bash(gh run:*)",
+      "mcp__playwright__browser_hover",
+      "Bash(gh release:*)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "playwright"
+  ]
 }
