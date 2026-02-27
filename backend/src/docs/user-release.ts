@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-27',
     changes: [
+      'Images: Batch Send for Review',
+      '- Select multiple images and send them all for Slack review in one click using the new "Send for Review (N)" button in the batch action bar',
+      '- Channel selection dialog shows thumbnail previews of all selected images and a batch description',
+      '- Already-reviewed images (pending, approved, revision submitted, rejected) are automatically excluded',
+      '- Review requests are queued as a background job with progress tracking, so you can continue working while they send',
       'Images: Background Jobs Survive Page Reloads',
       '- Image revision jobs (batch and individual) now persist across page reloads instead of being marked as "Interrupted by page reload"',
       '- Jobs in progress at reload time are automatically resumed once the Images page loads',
