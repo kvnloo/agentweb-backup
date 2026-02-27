@@ -111,6 +111,32 @@ export class ImageService {
   }
 
   /**
+   * Retry a function with exponential backoff for transient API errors (503, 429)
+   */
+  private async retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    opts: { maxRetries?: number; baseDelayMs?: number; retryableCheck?: (err: any) => boolean } = {}
+  ): Promise<T> {
+    const { maxRetries = 3, baseDelayMs = 3000, retryableCheck } = opts;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        const isRetryable = retryableCheck
+          ? retryableCheck(err)
+          : (err.status === 503 || err.status === 429 || err.code === 503 || err.code === 429
+             || err.message?.includes('high demand') || err.message?.includes('UNAVAILABLE')
+             || err.message?.includes('rate') || err.message?.includes('Too Many Requests'));
+        if (!isRetryable || attempt === maxRetries) throw err;
+        const delay = baseDelayMs * Math.pow(2, attempt - 1) + Math.random() * 1000;
+        console.warn(`⚠️ Image generation attempt ${attempt}/${maxRetries} failed (retryable). Retrying in ${Math.round(delay)}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+    throw new Error('Unreachable');
+  }
+
+  /**
    * Generate an image using various AI models
    */
   async generateImage(
@@ -273,25 +299,28 @@ export class ImageService {
         ...formData.getHeaders()
       };
       
-      const response = await axios.post(url, formData, { 
-        headers,
-        params: { "api-version": "2025-04-01-preview" }
-      });
-      
+      const response: any = await this.retryWithBackoff(
+        () => axios.post(url, formData, {
+          headers,
+          params: { "api-version": "2025-04-01-preview" }
+        }),
+        { maxRetries: 3, baseDelayMs: 3000 }
+      );
+
       if (response.status !== 200) {
         throw new Error(`Azure AI Services API error: ${response.status} - ${response.statusText}`);
       }
-      
+
       const resultData = response.data;
       if (!resultData.data || resultData.data.length === 0) {
         throw new Error("No image data received from Azure AI Services API");
       }
-      
+
       const imageBase64 = resultData.data[0].b64_json;
       if (!imageBase64) {
         throw new Error("No b64_json data in Azure AI Services response");
       }
-      
+
       const dataUrl = `data:image/png;base64,${imageBase64}`;
       return {
         success: true,
@@ -312,12 +341,15 @@ export class ImageService {
         quality: params.quality || 'medium',
         output_format: "png"
       };
-      
-      const response = await axios.post(url, data, { 
-        headers, 
-        params: { "api-version": "2025-04-01-preview" }
-      });
-      
+
+      const response: any = await this.retryWithBackoff(
+        () => axios.post(url, data, {
+          headers,
+          params: { "api-version": "2025-04-01-preview" }
+        }),
+        { maxRetries: 3, baseDelayMs: 3000 }
+      );
+
       if (response.status !== 200) {
         throw new Error(`Azure AI Services API error: ${response.status} - ${response.statusText}`);
       }
@@ -447,15 +479,18 @@ export class ImageService {
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       if (inputImageCount === 0) {
-        // Text-to-image generation - use streaming
-        const streamResult = model.generateContentStream({
-          contents: [{
-            role: "user",
-            parts: [{
-              text: params.prompt
+        // Text-to-image generation - use streaming (with retry for transient 503/429 errors)
+        const streamResult = await this.retryWithBackoff(
+          () => model.generateContentStream({
+            contents: [{
+              role: "user",
+              parts: [{
+                text: params.prompt
+              }]
             }]
-          }]
-        });
+          }),
+          { maxRetries: 3, baseDelayMs: 3000 }
+        );
         
         // Get the async iterable stream - handle promise if needed
         let stream: any = streamResult;
@@ -523,26 +558,29 @@ export class ImageService {
         
         const imageBase64 = processedImage.buffer.toString('base64');
         
-        // Use streaming for image generation
-        const streamResult = model.generateContentStream({
-          contents: [
-            {
-              role: "user",
-              parts: [{
-                inlineData: {
-                  mimeType: processedImage.mimeType,
-                  data: imageBase64
-                }
-              }]
-            },
-            {
-              role: "user", 
-              parts: [{
-                text: params.prompt
-              }]
-            }
-          ]
-        });
+        // Use streaming for image generation (with retry for transient 503/429 errors)
+        const streamResult = await this.retryWithBackoff(
+          () => model.generateContentStream({
+            contents: [
+              {
+                role: "user",
+                parts: [{
+                  inlineData: {
+                    mimeType: processedImage.mimeType,
+                    data: imageBase64
+                  }
+                }]
+              },
+              {
+                role: "user",
+                parts: [{
+                  text: params.prompt
+                }]
+              }
+            ]
+          }),
+          { maxRetries: 3, baseDelayMs: 3000 }
+        );
         
         // Get the async iterable stream - handle promise if needed
         let stream: any = streamResult;
@@ -596,7 +634,7 @@ export class ImageService {
         
       } else {
         // Multiple image editing - use streaming for image generation
-        const parts = [];
+        const parts: any[] = [];
         
         // Add all input images as parts
         for (let i = 0; i < params.inputImages!.length; i++) {
@@ -626,13 +664,16 @@ export class ImageService {
           text: params.prompt
         });
         
-        // Use streaming for image generation
-        const streamResult = model.generateContentStream({
-          contents: [{
-            role: "user",
-            parts: parts
-          }]
-        });
+        // Use streaming for image generation (with retry for transient 503/429 errors)
+        const streamResult = await this.retryWithBackoff(
+          () => model.generateContentStream({
+            contents: [{
+              role: "user",
+              parts: parts
+            }]
+          }),
+          { maxRetries: 3, baseDelayMs: 3000 }
+        );
         
         // Get the async iterable stream - handle promise if needed
         let stream: any = streamResult;
@@ -842,12 +883,11 @@ export class ImageService {
         });
       }
 
-      // Generate content stream
-      const response = await ai.models.generateContentStream({
-        model,
-        config,
-        contents,
-      });
+      // Generate content stream (with retry for transient 503/429 errors)
+      const response: any = await this.retryWithBackoff(
+        () => ai.models.generateContentStream({ model, config, contents }),
+        { maxRetries: 3, baseDelayMs: 3000 }
+      );
 
       // Process streaming response to find image data
       let imageData: string | undefined;

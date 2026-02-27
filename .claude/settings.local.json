@@ -103,7 +103,16 @@
       "WebFetch(domain:developers.facebook.com)",
       "WebFetch(domain:stackoverflow.com)",
       "Bash(ssh:*)",
-      "Bash(grep META_API_VERSION:*)"
+      "Bash(grep META_API_VERSION:*)",
+      "Bash(cd:*)",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_hover",
+      "Bash(./test-env/test-env.sh status:*)",
+      "Bash(./test-env/test-env.sh logs:*)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "playwright"
+  ]
 }
