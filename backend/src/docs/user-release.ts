@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-27',
     changes: [
+      'Images: Batch Send for Review',
+      '- Select multiple images and send them all for Slack review in one click using the new "Send for Review (N)" button in the batch action bar',
+      '- Channel selection dialog shows thumbnail previews of all selected images and a batch description',
+      '- Already-reviewed images (pending, approved, revision submitted, rejected) are automatically excluded',
+      '- Review requests are queued as a background job with progress tracking, so you can continue working while they send',
       'Agent Mode: Show Plan Name in Work Plan Progress',
       '- The horizontal plan progress bar now displays the work plan name above the step dots',
       '- The full plan card also formats plan names with underscores replaced by spaces for readability',
