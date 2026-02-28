@@ -534,7 +534,10 @@ export class AgentModeService {
       throw new Error(`Failed to initialize client for model: ${model}`);
     }
 
+    const startTime = Date.now();
     const res = await client.chat.completions.create(params);
+    const duration = Date.now() - startTime;
+    console.log(`AgentMode: LLM call completed [model=${model}, duration=${duration}ms, tokens=${res.usage?.total_tokens || 'N/A'}]`);
     return res;
   }
 
@@ -697,6 +700,10 @@ export class AgentModeService {
         await new Promise(resolve => setImmediate(resolve));
         responseMessage = response.choices[0].message;
 
+        // Log per-iteration summary for performance diagnostics
+        const toolNames = responseMessage.tool_calls?.map((tc: any) => tc.function.name).join(', ') || 'none';
+        console.log(`AgentMode: Iteration ${iteration} [model=${llmModel}, tools=${toolNames}, sessionId=${sessionId}]`);
+
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
         if (typeof responseMessage.content === 'string') {
@@ -781,7 +788,10 @@ export class AgentModeService {
                 skillsUpdated = true;
             }
 
+            const toolStart = Date.now();
             const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
+            const toolDuration = Date.now() - toolStart;
+            console.log(`AgentMode: Tool executed [name=${toolCall.function.name}, duration=${toolDuration}ms, sessionId=${sessionId}]`);
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
 
             toolCalls.push({
