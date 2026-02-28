@@ -25,6 +25,13 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   }
 }));
 
+jest.mock('../services/agentModeService', () => ({
+  agentModeService: {
+    generateSessionTitle: jest.fn().mockResolvedValue('Test Session Title'),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([])
+  }
+}));
+
 jest.mock('../utils/sseProgress', () => ({
   emitProgress: jest.fn(),
   registerProgressCallback: jest.fn(),
