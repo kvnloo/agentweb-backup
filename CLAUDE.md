@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **IMPORTANT:** This project follows the global development rules defined in `~/.claude/CLAUDE.md`. When conflicts arise, these project-specific rules take precedence.
 
+### Rule 0: Always Use Worktrees
+
+**CRITICAL:** Multiple agents work on this codebase in parallel. To avoid breaking other agents' work:
+
+1. **Always start work in a worktree.** Use the `EnterWorktree` tool at the beginning of every session before making any changes.
+2. **NEVER switch branches** (`git checkout`, `git switch`) in the main working directory.
+3. **NEVER stash** another agent's changes — this silently reverts their files and causes data loss.
+4. **Applies to all repos** including the customer portal at `../agentweb-customer-portal/`.
+
+Worktrees give each agent an isolated copy of the repo so edits never collide.
+
 ### Rule 1: Design Before Code
 
 Before writing implementation code:
