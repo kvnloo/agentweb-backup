@@ -25,6 +25,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Image generation now automatically retries on transient API errors (503 overload, 429 rate limit) with exponential backoff',
       '- Up to 3 attempts with increasing delays (3s → 6s → 12s) before failing, reducing "high demand" errors during peak usage',
       '- Applies to all image generation providers (Gemini, GPT Image, Azure AI)',
+      'Agent Mode: Faster Tool Execution',
+      '- Tools called in the same iteration now execute in parallel instead of one-at-a-time, reducing wait time when multiple tools run together',
+      '- Added per-turn performance logging for LLM calls, iterations, and tool execution to help diagnose slow sessions',
     ],
   },
   {
