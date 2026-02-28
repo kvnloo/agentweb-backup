@@ -754,14 +754,18 @@ export class AgentModeService {
           });
         }
 
-        // Execute tool calls
-        // Collect tool call counts for batched DB update (reduces N writes to 1)
+        // Execute tool calls in parallel for performance
+        // When the LLM returns multiple tool_calls in one response, they are independent
+        // and can run concurrently instead of sequentially.
         const pendingCounterUpdates: Record<string, number> = {};
+        const failedCounterUpdates: Record<string, number> = {};
+
+        // Phase 1: Validate and prepare tool calls (synchronous)
+        const preparedCalls: Array<{ toolCall: any; functionArgs: any }> = [];
 
         for (const toolCall of responseMessage.tool_calls) {
-          let functionArgs: any;
           try {
-            functionArgs = JSON.parse(toolCall.function.arguments);
+            const functionArgs = JSON.parse(toolCall.function.arguments);
 
             // Enforce skill-based tool access: reject calls to tools not in allowedToolNames.
             // LLMs may hallucinate tool calls from conversation history even when the tool
@@ -788,10 +792,43 @@ export class AgentModeService {
                 skillsUpdated = true;
             }
 
-            const toolStart = Date.now();
+            preparedCalls.push({ toolCall, functionArgs });
+          } catch (error) {
+            // JSON parse failure — append error message for LLM
+            console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
+            const errMsg = error instanceof Error ? error.message : String(error);
+            const errorContent = this.formatToolError(toolCall.function.name, `Failed to parse arguments: ${errMsg}`);
+            (messages as any[]).push({
+              tool_call_id: toolCall.id,
+              role: 'tool',
+              name: toolCall.function.name,
+              content: errorContent,
+              metadata: { timestamp: new Date().toISOString() }
+            });
+          }
+        }
+
+        // Phase 2: Execute all prepared tools in parallel
+        const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
+          const toolStart = Date.now();
+          try {
             const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             const toolDuration = Date.now() - toolStart;
             console.log(`AgentMode: Tool executed [name=${toolCall.function.name}, duration=${toolDuration}ms, sessionId=${sessionId}]`);
+            return { status: 'success' as const, toolCall, functionArgs, result };
+          } catch (error) {
+            const toolDuration = Date.now() - toolStart;
+            console.error(`AgentMode: Tool execution error for ${toolCall.function.name} (${toolDuration}ms):`, error);
+            return { status: 'error' as const, toolCall, functionArgs, error };
+          }
+        });
+
+        const toolResults = await Promise.all(toolPromises);
+
+        // Phase 3: Process results in original order — append to messages, toolCalls, counters
+        for (const toolResult of toolResults) {
+          if (toolResult.status === 'success') {
+            const { toolCall, functionArgs, result } = toolResult;
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
 
             toolCalls.push({
@@ -801,22 +838,9 @@ export class AgentModeService {
               result: minimalResult
             });
 
-            // Send progress update: tool executed
-            // Explicitly clear pendingTools to indicate this tool is done
-            if (onProgress) {
-              onProgress({
-                iteration,
-                status: 'tool_executed',
-                toolCalls: toolCalls.slice(),
-                pendingTools: [] // Clear pending tools to indicate this tool completed
-              });
-            }
-
-            // Collect for batched counter update instead of immediate DB write
             pendingCounterUpdates[toolCall.function.name] =
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
-            // Append the tool call result as a tool message for the model to consume next
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
             (messages as any[]).push({
               tool_call_id: toolCall.id,
@@ -825,40 +849,20 @@ export class AgentModeService {
               content: toolContent,
               metadata: { timestamp: new Date().toISOString() }
             });
-
-            // Tool results are now included in the tool message content above
-          } catch (error) {
-            console.error(`AgentMode: Tool execution error for ${toolCall.function.name}:`, error);
+          } else {
+            const { toolCall, functionArgs, error } = toolResult;
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs || toolCall.function.arguments,
               error: error instanceof Error ? error.message : 'Unknown error'
             });
-            
-            // Send progress update: tool failed (clear pendingTools)
-            if (onProgress) {
-              onProgress({
-                iteration,
-                status: 'tool_executed',
-                toolCalls: toolCalls.slice(),
-                pendingTools: [] // Clear pending tools even on error
-              });
-            }
-            
-            // Update the failedFunctions counter immediately after failed tool call
-            try {
-              await chatbotDb.incrementFailedFunctions(sessionId, { [toolCall.function.name]: 1 });
-            } catch (counterError) {
-              console.error('AgentMode: Failed to update failed function call counter:', counterError);
-              // Don't fail the whole tool call if counter update fails
-            }
 
-            // Ensure LLM receives the error to adjust its plan
+            failedCounterUpdates[toolCall.function.name] =
+              (failedCounterUpdates[toolCall.function.name] || 0) + 1;
+
             const errMsg = error instanceof Error ? error.message : String(error);
             const errorContent = this.formatToolError(toolCall.function.name, errMsg);
-
-            // Append error as tool message
             messages.push({
               tool_call_id: toolCall.id,
               role: 'tool',
@@ -866,6 +870,25 @@ export class AgentModeService {
               content: errorContent,
               metadata: { timestamp: new Date().toISOString() }
             });
+          }
+        }
+
+        // Send progress update after all tools complete
+        if (onProgress) {
+          onProgress({
+            iteration,
+            status: 'tool_executed',
+            toolCalls: toolCalls.slice(),
+            pendingTools: []
+          });
+        }
+
+        // Update failed function counters (batched)
+        if (Object.keys(failedCounterUpdates).length > 0) {
+          try {
+            await chatbotDb.incrementFailedFunctions(sessionId, failedCounterUpdates);
+          } catch (counterError) {
+            console.error('AgentMode: Failed to update failed function call counter:', counterError);
           }
         }
 
