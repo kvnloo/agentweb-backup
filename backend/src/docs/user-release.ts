@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-28',
     changes: [
+      'Images: Nano Banana 2 (Gemini 3.1 Flash) Model Support',
+      '- Added gemini-3.1-flash-image-preview as a new image generation model, available in the Images page model selector and agent mode',
+      '- Supports the same quality settings (Low 1k, Medium 2k, High 4k) and aspect ratios as Gemini 3 Pro',
       'Admin: Timing Visibility in Debug Chats',
       '- Assistant messages in Debug Chat now show a blue "Xs LLM" chip summarizing total LLM time per response',
       '- Tool call names display their execution duration inline (e.g., "search_web 1.5s")',
