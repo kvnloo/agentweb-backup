@@ -1,3 +1,76 @@
+# February 27, 2026: Agent Mode LLM Performance — Opus vs Sonnet Timing Investigation
+
+**Problem:** A customer session (`5b1c1270-57b8-4de0-95c7-a787115b965e`) on `anthropic.claude-opus-4-6-v1` took ~49 minutes (29 min system time). No per-turn timing instrumentation existed to diagnose which LLM turns were slow.
+
+**Investigation:**
+
+Added per-turn timing instrumentation to `agentModeService.ts`:
+1. **`callLLM()` timing** — logs model name, duration, token count after every LLM API call
+2. **Iteration summary** — logs iteration number, model, tool names, sessionId per agent loop turn
+3. **Tool execution timing** — logs tool name, duration, sessionId per tool call
+
+Log format examples:
+```
+AgentMode: LLM call completed [model=anthropic.claude-opus-4-6-v1, duration=2883ms, tokens=N/A]
+AgentMode: Iteration 1 [model=anthropic.claude-opus-4-6-v1, tools=search_web, sessionId=abc123]
+AgentMode: Tool executed [name=search_web, duration=549ms, sessionId=abc123]
+```
+
+**Benchmark — same prompt ("What are the top 3 B2B lead generation strategies for SaaS companies?"):**
+
+| Metric | Opus (`claude-opus-4-6-v1`) | Sonnet (`claude-sonnet-4-6`) |
+|---|---|---|
+| LLM call 1 | 2,883ms | 1,829ms |
+| LLM call 2 | 2,808ms | 9,800ms (final) |
+| LLM call 3 (final) | 19,656ms | — |
+| Iterations | 3 | 2 |
+| Tools used | search_web, read_page_source ×2 | install_skills |
+| **Total wall clock** | **~28.3s** | **~11.8s** |
+
+**Finding:** Opus is ~2.4x slower than Sonnet. The biggest bottleneck is the final response generation (19.6s vs 9.8s for Sonnet). Opus also uses more tools (3 iterations vs 2), compounding latency from extra LLM calls + tool execution.
+
+**Performance improvement — parallel tool execution:** Tools within a single iteration were executed sequentially. When the LLM returns multiple tool_calls in one response, they are independent and can run concurrently. Changed the tool execution loop from sequential `for...await` to `Promise.all()` for parallel execution.
+
+**Before/after comparison (Opus, Iteration 2 with 2× `read_page_source`):**
+
+| | Before (sequential) | After (parallel) |
+|---|---|---|
+| read_page_source #1 | 1,208ms | 80ms |
+| read_page_source #2 | 1,216ms | 1,291ms |
+| **Tool phase wall clock** | **2,424ms** (sum) | **~1,291ms** (max) |
+
+The parallel version runs both tools concurrently, so wall clock = max(individual durations) instead of sum. Savings grow with more concurrent tools and longer-running tools. In a full work plan session with dozens of multi-tool iterations, this compounds significantly.
+
+**Full Opus session comparison (same prompt, same model):**
+
+| Metric | Before (`abd13579`) | After (`240300f7`) |
+|---|---|---|
+| LLM call 1 | 2,883ms | 2,933ms |
+| LLM call 2 | 2,808ms | 2,875ms |
+| LLM call 3 (final) | 19,656ms | 19,177ms |
+| Tool: search_web | 549ms | 347ms |
+| Tool: read_page_source ×2 | 1,208 + 1,216ms (seq) | 80 + 1,291ms (parallel) |
+| **Tool phase Iter 2** | **~2,424ms** | **~1,291ms** |
+
+LLM call durations are consistent (network/model variability). The tool execution phase in Iteration 2 dropped from ~2.4s to ~1.3s — a **~47% reduction** in that phase.
+
+**Heavy-context benchmark — production session `5b1c1270` (97 messages, "Facebook Marketing Strategy"):**
+
+Same follow-up prompt ("Summarize the key findings from this session and give me 3 actionable next steps") sent to both models on the same session context:
+
+| Model | LLM Call Duration | Tools | Relative |
+|---|---|---|---|
+| Opus | 29,855ms | none | 1.24x slower |
+| Sonnet | 24,047ms | none | baseline |
+
+On a heavy-context session, Opus is ~24% slower per LLM call — a smaller gap than the 2.4x on lightweight prompts because input processing (not generation) dominates. Across a full work plan with 20-30 iterations, this ~6s/call overhead compounds to minutes of extra wall time. Combined with Opus's tendency to use more tools per turn (3 iterations vs 2 in the lightweight test), total session time difference can be 2x+.
+
+**Files changed:**
+- `backend/src/services/agentModeService.ts` — timing logs + parallel tool execution
+- `backend/src/__tests__/agentModeService.llmTiming.test.ts` — 10 tests (timing instrumentation + parallel execution)
+
+---
+
 # February 26, 2026: Instagram Business Login — "Unsupported request" in Production
 
 **Symptom:** Connecting an Instagram Business account via Connected Accounts failed in production with `IGApiException` code 100: `"Unsupported request - method type: get"`. Both `getLongLivedToken` (`graph.instagram.com/.../access_token`) and `getInstagramBusinessMe` (`graph.instagram.com/.../me`) returned the same error. The initial OAuth token exchange (POST to `api.instagram.com/oauth/access_token`) succeeded.

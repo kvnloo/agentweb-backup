@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-28',
+    changes: [
+      'Admin: Timing Visibility in Debug Chats',
+      '- Assistant messages in Debug Chat now show a blue "Xs LLM" chip summarizing total LLM time per response',
+      '- Tool call names display their execution duration inline (e.g., "search_web 1.5s")',
+      '- A per-iteration timing breakdown box shows LLM time and tool names for each iteration',
+      '- Chat History table includes a new "Longest Wait" column showing the slowest response per session',
+      '- Wait times over 60s are highlighted red, over 30s highlighted orange, for quick slow-session triage',
+    ],
+  },
+  {
     date: '2026-02-27',
     changes: [
       'Images: Batch Send for Review',
@@ -25,6 +36,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Image generation now automatically retries on transient API errors (503 overload, 429 rate limit) with exponential backoff',
       '- Up to 3 attempts with increasing delays (3s → 6s → 12s) before failing, reducing "high demand" errors during peak usage',
       '- Applies to all image generation providers (Gemini, GPT Image, Azure AI)',
+      'Agent Mode: Faster Tool Execution',
+      '- Tools called in the same iteration now execute in parallel instead of one-at-a-time, reducing wait time when multiple tools run together',
+      '- Added per-turn performance logging for LLM calls, iterations, and tool execution to help diagnose slow sessions',
     ],
   },
   {

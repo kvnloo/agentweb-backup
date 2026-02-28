@@ -427,6 +427,13 @@ const ChatDialog = ({
                           </Box>
                         </Tooltip>
                       )}
+                      {msg.role === "assistant" && msg.metadata?.iterationTimings && (
+                        <Chip
+                          label={`${(msg.metadata.iterationTimings.reduce((sum: number, t: any) => sum + t.llmDurationMs, 0) / 1000).toFixed(1)}s LLM`}
+                          size="small"
+                          sx={{ fontSize: '0.65rem', height: '18px', ml: 0.5, backgroundColor: 'rgba(25, 118, 210, 0.1)', color: '#1976d2' }}
+                        />
+                      )}
                     </Typography>
                     <Box
                       sx={{
@@ -471,6 +478,14 @@ const ChatDialog = ({
                             <Box key={toolIndex} sx={{ mt: 1, p: 1, backgroundColor: "rgba(0, 0, 0, 0.03)", borderRadius: 1 }}>
                               <Typography variant="caption" sx={{ fontWeight: "bold" }}>
                                 {toolCall.function?.name || toolCall.name}
+                                {(() => {
+                                  const tc = msg.metadata?.toolCalls?.find((tc: any) => tc.id === toolCall.id || tc.name === (toolCall.function?.name || toolCall.name));
+                                  return tc?.duration != null ? (
+                                    <span style={{ fontWeight: 'normal', color: '#666', marginLeft: '8px' }}>
+                                      {(tc.duration / 1000).toFixed(1)}s
+                                    </span>
+                                  ) : null;
+                                })()}
                               </Typography>
                               {toolCall.function?.arguments && (
                                 <pre style={{ fontSize: "0.75rem", margin: "4px 0 0 0", overflowX: "auto" }}>
@@ -481,7 +496,22 @@ const ChatDialog = ({
                           ))}
                         </Box>
                       )}
-                      
+
+                      {/* Display iteration timing breakdown */}
+                      {msg.role === "assistant" && msg.metadata?.iterationTimings?.length > 0 && (
+                        <Box sx={{ mt: 1, p: 1, backgroundColor: 'rgba(25, 118, 210, 0.04)', borderRadius: 1 }}>
+                          <Typography variant="caption" color="text.secondary" sx={{ fontWeight: "bold" }}>
+                            Timing ({msg.metadata.iterationTimings.length} iteration{msg.metadata.iterationTimings.length > 1 ? 's' : ''}):
+                          </Typography>
+                          {msg.metadata.iterationTimings.map((timing: any, i: number) => (
+                            <Typography key={i} variant="caption" component="div" sx={{ ml: 1, color: 'text.secondary' }}>
+                              Iter {timing.iteration}: {(timing.llmDurationMs / 1000).toFixed(1)}s LLM
+                              {timing.toolNames?.length > 0 && ` → ${timing.toolNames.join(', ')}`}
+                            </Typography>
+                          ))}
+                        </Box>
+                      )}
+
                       {/* Display tool message content */}
                       {msg.role === "tool" && (
                         <Box sx={{ mt: 1 }}>
@@ -4170,7 +4200,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={9} align="center">
+                    <TableCell colSpan={10} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4402,6 +4432,7 @@ export default function AdminDashboard() {
                   <TableCell>Created At</TableCell>
                   <TableCell>Updated At</TableCell>
                   <TableCell>Message Count</TableCell>
+                  <TableCell>Longest Wait</TableCell>
                   <TableCell>Feedback</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -4409,7 +4440,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={9} align="center">
+                    <TableCell colSpan={10} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4511,6 +4542,19 @@ export default function AdminDashboard() {
                         </TableCell>
                         <TableCell>
                           {(() => {
+                            const waitTimes = (session.messages || [])
+                              .filter((msg: any) => msg?.role === 'assistant' && msg?.metadata?.iterationTimings?.length > 0)
+                              .map((msg: any) => msg.metadata.iterationTimings.reduce((sum: number, t: any) => sum + (t.llmDurationMs || 0), 0));
+                            if (waitTimes.length === 0) return <span style={{ color: '#999' }}>-</span>;
+                            const maxWaitMs = Math.max(...waitTimes);
+                            const maxWaitSec = maxWaitMs / 1000;
+                            const label = maxWaitSec >= 60 ? `${(maxWaitSec / 60).toFixed(1)}m` : `${maxWaitSec.toFixed(1)}s`;
+                            const color = maxWaitSec > 60 ? '#d32f2f' : maxWaitSec > 30 ? '#ed6c02' : '#666';
+                            return <span style={{ color, fontWeight: maxWaitSec > 30 ? 'bold' : 'normal' }}>{label}</span>;
+                          })()}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
                             const likes = session.messages?.filter((msg: any) =>
                               msg?.role === 'assistant' && msg?.metadata?.feedback?.type === 'like'
                             ).length || 0;
@@ -4599,7 +4643,7 @@ export default function AdminDashboard() {
                     ))}
                     {chatSessionsLoading && (
                       <TableRow>
-                        <TableCell colSpan={9} align="center">
+                        <TableCell colSpan={10} align="center">
                           <CircularProgress size={24} />
                         </TableCell>
                       </TableRow>

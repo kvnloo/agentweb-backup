@@ -117,7 +117,7 @@
       "Bash(git:*)",
       "Bash(gh run:*)",
       "mcp__playwright__browser_hover",
-      "Bash(gh release:*)"
+      "Bash(gh release:*)",
       "Bash(grep META_API_VERSION:*)",
       "Bash(cd:*)",
       "mcp__playwright__browser_fill_form",
