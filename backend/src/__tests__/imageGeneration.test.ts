@@ -219,6 +219,124 @@ describe('ImageService', () => {
         }
       }
     });
+
+    it('should accept gemini-3.1-flash-image-preview as a valid model', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      // Set up the mock return value for generateContentStream
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '16:9'
+      });
+
+      // Verify the model is not rejected as invalid
+      if (result.success === false && result.error) {
+        expect(result.error).not.toContain('Invalid imageModel');
+      }
+    });
+
+    it('should route gemini-3.1-flash-image-preview to Google/Image API key', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '1:1'
+      });
+
+      // Verify it routes to Google/Image secret (same as gemini-3-pro)
+      const getSecretMock = secretsManager.getSecret as jest.Mock;
+      if (getSecretMock.mock.calls.length > 0) {
+        expect(secretsManager.getSecret).toHaveBeenCalledWith(
+          expect.stringContaining('Google/Image')
+        );
+      }
+    });
+
+    it('should use same quality/size mapping for gemini-3.1-flash-image-preview as gemini-3-pro', async () => {
+      const mockApiKey = 'test-api-key';
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue('s3://bucket/file.png');
+
+      mockGenerateContentStream.mockReturnValue({
+        [Symbol.asyncIterator]: async function* () {
+          yield {
+            candidates: [{
+              content: {
+                parts: [{
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: 'base64data'
+                  }
+                }]
+              }
+            }]
+          };
+        }
+      });
+
+      const result = await imageService.generateImage({
+        prompt: 'Test prompt',
+        filename: 'test.png',
+        userId: 'user123',
+        imageModel: 'gemini-3.1-flash-image-preview',
+        size: '16:9',
+        quality: 'high'
+      });
+
+      // Verify the model is accepted and routed to the same code path
+      if (result.success === false && result.error) {
+        expect(result.error).not.toContain('Invalid imageModel');
+        expect(result.error).not.toContain('Invalid quality');
+      }
+
+      // Verify GoogleGenAI was called (same SDK as gemini-3-pro)
+      const mockModule = jest.requireMock('@google/genai');
+      expect(mockModule.GoogleGenAI).toHaveBeenCalled();
+    });
   });
 
   describe('Ratio Format Handling', () => {

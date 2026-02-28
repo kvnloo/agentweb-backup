@@ -15,6 +15,7 @@ const SUPPORTED_MODELS = [
   "gpt-image-1",
   "gemini-2.5-flash-image",
   "gemini-3-pro-image-preview",
+  "gemini-3.1-flash-image-preview",
   "gen4_image",
   "gemini_2.5_flash",
 ] as const;
@@ -80,7 +81,7 @@ export class ImageService {
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Azure/Image" 
           : "prod/AgentWeb/Azure/Image";
-      } else if (model === "gemini-2.5-flash-image" || model === "gemini-3-pro-image-preview") {
+      } else if (model === "gemini-2.5-flash-image" || model === "gemini-3-pro-image-preview" || model === "gemini-3.1-flash-image-preview") {
         // Google Gemini
         secretName = process.env.NODE_ENV === "development" 
           ? "dev/AgentWeb/Google/Image" 
@@ -190,7 +191,7 @@ export class ImageService {
           result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image") {
           result = await this.generateWithGoogleGemini(params);
-        } else if (modelToUse === "gemini-3-pro-image-preview") {
+        } else if (modelToUse === "gemini-3-pro-image-preview" || modelToUse === "gemini-3.1-flash-image-preview") {
           result = await this.generateWithGoogleGemini3Pro(params);
         } else if (modelToUse === "gen4_image" || modelToUse === "gemini_2.5_flash") {
           result = await this.generateWithRunwayML(params, modelToUse);
@@ -804,12 +805,13 @@ export class ImageService {
     try {
       const { GoogleGenAI } = require('@google/genai');
       
-      const apiKey = await this.getApiKey("gemini-3-pro-image-preview");
+      const modelId = params.imageModel || 'gemini-3-pro-image-preview';
+      const apiKey = await this.getApiKey(modelId);
       const ai = new GoogleGenAI({
         apiKey: apiKey,
       });
 
-      const model = 'gemini-3-pro-image-preview';
+      const model = modelId;
       const inputImageCount = params.inputImages ? params.inputImages.length : 0;
       
       // Convert size to aspect ratio
