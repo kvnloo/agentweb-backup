@@ -54,6 +54,17 @@ The parallel version runs both tools concurrently, so wall clock = max(individua
 
 LLM call durations are consistent (network/model variability). The tool execution phase in Iteration 2 dropped from ~2.4s to ~1.3s — a **~47% reduction** in that phase.
 
+**Heavy-context benchmark — production session `5b1c1270` (97 messages, "Facebook Marketing Strategy"):**
+
+Same follow-up prompt ("Summarize the key findings from this session and give me 3 actionable next steps") sent to both models on the same session context:
+
+| Model | LLM Call Duration | Tools | Relative |
+|---|---|---|---|
+| Opus | 29,855ms | none | 1.24x slower |
+| Sonnet | 24,047ms | none | baseline |
+
+On a heavy-context session, Opus is ~24% slower per LLM call — a smaller gap than the 2.4x on lightweight prompts because input processing (not generation) dominates. Across a full work plan with 20-30 iterations, this ~6s/call overhead compounds to minutes of extra wall time. Combined with Opus's tendency to use more tools per turn (3 iterations vs 2 in the lightweight test), total session time difference can be 2x+.
+
 **Files changed:**
 - `backend/src/services/agentModeService.ts` — timing logs + parallel tool execution
 - `backend/src/__tests__/agentModeService.llmTiming.test.ts` — 10 tests (timing instrumentation + parallel execution)
