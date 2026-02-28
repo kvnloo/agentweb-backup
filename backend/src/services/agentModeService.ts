@@ -534,10 +534,7 @@ export class AgentModeService {
       throw new Error(`Failed to initialize client for model: ${model}`);
     }
 
-    const startTime = Date.now();
     const res = await client.chat.completions.create(params);
-    const duration = Date.now() - startTime;
-    console.log(`AgentMode: LLM call completed [model=${model}, duration=${duration}ms, tokens=${res.usage?.total_tokens || 'N/A'}]`);
     return res;
   }
 
@@ -601,6 +598,7 @@ export class AgentModeService {
       const toolCalls: any[] = [];
       const knowledgeBaseQueries: string[] = [];
       const sources: string[] = [];
+      const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
 
       // Remember initial message count to slice response messages later
       let initialMessageCount = messages.length;
@@ -688,21 +686,23 @@ export class AgentModeService {
         }
 
         // Make LLM call
+        const llmStart = Date.now();
         const response: any = await this.callLLM(llmModel, messages, {
           tools: filteredToolsCache,
           tool_choice: 'auto',
           max_completion_tokens: 12384,
           temperature: 0.1
         });
+        const llmDurationMs = Date.now() - llmStart;
 
         // Yield control back to event loop after LLM call to allow health checks and other requests
         // This prevents blocking the main thread during long-running generateResponse operations
         await new Promise(resolve => setImmediate(resolve));
         responseMessage = response.choices[0].message;
 
-        // Log per-iteration summary for performance diagnostics
-        const toolNames = responseMessage.tool_calls?.map((tc: any) => tc.function.name).join(', ') || 'none';
-        console.log(`AgentMode: Iteration ${iteration} [model=${llmModel}, tools=${toolNames}, sessionId=${sessionId}]`);
+        // Record per-iteration timing for metadata
+        const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
+        iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
 
         // Extract content - handle both string and array formats (Claude returns array)
         let responseContent = '';
@@ -814,12 +814,10 @@ export class AgentModeService {
           try {
             const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             const toolDuration = Date.now() - toolStart;
-            console.log(`AgentMode: Tool executed [name=${toolCall.function.name}, duration=${toolDuration}ms, sessionId=${sessionId}]`);
-            return { status: 'success' as const, toolCall, functionArgs, result };
+            return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
           } catch (error) {
             const toolDuration = Date.now() - toolStart;
-            console.error(`AgentMode: Tool execution error for ${toolCall.function.name} (${toolDuration}ms):`, error);
-            return { status: 'error' as const, toolCall, functionArgs, error };
+            return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
           }
         });
 
@@ -828,14 +826,15 @@ export class AgentModeService {
         // Phase 3: Process results in original order — append to messages, toolCalls, counters
         for (const toolResult of toolResults) {
           if (toolResult.status === 'success') {
-            const { toolCall, functionArgs, result } = toolResult;
+            const { toolCall, functionArgs, result, duration } = toolResult;
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
 
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs,
-              result: minimalResult
+              result: minimalResult,
+              duration
             });
 
             pendingCounterUpdates[toolCall.function.name] =
@@ -850,12 +849,13 @@ export class AgentModeService {
               metadata: { timestamp: new Date().toISOString() }
             });
           } else {
-            const { toolCall, functionArgs, error } = toolResult;
+            const { toolCall, functionArgs, error, duration } = toolResult;
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs || toolCall.function.arguments,
-              error: error instanceof Error ? error.message : 'Unknown error'
+              error: error instanceof Error ? error.message : 'Unknown error',
+              duration
             });
 
             failedCounterUpdates[toolCall.function.name] =
@@ -909,14 +909,16 @@ export class AgentModeService {
         console.warn('AgentMode: Reached maximum tool execution iterations');
       }
 
-      // Add tool calls data to the last message for frontend display
-      if (toolCalls.length > 0 && messages.length > 0) {
-        const lastMessage = messages[messages.length - 1];
-        if (lastMessage.role === 'assistant') {
+      // Attach timing metadata and tool calls to the last assistant message
+      if (messages.length > 0) {
+        const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
+        if (lastAssistantIdx < messages.length) {
+          const lastMessage = messages[lastAssistantIdx];
           lastMessage.metadata = {
             ...lastMessage.metadata,
-            toolCalls: toolCalls,
             timestamp: new Date().toISOString(),
+            iterationTimings,
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
           };
         }
       }

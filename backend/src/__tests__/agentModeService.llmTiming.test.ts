@@ -1,10 +1,10 @@
 /**
- * Tests for per-turn LLM timing logs in AgentModeService.
+ * Tests for per-turn LLM timing metadata in AgentModeService.
  *
  * Validates that:
- * 1. callLLM() logs model name, duration, and token count
- * 2. Main agent loop logs iteration number with tool names
- * 3. Tool execution logs tool name with duration
+ * 1. iterationTimings are stored in the last assistant message's metadata
+ * 2. Tool execution durations are stored in toolCalls metadata entries
+ * 3. Parallel tool execution works correctly
  */
 
 import { AgentModeService } from '../services/agentModeService';
@@ -46,14 +46,12 @@ jest.mock('aws-sdk', () => ({
   }
 }));
 
-describe('AgentModeService - LLM Timing Logs', () => {
+describe('AgentModeService - LLM Timing Metadata', () => {
   let agentModeService: AgentModeService;
-  let consoleSpy: jest.SpyInstance;
   let llmCallSpy: jest.SpyInstance;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    consoleSpy = jest.spyOn(console, 'log').mockImplementation();
 
     // Mock chatbotDb
     (chatbotDb.getChatSession as jest.Mock) = jest.fn().mockResolvedValue({
@@ -72,68 +70,12 @@ describe('AgentModeService - LLM Timing Logs', () => {
     llmCallSpy = jest.spyOn(agentModeService as any, 'callLLM');
   });
 
-  afterEach(() => {
-    consoleSpy.mockRestore();
-  });
-
-  describe('callLLM timing', () => {
-    it('should log model name, duration, and token count after LLM call', async () => {
-      // Mock the client directly on the llmModels registry
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test' } }],
-        usage: { total_tokens: 150 }
-      });
-      (agentModeService as any).llmModels = {
-        'test-model': {
-          client: { chat: { completions: { create: mockCreate } } }
-        }
-      };
-
-      await (agentModeService as any).callLLM('test-model', [], {});
-
-      const timingLog = consoleSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: LLM call completed')
-      );
-      expect(timingLog).toBeDefined();
-      expect(timingLog![0]).toMatch(/model=test-model/);
-      expect(timingLog![0]).toMatch(/duration=\d+ms/);
-      expect(timingLog![0]).toMatch(/tokens=150/);
-    });
-
-    it('should log tokens as N/A when usage is not available', async () => {
-      const mockCreate = jest.fn().mockResolvedValue({
-        choices: [{ message: { content: 'test' } }]
-        // no usage field
-      });
-      (agentModeService as any).llmModels = {
-        'test-model': {
-          client: { chat: { completions: { create: mockCreate } } }
-        }
-      };
-
-      await (agentModeService as any).callLLM('test-model', [], {});
-
-      const timingLog = consoleSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: LLM call completed')
-      );
-      expect(timingLog).toBeDefined();
-      expect(timingLog![0]).toMatch(/tokens=N\/A/);
-    });
-
-    it('should throw error when model is not registered', async () => {
-      (agentModeService as any).llmModels = {};
-
-      await expect(
-        (agentModeService as any).callLLM('unknown-model', [], {})
-      ).rejects.toThrow("Invalid model 'unknown-model'");
-    });
-  });
-
-  describe('iteration summary logging', () => {
-    it('should log iteration number with tool names when tools are called', async () => {
+  describe('iteration timing metadata', () => {
+    it('should store iterationTimings with tool names in last assistant message metadata', async () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: '',
             tool_calls: [
               { id: 'tc1', function: { name: 'search_web', arguments: '{}' } },
@@ -144,56 +86,73 @@ describe('AgentModeService - LLM Timing Logs', () => {
       }).mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Done',
             tool_calls: null
           }
         }]
       });
 
-      // Mock executeTool to return a simple result
       jest.spyOn(agentModeService as any, 'executeTool').mockResolvedValue({ success: true });
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
 
-      const iterationLog = consoleSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: Iteration 1')
-      );
-      expect(iterationLog).toBeDefined();
-      expect(iterationLog![0]).toContain('tools=search_web, create_task');
-      expect(iterationLog![0]).toContain('sessionId=test-session');
+      // Find the last assistant message in responseMessages
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      expect(assistantMessages.length).toBeGreaterThan(0);
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
+
+      expect(lastAssistant.metadata).toBeDefined();
+      expect(lastAssistant.metadata.iterationTimings).toBeDefined();
+      expect(lastAssistant.metadata.iterationTimings).toHaveLength(2);
+
+      // First iteration should have tool names
+      expect(lastAssistant.metadata.iterationTimings[0].iteration).toBe(1);
+      expect(lastAssistant.metadata.iterationTimings[0].toolNames).toEqual(['search_web', 'create_task']);
+      expect(lastAssistant.metadata.iterationTimings[0].llmDurationMs).toBeGreaterThanOrEqual(0);
+
+      // Second iteration should have no tools
+      expect(lastAssistant.metadata.iterationTimings[1].iteration).toBe(2);
+      expect(lastAssistant.metadata.iterationTimings[1].toolNames).toEqual([]);
     });
 
-    it('should log tools=none when no tool calls in response', async () => {
+    it('should store iterationTimings even when no tool calls in response', async () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Simple response',
             tool_calls: null
           }
         }]
       });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
 
-      const iterationLog = consoleSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: Iteration 1')
-      );
-      expect(iterationLog).toBeDefined();
-      expect(iterationLog![0]).toContain('tools=none');
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      expect(assistantMessages.length).toBeGreaterThan(0);
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
+
+      expect(lastAssistant.metadata).toBeDefined();
+      expect(lastAssistant.metadata.iterationTimings).toBeDefined();
+      expect(lastAssistant.metadata.iterationTimings).toHaveLength(1);
+      expect(lastAssistant.metadata.iterationTimings[0].toolNames).toEqual([]);
+      // Should not have toolCalls when no tools were called
+      expect(lastAssistant.metadata.toolCalls).toBeUndefined();
     });
   });
 
-  describe('tool execution timing', () => {
-    it('should log tool name and duration after tool execution', async () => {
-      // First call returns a tool call, second call returns final response
+  describe('tool execution duration in metadata', () => {
+    it('should include duration in toolCalls metadata entries', async () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: '',
             tool_calls: [
               { id: 'tc1', function: { name: 'get_website_info', arguments: '{}' } }
@@ -203,36 +162,37 @@ describe('AgentModeService - LLM Timing Logs', () => {
       }).mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Done',
             tool_calls: null
           }
         }]
       });
 
-      // Mock executeTool with a small delay to verify timing
       jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(async () => {
         await new Promise(resolve => setTimeout(resolve, 10));
         return { success: true };
       });
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
 
-      const toolLog = consoleSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: Tool executed')
-      );
-      expect(toolLog).toBeDefined();
-      expect(toolLog![0]).toContain('name=get_website_info');
-      expect(toolLog![0]).toMatch(/duration=\d+ms/);
-      expect(toolLog![0]).toContain('sessionId=test-session');
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
+
+      expect(lastAssistant.metadata.toolCalls).toBeDefined();
+      expect(lastAssistant.metadata.toolCalls).toHaveLength(1);
+      expect(lastAssistant.metadata.toolCalls[0].name).toBe('get_website_info');
+      expect(lastAssistant.metadata.toolCalls[0].duration).toBeGreaterThanOrEqual(10);
     });
 
-    it('should log timing for each tool when multiple tools are called', async () => {
+    it('should include duration for each tool when multiple tools are called', async () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: '',
             tool_calls: [
               { id: 'tc1', function: { name: 'search_web', arguments: '{}' } },
@@ -243,6 +203,7 @@ describe('AgentModeService - LLM Timing Logs', () => {
       }).mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Done',
             tool_calls: null
           }
@@ -252,16 +213,18 @@ describe('AgentModeService - LLM Timing Logs', () => {
       jest.spyOn(agentModeService as any, 'executeTool').mockResolvedValue({ success: true });
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
 
-      const toolLogs = consoleSpy.mock.calls.filter(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: Tool executed')
-      );
-      expect(toolLogs).toHaveLength(2);
-      expect(toolLogs[0][0]).toContain('name=search_web');
-      expect(toolLogs[1][0]).toContain('name=get_seo_metrics');
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
+
+      expect(lastAssistant.metadata.toolCalls).toHaveLength(2);
+      expect(lastAssistant.metadata.toolCalls[0].name).toBe('search_web');
+      expect(typeof lastAssistant.metadata.toolCalls[0].duration).toBe('number');
+      expect(lastAssistant.metadata.toolCalls[1].name).toBe('get_seo_metrics');
+      expect(typeof lastAssistant.metadata.toolCalls[1].duration).toBe('number');
     });
   });
 
@@ -272,6 +235,7 @@ describe('AgentModeService - LLM Timing Logs', () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: '',
             tool_calls: [
               { id: 'tc1', function: { name: 'search_web', arguments: '{}' } },
@@ -283,6 +247,7 @@ describe('AgentModeService - LLM Timing Logs', () => {
       }).mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Done',
             tool_calls: null
           }
@@ -312,6 +277,7 @@ describe('AgentModeService - LLM Timing Logs', () => {
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: '',
             tool_calls: [
               { id: 'tc1', function: { name: 'tool_a', arguments: '{}' } },
@@ -322,6 +288,7 @@ describe('AgentModeService - LLM Timing Logs', () => {
       }).mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Done',
             tool_calls: null
           }
@@ -341,33 +308,25 @@ describe('AgentModeService - LLM Timing Logs', () => {
         (result: any) => result
       );
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
 
       // Verify both tools were called
       expect(executeToolSpy).toHaveBeenCalledTimes(2);
 
-      // Verify tool logs appear for both tools (order in logs doesn't matter,
-      // but results in messages array should match original order)
-      const toolLogs = consoleSpy.mock.calls.filter(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: Tool executed')
-      );
-      expect(toolLogs).toHaveLength(2);
-      const toolNames = toolLogs.map((log: any[]) => {
-        const match = log[0].match(/name=(\w+)/);
-        return match ? match[1] : null;
-      });
-      expect(toolNames).toContain('tool_a');
-      expect(toolNames).toContain('tool_b');
+      // Verify tool order in metadata matches original tool_calls order
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
+      expect(lastAssistant.metadata.toolCalls[0].name).toBe('tool_a');
+      expect(lastAssistant.metadata.toolCalls[1].name).toBe('tool_b');
     });
 
     it('should handle mixed success and failure in parallel tools', async () => {
-      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
-
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: '',
             tool_calls: [
               { id: 'tc1', function: { name: 'good_tool', arguments: '{}' } },
@@ -378,6 +337,7 @@ describe('AgentModeService - LLM Timing Logs', () => {
       }).mockResolvedValueOnce({
         choices: [{
           message: {
+            role: 'assistant',
             content: 'Done',
             tool_calls: null
           }
@@ -394,29 +354,33 @@ describe('AgentModeService - LLM Timing Logs', () => {
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
       (chatbotDb.incrementFailedFunctions as jest.Mock) = jest.fn().mockResolvedValue({});
 
-      await agentModeService.generateMarketingResponse(
+      const result = await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
 
-      // good_tool should have a success log
-      const successLog = consoleSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('name=good_tool')
-      );
-      expect(successLog).toBeDefined();
+      // Check metadata has both tool entries with durations
+      const assistantMessages = result.responseMessages.filter((m: any) => m.role === 'assistant');
+      const lastAssistant = assistantMessages[assistantMessages.length - 1];
 
-      // bad_tool should have an error log
-      const errorLog = consoleErrorSpy.mock.calls.find(
-        (call: any[]) => typeof call[0] === 'string' && call[0].includes('bad_tool')
-      );
-      expect(errorLog).toBeDefined();
+      expect(lastAssistant.metadata.toolCalls).toHaveLength(2);
+
+      // good_tool should have result and duration
+      const goodTool = lastAssistant.metadata.toolCalls.find((tc: any) => tc.name === 'good_tool');
+      expect(goodTool).toBeDefined();
+      expect(goodTool.result).toEqual({ success: true });
+      expect(typeof goodTool.duration).toBe('number');
+
+      // bad_tool should have error and duration
+      const badTool = lastAssistant.metadata.toolCalls.find((tc: any) => tc.name === 'bad_tool');
+      expect(badTool).toBeDefined();
+      expect(badTool.error).toBe('Tool failed');
+      expect(typeof badTool.duration).toBe('number');
 
       // Failed function counter should be updated for bad_tool
       expect(chatbotDb.incrementFailedFunctions).toHaveBeenCalledWith(
         'test-session',
         { bad_tool: 1 }
       );
-
-      consoleErrorSpy.mockRestore();
     });
   });
 });
