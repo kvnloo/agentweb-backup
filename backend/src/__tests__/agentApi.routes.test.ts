@@ -9,6 +9,17 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
+// Mock userDb (subscription gate - always return subscribed user for route tests)
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn().mockResolvedValue({
+      userId: 'test-user-id',
+      email: 'test@example.com',
+      stripe_customer_id: 'cus_test123',
+    }),
+  },
+}));
+
 // Mock agentApiKeyService
 const mockGenerateKey = jest.fn();
 const mockGetKeysByUserId = jest.fn();

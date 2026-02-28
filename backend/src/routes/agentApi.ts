@@ -7,6 +7,7 @@ import {
   AgentApiRequest,
 } from "../middleware/agentApiAuth";
 import { agentApiKeyService } from "../services/agentApiKeyService";
+import { userDb } from "../services/db";
 import { agentToolExecutor } from "../services/agentToolExecutor";
 
 const router = Router();
@@ -23,6 +24,14 @@ router.post(
 
       if (!keyName) {
         return res.status(400).json({ error: "keyName is required" });
+      }
+
+      // Gate key creation behind active subscription
+      const user = await userDb.getUserById(authReq.user.userId);
+      if (!user || !user.stripe_customer_id) {
+        return res.status(403).json({
+          error: "Active subscription required to generate API keys",
+        });
       }
 
       const { rawKey, keyRecord } = await agentApiKeyService.generateKey(
