@@ -988,6 +988,24 @@ KEY_FILE=~/.ssh/my-keypair.pem
 
 A Playwright MCP server is configured via `.mcp.json` in each repo root. Use the `mcp__playwright__browser_*` tools to drive a real browser against the cloud test environment for manual verification (login, delegation, UI interactions). If the tools are not available, restart the Claude Code session to reload MCP servers.
 
+## Notion Integration (Sprint Tasks)
+
+A Notion MCP server is configured via `.mcp.json` in the repo root. Use the `mcp__notion__*` tools to query the **"Sprint Tasks - Argusoft"** Notion database for dev items.
+
+**When the user asks to pull dev items, check sprint tasks, or reference Notion tickets:**
+1. Use `mcp__notion__API-query-data-source` with data source ID `2bf09247-c951-812a-bd0a-000bd4c05bbf`
+2. Filter by status (e.g., `{"property": "Status", "status": {"equals": "To-do"}}`)
+3. Pull task details including title, status, assignee, priority, and description
+4. Present tasks in a clear summary format
+
+**Key IDs:**
+- Database ID: `2bf09247-c951-8122-a327-ee39ef7a6ec7` (for search/retrieve)
+- Data Source ID: `2bf09247-c951-812a-bd0a-000bd4c05bbf` (for queries — use this with `API-query-data-source`)
+
+**Database properties:** Name (title), Status (To-do/Not started/Blocked/In progress/In Review/Done), Priority Level (High/Medium/Low), Sprint, Owner (people), Tags, Sprint Points, Due Date, Blocking/Blocked by (relations), Parent item/Sub-item (relations)
+
+**Setup:** See `dev.md` entry "Notion MCP Integration for Sprint Task Management" for configuration steps. The `.mcp.json` file is gitignored since it contains the API token. If Notion tools are not available, restart Claude Code to reload MCP servers.
+
 ## "Prep Branch for \<topic\>" Command
 
 When the user says **"prep branch for \<topic\>"**:
