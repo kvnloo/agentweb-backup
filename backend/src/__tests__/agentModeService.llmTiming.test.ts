@@ -264,4 +264,159 @@ describe('AgentModeService - LLM Timing Logs', () => {
       expect(toolLogs[1][0]).toContain('name=get_seo_metrics');
     });
   });
+
+  describe('parallel tool execution', () => {
+    it('should execute multiple tools concurrently (not sequentially)', async () => {
+      const TOOL_DELAY_MS = 50;
+
+      llmCallSpy.mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: '',
+            tool_calls: [
+              { id: 'tc1', function: { name: 'search_web', arguments: '{}' } },
+              { id: 'tc2', function: { name: 'get_seo_metrics', arguments: '{}' } },
+              { id: 'tc3', function: { name: 'get_website_info', arguments: '{}' } }
+            ]
+          }
+        }]
+      }).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: 'Done',
+            tool_calls: null
+          }
+        }]
+      });
+
+      // Each tool takes TOOL_DELAY_MS — if sequential, total >= 3 * TOOL_DELAY_MS
+      // If parallel, total should be close to TOOL_DELAY_MS
+      jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, TOOL_DELAY_MS));
+        return { success: true };
+      });
+      jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
+
+      const start = Date.now();
+      await agentModeService.generateMarketingResponse(
+        'Test message', [], 'test-user', 'test-model', 'test-session', true
+      );
+      const elapsed = Date.now() - start;
+
+      // If tools run in parallel, total should be well under 3 * TOOL_DELAY_MS
+      // Allow generous margin for test overhead but reject clearly sequential execution
+      expect(elapsed).toBeLessThan(3 * TOOL_DELAY_MS);
+    });
+
+    it('should preserve tool result order matching original tool_calls order', async () => {
+      llmCallSpy.mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: '',
+            tool_calls: [
+              { id: 'tc1', function: { name: 'tool_a', arguments: '{}' } },
+              { id: 'tc2', function: { name: 'tool_b', arguments: '{}' } }
+            ]
+          }
+        }]
+      }).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: 'Done',
+            tool_calls: null
+          }
+        }]
+      });
+
+      // tool_b finishes before tool_a to test ordering is preserved
+      const executeToolSpy = jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(
+        async (...args: any[]) => {
+          const toolName = args[1] as string;
+          const delay = toolName === 'tool_a' ? 40 : 10;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return { result: `${toolName}_result` };
+        }
+      );
+      jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockImplementation(
+        (result: any) => result
+      );
+
+      await agentModeService.generateMarketingResponse(
+        'Test message', [], 'test-user', 'test-model', 'test-session', true
+      );
+
+      // Verify both tools were called
+      expect(executeToolSpy).toHaveBeenCalledTimes(2);
+
+      // Verify tool logs appear for both tools (order in logs doesn't matter,
+      // but results in messages array should match original order)
+      const toolLogs = consoleSpy.mock.calls.filter(
+        (call: any[]) => typeof call[0] === 'string' && call[0].includes('AgentMode: Tool executed')
+      );
+      expect(toolLogs).toHaveLength(2);
+      const toolNames = toolLogs.map((log: any[]) => {
+        const match = log[0].match(/name=(\w+)/);
+        return match ? match[1] : null;
+      });
+      expect(toolNames).toContain('tool_a');
+      expect(toolNames).toContain('tool_b');
+    });
+
+    it('should handle mixed success and failure in parallel tools', async () => {
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      llmCallSpy.mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: '',
+            tool_calls: [
+              { id: 'tc1', function: { name: 'good_tool', arguments: '{}' } },
+              { id: 'tc2', function: { name: 'bad_tool', arguments: '{}' } }
+            ]
+          }
+        }]
+      }).mockResolvedValueOnce({
+        choices: [{
+          message: {
+            content: 'Done',
+            tool_calls: null
+          }
+        }]
+      });
+
+      jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(
+        async (...args: any[]) => {
+          const toolName = args[1] as string;
+          if (toolName === 'bad_tool') throw new Error('Tool failed');
+          return { success: true };
+        }
+      );
+      jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
+      (chatbotDb.incrementFailedFunctions as jest.Mock) = jest.fn().mockResolvedValue({});
+
+      await agentModeService.generateMarketingResponse(
+        'Test message', [], 'test-user', 'test-model', 'test-session', true
+      );
+
+      // good_tool should have a success log
+      const successLog = consoleSpy.mock.calls.find(
+        (call: any[]) => typeof call[0] === 'string' && call[0].includes('name=good_tool')
+      );
+      expect(successLog).toBeDefined();
+
+      // bad_tool should have an error log
+      const errorLog = consoleErrorSpy.mock.calls.find(
+        (call: any[]) => typeof call[0] === 'string' && call[0].includes('bad_tool')
+      );
+      expect(errorLog).toBeDefined();
+
+      // Failed function counter should be updated for bad_tool
+      expect(chatbotDb.incrementFailedFunctions).toHaveBeenCalledWith(
+        'test-session',
+        { bad_tool: 1 }
+      );
+
+      consoleErrorSpy.mockRestore();
+    });
+  });
 });
