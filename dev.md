@@ -1,3 +1,56 @@
+# February 28, 2026: Notion MCP Integration for Sprint Task Management
+
+**Purpose:** Enable Claude Code to pull dev items directly from the Notion "Sprint Tasks - Argusoft" database via MCP.
+
+**Setup:**
+
+1. **Create a Notion internal integration** at https://www.notion.so/profile/integrations
+   - Choose **"Internal integration"** (not public/OAuth)
+   - Copy the **Internal Integration Secret** (starts with `ntn_`)
+   - No webhooks or redirect URIs needed
+
+2. **Connect the integration to your Notion pages:**
+   - Open the "Sprint Tasks - Argusoft" database in Notion
+   - Click "..." menu (top right) → **Connections** → **Connect to** → select the integration
+   - Repeat for any other pages/databases you want accessible
+
+3. **Configure `.mcp.json`** in the repo root (already gitignored):
+   ```json
+   {
+     "mcpServers": {
+       "notion": {
+         "type": "stdio",
+         "command": "npx",
+         "args": ["-y", "@notionhq/notion-mcp-server"],
+         "env": {
+           "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer <YOUR_NOTION_TOKEN>\",\"Notion-Version\":\"2025-09-03\"}"
+         }
+       }
+     }
+   }
+   ```
+
+4. **Restart Claude Code** to load the new MCP server
+
+**How it works:**
+- The Notion MCP server exposes tools for searching, reading, and querying Notion databases
+- Claude Code calls these tools on demand (pull-based, no webhooks)
+- `.mcp.json` is gitignored since it contains the API token
+
+**Important: Database ID vs Data Source ID:**
+- The Notion API has two ID types: `database_id` and `data_source_id`
+- Use `mcp__notion__API-post-search` with `"filter": {"property": "object", "value": "data_source"}` to find the database
+- For `mcp__notion__API-query-data-source`, use the **data_source_id** (found in relation properties), NOT the database_id
+- Sprint Tasks database ID: `2bf09247-c951-8122-a327-ee39ef7a6ec7`
+- Sprint Tasks data source ID: `2bf09247-c951-812a-bd0a-000bd4c05bbf` (use this for queries)
+
+**Troubleshooting:**
+- If Notion tools aren't available after restart, check `npx @notionhq/notion-mcp-server` runs without errors
+- If queries return empty results, verify the integration is connected to the target page/database in Notion
+- Token rotation: update the `ntn_` token in `.mcp.json` and restart Claude Code
+
+---
+
 # February 27, 2026: Agent Mode LLM Performance — Opus vs Sonnet Timing Investigation
 
 **Problem:** A customer session (`5b1c1270-57b8-4de0-95c7-a787115b965e`) on `anthropic.claude-opus-4-6-v1` took ~49 minutes (29 min system time). No per-turn timing instrumentation existed to diagnose which LLM turns were slow.
