@@ -123,7 +123,9 @@
       "mcp__playwright__browser_fill_form",
       "mcp__playwright__browser_hover",
       "Bash(./test-env/test-env.sh status:*)",
-      "Bash(./test-env/test-env.sh logs:*)"
+      "Bash(./test-env/test-env.sh logs:*)",
+      "mcp__notion__API-post-search",
+      "mcp__notion__API-query-data-source"
     ]
   },
   "enableAllProjectMcpServers": true,

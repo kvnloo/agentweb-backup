@@ -1004,7 +1004,14 @@ A Notion MCP server is configured via `.mcp.json` in the repo root. Use the `mcp
 
 **Database properties:** Name (title), Status (To-do/Not started/Blocked/In progress/In Review/Done), Priority Level (High/Medium/Low), Sprint, Owner (people), Tags, Sprint Points, Due Date, Blocking/Blocked by (relations), Parent item/Sub-item (relations)
 
-**Setup:** See `dev.md` entry "Notion MCP Integration for Sprint Task Management" for configuration steps. The `.mcp.json` file is gitignored since it contains the API token. If Notion tools are not available, restart Claude Code to reload MCP servers.
+**Setup:** The `.mcp.json` file is gitignored since it contains the API token. A template is provided at `.mcp.json.example`. See `dev.md` entry "Notion MCP Integration for Sprint Task Management" for full configuration steps.
+
+**Auto-setup:** If Notion MCP tools are not available or return auth errors:
+1. Check if `.mcp.json` exists — if not, copy from `.mcp.json.example`
+2. Check if it still has the `<YOUR_NOTION_TOKEN>` placeholder
+3. If placeholder found, ask the user for their Notion API token (created at https://www.notion.so/profile/integrations)
+4. Replace the placeholder in `.mcp.json` with the real token
+5. Tell the user to restart Claude Code to load the MCP server
 
 ## "Prep Branch for \<topic\>" Command
 
