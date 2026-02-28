@@ -1,3 +1,42 @@
+# February 27, 2026: Agent Mode LLM Performance — Opus vs Sonnet Timing Investigation
+
+**Problem:** A customer session (`5b1c1270-57b8-4de0-95c7-a787115b965e`) on `anthropic.claude-opus-4-6-v1` took ~49 minutes (29 min system time). No per-turn timing instrumentation existed to diagnose which LLM turns were slow.
+
+**Investigation:**
+
+Added per-turn timing instrumentation to `agentModeService.ts`:
+1. **`callLLM()` timing** — logs model name, duration, token count after every LLM API call
+2. **Iteration summary** — logs iteration number, model, tool names, sessionId per agent loop turn
+3. **Tool execution timing** — logs tool name, duration, sessionId per tool call
+
+Log format examples:
+```
+AgentMode: LLM call completed [model=anthropic.claude-opus-4-6-v1, duration=2883ms, tokens=N/A]
+AgentMode: Iteration 1 [model=anthropic.claude-opus-4-6-v1, tools=search_web, sessionId=abc123]
+AgentMode: Tool executed [name=search_web, duration=549ms, sessionId=abc123]
+```
+
+**Benchmark — same prompt ("What are the top 3 B2B lead generation strategies for SaaS companies?"):**
+
+| Metric | Opus (`claude-opus-4-6-v1`) | Sonnet (`claude-sonnet-4-6`) |
+|---|---|---|
+| LLM call 1 | 2,883ms | 1,829ms |
+| LLM call 2 | 2,808ms | 9,800ms (final) |
+| LLM call 3 (final) | 19,656ms | — |
+| Iterations | 3 | 2 |
+| Tools used | search_web, read_page_source ×2 | install_skills |
+| **Total wall clock** | **~28.3s** | **~11.8s** |
+
+**Finding:** Opus is ~2.4x slower than Sonnet. The biggest bottleneck is the final response generation (19.6s vs 9.8s for Sonnet). Opus also uses more tools (3 iterations vs 2), compounding latency from extra LLM calls + tool execution.
+
+**Performance improvement — parallel tool execution:** Tools within a single iteration were executed sequentially. When the LLM returns multiple tool_calls in one response, they are independent and can run concurrently. Changed the tool execution loop from sequential `for...await` to `Promise.allSettled()` for parallel execution. This eliminates the additive latency when multiple tools are called in the same iteration (e.g., two `read_page_source` calls that each take ~1.2s now run in ~1.2s total instead of ~2.4s).
+
+**Files changed:**
+- `backend/src/services/agentModeService.ts` — timing logs + parallel tool execution
+- `backend/src/__tests__/agentModeService.llmTiming.test.ts` — 7 tests for timing instrumentation
+
+---
+
 # February 26, 2026: Instagram Business Login — "Unsupported request" in Production
 
 **Symptom:** Connecting an Instagram Business account via Connected Accounts failed in production with `IGApiException` code 100: `"Unsupported request - method type: get"`. Both `getLongLivedToken` (`graph.instagram.com/.../access_token`) and `getInstagramBusinessMe` (`graph.instagram.com/.../me`) returned the same error. The initial OAuth token exchange (POST to `api.instagram.com/oauth/access_token`) succeeded.
