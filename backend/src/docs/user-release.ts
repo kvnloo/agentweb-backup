@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-28',
+    changes: [
+      'Settings: API Keys Management',
+      '- New "API Keys" tab in Settings lets you create, view, and revoke API keys for connecting external agents to Emma\'s MCP server',
+      '- API key creation requires an active subscription (Stripe checkout) — non-subscribers see a paywall with subscribe CTA',
+      '- Keys are shown once on creation with a copy button, then displayed as masked values (aw_...abc)',
+      '- Revoke keys instantly with confirmation dialog — revoked keys lose access immediately',
+    ],
+  },
+  {
     date: '2026-02-27',
     changes: [
       'Images: Batch Send for Review',
