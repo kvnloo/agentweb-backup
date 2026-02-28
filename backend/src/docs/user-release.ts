@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-02-28',
+    changes: [
+      'Admin: Timing Visibility in Debug Chats',
+      '- Assistant messages in Debug Chat now show a blue "Xs LLM" chip summarizing total LLM time per response',
+      '- Tool call names display their execution duration inline (e.g., "search_web 1.5s")',
+      '- A per-iteration timing breakdown box shows LLM time and tool names for each iteration',
+      '- Chat History table includes a new "Longest Wait" column showing the slowest response per session',
+      '- Wait times over 60s are highlighted red, over 30s highlighted orange, for quick slow-session triage',
+    ],
+  },
+  {
     date: '2026-02-27',
     changes: [
       'Images: Batch Send for Review',
