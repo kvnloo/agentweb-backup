@@ -29,11 +29,34 @@ AgentMode: Tool executed [name=search_web, duration=549ms, sessionId=abc123]
 
 **Finding:** Opus is ~2.4x slower than Sonnet. The biggest bottleneck is the final response generation (19.6s vs 9.8s for Sonnet). Opus also uses more tools (3 iterations vs 2), compounding latency from extra LLM calls + tool execution.
 
-**Performance improvement — parallel tool execution:** Tools within a single iteration were executed sequentially. When the LLM returns multiple tool_calls in one response, they are independent and can run concurrently. Changed the tool execution loop from sequential `for...await` to `Promise.allSettled()` for parallel execution. This eliminates the additive latency when multiple tools are called in the same iteration (e.g., two `read_page_source` calls that each take ~1.2s now run in ~1.2s total instead of ~2.4s).
+**Performance improvement — parallel tool execution:** Tools within a single iteration were executed sequentially. When the LLM returns multiple tool_calls in one response, they are independent and can run concurrently. Changed the tool execution loop from sequential `for...await` to `Promise.all()` for parallel execution.
+
+**Before/after comparison (Opus, Iteration 2 with 2× `read_page_source`):**
+
+| | Before (sequential) | After (parallel) |
+|---|---|---|
+| read_page_source #1 | 1,208ms | 80ms |
+| read_page_source #2 | 1,216ms | 1,291ms |
+| **Tool phase wall clock** | **2,424ms** (sum) | **~1,291ms** (max) |
+
+The parallel version runs both tools concurrently, so wall clock = max(individual durations) instead of sum. Savings grow with more concurrent tools and longer-running tools. In a full work plan session with dozens of multi-tool iterations, this compounds significantly.
+
+**Full Opus session comparison (same prompt, same model):**
+
+| Metric | Before (`abd13579`) | After (`240300f7`) |
+|---|---|---|
+| LLM call 1 | 2,883ms | 2,933ms |
+| LLM call 2 | 2,808ms | 2,875ms |
+| LLM call 3 (final) | 19,656ms | 19,177ms |
+| Tool: search_web | 549ms | 347ms |
+| Tool: read_page_source ×2 | 1,208 + 1,216ms (seq) | 80 + 1,291ms (parallel) |
+| **Tool phase Iter 2** | **~2,424ms** | **~1,291ms** |
+
+LLM call durations are consistent (network/model variability). The tool execution phase in Iteration 2 dropped from ~2.4s to ~1.3s — a **~47% reduction** in that phase.
 
 **Files changed:**
 - `backend/src/services/agentModeService.ts` — timing logs + parallel tool execution
-- `backend/src/__tests__/agentModeService.llmTiming.test.ts` — 7 tests for timing instrumentation
+- `backend/src/__tests__/agentModeService.llmTiming.test.ts` — 10 tests (timing instrumentation + parallel execution)
 
 ---
 
