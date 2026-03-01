@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-01',
+    changes: [
+      'Images: Ad Inspiration V2',
+      '- Ad Inspiration dialog now includes Brand Guidelines, Business Overview, ICP selection, and Image Model options matching the Create Ad Images configuration',
+      '- When multiple ICPs are selected, separate scheduled chats are created for each ICP so images are tailored per audience',
+      '- Success toast includes a "View Schedules" button linking to the new /scheduled-chats page for easy schedule management',
+      '- /scheduled-chats route added as a direct link to the Scheduled Chats tab in Agent Mode',
+    ],
+  },
+  {
     date: '2026-02-28',
     changes: [
       'Images: Nano Banana 2 (Gemini 3.1 Flash) Model Support',
