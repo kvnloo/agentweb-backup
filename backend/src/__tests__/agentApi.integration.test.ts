@@ -94,6 +94,19 @@ jest.mock('aws-sdk', () => ({
         update: (...args: any[]) => mockUpdate(...args),
       })),
     },
+    S3: jest.fn(() => ({})),
+  },
+}));
+
+// ─── Mock userDb for subscription gate ───
+
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn().mockResolvedValue({
+      userId: 'user-harsha-123',
+      email: 'harsha@agentweb.pro',
+      stripe_customer_id: 'cus_test123',
+    }),
   },
 }));
 
