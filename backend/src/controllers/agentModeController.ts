@@ -863,6 +863,9 @@ async function runScheduledChat(
     );
     const sessionId = testSession.sessionId;
 
+    // Set the session title to the schedule name
+    await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
+
     // Update the session with the selected model from the schedule
     const defaultModel = await agentModeService.getDefaultModel();
     const modelToUse = schedule.llmModel || defaultModel;
@@ -1123,8 +1126,8 @@ export async function generateSessionResponse(
     }
   }
 
-  // If this is the first message, generate session title
-  if (isFirstMessage) {
+  // If this is the first message, generate session title (skip for scheduled sessions which already have a title)
+  if (isFirstMessage && session.sessionType !== 'scheduled') {
     try {
       const title = await agentModeService.generateSessionTitle(userMessage);
       await chatbotDb.updateSessionTitle(sessionId, title);
