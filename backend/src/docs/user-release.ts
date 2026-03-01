@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-02-28',
     changes: [
+      'Emma Agent-to-Agent API',
+      '- External AI agents (Claude Code, OpenClaw, etc.) can now connect to Emma via MCP protocol or REST API',
+      '- REST endpoints: GET /api/v1/agent/tools (discover tools) and POST /api/v1/agent/tools/execute (run tools)',
+      '- API key authentication with SHA-256 hashing, rate limiting (60 req/min), and scope-based access control',
+      '- Public onboarding docs available at /docs/agent-api with step-by-step connection instructions',
       'Settings: API Keys Management',
       '- New "API Keys" tab in Settings lets you create, view, and revoke API keys for connecting external agents to Emma\'s MCP server',
       '- API key creation requires an active subscription (Stripe checkout) — non-subscribers see a paywall with subscribe CTA',
