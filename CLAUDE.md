@@ -341,143 +341,7 @@ Real-time chat functionality in `server.ts`:
 
 ### HTML Template Creation and Email Templates
 
-The platform includes a comprehensive email template system accessible in the customer portal's "Email Templates" section.
-
-#### Creating HTML Templates
-
-**Two main approaches:**
-
-1. **Manual Creation** (Customer Portal UI):
-   - Create templates directly in the Email Templates interface
-   - Enter template name, subject, and HTML content
-   - System automatically detects variables: `{{variable_name}}`
-   - Support for array variables: `{{items_n}}`, `{{items_n_title}}`, `{{items_n_description}}`
-
-2. **AI-Generated Templates** (Agent Mode MCP Tool):
-   - Use `create_html_template` tool in agent mode chat
-   - Provide existing HTML file (S3 URL or raw HTML content)
-   - Claude 4.5 processes and enhances the HTML
-   - Automatically identifies dynamic content and creates variables
-   - Saves directly to Email Templates for editing/preview
-
-#### MCP Tools for HTML/Template Management
-
-**`create_html_template`** - Convert HTML to reusable email template
-```typescript
-// Parameters:
-{
-  html_source: string,        // S3 URL or raw HTML content
-  template_name: string,      // Unique template identifier
-  subject: string,            // Email subject (can include variables)
-  additional_instructions: string  // Optional: how to process HTML
-}
-```
-
-Example usage in agent mode:
-```
-User: "Take this HTML file and create an email template for welcome messages"
-Agent: Uses create_html_template with:
-  - html_source: "https://s3.amazonaws.com/bucket/welcome.html"
-  - template_name: "welcome_email"
-  - subject: "Welcome to {{company_name}}!"
-  - additional_instructions: "Add variables for user name and company"
-```
-
-**`create_html_file`** - Generate standalone HTML file (not template)
-```typescript
-// Parameters:
-{
-  title: string,
-  content_draft: string,
-  format_requirements: string  // Optional styling/structure requirements
-}
-// Returns S3 URL to generated HTML file
-```
-
-**`create_html_from_template`** - Generate HTML from existing template
-```typescript
-// Parameters:
-{
-  template_name: string,
-  llmModel: string,
-  variableValues: { [key: string]: string },
-  arrayVariableValues: { [key: string]: string[] }
-}
-// Uses LLM to perform variable substitution
-// Returns S3 URL to final HTML file
-```
-
-#### Variable System
-
-**Regular Variables:** `{{variable_name}}`
-- Single value substitution
-- Examples: `{{user_name}}`, `{{company_name}}`, `{{email}}`
-
-**Array Variables:** `{{items_n}}` pattern
-- Used for repeating sections (lists, tables, etc.)
-- **REQUIRED Pattern:** Must include exactly three instances: `_1`, `_2`, `_n`
-  - `{{items_1_property}}` - First item
-  - `{{items_2_property}}` - Second item
-  - `{{items_n_property}}` - Array pattern
-- Do NOT use `_3`, `_4`, `_5`, etc. Only `_1`, `_2`, and `_n` are valid
-- This three-part pattern is required for the template system to function properly
-- When using template: provide any number of items (not limited to 2)
-
-**Example Array Variable Pattern:**
-```html
-<!-- In template: REQUIRED three-part pattern -->
-<li>{{products_1_name}} - ${{products_1_price}}</li>
-<li>{{products_2_name}} - ${{products_2_price}}</li>
-<li>{{products_n_name}} - ${{products_n_price}}</li>
-
-<!-- System extracts: products_n_name, products_n_price -->
-<!-- When using: provide any number of items (5, 10, 100...) -->
-```
-
-#### Storage and Access
-
-- **Backend:** Templates stored in DynamoDB settings table
-  - Setting key: `email_templates_${userId}`
-  - Value: JSON array of template objects
-  - Each template includes: name, subject, html_content, variables, arrayVariables, timestamps
-
-- **Frontend:** Email Templates page (customer-portal/src/pages/EmailTemplates.tsx)
-  - Create, edit, delete operations
-  - Live preview in iframe
-  - Variable detection and display
-  - Template selection for HTML generation
-
-- **API Endpoints:**
-  - `GET /api/settings/email-templates` - List user's templates
-  - `POST /api/settings/email-templates` - Create/update template
-  - `DELETE /api/settings/email-templates/:templateName` - Delete template
-
-#### Implementation Details
-
-**Template Creation Flow (create_html_template):**
-1. Read HTML from source (URL fetch or direct content)
-2. Send to Claude 4.5 with system prompt for email template enhancement
-3. LLM identifies dynamic content and adds `{{variable}}` placeholders
-4. Extract all variables using regex: `/\{\{([^}]+)\}\}/g`
-5. Classify variables as regular or array type (based on `_n` pattern)
-6. Save to DynamoDB with metadata
-7. Return success with variable list
-
-**Variable Extraction Logic:**
-- Find all `{{...}}` patterns in HTML and subject
-- Identify array base patterns: `something_n` or `something_n_suffix`
-- Match numeric instances: `something_1`, `something_2`, etc.
-- Separate into regular and array variable lists
-
-**LLM Configuration:**
-- Model: Claude Sonnet 4.5 (`anthropic.claude-sonnet-4-5-20250929-v1:0`)
-- Temperature: 0.8 for creative template enhancement
-- Max tokens: 4000
-- System prompt emphasizes email compatibility, inline styles, responsive design
-
-**Testing:**
-- Tests: `backend/src/__tests__/agentModeService.createHtmlTemplate.test.ts`
-- Covers: HTML content, S3 URL fetching, variable extraction, template updates, error handling
+See `docs/html-templates.md` for the full email template system docs (MCP tools, variable system, storage, implementation details).
 
 ## Agent Engine Architecture
 
@@ -789,75 +653,11 @@ python -m unittest tests.test_task_monitor -v  # Specific test
 
 ## Common Troubleshooting
 
-### Backend Issues
-
-**Port 3001 already in use:**
-```bash
-lsof -ti:3001 | xargs kill -9
-```
-
-**Google OAuth redirect errors:**
-- Check Google Cloud Console redirect URIs match exactly
-- Verify `BACKEND_URL` environment variable
-- For dev: `http://localhost:3001/api/auth/google/callback`
-- For prod: `https://api.agentweb.pro/api/auth/google/callback`
-
-**DynamoDB index missing errors:**
-- Check if GSI exists: `aws dynamodb describe-table --table-name Dev-AW-TaskExecutions --region us-west-2`
-- Create missing index using AWS CLI commands in `dev.md`
-
-### Agent Engine Issues
-
-**Memory system database errors (Azure OpenAI models):**
-```bash
-cd agent-engine
-python memory_fix_v2.py
-```
-
-**Browser initialization failures:**
-```bash
-# Check VNC server (on Google Cloud VM)
-ps aux | grep vnc
-export DISPLAY=:1
-vncserver -kill :1
-tigervncserver :1 -geometry 1920x1080 -depth 24
-```
-
-**Module import errors:**
-```bash
-conda activate agent-engine
-pip install -r requirements.txt
-playwright install chromium
-```
+See `docs/troubleshooting.md` for backend and agent engine troubleshooting guides.
 
 ## Reproducing Production Issues in Dev
 
-To safely investigate a production chat session without touching prod data, copy it to the dev DynamoDB tables and test against the dev/test environment.
-
-### 1. Copy a production session to dev
-
-```bash
-cd backend
-npx ts-node src/scripts/copy-session-to-dev.ts <prodSessionId> <devUserId>
-```
-
-- `<prodSessionId>` — the `sessionId` from production (`AW-ChatSessions`)
-- `<devUserId>` — the user ID in dev that the session should be associated with (find this in the customer portal under Settings → Your Profile)
-
-This copies both the session record and all messages (`AW-ChatMessages` → `Dev-AW-ChatMessages`), remapping `userId` to the dev user. The `sessionId` stays the same so URLs work directly in the test environment.
-
-### 2. Test in the dev/test environment
-
-Open the session in the test environment customer portal at `http://<test-env-ip>:5174/agent-mode/<sessionId>` and reproduce/debug the issue.
-
-### 3. Clean up after testing
-
-```bash
-cd backend
-npx ts-node src/scripts/delete-dev-session.ts <sessionId>
-```
-
-This deletes the session and all its messages from the dev tables.
+See `docs/debug-production.md` for steps to copy prod sessions to dev and test locally.
 
 ## Key Files to Review
 
@@ -899,90 +699,9 @@ For manual testing on test/staging environments:
 
 ## Cloud Test Environment
 
-Ephemeral test environments can be launched on EC2 for manual testing. All files live in `test-env/`.
+Ephemeral EC2 test environments for manual testing. See `docs/cloud-test-env.md` for full setup, usage commands, and architecture.
 
-Each environment is automatically named from the developer's AWS username and repo folder name (e.g., `myuser-agentweb`). Scripts in each clone can only operate that clone's instance — `agentweb/` and `agentweb1/` are fully isolated.
-
-### Prerequisites (One-Time Admin Setup)
-
-```bash
-cd test-env
-./setup-infra.sh
-```
-
-This creates:
-- **Secrets Manager secret** (`agentweb/test-env/backend-env`) — stores backend `.env`
-- **IAM role + instance profile** — EC2 can read the secret
-- Security groups are created per-instance at launch time, locked to the developer's IP
-
-### Developer IAM Policy
-
-Each developer needs the `AgentWebTestEnvDeveloper` inline policy on their IAM user. See `README.md` → "Cloud Test Environment" → "Developer IAM Policy" for the full policy JSON. The policy uses tag-based conditions so developers can only launch/terminate instances tagged `purpose=test-env` (production instances are protected).
-
-### Developer Setup
-
-On first `launch`, the script interactively creates `.test-env.config` and an EC2 key pair. Or create the config manually in repo root:
-
-```
-KEY_NAME=my-keypair
-KEY_FILE=~/.ssh/my-keypair.pem
-```
-
-### Usage
-
-**CRITICAL:** When a test environment is active (check with `./test-env/test-env.sh list`), you MUST run `./test-env/test-env.sh sync` after EVERY code change to deploy it to the instance. Always sync immediately after making changes — do not wait for the user to ask. Sync the specific service that changed (e.g., `sync backend`, `sync customer-portal`) or `sync` for all. There is no automatic file watcher — sync must be run explicitly after each change.
-
-```bash
-# Launch environment (auto-detects your IP and locks access to it)
-./test-env/test-env.sh launch
-
-# Sync local code changes and rebuild (run after every code change)
-./test-env/test-env.sh sync              # all services
-./test-env/test-env.sh sync backend      # just backend
-
-# Grant/revoke access for other people (MUST use IPv4 — see note below)
-./test-env/test-env.sh allow-ip 203.0.113.50
-./test-env/test-env.sh revoke-ip 203.0.113.50
-
-# View logs
-./test-env/test-env.sh logs backend
-
-# SSH into instance
-./test-env/test-env.sh ssh
-
-# Check status
-./test-env/test-env.sh status
-
-# Show this folder's environment
-./test-env/test-env.sh list
-
-# Tear down (also deletes the per-instance security group)
-./test-env/test-env.sh teardown
-```
-
-### IPv4 Requirement for allow-ip
-
-**CRITICAL:** The EC2 security group only works with IPv4 addresses. When allowing an IP, always force IPv4:
-
-```bash
-# CORRECT — force IPv4
-./test-env/test-env.sh allow-ip $(curl -4 -s ifconfig.me)
-
-# WRONG — may return IPv6 which won't work with EC2 security groups
-./test-env/test-env.sh allow-ip $(curl -s ifconfig.me)
-```
-
-`curl ifconfig.me` (without `-4`) can return an IPv6 address on dual-stack networks. IPv6 rules won't grant access to IPv4-only EC2 instances, causing silent connectivity failures (SSH hangs, browser timeouts).
-
-### Architecture
-
-- Three Docker containers on one EC2 instance (t3.large)
-- **IP-restricted (IPv4 only)** — per-instance security group locked to developer's IP at launch; use `allow-ip`/`revoke-ip` to manage access
-- Backend `.env` fetched from Secrets Manager at launch (developers never see it)
-- Code synced via `rsync` — only changed files transferred
-- Auto-terminates after **24 hours of inactivity** (watchdog cron)
-- Per-clone isolation enforced via name-based state files and validation guards
-- Ports: backend=3001, partner-portal=5173, customer-portal=5174
+**CRITICAL:** When a test environment is active, run `./test-env/test-env.sh sync` after EVERY code change.
 
 ## Browser Testing with Playwright MCP
 
@@ -990,28 +709,7 @@ A Playwright MCP server is configured via `.mcp.json` in each repo root. Use the
 
 ## Notion Integration (Sprint Tasks)
 
-A Notion MCP server is configured via `.mcp.json` in the repo root. Use the `mcp__notion__*` tools to query the **"Sprint Tasks - Argusoft"** Notion database for dev items.
-
-**When the user asks to pull dev items, check sprint tasks, or reference Notion tickets:**
-1. Use `mcp__notion__API-query-data-source` with data source ID `2bf09247-c951-812a-bd0a-000bd4c05bbf`
-2. Filter by status (e.g., `{"property": "Status", "status": {"equals": "To-do"}}`)
-3. Pull task details including title, status, assignee, priority, and description
-4. Present tasks in a clear summary format
-
-**Key IDs:**
-- Database ID: `2bf09247-c951-8122-a327-ee39ef7a6ec7` (for search/retrieve)
-- Data Source ID: `2bf09247-c951-812a-bd0a-000bd4c05bbf` (for queries — use this with `API-query-data-source`)
-
-**Database properties:** Name (title), Status (To-do/Not started/Blocked/In progress/In Review/Done), Priority Level (High/Medium/Low), Sprint, Owner (people), Tags, Sprint Points, Due Date, Blocking/Blocked by (relations), Parent item/Sub-item (relations)
-
-**Setup:** The `.mcp.json` file is gitignored since it contains the API token. A template is provided at `.mcp.json.example`. See `dev.md` entry "Notion MCP Integration for Sprint Task Management" for full configuration steps.
-
-**Auto-setup:** If Notion MCP tools are not available or return auth errors:
-1. Check if `.mcp.json` exists — if not, copy from `.mcp.json.example`
-2. Check if it still has the `<YOUR_NOTION_TOKEN>` placeholder
-3. If placeholder found, ask the user for their Notion API token (created at https://www.notion.so/profile/integrations)
-4. Replace the placeholder in `.mcp.json` with the real token
-5. Tell the user to restart Claude Code to load the MCP server
+Notion MCP configured via `.mcp.json`. See `docs/notion-integration.md` for database IDs, query examples, and auto-setup instructions.
 
 ## "Prep Branch for \<topic\>" Command
 
