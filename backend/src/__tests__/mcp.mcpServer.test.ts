@@ -130,7 +130,7 @@ describe('MCP Server', () => {
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
       expect(response.status).toBe(401);
-      expect(response.body.error).toContain('Missing access token');
+      expect(response.body.error).toContain('Invalid or missing access token');
     });
 
     it('should reject request with invalid token', async () => {
@@ -144,8 +144,8 @@ describe('MCP Server', () => {
         .set('Authorization', 'Bearer wrong-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
-      expect(response.status).toBe(403);
-      expect(response.body.error).toContain('Invalid access token');
+      expect(response.status).toBe(401);
+      expect(response.body.error).toContain('Invalid or missing access token');
     });
 
     it('should accept request with valid Bearer token', async () => {
