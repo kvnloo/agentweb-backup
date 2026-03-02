@@ -14,6 +14,10 @@ import { taskDb, scheduleDb } from "../../services/db";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function jsonResult(data: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+}
+
 function requireUserId(context: any): string {
   if (!context?.userId) {
     throw new Error("Authentication required: no userId in context");
@@ -51,24 +55,15 @@ mcpToolRegistry.register({
   execute: async (_args: any, context: any) => {
     const userId = requireUserId(context);
     const tasks = await taskDb.getTasksByUserId(userId);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            (tasks || []).map((t: any) => ({
-              taskId: t.taskId,
-              name: t.name,
-              status: t.status,
-              createdAt: t.createdAt,
-              category: t.category,
-            })),
-            null,
-            2
-          ),
-        },
-      ],
-    };
+    return jsonResult(
+      (tasks || []).map((t: any) => ({
+        taskId: t.taskId,
+        name: t.name,
+        status: t.status,
+        createdAt: t.createdAt,
+        category: t.category,
+      }))
+    );
   },
 });
 
@@ -88,9 +83,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const userId = requireUserId(context);
     const task = await requireTaskOwnership(args.taskId, userId);
-    return {
-      content: [{ type: "text", text: JSON.stringify(task, null, 2) }],
-    };
+    return jsonResult(task);
   },
 });
 
@@ -123,9 +116,7 @@ mcpToolRegistry.register({
       ...(args.category && { category: args.category }),
       ...(args.description && { description: args.description }),
     });
-    return {
-      content: [{ type: "text", text: JSON.stringify(task, null, 2) }],
-    };
+    return jsonResult(task);
   },
 });
 
@@ -153,9 +144,7 @@ mcpToolRegistry.register({
 
     const { taskId, ...updates } = args;
     const updated = await taskDb.updateTask(taskId, updates);
-    return {
-      content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
-    };
+    return jsonResult(updated);
   },
 });
 
@@ -176,11 +165,7 @@ mcpToolRegistry.register({
     const userId = requireUserId(context);
     await requireTaskOwnership(args.taskId, userId);
     await taskDb.deleteTask(args.taskId);
-    return {
-      content: [
-        { type: "text", text: JSON.stringify({ deleted: true, taskId: args.taskId }) },
-      ],
-    };
+    return jsonResult({ deleted: true, taskId: args.taskId });
   },
 });
 
@@ -209,9 +194,7 @@ mcpToolRegistry.register({
       status: "pending",
       startTime: new Date().toISOString(),
     });
-    return {
-      content: [{ type: "text", text: JSON.stringify(execution, null, 2) }],
-    };
+    return jsonResult(execution);
   },
 });
 
@@ -233,24 +216,15 @@ mcpToolRegistry.register({
     await requireTaskOwnership(args.taskId, userId);
 
     const executions = await taskDb.getTaskExecutions(args.taskId);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            (executions || []).map((e: any) => ({
-              executionId: e.executionId,
-              status: e.status,
-              startTime: e.startTime,
-              completedAt: e.completedAt,
-              error: e.error,
-            })),
-            null,
-            2
-          ),
-        },
-      ],
-    };
+    return jsonResult(
+      (executions || []).map((e: any) => ({
+        executionId: e.executionId,
+        status: e.status,
+        startTime: e.startTime,
+        completedAt: e.completedAt,
+        error: e.error,
+      }))
+    );
   },
 });
 
@@ -274,9 +248,7 @@ mcpToolRegistry.register({
     if (execution.userId !== userId)
       throw new Error("Access denied: you do not own this execution");
 
-    return {
-      content: [{ type: "text", text: JSON.stringify(execution, null, 2) }],
-    };
+    return jsonResult(execution);
   },
 });
 
@@ -300,24 +272,15 @@ mcpToolRegistry.register({
     await requireTaskOwnership(args.taskId, userId);
 
     const schedules = await scheduleDb.getSchedulesByTaskId(args.taskId);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            (schedules || []).map((s: any) => ({
-              scheduleId: s.scheduleId,
-              scheduleName: s.scheduleName,
-              frequency: s.frequency,
-              nextRunTime: s.nextRunTime,
-              status: s.status,
-            })),
-            null,
-            2
-          ),
-        },
-      ],
-    };
+    return jsonResult(
+      (schedules || []).map((s: any) => ({
+        scheduleId: s.scheduleId,
+        scheduleName: s.scheduleName,
+        frequency: s.frequency,
+        nextRunTime: s.nextRunTime,
+        status: s.status,
+      }))
+    );
   },
 });
 
@@ -362,9 +325,7 @@ mcpToolRegistry.register({
       ...(args.description && { description: args.description }),
       ...(args.timezone && { timezone: args.timezone }),
     });
-    return {
-      content: [{ type: "text", text: JSON.stringify(schedule, null, 2) }],
-    };
+    return jsonResult(schedule);
   },
 });
 
@@ -394,9 +355,7 @@ mcpToolRegistry.register({
 
     const { scheduleId, ...updates } = args;
     const updated = await scheduleDb.updateSchedule(scheduleId, updates);
-    return {
-      content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
-    };
+    return jsonResult(updated);
   },
 });
 
@@ -417,13 +376,6 @@ mcpToolRegistry.register({
     const userId = requireUserId(context);
     await requireScheduleOwnership(args.scheduleId, userId);
     await scheduleDb.deleteSchedule(args.scheduleId);
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify({ deleted: true, scheduleId: args.scheduleId }),
-        },
-      ],
-    };
+    return jsonResult({ deleted: true, scheduleId: args.scheduleId });
   },
 });
