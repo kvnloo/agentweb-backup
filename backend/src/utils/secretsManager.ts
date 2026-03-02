@@ -266,11 +266,6 @@ export interface UnipileCredentials {
  * @returns The Unipile DSN and API key
  */
 export async function getUnipileCredentials(): Promise<UnipileCredentials> {
-  return {
-    dsn: "api3.unipile.com:13311",
-    apiKey: "UhO47qKL.Sji/XneO0ETEN2oFeymI+w80yaemyRPHzwpw9DYHP1M="
-  };
-
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
