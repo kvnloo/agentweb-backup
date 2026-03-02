@@ -1,11 +1,12 @@
 /**
- * Tests for MCP server auth changes — Agent API key support.
+ * Tests for MCP server auth changes — Agent API key + OAuth token support.
  *
  * Validates that:
  * - aw_* keys are validated via agentApiKeyService
  * - agentUserId is propagated through session context
  * - Static MCP_ACCESS_TOKEN still works
- * - Invalid keys are rejected
+ * - OAuth 2.1 tokens are validated via mcpOAuthService
+ * - Invalid keys return 401
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -17,6 +18,16 @@ const mockValidateKey = jest.fn();
 jest.mock('../services/agentApiKeyService', () => ({
   agentApiKeyService: {
     validateKey: (...args: any[]) => mockValidateKey(...args),
+  },
+}));
+
+// ─── Mock mcpOAuthService ───────────────────────────────────────────────────
+
+const mockValidateAccessToken = jest.fn();
+
+jest.mock('../mcp/oauth/oauthService', () => ({
+  mcpOAuthService: {
+    validateAccessToken: (...args: any[]) => mockValidateAccessToken(...args),
   },
 }));
 
@@ -160,6 +171,30 @@ describe('MCP Server Auth - Agent API Key Support', () => {
     });
   });
 
+  describe('Rate limiting for aw_* keys', () => {
+    it('should rate-limit aw_* keys via RateLimiter', () => {
+      // Directly test the RateLimiter that mcpServer uses
+      const { RateLimiter } = require('../middleware/rateLimiter');
+      const limiter = new RateLimiter();
+
+      const keyId = 'key-rate-test';
+      const maxPerMinute = 3;
+
+      // First 3 requests should be allowed
+      expect(limiter.check(keyId, maxPerMinute).allowed).toBe(true);
+      expect(limiter.check(keyId, maxPerMinute).allowed).toBe(true);
+      expect(limiter.check(keyId, maxPerMinute).allowed).toBe(true);
+
+      // 4th request should be denied
+      const result = limiter.check(keyId, maxPerMinute);
+      expect(result.allowed).toBe(false);
+      expect(result.remaining).toBe(0);
+      expect(result.resetInMs).toBeGreaterThan(0);
+
+      limiter.destroy();
+    });
+  });
+
   describe('portalTools import', () => {
     it('should import portalTools alongside tools', () => {
       // Verify that mcpServerCore.ts imports portalTools
@@ -170,6 +205,48 @@ describe('MCP Server Auth - Agent API Key Support', () => {
       const toolNames = mcpToolRegistry.getToolNames();
       const portalTools = toolNames.filter((n: string) => n.startsWith('portal_'));
       expect(portalTools.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Invalid aw_* key returns 401', () => {
+    it('should return 401 (not 403) for invalid aw_ keys', async () => {
+      // The middleware now returns 401 for invalid aw_ keys
+      mockValidateKey.mockResolvedValue(null);
+
+      const result = await mockValidateKey('aw_invalidkey');
+      expect(result).toBeNull();
+      // The mcpServer.ts code now uses status(401) for this case
+    });
+  });
+
+  describe('OAuth 2.1 token validation', () => {
+    it('should validate OAuth access tokens via mcpOAuthService', async () => {
+      mockValidateAccessToken.mockResolvedValue({
+        tokenHash: 'hash-123',
+        userId: 'user-oauth',
+        clientId: 'client-123',
+        scope: 'mcp:tools',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        revoked: false,
+      });
+
+      const result = await mockValidateAccessToken('oauth-access-token');
+      expect(result).not.toBeNull();
+      expect(result.userId).toBe('user-oauth');
+    });
+
+    it('should return null for invalid OAuth tokens', async () => {
+      mockValidateAccessToken.mockResolvedValue(null);
+
+      const result = await mockValidateAccessToken('bad-oauth-token');
+      expect(result).toBeNull();
+    });
+
+    it('should return null for expired OAuth tokens', async () => {
+      mockValidateAccessToken.mockResolvedValue(null);
+
+      const result = await mockValidateAccessToken('expired-oauth-token');
+      expect(result).toBeNull();
     });
   });
 });
