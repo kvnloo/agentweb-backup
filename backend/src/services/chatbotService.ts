@@ -15,6 +15,7 @@ import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
 import { getGCSPPrivateKey } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { AgentModeService } from './agentModeService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -2453,7 +2454,9 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
 
 const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
 
-Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics. 
+Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
+
+You have access to tools that allow you to save information to knowledge bases. When a user asks you to remember something, save research, or persist data for later use, you can use the update_knowledge_base tool. IMPORTANT: Use list_knowledge_base_files first to see available knowledge bases and get the correct taskId (kb_identifier). Then use update_knowledge_base with that taskId.
 
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
@@ -2746,7 +2749,7 @@ export async function generateChatResponse(
   pageContent?: string,
   portalType: "customer" | "partner" = "partner",
   userId?: string
-): Promise<string> {
+): Promise<string | { content: string; toolCalls?: any[] }> {
   try {
     const timestamp = new Date().toISOString();
 
@@ -2867,42 +2870,184 @@ export async function generateChatResponse(
       retrievalErrorOccurred = true;
     }
 
-    // Generate response using OpenAI
-    const response = await openai.chat.completions.create({
-      model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-      messages: messages
-        .filter(({ role, content }) => {
-          // Skip tool result messages — their content is already in assistant responses,
-          // and including them without proper tool_calls on the preceding assistant message
-          // causes OpenAI to reject the request.
-          if (role === 'tool') return false;
-          // Skip assistant messages with no text content (tool-call-only messages)
-          if (role === 'assistant' && !content) return false;
-          return true;
-        })
-        .map(({ role, content, name }) => {
+    // Initialize tool support for Emma (customer portal only)
+    let agentModeService: AgentModeService | null = null;
+    let toolDefinitions: any[] = [];
+
+    if (portalType === 'customer') {
+      try {
+        // Initialize AgentModeService to access tool registry and executeTool
+        agentModeService = new AgentModeService();
+        await agentModeService.initialize();
+
+        // Get specific tools for Emma (for MVP, just update_knowledge_base)
+        // Later can expand to include other tools
+        const toolsToInclude = ['update_knowledge_base'];
+
+        const { mcpToolRegistry } = await import('../mcp/server/registry');
+
+        for (const toolName of toolsToInclude) {
+          const toolHandler = mcpToolRegistry.getTool(toolName);
+          if (toolHandler) {
+            // Convert MCP definition to OpenAI format
+            const mcpDef = toolHandler.definition;
+            toolDefinitions.push({
+              type: "function",
+              function: {
+                name: mcpDef.name,
+                description: mcpDef.description,
+                parameters: mcpDef.inputSchema
+              }
+            });
+          }
+        }
+
+        console.log(`[generateChatResponse] Loaded ${toolDefinitions.length} tools for Emma`);
+      } catch (error) {
+        console.error('[generateChatResponse] Error loading tools:', error);
+        // Continue without tools if loading fails
+      }
+    }
+
+    // Iterative tool execution loop (follows Agent Mode pattern)
+    let iteration = 0;
+    const MAX_ITERATIONS = 10;
+    const toolCalls: any[] = []; // Track tool calls for response
+    let finalAssistantMessage = '';
+    let finalUsageData: any = null;
+
+    while (iteration < MAX_ITERATIONS) {
+      console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
+
+      // Generate response using OpenAI (with tools if available)
+      const response = await openai.chat.completions.create({
+        model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+        messages: messages.map(({ role, content, name, tool_call_id }) => {
           const message: any = { role, content };
+          if (role === 'tool' && tool_call_id) {
+            message.tool_call_id = tool_call_id;
+          }
           if (name) {
             message.name = name;
           }
           return message;
         }),
-    });
+        // Add tools only for customer portal with tools loaded
+        ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
+      });
 
-    // Log and get usage data
-    const usageData = logTokenUsage(
-      response,
-      contextInfo
-        ? `Used ${contextInfo.length} chars of context`
-        : "No context used"
-    );
+      const responseMessage = response.choices[0]?.message;
+      if (!responseMessage) {
+        throw new Error("No response from LLM");
+      }
 
-    // Extract assistant's reply
-    const assistantReply =
-      response.choices[0]?.message?.content ||
-      "I apologize, but I was unable to generate a response.";
+      // Log token usage for this iteration
+      logTokenUsage(
+        response,
+        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
+      );
 
-    // Add assistant's reply to the session with usage data and metadata
+      // Add assistant message to messages array (for next iteration)
+      const assistantMsg: any = {
+        role: 'assistant',
+        content: responseMessage.content || ''
+      };
+      if (responseMessage.tool_calls) {
+        assistantMsg.tool_calls = responseMessage.tool_calls;
+      }
+      messages.push(assistantMsg);
+
+      // Check if LLM wants to call tools
+      if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+        // No tool calls - we're done
+        finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
+        finalUsageData = logTokenUsage(response, "Final response");
+        break;
+      }
+
+      console.log(`[generateChatResponse] Executing ${responseMessage.tool_calls.length} tool calls`);
+
+      // Execute each tool call
+      for (const toolCall of responseMessage.tool_calls) {
+        let functionArgs: any;
+        try {
+          functionArgs = JSON.parse(toolCall.function.arguments);
+
+          console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
+
+          // Execute tool via AgentModeService (reuse existing infrastructure)
+          if (!agentModeService) {
+            throw new Error("AgentModeService not initialized");
+          }
+
+          const result = await agentModeService.executeTool(
+            response.model,
+            toolCall.function.name,
+            functionArgs,
+            userId!,
+            sessionId,
+            false // mockMode
+          );
+
+          console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
+
+          // Track tool call for response
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs,
+            result: result
+          });
+
+          // Format result for tool message
+          const toolContent = typeof result === 'string' ? result : JSON.stringify(result);
+
+          // Add tool result message to messages array (for next iteration)
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: toolCall.function.name,
+            content: toolContent,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+
+        } catch (error) {
+          console.error(`[generateChatResponse] Tool execution error for ${toolCall.function.name}:`, error);
+
+          // Track failed tool call
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs || toolCall.function.arguments,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+
+          // Add error result as tool message (LLM needs to see the error)
+          const errorContent = JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: toolCall.function.name,
+            content: errorContent,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+        }
+      }
+
+      iteration++;
+    }
+
+    // Safety check: if we hit max iterations, ensure we have a response
+    if (iteration >= MAX_ITERATIONS && !finalAssistantMessage) {
+      finalAssistantMessage = "I apologize, but I reached the maximum number of iterations. Please try again with a simpler request.";
+      console.warn(`[generateChatResponse] Hit MAX_ITERATIONS (${MAX_ITERATIONS})`);
+    }
+
+    // Save all new messages to session
     const assistantMessageMetadata = {
       currentUrl,
       pageContentLength: pageContent?.length,
@@ -2911,16 +3056,27 @@ export async function generateChatResponse(
       relevantChunks: relevantChunksInfo,
       timestamp,
       portalType,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined // Include tool calls if any
     };
 
+    // Add final assistant message
     await chatbotDb.addMessageToSession(sessionId, {
       role: "assistant",
-      content: assistantReply,
-      usage: usageData,
+      content: finalAssistantMessage,
+      usage: finalUsageData,
       metadata: assistantMessageMetadata,
     });
 
-    return assistantReply;
+    // Return response object (like Agent Mode, not just string)
+    if (toolCalls.length > 0) {
+      return {
+        content: finalAssistantMessage,
+        toolCalls: toolCalls
+      };
+    } else {
+      // For backward compatibility with partner portal
+      return finalAssistantMessage;
+    }
   } catch (error) {
     console.error("[generateChatResponse] Error:", error);
     throw error;

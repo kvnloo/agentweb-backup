@@ -25,6 +25,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-02',
     changes: [
+      'Emma: Knowledge Base Write Access',
+      '- Emma can now save information to your task knowledge bases using the new update_knowledge_base tool',
+      '- Ask Emma to "save this research to task-abc123" or "remember this for later" and she\'ll store it in the knowledge base',
+      '- Supports both replace (overwrite entire KB) and append (add to existing content) modes',
+      '- Tool calls are displayed in the chat with success/error indicators so you can see when Emma saves information',
+      '- Emma uses an iterative tool execution loop matching Agent Mode\'s architecture, enabling multi-turn tool operations',
+      '- Use list_knowledge_base_files first to see available knowledge bases and get the correct task ID',
       'Agent Mode: Feedback Improves Conversations',
       '- Like and dislike feedback on messages is now injected into the session as context, so future responses learn from your preferences',
       '- Image feedback (dislike reasons, comments) is propagated to the session so the agent improves image generation in subsequent turns',
