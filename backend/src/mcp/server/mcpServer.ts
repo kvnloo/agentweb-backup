@@ -4,6 +4,11 @@ import express, { Request, Response, NextFunction } from "express";
 import { randomUUID } from "node:crypto";
 import { createMcpServer } from './mcpServerCore';
 import { agentApiKeyService } from '../../services/agentApiKeyService';
+import { mcpOAuthService } from '../oauth/oauthService';
+import { RateLimiter } from '../../middleware/rateLimiter';
+
+// Rate limiter for MCP requests authenticated via aw_* API keys
+const mcpRateLimiter = new RateLimiter();
 
 // Session timeout in milliseconds (default: 1 hour)
 const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '3600000', 10);
@@ -29,14 +34,23 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
   const tokenMatch = authHeader?.match(/^Bearer\s+(.+)$/i);
   const providedToken = tokenMatch ? tokenMatch[1] : authHeader;
 
-  // Check if this is an Agent API key (aw_ prefix)
+  // 1. Check if this is an Agent API key (aw_ prefix)
   if (providedToken && providedToken.startsWith("aw_")) {
     try {
       const keyRecord = await agentApiKeyService.validateKey(providedToken);
       if (!keyRecord) {
         console.error("[MCP] Access denied: Invalid agent API key");
-        return res.status(403).json({ error: "Forbidden: Invalid agent API key" });
+        return res.status(401).json({ error: "Unauthorized: Invalid agent API key" });
       }
+      // Enforce per-key rate limit
+      const rateLimitResult = mcpRateLimiter.check(keyRecord.keyId, keyRecord.rateLimitPerMin);
+      if (!rateLimitResult.allowed) {
+        return res.status(429).json({
+          error: "Rate limit exceeded",
+          retryAfterMs: rateLimitResult.resetInMs,
+        });
+      }
+
       // Store the userId from the API key on the request for downstream use
       (req as any)._agentApiUserId = keyRecord.userId;
       return next();
@@ -46,25 +60,42 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
     }
   }
 
-  // Fall back to static MCP_ACCESS_TOKEN validation
+  // 2. Check static MCP_ACCESS_TOKEN
   const expectedToken = process.env.MCP_ACCESS_TOKEN;
-
-  // If no token is configured, skip validation
-  if (!expectedToken) {
+  if (expectedToken && providedToken === expectedToken) {
     return next();
   }
 
-  if (!authHeader) {
-    console.error("[MCP] Access denied: Missing Authorization header");
-    return res.status(401).json({ error: "Unauthorized: Missing access token" });
+  // 3. Try OAuth 2.1 access token validation
+  if (providedToken) {
+    try {
+      const tokenRecord = await mcpOAuthService.validateAccessToken(providedToken);
+      if (tokenRecord) {
+        // Rate limit OAuth tokens by userId
+        const rateLimitResult = mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60);
+        if (!rateLimitResult.allowed) {
+          return res.status(429).json({
+            error: "Rate limit exceeded",
+            retryAfterMs: rateLimitResult.resetInMs,
+          });
+        }
+        (req as any)._agentApiUserId = tokenRecord.userId;
+        return next();
+      }
+    } catch (error) {
+      console.error("[MCP] Error validating OAuth token:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
   }
 
-  if (providedToken !== expectedToken) {
-    console.error("[MCP] Access denied: Invalid access token");
-    return res.status(403).json({ error: "Forbidden: Invalid access token" });
+  // 4. If no token configured and nothing provided, allow (backward compatible)
+  if (!expectedToken && !providedToken) {
+    return next();
   }
 
-  next();
+  // 5. All auth methods failed
+  console.error("[MCP] Access denied: No valid credentials");
+  return res.status(401).json({ error: "Unauthorized: Invalid or missing access token" });
 }
 
 export function setupMcpServer(app: express.Express) {

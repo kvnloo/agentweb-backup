@@ -47,6 +47,7 @@ const { version } = require('../package.json');
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
+import { setupMcpOAuth } from "./mcp/oauth/oauthRoutes";
 import {
   viewExternalFile,
   getFileContent,
@@ -55,8 +56,11 @@ import {
 
 const app = express();
 
-// Initialize MCP Server routes BEFORE glocal body parsers
+// Initialize MCP Server routes BEFORE global body parsers
 setupMcpServer(app);
+
+// Initialize MCP OAuth 2.1 routes (well-known, register, authorize, token)
+setupMcpOAuth(app);
 
 // CORS configuration
 const corsOptions = {
