@@ -1,7 +1,7 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { createAccount } from '../services/connectedAccountsDb';
-import { LinkedInOutreachService } from '../services/linkedInOutreachService';
+import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
 const router = express.Router();
 
@@ -17,7 +17,7 @@ const router = express.Router();
  */
 router.get('/init', authenticateToken, async (req: any, res: any) => {
   try {
-    const client = await LinkedInOutreachService.getClient();
+    const client = await linkedInOutreachService.getClient();
     const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
 
     // Unipile requires expiresOn as ISO 8601 string: "YYYY-MM-DDTHH:MM:SS.sssZ"
@@ -29,7 +29,7 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
       expiresOn: expiresOn as any,
       success_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback`,
       failure_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback?error=connection_failed`,
-      api_url: await LinkedInOutreachService.getApiUrl(),
+      api_url: await linkedInOutreachService.getApiUrl(),
     });
 
     res.json({ success: true, url: authLink.url });
@@ -57,7 +57,7 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
 
   try {
     // Fetch account details from Unipile to get the LinkedIn username/name
-    const unipileAccount = await LinkedInOutreachService.getAccount(unipileAccountId);
+    const unipileAccount = await linkedInOutreachService.getAccount(unipileAccountId);
 
     if ((unipileAccount as any).type !== 'LINKEDIN') {
       return res.status(400).json({ error: 'Account is not a LinkedIn account' });
@@ -80,7 +80,7 @@ router.post('/save-account', authenticateToken, async (req: any, res: any) => {
       },
     };
 
-    const account = await createAccount(userId, 'linkedin_outreach', accountInput);
+    const account = await createAccount(userId, 'unipile', accountInput);
 
     console.log(`[LinkedIn Outreach] Connected account ${unipileAccountId} for user ${userId}`);
     res.json({ success: true, account });

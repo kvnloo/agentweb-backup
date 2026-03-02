@@ -29,7 +29,47 @@ mcpToolRegistry.register({
   }
 });
 
-// --- Tools from marketingTools.ts ---
+mcpToolRegistry.register({
+  name: 'linkedin-outreach',
+  definition: {
+    name: 'linkedin-outreach',
+    description: 'Perform LinkedIn outreach actions: resolve a profile URL to get details, send connection invites, or send direct messages. FLOW: Use "list-accounts" to find available Unipile account IDs. If you have a profile URL, ALWAYS call "get-profile" first to retrieve the "provider_id", then use that ID for "send-invite" or "send-message".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list-accounts', 'get-profile', 'send-invite', 'send-message'],
+          description: 'The action to perform.'
+        },
+        account_id: {
+          type: 'string',
+          description: 'The Unipile account ID for LinkedIn connection.'
+        },
+        profile_url: {
+          type: 'string',
+          description: 'The LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)'
+        },
+        provider_id: {
+          type: 'string',
+          description: 'The Unipile provider_id (resolved via get-profile). Required for "send-invite" and "send-message".'
+        },
+        message: {
+          type: 'string',
+          description: 'The message content to send. Required for "send-message", advisable for "send-invite".'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.linkedinOutreach(context.userId, args);
+  }
+});
+
 mcpToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {

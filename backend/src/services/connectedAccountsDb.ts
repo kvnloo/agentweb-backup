@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'linkedin_outreach' | 'meta' | 'twitter' | 'instagram';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram';
 
 /**
  * Base OAuth configuration shared across all platforms

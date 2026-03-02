@@ -22,6 +22,7 @@ import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 
 type MetaApiResult = {
@@ -15526,6 +15527,49 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return {
         success: false,
         message: 'Failed to get post analytics',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Perform LinkedIn outreach actions using Unipile API
+   * Orchestrates calls to the atomic methods in UnipileService
+   */
+  async linkedinOutreach(userId: string, args: any): Promise<any> {
+    const { action, account_id, query, provider_id, chat_id, message } = args;
+    console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
+
+    try {
+      switch (action) {
+        case 'list-accounts':
+          const accounts = await linkedInOutreachService.listAccounts(userId);
+          return { success: true, data: accounts };
+
+        case 'get-profile':
+          if (!args.profile_url) throw new Error('profile_url is required for get-profile action');
+          const profile = await linkedInOutreachService.getLinkedInProfile(args.profile_url, account_id);
+          return { success: true, data: profile };
+
+        case 'send-invite':
+          if (!provider_id) throw new Error('provider_id is required for send-invite action');
+          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, provider_id, message);
+          return { success: true, data: inviteResult };
+
+        case 'send-message':
+          if (!message) throw new Error('message is required for send-message action');
+          
+          const messageResponse = await linkedInOutreachService.sendMessage(account_id, provider_id, message);
+          return { success: true, data: messageResponse };
+
+        default:
+          throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
+      }
+    } catch (error) {
+      console.error('AgentMode: LinkedIn outreach failed:', error);
+      return {
+        success: false,
+        message: 'LinkedIn outreach action failed',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
