@@ -3,7 +3,7 @@ import { chatbotDb } from '../services/chatbotService';
 // Track batchWrite calls
 const batchWriteMock = jest.fn();
 
-// Mock AWS DynamoDB
+// Mock AWS DynamoDB and S3
 jest.mock('aws-sdk', () => {
   return {
     DynamoDB: {
@@ -15,6 +15,10 @@ jest.mock('aws-sdk', () => {
         update: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       })),
     },
+    S3: jest.fn(() => ({
+      upload: jest.fn().mockReturnThis(),
+      promise: jest.fn(),
+    })),
     config: { update: jest.fn() },
   };
 });
