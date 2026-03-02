@@ -15,18 +15,24 @@ import { mcpToolRegistry } from './registry';
 
 // Import all tools to register them
 import './tools';
+import './portalTools';
+
+export interface McpSessionContext {
+  agentUserId?: string;
+}
 
 /**
  * Factory function to create a new MCP server instance.
  * This is the shared core used by both stdio and HTTP transports.
- * 
+ *
  * Uses the new McpServer class (recommended) while still supporting
  * our custom tool registry through low-level Server access.
- * 
+ *
  * @param serverName - Optional custom server name (defaults to "agentweb-mcp-server")
+ * @param sessionContext - Optional session context (e.g. agentUserId from API key auth)
  * @returns The low-level Server instance for transport connection
  */
-export function createMcpServer(serverName: string = "agentweb-mcp-server"): Server {
+export function createMcpServer(serverName: string = "agentweb-mcp-server", sessionContext?: McpSessionContext): Server {
   // Create McpServer instance (new recommended API)
   // Capabilities are passed as the second argument to enable tools support
   const mcpServer = new McpServer({
@@ -63,7 +69,12 @@ export function createMcpServer(serverName: string = "agentweb-mcp-server"): Ser
 
     // Extract context fields from args (injected by internal MCP clients)
     const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
-    const context = { userId, sessionId, llmModel };
+    // Fall back to agentUserId from API key auth if userId not in args
+    const context = {
+      userId: userId || sessionContext?.agentUserId,
+      sessionId,
+      llmModel,
+    };
 
     try {
       const result = await mcpToolRegistry.execute(name, toolArgs, context);
