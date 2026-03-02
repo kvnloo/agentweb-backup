@@ -6505,6 +6505,110 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Update knowledge base content for a task
+   * Used by update_knowledge_base tool
+   */
+  public async updateKnowledgeBase(
+    taskId: string,
+    content: string,
+    mode: 'replace' | 'append',
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[updateKnowledgeBase] taskId=${taskId}, mode=${mode}, userId=${userId}`);
+
+      // 1. Get task and check authorization
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return {
+          success: false,
+          message: 'Task not found',
+          error: 'Task not found'
+        };
+      }
+
+      if (task.userId !== userId) {
+        return {
+          success: false,
+          message: 'Not authorized to modify this task',
+          error: 'Unauthorized'
+        };
+      }
+
+      // 2. Initialize GCS
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      // 3. Determine bucket based on knowledgeBaseType
+      const knowledgeBaseType = task.knowledgeBaseType || 'private';
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
+      const file = bucket.file(filePath);
+
+      // 4. Handle append mode - read existing content
+      let finalContent = content;
+      if (mode === 'append') {
+        try {
+          const [existingContent] = await file.download();
+          finalContent = existingContent.toString() + '\n\n' + content;
+        } catch (error) {
+          // If file doesn't exist, just use new content
+          console.log(`[updateKnowledgeBase] No existing KB file for task ${taskId}, creating new`);
+        }
+      }
+
+      // 5. Save content to GCS
+      await file.save(finalContent, {
+        contentType: 'text/plain',
+        metadata: {
+          taskId,
+          userId,
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      // 6. Get signed URL (expires 03-01-2500 like other KB operations)
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500'
+      });
+
+      // 7. Update task metadata in DynamoDB
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseSize: Buffer.byteLength(finalContent, 'utf8'),
+        knowledgeBase: url,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
+
+      return {
+        success: true,
+        message: `Knowledge base ${mode === 'append' ? 'updated' : 'replaced'} successfully`,
+        updatedSize: Buffer.byteLength(finalContent, 'utf8'),
+        updatedAt: new Date().toISOString()
+      };
+
+    } catch (error) {
+      console.error('[updateKnowledgeBase] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to update knowledge base',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
     try {
       const taskStatuses: any[] = [];

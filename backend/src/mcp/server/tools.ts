@@ -3075,6 +3075,48 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'update_knowledge_base',
+  definition: {
+    name: 'update_knowledge_base',
+    description: 'Update or append content to a task\'s knowledge base. Use this to save information that should persist across executions, like research findings, data collected, or documentation. The user must own the task to update its knowledge base. IMPORTANT: Use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'The task ID (kb_identifier) whose knowledge base to update. Get this from list_knowledge_base_files.'
+        },
+        content: {
+          type: 'string',
+          description: 'The content to write to the knowledge base'
+        },
+        mode: {
+          type: 'string',
+          enum: ['replace', 'append'],
+          description: 'Whether to replace the entire knowledge base or append to it. Default: append'
+        }
+      },
+      required: ['taskId', 'content']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    // Standard authorization check
+    if (!context?.userId || !context?.sessionId) {
+      throw new Error("Missing user or session context");
+    }
+
+    // Delegate to service method
+    return await agentModeService.updateKnowledgeBase(
+      args.taskId,
+      args.content,
+      args.mode || 'append',
+      context.userId,
+      context.sessionId
+    );
+  }
+});
+
+mcpToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
