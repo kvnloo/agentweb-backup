@@ -2,6 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, deleteAccount, deleteAccountById } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
+import { LinkedInOutreachService } from '../services/linkedInOutreachService';
 
 const router = express.Router();
 
@@ -65,6 +66,18 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
   const { platform, accountId } = req.params;
 
   try {
+    // For LinkedIn Outreach accounts, also delete from Unipile so the
+    // connection is fully revoked — not just removed from our DB.
+    if (platform === 'linkedin_outreach') {
+      try {
+        await LinkedInOutreachService.deleteAccount(accountId);
+        console.log(`[LinkedIn Outreach] Deleted Unipile account ${accountId} for user ${userId}`);
+      } catch (unipileErr: any) {
+        // Non-fatal: log and continue with DB deletion so the user isn't stuck
+        console.warn(`[LinkedIn Outreach] Failed to delete Unipile account ${accountId}:`, unipileErr?.message);
+      }
+    }
+
     await deleteAccountById(userId, platform, accountId);
     res.json({ success: true, message: `${platform} account ${accountId} disconnected` });
   } catch (error) {
