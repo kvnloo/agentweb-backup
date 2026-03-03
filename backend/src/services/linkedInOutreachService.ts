@@ -161,6 +161,26 @@ export class LinkedInOutreachService {
   // ─── Profile & outreach ──────────────────────────────────────────────────────
 
   /**
+   * Resolve the target to a Unipile provider_id.
+   * @param target  - Either a LinkedIn profile URL or a raw provider_id string.
+   * @param isUrl   - true if target is a profile URL; false if it is already a provider_id.
+   * @param account_id - Required when isUrl is true.
+   */
+  private async resolveProviderId(target: string, isUrl: boolean, account_id: string): Promise<string> {
+    if (isUrl) {
+      this.log(`Resolving LinkedIn URL to provider_id`, { target, account_id });
+      const profile = await this.getLinkedInProfile(target, account_id);
+      const resolved = profile?.provider_id;
+      if (!resolved) {
+        throw new Error(`Could not resolve provider_id from URL: ${target}`);
+      }
+      this.log(`Resolved provider_id: ${resolved}`);
+      return resolved;
+    }
+    return target;
+  }
+
+  /**
    * Get LinkedIn profile by URL/identifier.
    */
   async getLinkedInProfile(profileUrl: string, account_id: string): Promise<any> {
@@ -178,7 +198,6 @@ export class LinkedInOutreachService {
     try {
       this.log(`Fetching LinkedIn profile: ${identifier}`, { account_id });
       const client = await this.getClient();
-      // Use raw request to call /users/{identifier}
       const profile = await client.request.send({
         method: 'GET',
         path: ['users', identifier],
@@ -193,17 +212,22 @@ export class LinkedInOutreachService {
 
   /**
    * Send a connection invitation on LinkedIn.
+   * @param account_id     - The Unipile account ID to send from.
+   * @param profileUrlOrId - A LinkedIn profile URL OR a raw provider_id.
+   * @param isUrl          - true if profileUrlOrId is a profile URL, false if it is already a provider_id.
+   * @param message        - Optional personalised note to attach to the invitation.
    */
-  async sendInvitation(account_id: string, profile_id: string, message?: string): Promise<any> {
+  async sendInvitation(account_id: string, profileUrlOrId: string, isUrl: boolean, message?: string): Promise<any> {
     try {
-      this.log(`Sending invitation`, { account_id, profile_id });
+      const provider_id = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
+      this.log(`Sending invitation`, { account_id, provider_id });
       const client = await this.getClient();
       const res = await client.users.sendInvitation({
         account_id,
-        provider_id: profile_id,
+        provider_id,
         message: message || "Hello, I'm interested in connecting with you."
       });
-      this.log(`Invitation sent successfully`, { account_id, profile_id });
+      this.log(`Invitation sent successfully`, { account_id, provider_id });
       return res;
     } catch (error: any) {
       return this.handleError(error, 'sendInvitation');
@@ -213,9 +237,14 @@ export class LinkedInOutreachService {
   /**
    * Send a message to a LinkedIn profile.
    * Uses startNewChat to handle both new and existing conversations.
+   * @param accountId      - The Unipile account ID to send from.
+   * @param profileUrlOrId - A LinkedIn profile URL OR a raw provider_id.
+   * @param isUrl          - true if profileUrlOrId is a profile URL, false if it is already a provider_id.
+   * @param messageText    - The message to send.
    */
-  async sendMessage(accountId: string, providerId: string, messageText: string): Promise<any> {
+  async sendMessage(accountId: string, profileUrlOrId: string, isUrl: boolean, messageText: string): Promise<any> {
     try {
+      const providerId = await this.resolveProviderId(profileUrlOrId, isUrl, accountId);
       this.log(`Sending message`, { accountId, providerId, messageLength: messageText.length });
       const client = await this.getClient();
       const res = await client.messaging.startNewChat({

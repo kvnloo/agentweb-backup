@@ -33,33 +33,33 @@ mcpToolRegistry.register({
   name: 'linkedin-outreach',
   definition: {
     name: 'linkedin-outreach',
-    description: 'Perform LinkedIn outreach actions: resolve a profile URL to get details, send connection invites, or send direct messages. FLOW: Use "list-accounts" to find available Unipile account IDs. If you have a profile URL, ALWAYS call "get-profile" first to retrieve the "provider_id", then use that ID for "send-invite" or "send-message".',
+    description: 'Send a LinkedIn connection invite or a direct message via a connected Unipile account. To find the account_id, call list_connected_accounts(platform=\'unipile\') tool.\n\nFor the target person, pass EITHER:\n- profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/) - this tool will resolve it to a provider_id automatically.\n- provider_id: the Unipile provider_id directly if you already have it.\n\nActions:\n- send-invite: Send a connection request (message optional but recommended).\n- send-message: Send a direct message (message required).',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['list-accounts', 'get-profile', 'send-invite', 'send-message'],
-          description: 'The action to perform.'
+          enum: ['send-invite', 'send-message'],
+          description: 'The outreach action to perform.'
         },
         account_id: {
           type: 'string',
-          description: 'The Unipile account ID for LinkedIn connection.'
+          description: 'The Unipile account ID for the LinkedIn connection. Obtain via list_connected_accounts(platform=\'unipile\') tool.'
         },
         profile_url: {
           type: 'string',
-          description: 'The LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). Provide this OR provider_id.'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id (resolved via get-profile). Required for "send-invite" and "send-message".'
+          description: 'The Unipile provider_id for the target LinkedIn user. Provide this OR profile_url.'
         },
         message: {
           type: 'string',
-          description: 'The message content to send. Required for "send-message", advisable for "send-invite".'
+          description: 'Message content. Required for send-message; recommended for send-invite.'
         }
       },
-      required: ['action']
+      required: ['action', 'account_id']
     }
   },
   execute: async (args: any, context: any) => {
@@ -2430,13 +2430,13 @@ mcpToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'Returns list of social media accounts connected by the user',
+    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin-outreach tool).',
     inputSchema: {
       type: 'object',
       properties: {
         platform: {
           type: 'string',
-          description: 'Filter by platform (e.g., "linkedin", "facebook", "meta", "twitter"), or "all" for all platforms',
+          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "facebook", "meta", "twitter", "unipile" (LinkedIn Outreach - use this when the user asks about sending connection requests or direct messages on LinkedIn), or "all" for every platform.',
           default: 'all'
         }
       },

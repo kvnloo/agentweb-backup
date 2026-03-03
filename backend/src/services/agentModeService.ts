@@ -15533,34 +15533,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   /**
-   * Perform LinkedIn outreach actions using Unipile API
-   * Orchestrates calls to the atomic methods in UnipileService
+   * Perform LinkedIn outreach actions using Unipile API.
+   * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
   async linkedinOutreach(userId: string, args: any): Promise<any> {
-    const { action, account_id, query, provider_id, chat_id, message } = args;
+    const { action, account_id, profile_url, provider_id, message } = args;
     console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
+
+    // The service accepts either a LinkedIn URL or a raw provider_id.
+    // We know which one it is based on which arg was provided.
+    const isUrl = !!profile_url;
+    const target = profile_url || provider_id;
 
     try {
       switch (action) {
-        case 'list-accounts':
-          const accounts = await linkedInOutreachService.listAccounts(userId);
-          return { success: true, data: accounts };
-
-        case 'get-profile':
-          if (!args.profile_url) throw new Error('profile_url is required for get-profile action');
-          const profile = await linkedInOutreachService.getLinkedInProfile(args.profile_url, account_id);
-          return { success: true, data: profile };
-
-        case 'send-invite':
-          if (!provider_id) throw new Error('provider_id is required for send-invite action');
-          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, provider_id, message);
+        case 'send-invite': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
+          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
           return { success: true, data: inviteResult };
+        }
 
-        case 'send-message':
+        case 'send-message': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for send-message');
           if (!message) throw new Error('message is required for send-message action');
-          
-          const messageResponse = await linkedInOutreachService.sendMessage(account_id, provider_id, message);
+          const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
           return { success: true, data: messageResponse };
+        }
 
         default:
           throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
