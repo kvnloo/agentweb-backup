@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-02',
+    changes: [
+      'Agent Mode: Feedback Improves Conversations',
+      '- Like and dislike feedback on messages is now injected into the session as context, so future responses learn from your preferences',
+      '- Image feedback (dislike reasons, comments) is propagated to the session so the agent improves image generation in subsequent turns',
+      '- Feedback dialogs now show a highlighted hint explaining that your feedback will be used to improve future responses in the session',
+      'Images: Feedback Tooltip on Hover',
+      '- Hovering over a disliked image\'s thumbs-down icon now shows the feedback reasons and comments in a tooltip, without needing to open the dialog',
+    ],
+  },
+  {
     date: '2026-03-01',
     changes: [
       'Images: Ad Inspiration V2',
