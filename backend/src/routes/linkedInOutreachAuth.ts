@@ -26,6 +26,8 @@ router.get('/init', authenticateToken, async (req: any, res: any) => {
     const authLink = await client.account.createHostedAuthLink({
       type: 'create',
       providers: ['LINKEDIN'],
+      // The SDK types expect a branded datetime string; cast to bypass the
+      // type mismatch since ISO 8601 is what the Unipile API actually requires.
       expiresOn: expiresOn as any,
       success_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback`,
       failure_redirect_url: `${frontendUrl}/oauth/linkedin-outreach/callback?error=connection_failed`,

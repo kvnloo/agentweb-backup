@@ -30,9 +30,9 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'linkedin-outreach',
+  name: 'linkedin_outreach',
   definition: {
-    name: 'linkedin-outreach',
+    name: 'linkedin_outreach',
     description: 'Send a LinkedIn connection invite or a direct message via a connected Unipile account. To find the account_id, call list_connected_accounts(platform=\'unipile\') tool.\n\nFor the target person, pass EITHER:\n- profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/) - this tool will resolve it to a provider_id automatically.\n- provider_id: the Unipile provider_id directly if you already have it.\n\nActions:\n- send-invite: Send a connection request (message optional but recommended).\n- send-message: Send a direct message (message required).',
     inputSchema: {
       type: 'object',
@@ -65,6 +65,12 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     if (!context?.userId) {
       throw new Error("Missing user context");
+    }
+    if (!args.profile_url && !args.provider_id) {
+      return { success: false, message: 'Either profile_url or provider_id is required.' };
+    }
+    if (args.profile_url && args.provider_id) {
+      return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
     }
     return await agentModeService.linkedinOutreach(context.userId, args);
   }
@@ -2430,7 +2436,7 @@ mcpToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin-outreach tool).',
+    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool).',
     inputSchema: {
       type: 'object',
       properties: {

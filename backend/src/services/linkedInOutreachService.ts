@@ -4,6 +4,9 @@ import { userDb } from './db';
 
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
+  // Cached to avoid a Secrets Manager round-trip on every method call
+  private cachedDsn: string | null = null;
+  private cachedApiKey: string | null = null;
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -50,22 +53,35 @@ export class LinkedInOutreachService {
   // ─── Client initialization ───────────────────────────────────────────────────
 
   /**
-   * Get the normalized API URL (DSN) from credentials.
+   * Fetch credentials once and cache them for the lifetime of this instance.
    */
-  async getApiUrl(): Promise<string> {
-    const { dsn: rawDsn } = await getUnipileCredentials();
-    return rawDsn.startsWith('http://') || rawDsn.startsWith('https://')
-      ? rawDsn
-      : `https://${rawDsn}`;
+  private async getCredentials(): Promise<{ dsn: string; apiKey: string }> {
+    if (!this.cachedDsn || !this.cachedApiKey) {
+      const creds = await getUnipileCredentials();
+      const rawDsn = creds.dsn;
+      this.cachedDsn = rawDsn.startsWith('http://') || rawDsn.startsWith('https://')
+        ? rawDsn
+        : `https://${rawDsn}`;
+      this.cachedApiKey = creds.apiKey;
+    }
+    return { dsn: this.cachedDsn!, apiKey: this.cachedApiKey! };
   }
 
   /**
-   * Get an initialized UnipileClient instance.
-   * Credentials are fetched from Secrets Manager.
+   * Get the normalized API URL (DSN) from cached credentials.
+   */
+  async getApiUrl(): Promise<string> {
+    const { dsn } = await this.getCredentials();
+    return dsn;
+  }
+
+  /**
+   * Get an initialized UnipileClient instance, reusing the cached client
+   * to avoid repeated Secrets Manager calls.
    */
   async getClient(): Promise<UnipileClient> {
-    const { apiKey } = await getUnipileCredentials();
-    const dsn = await this.getApiUrl();
+    if (this.client) return this.client;
+    const { dsn, apiKey } = await this.getCredentials();
     this.client = new UnipileClient(dsn, apiKey);
     return this.client;
   }
@@ -225,7 +241,7 @@ export class LinkedInOutreachService {
       const res = await client.users.sendInvitation({
         account_id,
         provider_id,
-        message: message || "Hello, I'm interested in connecting with you."
+        message
       });
       this.log(`Invitation sent successfully`, { account_id, provider_id });
       return res;
