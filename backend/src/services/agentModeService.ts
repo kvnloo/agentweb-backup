@@ -2932,6 +2932,21 @@ When a user requests client onboarding or says "onboard new client" or similar:
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
+      // Bedrock Converse API requires base64 data URIs for images (not URLs).
+      // Download the image and convert to a data URI for Bedrock models.
+      let resolvedImageUrl = imageUrl;
+      if (llmModel.startsWith('anthropic.') && !imageUrl.startsWith('data:')) {
+        try {
+          const axios = (await import('axios')).default;
+          const imgResp = await axios.get<ArrayBuffer>(imageUrl, { responseType: 'arraybuffer', timeout: 30000 });
+          const contentType = imgResp.headers['content-type'] || 'image/png';
+          const base64 = Buffer.from(imgResp.data as ArrayBuffer).toString('base64');
+          resolvedImageUrl = `data:${contentType};base64,${base64}`;
+        } catch (downloadError) {
+          console.error('AgentMode: Failed to download image for Bedrock, falling back to URL:', downloadError instanceof Error ? downloadError.message : downloadError);
+        }
+      }
+
       // Create messages for vision API
       const messages = [
         {
@@ -2943,13 +2958,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
             },
             {
               type: 'image_url' as const,
-              image_url: { url: imageUrl }
+              image_url: { url: resolvedImageUrl }
             }
           ]
         }
       ];
 
-      // Call OpenAI Vision API using the same model as agent mode
+      // Call LLM vision API using the same model as agent mode
       const response = await this.callLLM(llmModel, messages, {
         max_completion_tokens: 2000
       });

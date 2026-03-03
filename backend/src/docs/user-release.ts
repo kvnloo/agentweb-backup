@@ -7,6 +7,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-03',
+    changes: [
+      'Email Emma: Interact with Agent Mode via Email',
+      '- Send an email to emma@updates.agentweb.pro to start an Agent Mode conversation',
+      '- Uses the same Agent Mode engine with full tool calling, web search, and skill support',
+      '- Reply to continue the conversation in the same session, or click "Continue in Browser" to switch to the web UI',
+      '- Email attachments (images, PDFs, etc.) are supported and passed to Agent Mode for analysis',
+      '- Unregistered senders receive a free trial invite',
+      'Fix: Image Analysis on Bedrock Models',
+      '- Fixed image analysis (describe_image) failing on Bedrock Claude models by converting image URLs to base64 data URIs',
+    ],
+  },
+  {
     date: '2026-03-02',
     changes: [
       'Agent Mode: Feedback Improves Conversations',

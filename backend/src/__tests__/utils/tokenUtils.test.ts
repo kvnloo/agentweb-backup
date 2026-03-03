@@ -74,8 +74,8 @@ describe('tokenUtils', () => {
        // logic: minutes = Math.floor((diffMs + 500) / (60 * 1000))
        // We want minutes >= 60.
        // 60 * 60 * 1000 = 3600000 ms.
-       // If diffMs = 3599500 (approx 59m 59.5s). +500 = 3600000. / 60000 = 60.
-       const almostOneHour = Date.now() + 3599500;
+       // Use 3599600 to account for a few ms elapsing between Date.now() calls.
+       const almostOneHour = Date.now() + 3599600;
        expect(formatExpiryMessage(almostOneHour)).toBe('Expires in 1 hour');
     });
   });
