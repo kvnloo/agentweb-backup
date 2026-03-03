@@ -195,7 +195,14 @@ describe('Agent Mode Controller - Message Feedback Image Propagation', () => {
 
       // Should NOT call updateSessionFeedbacks since no images
       expect(chatbotDb.updateSessionFeedbacks).not.toHaveBeenCalled();
-      expect(chatbotDb.addMessageToSession).not.toHaveBeenCalled();
+      // Should still inject a general message feedback system message
+      expect(chatbotDb.addMessageToSession).toHaveBeenCalledWith(
+        'session-abc',
+        expect.objectContaining({
+          role: 'system',
+          content: expect.stringContaining('[Message Feedback]'),
+        })
+      );
     });
 
     it('should handle multiple images in a single message', async () => {
