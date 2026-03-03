@@ -15564,11 +15564,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
       }
     } catch (error) {
-      console.error('AgentMode: LinkedIn outreach failed:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Errors that went through handleError are already logged by the service; don't double-log.
+      // Also suppress user-facing errors like "Cannot send message: not a 1st-degree connection".
+      const alreadyLogged = error instanceof Error && !!(error as any).structuredError;
+      const isExpectedUserError = errorMessage.startsWith('Cannot send message:');
+      if (!alreadyLogged && !isExpectedUserError) {
+        console.error('AgentMode: LinkedIn outreach failed:', error);
+      }
       return {
         success: false,
         message: 'LinkedIn outreach action failed',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: errorMessage
       };
     }
   }

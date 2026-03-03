@@ -18,13 +18,14 @@ export class LinkedInOutreachService {
     console.error(`[LinkedInOutreachError] --- START ERROR LOG ---`);
     console.error(`[LinkedInOutreachError] Context: ${context}`);
 
-    const responseData = error.response?.data || error.response || {};
+    // Unipile's UnsuccessfulRequestError uses error.body; fall back through all formats
+    const responseData = error.response?.data || error.response || error.body || {};
 
     const structuredError: any = {
-      message: responseData.message || error.message || 'Unknown error',
-      code: responseData.code || error.code,
-      status: error.response?.status || error.status,
-      details: responseData.details || error.details,
+      message: responseData.message || responseData.title || responseData.detail || error.message || 'Unknown error',
+      code: responseData.code || responseData.type || error.code,
+      status: error.response?.status || responseData.status || error.status,
+      details: responseData.details || responseData.detail || error.details,
       classification: 'UNKNOWN_ERROR'
     };
 
@@ -45,7 +46,11 @@ export class LinkedInOutreachService {
     console.error(`[LinkedInOutreachError] Structured Data:`, JSON.stringify(structuredError, null, 2));
     console.error(`[LinkedInOutreachError] --- END ERROR LOG ---`);
 
-    const enhancedError = error instanceof Error ? error : new Error(structuredError.message);
+    // Unipile SDK errors have error.body but use the class name as message (e.g. "UnsuccessfulRequestError").
+    // Replace with the human-readable structured message so callers receive something actionable.
+    const enhancedError = (error instanceof Error && (error as any).body)
+      ? new Error(structuredError.message)
+      : (error instanceof Error ? error : new Error(structuredError.message));
     (enhancedError as any).structuredError = structuredError;
     throw enhancedError;
   }
@@ -236,6 +241,7 @@ export class LinkedInOutreachService {
   async sendInvitation(account_id: string, profileUrlOrId: string, isUrl: boolean, message?: string): Promise<any> {
     try {
       const provider_id = await this.resolveProviderId(profileUrlOrId, isUrl, account_id);
+      await this.checkIsNotAlreadyConnected(account_id, provider_id);
       this.log(`Sending invitation`, { account_id, provider_id });
       const client = await this.getClient();
       const res = await client.users.sendInvitation({
@@ -251,6 +257,46 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * Check that a target profile is not already a 1st-degree connection before sending an invite.
+   */
+  private async checkIsNotAlreadyConnected(accountId: string, providerId: string): Promise<void> {
+    const client = await this.getClient();
+    const profile = await client.users.getProfile({
+      account_id: accountId,
+      identifier: providerId
+    });
+    const distance = (profile as any).network_distance;
+
+    if (distance === 'FIRST_DEGREE') {
+      throw new Error(
+        `Cannot send invite: you are already connected with this person. ` +
+        `Use the send-message action to reach them directly.`
+      );
+    }
+  }
+
+  /**
+   * Check that a target profile can receive DMs: must be a 1st-degree connection
+   * or have an open profile (LinkedIn Premium Open Profile).
+   */
+  private async checkIsMessageable(accountId: string, providerId: string): Promise<void> {
+    const client = await this.getClient();
+    const profile = await client.users.getProfile({
+      account_id: accountId,
+      identifier: providerId
+    });
+    const distance = (profile as any).network_distance;
+    const isOpenProfile = (profile as any).is_open_profile;
+
+    if (distance !== 'FIRST_DEGREE' && !isOpenProfile) {
+      throw new Error(
+        `Cannot send message: target is not a 1st-degree connection (status: ${distance ?? 'unknown'}). ` +
+        `Use the send-invite action first to connect.`
+      );
+    }
+  }
+
+  /**
    * Send a message to a LinkedIn profile.
    * Uses startNewChat to handle both new and existing conversations.
    * @param accountId      - The Unipile account ID to send from.
@@ -261,6 +307,7 @@ export class LinkedInOutreachService {
   async sendMessage(accountId: string, profileUrlOrId: string, isUrl: boolean, messageText: string): Promise<any> {
     try {
       const providerId = await this.resolveProviderId(profileUrlOrId, isUrl, accountId);
+      await this.checkIsMessageable(accountId, providerId);
       this.log(`Sending message`, { accountId, providerId, messageLength: messageText.length });
       const client = await this.getClient();
       const res = await client.messaging.startNewChat({
@@ -271,6 +318,12 @@ export class LinkedInOutreachService {
       this.log(`Message sent successfully`, { accountId, providerId });
       return res;
     } catch (error: any) {
+      if (error.body?.type === 'errors/no_connection_with_recipient') {
+        throw new Error(
+          `Cannot send message: target is not a 1st-degree connection. ` +
+          `Use the send-invite action first to connect.`
+        );
+      }
       return this.handleError(error, 'sendMessage');
     }
   }
