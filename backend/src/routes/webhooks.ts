@@ -7,6 +7,7 @@ import { leadListAlertService } from '../services/leadListAlertService';
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
+import { emmaEmailService } from '../services/emmaEmailService';
 
 const router = express.Router();
 
@@ -49,12 +50,20 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
       });
     }
 
-    // Store the event in the database
-    const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
-    try {
-      await leadListAlertService.notifyForEmailEvent(emailEvent);
-    } catch (alertError) {
-      console.error('Failed to send lead list alert email:', alertError);
+    // Skip CRM event storage and alerts for Emma-related emails
+    const eventTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+    const isEmmaEvent = emmaEmailService.isEmmaRelatedEvent(event.data.from || '', eventTo);
+
+    if (!isEmmaEvent) {
+      // Store the event in the database
+      const emailEvent = await emailEventsDb.addEmailEvent(event, emailDomain, eventId);
+      try {
+        await leadListAlertService.notifyForEmailEvent(emailEvent);
+      } catch (alertError) {
+        console.error('Failed to send lead list alert email:', alertError);
+      }
+    } else {
+      console.log(`Skipping CRM event storage for Emma-related email: ${event.data.email_id}`);
     }
 
     // Handle specific event types
@@ -79,17 +88,34 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         console.log(`Email opened: ${event.data.email_id}`);
         break;
       
-      case 'email.received':
-        console.log(`Email received: ${event.data.email_id} from ${event.data.from} to ${Array.isArray(event.data.to) ? event.data.to.join(', ') : event.data.to}`);
+      case 'email.received': {
+        const toAddresses = Array.isArray(event.data.to) ? event.data.to : [event.data.to];
+        console.log(`Email received: ${event.data.email_id} from ${event.data.from} to ${toAddresses.join(', ')}`);
+        if (emmaEmailService.isEmmaEmail(toAddresses)) {
+          // Process asynchronously - don't block webhook response
+          void (async () => {
+            try {
+              await emmaEmailService.processInboundEmail({
+                emailId: event.data.email_id,
+                from: event.data.from,
+                to: toAddresses,
+                subject: event.data.subject,
+              });
+            } catch (err) {
+              console.error('[EmmaEmail] Failed to process:', err);
+            }
+          })();
+        }
         break;
+      }
       
       default:
         console.log(`Unhandled event type: ${event.type}`);
     }
 
-    res.status(200).json({ 
+    res.status(200).json({
       message: 'Webhook processed successfully',
-      eventId: emailEvent.eventId,
+      eventId: eventId,
       emailDomain: emailDomain
     });
 

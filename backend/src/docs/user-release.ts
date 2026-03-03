@@ -7,6 +7,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-03',
+    changes: [
+      'Email Emma: Interact with Agent Mode via Email',
+      '- Send an email to emma@updates.agentweb.pro to start an Agent Mode conversation',
+      '- Uses the same Agent Mode engine with full tool calling, web search, and skill support',
+      '- Reply to continue the conversation in the same session, or click "Continue in Browser" to switch to the web UI',
+      '- Email attachments (images, PDFs, etc.) are supported and passed to Agent Mode for analysis',
+      '- Unregistered senders receive a free trial invite',
+      'Fix: Image Analysis on Bedrock Models',
+      '- Fixed image analysis (describe_image) failing on Bedrock Claude models by converting image URLs to base64 data URIs',
+    ],
+  },
+  {
     date: '2026-03-02',
     changes: [
       'Emma: Knowledge Base Write Access',
@@ -16,6 +29,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Tool calls are displayed in the chat with success/error indicators so you can see when Emma saves information',
       '- Emma uses an iterative tool execution loop matching Agent Mode\'s architecture, enabling multi-turn tool operations',
       '- Use list_knowledge_base_files first to see available knowledge bases and get the correct task ID',
+      'Agent Mode: Feedback Improves Conversations',
+      '- Like and dislike feedback on messages is now injected into the session as context, so future responses learn from your preferences',
+      '- Image feedback (dislike reasons, comments) is propagated to the session so the agent improves image generation in subsequent turns',
+      '- Feedback dialogs now show a highlighted hint explaining that your feedback will be used to improve future responses in the session',
+      'Images: Feedback Tooltip on Hover',
+      '- Hovering over a disliked image\'s thumbs-down icon now shows the feedback reasons and comments in a tooltip, without needing to open the dialog',
     ],
   },
   {
