@@ -15,6 +15,10 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-west-2}"
 SECRET_NAME="agentweb/test-env/backend-env"
 SECRET_NAME_ACCESS="agentweb/test-env/test-env-access-env"
+SECRET_NAME_CLAUDE="agentweb/test-env/claude-code-env"
+SECRET_NAME_GITHUB_PAT="agentweb/test-env/github-pat"
+SECRET_NAME_SSH_PASSWORD="agentweb/test-env/ssh-password"
+SECRET_NAME_NOTION_TOKEN="agentweb/test-env/notion-token"
 ROLE_NAME="agentweb-test-env-ec2-role"
 PROFILE_NAME="agentweb-test-env-profile"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -101,6 +105,116 @@ else
 fi
 echo ""
 
+log "=== Secrets Manager (claude-code-env) ==="
+
+if aws secretsmanager describe-secret --secret-id "$SECRET_NAME_CLAUDE" --region "$REGION" &>/dev/null; then
+  log "Secret '$SECRET_NAME_CLAUDE' already exists."
+  echo ""
+  warn "To update it, run:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_CLAUDE' \\"
+  warn "    --secret-string 'CLAUDE_CODE_USE_BEDROCK=1"
+  warn "AWS_REGION=us-west-2"
+  warn "AWS_BEARER_TOKEN_BEDROCK=<token>' \\"
+  warn "    --region $REGION"
+else
+  log "Creating secret '$SECRET_NAME_CLAUDE'..."
+
+  aws secretsmanager create-secret \
+    --name "$SECRET_NAME_CLAUDE" \
+    --description "Claude Code Bedrock config for dev mode test environments" \
+    --secret-string "CLAUDE_CODE_USE_BEDROCK=1
+AWS_REGION=us-west-2
+AWS_BEARER_TOKEN_BEDROCK=PLACEHOLDER" \
+    --region "$REGION" > /dev/null
+  warn "Secret created with placeholder. Update it with:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_CLAUDE' \\"
+  warn "    --secret-string 'CLAUDE_CODE_USE_BEDROCK=1"
+  warn "AWS_REGION=us-west-2"
+  warn "AWS_BEARER_TOKEN_BEDROCK=<your-token>' \\"
+  warn "    --region $REGION"
+fi
+echo ""
+
+log "=== Secrets Manager (github-pat) ==="
+
+if aws secretsmanager describe-secret --secret-id "$SECRET_NAME_GITHUB_PAT" --region "$REGION" &>/dev/null; then
+  log "Secret '$SECRET_NAME_GITHUB_PAT' already exists."
+  echo ""
+  warn "To update it, run:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_GITHUB_PAT' \\"
+  warn "    --secret-string '<your-github-pat>' \\"
+  warn "    --region $REGION"
+else
+  log "Creating secret '$SECRET_NAME_GITHUB_PAT'..."
+
+  aws secretsmanager create-secret \
+    --name "$SECRET_NAME_GITHUB_PAT" \
+    --description "GitHub PAT for git clone in auto-launched dev environments" \
+    --secret-string "PLACEHOLDER" \
+    --region "$REGION" > /dev/null
+  warn "Secret created with placeholder. Update it with:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_GITHUB_PAT' \\"
+  warn "    --secret-string '<your-github-pat>' \\"
+  warn "    --region $REGION"
+fi
+echo ""
+
+log "=== Secrets Manager (ssh-password) ==="
+
+if aws secretsmanager describe-secret --secret-id "$SECRET_NAME_SSH_PASSWORD" --region "$REGION" &>/dev/null; then
+  log "Secret '$SECRET_NAME_SSH_PASSWORD' already exists."
+  echo ""
+  warn "To update it, run:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_SSH_PASSWORD' \\"
+  warn "    --secret-string '<your-ssh-password>' \\"
+  warn "    --region $REGION"
+else
+  log "Creating secret '$SECRET_NAME_SSH_PASSWORD'..."
+
+  aws secretsmanager create-secret \
+    --name "$SECRET_NAME_SSH_PASSWORD" \
+    --description "SSH password for ec2-user on auto-launched dev environments" \
+    --secret-string "PLACEHOLDER" \
+    --region "$REGION" > /dev/null
+  warn "Secret created with placeholder. Update it with:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_SSH_PASSWORD' \\"
+  warn "    --secret-string '<your-ssh-password>' \\"
+  warn "    --region $REGION"
+fi
+echo ""
+
+log "=== Secrets Manager (notion-token) ==="
+
+if aws secretsmanager describe-secret --secret-id "$SECRET_NAME_NOTION_TOKEN" --region "$REGION" &>/dev/null; then
+  log "Secret '$SECRET_NAME_NOTION_TOKEN' already exists."
+  echo ""
+  warn "To update it, run:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_NOTION_TOKEN' \\"
+  warn "    --secret-string '<your-notion-integration-token>' \\"
+  warn "    --region $REGION"
+else
+  log "Creating secret '$SECRET_NAME_NOTION_TOKEN'..."
+
+  aws secretsmanager create-secret \
+    --name "$SECRET_NAME_NOTION_TOKEN" \
+    --description "Notion internal integration token for dev environment automation" \
+    --secret-string "PLACEHOLDER" \
+    --region "$REGION" > /dev/null
+  warn "Secret created with placeholder. Update it with:"
+  warn "  aws secretsmanager put-secret-value \\"
+  warn "    --secret-id '$SECRET_NAME_NOTION_TOKEN' \\"
+  warn "    --secret-string '<your-notion-integration-token>' \\"
+  warn "    --region $REGION"
+fi
+echo ""
+
 ###############################################################################
 # 2. IAM role + instance profile
 ###############################################################################
@@ -116,7 +230,7 @@ TRUST_POLICY='{
   }]
 }'
 
-# Permissions — read the specific secret
+# Permissions — read secrets, manage SG ingress, describe own tags
 PERMISSIONS_POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -125,7 +239,11 @@ PERMISSIONS_POLICY='{
       "Action": ["secretsmanager:GetSecretValue"],
       "Resource": [
         "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME"'*",
-        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_ACCESS"'*"
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_ACCESS"'*",
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_CLAUDE"'*",
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_GITHUB_PAT"'*",
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_SSH_PASSWORD"'*",
+        "arn:aws:secretsmanager:'"$REGION"':'"$ACCOUNT_ID"':secret:'"$SECRET_NAME_NOTION_TOKEN"'*"
       ]
     },
     {
@@ -135,6 +253,11 @@ PERMISSIONS_POLICY='{
       "Condition": {
         "StringEquals": { "ec2:ResourceTag/purpose": "test-env" }
       }
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeTags"],
+      "Resource": "*"
     }
   ]
 }'
@@ -189,7 +312,12 @@ log "========================================="
 log " Infrastructure setup complete!"
 log "========================================="
 echo ""
-echo "  Secret:           $SECRET_NAME"
+echo "  Secrets:          $SECRET_NAME"
+echo "                    $SECRET_NAME_ACCESS"
+echo "                    $SECRET_NAME_CLAUDE"
+echo "                    $SECRET_NAME_GITHUB_PAT"
+echo "                    $SECRET_NAME_SSH_PASSWORD"
+echo "                    $SECRET_NAME_NOTION_TOKEN"
 echo "  IAM Role:         $ROLE_NAME"
 echo "  Instance Profile: $PROFILE_NAME"
 echo "  Security Groups:  Created per-instance at launch (IP-restricted)"
@@ -199,4 +327,11 @@ echo "  1. Create .test-env.config with their SSH key pair:"
 echo "       KEY_NAME=my-keypair"
 echo "       KEY_FILE=~/.ssh/my-keypair.pem"
 echo "  2. Run: ./test-env/test-env.sh launch"
+echo ""
+echo "For Notion-triggered dev environments, the backend IAM credentials also need:"
+echo "  ec2:RunInstances, ec2:TerminateInstances, ec2:DescribeInstances,"
+echo "  ec2:CreateSecurityGroup, ec2:DeleteSecurityGroup, ec2:AuthorizeSecurityGroupIngress,"
+echo "  ec2:CreateTags, ec2:DescribeVpcs, ssm:GetParameters,"
+echo "  iam:PassRole (on $ROLE_NAME)"
+echo "  Condition: ec2:ResourceTag/purpose = test-env (where applicable)"
 echo ""

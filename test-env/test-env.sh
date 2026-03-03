@@ -9,13 +9,14 @@ set -euo pipefail
 # folder name (e.g., myuser-agentweb), so each clone gets its own instance.
 #
 # Usage:
-#   ./test-env.sh launch   [--key-name K] [--key-file F] [--instance-type T] [--no-watchdog]
+#   ./test-env.sh launch   [--dev] [--key-name K] [--key-file F] [--instance-type T] [--no-watchdog]
 #   ./test-env.sh teardown
 #   ./test-env.sh sync     [backend|partner-portal|customer-portal|test-env-access]
 #   ./test-env.sh status
 #   ./test-env.sh allow-ip <IP>         # grant another IP access
 #   ./test-env.sh revoke-ip <IP>        # revoke an IP's access
 #   ./test-env.sh ssh
+#   ./test-env.sh claude   [message]              # dev mode: run Claude Code
 #   ./test-env.sh logs     [backend|partner-portal|customer-portal]
 #   ./test-env.sh list                  # list active environment
 #   ./test-env.sh teardown-all          # terminate environment
@@ -31,6 +32,7 @@ REGION="${AWS_REGION:-us-west-2}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
 SECRET_NAME="${SECRET_NAME:-agentweb/test-env/backend-env}"
 SECRET_NAME_ACCESS="${SECRET_NAME_ACCESS:-agentweb/test-env/test-env-access-env}"
+SECRET_NAME_CLAUDE="${SECRET_NAME_CLAUDE:-agentweb/test-env/claude-code-env}"
 PROFILE_NAME="agentweb-test-env-profile"
 SSH_USER="ec2-user"
 
@@ -78,8 +80,13 @@ PUBLIC_IP=$PUBLIC_IP
 KEY_NAME=$KEY_NAME
 KEY_FILE=$KEY_FILE
 SG_ID=$SG_ID
+MODE=${MODE:-docker}
 LAUNCH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
+}
+
+is_dev_mode() {
+  [[ "${MODE:-docker}" == "dev" ]]
 }
 
 load_state() {
@@ -112,17 +119,25 @@ cmd_launch() {
   local name
   name="$(resolve_env_name)"
   local NO_WATCHDOG=false
+  local INSTANCE_TYPE_SPECIFIED=false
+  MODE="docker"
 
   # Parse flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --key-name)      KEY_NAME="$2"; shift 2 ;;
       --key-file)      KEY_FILE="$2"; shift 2 ;;
-      --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
+      --instance-type) INSTANCE_TYPE="$2"; INSTANCE_TYPE_SPECIFIED=true; shift 2 ;;
       --no-watchdog)   NO_WATCHDOG=true; shift ;;
+      --dev)           MODE="dev"; shift ;;
       *) err "Unknown flag: $1"; exit 1 ;;
     esac
   done
+
+  # Dev mode: auto-upgrade to t3.xlarge (16 GB) unless user specified --instance-type
+  if is_dev_mode && [[ "$INSTANCE_TYPE_SPECIFIED" == "false" ]]; then
+    INSTANCE_TYPE="t3.xlarge"
+  fi
 
   # If config missing and no flags provided, interactively create it
   if [[ -z "${KEY_NAME:-}" ]] || [[ -z "${KEY_FILE:-}" ]]; then
@@ -248,12 +263,15 @@ EOF
   done
 
   # IP allowlist service must be publicly accessible so users can self-register
-  aws ec2 authorize-security-group-ingress \
-    --group-id "$SG_ID" \
-    --protocol tcp \
-    --port 5175 \
-    --cidr "0.0.0.0/0" \
-    --region "$REGION" > /dev/null
+  # (not needed in dev mode — no test-env-access container)
+  if ! is_dev_mode; then
+    aws ec2 authorize-security-group-ingress \
+      --group-id "$SG_ID" \
+      --protocol tcp \
+      --port 5175 \
+      --cidr "0.0.0.0/0" \
+      --region "$REGION" > /dev/null
+  fi
   log "Security group: $SG_ID"
 
   # Look up instance profile
@@ -267,7 +285,17 @@ EOF
   fi
   log "Instance profile: $PROFILE_NAME"
 
-  log "Launching EC2 instance ($INSTANCE_TYPE)..."
+  # Select user-data script and EBS volume size based on mode
+  local user_data_script volume_size
+  if is_dev_mode; then
+    user_data_script="$SCRIPT_DIR/user-data-dev.sh"
+    volume_size=50
+  else
+    user_data_script="$SCRIPT_DIR/user-data.sh"
+    volume_size=30
+  fi
+
+  log "Launching EC2 instance ($INSTANCE_TYPE, ${volume_size}GB, mode: $MODE)..."
   INSTANCE_ID=$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
@@ -275,14 +303,15 @@ EOF
     --security-group-ids "$SG_ID" \
     --iam-instance-profile "Name=$PROFILE_NAME" \
     --instance-initiated-shutdown-behavior terminate \
-    --user-data "file://$SCRIPT_DIR/user-data.sh" \
+    --user-data "file://$user_data_script" \
     --tag-specifications "ResourceType=instance,Tags=[
       {Key=Name,Value=agentweb-test-env-$(whoami)-${name}},
       {Key=purpose,Value=test-env},
       {Key=creator,Value=$(whoami)},
-      {Key=env-name,Value=${name}}
+      {Key=env-name,Value=${name}},
+      {Key=mode,Value=${MODE}}
     ]" \
-    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
+    --block-device-mappings "[{\"DeviceName\":\"/dev/xvda\",\"Ebs\":{\"VolumeSize\":${volume_size},\"VolumeType\":\"gp3\"}}]" \
     --region "$REGION" \
     --query 'Instances[0].InstanceId' --output text)
 
@@ -315,52 +344,122 @@ EOF
     sleep 5
   done
 
-  # Wait for user-data to finish (Docker installed)
-  log "Waiting for Docker setup to complete..."
+  # Wait for user-data to finish
+  local ready_file setup_label
+  if is_dev_mode; then
+    ready_file="/home/ec2-user/.test-env-dev-ready"
+    setup_label="Node.js"
+  else
+    ready_file="/home/ec2-user/.test-env-ready"
+    setup_label="Docker"
+  fi
+  log "Waiting for $setup_label setup to complete..."
   for i in $(seq 1 60); do
-    if remote "test -f /home/ec2-user/.test-env-ready" 2>/dev/null; then
+    if remote "test -f $ready_file" 2>/dev/null; then
       break
     fi
     if [[ $i -eq 60 ]]; then
-      err "Docker setup timeout"
+      err "$setup_label setup timeout"
       exit 1
     fi
     sleep 10
   done
 
   log "Instance ready. Syncing code..."
-  _do_sync "all"
 
-  # Fetch .env files from Secrets Manager
-  log "Fetching backend .env from Secrets Manager..."
-  remote "aws secretsmanager get-secret-value \
-    --secret-id '$SECRET_NAME' \
-    --region '$REGION' \
-    --query SecretString --output text \
-    > /home/ec2-user/agentweb/.env.test-env"
+  if is_dev_mode; then
+    _do_sync_dev "all"
+  else
+    _do_sync "all"
+  fi
 
-  log "Fetching test-env-access .env from Secrets Manager..."
-  remote "aws secretsmanager get-secret-value \
-    --secret-id '$SECRET_NAME_ACCESS' \
-    --region '$REGION' \
-    --query SecretString --output text \
-    > /home/ec2-user/agentweb/.env.test-env-access"
+  if is_dev_mode; then
+    # --- Dev mode post-launch ---
 
-  log "Building and starting services (this may take a few minutes on first run)..."
-  remote "cd /home/ec2-user/agentweb/test-env && \
-    export PUBLIC_IP='$PUBLIC_IP' && \
-    export SG_ID='$SG_ID' && \
-    export AWS_REGION='$REGION' && \
-    docker compose build && \
-    docker compose up -d"
+    # Fetch backend .env from Secrets Manager and patch URLs
+    log "Fetching backend .env from Secrets Manager..."
+    remote "aws secretsmanager get-secret-value \
+      --secret-id '$SECRET_NAME' \
+      --region '$REGION' \
+      --query SecretString --output text \
+      > /home/ec2-user/agentweb/backend/.env"
 
-  # Seed IP allowlist with developer's IP so the UI shows correct status
-  local dev_subnet dev_now
-  dev_subnet="$(echo "$MY_IP" | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"
-  dev_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  log "Seeding IP allowlist with developer IP ($MY_IP)..."
-  remote "printf '%s' '{\"ips\":[{\"ip\":\"$MY_IP\",\"subnet\":\"$dev_subnet\",\"email\":\"launcher\",\"addedAt\":\"$dev_now\"}]}' | \
-    docker compose -f /home/ec2-user/agentweb/test-env/docker-compose.yml exec -T test-env-access sh -c 'cat > /app/data/allowlist.json'"
+    log "Patching backend .env with instance URLs..."
+    remote "cd /home/ec2-user/agentweb/backend && \
+      sed -i 's|^FRONTEND_URL=.*|FRONTEND_URL=http://$PUBLIC_IP:5173|' .env && \
+      sed -i 's|^CUSTOMER_FRONTEND_URL=.*|CUSTOMER_FRONTEND_URL=http://$PUBLIC_IP:5174|' .env && \
+      sed -i 's|^BACKEND_URL=.*|BACKEND_URL=http://$PUBLIC_IP:3001|' .env && \
+      grep -q '^NODE_ENV=' .env && sed -i 's|^NODE_ENV=.*|NODE_ENV=development|' .env || echo 'NODE_ENV=development' >> .env"
+
+    # Create frontend .env.local files with VITE_API_URL
+    log "Creating frontend .env.local files..."
+    remote "echo 'VITE_API_URL=http://$PUBLIC_IP:3001
+VITE_CUSTOMER_FRONTEND_URL=http://$PUBLIC_IP:5174
+VITE_DEBUG=true' > /home/ec2-user/agentweb/partner-portal/.env.local"
+
+    remote "echo 'VITE_API_URL=http://$PUBLIC_IP:3001
+VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
+
+    # Fetch Claude Code Bedrock config from Secrets Manager and write to .bashrc
+    log "Fetching Claude Code config from Secrets Manager..."
+    remote "aws secretsmanager get-secret-value \
+      --secret-id '$SECRET_NAME_CLAUDE' \
+      --region '$REGION' \
+      --query SecretString --output text \
+      > /tmp/claude-code-env && \
+      sed -i '/# Claude Code Bedrock config/,/^$/d' ~/.bashrc && \
+      echo '' >> ~/.bashrc && \
+      echo '# Claude Code Bedrock config' >> ~/.bashrc && \
+      while IFS= read -r line; do
+        [[ -n \"\$line\" ]] && echo \"export \$line\" >> ~/.bashrc
+      done < /tmp/claude-code-env && \
+      rm -f /tmp/claude-code-env"
+
+    # Install npm dependencies
+    log "Installing npm dependencies (this may take a few minutes)..."
+    remote "cd /home/ec2-user/agentweb/backend && npm ci"
+    remote "cd /home/ec2-user/agentweb/partner-portal && npm ci"
+    remote "cd /home/ec2-user/agentweb/customer-portal && npm ci"
+
+    # Deploy and start dev services
+    log "Starting dev servers..."
+    remote "chmod +x /home/ec2-user/agentweb/test-env/dev-services.sh && \
+      /home/ec2-user/agentweb/test-env/dev-services.sh start-all"
+
+  else
+    # --- Docker mode post-launch ---
+
+    # Fetch .env files from Secrets Manager
+    log "Fetching backend .env from Secrets Manager..."
+    remote "aws secretsmanager get-secret-value \
+      --secret-id '$SECRET_NAME' \
+      --region '$REGION' \
+      --query SecretString --output text \
+      > /home/ec2-user/agentweb/.env.test-env"
+
+    log "Fetching test-env-access .env from Secrets Manager..."
+    remote "aws secretsmanager get-secret-value \
+      --secret-id '$SECRET_NAME_ACCESS' \
+      --region '$REGION' \
+      --query SecretString --output text \
+      > /home/ec2-user/agentweb/.env.test-env-access"
+
+    log "Building and starting services (this may take a few minutes on first run)..."
+    remote "cd /home/ec2-user/agentweb/test-env && \
+      export PUBLIC_IP='$PUBLIC_IP' && \
+      export SG_ID='$SG_ID' && \
+      export AWS_REGION='$REGION' && \
+      docker compose build && \
+      docker compose up -d"
+
+    # Seed IP allowlist with developer's IP so the UI shows correct status
+    local dev_subnet dev_now
+    dev_subnet="$(echo "$MY_IP" | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"
+    dev_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    log "Seeding IP allowlist with developer IP ($MY_IP)..."
+    remote "printf '%s' '{\"ips\":[{\"ip\":\"$MY_IP\",\"subnet\":\"$dev_subnet\",\"email\":\"launcher\",\"addedAt\":\"$dev_now\"}]}' | \
+      docker compose -f /home/ec2-user/agentweb/test-env/docker-compose.yml exec -T test-env-access sh -c 'cat > /app/data/allowlist.json'"
+  fi
 
   # Set up watchdog cron (unless --no-watchdog)
   if [[ "$NO_WATCHDOG" == "true" ]]; then
@@ -376,11 +475,18 @@ EOF
   log "========================================="
   log " Test environment '$name' is ready!"
   log "========================================="
+  echo -e " ${CYAN}Mode:${NC}             $MODE"
   echo -e " ${CYAN}Backend:${NC}          http://$PUBLIC_IP:3001"
   echo -e " ${CYAN}Partner Portal:${NC}   http://$PUBLIC_IP:5173"
   echo -e " ${CYAN}Customer Portal:${NC}  http://$PUBLIC_IP:5174"
-  echo -e " ${CYAN}IP Allowlist:${NC}     http://$PUBLIC_IP:5175"
-  echo -e " ${CYAN}SSH:${NC}              ssh -i $KEY_FILE $SSH_USER@$PUBLIC_IP"
+  if ! is_dev_mode; then
+    echo -e " ${CYAN}IP Allowlist:${NC}     http://$PUBLIC_IP:5175"
+  fi
+  if is_dev_mode; then
+    echo -e " ${CYAN}SSH:${NC}              ssh -A -i $KEY_FILE $SSH_USER@$PUBLIC_IP"
+  else
+    echo -e " ${CYAN}SSH:${NC}              ssh -i $KEY_FILE $SSH_USER@$PUBLIC_IP"
+  fi
   echo ""
   if [[ "$NO_WATCHDOG" == "true" ]]; then
     echo -e " ${YELLOW}Auto-shutdown:${NC}    DISABLED (manual teardown required)"
@@ -388,6 +494,13 @@ EOF
     echo -e " ${YELLOW}Auto-shutdown:${NC}    After 24 hours of inactivity"
   fi
   echo -e " ${YELLOW}Teardown:${NC}         ./test-env.sh teardown"
+  if is_dev_mode; then
+    echo ""
+    echo -e " ${CYAN}Claude Code:${NC}      SSH in, then run 'claude login' (first time) and 'cd ~/agentweb && claude'"
+    echo ""
+    echo -e " ${YELLOW}NOTE:${NC} Dev servers auto-reload on file changes. No need to sync after editing on the instance."
+    echo -e " ${YELLOW}NOTE:${NC} If you sync from local, commit on-instance changes first (rsync --delete overwrites remote files)."
+  fi
   log "========================================="
 }
 
@@ -505,12 +618,89 @@ _do_sync() {
     "$REPO_ROOT/.dockerignore" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/.dockerignore"
 }
 
+_do_sync_dev() {
+  local service="${1:-all}"
+  local targets=()
+
+  case "$service" in
+    all)
+      targets=("backend" "partner-portal" "customer-portal" "test-env")
+      ;;
+    backend|partner-portal|customer-portal)
+      targets=("$service")
+      ;;
+    *)
+      err "Unknown service: $service (use backend, partner-portal, or customer-portal)"
+      exit 1
+      ;;
+  esac
+
+  for target in "${targets[@]}"; do
+    local src_path="$REPO_ROOT/$target/"
+    if [[ ! -d "$src_path" ]]; then
+      warn "Directory not found: $src_path — skipping"
+      continue
+    fi
+
+    log "Syncing $target..."
+    rsync -az --delete \
+      --exclude 'node_modules' \
+      --exclude 'dist' \
+      --exclude '.env' \
+      --exclude '.env.local' \
+      --exclude '.env.*.local' \
+      --exclude 'coverage' \
+      --exclude 'logs' \
+      --exclude '.cache' \
+      --exclude '*.log' \
+      --exclude 'builds' \
+      --exclude '*.zip' \
+      --exclude '*.pem' \
+      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+      "$src_path" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/$target/"
+  done
+
+  # On full sync, also sync repo-root files needed for development
+  if [[ "$service" == "all" ]]; then
+    log "Syncing repo-root .git/ directory..."
+    rsync -az \
+      -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+      "$REPO_ROOT/.git/" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/.git/"
+
+    log "Syncing repo-root files..."
+    for f in CLAUDE.md .gitignore; do
+      if [[ -f "$REPO_ROOT/$f" ]]; then
+        rsync -az \
+          -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+          "$REPO_ROOT/$f" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/$f"
+      fi
+    done
+
+    # Sync .claude/ directory if it exists
+    if [[ -d "$REPO_ROOT/.claude" ]]; then
+      rsync -az \
+        -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $KEY_FILE" \
+        "$REPO_ROOT/.claude/" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/agentweb/.claude/"
+    fi
+  fi
+}
+
 cmd_sync() {
   local name
   name="$(resolve_env_name)"
   load_state "$name"
 
   local service="${1:-all}"
+
+  if is_dev_mode; then
+    _do_sync_dev "$service"
+    log "Sync complete. Dev servers will auto-reload changed files."
+    if [[ "$service" == "all" ]]; then
+      warn "If package.json changed, SSH in and run 'npm ci' in the affected service directory."
+    fi
+    return
+  fi
+
   _do_sync "$service"
 
   # Rebuild and restart affected containers
@@ -551,13 +741,19 @@ cmd_status() {
   echo -e "${CYAN}Instance:${NC}    $INSTANCE_ID"
   echo -e "${CYAN}State:${NC}       $state"
   echo -e "${CYAN}IP:${NC}          $PUBLIC_IP"
+  echo -e "${CYAN}Mode:${NC}        ${MODE:-docker}"
   echo -e "${CYAN}Launched:${NC}    $LAUNCH_TIME"
 
   if [[ "$state" == "running" ]]; then
     echo ""
     echo -e "${CYAN}Services:${NC}"
-    remote "cd /home/ec2-user/agentweb/test-env && docker compose ps" 2>/dev/null || \
-      warn "Could not reach instance"
+    if is_dev_mode; then
+      remote "/home/ec2-user/agentweb/test-env/dev-services.sh status" 2>/dev/null || \
+        warn "Could not reach instance"
+    else
+      remote "cd /home/ec2-user/agentweb/test-env && docker compose ps" 2>/dev/null || \
+        warn "Could not reach instance"
+    fi
   fi
 }
 
@@ -660,8 +856,41 @@ cmd_ssh() {
   local name
   name="$(resolve_env_name)"
   load_state "$name"
-  exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-       -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
+  if is_dev_mode; then
+    # -A enables SSH agent forwarding for git push/pull on the instance
+    exec ssh -A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+         -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
+  else
+    exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+         -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP"
+  fi
+}
+
+###############################################################################
+# claude — run Claude Code on the instance with an optional message
+###############################################################################
+cmd_claude() {
+  local name
+  name="$(resolve_env_name)"
+  load_state "$name"
+
+  if ! is_dev_mode; then
+    err "The 'claude' command is only available in dev mode (launch with --dev)."
+    exit 1
+  fi
+
+  local message="$*"
+  if [[ -n "$message" ]]; then
+    # Run Claude Code with a prompt (non-interactive, streams output back)
+    ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        "source ~/.bashrc && cd /home/ec2-user/agentweb && claude -p $(printf '%q' "$message")"
+  else
+    # Interactive Claude Code session
+    ssh -A -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        "source ~/.bashrc && cd /home/ec2-user/agentweb && claude"
+  fi
 }
 
 ###############################################################################
@@ -673,10 +902,18 @@ cmd_logs() {
   load_state "$name"
 
   local service="${1:-}"
-  if [[ -n "$service" ]]; then
-    remote "cd /home/ec2-user/agentweb/test-env && docker compose logs --tail=100 -f $service"
+  if is_dev_mode; then
+    if [[ -n "$service" ]]; then
+      remote "tail -f /home/ec2-user/agentweb/logs/$service.log"
+    else
+      remote "tail -f /home/ec2-user/agentweb/logs/backend.log /home/ec2-user/agentweb/logs/partner-portal.log /home/ec2-user/agentweb/logs/customer-portal.log"
+    fi
   else
-    remote "cd /home/ec2-user/agentweb/test-env && docker compose logs --tail=100 -f"
+    if [[ -n "$service" ]]; then
+      remote "cd /home/ec2-user/agentweb/test-env && docker compose logs --tail=100 -f $service"
+    else
+      remote "cd /home/ec2-user/agentweb/test-env && docker compose logs --tail=100 -f"
+    fi
   fi
 }
 
@@ -696,6 +933,7 @@ case "$CMD" in
   allow-ip)     cmd_allow_ip "${1:-}" ;;
   revoke-ip)    cmd_revoke_ip "${1:-}" ;;
   ssh)          cmd_ssh ;;
+  claude)       cmd_claude "$@" ;;
   logs)         cmd_logs "${1:-}" ;;
   help|*)
     echo "Usage: test-env.sh <command> [options]"
@@ -704,13 +942,21 @@ case "$CMD" in
     echo "  launch       Launch a new test environment"
     echo "  teardown     Terminate a test environment"
     echo "  teardown-all Terminate ALL test environments"
-    echo "  sync         Sync code and rebuild [backend|partner-portal|customer-portal|test-env-access|all]"
+    echo "  sync         Sync code [backend|partner-portal|customer-portal|test-env-access|all]"
     echo "  status       Show environment status"
     echo "  list         List all active environments"
     echo "  allow-ip IP  Grant another IP access to this environment"
     echo "  revoke-ip IP Revoke an IP's access"
     echo "  ssh          Open SSH session to the instance"
-    echo "  logs         View container logs [service]"
+    echo "  claude [msg] Run Claude Code on instance (dev mode only)"
+    echo "  logs         View service logs [service]"
+    echo ""
+    echo "Launch flags:"
+    echo "  --dev            Dev mode: hot-reload dev servers + Claude Code (no Docker)"
+    echo "  --key-name K     EC2 key pair name"
+    echo "  --key-file F     Path to private key file"
+    echo "  --instance-type T  Instance type (default: t3.large, dev mode: t3.xlarge)"
+    echo "  --no-watchdog    Disable auto-shutdown watchdog"
     echo ""
     echo "The environment name is derived automatically from your AWS username"
     echo "and the repo folder name (e.g., myuser-agentweb)."
@@ -718,9 +964,17 @@ case "$CMD" in
     echo "By default, only the developer's IP (detected at launch) can access"
     echo "the instance. Use 'allow-ip' to grant access to others."
     echo ""
+    echo "Modes:"
+    echo "  Docker (default): 4 Docker containers, sync + rebuild cycle"
+    echo "  Dev (--dev):      Hot-reload dev servers, Claude Code CLI installed"
+    echo "                    SSH in and use 'claude' to develop in the cloud"
+    echo ""
     echo "Examples:"
-    echo "  ./test-env.sh launch                    # launch environment"
+    echo "  ./test-env.sh launch                    # launch Docker environment"
+    echo "  ./test-env.sh launch --dev              # launch dev environment"
     echo "  ./test-env.sh launch --no-watchdog      # launch without auto-shutdown"
+    echo "  ./test-env.sh claude                    # interactive Claude Code (dev mode)"
+    echo "  ./test-env.sh claude 'fix the login bug'  # run Claude with a prompt"
     echo "  ./test-env.sh sync                      # sync all services"
     echo "  ./test-env.sh sync backend              # sync just backend"
     echo "  ./test-env.sh allow-ip 203.0.113.50     # grant IP access"
