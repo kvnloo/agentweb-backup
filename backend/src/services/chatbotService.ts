@@ -69,6 +69,15 @@ export interface MessageFeedback {
   userId: string;                      // User who gave feedback
 }
 
+// Interface for image-level feedback (stored on session.feedbacks or result_files[].feedback)
+export interface ImageFeedback {
+  type: 'like' | 'dislike';
+  reasons?: string[];
+  comment?: string;
+  timestamp: string;
+  userId: string;
+}
+
 // Interface for chat messages
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -164,6 +173,7 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
+  feedbacks?: Record<string, ImageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint"; // Type of session based on how it was created
   resultEndpointMetadata?: {
     resultName: string;
@@ -1847,6 +1857,32 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session LLM model:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionFeedbacks(
+    sessionId: string,
+    feedbacks: Record<string, ImageFeedback>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET feedbacks = :feedbacks, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":feedbacks": feedbacks,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW" as const,
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session feedbacks:", error);
       throw error;
     }
   }
