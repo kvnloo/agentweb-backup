@@ -164,7 +164,12 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint"; // Type of session based on how it was created
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
+  emailMetadata?: {
+    senderEmail: string;
+    lastInboundEmailId?: string;
+    lastOutboundEmailId?: string;
+  };
   resultEndpointMetadata?: {
     resultName: string;
     resultTitle?: string;
@@ -419,7 +424,7 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint",
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
@@ -1761,6 +1766,37 @@ export class ChatbotDB {
     }
   }
 
+  async updateSessionEmailMetadata(
+    sessionId: string,
+    emailMetadata: {
+      senderEmail: string;
+      lastInboundEmailId?: string;
+      lastOutboundEmailId?: string;
+    }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET emailMetadata = :emailMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":emailMetadata": emailMetadata,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session email metadata:", error);
+      throw error;
+    }
+  }
+
   async updateSessionWorkPlan(
     sessionId: string,
     workPlan: {
@@ -2798,16 +2834,23 @@ export async function generateChatResponse(
     // Generate response using OpenAI
     const response = await openai.chat.completions.create({
       model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-      messages: messages.map(({ role, content, name, tool_call_id }) => {
-        const message: any = { role, content };
-        if (role === 'tool' && tool_call_id) {
-          message.tool_call_id = tool_call_id;
-        }
-        if (name) {
-          message.name = name;
-        }
-        return message;
-      }), // Send appropriate properties based on message type
+      messages: messages
+        .filter(({ role, content }) => {
+          // Skip tool result messages — their content is already in assistant responses,
+          // and including them without proper tool_calls on the preceding assistant message
+          // causes OpenAI to reject the request.
+          if (role === 'tool') return false;
+          // Skip assistant messages with no text content (tool-call-only messages)
+          if (role === 'assistant' && !content) return false;
+          return true;
+        })
+        .map(({ role, content, name }) => {
+          const message: any = { role, content };
+          if (name) {
+            message.name = name;
+          }
+          return message;
+        }),
     });
 
     // Log and get usage data
