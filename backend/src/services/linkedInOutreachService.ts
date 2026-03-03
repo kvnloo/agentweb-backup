@@ -258,41 +258,66 @@ export class LinkedInOutreachService {
 
   /**
    * Check that a target profile is not already a 1st-degree connection before sending an invite.
+   * Uses raw API call to avoid SDK validator failures.
    */
   private async checkIsNotAlreadyConnected(accountId: string, providerId: string): Promise<void> {
-    const client = await this.getClient();
-    const profile = await client.users.getProfile({
-      account_id: accountId,
-      identifier: providerId
-    });
-    const distance = (profile as any).network_distance;
+    try {
+      const client = await this.getClient();
+      this.log(`Fetching profile for connection check`, { accountId, providerId });
+      const profile = await client.request.send({
+        method: 'GET',
+        path: ['users', providerId],
+        parameters: { account_id: accountId }
+      }) as any;
+      const distance = profile?.network_distance;
+      this.log(`Connection check for invite`, { providerId, network_distance: distance });
 
-    if (distance === 'FIRST_DEGREE') {
-      throw new Error(
-        `Cannot send invite: you are already connected with this person. ` +
-        `Use the send-message action to reach them directly.`
-      );
+      // Unipile may return 'FIRST_DEGREE' (validated format) or 'DISTANCE_1' (raw format)
+      if (distance === 'FIRST_DEGREE' || distance === 'DISTANCE_1') {
+        throw new Error(
+          `Cannot send invite: you are already connected with this person (network_distance: ${distance}). ` +
+          `Use the send-message action to reach them directly.`
+        );
+      }
+    } catch (error: any) {
+      if (error.message?.startsWith('Cannot send invite:')) throw error;
+      // Profile lookup failed — log and proceed rather than blocking the invite
+      this.log(`Connection status check skipped (profile fetch failed)`, { providerId, reason: error.message });
     }
   }
 
   /**
    * Check that a target profile can receive DMs: must be a 1st-degree connection
    * or have an open profile (LinkedIn Premium Open Profile).
+   * Uses raw API call to avoid SDK validator failures.
    */
   private async checkIsMessageable(accountId: string, providerId: string): Promise<void> {
-    const client = await this.getClient();
-    const profile = await client.users.getProfile({
-      account_id: accountId,
-      identifier: providerId
-    });
-    const distance = (profile as any).network_distance;
-    const isOpenProfile = (profile as any).is_open_profile;
+    try {
+      const client = await this.getClient();
+      this.log(`Fetching profile for messageability check`, { accountId, providerId });
+      const profile = await client.request.send({
+        method: 'GET',
+        path: ['users', providerId],
+        parameters: { account_id: accountId }
+      }) as any;
+      const distance = profile?.network_distance;
+      const isOpenProfile = profile?.is_open_profile;
+      this.log(`Messageability check`, { providerId, network_distance: distance, is_open_profile: isOpenProfile });
 
-    if (distance !== 'FIRST_DEGREE' && !isOpenProfile) {
-      throw new Error(
-        `Cannot send message: target is not a 1st-degree connection (status: ${distance ?? 'unknown'}). ` +
-        `Use the send-invite action first to connect.`
-      );
+      // Unipile may return 'FIRST_DEGREE' (validated format) or 'DISTANCE_1' (raw format)
+      const isFirstDegree = distance === 'FIRST_DEGREE' || distance === 'DISTANCE_1';
+      if (!isFirstDegree && !isOpenProfile) {
+        throw new Error(
+          `Cannot send message: target is not a 1st-degree connection (status: ${distance ?? 'unknown'}). ` +
+          `Use the send-invite action first to connect.`
+        );
+      }
+    } catch (error: any) {
+      // Re-throw our own check errors
+      if (error.message?.startsWith('Cannot send message:')) throw error;
+      // For API/network errors, log a warning but let the message attempt proceed
+      // (Unipile API will reject it server-side if not messageable)
+      this.log(`Messageability check skipped (profile fetch failed)`, { providerId, reason: error.message });
     }
   }
 

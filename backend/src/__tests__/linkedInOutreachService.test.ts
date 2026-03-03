@@ -92,10 +92,21 @@ describe('LinkedInOutreachService', () => {
       });
     });
 
-    it('should reject with a helpful error when target is already a 1st-degree connection', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
-        network_distance: 'FIRST_DEGREE',
-        is_open_profile: false
+    it('should reject with a helpful error when target is already a 1st-degree connection (FIRST_DEGREE)', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'FIRST_DEGREE'
+      });
+
+      await expect(
+        linkedInOutreachService.sendInvitation('account-id', 'provider-id', false)
+      ).rejects.toThrow('already connected');
+
+      expect(mockUnipileClient.users.sendInvitation).not.toHaveBeenCalled();
+    });
+
+    it('should reject with a helpful error when target is already a 1st-degree connection (DISTANCE_1 raw format)', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'DISTANCE_1'
       });
 
       await expect(
@@ -106,9 +117,8 @@ describe('LinkedInOutreachService', () => {
     });
 
     it('should send invitation when target is SECOND_DEGREE (not yet connected)', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
-        network_distance: 'SECOND_DEGREE',
-        is_open_profile: false
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'SECOND_DEGREE'
       });
 
       await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false);
@@ -116,10 +126,16 @@ describe('LinkedInOutreachService', () => {
     });
 
     it('should send invitation when target is OUT_OF_NETWORK', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
-        network_distance: 'OUT_OF_NETWORK',
-        is_open_profile: false
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'OUT_OF_NETWORK'
       });
+
+      await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false);
+      expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
+    });
+
+    it('should proceed with invite when connection status check fails (resilient fallback)', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(new Error('404 Not Found'));
 
       await linkedInOutreachService.sendInvitation('account-id', 'provider-id', false);
       expect(mockUnipileClient.users.sendInvitation).toHaveBeenCalled();
@@ -145,7 +161,7 @@ describe('LinkedInOutreachService', () => {
 
   describe('sendMessage', () => {
     it('should reject with a helpful error when target is SECOND_DEGREE connection', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
         network_distance: 'SECOND_DEGREE',
         is_open_profile: false
       });
@@ -158,7 +174,7 @@ describe('LinkedInOutreachService', () => {
     });
 
     it('should reject with a helpful error when target is OUT_OF_NETWORK', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
         network_distance: 'OUT_OF_NETWORK',
         is_open_profile: false
       });
@@ -171,7 +187,7 @@ describe('LinkedInOutreachService', () => {
     });
 
     it('should reject with a helpful error when target is THIRD_DEGREE connection', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
         network_distance: 'THIRD_DEGREE',
         is_open_profile: false
       });
@@ -184,7 +200,7 @@ describe('LinkedInOutreachService', () => {
     });
 
     it('should send message successfully when target is FIRST_DEGREE connection', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
         network_distance: 'FIRST_DEGREE',
         is_open_profile: false
       });
@@ -199,8 +215,24 @@ describe('LinkedInOutreachService', () => {
       expect(result).toEqual({ id: 'chat-id' });
     });
 
+    it('should send message successfully when target is DISTANCE_1 (raw format)', async () => {
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
+        network_distance: 'DISTANCE_1',
+        is_open_profile: false
+      });
+
+      const result = await linkedInOutreachService.sendMessage('account-id', 'provider-id', false, 'Hello!');
+
+      expect(mockUnipileClient.messaging.startNewChat).toHaveBeenCalledWith({
+        account_id: 'account-id',
+        attendees_ids: ['provider-id'],
+        text: 'Hello!'
+      });
+      expect(result).toEqual({ id: 'chat-id' });
+    });
+
     it('should send message successfully when target has open profile (SECOND_DEGREE but is_open_profile=true)', async () => {
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
         network_distance: 'SECOND_DEGREE',
         is_open_profile: true
       });
@@ -217,7 +249,7 @@ describe('LinkedInOutreachService', () => {
 
     it('should surface a helpful error when startNewChat returns no_connection_with_recipient (pre-flight bypass)', async () => {
       // Simulate pre-flight check incorrectly passing but API rejecting
-      (mockUnipileClient.users.getProfile as jest.Mock).mockResolvedValue({
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce({
         network_distance: 'FIRST_DEGREE',
         is_open_profile: false
       });
