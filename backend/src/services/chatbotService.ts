@@ -2850,10 +2850,13 @@ export async function generateChatResponse(
       // Generate response using OpenAI (with tools if available)
       const response = await openai.chat.completions.create({
         model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-        messages: messages.map(({ role, content, name, tool_call_id }) => {
+        messages: messages.map(({ role, content, name, tool_call_id, tool_calls }) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
             message.tool_call_id = tool_call_id;
+          }
+          if (role === 'assistant' && tool_calls) {
+            message.tool_calls = tool_calls;
           }
           if (name) {
             message.name = name;
