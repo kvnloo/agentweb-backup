@@ -6664,6 +6664,7 @@ Format the response as JSON with this structure:
         metadata: {
           taskId,
           userId,
+          sessionId,
           updatedAt: new Date().toISOString()
         }
       });
