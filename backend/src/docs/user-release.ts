@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-03',
     changes: [
+      'Reports: Search by File Name',
+      '- The search bar on the Reports page now matches against report file names in addition to task name and task ID',
+      '- Updated placeholder text to clarify searchable fields',
       'Email Emma: Interact with Agent Mode via Email',
       '- Send an email to emma@updates.agentweb.pro to start an Agent Mode conversation',
       '- Uses the same Agent Mode engine with full tool calling, web search, and skill support',
