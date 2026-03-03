@@ -300,9 +300,16 @@ class ResendService {
     html?: string;
     text?: string;
     headers?: Record<string, string>;
+    attachments?: Array<{
+      id: string;
+      filename: string;
+      size: number;
+      content_type: string;
+      download_url: string;
+    }>;
   } | null> {
     await this.initializeResend();
-    
+
     if (!this.apiKey) {
       console.error('Resend API key not available');
       return null;
@@ -318,6 +325,13 @@ class ResendService {
       html?: string;
       text?: string;
       headers?: Record<string, string>;
+      attachments?: Array<{
+        id: string;
+        filename: string;
+        size: number;
+        content_type: string;
+        download_url: string;
+      }>;
     }
 
     const result = await this.retryWithBackoff<ResendEmailContent>(
@@ -332,7 +346,7 @@ class ResendService {
               },
             }
           );
-          
+
           return response.data;
         } catch (error: any) {
           if (error.response) {
@@ -352,10 +366,27 @@ class ResendService {
     );
 
     if (result) {
+      // If attachments not in main response, try the separate list endpoint
+      let attachments = result.attachments;
+      if ((!attachments || attachments.length === 0) && this.apiKey) {
+        try {
+          const attachResp = await axios.get<{ data: ResendEmailContent['attachments'] }>(
+            `https://api.resend.com/emails/receiving/${emailId}/attachments`,
+            { headers: { 'Authorization': `Bearer ${this.apiKey}` } }
+          );
+          if (attachResp.data?.data && attachResp.data.data.length > 0) {
+            attachments = attachResp.data.data;
+          }
+        } catch {
+          // Ignore — attachments list endpoint may not exist for all emails
+        }
+      }
+
       return {
         html: result.html || undefined,
         text: result.text || undefined,
         headers: result.headers || undefined,
+        attachments: attachments && attachments.length > 0 ? attachments : undefined,
       };
     }
 

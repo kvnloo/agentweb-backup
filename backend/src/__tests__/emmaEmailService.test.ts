@@ -36,10 +36,21 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+jest.mock('../utils/s3Utils', () => ({
+  uploadFileToS3: jest.fn(),
+}));
+
+jest.mock('axios', () => ({
+  default: { get: jest.fn() },
+  get: jest.fn(),
+}));
+
 import { resendService } from '../services/resendService';
 import { chatbotDb } from '../services/chatbotService';
 import { generateSessionResponse } from '../controllers/agentModeController';
 import { userDb } from '../services/db';
+import { uploadFileToS3 } from '../utils/s3Utils';
+import axios from 'axios';
 
 describe('EmmaEmailService', () => {
   let service: EmmaEmailService;
@@ -322,7 +333,8 @@ describe('EmmaEmailService', () => {
         'new-session-id',
         'Help with my website\n\nHelp me please',
         'user-123',
-        'claude-sonnet-4-20250514'
+        'claude-sonnet-4-20250514',
+        undefined
       );
     });
 
@@ -349,7 +361,8 @@ describe('EmmaEmailService', () => {
         sessionId,
         'Follow-up question',
         'user-123',
-        'claude-sonnet-4-20250514'
+        'claude-sonnet-4-20250514',
+        undefined
       );
     });
 
@@ -437,6 +450,74 @@ describe('EmmaEmailService', () => {
           senderEmail: 'user@example.com',
           lastInboundEmailId: 'email-001',
         })
+      );
+    });
+
+    it('uploads email attachments to S3 and passes them to generateSessionResponse', async () => {
+      const attachments = [
+        { id: 'att-1', filename: 'report.pdf', size: 12345, content_type: 'application/pdf', download_url: 'https://resend.com/dl/att-1' },
+        { id: 'att-2', filename: 'photo.png', size: 67890, content_type: 'image/png', download_url: 'https://resend.com/dl/att-2' },
+      ];
+
+      (resendService.getReceivedEmailContent as jest.Mock).mockResolvedValue({ text: 'See attached', attachments });
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+      (chatbotDb.createChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-att' });
+      (axios.get as jest.Mock).mockResolvedValue({ data: Buffer.from('fake-file-content') });
+      (uploadFileToS3 as jest.Mock)
+        .mockResolvedValueOnce({ success: true, url: 'https://s3.amazonaws.com/bucket/report.pdf' })
+        .mockResolvedValueOnce({ success: true, url: 'https://s3.amazonaws.com/bucket/photo.png' });
+      (generateSessionResponse as jest.Mock).mockResolvedValue({ content: 'I see your files', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue('https://app.agentweb.pro/ishare/session-att?conversable=token');
+      (chatbotDb.updateSessionEmailMetadata as jest.Mock).mockResolvedValue({});
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'sent-att' });
+
+      await service.processInboundEmail(baseEvent);
+
+      // Should download each attachment
+      expect(axios.get).toHaveBeenCalledWith('https://resend.com/dl/att-1', { responseType: 'arraybuffer' });
+      expect(axios.get).toHaveBeenCalledWith('https://resend.com/dl/att-2', { responseType: 'arraybuffer' });
+
+      // Should upload each to S3
+      expect(uploadFileToS3).toHaveBeenCalledTimes(2);
+      expect(uploadFileToS3).toHaveBeenCalledWith(expect.any(Buffer), 'report.pdf', 'user-123', 'application/pdf');
+      expect(uploadFileToS3).toHaveBeenCalledWith(expect.any(Buffer), 'photo.png', 'user-123', 'image/png');
+
+      // Should pass attachments to generateSessionResponse
+      expect(generateSessionResponse).toHaveBeenCalledWith(
+        'session-att',
+        expect.any(String),
+        'user-123',
+        'claude-sonnet-4-20250514',
+        expect.arrayContaining([
+          expect.objectContaining({ url: 'https://s3.amazonaws.com/bucket/report.pdf', filename: 'report.pdf' }),
+          expect.objectContaining({ url: 'https://s3.amazonaws.com/bucket/photo.png', filename: 'photo.png' }),
+        ])
+      );
+    });
+
+    it('continues processing when attachment upload fails', async () => {
+      const attachments = [
+        { id: 'att-1', filename: 'broken.pdf', size: 100, content_type: 'application/pdf', download_url: 'https://resend.com/dl/broken' },
+      ];
+
+      (resendService.getReceivedEmailContent as jest.Mock).mockResolvedValue({ text: 'See attached', attachments });
+      (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ userId: 'user-123', email: 'user@example.com' });
+      (chatbotDb.createChatSession as jest.Mock).mockResolvedValue({ sessionId: 'session-fail' });
+      (axios.get as jest.Mock).mockRejectedValue(new Error('Download failed'));
+      (generateSessionResponse as jest.Mock).mockResolvedValue({ content: 'Response without attachments', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [] });
+      (chatbotDb.createOrReuseInteractiveShare as jest.Mock).mockResolvedValue('https://app.agentweb.pro/ishare/session-fail?conversable=token');
+      (chatbotDb.updateSessionEmailMetadata as jest.Mock).mockResolvedValue({});
+      (resendService.sendEmail as jest.Mock).mockResolvedValue({ id: 'sent-fail' });
+
+      await service.processInboundEmail(baseEvent);
+
+      // Should still generate response without attachments
+      expect(generateSessionResponse).toHaveBeenCalledWith(
+        'session-fail',
+        expect.any(String),
+        'user-123',
+        'claude-sonnet-4-20250514',
+        undefined
       );
     });
   });

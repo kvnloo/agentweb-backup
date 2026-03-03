@@ -1,9 +1,11 @@
+import axios from 'axios';
 import { EMMA_EMAIL_ADDRESS, EMMA_EMAIL_FROM } from '../config';
 import { resendService } from './resendService';
 import { chatbotDb } from './chatbotService';
 import { generateSessionResponse } from '../controllers/agentModeController';
 import { agentModeService } from './agentModeService';
 import { userDb } from './db';
+import { uploadFileToS3 } from '../utils/s3Utils';
 
 interface InboundEmailEvent {
   emailId: string;
@@ -240,7 +242,37 @@ export class EmmaEmailService {
       lastInboundEmailId: event.emailId,
     });
 
-    // 7. Generate response using Agent Mode (same logic as in-app Agent Mode chat)
+    // 7. Upload email attachments to S3 for Agent Mode access
+    let attachments: { url: string; filename: string; size: number; mimetype: string; uploadedAt: string }[] | undefined;
+    if (emailContent.attachments && emailContent.attachments.length > 0) {
+      console.log(`[EmmaEmail] Processing ${emailContent.attachments.length} attachment(s)`);
+      attachments = [];
+      for (const att of emailContent.attachments) {
+        try {
+          // Download from Resend's signed URL
+          const downloadResp = await axios.get<ArrayBuffer>(att.download_url, { responseType: 'arraybuffer' });
+          const buffer = Buffer.from(downloadResp.data as ArrayBuffer);
+
+          // Upload to S3
+          const uploadResult = await uploadFileToS3(buffer, att.filename, userId, att.content_type);
+          if (uploadResult.success && uploadResult.url) {
+            attachments.push({
+              url: uploadResult.url,
+              filename: att.filename,
+              size: att.size,
+              mimetype: att.content_type,
+              uploadedAt: new Date().toISOString(),
+            });
+            console.log(`[EmmaEmail] Uploaded attachment: ${att.filename} (${att.size} bytes)`);
+          }
+        } catch (err) {
+          console.error(`[EmmaEmail] Failed to process attachment ${att.filename}:`, err);
+        }
+      }
+      if (attachments.length === 0) attachments = undefined;
+    }
+
+    // 8. Generate response using Agent Mode (same logic as in-app Agent Mode chat)
     const isNewConversation = !existingSessionId;
     const fullMessage = isNewConversation && event.subject && messageBody
       ? `${event.subject}\n\n${messageBody}`
@@ -250,14 +282,15 @@ export class EmmaEmailService {
       sessionId,
       fullMessage,
       userId,
-      llmModel
+      llmModel,
+      attachments
     );
     const emmaResponse = agentResponse.content;
 
-    // 8. Create ishare URL
+    // 9. Create ishare URL
     const ishareUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
 
-    // 9. Build and send response email
+    // 10. Build and send response email
     const responseSubject = this.buildResponseSubject(event.subject, sessionId);
     const { html, text } = this.buildResponseEmail(emmaResponse, ishareUrl);
 
@@ -275,7 +308,7 @@ export class EmmaEmailService {
       inReplyTo: inboundMessageId || event.emailId,
     });
 
-    // 10. Update outbound email ID on session
+    // 11. Update outbound email ID on session
     if (sendResult?.id) {
       await chatbotDb.updateSessionEmailMetadata(sessionId, {
         senderEmail: event.from,
