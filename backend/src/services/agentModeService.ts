@@ -6569,7 +6569,34 @@ Format the response as JSON with this structure:
     try {
       console.log(`[updateKnowledgeBase] taskId=${taskId}, mode=${mode}, userId=${userId}`);
 
-      // 1. Get task and check authorization
+      // 1. Input validation
+      if (!content || content.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Content cannot be empty',
+          error: 'Invalid input: empty content'
+        };
+      }
+
+      const MAX_KB_SIZE = 10 * 1024 * 1024; // 10MB
+      const contentSize = Buffer.byteLength(content, 'utf8');
+      if (contentSize > MAX_KB_SIZE) {
+        return {
+          success: false,
+          message: `Content too large (${Math.round(contentSize / 1024 / 1024)}MB). Maximum size is 10MB.`,
+          error: 'Content exceeds size limit'
+        };
+      }
+
+      if (!taskId || taskId.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Task ID is required',
+          error: 'Invalid input: missing taskId'
+        };
+      }
+
+      // 2. Get task and check authorization
       const task = await taskDb.getTaskById(taskId);
       if (!task) {
         return {
@@ -6587,7 +6614,7 @@ Format the response as JSON with this structure:
         };
       }
 
-      // 2. Initialize GCS
+      // 3. Initialize GCS
       const privateKey = await getGCSPPrivateKey();
       const storage = new Storage({
         projectId: process.env.GCS_PROJECT_ID,
@@ -6597,7 +6624,7 @@ Format the response as JSON with this structure:
         }
       });
 
-      // 3. Determine bucket based on knowledgeBaseType
+      // 4. Determine bucket based on knowledgeBaseType
       const knowledgeBaseType = task.knowledgeBaseType || 'private';
       const bucketName = knowledgeBaseType === 'public'
         ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
@@ -6607,19 +6634,31 @@ Format the response as JSON with this structure:
       const filePath = `tasks/${taskId}/knowledge-base.txt`;
       const file = bucket.file(filePath);
 
-      // 4. Handle append mode - read existing content
+      // 5. Handle append mode - read existing content
       let finalContent = content;
       if (mode === 'append') {
         try {
           const [existingContent] = await file.download();
           finalContent = existingContent.toString() + '\n\n' + content;
-        } catch (error) {
-          // If file doesn't exist, just use new content
-          console.log(`[updateKnowledgeBase] No existing KB file for task ${taskId}, creating new`);
+        } catch (error: any) {
+          // Only treat 404 as "file not found" - re-throw all other errors
+          const errorMessage = error.message?.toLowerCase() || '';
+          const isNotFound = error.code === 404 ||
+                            errorMessage.includes('no such object') ||
+                            errorMessage.includes('not found') ||
+                            errorMessage.includes('does not exist');
+
+          if (isNotFound) {
+            console.log(`[updateKnowledgeBase] No existing KB file for task ${taskId}, creating new`);
+          } else {
+            // Re-throw permission errors, network errors, etc.
+            console.error(`[updateKnowledgeBase] Error downloading existing KB file:`, error);
+            throw error;
+          }
         }
       }
 
-      // 5. Save content to GCS
+      // 6. Save content to GCS
       await file.save(finalContent, {
         contentType: 'text/plain',
         metadata: {
@@ -6629,13 +6668,13 @@ Format the response as JSON with this structure:
         }
       });
 
-      // 6. Get signed URL (expires 03-01-2500 like other KB operations)
+      // 7. Get signed URL (expires 03-01-2500 like other KB operations)
       const [url] = await file.getSignedUrl({
         action: 'read',
         expires: '03-01-2500'
       });
 
-      // 7. Update task metadata in DynamoDB
+      // 8. Update task metadata in DynamoDB
       await taskDb.updateTask(taskId, {
         knowledgeBaseSize: Buffer.byteLength(finalContent, 'utf8'),
         knowledgeBase: url,
