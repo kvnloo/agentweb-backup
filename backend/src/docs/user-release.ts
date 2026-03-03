@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-03',
+    changes: [
+      'Reports: Search by File Name',
+      '- The search bar on the Reports page now matches against report file names in addition to task name and task ID',
+      '- Updated placeholder text to clarify searchable fields',
+    ],
+  },
+  {
     date: '2026-03-02',
     changes: [
       'Agent Mode: Feedback Improves Conversations',
