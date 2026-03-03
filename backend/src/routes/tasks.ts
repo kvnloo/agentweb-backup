@@ -89,6 +89,13 @@ interface ResultFile {
   is_html?: boolean;
   is_favorited?: boolean;
   is_archived?: boolean;
+  feedback?: {
+    type: 'like' | 'dislike';
+    reasons?: string[];
+    comment?: string;
+    timestamp: string;
+    userId: string;
+  };
   placid_config?: {
     template_uuid: string;
     layers: Record<string, Record<string, string | boolean | number>>;
@@ -2093,15 +2100,16 @@ async function getExecutionsWithAssets(
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
-                  // Check favorites and archives from session fields
+                  // Check favorites, archives, and feedbacks from session fields
                   const isFavorited = sessionWithMessages.favorites?.[imageUrl] || false;
                   const isArchived = sessionWithMessages.archives?.[imageUrl] || false;
-                  
+                  const imageFeedback = sessionWithMessages.feedbacks?.[imageUrl];
+
                   // Skip archived images (they will be filtered out, similar to task executions)
                   if (isArchived) {
                     return; // Skip this image
                   }
-                  
+
                   if (!execution) {
                     execution = {
                       executionId: executionId,
@@ -2115,7 +2123,7 @@ async function getExecutionsWithAssets(
                       execution.startTime = timestamp;
                     }
                   }
-                  
+
                   // Add the image file with its generation timestamp and status
                   execution.result_files.push({
                     url: imageUrl,
@@ -2125,7 +2133,8 @@ async function getExecutionsWithAssets(
                     sessionId: sessionWithMessages.sessionId,
                     generatedAt: timestamp, // Store when this specific image was generated
                     is_favorited: isFavorited,
-                    is_archived: false // Always false since we filter out archived images
+                    is_archived: false, // Always false since we filter out archived images
+                    feedback: imageFeedback,
                   });
                 }
               }
@@ -2216,15 +2225,16 @@ async function getExecutionsWithAssets(
                   // Check if this execution already exists
                   let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
                   
-                  // Check favorites and archives from session fields
+                  // Check favorites, archives, and feedbacks from session fields
                   const isFavorited = sessionWithMessages.favorites?.[videoUrl] || false;
                   const isArchived = sessionWithMessages.archives?.[videoUrl] || false;
-                  
+                  const videoFeedback = sessionWithMessages.feedbacks?.[videoUrl];
+
                   // Skip archived videos (they will be filtered out, similar to task executions)
                   if (isArchived) {
                     return; // Skip this video
                   }
-                  
+
                   if (!execution) {
                     execution = {
                       executionId: executionId,
@@ -2238,7 +2248,7 @@ async function getExecutionsWithAssets(
                       execution.startTime = timestamp;
                     }
                   }
-                  
+
                   // Add the video file with its generation timestamp and status
                   execution.result_files.push({
                     url: videoUrl,
@@ -2248,7 +2258,8 @@ async function getExecutionsWithAssets(
                     sessionId: sessionWithMessages.sessionId,
                     generatedAt: timestamp, // Store when this specific video was generated
                     is_favorited: isFavorited,
-                    is_archived: false // Always false since we filter out archived videos
+                    is_archived: false, // Always false since we filter out archived videos
+                    feedback: videoFeedback,
                   });
                 }
               }
@@ -2292,6 +2303,7 @@ async function getExecutionsWithAssets(
         const derivedFilename = filename || url.split('/').pop() || 'report.html';
         const isArchived = sessionWithMessages.archives?.[url] || false;
         const isFavorited = sessionWithMessages.favorites?.[url] || false;
+        const htmlFeedback = sessionWithMessages.feedbacks?.[url];
 
         if (isArchived) {
           return;
@@ -2333,7 +2345,8 @@ async function getExecutionsWithAssets(
             generatedAt: timestamp,
             is_html: true,
             is_favorited: isFavorited,
-            is_archived: false
+            is_archived: false,
+            feedback: htmlFeedback,
           });
         } else if (isOwnTimestamp && timestamp) {
           // A later message with a real per-message timestamp provides a more
@@ -2528,7 +2541,7 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       const currentFavorites: Record<string, boolean> = session.favorites || {};
       const currentStatus = currentFavorites[imageUrl] || false;
       const newFavoriteStatus = !currentStatus;
-      
+
       const updatedFavorites: Record<string, boolean> = {
         ...currentFavorites,
         [imageUrl]: newFavoriteStatus
@@ -2539,22 +2552,39 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
         delete updatedFavorites[imageUrl];
       }
 
-      // Update the session with the modified favorites
+      // Also update feedbacks: favoriting stores a "like" feedback, unfavoriting removes it
+      const currentFeedbacks = session.feedbacks || {};
+      const updatedFeedbacks = { ...currentFeedbacks };
+      if (newFavoriteStatus) {
+        updatedFeedbacks[imageUrl] = {
+          type: 'like',
+          timestamp: new Date().toISOString(),
+          userId: userId!,
+        };
+      } else {
+        delete updatedFeedbacks[imageUrl];
+      }
+
+      // Update the session with the modified favorites and feedbacks
       const params = {
         TableName: `${TABLE_PREFIX}AW-ChatSessions`,
         Key: { sessionId: agentSessionId },
-        UpdateExpression: "SET favorites = :favorites, updatedAt = :updatedAt",
+        UpdateExpression: "SET favorites = :favorites, feedbacks = :feedbacks, updatedAt = :updatedAt",
         ExpressionAttributeValues: {
           ":favorites": updatedFavorites,
+          ":feedbacks": updatedFeedbacks,
           ":updatedAt": new Date().toISOString()
         }
       };
 
       await dynamodb.update(params).promise();
 
-      res.json({ 
-        success: true, 
-        is_favorited: newFavoriteStatus 
+      const likeFeedback = newFavoriteStatus ? updatedFeedbacks[imageUrl] : undefined;
+
+      res.json({
+        success: true,
+        is_favorited: newFavoriteStatus,
+        feedback: likeFeedback,
       });
       return;
     }
@@ -2571,12 +2601,16 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
       return res.status(403).json({ message: 'Not authorized to modify this execution' });
     }
 
-    // Find the image in result_files and toggle its favorite status
+    // Find the image in result_files and toggle its favorite status + update feedback
     const updatedResultFiles = execution.result_files?.map((file: ResultFile) => {
       if (file.url === imageUrl) {
+        const newFavorited = !file.is_favorited;
         return {
           ...file,
-          is_favorited: !file.is_favorited
+          is_favorited: newFavorited,
+          feedback: newFavorited
+            ? { type: 'like' as const, timestamp: new Date().toISOString(), userId: userId! }
+            : undefined,
         };
       }
       return file;
@@ -2589,10 +2623,11 @@ router.post('/executions/:executionId/favorite-image', authenticateToken, async 
 
     // Find the updated file to return its new favorite status
     const updatedFile = updatedResultFiles.find((file: ResultFile) => file.url === imageUrl);
-    
-    res.json({ 
-      success: true, 
-      is_favorited: updatedFile?.is_favorited || false 
+
+    res.json({
+      success: true,
+      is_favorited: updatedFile?.is_favorited || false,
+      feedback: updatedFile?.feedback,
     });
 
   } catch (error) {
@@ -2709,4 +2744,133 @@ router.post('/executions/:executionId/archive-image', authenticateToken, async (
   }
 });
 
-export default router; 
+// Submit feedback (like/dislike with reasons) for a specific image
+router.post('/executions/:executionId/image-feedback', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { executionId } = req.params;
+    const { imageUrl, type, reasons, comment } = req.body;
+    const userId = (req as AuthenticatedRequest).user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!executionId || !imageUrl) {
+      return res.status(400).json({ message: 'Execution ID and image URL are required' });
+    }
+
+    if (!type || (type !== 'like' && type !== 'dislike')) {
+      return res.status(400).json({ message: 'Invalid feedback type. Must be "like" or "dislike"' });
+    }
+
+    if (comment && comment.length > 500) {
+      return res.status(400).json({ message: 'Comment too long. Maximum 500 characters' });
+    }
+
+    const feedback = {
+      type: type as 'like' | 'dislike',
+      reasons: type === 'dislike' && reasons?.length ? reasons : undefined,
+      comment: comment || undefined,
+      timestamp: new Date().toISOString(),
+      userId,
+    };
+
+    // Check if this is an agent mode asset
+    const isAgentModeImage = executionId.endsWith('-images');
+    const isAgentModeVideo = executionId.endsWith('-videos');
+    const isAgentModeHtml = executionId.endsWith('-html');
+    const isAgentModeAsset = isAgentModeImage || isAgentModeVideo || isAgentModeHtml;
+    const agentSessionId = isAgentModeAsset
+      ? (isAgentModeImage
+        ? executionId.replace('-images', '')
+        : isAgentModeVideo
+          ? executionId.replace('-videos', '')
+          : executionId.replace('-html', ''))
+      : null;
+
+    if (agentSessionId) {
+      const chatbotDb = new ChatbotDB();
+      const session = await chatbotDb.getChatSession(agentSessionId);
+
+      if (!session) {
+        return res.status(404).json({ message: 'Session not found' });
+      }
+
+      if (session.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+        return res.status(403).json({ message: 'Not authorized to modify this session' });
+      }
+
+      // Store feedback in session.feedbacks
+      const currentFeedbacks = session.feedbacks || {};
+      const updatedFeedbacks = {
+        ...currentFeedbacks,
+        [imageUrl]: feedback,
+      };
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ChatSessions`,
+        Key: { sessionId: agentSessionId },
+        UpdateExpression: "SET feedbacks = :feedbacks, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":feedbacks": updatedFeedbacks,
+          ":updatedAt": new Date().toISOString()
+        }
+      };
+      await dynamodb.update(params).promise();
+
+      // If dislike, inject a system message into the session for Emma to learn
+      if (type === 'dislike') {
+        const filename = imageUrl.split('/').pop() || 'image';
+        const reasonsText = reasons?.length ? reasons.join(', ') : 'No specific reasons';
+        const commentText = comment ? ` Comment: "${comment}".` : '';
+        const systemContent = `[Image Feedback] The user disliked the image "${filename}". Reasons: ${reasonsText}.${commentText} Please take this feedback into account for future image generations.`;
+
+        try {
+          await chatbotDb.addMessageToSession(agentSessionId, {
+            role: 'system',
+            content: systemContent,
+            metadata: {
+              timestamp: new Date().toISOString(),
+              isContextMessage: true,
+            },
+          });
+        } catch (msgError: any) {
+          // Don't fail the whole request if system message fails (e.g. session at message limit)
+          console.warn('Failed to inject image feedback system message:', msgError.message);
+        }
+      }
+
+      res.json({ success: true, feedback });
+      return;
+    }
+
+    // Handle regular task execution
+    const execution = await taskDb.getTaskExecutionById(executionId);
+    if (!execution) {
+      return res.status(404).json({ message: 'Execution not found' });
+    }
+
+    if (execution.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+      return res.status(403).json({ message: 'Not authorized to modify this execution' });
+    }
+
+    const updatedResultFiles = execution.result_files?.map((file: ResultFile) => {
+      if (file.url === imageUrl) {
+        return { ...file, feedback };
+      }
+      return file;
+    }) || [];
+
+    await taskDb.updateTaskExecution(executionId, {
+      result_files: updatedResultFiles,
+    });
+
+    res.json({ success: true, feedback });
+
+  } catch (error) {
+    console.error('Error submitting image feedback:', error);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+export default router;

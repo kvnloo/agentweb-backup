@@ -2200,6 +2200,75 @@ export const agentModeController = {
         feedback
       );
 
+      // Propagate feedback to images if the message contains generate_image tool calls
+      try {
+        const toolCalls = message.metadata?.toolCalls || [];
+        const imageToolCalls = toolCalls.filter(
+          (tc: any) => tc.name === 'generate_image' && tc.result?.imageUrl
+        );
+
+        if (imageToolCalls.length > 0) {
+          const currentFeedbacks = session.feedbacks || {};
+          const updatedFeedbacks = { ...currentFeedbacks };
+
+          for (const tc of imageToolCalls) {
+            const imageUrl = tc.result.imageUrl;
+            updatedFeedbacks[imageUrl] = {
+              type: type as 'like' | 'dislike',
+              comment: comment || undefined,
+              timestamp: new Date().toISOString(),
+              userId: user.userId,
+            };
+          }
+
+          await chatbotDb.updateSessionFeedbacks(sessionId, updatedFeedbacks);
+
+          // If dislike, inject system message for Emma to learn
+          if (type === 'dislike') {
+            for (const tc of imageToolCalls) {
+              const filename = tc.result.filename || tc.result.imageUrl.split('/').pop() || 'image';
+              const commentText = comment ? ` Comment: "${comment}".` : '';
+              const systemContent = `[Image Feedback] The user disliked the image "${filename}".${commentText} Please take this feedback into account for future image generations.`;
+
+              try {
+                await chatbotDb.addMessageToSession(sessionId, {
+                  role: 'system',
+                  content: systemContent,
+                  metadata: {
+                    timestamp: new Date().toISOString(),
+                    isContextMessage: true,
+                  },
+                });
+              } catch (msgError: any) {
+                console.warn('Failed to inject image feedback system message:', msgError.message);
+              }
+            }
+          }
+        } else {
+          // Inject general message feedback for non-image messages
+          const commentText = comment ? ` Comment: "${comment}".` : '';
+          const systemContent = type === 'dislike'
+            ? `[Message Feedback] The user disliked the previous response.${commentText} Please take this feedback into account for future responses.`
+            : `[Message Feedback] The user liked the previous response.${commentText} Keep doing more of this.`;
+
+          try {
+            await chatbotDb.addMessageToSession(sessionId, {
+              role: 'system',
+              content: systemContent,
+              metadata: {
+                timestamp: new Date().toISOString(),
+                isContextMessage: true,
+              },
+            });
+          } catch (msgError: any) {
+            console.warn('Failed to inject message feedback system message:', msgError.message);
+          }
+        }
+      } catch (propagateError) {
+        // Don't fail the main feedback response if image propagation fails
+        console.warn('Failed to propagate message feedback to images:', propagateError);
+      }
+
       res.json({
         success: true,
         message: updatedMessage,
@@ -2269,6 +2338,74 @@ export const agentModeController = {
         messageIndexNum,
         feedback
       );
+
+      // Propagate feedback to images if the message contains generate_image tool calls
+      try {
+        const toolCalls = message.metadata?.toolCalls || [];
+        const imageToolCalls = toolCalls.filter(
+          (tc: any) => tc.name === 'generate_image' && tc.result?.imageUrl
+        );
+
+        if (imageToolCalls.length > 0) {
+          const currentFeedbacks = session.feedbacks || {};
+          const updatedFeedbacks = { ...currentFeedbacks };
+
+          for (const tc of imageToolCalls) {
+            const imageUrl = tc.result.imageUrl;
+            updatedFeedbacks[imageUrl] = {
+              type: type as 'like' | 'dislike',
+              comment: comment || undefined,
+              timestamp: new Date().toISOString(),
+              userId: 'anonymous-ishare',
+            };
+          }
+
+          await chatbotDb.updateSessionFeedbacks(shareId, updatedFeedbacks);
+
+          // If dislike, inject system message for Emma to learn
+          if (type === 'dislike') {
+            for (const tc of imageToolCalls) {
+              const filename = tc.result.filename || tc.result.imageUrl.split('/').pop() || 'image';
+              const commentText = comment ? ` Comment: "${comment}".` : '';
+              const systemContent = `[Image Feedback] The user disliked the image "${filename}".${commentText} Please take this feedback into account for future image generations.`;
+
+              try {
+                await chatbotDb.addMessageToSession(shareId, {
+                  role: 'system',
+                  content: systemContent,
+                  metadata: {
+                    timestamp: new Date().toISOString(),
+                    isContextMessage: true,
+                  },
+                });
+              } catch (msgError: any) {
+                console.warn('Failed to inject image feedback system message:', msgError.message);
+              }
+            }
+          }
+        } else {
+          // Inject general message feedback for non-image messages
+          const commentText = comment ? ` Comment: "${comment}".` : '';
+          const systemContent = type === 'dislike'
+            ? `[Message Feedback] The user disliked the previous response.${commentText} Please take this feedback into account for future responses.`
+            : `[Message Feedback] The user liked the previous response.${commentText} Keep doing more of this.`;
+
+          try {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'system',
+              content: systemContent,
+              metadata: {
+                timestamp: new Date().toISOString(),
+                isContextMessage: true,
+              },
+            });
+          } catch (msgError: any) {
+            console.warn('Failed to inject message feedback system message:', msgError.message);
+          }
+        }
+      } catch (propagateError) {
+        console.warn('Failed to propagate ishare message feedback to images:', propagateError);
+      }
 
       res.json({
         success: true,
