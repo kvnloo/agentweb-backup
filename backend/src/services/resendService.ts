@@ -366,9 +366,12 @@ class ResendService {
     );
 
     if (result) {
-      // If attachments not in main response, try the separate list endpoint
+      // The main response includes attachments but without download_url.
+      // Fetch from the separate list endpoint which includes signed download URLs.
       let attachments = result.attachments;
-      if ((!attachments || attachments.length === 0) && this.apiKey) {
+      const needsDownloadUrls = attachments && attachments.length > 0
+        && attachments.some(a => !a.download_url);
+      if ((needsDownloadUrls || !attachments || attachments.length === 0) && this.apiKey) {
         try {
           const attachResp = await axios.get<{ data: ResendEmailContent['attachments'] }>(
             `https://api.resend.com/emails/receiving/${emailId}/attachments`,
