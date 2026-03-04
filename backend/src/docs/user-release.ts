@@ -7,17 +7,6 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
-    date: '2026-03-03',
-    changes: [
-      'Cloud Dev Environment',
-      '- Launch cloud dev environments directly from Notion by setting a sprint item status to "Start"',
-      '- EC2 instance auto-provisions with hot-reload dev servers (backend, partner portal, customer portal) and Claude Code',
-      '- Claude Code auto-runs "prep branch" using the Notion item title and description',
-      '- SSH in and run claude then /resume to continue development where Claude Code left off',
-      '- Set status to "Done" in Notion to automatically tear down the environment',
-    ],
-  },
-  {
     date: '2026-03-01',
     changes: [
       'Images: Ad Inspiration V2',
