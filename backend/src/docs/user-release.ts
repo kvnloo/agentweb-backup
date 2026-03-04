@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-04',
+    changes: [
+      'Agent Mode: Stability Improvements for Long Sessions',
+      '- Sessions with many tool calls (search, read, publish) no longer crash from exceeding the LLM context window',
+      '- Transient LLM errors (503, 429, timeouts) are now automatically retried with exponential backoff',
+    ],
+  },
+  {
     date: '2026-03-03',
     changes: [
       'Admin: Per-Feature Model Overrides',
