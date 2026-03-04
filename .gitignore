@@ -114,6 +114,7 @@ OAI_CONFIG_LIST
 
 # Separate repositories (now independent)
 growth-chat/
+customer-portal
 customer-portal/
 
 # Test environment local state
