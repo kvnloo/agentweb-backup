@@ -1999,6 +1999,33 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return extracted;
     }
 
+    // For blog publishing, preserve the publish status fields
+    if (toolName === 'publish_blog_article') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse publish_blog_article result.content as JSON:`, e);
+        }
+      }
+      const extracted: any = {
+        success: actualResult.success,
+        message: actualResult.message,
+      };
+      if (actualResult.data) {
+        extracted.data = {
+          status: actualResult.data.status,
+          title: actualResult.data.title,
+          cmsType: actualResult.data.cmsType,
+        };
+      }
+      if (!actualResult.success && actualResult.error) {
+        extracted.error = actualResult.error;
+      }
+      return extracted;
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }

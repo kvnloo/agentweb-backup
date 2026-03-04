@@ -1573,3 +1573,164 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
     });
   }
 };
+
+/**
+ * GET /api/blog/categories
+ * Returns the list of CMS category names for the authenticated user.
+ */
+export const getCmsCategories = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const { userDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    const cmsType = user?.cmsType;
+
+    // Only Webflow has categories configured via Secrets Manager
+    if (cmsType !== 'Webflow') {
+      return res.status(200).json({
+        success: true,
+        cmsType: cmsType || null,
+        categories: [],
+      });
+    }
+
+    const config = await getWebflowConfig(userId);
+    const categoryNames = config.categories ? Object.keys(config.categories) : [];
+
+    return res.status(200).json({
+      success: true,
+      cmsType,
+      categories: categoryNames,
+    });
+  } catch (error: any) {
+    console.error("❌ Error fetching CMS categories:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch CMS categories",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * POST /api/blog/publish-direct
+ * Publishes a blog article directly from an HTML report URL.
+ * Extracts title, description, and hero image from the HTML, then delegates
+ * to agentModeService.publishBlogArticle.
+ */
+export const publishBlogDirect = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const { blogHtmlUrl, status = 'draft', author, categories, sessionId } = req.body;
+
+    if (!blogHtmlUrl) {
+      return res.status(400).json({ message: "blogHtmlUrl is required" });
+    }
+
+    // Fetch the HTML
+    const htmlResponse = await axios.get(blogHtmlUrl, {
+      timeout: 30000,
+      responseType: 'text',
+      headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+    });
+    const html = htmlResponse.data as string;
+
+    // Extract title from <title> tag
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].trim() : 'Untitled';
+
+    // Extract description from <meta name="description">
+    const descMatch = html.match(/<meta\s+name=["']description["']\s+content=["']([^"']+)["']/i);
+    const description = descMatch ? descMatch[1].trim() : '';
+
+    // Extract hero image — try class="hero-image" first, then fall back to first <img> with src
+    const heroMatch = html.match(/<img[^>]*class=["'][^"']*hero-image[^"']*["'][^>]*src=["']([^"']+)["']/i);
+    let heroImageUrl = heroMatch ? heroMatch[1] : '';
+    if (!heroImageUrl) {
+      // Fallback: try src before class pattern
+      const heroMatchAlt = html.match(/<img[^>]*src=["']([^"']+)["'][^>]*class=["'][^"']*hero-image[^"']*["']/i);
+      if (heroMatchAlt) {
+        heroImageUrl = heroMatchAlt[1];
+      } else {
+        // Last resort: first <img> with an https src
+        const firstImgMatch = html.match(/<img[^>]*src=["'](https?:\/\/[^"']+)["']/i);
+        heroImageUrl = firstImgMatch ? firstImgMatch[1] : '';
+      }
+    }
+
+    // For manually_published, skip CMS and just store the status
+    if (status === 'manually_published') {
+      if (sessionId) {
+        try {
+          const { ChatbotDB } = await import('../services/chatbotService');
+          const chatbotDb = new ChatbotDB();
+          const session = await chatbotDb.getChatSession(sessionId);
+          if (session) {
+            const currentStatuses = session.publishStatuses || {};
+            await chatbotDb.updateSessionPublishStatuses(sessionId, {
+              ...currentStatuses,
+              [blogHtmlUrl]: status,
+            });
+          }
+        } catch (sessionError) {
+          console.error("⚠️ Failed to update session publish status:", sessionError);
+        }
+      }
+      return res.status(200).json({
+        success: true,
+        message: 'Report marked as manually published',
+        data: { status: 'manually_published', title },
+      });
+    }
+
+    // Call agentModeService.publishBlogArticle
+    const { agentModeService } = await import('../services/agentModeService');
+    const result = await agentModeService.publishBlogArticle(
+      title,
+      description,
+      heroImageUrl,
+      blogHtmlUrl,
+      userId,
+      sessionId || '',
+      status,
+      author,
+      categories
+    );
+
+    // If publish succeeded and sessionId is provided, store publish status on the session
+    if (result.success && sessionId) {
+      try {
+        const { ChatbotDB } = await import('../services/chatbotService');
+        const chatbotDb = new ChatbotDB();
+        const session = await chatbotDb.getChatSession(sessionId);
+        if (session) {
+          const currentStatuses = session.publishStatuses || {};
+          await chatbotDb.updateSessionPublishStatuses(sessionId, {
+            ...currentStatuses,
+            [blogHtmlUrl]: status,
+          });
+        }
+      } catch (sessionError) {
+        // Don't fail the publish if session update fails
+        console.error("⚠️ Failed to update session publish status:", sessionError);
+      }
+    }
+
+    return res.status(200).json(result);
+  } catch (error: any) {
+    console.error("❌ Error in publish-direct:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to publish blog article",
+      error: error.message,
+    });
+  }
+};

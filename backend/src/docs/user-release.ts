@@ -26,6 +26,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Unregistered senders receive a free trial invite',
       'Fix: Image Analysis on Bedrock Models',
       '- Fixed image analysis (describe_image) failing on Bedrock Claude models by converting image URLs to base64 data URIs',
+      'Research Reports: Publish Blog Post',
+      '- Replaced the multi-step "Generate Blog Post" flow with a direct "Publish Blog Post" button',
+      '- New single-step dialog with Status (Draft, Published, or Manually Published), optional Author, and Categories fields',
+      '- Categories are loaded from your CMS configuration (Webflow)',
+      '- "Manually Published" labels a report as published without calling the CMS, for reports already published externally',
+      '- Publish status badges (Draft, Published, Manually Published) now appear on report cards',
+      '- New Agent Mode tool: list_cms_categories returns available CMS categories for use in conversations',
     ],
   },
   {
