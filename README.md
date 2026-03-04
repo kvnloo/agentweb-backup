@@ -1903,6 +1903,87 @@ aws secretsmanager put-secret-value \
   --region us-west-2
 ```
 
+### Notion-Triggered Dev Environments
+
+Dev environments can be launched automatically from Notion. When a sprint item's status changes to "Start", the backend webhook launches an EC2 instance with hot-reload dev servers and Claude Code. Changing to "Done" tears it down.
+
+This requires 3 additional Secrets Manager secrets beyond the existing ones:
+
+#### 1. GitHub PAT (`agentweb/test-env/github-pat`)
+
+A GitHub Personal Access Token used by the EC2 instance to `git clone` both repos.
+
+**How to create:**
+1. Go to https://github.com/settings/tokens?type=beta (fine-grained tokens)
+2. Token name: `agentweb-test-env`
+3. Expiration: **No expiration**
+4. Repository access: "Only select repositories" → select `AgentWebPro/agentweb` and `AgentWebPro/agentweb-customer-portal`
+5. Permissions → Repository permissions:
+   - Contents: **Read and write** (clone, push branches, create commits)
+   - Pull requests: **Read and write** (create and update PRs via `gh`)
+6. Click "Generate token"
+7. Copy the token (starts with `github_pat_...`)
+
+#### 2. SSH Password (`agentweb/test-env/ssh-password`)
+
+A password for `ec2-user` SSH access on auto-launched instances (no key pair needed).
+
+**How to create:**
+- Choose a strong password (16+ characters, mix of letters/numbers/symbols)
+- This replaces SSH key pairs for Notion-triggered instances — developers SSH in with `ssh ec2-user@<IP>` and enter this password
+
+#### 3. Notion Integration Token (`agentweb/test-env/notion-token`)
+
+An internal Notion integration token used by both the backend (webhook handler) and EC2 instances (to fetch page title/content for Claude Code).
+
+**How to create:**
+1. Go to https://www.notion.so/my-integrations
+2. Click "New integration"
+3. Name: `AgentWeb Dev Env`
+4. Associated workspace: your team workspace
+5. Capabilities: **Read content**, **Update content**, **Insert content** (all checked)
+6. Click "Submit"
+7. Copy the "Internal Integration Secret" (starts with `ntn_...`)
+8. **Configure webhook:**
+   - In the integration settings, add a webhook URL:
+     - **Testing:** `https://api-stage.agentweb.pro/api/webhooks/notion-dev-env`
+     - **Production:** `https://api.agentweb.pro/api/webhooks/notion-dev-env`
+   - Subscribe to event: **`page.properties_updated`**
+   - Start with the staging URL, verify the full flow, then switch to production
+9. **Connect to database:** Open the sprint database in Notion → click `...` menu → "Connections" → add the `AgentWeb Dev Env` integration
+
+#### Uploading the secrets
+
+Once you have all 3 values, upload them:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id agentweb/test-env/github-pat \
+  --secret-string 'YOUR_GITHUB_PAT' \
+  --region us-west-2
+
+aws secretsmanager put-secret-value \
+  --secret-id agentweb/test-env/ssh-password \
+  --secret-string 'YOUR_SSH_PASSWORD' \
+  --region us-west-2
+
+aws secretsmanager put-secret-value \
+  --secret-id agentweb/test-env/notion-token \
+  --secret-string 'YOUR_NOTION_TOKEN' \
+  --region us-west-2
+```
+
+**Note:** The secret names must be created first by running `./test-env/setup-infra.sh` (which creates them with placeholder values).
+
+#### Notion Database Setup
+
+After secrets and integration are configured:
+1. Add 3 text properties to the sprint database: `Instance ID`, `Public IP`, `SG ID`
+
+#### Testing with ngrok
+
+To test the webhook, run `ngrok http http://<TEST_ENV_IP>:3001` locally, then set the Notion integration webhook URL to `https://<ngrok-url>/api/webhooks/notion-dev-env`.
+
 ## Deployment to AWS Elastic Beanstalk
 
 ### Prerequisites

@@ -8,6 +8,17 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-03-03",
+    changes: [
+      "Cloud Dev Environment",
+      "- Launch cloud dev environments from Notion by setting a sprint item status to \"Start\"",
+      "- EC2 instance auto-provisions with hot-reload dev servers and Claude Code",
+      "- Claude Code auto-runs \"prep branch\" using the Notion item title and description",
+      "- SSH in and run claude then /resume to continue development",
+      "- Set status to \"Done\" in Notion to tear down the environment",
+    ],
+  },
+  {
     date: "2026-02-23",
     changes: [
       "Repository Security",
