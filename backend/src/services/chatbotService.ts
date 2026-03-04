@@ -165,7 +165,7 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  feedbacks?: Record<string, ImageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
+  feedbacks?: Record<string, MessageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
   publishStatuses?: Record<string, string>; // Track publish status by asset URL (key: assetUrl, value: 'draft' | 'published')
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
   emailMetadata?: {
@@ -173,7 +173,6 @@ export interface ChatSession {
     lastInboundEmailId?: string;
     lastOutboundEmailId?: string;
   }; // Email metadata for emma-email sessions
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
   resultEndpointMetadata?: {
     resultName: string;
     resultTitle?: string;
@@ -2482,8 +2481,6 @@ const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assis
 
 Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
 
-You have access to tools that allow you to save information to knowledge bases. When a user asks you to remember something, save research, or persist data for later use, you can use the update_knowledge_base tool. IMPORTANT: Use list_knowledge_base_files first to see available knowledge bases and get the correct taskId (kb_identifier). Then use update_knowledge_base with that taskId.
-
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
 I will provide you with relevant information from the Customer Portal User Guide to help answer questions. Please use this information when responding to user queries.
@@ -2906,9 +2903,8 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // Get specific tools for Emma (for MVP, just update_knowledge_base)
-        // Later can expand to include other tools
-        const toolsToInclude = ['update_knowledge_base'];
+        // Get specific tools for Emma
+        const toolsToInclude = ['read_page_source'];
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
 

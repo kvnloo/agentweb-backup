@@ -488,40 +488,6 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
-  name: 'extract_css_from_url',
-  definition: {
-    name: 'extract_css_from_url',
-    description: 'Extract CSS design tokens (colors, typography, visual effects) and brand identity (logo, name, tagline) from a website URL. Returns detailed analysis (detailedTokensJSON), suggested brand tokens (suggestedBrandTokens), and brand identity (brandIdentity). Use update_brand_guidelines to apply suggested tokens and brand identity, and update_knowledge_base to save detailed analysis. Use this tool when the user wants to extract design elements from an existing website.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        url: {
-          type: 'string',
-          description: 'The full URL of the website to analyze (e.g., https://example.com). Must be HTTP or HTTPS.'
-        },
-        options: {
-          type: 'object',
-          description: 'Optional extraction settings',
-          properties: {
-            includeExternalStylesheets: {
-              type: 'boolean',
-              description: 'Whether to fetch and analyze external CSS files (default: true)'
-            },
-            maxStylesheets: {
-              type: 'number',
-              description: 'Maximum number of external stylesheets to fetch (default: 10)'
-            }
-          }
-        }
-      },
-      required: ['url']
-    }
-  },
-  execute: async (args, context) => {
-    return await agentModeService.extractCSSFromURL(args, context?.userId);
-  }
-});
 
 mcpToolRegistry.register({
   name: 'read_market_strategy',
@@ -3146,48 +3112,6 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'update_knowledge_base',
-  definition: {
-    name: 'update_knowledge_base',
-    description: 'Update or append content to a task\'s knowledge base. Use this to save information that should persist across executions, like research findings, data collected, or documentation. The user must own the task to update its knowledge base. IMPORTANT: Use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        taskId: {
-          type: 'string',
-          description: 'The task ID (kb_identifier) whose knowledge base to update. Get this from list_knowledge_base_files.'
-        },
-        content: {
-          type: 'string',
-          description: 'The content to write to the knowledge base'
-        },
-        mode: {
-          type: 'string',
-          enum: ['replace', 'append'],
-          description: 'Whether to replace the entire knowledge base or append to it. Default: append'
-        }
-      },
-      required: ['taskId', 'content']
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    // Standard authorization check
-    if (!context?.userId || !context?.sessionId) {
-      throw new Error("Missing user or session context");
-    }
-
-    // Delegate to service method
-    return await agentModeService.updateKnowledgeBase(
-      args.taskId,
-      args.content,
-      args.mode || 'append',
-      context.userId,
-      context.sessionId
-    );
-  }
-});
-
-mcpToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
@@ -3231,19 +3155,29 @@ mcpToolRegistry.register({
   name: "read_page_source",
   definition: {
     name: "read_page_source",
-    description: 'Read and extract the HTML source code from any webpage URL. This is an alternative to read_file_content but specifically designed for web pages. Returns the raw HTML source for analysis.',
+    description: 'Read and extract the HTML source code from any webpage URL. By default returns raw HTML. When extractDesignTokens is true, uses a headless browser to extract CSS design tokens (colors, typography, visual effects), brand identity (logo, name, tagline), and suggested brand tokens. Use extractDesignTokens when the user wants to extract design elements or brand identity from a website.',
     inputSchema: {
       type: "object",
       properties: {
         url: {
           type: 'string',
           description: 'The URL of the webpage to read and extract HTML source from'
+        },
+        extractDesignTokens: {
+          type: 'boolean',
+          description: 'When true, extracts CSS design tokens, brand identity, and suggested brand tokens in addition to HTML. Use update_brand_guidelines to apply the suggested tokens. Default: false'
         }
       },
       required: ["url"]
     }
   },
   execute: async (args: any, context?: any) => {
+    // If extractDesignTokens is true, use CSS extraction
+    if (args.extractDesignTokens) {
+      return await agentModeService.extractCSSFromURL(args, context?.userId);
+    }
+
+    // Default: read raw HTML
     const result = await agentModeService.readFileContent(args.url);
     if (result.success === false) {
       return {
