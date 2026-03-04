@@ -23,6 +23,7 @@ import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from 
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { isTransientLLMError } from '../utils/agentModeErrors';
 
 type MetaApiResult = {
   success: boolean;
@@ -606,8 +607,30 @@ export class AgentModeService {
       throw new Error(`Failed to initialize client for model: ${model}`);
     }
 
-    const res = await client.chat.completions.create(params);
-    return res;
+    // Retry loop with exponential backoff for transient LLM errors (503, 429, timeouts)
+    const maxAttempts = 3;
+    const baseDelayMs = 2000;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const res = await client.chat.completions.create(params);
+        return res;
+      } catch (error) {
+        const isLastAttempt = attempt >= maxAttempts;
+        if (!isTransientLLMError(error) || isLastAttempt) {
+          throw error;
+        }
+        const jitterMs = Math.floor(Math.random() * 500);
+        const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
+        console.warn(
+          `AgentMode: callLLM retry ${attempt}/${maxAttempts} for model "${model}" after ${delayMs}ms due to:`,
+          error instanceof Error ? error.message : error
+        );
+        await this.sleep(delayMs);
+      }
+    }
+
+    // Unreachable, but TypeScript needs it
+    throw new Error('callLLM: unexpected code path');
   }
 
   // Generate AI response for marketing conversation
@@ -757,9 +780,12 @@ export class AgentModeService {
              filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
         }
 
+        // Trim large old tool results to prevent context window overflow
+        const trimmedMessages = this.trimToolMessagesForContext(messages);
+
         // Make LLM call
         const llmStart = Date.now();
-        const response: any = await this.callLLM(llmModel, messages, {
+        const response: any = await this.callLLM(llmModel, trimmedMessages, {
           tools: filteredToolsCache,
           tool_choice: 'auto',
           max_completion_tokens: 12384,
@@ -10401,6 +10427,38 @@ Format the response as JSON with this structure:
 
   private async sleep(ms: number): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Truncate large tool-result messages in a copy of the messages array to stay within
+   * LLM context limits. Preserves the most recent tool results at full size.
+   */
+  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+    // Find indices of all tool-role messages
+    const toolIndices: number[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === 'tool') {
+        toolIndices.push(i);
+      }
+    }
+
+    // Indices of tool messages that should be preserved at full size (most recent N)
+    const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+
+    // Shallow-copy the array; only deep-copy messages that need truncation
+    const result = messages.map((msg, idx) => {
+      if (
+        msg.role === 'tool' &&
+        !preserveSet.has(idx) &&
+        typeof msg.content === 'string' &&
+        msg.content.length > maxToolContentLength
+      ) {
+        return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
+      }
+      return msg;
+    });
+
+    return result;
   }
 
   // Get Google Search API credentials from AWS Secrets Manager

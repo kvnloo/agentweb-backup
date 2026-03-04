@@ -12,6 +12,9 @@ const agentModeService = new AgentModeService();
 let initialized = false;
 let initializationPromise: Promise<void> | null = null;
 
+// Track the current requestId so uncaught error handlers can include it
+let currentRequestId: string | null = null;
+
 async function ensureInitialized() {
   if (initialized) return;
 
@@ -43,6 +46,7 @@ ensureInitialized()
 // Listen for messages from parent process
 process.on('message', async (message: any) => {
   const requestId = message.requestId;
+  currentRequestId = requestId;
 
   try {
     if (message.type === 'generateMarketingResponse') {
@@ -94,10 +98,11 @@ process.on('message', async (message: any) => {
   }
 });
 
-// Handle uncaught errors
+// Handle uncaught errors — include currentRequestId so the parent can match the response
 process.on('uncaughtException', (error) => {
   process.send!({
     type: 'error',
+    requestId: currentRequestId,
     error: error.message,
     stack: error.stack
   });
@@ -107,6 +112,7 @@ process.on('uncaughtException', (error) => {
 process.on('unhandledRejection', (reason, promise) => {
   process.send!({
     type: 'error',
+    requestId: currentRequestId,
     error: reason instanceof Error ? reason.message : String(reason),
     stack: reason instanceof Error ? reason.stack : undefined
   });
