@@ -155,6 +155,7 @@ interface AdminChatSession {
     welcomeMessage?: string;
     autocomplete?: boolean;
   };
+  llmModel?: string;
   // Add other fields if the backend sends more for the session list
 }
 
@@ -4429,6 +4430,7 @@ export default function AdminDashboard() {
                   <TableCell>User ID</TableCell>
                   <TableCell>Portal Type</TableCell>
                   <TableCell>Session Type</TableCell>
+                  <TableCell>LLM</TableCell>
                   <TableCell>Created At</TableCell>
                   <TableCell>Updated At</TableCell>
                   <TableCell>Message Count</TableCell>
@@ -4440,7 +4442,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={10} align="center">
+                    <TableCell colSpan={11} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4525,6 +4527,17 @@ export default function AdminDashboard() {
                             />
                           ) : (
                             <Chip label="Undefined" color="default" size="small" />
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {session.llmModel ? (
+                            <Chip
+                              label={session.llmModel}
+                              size="small"
+                              variant="outlined"
+                            />
+                          ) : (
+                            <span style={{ color: "#999" }}>-</span>
                           )}
                         </TableCell>
                         <TableCell>
@@ -4643,7 +4656,7 @@ export default function AdminDashboard() {
                     ))}
                     {chatSessionsLoading && (
                       <TableRow>
-                        <TableCell colSpan={10} align="center">
+                        <TableCell colSpan={11} align="center">
                           <CircularProgress size={24} />
                         </TableCell>
                       </TableRow>
