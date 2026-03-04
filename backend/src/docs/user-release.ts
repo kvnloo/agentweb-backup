@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-04',
+    changes: [
+      'Emma: Expanded Knowledge Base Tools',
+      '- Emma can now create new knowledge bases from scratch using the create_knowledge_base tool',
+      '- The update_knowledge_base_file tool lets Emma update or append to specific files by name (main KB file or attached files)',
+      '- The attach_knowledge_base_files tool lets Emma save multiple pieces of content as separate named files in a KB',
+      '- Ask Emma to "create a new KB called Research Notes" or "attach these summaries to my KB"',
+    ],
+  },
+  {
     date: '2026-03-03',
     changes: [
       'Admin: Per-Feature Model Overrides',
