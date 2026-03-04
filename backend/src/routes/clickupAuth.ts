@@ -3,7 +3,7 @@ import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { userDb } from '../services/db';
 import { encryptPassword } from '../utils/crypto';
-import { getAccessToken, getWorkspaces, listDocs } from '../services/clickupService';
+import { getAccessToken, getWorkspaces, listDocs, listTasks } from '../services/clickupService';
 
 const router = express.Router();
 
@@ -99,6 +99,28 @@ router.get('/workspace/:teamId/docs', authenticateToken, async (req: any, res) =
   } catch (error: any) {
     console.error('[ClickUp Docs] Error:', error.message);
     res.status(500).json({ error: 'Failed to fetch workspace docs' });
+  }
+});
+
+// ============================================
+// GET /workspace/:teamId/tasks — Fetch tasks in a workspace
+// ============================================
+router.get('/workspace/:teamId/tasks', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { teamId } = req.params;
+
+  try {
+    const accessToken = await getAccessToken(userId);
+    if (!accessToken) {
+      return res.status(401).json({ error: 'ClickUp not connected' });
+    }
+
+    const tasks = await listTasks(accessToken, teamId);
+
+    res.json({ tasks });
+  } catch (error: any) {
+    console.error('[ClickUp Tasks] Error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch workspace tasks' });
   }
 });
 

@@ -18,6 +18,27 @@ export interface ClickUpDoc {
   dateUpdated: string;
 }
 
+export interface ClickUpAttachment {
+  id: string;
+  title: string;
+  url: string;
+  size?: number;
+}
+
+export interface ClickUpTask {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  assignees: string[];
+  dueDate: string | null;
+  tags: string[];
+  priority: string | null;
+  attachments: ClickUpAttachment[];
+  dateCreated: string;
+  dateUpdated: string;
+}
+
 /**
  * Get the decrypted ClickUp access token for a user.
  * Returns null if no token is stored or decryption fails.
@@ -121,4 +142,140 @@ export async function readDocContent(accessToken: string, workspaceId: string, d
     }
   }
   return contentParts.join('\n\n---\n\n');
+}
+
+/**
+ * Map a raw ClickUp API task object to our ClickUpTask interface.
+ */
+function mapTask(task: any): ClickUpTask {
+  return {
+    id: task.id,
+    name: task.name,
+    description: task.description || '',
+    status: task.status?.status || '',
+    assignees: (task.assignees || []).map((a: any) => a.username || a.email || ''),
+    dueDate: task.due_date || null,
+    tags: (task.tags || []).map((t: any) => t.name || ''),
+    priority: task.priority?.priority || null,
+    attachments: (task.attachments || []).map((att: any) => ({
+      id: att.id,
+      title: att.title || '',
+      url: att.url,
+      size: att.size,
+    })),
+    dateCreated: task.date_created,
+    dateUpdated: task.date_updated || task.date_created,
+  };
+}
+
+/**
+ * Fetch a single task by ID (returns full details including attachments).
+ */
+export async function getTask(accessToken: string, taskId: string): Promise<ClickUpTask> {
+  const headers = { Authorization: accessToken };
+  const response = await axios.get<any>(
+    `${CLICKUP_API_V2}/task/${taskId}`,
+    { headers }
+  );
+  return mapTask(response.data);
+}
+
+/**
+ * List all tasks in a workspace (paginated via v2 API).
+ * Enriches each task with attachment data from individual task fetches,
+ * since the list endpoint may not include attachments.
+ */
+export async function listTasks(accessToken: string, teamId: string): Promise<ClickUpTask[]> {
+  const allTasks: any[] = [];
+  let page = 0;
+  const headers = { Authorization: accessToken };
+  let lastPage = false;
+  do {
+    const params = new URLSearchParams({ page: String(page) });
+    const response = await axios.get<{ tasks: any[]; last_page: boolean }>(
+      `${CLICKUP_API_V2}/team/${teamId}/task?${params.toString()}`,
+      { headers }
+    );
+    allTasks.push(...(response.data.tasks || []));
+    lastPage = response.data.last_page !== false;
+    page++;
+  } while (!lastPage);
+
+  const mapped = allTasks.map(mapTask);
+
+  // Enrich tasks that have no attachments from the list response
+  // by fetching individual task details (the single-task endpoint returns attachments).
+  // Process in batches of 10 to avoid overwhelming the API.
+  const BATCH_SIZE = 10;
+  for (let i = 0; i < mapped.length; i += BATCH_SIZE) {
+    const batch = mapped.slice(i, i + BATCH_SIZE);
+    const enriched = await Promise.all(
+      batch.map(async (task) => {
+        if (task.attachments.length > 0) return task; // already has attachment data
+        try {
+          const full = await getTask(accessToken, task.id);
+          task.attachments = full.attachments;
+        } catch {
+          // Keep task without attachments if individual fetch fails
+        }
+        return task;
+      })
+    );
+    // Replace in-place
+    for (let j = 0; j < enriched.length; j++) {
+      mapped[i + j] = enriched[j];
+    }
+  }
+
+  return mapped;
+}
+
+/**
+ * Read a single task and format it as markdown.
+ */
+export async function readTaskContent(accessToken: string, taskId: string): Promise<string> {
+  const task = await getTask(accessToken, taskId);
+
+  const parts: string[] = [];
+  parts.push(`# ${task.name}`);
+  parts.push('');
+
+  // Metadata
+  if (task.status) {
+    parts.push(`**Status:** ${task.status}`);
+  }
+  if (task.priority) {
+    parts.push(`**Priority:** ${task.priority}`);
+  }
+  if (task.assignees.length > 0) {
+    parts.push(`**Assignees:** ${task.assignees.join(', ')}`);
+  }
+  if (task.dueDate) {
+    const dueDate = new Date(parseInt(task.dueDate, 10));
+    parts.push(`**Due Date:** ${dueDate.toISOString().split('T')[0]}`);
+  }
+  if (task.tags.length > 0) {
+    parts.push(`**Tags:** ${task.tags.join(', ')}`);
+  }
+
+  // Description
+  if (task.description.trim()) {
+    parts.push('');
+    parts.push('## Description');
+    parts.push('');
+    parts.push(task.description);
+  }
+
+  // Attachments
+  if (task.attachments.length > 0) {
+    parts.push('');
+    parts.push('## Attachments');
+    parts.push('');
+    for (const att of task.attachments) {
+      const sizeStr = att.size ? ` (${att.size} bytes)` : '';
+      parts.push(`- [${att.title || 'Untitled'}](${att.url})${sizeStr}`);
+    }
+  }
+
+  return parts.join('\n');
 }
