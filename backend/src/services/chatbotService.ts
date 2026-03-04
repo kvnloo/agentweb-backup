@@ -165,7 +165,13 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint"; // Type of session based on how it was created
+  feedbacks?: Record<string, MessageFeedback>; // Track feedback on generated assets (key: assetUrl)
+  emailMetadata?: {
+    senderEmail?: string;
+    lastInboundEmailId?: string;
+    lastOutboundEmailId?: string;
+  }; // Email metadata for emma-email sessions
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
   resultEndpointMetadata?: {
     resultName: string;
     resultTitle?: string;
@@ -420,7 +426,7 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint",
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
@@ -1848,6 +1854,70 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session LLM model:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionFeedbacks(
+    sessionId: string,
+    feedbacks: Record<string, MessageFeedback>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET feedbacks = :feedbacks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":feedbacks": feedbacks,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session feedbacks:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionEmailMetadata(
+    sessionId: string,
+    metadata: {
+      senderEmail?: string;
+      lastInboundEmailId?: string;
+      lastOutboundEmailId?: string;
+    }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET emailMetadata = :emailMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":emailMetadata": metadata,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session email metadata:", error);
       throw error;
     }
   }
