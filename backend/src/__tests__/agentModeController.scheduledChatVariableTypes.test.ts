@@ -21,6 +21,7 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
+    getScheduledChatsDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -101,6 +102,7 @@ describe('Scheduled Chat Variable Types', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue('gpt-5-chat-2');
   });
 
   describe('createScheduledChat - variable type preservation', () => {
