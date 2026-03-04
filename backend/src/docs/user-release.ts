@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-04',
+    changes: [
+      'Admin: LLM Model Column in Chat History',
+      '- The Chat History table now shows which LLM model each session used, displayed between Session Type and Created At',
+    ],
+  },
+  {
     date: '2026-03-03',
     changes: [
       'Admin: Per-Feature Model Overrides',
