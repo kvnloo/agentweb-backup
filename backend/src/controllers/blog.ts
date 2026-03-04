@@ -1666,6 +1666,31 @@ export const publishBlogDirect = async (req: AuthRequest, res: Response) => {
       }
     }
 
+    // For manually_published, skip CMS and just store the status
+    if (status === 'manually_published') {
+      if (sessionId) {
+        try {
+          const { ChatbotDB } = await import('../services/chatbotService');
+          const chatbotDb = new ChatbotDB();
+          const session = await chatbotDb.getChatSession(sessionId);
+          if (session) {
+            const currentStatuses = session.publishStatuses || {};
+            await chatbotDb.updateSessionPublishStatuses(sessionId, {
+              ...currentStatuses,
+              [blogHtmlUrl]: status,
+            });
+          }
+        } catch (sessionError) {
+          console.error("⚠️ Failed to update session publish status:", sessionError);
+        }
+      }
+      return res.status(200).json({
+        success: true,
+        message: 'Report marked as manually published',
+        data: { status: 'manually_published', title },
+      });
+    }
+
     // Call agentModeService.publishBlogArticle
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.publishBlogArticle(
