@@ -670,10 +670,10 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       const toolResult = toolCall?.result || {};
 
                       if (originalApproval.assetType === 'image') {
-                        // For images, look for imageUrl, image_url, s3_url, or url in generate_image result
+                        // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                         // Only extract if the tool call succeeded
                         if (toolResult.success) {
-                          const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
+                          const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                           if (imageUrl) {
                             newAssetUrl = imageUrl;
                             newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
@@ -686,7 +686,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           console.error(`❌ generate_image tool call failed: ${toolCallFailureMessage}`);
                         }
                       } else if (originalApproval.assetType === 'html') {
-                        // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file result
+                        // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file/save_file result
                         // Only extract if the tool call succeeded
                         if (toolResult.success) {
                           const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
@@ -696,7 +696,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                             break;
                           } else {
                             // Tool succeeded but no URL in result - this shouldn't happen
-                            console.error(`❌ update_html_file succeeded but no URL in result. Result:`, JSON.stringify(toolResult));
+                            console.error(`❌ ${toolCall.name} succeeded but no URL in result. Result:`, JSON.stringify(toolResult));
                           }
                         } else if (toolCall.name === 'update_html_file') {
                           // Tool call failed
@@ -707,15 +707,15 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       }
                     }
                   }
-                  
+
                   // If we found a new asset, send it to Slack for review
                   if (newAssetUrl && newAssetFilename) {
                     console.log(`📤 Sending new revision asset to Slack: ${newAssetUrl}`);
-                    
+
                     try {
                       // Get the asset type from filename
                       const assetType = getAssetTypeFromFilename(newAssetFilename);
-                      
+
                       // Send approval request to the same Slack channel
                       const approvalResult = await sendApprovalRequestWithTracking({
                         executionId: originalApproval.executionId, // Keep the same executionId format
@@ -727,7 +727,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         channelName: originalApproval.slackChannelName,
                         note: `Revision based on feedback: ${feedbackValue}`
                       });
-                      
+
                       console.log(`✅ New revision asset sent to Slack for review: ${approvalResult.approvalId}`);
                     } catch (error) {
                       console.error('❌ Error sending revision asset to Slack:', error);
@@ -897,10 +897,10 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           const toolResult = toolCall?.result || {};
 
                           if (originalApproval.assetType === 'image') {
-                            // For images, look for imageUrl, image_url, s3_url, or url in generate_image result
+                            // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
                             // Only extract if the tool call succeeded
                             if (toolResult.success) {
-                              const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url;
+                              const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
                               if (imageUrl) {
                                 newAssetUrl = imageUrl;
                                 newAssetFilename = toolResult.filename || toolResult.file_name || `revised_${originalApproval.filename || 'image'}`;
@@ -913,7 +913,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                               console.error(`❌ generate_image tool call failed: ${toolCallFailureMessage}`);
                             }
                           } else if (originalApproval.assetType === 'html') {
-                            // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file result
+                            // For HTML, look for file_url, s3_url, or htmlUrl in update_html_file/save_file result
                             // Only extract if the tool call succeeded
                             if (toolResult.success) {
                               const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
@@ -923,7 +923,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                                 break;
                               } else {
                                 // Tool succeeded but no URL in result - this shouldn't happen
-                                console.error(`❌ update_html_file succeeded but no URL in result. Result:`, JSON.stringify(toolResult));
+                                console.error(`❌ ${toolCall.name} succeeded but no URL in result. Result:`, JSON.stringify(toolResult));
                               }
                             } else if (toolCall.name === 'update_html_file') {
                               // Tool call failed

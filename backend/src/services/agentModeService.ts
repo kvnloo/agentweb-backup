@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent } from './clickupService';
 import { taskDb, taskTemplateDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -1218,7 +1218,7 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, and ClickUp docs. This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
@@ -2050,6 +2050,24 @@ When a user requests client onboarding or says "onboard new client" or similar:
         extracted.error = actualResult.error;
       }
       return extracted;
+    }
+
+    // For save_file, preserve the URL and filename so Slack revision flow can extract the asset
+    if (toolName === 'save_file') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse save_file result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        file_url: actualResult.file_url,
+        file_name: actualResult.file_name,
+      };
     }
 
     // For other tools, return empty object to minimize storage
@@ -6680,6 +6698,632 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Extract CSS design tokens from a URL
+   * Used by read_page_source tool (extractDesignTokens=true)
+   */
+  public async extractCSSFromURL(args: any, userId: string): Promise<any> {
+    try {
+      const { url, options } = args;
+
+      if (!url) {
+        return {
+          success: false,
+          error: 'URL is required'
+        };
+      }
+
+      // Import the CSS extractor service
+      const { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens } = require('./cssExtractor');
+
+      // Extract CSS from URL
+      console.log(`Extracting CSS from ${url}...`);
+      const extractedCSS = await extractCSSFromURL(url, options);
+
+      // Analyze design tokens
+      console.log('Analyzing design tokens...');
+      const detailedTokens = await analyzeDesignTokens(extractedCSS);
+
+      // Log extraction details for debugging
+      console.log(`CSS extraction details: ${extractedCSS.stylesheets.length} stylesheets, ` +
+        `source=${extractedCSS.stylesheets[0]?.source || 'none'}, ` +
+        `computedElements=${extractedCSS.computedElements ? Object.keys(extractedCSS.computedElements).join(',') : 'none'}`);
+      console.log(`Design tokens: ${detailedTokens.colors.all.length} colors, ` +
+        `${detailedTokens.typography.fontFamilies.length} fonts, ` +
+        `top colors: ${detailedTokens.colors.all.slice(0, 5).map((c: any) => `${c.value}(${c.count})`).join(', ')}`);
+
+      // Infer brand tokens
+      console.log('Inferring brand tokens...');
+      const suggestedBrandTokens = inferBrandTokens(detailedTokens);
+
+      // Process brand identity: download logo and upload to S3
+      const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
+      let s3LogoUrl: string | null = null;
+
+      if (brandIdentity.logoUrl) {
+        try {
+          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
+          const logoResponse = await axios.get(brandIdentity.logoUrl, {
+            responseType: 'arraybuffer',
+            timeout: 15000,
+          });
+          const contentType = logoResponse.headers['content-type'] || '';
+          // Skip SVG since brand guidelines doesn't accept it
+          if (!contentType.includes('svg')) {
+            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
+            const filename = `logo.${ext}`;
+            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
+            const uploadResult = await uploadFileToS3WithPath(
+              Buffer.from(logoResponse.data as ArrayBuffer),
+              filename,
+              contentType,
+              `users/${userId}/brand/logo`
+            );
+            if (uploadResult.success && uploadResult.url) {
+              s3LogoUrl = uploadResult.url;
+              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
+            }
+          } else {
+            console.log('Skipping SVG logo (not supported by brand guidelines)');
+          }
+        } catch (logoErr: any) {
+          console.warn('Failed to download/upload logo:', logoErr.message);
+        }
+      }
+
+      // Format detailed tokens as JSON string for Emma to save to KB if needed
+      const detailedTokensJSON = JSON.stringify({
+        version: '1.0',
+        source: url,
+        extractedAt: extractedCSS.extractedAt,
+        tokens: detailedTokens,
+        metadata: {
+          extractionMethod: 'puppeteer-wallace',
+          savedBy: 'emma',
+          userId
+        }
+      }, null, 2);
+
+      // Format summary for LLM
+      const formattedSummary = this.formatCSSExtractionResult({
+        url,
+        suggestedBrandTokens,
+        detailedTokens,
+        brandIdentity: {
+          logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
+          brandName: brandIdentity.brandName || null,
+          tagline: brandIdentity.tagline || null,
+        },
+      });
+
+      // Merge brand identity into suggestedBrandTokens so Emma naturally displays it
+      const enrichedBrandTokens = {
+        ...suggestedBrandTokens,
+        brandName: brandIdentity.brandName || null,
+        logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
+        tagline: brandIdentity.tagline || null,
+      };
+
+      return {
+        success: true,
+        url,
+        extractedAt: extractedCSS.extractedAt,
+        suggestedBrandTokens: enrichedBrandTokens,
+        detailedTokens,
+        detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
+        formattedContent: formattedSummary
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error extracting CSS:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to extract CSS from URL',
+        details: error.stack
+      };
+    }
+  }
+
+  /**
+   * Format CSS extraction result for LLM consumption
+   */
+  private formatCSSExtractionResult(data: any): string {
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
+
+    let formatted = `# CSS Extraction Results\n\n`;
+    formatted += `**Source:** ${url}\n\n`;
+
+    // Brand identity section
+    if (brandIdentity) {
+      formatted += `## Brand Identity\n\n`;
+      formatted += `- **Brand Name:** ${brandIdentity.brandName || 'Not detected'}\n`;
+      formatted += `- **Logo:** ${brandIdentity.logoUrl || 'Not detected'}\n`;
+      formatted += `- **Tagline:** ${brandIdentity.tagline || 'Not detected'}\n\n`;
+    }
+
+    // Suggested brand tokens (what should go in brand guidelines)
+    formatted += `## Suggested Brand Tokens\n\n`;
+    formatted += `These are the recommended tokens to add to your brand guidelines:\n\n`;
+
+    formatted += `### Colors\n`;
+    formatted += `- **Primary:** ${suggestedBrandTokens.colors.primary}\n`;
+    formatted += `- **Secondary:** ${suggestedBrandTokens.colors.secondary}\n`;
+    formatted += `- **Palette:** ${suggestedBrandTokens.colors.palette.join(', ')}\n\n`;
+
+    formatted += `### Typography\n`;
+    formatted += `- **Heading Font:** ${suggestedBrandTokens.typography.headingFont}\n`;
+    formatted += `- **Body Font:** ${suggestedBrandTokens.typography.bodyFont}\n`;
+    formatted += `- **Font Weights:**\n`;
+    formatted += `  - Regular: ${suggestedBrandTokens.typography.fontWeights.regular}\n`;
+    formatted += `  - Semibold: ${suggestedBrandTokens.typography.fontWeights.semibold}\n`;
+    formatted += `  - Bold: ${suggestedBrandTokens.typography.fontWeights.bold}\n\n`;
+
+    formatted += `### Visual Effects\n`;
+    formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
+    formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Summary of detailed tokens
+    formatted += `## Detailed Analysis\n\n`;
+    formatted += `- **Total Colors Found:** ${detailedTokens.colors.all.length}\n`;
+    formatted += `- **Font Families:** ${detailedTokens.typography.fontFamilies.length}\n`;
+    formatted += `- **Font Sizes:** ${detailedTokens.typography.fontSizes.length}\n`;
+    formatted += `- **Box Shadows:** ${detailedTokens.visualEffects.boxShadows.length}\n`;
+    formatted += `- **Border Radius Values:** ${detailedTokens.visualEffects.borderRadius.length}\n\n`;
+
+    formatted += `### Next Steps\n\n`;
+    formatted += `1. **Apply to Brand Guidelines:** Use \`update_brand_guidelines\` with the suggested values above\n`;
+    formatted += `2. **Save Detailed Data:** Use \`update_knowledge_base_file\` to save the detailed CSS analysis (detailedTokensJSON) for future reference\n`;
+
+    return formatted;
+  }
+
+  /**
+   * Create a new knowledge base (task) with initial content
+   * Used by create_knowledge_base tool
+   */
+  public async createKnowledgeBase(
+    name: string,
+    content: string,
+    knowledgeBaseType: 'public' | 'private',
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[createKnowledgeBase] name=${name}, type=${knowledgeBaseType}, userId=${userId}`);
+
+      // 1. Input validation
+      if (!name || name.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Knowledge base name cannot be empty',
+          error: 'Invalid input: empty name'
+        };
+      }
+
+      if (!content || content.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Content cannot be empty',
+          error: 'Invalid input: empty content'
+        };
+      }
+
+      const MAX_KB_SIZE = 10 * 1024 * 1024; // 10MB
+      const contentSize = Buffer.byteLength(content, 'utf8');
+      if (contentSize > MAX_KB_SIZE) {
+        return {
+          success: false,
+          message: `Content too large (${Math.round(contentSize / 1024 / 1024)}MB). Maximum size is 10MB.`,
+          error: 'Content exceeds size limit'
+        };
+      }
+
+      // 2. Create the task
+      const taskId = uuidv4();
+      const now = new Date().toISOString();
+      await taskDb.createTask({
+        taskId,
+        userId,
+        name: name.trim(),
+        prompt: '',
+        status: 'active',
+        createdAt: now,
+        useKnowledgeBase: true,
+        updateKnowledgeBase: true,
+        knowledgeBaseType,
+      });
+
+      // 3. Initialize GCS and upload content
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
+      const file = bucket.file(filePath);
+
+      await file.save(content, {
+        contentType: 'text/plain',
+        metadata: {
+          taskId,
+          userId,
+          sessionId,
+          updatedAt: now
+        }
+      });
+
+      // 4. Get signed URL
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500'
+      });
+
+      // 5. Update task with KB metadata
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseSize: contentSize,
+        knowledgeBase: url,
+        knowledgeBaseUpdatedAt: now
+      });
+
+      return {
+        success: true,
+        taskId,
+        name: name.trim(),
+        message: `Knowledge base "${name.trim()}" created successfully`
+      };
+
+    } catch (error) {
+      console.error('[createKnowledgeBase] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to create knowledge base',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Update a specific file in a task's knowledge base
+   * Used by update_knowledge_base_file tool
+   */
+  public async updateKnowledgeBaseFile(
+    taskId: string,
+    fileName: string,
+    content: string,
+    mode: 'replace' | 'append',
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[updateKnowledgeBaseFile] taskId=${taskId}, fileName=${fileName}, mode=${mode}, userId=${userId}`);
+
+      // 1. Input validation
+      if (!content || content.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Content cannot be empty',
+          error: 'Invalid input: empty content'
+        };
+      }
+
+      const MAX_KB_SIZE = 10 * 1024 * 1024; // 10MB
+      const contentSize = Buffer.byteLength(content, 'utf8');
+      if (contentSize > MAX_KB_SIZE) {
+        return {
+          success: false,
+          message: `Content too large (${Math.round(contentSize / 1024 / 1024)}MB). Maximum size is 10MB.`,
+          error: 'Content exceeds size limit'
+        };
+      }
+
+      if (!taskId || taskId.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Task ID is required',
+          error: 'Invalid input: missing taskId'
+        };
+      }
+
+      if (!fileName || fileName.trim().length === 0) {
+        return {
+          success: false,
+          message: 'File name is required',
+          error: 'Invalid input: missing fileName'
+        };
+      }
+
+      // 2. Get task and check authorization
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return {
+          success: false,
+          message: 'Task not found',
+          error: 'Task not found'
+        };
+      }
+
+      if (task.userId !== userId) {
+        return {
+          success: false,
+          message: 'Not authorized to modify this task',
+          error: 'Unauthorized'
+        };
+      }
+
+      // 3. Initialize GCS
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      // 4. Determine bucket based on knowledgeBaseType
+      const knowledgeBaseType = task.knowledgeBaseType || 'private';
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+
+      // 5. Determine file path based on fileName
+      let filePath: string;
+      let isMainKB = false;
+
+      if (fileName === 'knowledge-base.txt') {
+        // Main knowledge base file
+        filePath = `tasks/${taskId}/knowledge-base.txt`;
+        isMainKB = true;
+      } else {
+        // Look up in knowledgeBaseFiles array
+        const kbFiles = task.knowledgeBaseFiles || [];
+        const existingFile = kbFiles.find((f: any) => f.filename === fileName);
+        if (existingFile) {
+          filePath = existingFile.key;
+        } else {
+          // Create new file under knowledge-base-files/
+          const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+          filePath = `tasks/${taskId}/knowledge-base-files/${Date.now()}_${sanitizedName}`;
+        }
+      }
+
+      const file = bucket.file(filePath);
+
+      // 6. Handle append mode - read existing content
+      let finalContent = content;
+      if (mode === 'append') {
+        try {
+          const [existingContent] = await file.download();
+          finalContent = existingContent.toString() + '\n\n' + content;
+        } catch (error: any) {
+          const errorMessage = error.message?.toLowerCase() || '';
+          const isNotFound = error.code === 404 ||
+                            errorMessage.includes('no such object') ||
+                            errorMessage.includes('not found') ||
+                            errorMessage.includes('does not exist');
+
+          if (isNotFound) {
+            console.log(`[updateKnowledgeBaseFile] No existing file ${fileName} for task ${taskId}, creating new`);
+          } else {
+            console.error(`[updateKnowledgeBaseFile] Error downloading existing file:`, error);
+            throw error;
+          }
+        }
+      }
+
+      // 7. Save content to GCS
+      await file.save(finalContent, {
+        contentType: 'text/plain',
+        metadata: {
+          taskId,
+          userId,
+          sessionId,
+          fileName,
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      // 8. Get signed URL
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500'
+      });
+
+      // 9. Update DynamoDB
+      const finalSize = Buffer.byteLength(finalContent, 'utf8');
+      const now = new Date().toISOString();
+
+      if (isMainKB) {
+        await taskDb.updateTask(taskId, {
+          knowledgeBaseSize: finalSize,
+          knowledgeBase: url,
+          knowledgeBaseUpdatedAt: now
+        });
+      } else {
+        // Update or add entry in knowledgeBaseFiles array
+        const kbFiles = task.knowledgeBaseFiles || [];
+        const existingIdx = kbFiles.findIndex((f: any) => f.filename === fileName);
+        const fileEntry = {
+          filename: fileName,
+          size: finalSize,
+          url,
+          key: filePath,
+          uploadedAt: now,
+        };
+        if (existingIdx >= 0) {
+          kbFiles[existingIdx] = fileEntry;
+        } else {
+          kbFiles.push(fileEntry);
+        }
+        await taskDb.updateTask(taskId, {
+          knowledgeBaseFiles: kbFiles,
+          knowledgeBaseUpdatedAt: now
+        });
+      }
+
+      return {
+        success: true,
+        message: `File "${fileName}" ${mode === 'append' ? 'updated' : 'replaced'} successfully`,
+        fileName,
+        updatedSize: finalSize,
+        updatedAt: now
+      };
+
+    } catch (error) {
+      console.error('[updateKnowledgeBaseFile] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to update knowledge base file',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Attach multiple files to a task's knowledge base
+   * Used by attach_knowledge_base_files tool
+   */
+  public async attachKnowledgeBaseFiles(
+    taskId: string,
+    files: Array<{ name: string; content: string }>,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[attachKnowledgeBaseFiles] taskId=${taskId}, filesCount=${files?.length}, userId=${userId}`);
+
+      // 1. Input validation
+      if (!taskId || taskId.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Task ID is required',
+          error: 'Invalid input: missing taskId'
+        };
+      }
+
+      if (!files || files.length === 0) {
+        return {
+          success: false,
+          message: 'At least one file is required',
+          error: 'Invalid input: empty files array'
+        };
+      }
+
+      // Validate each file has content
+      for (const f of files) {
+        if (!f.content || f.content.trim().length === 0) {
+          return {
+            success: false,
+            message: `File "${f.name}" has empty content`,
+            error: 'Invalid input: empty file content'
+          };
+        }
+      }
+
+      // 2. Get task and check authorization
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return {
+          success: false,
+          message: 'Task not found',
+          error: 'Task not found'
+        };
+      }
+
+      if (task.userId !== userId) {
+        return {
+          success: false,
+          message: 'Not authorized to modify this task',
+          error: 'Unauthorized'
+        };
+      }
+
+      // 3. Initialize GCS
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      const knowledgeBaseType = task.knowledgeBaseType || 'private';
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+      const kbFiles = task.knowledgeBaseFiles || [];
+      const uploadedFiles: Array<{ name: string; size: number; url: string }> = [];
+
+      // 4. Upload each file
+      for (const f of files) {
+        const sanitizedName = f.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filePath = `tasks/${taskId}/knowledge-base-files/${Date.now()}_${sanitizedName}`;
+        const file = bucket.file(filePath);
+        const now = new Date().toISOString();
+        const size = Buffer.byteLength(f.content, 'utf8');
+
+        await file.save(f.content, {
+          contentType: 'text/plain',
+          metadata: {
+            taskId,
+            userId,
+            sessionId,
+            fileName: f.name,
+            updatedAt: now
+          }
+        });
+
+        const [url] = await file.getSignedUrl({
+          action: 'read',
+          expires: '03-01-2500'
+        });
+
+        kbFiles.push({
+          filename: f.name,
+          size,
+          url,
+          key: filePath,
+          uploadedAt: now,
+        });
+
+        uploadedFiles.push({ name: f.name, size, url });
+      }
+
+      // 5. Update DynamoDB
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseFiles: kbFiles,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
+
+      return {
+        success: true,
+        message: `${uploadedFiles.length} file(s) attached successfully`,
+        files: uploadedFiles
+      };
+
+    } catch (error) {
+      console.error('[attachKnowledgeBaseFiles] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to attach knowledge base files',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
     try {
       const taskStatuses: any[] = [];
@@ -9826,6 +10470,41 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Search ClickUp tasks (name match + description match — no full content fetch needed)
+      if (userId) {
+        try {
+          const clickUpToken = await getClickUpAccessToken(userId);
+          if (clickUpToken) {
+            const workspaces = await getClickUpWorkspaces(clickUpToken);
+            const queryLower = query.toLowerCase();
+            for (const workspace of workspaces) {
+              try {
+                const tasks = await listClickUpTasks(clickUpToken, workspace.id);
+                let clickUpTaskResultCount = 0;
+                for (const task of tasks) {
+                  if (clickUpTaskResultCount >= limitedMaxResults) break;
+                  const nameMatch = task.name.toLowerCase().includes(queryLower);
+                  const descMatch = (task.description || '').toLowerCase().includes(queryLower);
+                  if (nameMatch || descMatch) {
+                    const summary = `# ${task.name}\n\n**Status:** ${task.status}${task.priority ? `\n**Priority:** ${task.priority}` : ''}${task.assignees.length > 0 ? `\n**Assignees:** ${task.assignees.join(', ')}` : ''}${task.description ? `\n\n${task.description}` : ''}`;
+                    results.push({
+                      content: summary.length > 5000 ? summary.substring(0, 5000) + '\n\n[Content truncated]' : summary,
+                      source: `clickup-tasks/${workspace.name}/${task.name}`
+                    });
+                    clickUpTaskResultCount++;
+                  }
+                }
+              } catch (wsErr) {
+                console.log(`AgentMode: Error searching ClickUp tasks in workspace ${workspace.name}:`, wsErr);
+              }
+            }
+          }
+        } catch (clickUpError) {
+          console.log('AgentMode: Error searching ClickUp tasks:', clickUpError);
+          // Don't fail the whole search if ClickUp tasks search fails
+        }
+      }
+
       if (results.length === 0) {
         return {
           success: true,
@@ -9980,6 +10659,43 @@ Format the response as JSON with this structure:
         console.error('AgentMode: Error listing ClickUp docs:', clickUpError);
       }
 
+      // Include ClickUp tasks
+      try {
+        const clickUpToken = await getClickUpAccessToken(userId);
+        if (clickUpToken) {
+          const workspaces = await getClickUpWorkspaces(clickUpToken);
+          for (const workspace of workspaces) {
+            try {
+              const tasks = await listClickUpTasks(clickUpToken, workspace.id);
+              const clickUpTaskFiles = tasks.map(task => ({
+                fileName: task.name,
+                fileSize: 0,
+                taskId: task.id,
+                status: task.status,
+                priority: task.priority,
+                dueDate: task.dueDate,
+                assignees: task.assignees,
+                attachmentCount: task.attachments.length,
+                dateCreated: task.dateCreated,
+                dateUpdated: task.dateUpdated,
+              }));
+
+              knowledgeBases.push({
+                identifier: `clickup-tasks:${workspace.id}`,
+                name: `ClickUp Tasks - ${workspace.name}`,
+                type: 'clickup-tasks',
+                updatedAt: clickUpTaskFiles.length > 0 ? clickUpTaskFiles[0].dateUpdated : undefined,
+                files: clickUpTaskFiles,
+              });
+            } catch (wsErr) {
+              console.log(`AgentMode: Error listing ClickUp tasks in workspace ${workspace.name}:`, wsErr);
+            }
+          }
+        }
+      } catch (clickUpError) {
+        console.error('AgentMode: Error listing ClickUp tasks:', clickUpError);
+      }
+
       const totalFiles = knowledgeBases.reduce(
         (sum: number, kb: any) => sum + (kb.files?.length || 0),
         0
@@ -9997,7 +10713,7 @@ Format the response as JSON with this structure:
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles
@@ -10132,6 +10848,11 @@ Format the response as JSON with this structure:
     // Handle Google Drive shared folder files (identifier starts with "gdrive:")
     if (kbIdentifier.startsWith('gdrive:')) {
       return await this.readGoogleDriveSharedFile(kbIdentifier, fileName, userId);
+    }
+
+    // Handle ClickUp tasks (identifier starts with "clickup-tasks:")
+    if (kbIdentifier.startsWith('clickup-tasks:')) {
+      return await this.readClickUpTask(kbIdentifier, fileName, userId);
     }
 
     // Handle ClickUp docs (identifier starts with "clickup:")
@@ -10333,6 +11054,58 @@ Format the response as JSON with this structure:
       return {
         success: false,
         message: `Failed to read ClickUp document "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Helper: read a task from a ClickUp workspace
+  private async readClickUpTask(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    const workspaceId = kbIdentifier.replace('clickup-tasks:', '');
+
+    try {
+      const clickUpToken = await getClickUpAccessToken(userId);
+      if (!clickUpToken) {
+        return { success: false, message: 'ClickUp not connected' };
+      }
+
+      // Verify user has access to this workspace
+      const workspaces = await getClickUpWorkspaces(clickUpToken);
+      const workspace = workspaces.find(w => w.id === workspaceId);
+      if (!workspace) {
+        return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      }
+
+      // Find the task by name in the workspace
+      const tasks = await listClickUpTasks(clickUpToken, workspaceId);
+      const task = tasks.find(t => t.name === fileName);
+      if (!task) {
+        return { success: false, message: `Task "${fileName}" not found in ClickUp workspace "${workspace.name}"` };
+      }
+
+      // Read task content (formatted as markdown)
+      const content = await readClickUpTaskContent(clickUpToken, task.id);
+
+      const maxContentLength = 50000;
+      const truncated = content.length > maxContentLength
+        ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : content;
+
+      return {
+        success: true,
+        message: `Successfully read ClickUp task "${fileName}"`,
+        kb_identifier: kbIdentifier,
+        file_name: fileName,
+        name: workspace.name,
+        content: truncated,
+        size: content.length,
+        type: 'clickup-tasks',
+        dateUpdated: task.dateUpdated,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading ClickUp task:', error);
+      return {
+        success: false,
+        message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }

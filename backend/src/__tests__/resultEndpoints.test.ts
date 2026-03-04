@@ -265,6 +265,42 @@ describe('Result Endpoints', () => {
       expect(res.body.assets[1].type).toBe('html');
       expect(res.body.assets[1].url).toBe('https://s3.example.com/result.html');
     });
+
+    it('should use contentUrl from metadata as fallback when no assets found from messages', async () => {
+      mockedChatbot.getChatSession.mockResolvedValue({
+        sessionId: 'sess-fallback',
+        resultEndpointMetadata: {
+          resultName: 'gtm',
+          resultTitle: 'GTM Plan',
+          leadEmail: 'lead@example.com',
+          reviewerEmail: 'reviewer@example.com',
+          outputFormat: 'html',
+          args: {},
+          contentUrl: 'https://s3.example.com/saved-file.html',
+          sendHistory: [],
+        },
+      } as any);
+
+      // No tool messages that produce assets (e.g. save_file content is not JSON-parseable)
+      (mockedChatbot as any).getMessagesFromMessagesTable.mockResolvedValue([
+        {
+          role: 'tool',
+          name: 'save_file',
+          content: 'File saved successfully to https://s3.example.com/saved-file.html',
+        },
+      ]);
+
+      mockedChatbot.createOrReuseInteractiveShare.mockResolvedValue('http://localhost:5174/ishare/sess-fallback?conversable=abc');
+
+      const res = await request(app)
+        .get('/review/sess-fallback')
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.assets).toHaveLength(1);
+      expect(res.body.assets[0].type).toBe('html');
+      expect(res.body.assets[0].url).toBe('https://s3.example.com/saved-file.html');
+    });
   });
 
   describe('POST /review/:sessionId/send', () => {
@@ -430,7 +466,7 @@ describe('Result Endpoints', () => {
       expect(res.body.reportUrl).toBeUndefined();
     });
 
-    it('should return completed status when contentUrl is set', async () => {
+    it('should return completed status with direct contentUrl as reportUrl', async () => {
       mockedSettings.getSetting.mockResolvedValue({
         settingName: 'result-endpoints-config',
         settingValue: JSON.stringify([sampleConfig]),
@@ -452,11 +488,11 @@ describe('Result Endpoints', () => {
         .expect(200);
 
       expect(res.body.status).toBe('completed');
-      expect(res.body.reportUrl).toContain('/review/sess-done');
+      expect(res.body.reportUrl).toBe('https://s3.example.com/result.html');
       expect(res.body.leadEmail).toBe('lead@example.com');
     });
 
-    it('should return completed status when contentHtml is set', async () => {
+    it('should return completed status with contentHtml when no contentUrl', async () => {
       mockedSettings.getSetting.mockResolvedValue({
         settingName: 'result-endpoints-config',
         settingValue: JSON.stringify([sampleConfig]),
@@ -478,7 +514,8 @@ describe('Result Endpoints', () => {
         .expect(200);
 
       expect(res.body.status).toBe('completed');
-      expect(res.body.reportUrl).toContain('/review/sess-html');
+      expect(res.body.reportUrl).toBeUndefined();
+      expect(res.body.contentHtml).toBe('<h1>Report</h1>');
     });
 
     it('should return 404 when result endpoint not found', async () => {
