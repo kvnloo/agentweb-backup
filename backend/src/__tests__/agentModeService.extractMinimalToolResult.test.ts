@@ -153,6 +153,67 @@ describe('AgentModeService - extractMinimalToolResult', () => {
     });
   });
 
+  describe('save_file result extraction', () => {
+    it('should extract file_url and file_name from save_file result', () => {
+      const result = {
+        success: true,
+        message: 'File "report_v3.html" has been saved successfully.',
+        file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html',
+        file_name: 'report_v3.html',
+        file_size: 23070,
+        formattedContent: '📁 **File Saved Successfully**\nFile: report_v3.html\nSize: 23070 bytes\nURL: https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'save_file');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        message: 'File "report_v3.html" has been saved successfully.',
+        file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html',
+        file_name: 'report_v3.html',
+      });
+    });
+
+    it('should extract file_url and file_name from MCP-wrapped save_file result', () => {
+      const wrappedResult = {
+        content: JSON.stringify({
+          success: true,
+          message: 'File "report_v3.html" has been saved successfully.',
+          file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html',
+          file_name: 'report_v3.html',
+          file_size: 23070
+        }),
+        raw: {}
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(wrappedResult, 'save_file');
+
+      expect(minimalResult).toEqual({
+        success: true,
+        message: 'File "report_v3.html" has been saved successfully.',
+        file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html',
+        file_name: 'report_v3.html',
+      });
+    });
+
+    it('should handle failed save_file result', () => {
+      const result = {
+        success: false,
+        message: 'Failed to save file to S3. Please try again.',
+        error: 'Upload error'
+      };
+
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'save_file');
+
+      expect(minimalResult).toEqual({
+        success: false,
+        message: 'Failed to save file to S3. Please try again.',
+        file_url: undefined,
+        file_name: undefined,
+      });
+    });
+  });
+
   describe('task creation result extraction', () => {
     it('should extract taskId and executionId from MCP-wrapped create_task_from_template result', () => {
       const wrappedResult = {

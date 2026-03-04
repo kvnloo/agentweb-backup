@@ -57,9 +57,10 @@ router.get('/:resultName/status/:sessionId', async (req, res) => {
     };
 
     if (isCompleted) {
-      // Build the review page URL
-      const customerBaseUrl = (process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174').replace(/\/$/, '');
-      response.reportUrl = `${customerBaseUrl}/review/${sessionId}`;
+      if (metadata?.contentUrl) {
+        response.reportUrl = metadata.contentUrl;
+      }
+      response.contentHtml = metadata?.contentHtml || null;
       response.leadEmail = metadata?.leadEmail || null;
     }
 
@@ -152,6 +153,12 @@ reviewRouter.get('/:sessionId', async (req, res) => {
           }
         }
       }
+    }
+
+    // Fallback: if no assets found from messages but contentUrl exists in metadata, add it as an asset
+    if (assets.length === 0 && metadata.contentUrl) {
+      const isHtml = metadata.outputFormat === 'html' || metadata.contentUrl.endsWith('.html');
+      addAsset(isHtml ? 'html' : 'file', metadata.contentUrl);
     }
 
     // Attach send history to matching assets
