@@ -2481,6 +2481,16 @@ const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assis
 
 Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
 
+You have access to tools that allow you to manage knowledge bases. Here are the tools and when to use each:
+
+1. **create_knowledge_base**: Create a brand new knowledge base. Use when the user wants to start fresh with new research, documentation, or data collection. Provide a name and initial content.
+
+2. **update_knowledge_base_file**: Update or append content to a specific file in an existing knowledge base. Use list_knowledge_base_files first to get the correct taskId (kb_identifier). Specify fileName "knowledge-base.txt" for the main file, or the name of an attached file.
+
+3. **attach_knowledge_base_files**: Save multiple pieces of content as separate named files in an existing knowledge base. Use when the user wants to save several distinct items (e.g., research summaries, data files) at once.
+
+IMPORTANT: Always use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds) before using update_knowledge_base_file or attach_knowledge_base_files.
+
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
 I will provide you with relevant information from the Customer Portal User Guide to help answer questions. Please use this information when responding to user queries.
@@ -2903,8 +2913,8 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // Get specific tools for Emma
-        const toolsToInclude = ['read_page_source'];
+        // KB tools and other tools available to Emma
+        const toolsToInclude = ['create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source'];
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
 

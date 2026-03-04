@@ -674,6 +674,9 @@ export const taskDb = {
     slackChannel?: string;
     emailSender?: string;
     fromName?: string;
+    useKnowledgeBase?: boolean;
+    updateKnowledgeBase?: boolean;
+    knowledgeBaseType?: 'public' | 'private';
   }) {
     try {
       const params = {
