@@ -208,6 +208,19 @@ app.get("/docs/agent-api", (req, res) => {
   }
 });
 
+// Serve skill.md — agent-readable guide for external MCP clients (public, no auth)
+app.get("/skill.md", (req, res) => {
+  const path = require("path");
+  const fs = require("fs");
+  const docPath = path.join(__dirname, "../docs/skill.md");
+  try {
+    const content = fs.readFileSync(docPath, "utf-8");
+    res.type("text/markdown").send(content);
+  } catch {
+    res.status(404).json({ error: "Documentation not found" });
+  }
+});
+
 // Health check endpoint
 app.get("/", (req, res) => {
   res.status(200).json({ status: "healthy" });
