@@ -174,6 +174,7 @@ export interface ChatSession {
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   feedbacks?: Record<string, ImageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
+  publishStatuses?: Record<string, string>; // Track publish status by asset URL (key: assetUrl, value: 'draft' | 'published')
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
   emailMetadata?: {
     senderEmail: string;
@@ -1919,6 +1920,32 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session feedbacks:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionPublishStatuses(
+    sessionId: string,
+    publishStatuses: Record<string, string>
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET publishStatuses = :publishStatuses, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":publishStatuses": publishStatuses,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW" as const,
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session publish statuses:", error);
       throw error;
     }
   }

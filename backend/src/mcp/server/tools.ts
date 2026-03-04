@@ -1028,6 +1028,42 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'list_cms_categories',
+  definition: {
+    name: 'list_cms_categories',
+    description: 'List the available CMS categories for the current user. Returns category names configured in the user\'s Webflow CMS settings. Use this to discover valid category values before calling publish_blog_article.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId;
+    if (!userId) {
+      return { success: false, message: 'User context required' };
+    }
+    try {
+      const { userDb } = await import('../../services/db');
+      const user = await userDb.getUserById(userId);
+      const cmsType = user?.cmsType;
+
+      if (cmsType !== 'Webflow') {
+        return { success: true, cmsType: cmsType || null, categories: [] };
+      }
+
+      const { getWebflowConfig } = await import('../../controllers/blog');
+      const config = await getWebflowConfig(userId);
+      const categoryNames = config.categories ? Object.keys(config.categories) : [];
+
+      return { success: true, cmsType, categories: categoryNames };
+    } catch (error: any) {
+      return { success: false, message: 'Failed to fetch CMS categories', error: error.message };
+    }
+  }
+});
+
+mcpToolRegistry.register({
   name: 'repair_blog_article',
   definition: {
     name: 'repair_blog_article',

@@ -2423,6 +2423,57 @@ async function getExecutionsWithAssets(
             }
           }
         });
+
+        // Second pass: scan for publish_blog_article tool calls and annotate matching files
+        if (result[sessionKey]) {
+          sessionWithMessages.messages.forEach((message: any) => {
+            if (message.metadata?.toolCalls) {
+              message.metadata.toolCalls.forEach((toolCall: any) => {
+                if (toolCall.name === 'publish_blog_article') {
+                  const blogHtmlUrl = toolCall.arguments?.blog_html_url;
+                  if (!blogHtmlUrl) return;
+
+                  // Determine publish status: prefer result.data.status (new format),
+                  // fall back to arguments.status (old format where result was {})
+                  const publishStatus = toolCall.result?.data?.status
+                    || toolCall.arguments?.status
+                    || 'draft';
+
+                  // Determine success: check result.success if available,
+                  // otherwise assume success if no error field
+                  const isSuccess = toolCall.result?.success !== undefined
+                    ? toolCall.result.success
+                    : !toolCall.error;
+
+                  if (!isSuccess) return;
+
+                  // Find and annotate the matching file
+                  for (const execution of result[sessionKey].executions) {
+                    const matchingFile = execution.result_files.find(
+                      (file: any) => file.url === blogHtmlUrl
+                    );
+                    if (matchingFile) {
+                      matchingFile.publishStatus = publishStatus;
+                      break;
+                    }
+                  }
+                }
+              });
+            }
+          });
+
+          // Third pass: check session.publishStatuses map (set by publish-direct button)
+          const sessionPublishStatuses = sessionWithMessages.publishStatuses;
+          if (sessionPublishStatuses) {
+            for (const execution of result[sessionKey].executions) {
+              for (const file of execution.result_files) {
+                if (sessionPublishStatuses[file.url] && !file.publishStatus) {
+                  file.publishStatus = sessionPublishStatuses[file.url];
+                }
+              }
+            }
+          }
+        }
       }
 
       Object.keys(result).forEach(key => {
