@@ -2026,6 +2026,24 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return extracted;
     }
 
+    // For save_file, preserve the URL and filename so Slack revision flow can extract the asset
+    if (toolName === 'save_file') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse save_file result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        file_url: actualResult.file_url,
+        file_name: actualResult.file_name,
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
