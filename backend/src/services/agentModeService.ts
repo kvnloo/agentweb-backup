@@ -6555,6 +6555,120 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Extract CSS design tokens from a URL
+   * Used by extract_css_from_url tool
+   */
+  public async extractCSSFromURL(args: any, userId: string): Promise<any> {
+    try {
+      const { url, options } = args;
+
+      if (!url) {
+        return {
+          success: false,
+          error: 'URL is required'
+        };
+      }
+
+      // Import the CSS extractor service
+      const { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens } = require('./cssExtractor');
+
+      // Extract CSS from URL
+      console.log(`Extracting CSS from ${url}...`);
+      const extractedCSS = await extractCSSFromURL(url, options);
+
+      // Analyze design tokens
+      console.log('Analyzing design tokens...');
+      const detailedTokens = analyzeDesignTokens(extractedCSS);
+
+      // Infer brand tokens
+      console.log('Inferring brand tokens...');
+      const suggestedBrandTokens = inferBrandTokens(detailedTokens);
+
+      // Format detailed tokens as JSON string for Emma to save to KB if needed
+      const detailedTokensJSON = JSON.stringify({
+        version: '1.0',
+        source: url,
+        extractedAt: extractedCSS.extractedAt,
+        tokens: detailedTokens,
+        metadata: {
+          extractionMethod: 'regex-based',
+          savedBy: 'emma',
+          userId
+        }
+      }, null, 2);
+
+      // Format summary for LLM
+      const formattedSummary = this.formatCSSExtractionResult({
+        url,
+        suggestedBrandTokens,
+        detailedTokens
+      });
+
+      return {
+        success: true,
+        url,
+        extractedAt: extractedCSS.extractedAt,
+        suggestedBrandTokens,
+        detailedTokens,
+        detailedTokensJSON, // Emma can save this to KB using update_knowledge_base tool
+        formattedContent: formattedSummary
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error extracting CSS:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to extract CSS from URL',
+        details: error.stack
+      };
+    }
+  }
+
+  /**
+   * Format CSS extraction result for LLM consumption
+   */
+  private formatCSSExtractionResult(data: any): string {
+    const { url, suggestedBrandTokens, detailedTokens } = data;
+
+    let formatted = `# CSS Extraction Results\n\n`;
+    formatted += `**Source:** ${url}\n\n`;
+
+    // Suggested brand tokens (what should go in brand guidelines)
+    formatted += `## Suggested Brand Tokens\n\n`;
+    formatted += `These are the recommended tokens to add to your brand guidelines:\n\n`;
+
+    formatted += `### Colors\n`;
+    formatted += `- **Primary:** ${suggestedBrandTokens.colors.primary}\n`;
+    formatted += `- **Secondary:** ${suggestedBrandTokens.colors.secondary}\n`;
+    formatted += `- **Palette:** ${suggestedBrandTokens.colors.palette.join(', ')}\n\n`;
+
+    formatted += `### Typography\n`;
+    formatted += `- **Heading Font:** ${suggestedBrandTokens.typography.headingFont}\n`;
+    formatted += `- **Body Font:** ${suggestedBrandTokens.typography.bodyFont}\n`;
+    formatted += `- **Font Weights:**\n`;
+    formatted += `  - Regular: ${suggestedBrandTokens.typography.fontWeights.regular}\n`;
+    formatted += `  - Semibold: ${suggestedBrandTokens.typography.fontWeights.semibold}\n`;
+    formatted += `  - Bold: ${suggestedBrandTokens.typography.fontWeights.bold}\n\n`;
+
+    formatted += `### Visual Effects\n`;
+    formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
+    formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Summary of detailed tokens
+    formatted += `## Detailed Analysis\n\n`;
+    formatted += `- **Total Colors Found:** ${detailedTokens.colors.all.length}\n`;
+    formatted += `- **Font Families:** ${detailedTokens.typography.fontFamilies.length}\n`;
+    formatted += `- **Font Sizes:** ${detailedTokens.typography.fontSizes.length}\n`;
+    formatted += `- **Box Shadows:** ${detailedTokens.visualEffects.boxShadows.length}\n`;
+    formatted += `- **Border Radius Values:** ${detailedTokens.visualEffects.borderRadius.length}\n\n`;
+
+    formatted += `### Next Steps\n\n`;
+    formatted += `1. **Apply to Brand Guidelines:** Use \`update_brand_guidelines\` with the suggested values above\n`;
+    formatted += `2. **Save Detailed Data:** Use \`update_knowledge_base\` to save the detailed CSS analysis (detailedTokensJSON) for future reference\n`;
+
+    return formatted;
+  }
+
   private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
     try {
       const taskStatuses: any[] = [];
