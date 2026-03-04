@@ -149,8 +149,34 @@ describe('MCP Publishing Tools', () => {
     });
   });
 
+  describe('list_cms_categories tool', () => {
+    it('should be registered in the tool registry', () => {
+      const tool = mcpToolRegistry.getTool('list_cms_categories');
+      expect(tool).toBeDefined();
+      expect(tool?.name).toBe('list_cms_categories');
+    });
+
+    it('should have no required parameters', () => {
+      const tool = mcpToolRegistry.getTool('list_cms_categories');
+      const schema = tool?.definition.inputSchema;
+
+      expect(schema).toBeDefined();
+      // Should have no required params or an empty required array
+      expect(!schema?.required || schema?.required.length === 0).toBe(true);
+    });
+
+    it('should have description mentioning CMS categories', () => {
+      const tool = mcpToolRegistry.getTool('list_cms_categories');
+      const description = tool?.definition.description;
+
+      expect(description).toBeDefined();
+      expect(description?.toLowerCase()).toContain('categor');
+      expect(description?.toLowerCase()).toContain('cms');
+    });
+  });
+
   describe('Tool execution', () => {
-    it('should be able to get tool definitions for both publishing tools', () => {
+    it('should be able to get tool definitions for all publishing tools', () => {
       const definitions = mcpToolRegistry.getToolDefinitions();
 
       const publishBlogTool = definitions.find(
@@ -159,9 +185,13 @@ describe('MCP Publishing Tools', () => {
       const postOnAccountTool = definitions.find(
         (def: any) => def.name === 'post_on_connected_account'
       );
+      const listCmsCategoriesTool = definitions.find(
+        (def: any) => def.name === 'list_cms_categories'
+      );
 
       expect(publishBlogTool).toBeDefined();
       expect(postOnAccountTool).toBeDefined();
+      expect(listCmsCategoriesTool).toBeDefined();
     });
   });
 });
