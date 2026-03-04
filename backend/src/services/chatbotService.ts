@@ -174,13 +174,13 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  feedbacks?: Record<string, ImageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
+  feedbacks?: Record<string, MessageFeedback>; // Track feedback on generated assets (key: assetUrl)
   emailMetadata?: {
-    senderEmail: string;
+    senderEmail?: string;
     lastInboundEmailId?: string;
     lastOutboundEmailId?: string;
-  };
+  }; // Email metadata for emma-email sessions
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
   resultEndpointMetadata?: {
     resultName: string;
     resultTitle?: string;
@@ -1900,19 +1900,23 @@ export class ChatbotDB {
 
   async updateSessionFeedbacks(
     sessionId: string,
-    feedbacks: Record<string, ImageFeedback>
+    feedbacks: Record<string, MessageFeedback>
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
 
     const params = {
       TableName: this.tableName,
-      Key: { sessionId },
-      UpdateExpression: "SET feedbacks = :feedbacks, updatedAt = :updatedAt",
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET feedbacks = :feedbacks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":feedbacks": feedbacks,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
-      ReturnValues: "ALL_NEW" as const,
+      ReturnValues: "ALL_NEW",
     };
 
     try {
