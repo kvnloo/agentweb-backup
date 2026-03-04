@@ -15,7 +15,9 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getReportsModel: jest.fn(),
+    getReportGenerationDefaultModel: jest.fn(),
+    getImageGenerationDefaultModel: jest.fn(),
+    getVideoGenerationDefaultModel: jest.fn(),
     getDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
@@ -60,10 +62,12 @@ describe('runVerifiedChat model selection', () => {
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue({
       ...baseSession,
-      llmModel: 'reports-model',
+      llmModel: 'report-gen-model',
     } as any);
 
-    mockAgentModeService.getReportsModel.mockResolvedValue('reports-model');
+    mockAgentModeService.getReportGenerationDefaultModel.mockResolvedValue('report-gen-model');
+    mockAgentModeService.getImageGenerationDefaultModel.mockResolvedValue('image-gen-model');
+    mockAgentModeService.getVideoGenerationDefaultModel.mockResolvedValue('video-gen-model');
     mockAgentModeService.getDefaultModel.mockResolvedValue('default-model');
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('system prompt');
     mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
@@ -77,7 +81,7 @@ describe('runVerifiedChat model selection', () => {
     } as any);
   });
 
-  it('switches session to reports model for update_html_file revisions', async () => {
+  it('switches session to report generation model for update_html_file', async () => {
     await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
@@ -88,15 +92,15 @@ describe('runVerifiedChat model selection', () => {
       attachments: [],
     });
 
-    expect(mockAgentModeService.getReportsModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'reports-model');
+    expect(mockAgentModeService.getReportGenerationDefaultModel).toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model');
     expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
-      expect.objectContaining({ llmModel: 'reports-model' }),
+      expect.objectContaining({ llmModel: 'report-gen-model' }),
       expect.any(Function)
     );
   });
 
-  it('switches session to reports model for read_file_content revisions', async () => {
+  it('switches session to report generation model for read_file_content', async () => {
     mockWorkerService.runInWorker.mockResolvedValueOnce({
       content: 'Done',
       toolCalls: [{ name: 'read_file_content', result: { success: true } }],
@@ -115,11 +119,90 @@ describe('runVerifiedChat model selection', () => {
       attachments: [],
     });
 
-    expect(mockAgentModeService.getReportsModel).toHaveBeenCalled();
-    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'reports-model');
+    expect(mockAgentModeService.getReportGenerationDefaultModel).toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model');
     expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
-      expect.objectContaining({ llmModel: 'reports-model' }),
+      expect.objectContaining({ llmModel: 'report-gen-model' }),
       expect.any(Function)
     );
+  });
+
+  it('switches session to report generation model for create_blog_article', async () => {
+    mockWorkerService.runInWorker.mockResolvedValueOnce({
+      content: 'Done',
+      toolCalls: [{ name: 'create_blog_article', result: { success: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+
+    await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Create a new report.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'create_blog_article', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+    });
+
+    expect(mockAgentModeService.getReportGenerationDefaultModel).toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'report-gen-model');
+  });
+
+  it('switches session to image generation model for generate_image', async () => {
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue({
+      ...baseSession,
+      llmModel: 'image-gen-model',
+    } as any);
+
+    mockWorkerService.runInWorker.mockResolvedValueOnce({
+      content: 'Done',
+      toolCalls: [{ name: 'generate_image', result: { success: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+
+    await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Generate an image.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'generate_image', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+    });
+
+    expect(mockAgentModeService.getImageGenerationDefaultModel).toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'image-gen-model');
+  });
+
+  it('switches session to video generation model for generate_video', async () => {
+    mockChatbotDb.updateSessionLlmModel.mockResolvedValue({
+      ...baseSession,
+      llmModel: 'video-gen-model',
+    } as any);
+
+    mockWorkerService.runInWorker.mockResolvedValueOnce({
+      content: 'Done',
+      toolCalls: [{ name: 'generate_video', result: { success: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+
+    await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Generate a video.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'generate_video', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+    });
+
+    expect(mockAgentModeService.getVideoGenerationDefaultModel).toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'video-gen-model');
   });
 });
