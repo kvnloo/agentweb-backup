@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-04',
     changes: [
+      'Fix: Slack Revision Not Sent Back for Review',
+      '- Fixed a bug where revised assets were not sent back to Slack after Emma used save_file as a fallback when update_html_file failed during a revision',
+      '- The save_file tool result is now properly preserved so the Slack revision flow can extract the new asset URL',
+      '- Also added file_url fallback for image revisions to handle the same edge case',
       'Fix: Result Endpoint Review Page Not Showing Content',
       '- Fixed review page showing "Content is still being generated" when the agent used save_file instead of create_html_file',
       '- The contentUrl stored in session metadata is now used as a fallback asset when message scanning finds no assets',
