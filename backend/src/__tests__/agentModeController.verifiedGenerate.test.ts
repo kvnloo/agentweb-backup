@@ -8,6 +8,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessageToSession: jest.fn(),
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
+    updateSessionLlmModel: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
   },
 }));
@@ -16,6 +17,9 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
+    getReportGenerationDefaultModel: jest.fn(),
+    getImageGenerationDefaultModel: jest.fn(),
+    getVideoGenerationDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -91,6 +95,9 @@ describe('AgentModeController - Verified Generate', () => {
     mockChatbotDb.createOrReuseInteractiveShare.mockResolvedValue('http://ishare.test/session');
     mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(mockResponse);
     mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getReportGenerationDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getImageGenerationDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+    mockAgentModeService.getVideoGenerationDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
   });
 
   describe('verifiedGenerate endpoint', () => {
