@@ -1,7 +1,7 @@
 import { chatbotDb } from '../services/chatbotService';
 import AWS from 'aws-sdk';
 
-// Mock AWS DynamoDB
+// Mock AWS DynamoDB and S3
 jest.mock('aws-sdk', () => {
   const queryMock = jest.fn();
   return {
@@ -10,6 +10,10 @@ jest.mock('aws-sdk', () => {
         query: jest.fn(() => ({ promise: queryMock })),
       })),
     },
+    S3: jest.fn(() => ({
+      upload: jest.fn().mockReturnThis(),
+      promise: jest.fn(),
+    })),
     config: { update: jest.fn() },
     __queryMock: queryMock,
   };
