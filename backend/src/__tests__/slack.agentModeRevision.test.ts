@@ -119,6 +119,107 @@ describe('Agent Mode Revision from Slack Request Changes', () => {
     });
   });
 
+  describe('Asset URL extraction from save_file fallback', () => {
+    it('should extract file_url from save_file when update_html_file fails', () => {
+      // Simulates the real scenario: update_html_file fails, Emma falls back to save_file
+      const toolCalls = [
+        {
+          id: 'call1',
+          name: 'read_file_content',
+          result: {
+            success: true,
+            content: '<html>...</html>',
+            filename: 'report.html'
+          } as any
+        },
+        {
+          id: 'call2',
+          name: 'update_html_file',
+          result: {
+            success: false,
+            message: 'Replacement 1 failed: The old_content was not found in the content.'
+          } as any
+        },
+        {
+          id: 'call3',
+          name: 'save_file',
+          result: {
+            success: true,
+            file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html',
+            file_name: 'report_v3.html',
+          } as any
+        }
+      ];
+
+      const assetType = 'html';
+      let newAssetUrl: string | null = null;
+      let newAssetFilename: string | null = null;
+
+      for (const toolCall of toolCalls) {
+        const toolResult: any = toolCall?.result || {};
+
+        if (assetType === 'html') {
+          if (toolResult.success) {
+            const htmlUrl = toolResult.file_url || toolResult.s3_url || toolResult.htmlUrl;
+            if (htmlUrl) {
+              newAssetUrl = htmlUrl;
+              newAssetFilename = toolResult.filename || toolResult.file_name || toolResult.versioned_filename || 'revised_report.html';
+              break;
+            }
+          }
+        }
+      }
+
+      expect(newAssetUrl).toBe('https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/report_v3.html');
+      expect(newAssetFilename).toBe('report_v3.html');
+    });
+
+    it('should extract file_url from save_file for image assets', () => {
+      // Emma might fall back to save_file for images too
+      const toolCalls = [
+        {
+          id: 'call1',
+          name: 'generate_image',
+          result: {
+            success: false,
+            message: 'Image generation failed'
+          } as any
+        },
+        {
+          id: 'call2',
+          name: 'save_file',
+          result: {
+            success: true,
+            file_url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/image_v2.png',
+            file_name: 'image_v2.png',
+          } as any
+        }
+      ];
+
+      const assetType = 'image';
+      let newAssetUrl: string | null = null;
+      let newAssetFilename: string | null = null;
+
+      for (const toolCall of toolCalls) {
+        const toolResult: any = toolCall?.result || {};
+
+        if (assetType === 'image') {
+          if (toolResult.success) {
+            const imageUrl = toolResult.imageUrl || toolResult.image_url || toolResult.s3_url || toolResult.url || toolResult.file_url;
+            if (imageUrl) {
+              newAssetUrl = imageUrl;
+              newAssetFilename = toolResult.filename || toolResult.file_name || 'revised_image';
+              break;
+            }
+          }
+        }
+      }
+
+      expect(newAssetUrl).toBe('https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/user123/files/123/abc/image_v2.png');
+      expect(newAssetFilename).toBe('image_v2.png');
+    });
+  });
+
   describe('Oncall alert on extraction failure', () => {
     it('should send oncall alert when asset URL cannot be extracted', async () => {
       const { emailService } = require('../services/emailService');
