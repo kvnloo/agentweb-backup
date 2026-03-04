@@ -489,41 +489,6 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'extract_css_from_url',
-  definition: {
-    name: 'extract_css_from_url',
-    description: 'Extract CSS design tokens (colors, typography, visual effects) and brand identity (logo, name, tagline) from a website URL. Returns detailed analysis (detailedTokensJSON), suggested brand tokens (suggestedBrandTokens), and brand identity (brandIdentity). Use update_brand_guidelines to apply suggested tokens and brand identity, and update_knowledge_base_file to save detailed analysis. Use this tool when the user wants to extract design elements from an existing website.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        url: {
-          type: 'string',
-          description: 'The full URL of the website to analyze (e.g., https://example.com). Must be HTTP or HTTPS.'
-        },
-        options: {
-          type: 'object',
-          description: 'Optional extraction settings',
-          properties: {
-            includeExternalStylesheets: {
-              type: 'boolean',
-              description: 'Whether to fetch and analyze external CSS files (default: true)'
-            },
-            maxStylesheets: {
-              type: 'number',
-              description: 'Maximum number of external stylesheets to fetch (default: 10)'
-            }
-          }
-        }
-      },
-      required: ['url']
-    }
-  },
-  execute: async (args, context) => {
-    return await agentModeService.extractCSSFromURL(args, context?.userId);
-  }
-});
-
-mcpToolRegistry.register({
   name: 'read_market_strategy',
   definition: {
     name: 'read_market_strategy',
