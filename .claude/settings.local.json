@@ -125,7 +125,15 @@
       "Bash(./test-env/test-env.sh status:*)",
       "Bash(./test-env/test-env.sh logs:*)",
       "mcp__notion__API-post-search",
-      "mcp__notion__API-query-data-source"
+      "mcp__notion__API-query-data-source",
+      "mcp__notion__API-get-block-children",
+      "mcp__notion__API-patch-page",
+      "mcp__notion__API-create-a-comment",
+      "Bash(./test-env/test-env.sh teardown:*)",
+      "Bash(./test-env/test-env.sh allowlist-all:*)",
+      "WebFetch(domain:resend.com)",
+      "Bash(test:*)",
+      "Bash(/Users/ruiwang/Documents/GitHub/agentweb4/test-env/test-env.sh logs:*)"
     ]
   },
   "enableAllProjectMcpServers": true,
