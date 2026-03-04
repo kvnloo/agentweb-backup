@@ -9,6 +9,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-04',
     changes: [
+      'Agent Mode: Stability Improvements for Long Sessions',
+      '- Sessions with many tool calls (search, read, publish) no longer crash from exceeding the LLM context window',
+      '- Transient LLM errors (503, 429, timeouts) are now automatically retried with exponential backoff',
       'Emma: Expanded Knowledge Base Tools',
       '- Emma can now create new knowledge bases from scratch using the create_knowledge_base tool',
       '- The update_knowledge_base_file tool lets Emma update or append to specific files by name (main KB file or attached files)',
