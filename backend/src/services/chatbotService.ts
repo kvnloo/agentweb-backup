@@ -15,6 +15,7 @@ import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
 import { getGCSPPrivateKey } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
+import { AgentModeService } from './agentModeService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -67,15 +68,6 @@ export interface MessageFeedback {
   comment?: string;                    // Optional text feedback
   timestamp: string;                   // ISO timestamp when feedback given
   userId: string;                      // User who gave feedback
-}
-
-// Interface for image-level feedback (stored on session.feedbacks or result_files[].feedback)
-export interface ImageFeedback {
-  type: 'like' | 'dislike';
-  reasons?: string[];
-  comment?: string;
-  timestamp: string;
-  userId: string;
 }
 
 // Interface for chat messages
@@ -173,14 +165,14 @@ export interface ChatSession {
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
-  feedbacks?: Record<string, ImageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
+  feedbacks?: Record<string, MessageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
   publishStatuses?: Record<string, string>; // Track publish status by asset URL (key: assetUrl, value: 'draft' | 'published')
   sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
   emailMetadata?: {
-    senderEmail: string;
+    senderEmail?: string;
     lastInboundEmailId?: string;
     lastOutboundEmailId?: string;
-  };
+  }; // Email metadata for emma-email sessions
   resultEndpointMetadata?: {
     resultName: string;
     resultTitle?: string;
@@ -1777,37 +1769,6 @@ export class ChatbotDB {
     }
   }
 
-  async updateSessionEmailMetadata(
-    sessionId: string,
-    emailMetadata: {
-      senderEmail: string;
-      lastInboundEmailId?: string;
-      lastOutboundEmailId?: string;
-    }
-  ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
-    const params = {
-      TableName: this.tableName,
-      Key: { sessionId },
-      UpdateExpression: "SET emailMetadata = :emailMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":emailMetadata": emailMetadata,
-        ":updatedAt": timestamp,
-        ":adminListPartition": "all",
-      },
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error updating session email metadata:", error);
-      throw error;
-    }
-  }
-
   async updateSessionWorkPlan(
     sessionId: string,
     workPlan: {
@@ -1900,19 +1861,23 @@ export class ChatbotDB {
 
   async updateSessionFeedbacks(
     sessionId: string,
-    feedbacks: Record<string, ImageFeedback>
+    feedbacks: Record<string, MessageFeedback>
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
 
     const params = {
       TableName: this.tableName,
-      Key: { sessionId },
-      UpdateExpression: "SET feedbacks = :feedbacks, updatedAt = :updatedAt",
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET feedbacks = :feedbacks, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
       ExpressionAttributeValues: {
         ":feedbacks": feedbacks,
         ":updatedAt": timestamp,
+        ":adminListPartition": "all",
       },
-      ReturnValues: "ALL_NEW" as const,
+      ReturnValues: "ALL_NEW",
     };
 
     try {
@@ -1946,6 +1911,40 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session publish statuses:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionEmailMetadata(
+    sessionId: string,
+    metadata: {
+      senderEmail?: string;
+      lastInboundEmailId?: string;
+      lastOutboundEmailId?: string;
+    }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET emailMetadata = :emailMetadata, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":emailMetadata": metadata,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session email metadata:", error);
       throw error;
     }
   }
@@ -2480,7 +2479,17 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
 
 const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
 
-Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics. 
+Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
+
+You have access to tools that allow you to manage knowledge bases. Here are the tools and when to use each:
+
+1. **create_knowledge_base**: Create a brand new knowledge base. Use when the user wants to start fresh with new research, documentation, or data collection. Provide a name and initial content.
+
+2. **update_knowledge_base_file**: Update or append content to a specific file in an existing knowledge base. Use list_knowledge_base_files first to get the correct taskId (kb_identifier). Specify fileName "knowledge-base.txt" for the main file, or the name of an attached file.
+
+3. **attach_knowledge_base_files**: Save multiple pieces of content as separate named files in an existing knowledge base. Use when the user wants to save several distinct items (e.g., research summaries, data files) at once.
+
+IMPORTANT: Always use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds) before using update_knowledge_base_file or attach_knowledge_base_files.
 
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
@@ -2773,7 +2782,7 @@ export async function generateChatResponse(
   pageContent?: string,
   portalType: "customer" | "partner" = "partner",
   userId?: string
-): Promise<string> {
+): Promise<string | { content: string; toolCalls?: any[] }> {
   try {
     const timestamp = new Date().toISOString();
 
@@ -2894,42 +2903,186 @@ export async function generateChatResponse(
       retrievalErrorOccurred = true;
     }
 
-    // Generate response using OpenAI
-    const response = await openai.chat.completions.create({
-      model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-      messages: messages
-        .filter(({ role, content }) => {
-          // Skip tool result messages — their content is already in assistant responses,
-          // and including them without proper tool_calls on the preceding assistant message
-          // causes OpenAI to reject the request.
-          if (role === 'tool') return false;
-          // Skip assistant messages with no text content (tool-call-only messages)
-          if (role === 'assistant' && !content) return false;
-          return true;
-        })
-        .map(({ role, content, name }) => {
+    // Initialize tool support for Emma (customer portal only)
+    let agentModeService: AgentModeService | null = null;
+    let toolDefinitions: any[] = [];
+
+    if (portalType === 'customer') {
+      try {
+        // Initialize AgentModeService to access tool registry and executeTool
+        agentModeService = new AgentModeService();
+        await agentModeService.initialize();
+
+        // KB tools and other tools available to Emma
+        const toolsToInclude = ['create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source'];
+
+        const { mcpToolRegistry } = await import('../mcp/server/registry');
+
+        for (const toolName of toolsToInclude) {
+          const toolHandler = mcpToolRegistry.getTool(toolName);
+          if (toolHandler) {
+            // Convert MCP definition to OpenAI format
+            const mcpDef = toolHandler.definition;
+            toolDefinitions.push({
+              type: "function",
+              function: {
+                name: mcpDef.name,
+                description: mcpDef.description,
+                parameters: mcpDef.inputSchema
+              }
+            });
+          }
+        }
+
+        console.log(`[generateChatResponse] Loaded ${toolDefinitions.length} tools for Emma`);
+      } catch (error) {
+        console.error('[generateChatResponse] Error loading tools:', error);
+        // Continue without tools if loading fails
+      }
+    }
+
+    // Iterative tool execution loop (follows Agent Mode pattern)
+    let iteration = 0;
+    const MAX_ITERATIONS = 10;
+    const toolCalls: any[] = []; // Track tool calls for response
+    let finalAssistantMessage = '';
+    let finalUsageData: any = null;
+
+    while (iteration < MAX_ITERATIONS) {
+      console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
+
+      // Generate response using OpenAI (with tools if available)
+      const response = await openai.chat.completions.create({
+        model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+        messages: messages.map(({ role, content, name, tool_call_id, tool_calls }) => {
           const message: any = { role, content };
+          if (role === 'tool' && tool_call_id) {
+            message.tool_call_id = tool_call_id;
+          }
+          if (role === 'assistant' && tool_calls) {
+            message.tool_calls = tool_calls;
+          }
           if (name) {
             message.name = name;
           }
           return message;
         }),
-    });
+        // Add tools only for customer portal with tools loaded
+        ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
+      });
 
-    // Log and get usage data
-    const usageData = logTokenUsage(
-      response,
-      contextInfo
-        ? `Used ${contextInfo.length} chars of context`
-        : "No context used"
-    );
+      const responseMessage = response.choices[0]?.message;
+      if (!responseMessage) {
+        throw new Error("No response from LLM");
+      }
 
-    // Extract assistant's reply
-    const assistantReply =
-      response.choices[0]?.message?.content ||
-      "I apologize, but I was unable to generate a response.";
+      // Log token usage for this iteration
+      logTokenUsage(
+        response,
+        `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
+      );
 
-    // Add assistant's reply to the session with usage data and metadata
+      // Add assistant message to messages array (for next iteration)
+      const assistantMsg: any = {
+        role: 'assistant',
+        content: responseMessage.content || ''
+      };
+      if (responseMessage.tool_calls) {
+        assistantMsg.tool_calls = responseMessage.tool_calls;
+      }
+      messages.push(assistantMsg);
+
+      // Check if LLM wants to call tools
+      if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+        // No tool calls - we're done
+        finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
+        finalUsageData = logTokenUsage(response, "Final response");
+        break;
+      }
+
+      console.log(`[generateChatResponse] Executing ${responseMessage.tool_calls.length} tool calls`);
+
+      // Execute each tool call
+      for (const toolCall of responseMessage.tool_calls) {
+        let functionArgs: any;
+        try {
+          functionArgs = JSON.parse(toolCall.function.arguments);
+
+          console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
+
+          // Execute tool via AgentModeService (reuse existing infrastructure)
+          if (!agentModeService) {
+            throw new Error("AgentModeService not initialized");
+          }
+
+          const result = await agentModeService.executeTool(
+            response.model,
+            toolCall.function.name,
+            functionArgs,
+            userId!,
+            sessionId,
+            false // mockMode
+          );
+
+          console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
+
+          // Track tool call for response
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs,
+            result: result
+          });
+
+          // Format result for tool message
+          const toolContent = typeof result === 'string' ? result : JSON.stringify(result);
+
+          // Add tool result message to messages array (for next iteration)
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: toolCall.function.name,
+            content: toolContent,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+
+        } catch (error) {
+          console.error(`[generateChatResponse] Tool execution error for ${toolCall.function.name}:`, error);
+
+          // Track failed tool call
+          toolCalls.push({
+            id: toolCall.id,
+            name: toolCall.function.name,
+            arguments: functionArgs || toolCall.function.arguments,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+
+          // Add error result as tool message (LLM needs to see the error)
+          const errorContent = JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: toolCall.function.name,
+            content: errorContent,
+            metadata: { timestamp: new Date().toISOString() }
+          });
+        }
+      }
+
+      iteration++;
+    }
+
+    // Safety check: if we hit max iterations, ensure we have a response
+    if (iteration >= MAX_ITERATIONS && !finalAssistantMessage) {
+      finalAssistantMessage = "I apologize, but I reached the maximum number of iterations. Please try again with a simpler request.";
+      console.warn(`[generateChatResponse] Hit MAX_ITERATIONS (${MAX_ITERATIONS})`);
+    }
+
+    // Save all new messages to session
     const assistantMessageMetadata = {
       currentUrl,
       pageContentLength: pageContent?.length,
@@ -2938,16 +3091,27 @@ export async function generateChatResponse(
       relevantChunks: relevantChunksInfo,
       timestamp,
       portalType,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined // Include tool calls if any
     };
 
+    // Add final assistant message
     await chatbotDb.addMessageToSession(sessionId, {
       role: "assistant",
-      content: assistantReply,
-      usage: usageData,
+      content: finalAssistantMessage,
+      usage: finalUsageData,
       metadata: assistantMessageMetadata,
     });
 
-    return assistantReply;
+    // Return response object (like Agent Mode, not just string)
+    if (toolCalls.length > 0) {
+      return {
+        content: finalAssistantMessage,
+        toolCalls: toolCalls
+      };
+    } else {
+      // For backward compatibility with partner portal
+      return finalAssistantMessage;
+    }
   } catch (error) {
     console.error("[generateChatResponse] Error:", error);
     throw error;

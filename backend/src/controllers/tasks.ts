@@ -110,7 +110,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           createVideo: req.body.createVideo !== undefined ? Boolean(req.body.createVideo) : template.createVideo,
           videoModel: videoModel || null,
           imageModel: imageModel || null,
-          knowledgeBaseType: 'private',
+          knowledgeBaseType: 'private' as const,
           requireApproval: req.body.requireApproval !== undefined ? Boolean(req.body.requireApproval) : template.requireApproval || false,
           slackChannel: req.body.slackChannel || template.slackChannel || null,
           createdAt: new Date().toISOString(),
@@ -156,7 +156,7 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       createVideo: Boolean(req.body.createVideo),
       videoModel: videoModel || null,
       imageModel: imageModel || null,
-      knowledgeBaseType: 'private', // Default to private for new tasks
+      knowledgeBaseType: 'private' as const, // Default to private for new tasks
       createdAt: new Date().toISOString(),
       llmName: req.body.llmName || null,
       category: category,

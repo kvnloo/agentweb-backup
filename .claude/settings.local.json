@@ -125,10 +125,7 @@
       "Bash(./test-env/test-env.sh status:*)",
       "Bash(./test-env/test-env.sh logs:*)",
       "mcp__notion__API-post-search",
-      "mcp__notion__API-query-data-source",
-      "Bash(./test-env/test-env.sh teardown:*)",
-      "Bash(aws ce:*)",
-      "Bash(aws organizations:*)"
+      "mcp__notion__API-query-data-source"
     ]
   },
   "enableAllProjectMcpServers": true,

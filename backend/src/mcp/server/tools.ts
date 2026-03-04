@@ -3111,6 +3111,136 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'create_knowledge_base',
+  definition: {
+    name: 'create_knowledge_base',
+    description: 'Create a new knowledge base with initial content. This creates a new task with a knowledge base file. Use this when the user wants to start a new knowledge base for research, documentation, or data collection. Returns the new taskId which can be used with update_knowledge_base_file and attach_knowledge_base_files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Name for the new knowledge base (e.g., "Market Research Q1", "Competitor Analysis")'
+        },
+        content: {
+          type: 'string',
+          description: 'Initial content to write to the knowledge base'
+        },
+        knowledgeBaseType: {
+          type: 'string',
+          enum: ['public', 'private'],
+          description: 'Whether the knowledge base is public or private. Default: private'
+        }
+      },
+      required: ['name', 'content']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId || !context?.sessionId) {
+      throw new Error("Missing user or session context");
+    }
+    return await agentModeService.createKnowledgeBase(
+      args.name,
+      args.content,
+      args.knowledgeBaseType || 'private',
+      context.userId,
+      context.sessionId
+    );
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'update_knowledge_base_file',
+  definition: {
+    name: 'update_knowledge_base_file',
+    description: 'Update or append content to a specific file in a task\'s knowledge base. Use this to save information that should persist across executions, like research findings, data collected, or documentation. The user must own the task to update its knowledge base. IMPORTANT: Use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds). Use fileName "knowledge-base.txt" for the main knowledge base file, or specify an attached file\'s name.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'The task ID (kb_identifier) whose knowledge base to update. Get this from list_knowledge_base_files.'
+        },
+        fileName: {
+          type: 'string',
+          description: 'The name of the file to update. Use "knowledge-base.txt" for the main KB file, or the filename of an attached file. If the file does not exist, a new one will be created.'
+        },
+        content: {
+          type: 'string',
+          description: 'The content to write to the file'
+        },
+        mode: {
+          type: 'string',
+          enum: ['replace', 'append'],
+          description: 'Whether to replace the entire file or append to it. Default: append'
+        }
+      },
+      required: ['taskId', 'fileName', 'content']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId || !context?.sessionId) {
+      throw new Error("Missing user or session context");
+    }
+    return await agentModeService.updateKnowledgeBaseFile(
+      args.taskId,
+      args.fileName,
+      args.content,
+      args.mode || 'append',
+      context.userId,
+      context.sessionId
+    );
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'attach_knowledge_base_files',
+  definition: {
+    name: 'attach_knowledge_base_files',
+    description: 'Attach one or more files to a task\'s knowledge base. Use this to save multiple pieces of content as separate named files. The user must own the task. IMPORTANT: Use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description: 'The task ID (kb_identifier) to attach files to. Get this from list_knowledge_base_files.'
+        },
+        files: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Filename for the attached file (e.g., "research-summary.txt", "competitor-data.csv")'
+              },
+              content: {
+                type: 'string',
+                description: 'The file content'
+              }
+            },
+            required: ['name', 'content']
+          },
+          description: 'Array of files to attach, each with a name and content'
+        }
+      },
+      required: ['taskId', 'files']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId || !context?.sessionId) {
+      throw new Error("Missing user or session context");
+    }
+    return await agentModeService.attachKnowledgeBaseFiles(
+      args.taskId,
+      args.files,
+      context.userId,
+      context.sessionId
+    );
+  }
+});
+
+mcpToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
@@ -3154,19 +3284,29 @@ mcpToolRegistry.register({
   name: "read_page_source",
   definition: {
     name: "read_page_source",
-    description: 'Read and extract the HTML source code from any webpage URL. This is an alternative to read_file_content but specifically designed for web pages. Returns the raw HTML source for analysis.',
+    description: 'Read and extract the HTML source code from any webpage URL. By default returns raw HTML. When extractDesignTokens is true, uses a headless browser to extract CSS design tokens (colors, typography, visual effects), brand identity (logo, name, tagline), and suggested brand tokens. Use extractDesignTokens when the user wants to extract design elements or brand identity from a website.',
     inputSchema: {
       type: "object",
       properties: {
         url: {
           type: 'string',
           description: 'The URL of the webpage to read and extract HTML source from'
+        },
+        extractDesignTokens: {
+          type: 'boolean',
+          description: 'When true, extracts CSS design tokens, brand identity, and suggested brand tokens in addition to HTML. Use update_brand_guidelines to apply the suggested tokens. Default: false'
         }
       },
       required: ["url"]
     }
   },
   execute: async (args: any, context?: any) => {
+    // If extractDesignTokens is true, use CSS extraction
+    if (args.extractDesignTokens) {
+      return await agentModeService.extractCSSFromURL(args, context?.userId);
+    }
+
+    // Default: read raw HTML
     const result = await agentModeService.readFileContent(args.url);
     if (result.success === false) {
       return {

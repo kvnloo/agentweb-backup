@@ -35,7 +35,8 @@ describe('tokenUtils', () => {
     });
 
     it('should return days format for timestamps days away', () => {
-      const fiveDaysFromNow = Date.now() + 5 * 24 * 60 * 60 * 1000;
+      // Add 1 second buffer to avoid flaky rounding at the boundary
+      const fiveDaysFromNow = Date.now() + 5 * 24 * 60 * 60 * 1000 + 1000;
       expect(formatExpiryMessage(fiveDaysFromNow)).toBe('Expires in 5 days');
     });
 

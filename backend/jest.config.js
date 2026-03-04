@@ -3,7 +3,6 @@ module.exports = {
   testEnvironment: 'node',
   roots: ['<rootDir>/src'],
   testMatch: ['**/__tests__/**/*.test.ts'],
-  moduleFileExtensions: ['ts', 'js', 'json'],
   clearMocks: true,
   verbose: false,
   maxWorkers: 2, // Limit to 2 workers to reduce memory usage in CI
@@ -18,7 +17,7 @@ module.exports = {
     ]
   },
   testPathIgnorePatterns: ['/node_modules/'],
-  transformIgnorePatterns: ['/node_modules/'],
+  transformIgnorePatterns: ['/node_modules/(?!@projectwallace/)'],
   collectCoverageFrom: [
     'src/utils/**/*.ts',
     '!src/**/*.d.ts',
@@ -33,5 +32,3 @@ module.exports = {
     },
   },
 };
-
-

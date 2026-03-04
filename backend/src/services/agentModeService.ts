@@ -6672,6 +6672,632 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Extract CSS design tokens from a URL
+   * Used by read_page_source tool (extractDesignTokens=true)
+   */
+  public async extractCSSFromURL(args: any, userId: string): Promise<any> {
+    try {
+      const { url, options } = args;
+
+      if (!url) {
+        return {
+          success: false,
+          error: 'URL is required'
+        };
+      }
+
+      // Import the CSS extractor service
+      const { extractCSSFromURL, analyzeDesignTokens, inferBrandTokens } = require('./cssExtractor');
+
+      // Extract CSS from URL
+      console.log(`Extracting CSS from ${url}...`);
+      const extractedCSS = await extractCSSFromURL(url, options);
+
+      // Analyze design tokens
+      console.log('Analyzing design tokens...');
+      const detailedTokens = await analyzeDesignTokens(extractedCSS);
+
+      // Log extraction details for debugging
+      console.log(`CSS extraction details: ${extractedCSS.stylesheets.length} stylesheets, ` +
+        `source=${extractedCSS.stylesheets[0]?.source || 'none'}, ` +
+        `computedElements=${extractedCSS.computedElements ? Object.keys(extractedCSS.computedElements).join(',') : 'none'}`);
+      console.log(`Design tokens: ${detailedTokens.colors.all.length} colors, ` +
+        `${detailedTokens.typography.fontFamilies.length} fonts, ` +
+        `top colors: ${detailedTokens.colors.all.slice(0, 5).map((c: any) => `${c.value}(${c.count})`).join(', ')}`);
+
+      // Infer brand tokens
+      console.log('Inferring brand tokens...');
+      const suggestedBrandTokens = inferBrandTokens(detailedTokens);
+
+      // Process brand identity: download logo and upload to S3
+      const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
+      let s3LogoUrl: string | null = null;
+
+      if (brandIdentity.logoUrl) {
+        try {
+          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
+          const logoResponse = await axios.get(brandIdentity.logoUrl, {
+            responseType: 'arraybuffer',
+            timeout: 15000,
+          });
+          const contentType = logoResponse.headers['content-type'] || '';
+          // Skip SVG since brand guidelines doesn't accept it
+          if (!contentType.includes('svg')) {
+            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
+            const filename = `logo.${ext}`;
+            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
+            const uploadResult = await uploadFileToS3WithPath(
+              Buffer.from(logoResponse.data as ArrayBuffer),
+              filename,
+              contentType,
+              `users/${userId}/brand/logo`
+            );
+            if (uploadResult.success && uploadResult.url) {
+              s3LogoUrl = uploadResult.url;
+              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
+            }
+          } else {
+            console.log('Skipping SVG logo (not supported by brand guidelines)');
+          }
+        } catch (logoErr: any) {
+          console.warn('Failed to download/upload logo:', logoErr.message);
+        }
+      }
+
+      // Format detailed tokens as JSON string for Emma to save to KB if needed
+      const detailedTokensJSON = JSON.stringify({
+        version: '1.0',
+        source: url,
+        extractedAt: extractedCSS.extractedAt,
+        tokens: detailedTokens,
+        metadata: {
+          extractionMethod: 'puppeteer-wallace',
+          savedBy: 'emma',
+          userId
+        }
+      }, null, 2);
+
+      // Format summary for LLM
+      const formattedSummary = this.formatCSSExtractionResult({
+        url,
+        suggestedBrandTokens,
+        detailedTokens,
+        brandIdentity: {
+          logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
+          brandName: brandIdentity.brandName || null,
+          tagline: brandIdentity.tagline || null,
+        },
+      });
+
+      // Merge brand identity into suggestedBrandTokens so Emma naturally displays it
+      const enrichedBrandTokens = {
+        ...suggestedBrandTokens,
+        brandName: brandIdentity.brandName || null,
+        logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
+        tagline: brandIdentity.tagline || null,
+      };
+
+      return {
+        success: true,
+        url,
+        extractedAt: extractedCSS.extractedAt,
+        suggestedBrandTokens: enrichedBrandTokens,
+        detailedTokens,
+        detailedTokensJSON, // Emma can save this to KB using update_knowledge_base_file tool
+        formattedContent: formattedSummary
+      };
+    } catch (error: any) {
+      console.error('AgentMode: Error extracting CSS:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to extract CSS from URL',
+        details: error.stack
+      };
+    }
+  }
+
+  /**
+   * Format CSS extraction result for LLM consumption
+   */
+  private formatCSSExtractionResult(data: any): string {
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
+
+    let formatted = `# CSS Extraction Results\n\n`;
+    formatted += `**Source:** ${url}\n\n`;
+
+    // Brand identity section
+    if (brandIdentity) {
+      formatted += `## Brand Identity\n\n`;
+      formatted += `- **Brand Name:** ${brandIdentity.brandName || 'Not detected'}\n`;
+      formatted += `- **Logo:** ${brandIdentity.logoUrl || 'Not detected'}\n`;
+      formatted += `- **Tagline:** ${brandIdentity.tagline || 'Not detected'}\n\n`;
+    }
+
+    // Suggested brand tokens (what should go in brand guidelines)
+    formatted += `## Suggested Brand Tokens\n\n`;
+    formatted += `These are the recommended tokens to add to your brand guidelines:\n\n`;
+
+    formatted += `### Colors\n`;
+    formatted += `- **Primary:** ${suggestedBrandTokens.colors.primary}\n`;
+    formatted += `- **Secondary:** ${suggestedBrandTokens.colors.secondary}\n`;
+    formatted += `- **Palette:** ${suggestedBrandTokens.colors.palette.join(', ')}\n\n`;
+
+    formatted += `### Typography\n`;
+    formatted += `- **Heading Font:** ${suggestedBrandTokens.typography.headingFont}\n`;
+    formatted += `- **Body Font:** ${suggestedBrandTokens.typography.bodyFont}\n`;
+    formatted += `- **Font Weights:**\n`;
+    formatted += `  - Regular: ${suggestedBrandTokens.typography.fontWeights.regular}\n`;
+    formatted += `  - Semibold: ${suggestedBrandTokens.typography.fontWeights.semibold}\n`;
+    formatted += `  - Bold: ${suggestedBrandTokens.typography.fontWeights.bold}\n\n`;
+
+    formatted += `### Visual Effects\n`;
+    formatted += `- **Primary Shadow:** ${suggestedBrandTokens.visualEffects.primaryShadow}\n`;
+    formatted += `- **Border Radius:** ${suggestedBrandTokens.visualEffects.borderRadius}\n\n`;
+
+    // Summary of detailed tokens
+    formatted += `## Detailed Analysis\n\n`;
+    formatted += `- **Total Colors Found:** ${detailedTokens.colors.all.length}\n`;
+    formatted += `- **Font Families:** ${detailedTokens.typography.fontFamilies.length}\n`;
+    formatted += `- **Font Sizes:** ${detailedTokens.typography.fontSizes.length}\n`;
+    formatted += `- **Box Shadows:** ${detailedTokens.visualEffects.boxShadows.length}\n`;
+    formatted += `- **Border Radius Values:** ${detailedTokens.visualEffects.borderRadius.length}\n\n`;
+
+    formatted += `### Next Steps\n\n`;
+    formatted += `1. **Apply to Brand Guidelines:** Use \`update_brand_guidelines\` with the suggested values above\n`;
+    formatted += `2. **Save Detailed Data:** Use \`update_knowledge_base_file\` to save the detailed CSS analysis (detailedTokensJSON) for future reference\n`;
+
+    return formatted;
+  }
+
+  /**
+   * Create a new knowledge base (task) with initial content
+   * Used by create_knowledge_base tool
+   */
+  public async createKnowledgeBase(
+    name: string,
+    content: string,
+    knowledgeBaseType: 'public' | 'private',
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[createKnowledgeBase] name=${name}, type=${knowledgeBaseType}, userId=${userId}`);
+
+      // 1. Input validation
+      if (!name || name.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Knowledge base name cannot be empty',
+          error: 'Invalid input: empty name'
+        };
+      }
+
+      if (!content || content.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Content cannot be empty',
+          error: 'Invalid input: empty content'
+        };
+      }
+
+      const MAX_KB_SIZE = 10 * 1024 * 1024; // 10MB
+      const contentSize = Buffer.byteLength(content, 'utf8');
+      if (contentSize > MAX_KB_SIZE) {
+        return {
+          success: false,
+          message: `Content too large (${Math.round(contentSize / 1024 / 1024)}MB). Maximum size is 10MB.`,
+          error: 'Content exceeds size limit'
+        };
+      }
+
+      // 2. Create the task
+      const taskId = uuidv4();
+      const now = new Date().toISOString();
+      await taskDb.createTask({
+        taskId,
+        userId,
+        name: name.trim(),
+        prompt: '',
+        status: 'active',
+        createdAt: now,
+        useKnowledgeBase: true,
+        updateKnowledgeBase: true,
+        knowledgeBaseType,
+      });
+
+      // 3. Initialize GCS and upload content
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+      const filePath = `tasks/${taskId}/knowledge-base.txt`;
+      const file = bucket.file(filePath);
+
+      await file.save(content, {
+        contentType: 'text/plain',
+        metadata: {
+          taskId,
+          userId,
+          sessionId,
+          updatedAt: now
+        }
+      });
+
+      // 4. Get signed URL
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500'
+      });
+
+      // 5. Update task with KB metadata
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseSize: contentSize,
+        knowledgeBase: url,
+        knowledgeBaseUpdatedAt: now
+      });
+
+      return {
+        success: true,
+        taskId,
+        name: name.trim(),
+        message: `Knowledge base "${name.trim()}" created successfully`
+      };
+
+    } catch (error) {
+      console.error('[createKnowledgeBase] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to create knowledge base',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Update a specific file in a task's knowledge base
+   * Used by update_knowledge_base_file tool
+   */
+  public async updateKnowledgeBaseFile(
+    taskId: string,
+    fileName: string,
+    content: string,
+    mode: 'replace' | 'append',
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[updateKnowledgeBaseFile] taskId=${taskId}, fileName=${fileName}, mode=${mode}, userId=${userId}`);
+
+      // 1. Input validation
+      if (!content || content.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Content cannot be empty',
+          error: 'Invalid input: empty content'
+        };
+      }
+
+      const MAX_KB_SIZE = 10 * 1024 * 1024; // 10MB
+      const contentSize = Buffer.byteLength(content, 'utf8');
+      if (contentSize > MAX_KB_SIZE) {
+        return {
+          success: false,
+          message: `Content too large (${Math.round(contentSize / 1024 / 1024)}MB). Maximum size is 10MB.`,
+          error: 'Content exceeds size limit'
+        };
+      }
+
+      if (!taskId || taskId.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Task ID is required',
+          error: 'Invalid input: missing taskId'
+        };
+      }
+
+      if (!fileName || fileName.trim().length === 0) {
+        return {
+          success: false,
+          message: 'File name is required',
+          error: 'Invalid input: missing fileName'
+        };
+      }
+
+      // 2. Get task and check authorization
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return {
+          success: false,
+          message: 'Task not found',
+          error: 'Task not found'
+        };
+      }
+
+      if (task.userId !== userId) {
+        return {
+          success: false,
+          message: 'Not authorized to modify this task',
+          error: 'Unauthorized'
+        };
+      }
+
+      // 3. Initialize GCS
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      // 4. Determine bucket based on knowledgeBaseType
+      const knowledgeBaseType = task.knowledgeBaseType || 'private';
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+
+      // 5. Determine file path based on fileName
+      let filePath: string;
+      let isMainKB = false;
+
+      if (fileName === 'knowledge-base.txt') {
+        // Main knowledge base file
+        filePath = `tasks/${taskId}/knowledge-base.txt`;
+        isMainKB = true;
+      } else {
+        // Look up in knowledgeBaseFiles array
+        const kbFiles = task.knowledgeBaseFiles || [];
+        const existingFile = kbFiles.find((f: any) => f.filename === fileName);
+        if (existingFile) {
+          filePath = existingFile.key;
+        } else {
+          // Create new file under knowledge-base-files/
+          const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+          filePath = `tasks/${taskId}/knowledge-base-files/${Date.now()}_${sanitizedName}`;
+        }
+      }
+
+      const file = bucket.file(filePath);
+
+      // 6. Handle append mode - read existing content
+      let finalContent = content;
+      if (mode === 'append') {
+        try {
+          const [existingContent] = await file.download();
+          finalContent = existingContent.toString() + '\n\n' + content;
+        } catch (error: any) {
+          const errorMessage = error.message?.toLowerCase() || '';
+          const isNotFound = error.code === 404 ||
+                            errorMessage.includes('no such object') ||
+                            errorMessage.includes('not found') ||
+                            errorMessage.includes('does not exist');
+
+          if (isNotFound) {
+            console.log(`[updateKnowledgeBaseFile] No existing file ${fileName} for task ${taskId}, creating new`);
+          } else {
+            console.error(`[updateKnowledgeBaseFile] Error downloading existing file:`, error);
+            throw error;
+          }
+        }
+      }
+
+      // 7. Save content to GCS
+      await file.save(finalContent, {
+        contentType: 'text/plain',
+        metadata: {
+          taskId,
+          userId,
+          sessionId,
+          fileName,
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      // 8. Get signed URL
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '03-01-2500'
+      });
+
+      // 9. Update DynamoDB
+      const finalSize = Buffer.byteLength(finalContent, 'utf8');
+      const now = new Date().toISOString();
+
+      if (isMainKB) {
+        await taskDb.updateTask(taskId, {
+          knowledgeBaseSize: finalSize,
+          knowledgeBase: url,
+          knowledgeBaseUpdatedAt: now
+        });
+      } else {
+        // Update or add entry in knowledgeBaseFiles array
+        const kbFiles = task.knowledgeBaseFiles || [];
+        const existingIdx = kbFiles.findIndex((f: any) => f.filename === fileName);
+        const fileEntry = {
+          filename: fileName,
+          size: finalSize,
+          url,
+          key: filePath,
+          uploadedAt: now,
+        };
+        if (existingIdx >= 0) {
+          kbFiles[existingIdx] = fileEntry;
+        } else {
+          kbFiles.push(fileEntry);
+        }
+        await taskDb.updateTask(taskId, {
+          knowledgeBaseFiles: kbFiles,
+          knowledgeBaseUpdatedAt: now
+        });
+      }
+
+      return {
+        success: true,
+        message: `File "${fileName}" ${mode === 'append' ? 'updated' : 'replaced'} successfully`,
+        fileName,
+        updatedSize: finalSize,
+        updatedAt: now
+      };
+
+    } catch (error) {
+      console.error('[updateKnowledgeBaseFile] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to update knowledge base file',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Attach multiple files to a task's knowledge base
+   * Used by attach_knowledge_base_files tool
+   */
+  public async attachKnowledgeBaseFiles(
+    taskId: string,
+    files: Array<{ name: string; content: string }>,
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      console.log(`[attachKnowledgeBaseFiles] taskId=${taskId}, filesCount=${files?.length}, userId=${userId}`);
+
+      // 1. Input validation
+      if (!taskId || taskId.trim().length === 0) {
+        return {
+          success: false,
+          message: 'Task ID is required',
+          error: 'Invalid input: missing taskId'
+        };
+      }
+
+      if (!files || files.length === 0) {
+        return {
+          success: false,
+          message: 'At least one file is required',
+          error: 'Invalid input: empty files array'
+        };
+      }
+
+      // Validate each file has content
+      for (const f of files) {
+        if (!f.content || f.content.trim().length === 0) {
+          return {
+            success: false,
+            message: `File "${f.name}" has empty content`,
+            error: 'Invalid input: empty file content'
+          };
+        }
+      }
+
+      // 2. Get task and check authorization
+      const task = await taskDb.getTaskById(taskId);
+      if (!task) {
+        return {
+          success: false,
+          message: 'Task not found',
+          error: 'Task not found'
+        };
+      }
+
+      if (task.userId !== userId) {
+        return {
+          success: false,
+          message: 'Not authorized to modify this task',
+          error: 'Unauthorized'
+        };
+      }
+
+      // 3. Initialize GCS
+      const privateKey = await getGCSPPrivateKey();
+      const storage = new Storage({
+        projectId: process.env.GCS_PROJECT_ID,
+        credentials: {
+          client_email: process.env.GCS_CLIENT_EMAIL,
+          private_key: privateKey
+        }
+      });
+
+      const knowledgeBaseType = task.knowledgeBaseType || 'private';
+      const bucketName = knowledgeBaseType === 'public'
+        ? (process.env.KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-dev')
+        : (process.env.PRIVATE_KNOWLEDGE_BASE_BUCKET || 'agentweb-knowledge-base-private-dev');
+
+      const bucket = storage.bucket(bucketName);
+      const kbFiles = task.knowledgeBaseFiles || [];
+      const uploadedFiles: Array<{ name: string; size: number; url: string }> = [];
+
+      // 4. Upload each file
+      for (const f of files) {
+        const sanitizedName = f.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filePath = `tasks/${taskId}/knowledge-base-files/${Date.now()}_${sanitizedName}`;
+        const file = bucket.file(filePath);
+        const now = new Date().toISOString();
+        const size = Buffer.byteLength(f.content, 'utf8');
+
+        await file.save(f.content, {
+          contentType: 'text/plain',
+          metadata: {
+            taskId,
+            userId,
+            sessionId,
+            fileName: f.name,
+            updatedAt: now
+          }
+        });
+
+        const [url] = await file.getSignedUrl({
+          action: 'read',
+          expires: '03-01-2500'
+        });
+
+        kbFiles.push({
+          filename: f.name,
+          size,
+          url,
+          key: filePath,
+          uploadedAt: now,
+        });
+
+        uploadedFiles.push({ name: f.name, size, url });
+      }
+
+      // 5. Update DynamoDB
+      await taskDb.updateTask(taskId, {
+        knowledgeBaseFiles: kbFiles,
+        knowledgeBaseUpdatedAt: new Date().toISOString()
+      });
+
+      return {
+        success: true,
+        message: `${uploadedFiles.length} file(s) attached successfully`,
+        files: uploadedFiles
+      };
+
+    } catch (error) {
+      console.error('[attachKnowledgeBaseFiles] Error:', error);
+      return {
+        success: false,
+        message: 'Failed to attach knowledge base files',
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
   private getCurrentTaskStatusesInSession(sessionHistory: ChatMessage[]): any[] {
     try {
       const taskStatuses: any[] = [];

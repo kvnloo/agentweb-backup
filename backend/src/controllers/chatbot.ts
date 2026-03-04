@@ -135,21 +135,27 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
       
-      // Return both the response and updated session
-      res.status(200).json({ 
-        response,
-        session: updatedSession 
+      // Return response in Agent Mode format (content + toolCalls)
+      // Maintain backward compatibility: if response is string, wrap it
+      const formattedResponse = typeof response === 'string'
+        ? { content: response }
+        : response; // Already { content, toolCalls }
+
+      res.status(200).json({
+        ...formattedResponse,  // content, toolCalls (if present)
+        session: updatedSession
       });
     } catch (error) {
       console.error('Error in chatbot service:', error);
-      
+
       // Get the session again to return it even if response generation failed
       const currentSession = await chatbotDb.getChatSession(sessionId);
-      
+
       // Return an error message but also return the current session state
       // so the frontend can maintain continuity
+      // Use 'content' key to match the normal response format
       res.status(200).json({
-        response: "I'm sorry, I encountered an error processing your request. Please try again.",
+        content: "I'm sorry, I encountered an error processing your request. Please try again.",
         session: currentSession,
         error: true
       });

@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-04',
     changes: [
+      'Emma: Expanded Knowledge Base Tools',
+      '- Emma can now create new knowledge bases from scratch using the create_knowledge_base tool',
+      '- The update_knowledge_base_file tool lets Emma update or append to specific files by name (main KB file or attached files)',
+      '- The attach_knowledge_base_files tool lets Emma save multiple pieces of content as separate named files in a KB',
+      '- Ask Emma to "create a new KB called Research Notes" or "attach these summaries to my KB"',
       'Admin: LLM Model Column in Chat History',
       '- The Chat History table now shows which LLM model each session used, displayed between Session Type and Created At',
       'Fix: Slack Revision Not Sent Back for Review',
@@ -44,6 +49,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Reply to continue the conversation in the same session, or click "Continue in Browser" to switch to the web UI',
       '- Email attachments (images, PDFs, etc.) are supported and passed to Agent Mode for analysis',
       '- Unregistered senders receive a free trial invite',
+      'Emma: Brand Identity & CSS Extraction',
+      '- read_page_source now supports an extractDesignTokens flag that extracts CSS design tokens, brand identity, and suggested brand tokens from any website',
+      '- Detects brand name, logo, and tagline from website pages (og:site_name, apple-touch-icon, og:image, meta description, etc.)',
+      '- Logos are downloaded and uploaded to S3 for use in brand guidelines (SVGs are skipped)',
+      '- Use update_brand_guidelines to apply the suggested brand tokens and identity',
       'Fix: Image Analysis on Bedrock Models',
       '- Fixed image analysis (describe_image) failing on Bedrock Claude models by converting image URLs to base64 data URIs',
       'Research Reports: Publish Blog Post',
