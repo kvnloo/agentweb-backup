@@ -16,11 +16,15 @@ const mockGetAccessToken = jest.fn();
 const mockGetWorkspaces = jest.fn();
 const mockListDocs = jest.fn();
 const mockReadDocContent = jest.fn();
+const mockListTasks = jest.fn();
+const mockReadTaskContent = jest.fn();
 jest.mock('../services/clickupService', () => ({
   getAccessToken: (...args: any[]) => mockGetAccessToken(...args),
   getWorkspaces: (...args: any[]) => mockGetWorkspaces(...args),
   listDocs: (...args: any[]) => mockListDocs(...args),
   readDocContent: (...args: any[]) => mockReadDocContent(...args),
+  listTasks: (...args: any[]) => mockListTasks(...args),
+  readTaskContent: (...args: any[]) => mockReadTaskContent(...args),
 }));
 
 // Mock userDb (needed by getUserGoogleDriveFolders in listKnowledgeBaseFiles)
@@ -269,6 +273,185 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       expect(clickUpResult).toBeDefined();
       expect(clickUpResult.content).toContain('[Content truncated]');
       expect(clickUpResult.content.length).toBeLessThan(10000);
+    });
+  });
+
+  // ============================================
+  // ClickUp Tasks integration tests
+  // ============================================
+
+  describe('readClickUpTask', () => {
+    it('should return error when ClickUp is not connected', async () => {
+      mockGetAccessToken.mockResolvedValue(null);
+
+      const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'My Task', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('ClickUp not connected');
+    });
+
+    it('should return error when workspace is not accessible', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-other', name: 'Other' }]);
+
+      const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'My Task', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Not authorized to access this ClickUp workspace');
+    });
+
+    it('should return error when task not found in workspace', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockListTasks.mockResolvedValue([
+        { id: 'task-1', name: 'Other Task', description: '', status: 'open', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '1000', dateUpdated: '2000' },
+      ]);
+
+      const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'Missing Task', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not found in ClickUp workspace');
+    });
+
+    it('should successfully read a ClickUp task', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockListTasks.mockResolvedValue([
+        { id: 'task-1', name: 'Build Feature', description: 'Build it', status: 'in progress', assignees: ['alice'], dueDate: '1700000000000', tags: ['frontend'], priority: 'high', attachments: [{ id: 'att-1', title: 'spec.pdf', url: 'https://att.url/spec.pdf', size: 1234 }], dateCreated: '1000', dateUpdated: '2000' },
+      ]);
+      mockReadTaskContent.mockResolvedValue('# Build Feature\n\n**Status:** in progress\n\n## Description\n\nBuild it');
+
+      const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'Build Feature', 'user-123');
+      expect(result.success).toBe(true);
+      expect(result.kb_identifier).toBe('clickup-tasks:ws-1');
+      expect(result.file_name).toBe('Build Feature');
+      expect(result.name).toBe('Test Workspace');
+      expect(result.content).toContain('Build Feature');
+      expect(result.type).toBe('clickup-tasks');
+    });
+
+    it('should truncate content exceeding 50000 characters', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'WS' }]);
+      mockListTasks.mockResolvedValue([
+        { id: 'task-1', name: 'Large Task', description: '', status: 'open', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '1000', dateUpdated: '2000' },
+      ]);
+      mockReadTaskContent.mockResolvedValue('x'.repeat(60000));
+
+      const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'Large Task', 'user-123');
+      expect(result.success).toBe(true);
+      expect(result.content).toContain('[Content truncated due to size limit]');
+      expect(result.content.length).toBeLessThan(60000);
+    });
+
+    it('should handle API errors gracefully', async () => {
+      mockGetAccessToken.mockRejectedValue(new Error('API Error'));
+
+      const result = await (agentModeService as any).readClickUpTask('clickup-tasks:ws-1', 'My Task', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to read ClickUp task');
+    });
+  });
+
+  describe('readSingleKnowledgeBaseFile - ClickUp tasks routing', () => {
+    it('should route clickup-tasks: identifiers to readClickUpTask', async () => {
+      mockGetAccessToken.mockResolvedValue(null);
+
+      const result = await (agentModeService as any).readSingleKnowledgeBaseFile('clickup-tasks:ws-1', 'My Task', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('ClickUp not connected');
+    });
+  });
+
+  describe('listKnowledgeBaseFiles - ClickUp tasks integration', () => {
+    it('should include ClickUp tasks in knowledge base listing', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'My Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockResolvedValue([
+        { id: 'task-1', name: 'Build Feature', description: 'Build it', status: 'in progress', assignees: ['alice'], dueDate: '1700000000000', tags: ['frontend'], priority: 'high', attachments: [], dateCreated: '1000', dateUpdated: '2000' },
+        { id: 'task-2', name: 'Fix Bug', description: '', status: 'open', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '3000', dateUpdated: '4000' },
+      ]);
+
+      const { taskDb } = require('../services/db');
+      taskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+      taskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+      const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+      expect(result.success).toBe(true);
+
+      const tasksKb = result.knowledge_bases.find((kb: any) => kb.type === 'clickup-tasks');
+      expect(tasksKb).toBeDefined();
+      expect(tasksKb.identifier).toBe('clickup-tasks:ws-1');
+      expect(tasksKb.name).toBe('ClickUp Tasks - My Workspace');
+      expect(tasksKb.files).toHaveLength(2);
+      expect(tasksKb.files[0].fileName).toBe('Build Feature');
+      expect(tasksKb.files[0].taskId).toBe('task-1');
+      expect(tasksKb.files[0].status).toBe('in progress');
+      expect(tasksKb.files[0].priority).toBe('high');
+      expect(tasksKb.files[1].fileName).toBe('Fix Bug');
+    });
+
+    it('should not include ClickUp tasks when user has no token', async () => {
+      mockGetAccessToken.mockResolvedValue(null);
+
+      const { taskDb } = require('../services/db');
+      taskDb.getTasksWithKnowledgeBase.mockResolvedValue([]);
+      taskDb.getAllPublicKnowledgeBaseTasks.mockResolvedValue([]);
+
+      const result = await (agentModeService as any).listKnowledgeBaseFiles('user-123');
+      expect(result.success).toBe(true);
+
+      const tasksKb = result.knowledge_bases?.find((kb: any) => kb.type === 'clickup-tasks');
+      expect(tasksKb).toBeUndefined();
+    });
+  });
+
+  describe('searchKnowledgeBase - ClickUp tasks integration', () => {
+    it('should include ClickUp tasks matching by name', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'My Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockResolvedValue([
+        { id: 'task-1', name: 'Fix Login Bug', description: 'Users cannot log in with SSO', status: 'open', assignees: [], dueDate: null, tags: [], priority: 'urgent', attachments: [], dateCreated: '1000', dateUpdated: '2000' },
+        { id: 'task-2', name: 'Add Feature', description: 'New dashboard feature', status: 'done', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '3000', dateUpdated: '4000' },
+      ]);
+      // No docs to read
+      mockReadDocContent.mockResolvedValue('');
+
+      const result = await (agentModeService as any).searchKnowledgeBase('login', 5, 'user-123');
+      expect(result.success).toBe(true);
+
+      const taskResults = result.results.filter((r: any) => r.source.startsWith('clickup-tasks/'));
+      expect(taskResults).toHaveLength(1);
+      expect(taskResults[0].source).toBe('clickup-tasks/My Workspace/Fix Login Bug');
+      expect(taskResults[0].content).toContain('Fix Login Bug');
+    });
+
+    it('should include ClickUp tasks matching by description', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'My Workspace' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockResolvedValue([
+        { id: 'task-1', name: 'Improve UX', description: 'Enhance the customer onboarding flow', status: 'open', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '1000', dateUpdated: '2000' },
+        { id: 'task-2', name: 'Other Task', description: 'Something else', status: 'done', assignees: [], dueDate: null, tags: [], priority: null, attachments: [], dateCreated: '3000', dateUpdated: '4000' },
+      ]);
+      mockReadDocContent.mockResolvedValue('');
+
+      const result = await (agentModeService as any).searchKnowledgeBase('onboarding', 5, 'user-123');
+      expect(result.success).toBe(true);
+
+      const taskResults = result.results.filter((r: any) => r.source.startsWith('clickup-tasks/'));
+      expect(taskResults).toHaveLength(1);
+      expect(taskResults[0].source).toBe('clickup-tasks/My Workspace/Improve UX');
+    });
+
+    it('should handle ClickUp tasks search errors without failing the whole search', async () => {
+      // First call for docs succeeds, tasks will use same token
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'WS' }]);
+      mockListDocs.mockResolvedValue([]);
+      mockListTasks.mockRejectedValue(new Error('Tasks API error'));
+
+      const result = await (agentModeService as any).searchKnowledgeBase('test', 5, 'user-123');
+      expect(result.success).toBe(true);
     });
   });
 });
