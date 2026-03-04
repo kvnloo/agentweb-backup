@@ -38,6 +38,7 @@ import connectedAccountsRoutes from "./routes/connectedAccounts";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
+import agentApiRoutes from "./routes/agentApi";
 import landingPagesRoutes from "./routes/landingPages";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import { authenticateToken } from "./middleware/auth";
@@ -47,6 +48,7 @@ const { version } = require('../package.json');
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
+import { setupMcpOAuth } from "./mcp/oauth/oauthRoutes";
 import {
   viewExternalFile,
   getFileContent,
@@ -55,8 +57,11 @@ import {
 
 const app = express();
 
-// Initialize MCP Server routes BEFORE glocal body parsers
+// Initialize MCP Server routes BEFORE global body parsers
 setupMcpServer(app);
+
+// Initialize MCP OAuth 2.1 routes (well-known, register, authorize, token)
+setupMcpOAuth(app);
 
 // CORS configuration
 const corsOptions = {
@@ -186,10 +191,37 @@ app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/api/v1/agent", agentApiRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.use("/review", reviewRouter);
 
 
+
+// Agent API documentation (public, no auth)
+app.get("/docs/agent-api", (req, res) => {
+  const path = require("path");
+  const fs = require("fs");
+  const docPath = path.join(__dirname, "../docs/AGENT_API.md");
+  try {
+    const content = fs.readFileSync(docPath, "utf-8");
+    res.type("text/markdown").send(content);
+  } catch {
+    res.status(404).json({ error: "Documentation not found" });
+  }
+});
+
+// Serve skill.md — agent-readable guide for external MCP clients (public, no auth)
+app.get("/skill.md", (req, res) => {
+  const path = require("path");
+  const fs = require("fs");
+  const docPath = path.join(__dirname, "../docs/skill.md");
+  try {
+    const content = fs.readFileSync(docPath, "utf-8");
+    res.type("text/markdown").send(content);
+  } catch {
+    res.status(404).json({ error: "Documentation not found" });
+  }
+});
 
 // Health check endpoint
 app.get("/", (req, res) => {

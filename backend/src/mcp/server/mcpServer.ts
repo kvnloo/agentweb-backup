@@ -3,6 +3,12 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express, { Request, Response, NextFunction } from "express";
 import { randomUUID } from "node:crypto";
 import { createMcpServer } from './mcpServerCore';
+import { agentApiKeyService } from '../../services/agentApiKeyService';
+import { mcpOAuthService } from '../oauth/oauthService';
+import { RateLimiter } from '../../middleware/rateLimiter';
+
+// Rate limiter for MCP requests authenticated via aw_* API keys
+const mcpRateLimiter = new RateLimiter();
 
 // Session timeout in milliseconds (default: 1 hour)
 const SESSION_TIMEOUT_MS = parseInt(process.env.MCP_SESSION_TIMEOUT_MS || '3600000', 10);
@@ -16,35 +22,100 @@ interface SessionEntry {
 
 /**
  * Middleware to validate MCP access token.
- * If MCP_ACCESS_TOKEN is set in environment, requests must include
- * Authorization: Bearer <token> header with matching token.
- * If MCP_ACCESS_TOKEN is not set, all requests are allowed (backward compatible).
+ * Authentication is REQUIRED. Accepts:
+ * 1. Agent API keys (aw_ prefix) — per-user keys for external agents
+ * 2. MCP_ACCESS_TOKEN (static env token) — for internal backend-to-backend clients
+ * 3. OAuth 2.1 access tokens — for OAuth-authenticated clients
  */
-function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
-  const expectedToken = process.env.MCP_ACCESS_TOKEN;
-  
-  // If no token is configured, skip validation
-  if (!expectedToken) {
-    return next();
-  }
-  
+async function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
   const authHeader = req.headers.authorization;
-  
+
+  // No token provided at all
   if (!authHeader) {
     console.error("[MCP] Access denied: Missing Authorization header");
-    return res.status(401).json({ error: "Unauthorized: Missing access token" });
+    return res.status(401).json({
+      error: "Unauthorized: Missing access token",
+      hint: `Authentication is required. Pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
+      setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
+    });
   }
-  
-  // Support "Bearer <token>" format
+
+  // Extract token from Bearer header
   const tokenMatch = authHeader.match(/^Bearer\s+(.+)$/i);
   const providedToken = tokenMatch ? tokenMatch[1] : authHeader;
-  
-  if (providedToken !== expectedToken) {
-    console.error("[MCP] Access denied: Invalid access token");
-    return res.status(403).json({ error: "Forbidden: Invalid access token" });
+
+  if (!providedToken) {
+    return res.status(401).json({
+      error: "Unauthorized: Empty access token",
+      hint: `Pass your API key as: Authorization: Bearer aw_YOUR_KEY`,
+      setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
+    });
   }
-  
-  next();
+
+  // 1. Check if this is an Agent API key (aw_ prefix)
+  if (providedToken.startsWith("aw_")) {
+    try {
+      const keyRecord = await agentApiKeyService.validateKey(providedToken);
+      if (!keyRecord) {
+        console.error("[MCP] Access denied: Invalid agent API key");
+        return res.status(401).json({
+          error: "Unauthorized: Invalid API key",
+          hint: "This API key is not recognized. It may have been revoked or is incorrect.",
+          setup: `Generate a new key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
+        });
+      }
+      // Enforce per-key rate limit
+      const rateLimitResult = mcpRateLimiter.check(keyRecord.keyId, keyRecord.rateLimitPerMin);
+      if (!rateLimitResult.allowed) {
+        return res.status(429).json({
+          error: "Rate limit exceeded",
+          retryAfterMs: rateLimitResult.resetInMs,
+        });
+      }
+
+      // Store the userId from the API key on the request for downstream use
+      (req as any)._agentApiUserId = keyRecord.userId;
+      return next();
+    } catch (error) {
+      console.error("[MCP] Error validating agent API key:", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  }
+
+  // 2. Check static MCP_ACCESS_TOKEN (internal backend-to-backend)
+  const expectedToken = process.env.MCP_ACCESS_TOKEN;
+  if (expectedToken && providedToken === expectedToken) {
+    return next();
+  }
+
+  // 3. Try OAuth 2.1 access token validation
+  try {
+    const tokenRecord = await mcpOAuthService.validateAccessToken(providedToken);
+    if (tokenRecord) {
+      // Rate limit OAuth tokens by userId
+      const rateLimitResult = mcpRateLimiter.check(`oauth:${tokenRecord.userId}`, 60);
+      if (!rateLimitResult.allowed) {
+        return res.status(429).json({
+          error: "Rate limit exceeded",
+          retryAfterMs: rateLimitResult.resetInMs,
+        });
+      }
+      (req as any)._agentApiUserId = tokenRecord.userId;
+      return next();
+    }
+  } catch (error) {
+    console.error("[MCP] Error validating OAuth token:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+
+  // All auth methods failed
+  console.error("[MCP] Access denied: No valid credentials");
+  return res.status(401).json({
+    error: "Unauthorized: Invalid access token",
+    hint: `The provided token is not a valid API key, MCP token, or OAuth token.`,
+    setup: `Get an API key at https://agentweb.pro (Settings > API Keys). Full guide: ${baseUrl}/skill.md`,
+  });
 }
 
 export function setupMcpServer(app: express.Express) {
@@ -121,8 +192,11 @@ export function setupMcpServer(app: express.Express) {
   process.on('SIGTERM', () => handleShutdown('SIGTERM'));
   process.on('SIGINT', () => handleShutdown('SIGINT'));
 
-  // Use shared server factory from core module
-  const createServer = () => createMcpServer("agentweb-http-server");
+  // Use shared server factory from core module, passing API key userId if present
+  const createServer = (req?: Request) =>
+    createMcpServer("agentweb-http-server", {
+      agentUserId: (req as any)?._agentApiUserId,
+    });
 
   // POST handler - handles all JSON-RPC messages including initialization
   // Note: express.json() is added here because MCP routes are mounted before global body parser
@@ -164,7 +238,7 @@ export function setupMcpServer(app: express.Express) {
         };
 
         // Connect server to transport BEFORE handling request
-        const server = createServer();
+        const server = createServer(req);
         await server.connect(transport);
         
         // Handle the initialization request

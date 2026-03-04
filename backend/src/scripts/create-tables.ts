@@ -1295,6 +1295,150 @@ const createSkillsTable = async () => {
   }
 };
 
+// Create Agent API Keys table
+const createAgentApiKeysTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AgentApiKeys`,
+    AttributeDefinitions: [
+      { AttributeName: 'keyId', AttributeType: 'S' },
+      { AttributeName: 'keyHash', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'keyId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'KeyHashIndex',
+        KeySchema: [
+          { AttributeName: 'keyHash', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create MCP OAuth Clients table (dynamic client registration)
+const createMcpOAuthClientsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-MCPOAuthClients`,
+    AttributeDefinitions: [
+      { AttributeName: 'clientId', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'clientId', KeyType: 'HASH' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create MCP OAuth Authorization Codes table (10-min TTL via DynamoDB TTL on expiresAt)
+const createMcpOAuthCodesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-MCPOAuthCodes`,
+    AttributeDefinitions: [
+      { AttributeName: 'code', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'code', KeyType: 'HASH' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
+// Create MCP OAuth Tokens table (access + refresh tokens, TTL on expiresAt)
+const createMcpOAuthTokensTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-MCPOAuthTokens`,
+    AttributeDefinitions: [
+      { AttributeName: 'tokenHash', AttributeType: 'S' },
+      { AttributeName: 'refreshTokenHash', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'tokenHash', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'RefreshTokenHashIndex',
+        KeySchema: [
+          { AttributeName: 'refreshTokenHash', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'UserIdIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1322,6 +1466,10 @@ const main = async () => {
     await createBookContentsTable();
     await createConnectedAccountPostsTable();
     await createSkillsTable();
+    await createAgentApiKeysTable();
+    await createMcpOAuthClientsTable();
+    await createMcpOAuthCodesTable();
+    await createMcpOAuthTokensTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

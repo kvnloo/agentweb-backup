@@ -114,6 +114,7 @@ OAI_CONFIG_LIST
 
 # Separate repositories (now independent)
 growth-chat/
+customer-portal
 customer-portal/
 
 # Test environment local state
@@ -124,4 +125,7 @@ customer-portal/
 
 # Force include Claude Code settings for team
 !.claude/
-!.claude/settings.local.json 
+!.claude/settings.local.json
+
+# Ignore Claude Code worktrees (agent-specific, never committed)
+.claude/worktrees/

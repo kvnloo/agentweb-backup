@@ -106,20 +106,18 @@ describe('MCP Server', () => {
       setupMcpServer(app);
     });
 
-    it('should allow request when no MCP_ACCESS_TOKEN is set', async () => {
-      // Mock initialization request
-      (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(true);
-
+    it('should reject request when no auth token is provided', async () => {
       const response = await request(app)
         .post('/mcp/server')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
-      expect(response.status).not.toBe(401);
-      expect(response.status).not.toBe(403);
+      expect(response.status).toBe(401);
+      expect(response.body.error).toContain('Missing access token');
+      expect(response.body.hint).toBeDefined();
+      expect(response.body.setup).toContain('skill.md');
     });
 
-    it('should reject request without Authorization header when token is configured', async () => {
-      // Create new app with token configured
+    it('should reject request without Authorization header even with MCP_ACCESS_TOKEN set', async () => {
       process.env.MCP_ACCESS_TOKEN = 'secret-token';
       const securedApp = express();
       securedApp.use(express.json());
@@ -131,6 +129,7 @@ describe('MCP Server', () => {
 
       expect(response.status).toBe(401);
       expect(response.body.error).toContain('Missing access token');
+      expect(response.body.setup).toContain('agentweb.pro');
     });
 
     it('should reject request with invalid token', async () => {
@@ -144,8 +143,9 @@ describe('MCP Server', () => {
         .set('Authorization', 'Bearer wrong-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
-      expect(response.status).toBe(403);
+      expect(response.status).toBe(401);
       expect(response.body.error).toContain('Invalid access token');
+      expect(response.body.setup).toContain('skill.md');
     });
 
     it('should accept request with valid Bearer token', async () => {
@@ -184,7 +184,10 @@ describe('MCP Server', () => {
   });
 
   describe('POST /mcp/server endpoint', () => {
+    const TEST_TOKEN = 'test-mcp-token';
+
     beforeEach(() => {
+      process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
       setupMcpServer(app);
     });
 
@@ -193,11 +196,12 @@ describe('MCP Server', () => {
 
       const response = await request(app)
         .post('/mcp/server')
-        .send({ 
-          jsonrpc: '2.0', 
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
+        .send({
+          jsonrpc: '2.0',
           method: 'initialize',
           params: { capabilities: {} },
-          id: 1 
+          id: 1
         });
 
       // Transport's handleRequest is called
@@ -209,6 +213,7 @@ describe('MCP Server', () => {
 
       const response = await request(app)
         .post('/mcp/server')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
 
       expect(response.status).toBe(400);
@@ -220,6 +225,7 @@ describe('MCP Server', () => {
 
       const response = await request(app)
         .post('/mcp/server')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'nonexistent-session')
         .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
 
@@ -228,13 +234,17 @@ describe('MCP Server', () => {
   });
 
   describe('GET /mcp/server endpoint (SSE)', () => {
+    const TEST_TOKEN = 'test-mcp-token';
+
     beforeEach(() => {
+      process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
       setupMcpServer(app);
     });
 
     it('should return 400 for missing session ID', async () => {
       const response = await request(app)
-        .get('/mcp/server');
+        .get('/mcp/server')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`);
 
       expect(response.status).toBe(400);
       expect(response.text).toContain('Invalid or missing session ID');
@@ -243,6 +253,7 @@ describe('MCP Server', () => {
     it('should return 400 for invalid session ID', async () => {
       const response = await request(app)
         .get('/mcp/server')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'invalid-session');
 
       expect(response.status).toBe(400);
@@ -250,13 +261,17 @@ describe('MCP Server', () => {
   });
 
   describe('DELETE /mcp/server endpoint', () => {
+    const TEST_TOKEN = 'test-mcp-token';
+
     beforeEach(() => {
+      process.env.MCP_ACCESS_TOKEN = TEST_TOKEN;
       setupMcpServer(app);
     });
 
     it('should return 400 for invalid session ID', async () => {
       const response = await request(app)
         .delete('/mcp/server')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'invalid-session');
 
       expect(response.status).toBe(400);
@@ -265,7 +280,8 @@ describe('MCP Server', () => {
 
     it('should return 400 for missing session ID', async () => {
       const response = await request(app)
-        .delete('/mcp/server');
+        .delete('/mcp/server')
+        .set('Authorization', `Bearer ${TEST_TOKEN}`);
 
       expect(response.status).toBe(400);
     });
@@ -276,26 +292,27 @@ describe('MCP Server', () => {
 
     beforeEach(() => {
       jest.clearAllMocks();
-      process.env.MCP_HTTP_ENABLED = 'true'; // Enable HTTP server for tests
+      process.env.MCP_HTTP_ENABLED = 'true';
+      process.env.MCP_ACCESS_TOKEN = 'session-test-token';
     });
 
     it('should create new session on initialization', async () => {
       jest.resetModules();
-      
-      // Re-require modules to ensure clean state
+
       const express = require('express');
       const { setupMcpServer: setup } = require('../mcp/server/mcpServer');
       const { isInitializeRequest: isInit } = require('@modelcontextprotocol/sdk/types.js');
       const { StreamableHTTPServerTransport: Transport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-      
+
       testApp = express();
       testApp.use(express.json());
-      
+
       (isInit as jest.Mock).mockReturnValue(true);
       setup(testApp);
 
       await request(testApp)
         .post('/mcp/server')
+        .set('Authorization', 'Bearer session-test-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
       expect(Transport).toHaveBeenCalledWith(
@@ -391,13 +408,14 @@ describe('Environment configuration', () => {
     consoleSpy.mockRestore();
   });
 
-  it('should log unsecured status when MCP_ACCESS_TOKEN not set', () => {
+  it('should log when MCP_ACCESS_TOKEN not set (auth still required via API keys)', () => {
     const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
-    
+
     delete process.env.MCP_ACCESS_TOKEN;
     const app = express();
     setupMcpServer(app);
 
+    // Auth is always required, but the log reflects whether a static token is configured
     expect(consoleSpy).toHaveBeenCalledWith(
       expect.stringContaining('secured: false')
     );
