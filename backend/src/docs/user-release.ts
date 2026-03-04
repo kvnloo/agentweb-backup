@@ -17,6 +17,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed review page showing "Content is still being generated" when the agent used save_file instead of create_html_file',
       '- The contentUrl stored in session metadata is now used as a fallback asset when message scanning finds no assets',
       '- The "View Report" link for leads now points directly to the generated HTML file instead of an internal review page',
+      'Knowledge Base: ClickUp Tasks & Attachments',
+      '- AI agents can now access ClickUp tasks (with attachments) from the Knowledge Base',
+      '- Tasks appear alongside docs in each ClickUp workspace, showing name, status, priority, and due date',
+      '- Attachments on each task are displayed as clickable links in the Knowledge Base UI',
+      '- Agent Mode can list, search, and read ClickUp tasks via knowledge base tools',
     ],
   },
   {
