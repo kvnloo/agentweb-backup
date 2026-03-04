@@ -515,6 +515,113 @@ describe('ClickUp Auth Routes', () => {
   });
 
   // ============================================
+  // GET /workspace/:teamId/tasks
+  // ============================================
+  describe('GET /api/oauth/clickup/workspace/:teamId/tasks', () => {
+    it('should return 401 if user has null secrets', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'test-user-id', secrets: null });
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/workspace/team-123/tasks')
+        .expect(401);
+
+      expect(response.body.error).toBe('ClickUp not connected');
+    });
+
+    it('should return 401 if no token in secrets', async () => {
+      mockGetUserById.mockResolvedValue({ userId: 'test-user-id', secrets: {} });
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/workspace/team-123/tasks')
+        .expect(401);
+
+      expect(response.body.error).toBe('ClickUp not connected');
+    });
+
+    it('should return 401 if decryption fails', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        secrets: { clickup_access_token: 'bad-data' },
+      });
+      mockDecryptPassword.mockImplementation(() => { throw new Error('Decrypt failed'); });
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/workspace/team-123/tasks')
+        .expect(401);
+
+      expect(response.body.error).toBe('ClickUp not connected');
+    });
+
+    it('should fetch tasks successfully', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        secrets: { clickup_access_token: 'encrypted' },
+      });
+      mockDecryptPassword.mockReturnValue({ password: 'access-token' });
+
+      mockAxiosGet.mockResolvedValue({
+        data: {
+          tasks: [
+            {
+              id: 'task-1',
+              name: 'Task One',
+              description: 'Description',
+              status: { status: 'open' },
+              assignees: [{ username: 'alice' }],
+              due_date: '1700000000000',
+              tags: [{ name: 'bug' }],
+              priority: { priority: 'high' },
+              attachments: [],
+              date_created: '1690000000000',
+              date_updated: '1695000000000',
+            },
+          ],
+          last_page: true,
+        },
+      });
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/workspace/team-456/tasks')
+        .expect(200);
+
+      expect(response.body.tasks).toHaveLength(1);
+      expect(response.body.tasks[0].id).toBe('task-1');
+      expect(response.body.tasks[0].name).toBe('Task One');
+      expect(response.body.tasks[0].status).toBe('open');
+    });
+
+    it('should return 500 if ClickUp API fails', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        secrets: { clickup_access_token: 'encrypted' },
+      });
+      mockDecryptPassword.mockReturnValue({ password: 'access-token' });
+      mockAxiosGet.mockRejectedValue(new Error('API Error'));
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/workspace/team-123/tasks')
+        .expect(500);
+
+      expect(response.body.error).toBe('Failed to fetch workspace tasks');
+    });
+
+    it('should handle empty tasks array', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        secrets: { clickup_access_token: 'encrypted' },
+      });
+      mockDecryptPassword.mockReturnValue({ password: 'access-token' });
+      mockAxiosGet.mockResolvedValue({ data: { tasks: [], last_page: true } });
+
+      const response = await request(app)
+        .get('/api/oauth/clickup/workspace/team-123/tasks')
+        .expect(200);
+
+      expect(response.body.tasks).toEqual([]);
+    });
+  });
+
+  // ============================================
   // POST /disconnect
   // ============================================
   describe('POST /api/oauth/clickup/disconnect', () => {

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { getAccessToken, getWorkspaces, listDocs, readDocContent } from '../services/clickupService';
+import { getAccessToken, getWorkspaces, listDocs, readDocContent, listTasks, readTaskContent } from '../services/clickupService';
 
 jest.mock('axios');
 const mockAxiosGet = axios.get as jest.Mock;
@@ -288,6 +288,315 @@ describe('clickupService', () => {
       expect(content).toContain('Good content.');
       // Bad Page has title from list but no content, should still show title
       expect(content).toContain('# Bad Page');
+    });
+  });
+
+  describe('listTasks', () => {
+    it('should list tasks with pagination and enrich attachments', async () => {
+      mockAxiosGet
+        // Page 0 of list
+        .mockResolvedValueOnce({
+          data: {
+            tasks: [
+              {
+                id: 'task-1',
+                name: 'Build feature',
+                description: 'Build the new feature',
+                status: { status: 'in progress' },
+                assignees: [{ username: 'alice' }],
+                due_date: '1700000000000',
+                tags: [{ name: 'frontend' }],
+                priority: { priority: 'high' },
+                attachments: [
+                  { id: 'att-1', title: 'mockup.png', url: 'https://att.url/mockup.png', size: 12345 },
+                ],
+                date_created: '1690000000000',
+                date_updated: '1695000000000',
+              },
+            ],
+            last_page: false,
+          },
+        })
+        // Page 1 of list
+        .mockResolvedValueOnce({
+          data: {
+            tasks: [
+              {
+                id: 'task-2',
+                name: 'Fix bug',
+                description: 'Fix the login bug',
+                status: { status: 'open' },
+                assignees: [],
+                due_date: null,
+                tags: [],
+                priority: null,
+                attachments: [],
+                date_created: '1691000000000',
+                date_updated: '1696000000000',
+              },
+            ],
+            last_page: true,
+          },
+        })
+        // Individual fetch for task-2 (no attachments from list, enrichment kicks in)
+        .mockResolvedValueOnce({
+          data: {
+            id: 'task-2',
+            name: 'Fix bug',
+            description: 'Fix the login bug',
+            status: { status: 'open' },
+            assignees: [],
+            due_date: null,
+            tags: [],
+            priority: null,
+            attachments: [
+              { id: 'att-2', title: 'screenshot.png', url: 'https://att.url/screenshot.png', size: 5000 },
+            ],
+            date_created: '1691000000000',
+            date_updated: '1696000000000',
+          },
+        });
+
+      const tasks = await listTasks('ck_token', 'ws-1');
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0]).toEqual({
+        id: 'task-1',
+        name: 'Build feature',
+        description: 'Build the new feature',
+        status: 'in progress',
+        assignees: ['alice'],
+        dueDate: '1700000000000',
+        tags: ['frontend'],
+        priority: 'high',
+        attachments: [
+          { id: 'att-1', title: 'mockup.png', url: 'https://att.url/mockup.png', size: 12345 },
+        ],
+        dateCreated: '1690000000000',
+        dateUpdated: '1695000000000',
+      });
+      expect(tasks[1].name).toBe('Fix bug');
+      // task-2 was enriched with attachments from individual fetch
+      expect(tasks[1].attachments).toEqual([
+        { id: 'att-2', title: 'screenshot.png', url: 'https://att.url/screenshot.png', size: 5000 },
+      ]);
+      // 2 list calls + 1 individual fetch (task-1 skipped because it had attachments)
+      expect(mockAxiosGet).toHaveBeenCalledTimes(3);
+    });
+
+    it('should handle empty tasks array', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { tasks: [], last_page: true },
+      });
+
+      const tasks = await listTasks('ck_token', 'ws-1');
+      expect(tasks).toEqual([]);
+    });
+
+    it('should handle null tasks array', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { tasks: null, last_page: true },
+      });
+
+      const tasks = await listTasks('ck_token', 'ws-1');
+      expect(tasks).toEqual([]);
+    });
+
+    it('should call correct API URL with pagination parameters', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { tasks: [], last_page: true },
+      });
+
+      await listTasks('ck_token', 'ws-1');
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        expect.stringContaining('https://api.clickup.com/api/v2/team/ws-1/task'),
+        { headers: { Authorization: 'ck_token' } }
+      );
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        expect.stringContaining('page=0'),
+        expect.anything()
+      );
+    });
+
+    it('should handle tasks with missing optional fields gracefully', async () => {
+      mockAxiosGet
+        // List endpoint
+        .mockResolvedValueOnce({
+          data: {
+            tasks: [
+              {
+                id: 'task-1',
+                name: 'Minimal task',
+                // no description, status, assignees, due_date, tags, priority, attachments
+                date_created: '1000',
+              },
+            ],
+            last_page: true,
+          },
+        })
+        // Individual fetch for enrichment (also returns no attachments)
+        .mockResolvedValueOnce({
+          data: {
+            id: 'task-1',
+            name: 'Minimal task',
+            date_created: '1000',
+          },
+        });
+
+      const tasks = await listTasks('ck_token', 'ws-1');
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).toEqual({
+        id: 'task-1',
+        name: 'Minimal task',
+        description: '',
+        status: '',
+        assignees: [],
+        dueDate: null,
+        tags: [],
+        priority: null,
+        attachments: [],
+        dateCreated: '1000',
+        dateUpdated: '1000',
+      });
+    });
+
+    it('should handle attachments with missing fields', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          tasks: [
+            {
+              id: 'task-1',
+              name: 'Task with attachments',
+              attachments: [
+                { id: 'att-1', title: 'file.pdf', url: 'https://att.url/file.pdf' },
+                { id: 'att-2', url: 'https://att.url/noname' },
+              ],
+              date_created: '1000',
+              date_updated: '2000',
+            },
+          ],
+          last_page: true,
+        },
+      });
+
+      const tasks = await listTasks('ck_token', 'ws-1');
+      expect(tasks[0].attachments).toEqual([
+        { id: 'att-1', title: 'file.pdf', url: 'https://att.url/file.pdf', size: undefined },
+        { id: 'att-2', title: '', url: 'https://att.url/noname', size: undefined },
+      ]);
+    });
+  });
+
+  describe('readTaskContent', () => {
+    it('should format task as markdown with all fields', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          id: 'task-1',
+          name: 'Build feature X',
+          description: 'Implement the new feature X for the dashboard.',
+          status: { status: 'in progress' },
+          assignees: [{ username: 'alice' }, { username: 'bob' }],
+          due_date: '1700000000000',
+          tags: [{ name: 'frontend' }, { name: 'priority' }],
+          priority: { priority: 'high' },
+          attachments: [
+            { id: 'att-1', title: 'mockup.png', url: 'https://att.url/mockup.png', size: 12345 },
+            { id: 'att-2', title: 'spec.pdf', url: 'https://att.url/spec.pdf', size: 98765 },
+          ],
+          date_created: '1690000000000',
+          date_updated: '1695000000000',
+        },
+      });
+
+      const content = await readTaskContent('ck_token', 'task-1');
+      expect(content).toContain('# Build feature X');
+      expect(content).toContain('**Status:** in progress');
+      expect(content).toContain('**Priority:** high');
+      expect(content).toContain('**Assignees:** alice, bob');
+      expect(content).toContain('**Due Date:**');
+      expect(content).toContain('**Tags:** frontend, priority');
+      expect(content).toContain('Implement the new feature X for the dashboard.');
+      expect(content).toContain('## Attachments');
+      expect(content).toContain('mockup.png');
+      expect(content).toContain('spec.pdf');
+      expect(content).toContain('https://att.url/mockup.png');
+    });
+
+    it('should handle task with no description', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          id: 'task-1',
+          name: 'No description task',
+          description: null,
+          status: { status: 'open' },
+          assignees: [],
+          due_date: null,
+          tags: [],
+          priority: null,
+          attachments: [],
+          date_created: '1000',
+          date_updated: '2000',
+        },
+      });
+
+      const content = await readTaskContent('ck_token', 'task-1');
+      expect(content).toContain('# No description task');
+      expect(content).toContain('**Status:** open');
+      expect(content).not.toContain('**Priority:**');
+      expect(content).not.toContain('**Assignees:**');
+      expect(content).not.toContain('**Due Date:**');
+      expect(content).not.toContain('**Tags:**');
+      expect(content).not.toContain('## Attachments');
+      expect(content).not.toContain('## Description');
+    });
+
+    it('should handle task with empty attachments', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          id: 'task-1',
+          name: 'Task',
+          description: 'Some description',
+          status: { status: 'done' },
+          assignees: [],
+          attachments: [],
+          date_created: '1000',
+        },
+      });
+
+      const content = await readTaskContent('ck_token', 'task-1');
+      expect(content).not.toContain('## Attachments');
+      expect(content).toContain('## Description');
+      expect(content).toContain('Some description');
+    });
+
+    it('should call correct API URL', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          id: 'task-abc',
+          name: 'Test',
+          status: { status: 'open' },
+          date_created: '1000',
+        },
+      });
+
+      await readTaskContent('ck_token', 'task-abc');
+      expect(mockAxiosGet).toHaveBeenCalledWith(
+        'https://api.clickup.com/api/v2/task/task-abc',
+        { headers: { Authorization: 'ck_token' } }
+      );
+    });
+
+    it('should handle missing optional fields gracefully', async () => {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          id: 'task-1',
+          name: 'Minimal',
+          date_created: '1000',
+        },
+      });
+
+      const content = await readTaskContent('ck_token', 'task-1');
+      expect(content).toContain('# Minimal');
+      // Should not throw
     });
   });
 });
