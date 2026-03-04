@@ -473,14 +473,32 @@ export async function runVerifiedChat(
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
   let sessionModel = sessionForModel?.llmModel;
   const normalizedStartingMessage = startingMessage.toLowerCase();
-  const shouldUseReportsModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content'
+  const shouldUseReportGenerationModel = requiredFunctions.some((reqFunc) => (
+    reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content' || reqFunc.functionName === 'create_blog_article'
   ));
-  if (shouldUseReportsModel) {
-    const reportsModel = await agentModeService.getReportsModel();
-    if (sessionModel !== reportsModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, reportsModel);
-      sessionModel = reportsModel;
+  const shouldUseImageGenerationModel = requiredFunctions.some((reqFunc) => (
+    reqFunc.functionName === 'generate_image'
+  ));
+  const shouldUseVideoGenerationModel = requiredFunctions.some((reqFunc) => (
+    reqFunc.functionName === 'generate_video'
+  ));
+  if (shouldUseReportGenerationModel) {
+    const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
+    if (sessionModel !== reportGenModel) {
+      await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel);
+      sessionModel = reportGenModel;
+    }
+  } else if (shouldUseImageGenerationModel) {
+    const imageGenModel = await agentModeService.getImageGenerationDefaultModel();
+    if (sessionModel !== imageGenModel) {
+      await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel);
+      sessionModel = imageGenModel;
+    }
+  } else if (shouldUseVideoGenerationModel) {
+    const videoGenModel = await agentModeService.getVideoGenerationDefaultModel();
+    if (sessionModel !== videoGenModel) {
+      await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel);
+      sessionModel = videoGenModel;
     }
   }
   const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
@@ -867,7 +885,7 @@ async function runScheduledChat(
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
     // Update the session with the selected model from the schedule
-    const defaultModel = await agentModeService.getDefaultModel();
+    const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
     const modelToUse = schedule.llmModel || defaultModel;
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
@@ -2691,7 +2709,7 @@ export const agentModeController = {
         sessionId: sessionId || null, // Store original sessionId for reference (can be null)
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
+        llmModel: llmModel || '', // Empty means "use default at runtime"
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
         variableValues: {} as Record<string, string>,
@@ -2831,7 +2849,7 @@ export const agentModeController = {
         dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || await agentModeService.getDefaultModel(), // Use provided model or default
+        llmModel: llmModel || '', // Empty means "use default at runtime"
       };
 
       const { variables: normalizedVariables, error: variableError } =

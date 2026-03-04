@@ -28,6 +28,7 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
+    getScheduledChatsDefaultModel: jest.fn(),
     getMarketingSystemPrompt: jest.fn(),
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
@@ -145,7 +146,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
-    
+    mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
+
     // Setup default mocks
     mockChatbotDb.createChatSession.mockResolvedValue(mockSession);
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);

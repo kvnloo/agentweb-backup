@@ -1,3 +1,31 @@
+# March 3, 2026: AWS Bedrock Cost Investigation ($7.7k in February)
+
+**Problem:** February AWS bill was $7,742.75, majority from Claude Opus 4.6 and Sonnet 4.6 on Bedrock.
+
+**Root Cause:** Chat sessions (agent mode) are the primary cost driver — not task executions.
+
+**February Bedrock Usage (Chat Sessions):**
+- **Claude Sonnet 4.6:** 224 sessions — top user: `juan@usehaven.ai` (232 sessions, 9,046 function calls)
+- **Claude Opus 4.6:** 139 sessions — top user: `childrenstorywithai@gmail.com` (40 sessions, 504 fn calls), plus anon users and `agentweb@xcures.com`
+- Task executions used almost zero Bedrock (10 calls total, all Claude 3.5 Sonnet v2)
+
+**Other LLM usage (not on AWS bill):** GPT-5.2 (320 sessions), GPT-5 (157), Gemini-3-pro (292) — these are Azure/Google costs.
+
+**Monitoring Enabled:** Bedrock Model Invocation Logging → `s3://agentweb-bedrock-logs/invocation-logs/` (enabled 2026-03-03). This logs caller identity, model, and token counts per request.
+
+**Cost Reduction Options:**
+1. Default anon/demo users to Sonnet instead of Opus (5x cheaper per token)
+2. Cap function calls per session to prevent runaway usage
+3. Track per-user token usage in DynamoDB for billing visibility
+4. Consider session-level token budgets
+
+**Querying Cost Data:**
+- AWS Cost Explorer only works from the parent/management account (not member account 992382574572)
+- The `facetoon_image_user` IAM user now has `ce:GetCostAndUsage` permission but can only see the member account's own costs (~$0.12/month)
+- For per-user breakdown, query `AW-ChatSessions` table: filter by date, group by `userId` + `llmModel`, count `calledFunctions`
+
+---
+
 # February 28, 2026: Notion MCP Integration for Sprint Task Management
 
 **Purpose:** Enable Claude Code to pull dev items directly from the Notion "Sprint Tasks - Argusoft" database via MCP.

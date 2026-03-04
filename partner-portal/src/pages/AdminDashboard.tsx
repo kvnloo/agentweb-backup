@@ -6240,8 +6240,6 @@ const AgentModeSettings = () => {
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [contentModel, setContentModel] = useState('');
-  const [reportsModel, setReportsModel] = useState('');
-  const [reportsModelOptions, setReportsModelOptions] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [savingDefaultModel, setSavingDefaultModel] = useState(false);
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
@@ -6250,7 +6248,14 @@ const AgentModeSettings = () => {
   const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
   const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
-  const [savingReportsModel, setSavingReportsModel] = useState(false);
+  const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
+  const [savingScheduledChatsDefaultModel, setSavingScheduledChatsDefaultModel] = useState(false);
+  const [reportGenerationDefaultModel, setReportGenerationDefaultModel] = useState('');
+  const [savingReportGenerationDefaultModel, setSavingReportGenerationDefaultModel] = useState(false);
+  const [imageGenerationDefaultModel, setImageGenerationDefaultModel] = useState('');
+  const [savingImageGenerationDefaultModel, setSavingImageGenerationDefaultModel] = useState(false);
+  const [videoGenerationDefaultModel, setVideoGenerationDefaultModel] = useState('');
+  const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
@@ -6308,8 +6313,17 @@ const AgentModeSettings = () => {
       // Load content model
       await loadContentModel();
 
-      // Load reports model (pass models array for validation)
-      await loadReportsModel(models);
+      // Load scheduled chats default model
+      await loadScheduledChatsDefaultModel(models);
+
+      // Load report generation default model
+      await loadReportGenerationDefaultModel(models);
+
+      // Load image generation default model
+      await loadImageGenerationDefaultModel(models);
+
+      // Load video generation default model
+      await loadVideoGenerationDefaultModel(models);
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
@@ -6649,74 +6663,205 @@ const AgentModeSettings = () => {
     }
   };
 
-  const loadReportsModel = async (models: string[] = []) => {
+  const loadScheduledChatsDefaultModel = async (models: string[] = []) => {
     const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
     try {
-      // Load reports-specific model options from dedicated endpoint
-      try {
-        const optionsResponse = await axios.get(buildApiUrl('/api/agent-mode/public/reports-model-options'), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        if (Array.isArray(optionsResponse.data) && optionsResponse.data.length > 0) {
-          setReportsModelOptions(optionsResponse.data);
-        }
-      } catch (optionsError) {
-        console.error('Error loading reports model options:', optionsError);
-      }
-
-      try {
-        // Try to get reports model from settings
-        const response = await axios.get(buildApiUrl('/api/settings/agent_mode_reports_model'), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-
-        if (response.data && response.data.settingValue) {
-          const configuredModel = response.data.settingValue;
-          // Verify the model is in available Agent Mode models list
-          if (availableModels.includes(configuredModel)) {
-            setReportsModel(configuredModel);
-            return;
-          } else {
-            console.warn('Configured reports model not in supported Agent Mode models list, using fallback');
-          }
-        }
-      } catch (settingsError: any) {
-        // If setting doesn't exist (404), use default
-        if (settingsError.response?.status !== 404) {
-          console.error('Error loading reports model:', settingsError);
-        }
-      }
-
-      // Default to fallbackDefaultModel or first supported model
-      const fallback = availableModels.includes(fallbackDefaultModel)
-        ? fallbackDefaultModel
-        : (availableModels[0] || 'gpt-5-chat-2');
-      setReportsModel(fallback);
-    } catch (error) {
-      console.error('Error loading reports model:', error);
-      setReportsModel(availableModels[0] || 'gpt-5-chat-2');
-    }
-  };
-
-  const saveReportsModel = async () => {
-    try {
-      setSavingReportsModel(true);
-      setError('');
-      setSuccess('');
-
-      await axios.put(buildApiUrl('/api/settings/agent_mode_reports_model'), {
-        settingValue: reportsModel,
-        description: 'Default LLM model for Reports page (for creating and revising reports in Agent Mode). This is used as the initial model selection when creating new reports or revising existing reports.'
-      }, {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
       });
 
-      setSuccess('Reports model updated successfully!');
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setScheduledChatsDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading scheduled chats default model:', settingsError);
+      }
+    }
+    // Empty means "use general default"
+    setScheduledChatsDefaultModel('');
+  };
+
+  const saveScheduledChatsDefaultModel = async () => {
+    try {
+      setSavingScheduledChatsDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (scheduledChatsDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+          settingValue: scheduledChatsDefaultModel,
+          description: 'Default LLM model for scheduled chats (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        // Empty means "use general default" — delete the override
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Scheduled chats default model updated successfully!');
     } catch (error) {
-      console.error('Error saving reports model:', error);
-      setError('Failed to save reports model');
+      console.error('Error saving scheduled chats default model:', error);
+      setError('Failed to save scheduled chats default model');
     } finally {
-      setSavingReportsModel(false);
+      setSavingScheduledChatsDefaultModel(false);
+    }
+  };
+
+  const loadReportGenerationDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_report_generation_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setReportGenerationDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading report generation default model:', settingsError);
+      }
+    }
+    setReportGenerationDefaultModel('');
+  };
+
+  const saveReportGenerationDefaultModel = async () => {
+    try {
+      setSavingReportGenerationDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (reportGenerationDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_report_generation_default_model'), {
+          settingValue: reportGenerationDefaultModel,
+          description: 'Default LLM model for report generation (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_report_generation_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Report generation default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving report generation default model:', error);
+      setError('Failed to save report generation default model');
+    } finally {
+      setSavingReportGenerationDefaultModel(false);
+    }
+  };
+
+  const loadImageGenerationDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_image_generation_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setImageGenerationDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading image generation default model:', settingsError);
+      }
+    }
+    setImageGenerationDefaultModel('');
+  };
+
+  const saveImageGenerationDefaultModel = async () => {
+    try {
+      setSavingImageGenerationDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (imageGenerationDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_image_generation_default_model'), {
+          settingValue: imageGenerationDefaultModel,
+          description: 'Default LLM model for image generation (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_image_generation_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Image generation default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving image generation default model:', error);
+      setError('Failed to save image generation default model');
+    } finally {
+      setSavingImageGenerationDefaultModel(false);
+    }
+  };
+
+  const loadVideoGenerationDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setVideoGenerationDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading video generation default model:', settingsError);
+      }
+    }
+    setVideoGenerationDefaultModel('');
+  };
+
+  const saveVideoGenerationDefaultModel = async () => {
+    try {
+      setSavingVideoGenerationDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (videoGenerationDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
+          settingValue: videoGenerationDefaultModel,
+          description: 'Default LLM model for video generation (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Video generation default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving video generation default model:', error);
+      setError('Failed to save video generation default model');
+    } finally {
+      setSavingVideoGenerationDefaultModel(false);
     }
   };
 
@@ -7057,7 +7202,7 @@ const AgentModeSettings = () => {
     setPredefinedWorkPlans(updated);
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7113,6 +7258,38 @@ const AgentModeSettings = () => {
 
         setDefaultModel(fallbackDefaultModel);
         setSuccess('Reset to default model successfully!');
+      } else if (type === 'scheduledChatsDefaultModel') {
+        setSavingScheduledChatsDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setScheduledChatsDefaultModel('');
+        setSuccess('Reset scheduled chats default model successfully!');
+      } else if (type === 'reportGenerationDefaultModel') {
+        setSavingReportGenerationDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_report_generation_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setReportGenerationDefaultModel('');
+        setSuccess('Reset report generation default model successfully!');
+      } else if (type === 'imageGenerationDefaultModel') {
+        setSavingImageGenerationDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_image_generation_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setImageGenerationDefaultModel('');
+        setSuccess('Reset image generation default model successfully!');
+      } else if (type === 'videoGenerationDefaultModel') {
+        setSavingVideoGenerationDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setVideoGenerationDefaultModel('');
+        setSuccess('Reset video generation default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -7126,6 +7303,14 @@ const AgentModeSettings = () => {
         setSavingConversationStarters(false);
       } else if (type === 'defaultModel') {
         setSavingDefaultModel(false);
+      } else if (type === 'scheduledChatsDefaultModel') {
+        setSavingScheduledChatsDefaultModel(false);
+      } else if (type === 'reportGenerationDefaultModel') {
+        setSavingReportGenerationDefaultModel(false);
+      } else if (type === 'imageGenerationDefaultModel') {
+        setSavingImageGenerationDefaultModel(false);
+      } else if (type === 'videoGenerationDefaultModel') {
+        setSavingVideoGenerationDefaultModel(false);
       }
     }
   };
@@ -7209,11 +7394,219 @@ const AgentModeSettings = () => {
         </CardContent>
       </Card>
 
-      {/* Content Model for Blog/Book Generation */}
+      {/* Scheduled Chats Default Model */}
       <Card sx={{ mb: 3 }}>
         <CardContent>
           <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-            <Typography variant="h6">Content Model (Blog & Book Generation)</Typography>
+            <Typography variant="h6">Scheduled Chats Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('scheduledChatsDefaultModel')}
+                disabled={savingScheduledChatsDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveScheduledChatsDefaultModel}
+                disabled={savingScheduledChatsDefaultModel}
+              >
+                {savingScheduledChatsDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-scheduled-chats-model-label">Scheduled Chats Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-scheduled-chats-model-label"
+              value={scheduledChatsDefaultModel}
+              label="Scheduled Chats Default Model"
+              onChange={(e) => setScheduledChatsDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            If set, scheduled chats use this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Report Generation Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Report Generation Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('reportGenerationDefaultModel')}
+                disabled={savingReportGenerationDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveReportGenerationDefaultModel}
+                disabled={savingReportGenerationDefaultModel}
+              >
+                {savingReportGenerationDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-report-generation-model-label">Report Generation Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-report-generation-model-label"
+              value={reportGenerationDefaultModel}
+              label="Report Generation Default Model"
+              onChange={(e) => setReportGenerationDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            If set, report creation and revision uses this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Image Generation Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Image Generation Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('imageGenerationDefaultModel')}
+                disabled={savingImageGenerationDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveImageGenerationDefaultModel}
+                disabled={savingImageGenerationDefaultModel}
+              >
+                {savingImageGenerationDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-image-generation-model-label">Image Generation Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-image-generation-model-label"
+              value={imageGenerationDefaultModel}
+              label="Image Generation Default Model"
+              onChange={(e) => setImageGenerationDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            If set, image generation uses this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Video Generation Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Video Generation Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('videoGenerationDefaultModel')}
+                disabled={savingVideoGenerationDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveVideoGenerationDefaultModel}
+                disabled={savingVideoGenerationDefaultModel}
+              >
+                {savingVideoGenerationDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-video-generation-model-label">Video Generation Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-video-generation-model-label"
+              value={videoGenerationDefaultModel}
+              label="Video Generation Default Model"
+              onChange={(e) => setVideoGenerationDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            If set, video generation uses this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Content Agent Model for Blog/Book Generation */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Content Agent Model (Blog & Book Generation)</Typography>
             <Button
               variant="contained"
               onClick={saveContentModel}
@@ -7224,11 +7617,11 @@ const AgentModeSettings = () => {
           </Box>
 
           <FormControl fullWidth sx={{ mb: 2 }}>
-            <InputLabel>Content Model</InputLabel>
+            <InputLabel>Content Agent Model</InputLabel>
             <Select
               value={contentModel}
               onChange={(e) => setContentModel(e.target.value)}
-              label="Content Model"
+              label="Content Agent Model"
             >
               <MenuItem value="gpt-5-chat-2">GPT-5 Chat 2 (Azure)</MenuItem>
               <MenuItem value="anthropic.claude-sonnet-4-5-20250929-v1:0">
@@ -7239,41 +7632,6 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Select the LLM model to use for blog article and book content generation. This setting does NOT affect Agent Mode chat conversations, which use their own model configuration.
-          </Typography>
-        </CardContent>
-      </Card>
-
-      {/* Reports Model Configuration */}
-      <Card sx={{ mb: 3 }}>
-        <CardContent>
-          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-            <Typography variant="h6">Reports Model (Default)</Typography>
-            <Button
-              variant="contained"
-              onClick={saveReportsModel}
-              disabled={savingReportsModel}
-            >
-              {savingReportsModel ? <CircularProgress size={20} /> : 'Save Changes'}
-            </Button>
-          </Box>
-
-          <FormControl fullWidth sx={{ mb: 2 }}>
-            <InputLabel>Reports Model</InputLabel>
-            <Select
-              value={reportsModel}
-              onChange={(e) => setReportsModel(e.target.value)}
-              label="Reports Model"
-            >
-              {(reportsModelOptions.length > 0 ? reportsModelOptions : supportedModels).map((model) => (
-                <MenuItem key={model} value={model}>
-                  {model}
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
-
-          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-            Select the default LLM model for the Reports page in Agent Mode. This model will be used when creating new reports and as the default when revising existing reports. Only models suitable for report generation are shown.
           </Typography>
         </CardContent>
       </Card>

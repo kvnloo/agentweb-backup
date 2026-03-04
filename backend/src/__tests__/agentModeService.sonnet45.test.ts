@@ -326,4 +326,162 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       ).rejects.toThrow();
     });
   });
+
+  describe('getScheduledChatsDefaultModel', () => {
+    const { settingsService } = require('../services/settingsService');
+
+    it('should return scheduled chats model when configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6',
+      });
+
+      const model = await agentModeService.getScheduledChatsDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+      expect(settingsService.getSetting).toHaveBeenCalledWith('agent_mode_scheduled_chats_default_model');
+    });
+
+    it('should fall back to general default model when not configured', async () => {
+      // First call (scheduled chats setting) returns null, second call (default model setting) returns a value
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce(null) // scheduled chats setting
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-opus-4-6-v1' }); // general default
+
+      const model = await agentModeService.getScheduledChatsDefaultModel();
+      expect(model).toBe('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should fall back to env/hardcoded default when neither setting is configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+
+      const model = await agentModeService.getScheduledChatsDefaultModel();
+      // Falls through to this.default_model (env var or hardcoded)
+      expect(model).toBe(agentModeService.default_model);
+    });
+
+    it('should fall back to general default when scheduled chats model is unsupported', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce({ settingValue: 'nonexistent-model' }) // unsupported scheduled chats model
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-sonnet-4-6' }); // general default
+
+      const model = await agentModeService.getScheduledChatsDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+    });
+  });
+
+  describe('getReportGenerationDefaultModel', () => {
+    const { settingsService } = require('../services/settingsService');
+
+    it('should return report generation model when configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6',
+      });
+
+      const model = await agentModeService.getReportGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+      expect(settingsService.getSetting).toHaveBeenCalledWith('agent_mode_report_generation_default_model');
+    });
+
+    it('should fall back to general default model when not configured', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-opus-4-6-v1' });
+
+      const model = await agentModeService.getReportGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should fall back to env/hardcoded default when neither setting is configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+
+      const model = await agentModeService.getReportGenerationDefaultModel();
+      expect(model).toBe(agentModeService.default_model);
+    });
+
+    it('should fall back to general default when report generation model is unsupported', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce({ settingValue: 'nonexistent-model' })
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-sonnet-4-6' });
+
+      const model = await agentModeService.getReportGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+    });
+  });
+
+  describe('getImageGenerationDefaultModel', () => {
+    const { settingsService } = require('../services/settingsService');
+
+    it('should return image generation model when configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6',
+      });
+
+      const model = await agentModeService.getImageGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+      expect(settingsService.getSetting).toHaveBeenCalledWith('agent_mode_image_generation_default_model');
+    });
+
+    it('should fall back to general default model when not configured', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce(null) // image generation setting
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-opus-4-6-v1' }); // general default
+
+      const model = await agentModeService.getImageGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should fall back to env/hardcoded default when neither setting is configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+
+      const model = await agentModeService.getImageGenerationDefaultModel();
+      expect(model).toBe(agentModeService.default_model);
+    });
+
+    it('should fall back to general default when image generation model is unsupported', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce({ settingValue: 'nonexistent-model' }) // unsupported
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-sonnet-4-6' }); // general default
+
+      const model = await agentModeService.getImageGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+    });
+  });
+
+  describe('getVideoGenerationDefaultModel', () => {
+    const { settingsService } = require('../services/settingsService');
+
+    it('should return video generation model when configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'anthropic.claude-sonnet-4-6',
+      });
+
+      const model = await agentModeService.getVideoGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+      expect(settingsService.getSetting).toHaveBeenCalledWith('agent_mode_video_generation_default_model');
+    });
+
+    it('should fall back to general default model when not configured', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce(null) // video generation setting
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-opus-4-6-v1' }); // general default
+
+      const model = await agentModeService.getVideoGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-opus-4-6-v1');
+    });
+
+    it('should fall back to env/hardcoded default when neither setting is configured', async () => {
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+
+      const model = await agentModeService.getVideoGenerationDefaultModel();
+      expect(model).toBe(agentModeService.default_model);
+    });
+
+    it('should fall back to general default when video generation model is unsupported', async () => {
+      (settingsService.getSetting as jest.Mock)
+        .mockResolvedValueOnce({ settingValue: 'nonexistent-model' }) // unsupported
+        .mockResolvedValueOnce({ settingValue: 'anthropic.claude-sonnet-4-6' }); // general default
+
+      const model = await agentModeService.getVideoGenerationDefaultModel();
+      expect(model).toBe('anthropic.claude-sonnet-4-6');
+    });
+  });
 });

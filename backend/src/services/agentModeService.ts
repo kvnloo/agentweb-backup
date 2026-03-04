@@ -86,6 +86,10 @@ export class AgentModeService {
   private static toolsRegistered: boolean = false;
   default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
   private defaultModelSettingName = 'agent_mode_default_model';
+  private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
+  private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
+  private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
+  private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -238,6 +242,74 @@ export class AgentModeService {
       console.error('AgentMode: Error getting reports model setting:', error);
     }
     return fallbackModel;
+  }
+
+  async getScheduledChatsDefaultModel(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting(this.scheduledChatsDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported scheduled chats default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting scheduled chats default model setting:', error);
+    }
+    // Fall back to the general default model
+    return this.getDefaultModel();
+  }
+
+  async getReportGenerationDefaultModel(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting(this.reportGenerationDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported report generation default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting report generation default model setting:', error);
+    }
+    // Fall back to the general default model
+    return this.getDefaultModel();
+  }
+
+  async getImageGenerationDefaultModel(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting(this.imageGenerationDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported image generation default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting image generation default model setting:', error);
+    }
+    // Fall back to the general default model
+    return this.getDefaultModel();
+  }
+
+  async getVideoGenerationDefaultModel(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting(this.videoGenerationDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported video generation default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting video generation default model setting:', error);
+    }
+    // Fall back to the general default model
+    return this.getDefaultModel();
   }
 
   // Helper method to create Azure OpenAI client for a specific deployment
