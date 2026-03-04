@@ -6579,11 +6579,54 @@ Format the response as JSON with this structure:
 
       // Analyze design tokens
       console.log('Analyzing design tokens...');
-      const detailedTokens = analyzeDesignTokens(extractedCSS);
+      const detailedTokens = await analyzeDesignTokens(extractedCSS);
+
+      // Log extraction details for debugging
+      console.log(`CSS extraction details: ${extractedCSS.stylesheets.length} stylesheets, ` +
+        `source=${extractedCSS.stylesheets[0]?.source || 'none'}, ` +
+        `computedElements=${extractedCSS.computedElements ? Object.keys(extractedCSS.computedElements).join(',') : 'none'}`);
+      console.log(`Design tokens: ${detailedTokens.colors.all.length} colors, ` +
+        `${detailedTokens.typography.fontFamilies.length} fonts, ` +
+        `top colors: ${detailedTokens.colors.all.slice(0, 5).map((c: any) => `${c.value}(${c.count})`).join(', ')}`);
 
       // Infer brand tokens
       console.log('Inferring brand tokens...');
       const suggestedBrandTokens = inferBrandTokens(detailedTokens);
+
+      // Process brand identity: download logo and upload to S3
+      const brandIdentity = extractedCSS.brandIdentity || { logoUrl: null, brandName: null, tagline: null, favicon: null };
+      let s3LogoUrl: string | null = null;
+
+      if (brandIdentity.logoUrl) {
+        try {
+          console.log(`Downloading logo from ${brandIdentity.logoUrl}...`);
+          const logoResponse = await axios.get(brandIdentity.logoUrl, {
+            responseType: 'arraybuffer',
+            timeout: 15000,
+          });
+          const contentType = logoResponse.headers['content-type'] || '';
+          // Skip SVG since brand guidelines doesn't accept it
+          if (!contentType.includes('svg')) {
+            const ext = contentType.includes('png') ? 'png' : contentType.includes('gif') ? 'gif' : 'jpg';
+            const filename = `logo.${ext}`;
+            const { uploadFileToS3WithPath } = await import('../utils/s3Utils');
+            const uploadResult = await uploadFileToS3WithPath(
+              Buffer.from(logoResponse.data as ArrayBuffer),
+              filename,
+              contentType,
+              `users/${userId}/brand/logo`
+            );
+            if (uploadResult.success && uploadResult.url) {
+              s3LogoUrl = uploadResult.url;
+              console.log(`Logo uploaded to S3: ${s3LogoUrl}`);
+            }
+          } else {
+            console.log('Skipping SVG logo (not supported by brand guidelines)');
+          }
+        } catch (logoErr: any) {
+          console.warn('Failed to download/upload logo:', logoErr.message);
+        }
+      }
 
       // Format detailed tokens as JSON string for Emma to save to KB if needed
       const detailedTokensJSON = JSON.stringify({
@@ -6592,7 +6635,7 @@ Format the response as JSON with this structure:
         extractedAt: extractedCSS.extractedAt,
         tokens: detailedTokens,
         metadata: {
-          extractionMethod: 'regex-based',
+          extractionMethod: 'puppeteer-wallace',
           savedBy: 'emma',
           userId
         }
@@ -6602,14 +6645,27 @@ Format the response as JSON with this structure:
       const formattedSummary = this.formatCSSExtractionResult({
         url,
         suggestedBrandTokens,
-        detailedTokens
+        detailedTokens,
+        brandIdentity: {
+          logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
+          brandName: brandIdentity.brandName || null,
+          tagline: brandIdentity.tagline || null,
+        },
       });
+
+      // Merge brand identity into suggestedBrandTokens so Emma naturally displays it
+      const enrichedBrandTokens = {
+        ...suggestedBrandTokens,
+        brandName: brandIdentity.brandName || null,
+        logoUrl: s3LogoUrl || brandIdentity.logoUrl || null,
+        tagline: brandIdentity.tagline || null,
+      };
 
       return {
         success: true,
         url,
         extractedAt: extractedCSS.extractedAt,
-        suggestedBrandTokens,
+        suggestedBrandTokens: enrichedBrandTokens,
         detailedTokens,
         detailedTokensJSON, // Emma can save this to KB using update_knowledge_base tool
         formattedContent: formattedSummary
@@ -6628,10 +6684,18 @@ Format the response as JSON with this structure:
    * Format CSS extraction result for LLM consumption
    */
   private formatCSSExtractionResult(data: any): string {
-    const { url, suggestedBrandTokens, detailedTokens } = data;
+    const { url, suggestedBrandTokens, detailedTokens, brandIdentity } = data;
 
     let formatted = `# CSS Extraction Results\n\n`;
     formatted += `**Source:** ${url}\n\n`;
+
+    // Brand identity section
+    if (brandIdentity) {
+      formatted += `## Brand Identity\n\n`;
+      formatted += `- **Brand Name:** ${brandIdentity.brandName || 'Not detected'}\n`;
+      formatted += `- **Logo:** ${brandIdentity.logoUrl || 'Not detected'}\n`;
+      formatted += `- **Tagline:** ${brandIdentity.tagline || 'Not detected'}\n\n`;
+    }
 
     // Suggested brand tokens (what should go in brand guidelines)
     formatted += `## Suggested Brand Tokens\n\n`;
