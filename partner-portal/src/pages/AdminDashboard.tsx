@@ -6251,6 +6251,8 @@ const AgentModeSettings = () => {
   const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [savingReportsModel, setSavingReportsModel] = useState(false);
+  const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
+  const [savingScheduledChatsDefaultModel, setSavingScheduledChatsDefaultModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
@@ -6310,6 +6312,9 @@ const AgentModeSettings = () => {
 
       // Load reports model (pass models array for validation)
       await loadReportsModel(models);
+
+      // Load scheduled chats default model
+      await loadScheduledChatsDefaultModel(models);
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
@@ -6720,6 +6725,58 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadScheduledChatsDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setScheduledChatsDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading scheduled chats default model:', settingsError);
+      }
+    }
+    // Empty means "use general default"
+    setScheduledChatsDefaultModel('');
+  };
+
+  const saveScheduledChatsDefaultModel = async () => {
+    try {
+      setSavingScheduledChatsDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (scheduledChatsDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+          settingValue: scheduledChatsDefaultModel,
+          description: 'Default LLM model for scheduled chats (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        // Empty means "use general default" — delete the override
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Scheduled chats default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving scheduled chats default model:', error);
+      setError('Failed to save scheduled chats default model');
+    } finally {
+      setSavingScheduledChatsDefaultModel(false);
+    }
+  };
+
   const saveSystemPrompt = async () => {
     try {
       setSavingSystemPrompt(true);
@@ -7057,7 +7114,7 @@ const AgentModeSettings = () => {
     setPredefinedWorkPlans(updated);
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'scheduledChatsDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7113,6 +7170,14 @@ const AgentModeSettings = () => {
 
         setDefaultModel(fallbackDefaultModel);
         setSuccess('Reset to default model successfully!');
+      } else if (type === 'scheduledChatsDefaultModel') {
+        setSavingScheduledChatsDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setScheduledChatsDefaultModel('');
+        setSuccess('Reset scheduled chats default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -7126,6 +7191,8 @@ const AgentModeSettings = () => {
         setSavingConversationStarters(false);
       } else if (type === 'defaultModel') {
         setSavingDefaultModel(false);
+      } else if (type === 'scheduledChatsDefaultModel') {
+        setSavingScheduledChatsDefaultModel(false);
       }
     }
   };
@@ -7205,6 +7272,58 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Sets the default model for newly created Agent Mode sessions. Existing sessions keep their current model.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Scheduled Chats Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Scheduled Chats Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('scheduledChatsDefaultModel')}
+                disabled={savingScheduledChatsDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveScheduledChatsDefaultModel}
+                disabled={savingScheduledChatsDefaultModel}
+              >
+                {savingScheduledChatsDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-scheduled-chats-model-label">Scheduled Chats Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-scheduled-chats-model-label"
+              value={scheduledChatsDefaultModel}
+              label="Scheduled Chats Default Model"
+              onChange={(e) => setScheduledChatsDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            If set, scheduled chats use this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
           </Typography>
         </CardContent>
       </Card>
