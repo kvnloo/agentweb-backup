@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-03',
     changes: [
+      'Admin: Per-Feature Model Overrides',
+      '- Added admin dashboard controls for Report Generation, Image Generation, and Video Generation default models',
+      '- Each feature can use a cheaper model instead of the general default, reducing Bedrock costs',
+      '- Report generation model covers both report creation and revision',
+      '- Removed the old "Reports Model (Default)" card in favor of the new Report Generation Default Model',
+      '- Renamed "Content Model" to "Content Agent Model" for clarity',
       'Reports: Search by File Name',
       '- The search bar on the Reports page now matches against report file names in addition to task name and task ID',
       '- Updated placeholder text to clarify searchable fields',
