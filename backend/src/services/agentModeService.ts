@@ -12547,10 +12547,16 @@ Format the response as JSON with this structure:
 
       const htmlContent = htmlResponse.data as string;
 
-      // Extract content from <div class="content"> - find first opening tag and last closing tag before </body>
+      // Extract content from <div class="content"> — required for proper CMS publishing
       const contentDivStart = htmlContent.search(/<div[^>]*class=["'][^"']*content[^"']*["'][^>]*>/i);
       if (contentDivStart === -1) {
-        throw new Error('Could not extract content from HTML. Expected <div class="content"> element.');
+        return {
+          success: false,
+          message: 'This article\'s HTML is not formatted for CMS publishing (missing <div class="content"> wrapper). Use repair_blog_article first to fix the formatting, then retry publish_blog_article.',
+          error: 'HTML not formatted for publishing',
+          requiresRepair: true,
+          articleUrl: blogHtmlUrl
+        };
       }
 
       // Find the position after the opening tag
@@ -12573,6 +12579,17 @@ Format the response as JSON with this structure:
 
       if (!bodyHtml) {
         throw new Error('Content is empty after cleaning');
+      }
+
+      // Extract <style> blocks from the full HTML and prepend to body content
+      const styleBlocks: string[] = [];
+      const styleRegex = /<style[\s\S]*?<\/style>/gi;
+      let styleMatch;
+      while ((styleMatch = styleRegex.exec(htmlContent)) !== null) {
+        styleBlocks.push(styleMatch[0]);
+      }
+      if (styleBlocks.length > 0) {
+        bodyHtml = styleBlocks.join('\n') + '\n' + bodyHtml;
       }
 
       // Extract image filename from URL
@@ -12955,6 +12972,68 @@ Format the response as JSON with this structure:
 
       let htmlContent = htmlResponse.data as string;
 
+      // Step 1.5: Restructure HTML if missing <div class="content"> wrapper
+      // This ensures the article is compatible with publishBlogArticle extraction
+      let structureRepaired = false;
+      const hasContentDiv = /<div[^>]*class=["'][^"']*content[^"']*["'][^>]*>/i.test(htmlContent);
+      if (!hasContentDiv) {
+        console.log('AgentMode: HTML missing <div class="content"> wrapper, restructuring...');
+        const bodyStartMatch = htmlContent.match(/<body[^>]*>/i);
+        const bodyEndIndex = htmlContent.lastIndexOf('</body>');
+        if (bodyStartMatch && bodyEndIndex !== -1) {
+          const bodyStartIndex = bodyStartMatch.index! + bodyStartMatch[0].length;
+          let bodyContent = htmlContent.substring(bodyStartIndex, bodyEndIndex).trim();
+
+          // Strip <script> tags
+          bodyContent = bodyContent.replace(/<script[\s\S]*?<\/script>/gi, '').trim();
+
+          // Split body into header chrome (h1, meta, hero image) and article content.
+          // Strategy: find the hero image — everything up to and including it is header;
+          // everything after is content. If no hero image, split at the first <h2> or
+          // first content block after the h1.
+          let headerChrome = '';
+          let articleContent = bodyContent;
+
+          // Try splitting at hero image (img with class="hero-image" or first standalone img)
+          const heroImgPattern = /<img[^>]*class=["'][^"']*hero-image[^"']*["'][^>]*\/?>/i;
+          let heroMatch = bodyContent.match(heroImgPattern);
+          if (!heroMatch) {
+            // Fall back to first <img> that appears before any <h2>/<p> content
+            const firstH2 = bodyContent.search(/<h2[\s>]/i);
+            const firstImg = bodyContent.match(/<img[^>]*\/?>/i);
+            if (firstImg && (firstH2 === -1 || firstImg.index! < firstH2)) {
+              heroMatch = firstImg;
+            }
+          }
+
+          if (heroMatch) {
+            const splitPoint = heroMatch.index! + heroMatch[0].length;
+            headerChrome = bodyContent.substring(0, splitPoint).trim();
+            articleContent = bodyContent.substring(splitPoint).trim();
+          } else {
+            // No hero image — split at first <h2> (everything before is header)
+            const firstH2Index = bodyContent.search(/<h2[\s>]/i);
+            if (firstH2Index > 0) {
+              headerChrome = bodyContent.substring(0, firstH2Index).trim();
+              articleContent = bodyContent.substring(firstH2Index).trim();
+            }
+            // If no h2 either, just wrap everything in content div (headerChrome stays empty)
+          }
+
+          // Rebuild body: header chrome outside div.content, article inside
+          const newBody = [
+            headerChrome,
+            `<div class="content">`,
+            `    ${articleContent}`,
+            `</div>`
+          ].filter(Boolean).join('\n    ');
+
+          htmlContent = htmlContent.substring(0, bodyStartIndex) + '\n    ' + newBody + '\n' + htmlContent.substring(bodyEndIndex);
+          structureRepaired = true;
+          console.log('AgentMode: HTML restructured with <div class="content"> wrapper');
+        }
+      }
+
       // Step 2: Find all images in HTML
       console.log('AgentMode: Looking for all images in HTML...');
       const allImages = new Set<string>();
@@ -13059,9 +13138,16 @@ Format the response as JSON with this structure:
       }
 
       // Step 5: Return repair results
-      const message = repairResults.imagesRepaired > 0
-        ? `Blog article repaired successfully. Fixed ${repairResults.imagesRepaired} of ${repairResults.totalImagesChecked} image(s) by resizing to meet file size limits. Use the repaired URLs to retry publishing.`
-        : `Blog article checked. All ${repairResults.totalImagesChecked} image(s) are within limits. A new article version has been created.`;
+      const messageParts: string[] = [];
+      if (structureRepaired) {
+        messageParts.push('HTML restructured for CMS publishing (added <div class="content"> wrapper)');
+      }
+      if (repairResults.imagesRepaired > 0) {
+        messageParts.push(`Fixed ${repairResults.imagesRepaired} of ${repairResults.totalImagesChecked} image(s) by resizing to meet file size limits`);
+      } else {
+        messageParts.push(`All ${repairResults.totalImagesChecked} image(s) are within limits`);
+      }
+      const message = `Blog article repaired successfully. ${messageParts.join('. ')}. Use the repaired article URL to publish.`;
 
       return {
         success: true,
@@ -13071,6 +13157,7 @@ Format the response as JSON with this structure:
         imagesRepaired: repairResults.imagesRepaired,
         totalImagesChecked: repairResults.totalImagesChecked,
         originalArticleUrl: repairResults.originalArticleUrl,
+        structureRepaired,
       };
     } catch (error: any) {
       console.error('AgentMode: Error repairing blog article:', error);

@@ -700,5 +700,150 @@ describe('AgentModeService - publish_blog_article function', () => {
       expect(fieldData['post-categories']).toEqual(['cat-tech-123', 'cat-mkt-456']);
     });
   });
+
+  describe('HTML content extraction and format validation', () => {
+    const setupMocks = (htmlContent: string) => {
+      mockGetUserById.mockResolvedValue({
+        userId: mockUserId,
+        cmsType: 'Webflow'
+      });
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig);
+      mockAxiosGet.mockResolvedValue({ data: htmlContent });
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+    };
+
+    it('should return requiresRepair error when HTML has no <div class="content"> wrapper', async () => {
+      const htmlWithoutContentDiv = `
+        <!DOCTYPE html>
+        <html>
+        <head><title>Test</title></head>
+        <body>
+          <h1>Article Title</h1>
+          <p>Article body content</p>
+        </body>
+        </html>
+      `;
+
+      setupMocks(htmlWithoutContentDiv);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.requiresRepair).toBe(true);
+      expect(result.articleUrl).toBe(mockBlogHtmlUrl);
+      expect(result.message).toContain('repair_blog_article');
+    });
+
+    it('should extract and prepend <style> blocks from <head> to body content', async () => {
+      const htmlWithStyles = `
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <title>Test</title>
+          <style>
+            .stat-card { background: #f0f0f0; padding: 20px; }
+            .tldr-box { border-left: 4px solid blue; }
+          </style>
+        </head>
+        <body>
+          <div class="content">
+            <div class="stat-card">Some stat</div>
+            <div class="tldr-box">TL;DR content</div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      setupMocks(htmlWithStyles);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft'
+      );
+
+      expect(result.success).toBe(true);
+
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const fieldData = webflowCall[1].fieldData;
+      const bodyContent = fieldData['post-body'];
+      // Style block should be prepended
+      expect(bodyContent).toContain('.stat-card');
+      expect(bodyContent).toContain('.tldr-box');
+      expect(bodyContent).toContain('<style>');
+      // Body content should still be present
+      expect(bodyContent).toContain('Some stat');
+      expect(bodyContent).toContain('TL;DR content');
+    });
+
+    it('should still extract from <div class="content"> when it exists (regression)', async () => {
+      setupMocks(mockHtmlContent);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft'
+      );
+
+      expect(result.success).toBe(true);
+
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const fieldData = webflowCall[1].fieldData;
+      expect(fieldData['post-body']).toContain('Test blog content here');
+    });
+
+    it('should preserve h1 inside <div class="content"> (create_blog_article compatibility)', async () => {
+      const htmlWithH1InContent = `
+        <!DOCTYPE html>
+        <html>
+        <head><title>Test</title></head>
+        <body>
+          <h1>Page Title</h1>
+          <img src="https://example.com/hero.png" class="hero-image">
+          <div class="content">
+            <h1>Content H1 That Should Stay</h1>
+            <p>Article content</p>
+          </div>
+        </body>
+        </html>
+      `;
+
+      setupMocks(htmlWithH1InContent);
+
+      const result = await (agentModeService as any).publishBlogArticle(
+        'Page Title',
+        'Description',
+        'https://example.com/hero.png',
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft'
+      );
+
+      expect(result.success).toBe(true);
+
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const fieldData = webflowCall[1].fieldData;
+      const bodyContent = fieldData['post-body'];
+      expect(bodyContent).toContain('Content H1 That Should Stay');
+      expect(bodyContent).toContain('Article content');
+    });
+  });
 });
 
