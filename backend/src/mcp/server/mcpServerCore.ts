@@ -17,8 +17,87 @@ import { mcpToolRegistry } from './registry';
 import './tools';
 import './portalTools';
 
+// Foundation tools always available (no skill required)
+// These are Emma's core GTM infrastructure - context and discovery tools
+const FOUNDATION_TOOLS = new Set([
+  // Discovery
+  'install_skills',
+  'list_available_skills',
+
+  // GTM Context (Read/Write)
+  'update_brand_guidelines',
+  'read_brand_guidelines',
+  'update_market_strategy',
+  'read_market_strategy',
+
+  // Knowledge Base
+  'search_knowledge_base',
+  'list_knowledge_base_files',
+  'read_knowledge_base_files',
+
+  // Work Plans (Emma's execution planning system)
+  'create_work_plan',
+  'modify_work_plan',
+  'set_work_plan_status',
+
+  // GTM Discovery (teasers - hint at Emma's capabilities)
+  'search_leads',           // CRM teaser
+  'get_lead_lists',         // Lead management teaser
+  'list_connected_accounts' // Social/ads integration teaser
+]);
+
+/**
+ * Build skill-to-tool mapping from published skills in database
+ */
+async function getSkillToolMapping(): Promise<Map<string, Set<string>>> {
+  const { skillService } = await import('../../services/skillService');
+  const skills = await skillService.getPublishedSkills();
+
+  const mapping = new Map<string, Set<string>>();
+  for (const skill of skills) {
+    mapping.set(skill.skillId, new Set(skill.toolNames || []));
+  }
+
+  return mapping;
+}
+
+/**
+ * Get allowed tool names for a session based on installed skills
+ */
+async function getAllowedToolNames(installedSkills: Set<string>): Promise<Set<string>> {
+  const allowedNames = new Set<string>(FOUNDATION_TOOLS);
+
+  if (installedSkills.size === 0) {
+    return allowedNames;
+  }
+
+  const skillMapping = await getSkillToolMapping();
+  const { skillService } = await import('../../services/skillService');
+
+  for (const skillId of installedSkills) {
+    if (skillId === '__other_skills__') {
+      // Add unassociated tools
+      const { agentModeService } = await import('../../services/agentModeService');
+      const publishedSkills = await skillService.getPublishedSkills();
+      const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
+      unassociatedTools.forEach((name: string) => allowedNames.add(name));
+    } else {
+      // Add tools from this skill
+      const toolNames = skillMapping.get(skillId);
+      if (toolNames) {
+        toolNames.forEach(name => allowedNames.add(name));
+      }
+    }
+  }
+
+  return allowedNames;
+}
+
 export interface McpSessionContext {
   agentUserId?: string;
+  sessionId?: string;               // MCP session ID
+  installedSkills?: Set<string>;    // Installed skill IDs for this session
+  isInternal?: boolean;             // Internal clients bypass skill gating
 }
 
 /**
@@ -32,7 +111,7 @@ export interface McpSessionContext {
  * @param sessionContext - Optional session context (e.g. agentUserId from API key auth)
  * @returns The low-level Server instance for transport connection
  */
-export function createMcpServer(serverName: string = "agentweb-mcp-server", sessionContext?: McpSessionContext): Server {
+export function createMcpServer(serverName: string = "Emma - GTM Automation Specialist", sessionContext?: McpSessionContext): Server {
   // Create McpServer instance (new recommended API)
   // Capabilities are passed as the second argument to enable tools support
   const mcpServer = new McpServer({
@@ -55,10 +134,23 @@ export function createMcpServer(serverName: string = "agentweb-mcp-server", sess
 
   /**
    * Handler for listing available tools.
+   * External clients see only foundation tools + installed skill tools.
+   * Internal clients see all tools (no filtering).
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const allTools = mcpToolRegistry.getToolDefinitions();
+
+    // Internal clients see all tools
+    if (sessionContext?.isInternal) {
+      return { tools: allTools };
+    }
+
+    // External clients: filter by installed skills + foundation tools
+    const installedSkills = sessionContext?.installedSkills || new Set<string>();
+    const allowedToolNames = await getAllowedToolNames(installedSkills);
+
     return {
-      tools: mcpToolRegistry.getToolDefinitions(),
+      tools: allTools.filter(tool => allowedToolNames.has(tool.name))
     };
   });
   /**
@@ -69,12 +161,37 @@ export function createMcpServer(serverName: string = "agentweb-mcp-server", sess
 
     // Extract context fields from args (injected by internal MCP clients)
     const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
-    // Fall back to agentUserId from API key auth if userId not in args
+
+    // Build context with session state and callback for install_skills
     const context = {
       userId: userId || sessionContext?.agentUserId,
-      sessionId,
+      sessionId: sessionContext?.sessionId || sessionId,
       llmModel,
+      agentUserId: sessionContext?.agentUserId,
+      installedSkills: sessionContext?.installedSkills,
+      isInternal: sessionContext?.isInternal,
+      // Callback for install_skills to update session state
+      updateInstalledSkills: (skillIds: string[]) => {
+        if (sessionContext?.installedSkills) {
+          skillIds.forEach(id => sessionContext.installedSkills!.add(id));
+        }
+      }
     };
+
+    // Validate tool is allowed for external clients
+    if (!sessionContext?.isInternal && !FOUNDATION_TOOLS.has(name)) {
+      const allowedToolNames = await getAllowedToolNames(sessionContext?.installedSkills || new Set());
+
+      if (!allowedToolNames.has(name)) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: Tool '${name}' requires a skill to be installed. Use install_skills(['skill-id']) or list_available_skills() to see available capabilities.`
+          }],
+          isError: true
+        };
+      }
+    }
 
     try {
       const result = await mcpToolRegistry.execute(name, toolArgs, context);

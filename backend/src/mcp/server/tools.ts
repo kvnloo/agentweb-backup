@@ -19,13 +19,123 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    if (!context?.userId || !context?.sessionId) {
-        throw new Error("Missing user or session context");
+    const userId = context?.userId || context?.agentUserId;
+
+    if (!userId) {
+      throw new Error("Authentication required: no user context");
     }
+
     if (!Array.isArray(args.skillIds) || args.skillIds.length === 0) {
-        return { message: "skillIds must be a non-empty array of skill IDs." };
+      return { message: "skillIds must be a non-empty array of skill IDs." };
     }
-    return await agentModeService.installSkills(args.skillIds, context.userId, context.sessionId);
+
+    // For external MCP clients: validate and update session state
+    if (context?.updateInstalledSkills) {
+      const { skillService } = await import('../../services/skillService');
+      const { getAllowedSkills } = await import('../../services/subscriptionService');
+
+      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+        skillService.getPublishedSkills(),
+        getAllowedSkills(userId)
+      ]);
+
+      const isWildcard = userAllowedSkillIds.includes("*");
+      const allowedSkillSet = new Set(userAllowedSkillIds);
+
+      const validSkillIds = args.skillIds.filter((id: string) =>
+        (id === '__other_skills__' || publishedSkills.some(s => s.skillId === id)) &&
+        (isWildcard || allowedSkillSet.has(id))
+      );
+
+      if (validSkillIds.length === 0) {
+        return {
+          message: "No valid skills found. The requested skills may not exist or are not included in your subscription."
+        };
+      }
+
+      // Update MCP session's installed skills
+      context.updateInstalledSkills(validSkillIds);
+
+      const installedNames = validSkillIds.map((id: string) => {
+        if (id === '__other_skills__') return 'other_skills';
+        const skill = publishedSkills.find(s => s.skillId === id);
+        return skill?.name || id;
+      });
+
+      return {
+        success: true,
+        message: `Successfully installed ${installedNames.length} skill(s). Use list_tools to see newly available tools.`,
+        installedSkills: installedNames
+      };
+    }
+
+    // For internal clients (agent mode): use chat session pattern
+    if (!context?.sessionId) {
+      throw new Error("Missing session context");
+    }
+    return await agentModeService.installSkills(args.skillIds, userId, context.sessionId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_available_skills',
+  definition: {
+    name: 'list_available_skills',
+    description: 'List all available skills with their descriptions and tool lists. Use this to discover what capabilities Emma offers before installing skills. Returns skill catalog with IDs, names, descriptions, and tool names.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+
+    if (!userId) {
+      throw new Error("Authentication required");
+    }
+
+    const { skillService } = await import('../../services/skillService');
+    const { getAllowedSkills } = await import('../../services/subscriptionService');
+
+    const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+      skillService.getPublishedSkills(),
+      getAllowedSkills(userId)
+    ]);
+
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSkillSet = new Set(userAllowedSkillIds);
+
+    // Filter skills by user's subscription
+    const availableSkills = publishedSkills
+      .filter(skill => isWildcard || allowedSkillSet.has(skill.skillId))
+      .map(skill => ({
+        skillId: skill.skillId,
+        name: skill.name,
+        description: skill.description,
+        toolNames: skill.toolNames || [],
+        toolCount: (skill.toolNames || []).length
+      }));
+
+    // Add __other_skills__ virtual skill
+    if (isWildcard || allowedSkillSet.has('__other_skills__')) {
+      const { agentModeService } = await import('../../services/agentModeService');
+      const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
+
+      availableSkills.push({
+        skillId: '__other_skills__',
+        name: 'Other Tools',
+        description: 'Additional tools not part of any specific skill bundle',
+        toolNames: unassociatedTools,
+        toolCount: unassociatedTools.length
+      });
+    }
+
+    return {
+      skills: availableSkills,
+      totalSkills: availableSkills.length,
+      message: `Found ${availableSkills.length} available skill(s). Use install_skills(['skill-id']) to unlock their tools.`
+    };
   }
 });
 

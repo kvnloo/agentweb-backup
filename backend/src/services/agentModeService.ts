@@ -1632,21 +1632,33 @@ When a user requests client onboarding or says "onboard new client" or similar:
   }
 
   // Tools that are always available without installing a skill.
-  // install_skills is the skill installer itself; the rest are general-purpose primitives
-  // (search, read, plan, save) that most conversations need regardless of domain.
-  private static readonly FOUNDATION_TOOLS = new Set([
+  // These are Emma's core GTM infrastructure - context and discovery tools
+  // Made public for use in MCP server skill gating
+  public static readonly FOUNDATION_TOOLS = new Set([
+    // Discovery
     'install_skills',
-    'search_web',
-    'read_file_content',
-    'read_page_source',
+    'list_available_skills',
+
+    // GTM Context (Read/Write)
+    'update_brand_guidelines',
+    'read_brand_guidelines',
+    'update_market_strategy',
+    'read_market_strategy',
+
+    // Knowledge Base
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
+
+    // Work Plans (Emma's execution planning system)
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
-    'save_file',
-    'describe_image',
+
+    // GTM Discovery (teasers - hint at Emma's capabilities)
+    'search_leads',           // CRM teaser
+    'get_lead_lists',         // Lead management teaser
+    'list_connected_accounts' // Social/ads integration teaser
   ]);
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
