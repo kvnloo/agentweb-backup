@@ -29,6 +29,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Tasks appear alongside docs in each ClickUp workspace, showing name, status, priority, and due date',
       '- Attachments on each task are displayed as clickable links in the Knowledge Base UI',
       '- Agent Mode can list, search, and read ClickUp tasks via knowledge base tools',
+      'Fix: Blog Publish Preserves HTML Formatting',
+      '- Fixed blog articles losing custom CSS formatting (stat cards, TL;DR boxes, CTA blocks, FAQ sections) when published to Webflow',
+      '- Style blocks from the HTML head are now included with the article content sent to the CMS',
+      '- Articles not formatted for CMS publishing now prompt repair_blog_article first, which restructures the HTML to separate header elements from article content',
     ],
   },
   {
