@@ -1645,10 +1645,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'update_market_strategy',
     'read_market_strategy',
 
-    // Knowledge Base
+    // Knowledge Base & Research
     'search_knowledge_base',
     'list_knowledge_base_files',
     'read_knowledge_base_files',
+    'search_web',             // Web search - core research capability
 
     // Work Plans (Emma's execution planning system)
     'create_work_plan',

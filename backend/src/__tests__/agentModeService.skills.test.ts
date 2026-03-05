@@ -233,6 +233,12 @@ describe('AgentModeService - Skills', () => {
       expect(result.allowedToolNames.has('install_skills')).toBe(true);
     });
 
+    it('should include search_web in foundation tools', () => {
+      const result = (agentModeService as any).buildSkillContext([], ['*'], [], []);
+
+      expect(result.allowedToolNames.has('search_web')).toBe(true);
+    });
+
     it('should add skill toolNames to allowed set', () => {
       const skills = [
         { skillId: 's1', name: 'Skill', toolNames: ['tool1', 'tool2'], description: '', isPublished: true },

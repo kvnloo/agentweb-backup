@@ -9,6 +9,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-05',
     changes: [
+      'Bug Fix: Web Search Now Available in Scheduled Chats',
+      '- Fixed issue where search_web tool was not available to scheduled chat sessions',
+      '- Web search is now a foundation tool, always available without requiring skill installation',
+      '- This fixes scheduled blog article generation and other research-intensive scheduled tasks',
+    ],
+  },
+  {
+    date: '2026-03-05',
+    changes: [
       'Performance: Faster Cold-Load for Images, Videos, and Reports',
       '- First-time page loads are now ~14x faster for accounts with many agent sessions (e.g. ~1s vs ~12s for 243 sessions)',
       '- Session messages are now loaded in parallel batches instead of one-by-one',
