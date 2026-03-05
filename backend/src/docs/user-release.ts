@@ -65,6 +65,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Chat Messages Missing After Page Reload',
       '- Fixed a bug where long chat sessions lost recent messages after reloading the page',
       '- The message retrieval query now paginates through all DynamoDB results instead of stopping at the first 1MB page',
+      'Fix: Admin Users Tab Slow Loading',
+      '- The Users tab in the Admin Dashboard now loads significantly faster',
+      '- Replaced full task detail fetches with lightweight count queries, eliminating thousands of unnecessary DynamoDB calls',
     ],
   },
   {
