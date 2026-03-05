@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-04',
+    changes: [
+      'New: Gmail Integration',
+      '- Connect your Gmail account to Emma via Settings → Connected Accounts',
+      '- Emma can now read, search, and send emails on your behalf using your connected Gmail',
+      '- OAuth-based connection with automatic token refresh — no passwords stored',
+      '- Supports reply threading, CC/BCC, and HTML emails',
+      '- Available as an MCP tool for external clients (email search, read, send)',
+    ],
+  },
+  {
     date: '2026-03-05',
     changes: [
       'Bug Fix: Web Search Now Available in Scheduled Chats',
