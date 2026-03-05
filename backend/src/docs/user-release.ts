@@ -9,6 +9,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-05',
     changes: [
+      'Performance: Faster Cold-Load for Images, Videos, and Reports',
+      '- First-time page loads are now ~14x faster for accounts with many agent sessions (e.g. ~1s vs ~12s for 243 sessions)',
+      '- Session messages are now loaded in parallel batches instead of one-by-one',
+      '- Fixed a pagination bug that could miss task executions for users with large execution histories',
+    ],
+  },
+  {
+    date: '2026-03-05',
+    changes: [
       'MCP: Simplified Endpoint URL (Breaking Change)',
       '- The MCP server endpoint has been simplified from /mcp/server to /mcp for a cleaner, more intuitive URL',
       '- If you have external MCP clients connected, update your configuration from https://api.agentweb.pro/mcp/server to https://api.agentweb.pro/mcp',
