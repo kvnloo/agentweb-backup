@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-05',
+    changes: [
+      'MCP: Simplified Endpoint URL (Breaking Change)',
+      '- The MCP server endpoint has been simplified from /mcp/server to /mcp for a cleaner, more intuitive URL',
+      '- If you have external MCP clients connected, update your configuration from https://api.agentweb.pro/mcp/server to https://api.agentweb.pro/mcp',
+      '- All documentation (skill.md, AGENT_API.md) has been updated with the new endpoint',
+    ],
+  },
+  {
     date: '2026-03-04',
     changes: [
       'Agent Mode: Stability Improvements for Long Sessions',
