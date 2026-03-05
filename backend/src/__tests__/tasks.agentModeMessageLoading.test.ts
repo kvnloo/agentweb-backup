@@ -1,8 +1,6 @@
-// Unit tests for Agent Mode message loading fix in getExecutionsWithAssets
-// This test verifies message loading behavior.
-// Note: getUserSessions now loads messages from the messages table, but getChatSession
-// is still used in tasks.ts for full session data with all message details.
-// doesn't include them (which is the actual behavior)
+// Unit tests for Agent Mode message loading in getExecutionsWithAssets
+// Tests verify that getSessionsWithoutMessages + getMessagesFromMessagesTable are used
+// for incremental asset caching instead of loading full sessions.
 
 import express from 'express';
 import request from 'supertest';
@@ -50,6 +48,28 @@ jest.mock('../middleware/auth', () => ({
 // Import the router after mocking
 const router = require('../routes/tasks').default;
 
+/**
+ * Helper: set up mocks for getSessionsWithoutMessages + getMessagesFromMessagesTable.
+ * Takes sessions with messages, splits them into metadata-only sessions + message arrays.
+ */
+function mockSessionsForAssetLoading(sessions: Array<{ messages: any[]; [key: string]: any }>) {
+  const sessionsMeta = sessions.map(({ messages, ...meta }) => ({
+    ...meta,
+    messages: [],
+    messageCount: messages.length,
+  }));
+
+  (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue(sessionsMeta);
+
+  // Map sessionId → messages for getMessagesFromMessagesTable
+  const messagesBySession = new Map(sessions.map(s => [s.sessionId, s.messages]));
+  (ChatbotDB.prototype.getMessagesFromMessagesTable as jest.Mock).mockImplementation((sid: string) => {
+    return Promise.resolve(messagesBySession.get(sid) || []);
+  });
+
+  (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);
+}
+
 describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
   let app: express.Application;
   const mockUserId = 'user123';
@@ -62,12 +82,35 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
   });
 
   describe('GET /executions/with-images', () => {
-    it('should load full session data via getChatSession for detailed message processing', async () => {
+    it('should load session messages via getMessagesFromMessagesTable for asset scanning', async () => {
       const sessionId = 'session-123';
       const imageUrl = 'https://example.com/image.png';
 
-      // Mock getUserSessions to return sessions WITH messages (from messages table)
-      const sessionWithoutMessages = {
+      const messages = [
+        {
+          role: 'assistant',
+          content: 'Generated an image',
+          timestamp: '2024-01-01T12:00:00Z',
+          metadata: {
+            portalType: 'agent' as const,
+            timestamp: '2024-01-01T12:00:00Z',
+            toolCalls: [
+              {
+                id: 'tool-call-1',
+                name: 'generate_image',
+                arguments: {},
+                result: {
+                  success: true,
+                  imageUrl: imageUrl,
+                  filename: 'generated-image.png'
+                }
+              }
+            ]
+          }
+        }
+      ];
+
+      mockSessionsForAssetLoading([{
         sessionId,
         userId: mockUserId,
         title: 'Test Session',
@@ -75,48 +118,9 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         updatedAt: '2024-01-01T12:00:00Z',
         archived: false,
         favorites: {},
-        archives: {}
-        // Note: messages are now loaded from messages table by getUserSessions
-      };
-
-      // Mock getChatSession to return session WITH messages (what our fix does)
-      const sessionWithMessages = {
-        ...sessionWithoutMessages,
-        messages: [
-          {
-            role: 'assistant',
-            content: 'Generated an image',
-            timestamp: '2024-01-01T12:00:00Z',
-            metadata: {
-              portalType: 'agent' as const,
-              timestamp: '2024-01-01T12:00:00Z',
-              toolCalls: [
-                {
-                  id: 'tool-call-1',
-                  name: 'generate_image',
-                  arguments: {},
-                  result: {
-                    success: true,
-                    imageUrl: imageUrl,
-                    filename: 'generated-image.png'
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [sessionWithoutMessages]
-      });
-
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockImplementation((sid: string) => {
-        if (sid === sessionId) {
-          return Promise.resolve(sessionWithMessages);
-        }
-        return Promise.resolve(null);
-      });
+        archives: {},
+        messages,
+      }]);
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
@@ -125,8 +129,8 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         .get('/api/tasks/executions/with-images')
         .expect(200);
 
-      // Verify getChatSession was called for the session
-      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId);
+      // Verify getSessionsWithoutMessages was called
+      expect(ChatbotDB.prototype.getSessionsWithoutMessages).toHaveBeenCalledWith(mockUserId, 'agent');
 
       // Verify the image was found and included in results
       const taskKey = `agent-mode-${sessionId}`;
@@ -141,7 +145,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
     it('should handle sessions that have no messages after loading', async () => {
       const sessionId = 'session-456';
 
-      const sessionWithoutMessages = {
+      mockSessionsForAssetLoading([{
         sessionId,
         userId: mockUserId,
         title: 'Empty Session',
@@ -149,20 +153,9 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         updatedAt: '2024-01-01T12:00:00Z',
         archived: false,
         favorites: {},
-        archives: {}
-      };
-
-      // getChatSession returns session with empty messages array
-      const sessionWithEmptyMessages = {
-        ...sessionWithoutMessages,
-        messages: []
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [sessionWithoutMessages]
-      });
-
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(sessionWithEmptyMessages);
+        archives: {},
+        messages: [],
+      }]);
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
@@ -171,46 +164,10 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         .get('/api/tasks/executions/with-images')
         .expect(200);
 
-      // Verify getChatSession was called
-      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId);
+      // Verify getSessionsWithoutMessages was called
+      expect(ChatbotDB.prototype.getSessionsWithoutMessages).toHaveBeenCalledWith(mockUserId, 'agent');
 
       // Verify no images were found (session has no messages with tool calls)
-      const taskKey = `agent-mode-${sessionId}`;
-      expect(response.body[taskKey]).toBeUndefined();
-    });
-
-    it('should handle sessions that return null from getChatSession', async () => {
-      const sessionId = 'session-789';
-
-      const sessionWithoutMessages = {
-        sessionId,
-        userId: mockUserId,
-        title: 'Missing Session',
-        createdAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-01T12:00:00Z',
-        archived: false,
-        favorites: {},
-        archives: {}
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [sessionWithoutMessages]
-      });
-
-      // getChatSession returns null (session not found)
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(null);
-
-      (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
-      (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
-
-      const response = await request(app)
-        .get('/api/tasks/executions/with-images')
-        .expect(200);
-
-      // Verify getChatSession was called
-      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId);
-
-      // Verify no images were found
       const taskKey = `agent-mode-${sessionId}`;
       expect(response.body[taskKey]).toBeUndefined();
     });
@@ -218,20 +175,20 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
     it('should skip archived sessions', async () => {
       const sessionId = 'session-archived';
 
-      const archivedSession = {
+      // getSessionsWithoutMessages already filters out archived sessions,
+      // but test that the code handles it if one slips through
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{
         sessionId,
         userId: mockUserId,
         title: 'Archived Session',
         createdAt: '2024-01-01T00:00:00Z',
         updatedAt: '2024-01-01T12:00:00Z',
-        archived: true, // Session is archived
+        archived: true,
         favorites: {},
-        archives: {}
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [archivedSession]
-      });
+        archives: {},
+        messages: [],
+      }]);
+      (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
@@ -240,8 +197,8 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         .get('/api/tasks/executions/with-images')
         .expect(200);
 
-      // Verify getChatSession was NOT called for archived sessions
-      expect(ChatbotDB.prototype.getChatSession).not.toHaveBeenCalled();
+      // Verify no messages were loaded for archived sessions
+      expect(ChatbotDB.prototype.getMessagesFromMessagesTable).not.toHaveBeenCalled();
 
       // Verify no images were found
       const taskKey = `agent-mode-${sessionId}`;
@@ -254,7 +211,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
       const imageUrl1 = 'https://example.com/image1.png';
       const imageUrl2 = 'https://example.com/image2.png';
 
-      const sessionsWithoutMessages = [
+      mockSessionsForAssetLoading([
         {
           sessionId: sessionId1,
           userId: mockUserId,
@@ -263,7 +220,26 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
           updatedAt: '2024-01-01T12:00:00Z',
           archived: false,
           favorites: {},
-          archives: {}
+          archives: {},
+          messages: [
+            {
+              role: 'assistant',
+              content: 'Generated image 1',
+              timestamp: '2024-01-01T12:00:00Z',
+              metadata: {
+                portalType: 'agent' as const,
+                timestamp: '2024-01-01T12:00:00Z',
+                toolCalls: [
+                  {
+                    id: 'tool-call-1',
+                    name: 'generate_image',
+                    arguments: {},
+                    result: { success: true, imageUrl: imageUrl1, filename: 'image1.png' }
+                  }
+                ]
+              }
+            }
+          ],
         },
         {
           sessionId: sessionId2,
@@ -273,77 +249,28 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
           updatedAt: '2024-01-02T12:00:00Z',
           archived: false,
           favorites: {},
-          archives: {}
-        }
-      ];
-
-      const session1WithMessages = {
-        ...sessionsWithoutMessages[0],
-        messages: [
-          {
-            role: 'assistant',
-            content: 'Generated image 1',
-            timestamp: '2024-01-01T12:00:00Z',
-            metadata: {
-              portalType: 'agent' as const,
-              timestamp: '2024-01-01T12:00:00Z',
-              toolCalls: [
-                {
-                  id: 'tool-call-1',
-                  name: 'generate_image',
-                  arguments: {},
-                  result: {
-                    success: true,
-                    imageUrl: imageUrl1,
-                    filename: 'image1.png'
-                  }
-                }
-              ]
-            }
-          }
-        ]
-      };
-
-      const session2WithMessages = {
-        ...sessionsWithoutMessages[1],
-        messages: [
-          {
-            role: 'assistant',
-            content: 'Generated image 2',
-            timestamp: '2024-01-02T12:00:00Z',
-            metadata: {
-              portalType: 'agent' as const,
+          archives: {},
+          messages: [
+            {
+              role: 'assistant',
+              content: 'Generated image 2',
               timestamp: '2024-01-02T12:00:00Z',
-              toolCalls: [
-                {
-                  id: 'tool-call-2',
-                  name: 'generate_image',
-                  arguments: {},
-                  result: {
-                    success: true,
-                    imageUrl: imageUrl2,
-                    filename: 'image2.png'
+              metadata: {
+                portalType: 'agent' as const,
+                timestamp: '2024-01-02T12:00:00Z',
+                toolCalls: [
+                  {
+                    id: 'tool-call-2',
+                    name: 'generate_image',
+                    arguments: {},
+                    result: { success: true, imageUrl: imageUrl2, filename: 'image2.png' }
                   }
-                }
-              ]
+                ]
+              }
             }
-          }
-        ]
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: sessionsWithoutMessages
-      });
-
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockImplementation((sid: string) => {
-        if (sid === sessionId1) {
-          return Promise.resolve(session1WithMessages);
-        }
-        if (sid === sessionId2) {
-          return Promise.resolve(session2WithMessages);
-        }
-        return Promise.resolve(null);
-      });
+          ],
+        },
+      ]);
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
@@ -351,10 +278,6 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
       const response = await request(app)
         .get('/api/tasks/executions/with-images')
         .expect(200);
-
-      // Verify getChatSession was called for both sessions
-      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId1);
-      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId2);
 
       // Verify both images were found
       const taskKey1 = `agent-mode-${sessionId1}`;
@@ -370,7 +293,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
       const generatedImageUrl = 'https://example.com/generated.png';
       const uploadedImageUrl = 'https://example.com/uploaded.png';
 
-      const sessionWithoutMessages = {
+      mockSessionsForAssetLoading([{
         sessionId,
         userId: mockUserId,
         title: 'Mixed Session',
@@ -378,11 +301,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         updatedAt: '2024-01-01T12:00:00Z',
         archived: false,
         favorites: {},
-        archives: {}
-      };
-
-      const sessionWithMessages = {
-        ...sessionWithoutMessages,
+        archives: {},
         messages: [
           {
             role: 'assistant',
@@ -396,11 +315,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
                   id: 'tool-call-1',
                   name: 'generate_image',
                   arguments: {},
-                  result: {
-                    success: true,
-                    imageUrl: generatedImageUrl,
-                    filename: 'generated.png'
-                  }
+                  result: { success: true, imageUrl: generatedImageUrl, filename: 'generated.png' }
                 }
               ]
             }
@@ -417,23 +332,13 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
                   id: 'tool-call-2',
                   name: 'upload_image',
                   arguments: {},
-                  result: {
-                    success: true,
-                    imageUrl: uploadedImageUrl,
-                    filename: 'uploaded.png'
-                  }
+                  result: { success: true, imageUrl: uploadedImageUrl, filename: 'uploaded.png' }
                 }
               ]
             }
           }
-        ]
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [sessionWithoutMessages]
-      });
-
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(sessionWithMessages);
+        ],
+      }]);
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
@@ -445,7 +350,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
       const taskKey = `agent-mode-${sessionId}`;
       expect(response.body[taskKey]).toBeDefined();
       expect(response.body[taskKey].executions[0].result_files).toHaveLength(2);
-      
+
       const imageUrls = response.body[taskKey].executions[0].result_files.map((f: any) => f.url);
       expect(imageUrls).toContain(generatedImageUrl);
       expect(imageUrls).toContain(uploadedImageUrl);
@@ -453,11 +358,11 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
   });
 
   describe('GET /executions/with-videos', () => {
-    it('should load messages via getChatSession for videos as well', async () => {
+    it('should load messages via getMessagesFromMessagesTable for videos', async () => {
       const sessionId = 'session-video';
       const videoUrl = 'https://example.com/video.mp4';
 
-      const sessionWithoutMessages = {
+      mockSessionsForAssetLoading([{
         sessionId,
         userId: mockUserId,
         title: 'Video Session',
@@ -465,11 +370,7 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         updatedAt: '2024-01-01T12:00:00Z',
         archived: false,
         favorites: {},
-        archives: {}
-      };
-
-      const sessionWithMessages = {
-        ...sessionWithoutMessages,
+        archives: {},
         messages: [
           {
             role: 'assistant',
@@ -483,23 +384,13 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
                   id: 'tool-call-1',
                   name: 'generate_video',
                   arguments: {},
-                  result: {
-                    success: true,
-                    videoUrl: videoUrl,
-                    filename: 'generated-video.mp4'
-                  }
+                  result: { success: true, videoUrl: videoUrl, filename: 'generated-video.mp4' }
                 }
               ]
             }
           }
-        ]
-      };
-
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({
-        sessions: [sessionWithoutMessages]
-      });
-
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(sessionWithMessages);
+        ],
+      }]);
 
       (taskDb.getAllTaskExecutionsByUserId as jest.Mock).mockResolvedValue([]);
       (taskDb.getTasksByUserId as jest.Mock).mockResolvedValue([]);
@@ -508,8 +399,8 @@ describe('Tasks Routes - Agent Mode Message Loading Fix', () => {
         .get('/api/tasks/executions/with-videos')
         .expect(200);
 
-      // Verify getChatSession was called
-      expect(ChatbotDB.prototype.getChatSession).toHaveBeenCalledWith(sessionId);
+      // Verify getSessionsWithoutMessages was called
+      expect(ChatbotDB.prototype.getSessionsWithoutMessages).toHaveBeenCalledWith(mockUserId, 'agent');
 
       // Verify the video was found
       const taskKey = `agent-mode-${sessionId}`;

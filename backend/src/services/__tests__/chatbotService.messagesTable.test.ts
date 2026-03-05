@@ -109,6 +109,11 @@ describe('ChatbotDB - Messages Table', () => {
         promise: jest.fn().mockResolvedValue({}),
       });
 
+      // Mock update for incrementMessageCount during migration
+      mockDocClient.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
       const result = await chatbotDb.getChatSession(sessionId);
 
       // Verify session was retrieved
@@ -150,6 +155,12 @@ describe('ChatbotDB - Messages Table', () => {
           ],
         },
       });
+
+      // Verify messageCount was set during migration for asset cache tracking
+      expect(mockDocClient.update).toHaveBeenCalledWith(expect.objectContaining({
+        UpdateExpression: 'ADD messageCount :count',
+        ExpressionAttributeValues: { ':count': 2 },
+      }));
 
       // Verify result has messages from session (migrated)
       expect(result).toBeDefined();
@@ -307,8 +318,11 @@ describe('ChatbotDB - Messages Table', () => {
         },
       });
 
-      // Verify session table was NOT updated
-      expect(mockDocClient.update).not.toHaveBeenCalled();
+      // Verify session table was only updated for messageCount increment (not messages)
+      expect(mockDocClient.update).toHaveBeenCalledTimes(1);
+      expect(mockDocClient.update).toHaveBeenCalledWith(expect.objectContaining({
+        UpdateExpression: 'ADD messageCount :count',
+      }));
 
       // Verify result includes the new message
       expect(result).toBeDefined();
@@ -434,8 +448,11 @@ describe('ChatbotDB - Messages Table', () => {
         },
       });
 
-      // Verify session table was NOT updated
-      expect(mockDocClient.update).not.toHaveBeenCalled();
+      // Verify session table was only updated for messageCount increment (not messages)
+      expect(mockDocClient.update).toHaveBeenCalledTimes(1);
+      expect(mockDocClient.update).toHaveBeenCalledWith(expect.objectContaining({
+        UpdateExpression: 'ADD messageCount :count',
+      }));
 
       // Verify result includes the new messages
       expect(result).toBeDefined();
