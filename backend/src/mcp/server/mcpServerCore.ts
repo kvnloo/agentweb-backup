@@ -134,24 +134,12 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
 
   /**
    * Handler for listing available tools.
-   * External clients see only foundation tools + installed skill tools.
-   * Internal clients see all tools (no filtering).
+   * ALL clients now see all tools (no skill-gating).
+   * Tool descriptions guide proper usage.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const allTools = mcpToolRegistry.getToolDefinitions();
-
-    // Internal clients see all tools
-    if (sessionContext?.isInternal) {
-      return { tools: allTools };
-    }
-
-    // External clients: filter by installed skills + foundation tools
-    const installedSkills = sessionContext?.installedSkills || new Set<string>();
-    const allowedToolNames = await getAllowedToolNames(installedSkills);
-
-    return {
-      tools: allTools.filter(tool => allowedToolNames.has(tool.name))
-    };
+    return { tools: allTools };
   });
   /**
    * Handler for tool execution.
@@ -178,20 +166,7 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       }
     };
 
-    // Validate tool is allowed for external clients
-    if (!sessionContext?.isInternal && !FOUNDATION_TOOLS.has(name)) {
-      const allowedToolNames = await getAllowedToolNames(sessionContext?.installedSkills || new Set());
-
-      if (!allowedToolNames.has(name)) {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: Tool '${name}' requires a skill to be installed. Use install_skills(['skill-id']) or list_available_skills() to see available capabilities.`
-          }],
-          isError: true
-        };
-      }
-    }
+    // All tools are available to all clients (no skill-gating validation)
 
     try {
       const result = await mcpToolRegistry.execute(name, toolArgs, context);
