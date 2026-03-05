@@ -2048,52 +2048,54 @@ async function getExecutionsWithAssets(
     // Load sessions metadata only (no messages) — single DynamoDB query
     const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
 
-    for (const session of agentSessions) {
-      if (session.archived) continue;
+    // Phase 1: Load messages in parallel batches (avoid DynamoDB throttling)
+    const BATCH_SIZE = 15;
+    const activeSessions = agentSessions.filter(s => !s.archived);
+    const sessionResults: Array<{ session: typeof activeSessions[0]; messages: any[]; existingCache: any }> = [];
 
-      // Determine if we need to scan messages at all
-      const cachedScanIndex = session.assetScanIndex ?? 0;
-      const cachedMessageCount = session.messageCount ?? 0;
-      const hasCache = session.assetCache !== undefined && session.assetScanIndex !== undefined;
+    for (let i = 0; i < activeSessions.length; i += BATCH_SIZE) {
+      const batch = activeSessions.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.all(batch.map(async (session) => {
+        const cachedScanIndex = session.assetScanIndex ?? 0;
+        const cachedMessageCount = session.messageCount ?? 0;
+        const hasCache = session.assetCache !== undefined && session.assetScanIndex !== undefined;
 
-      let messages: any[];
-      let existingCache = session.assetCache || { images: [], videos: [], htmlReports: [] };
+        let messages: any[];
+        let existingCache = session.assetCache || { images: [], videos: [], htmlReports: [] };
 
-      if (hasCache && cachedMessageCount > 0 && cachedScanIndex >= cachedMessageCount) {
-        // Cache is up to date and messageCount is tracked — no message reads needed
-        messages = [];
-      } else if (hasCache && cachedMessageCount === 0) {
-        // Legacy session: cache exists but messageCount was never set.
-        // Trust the cache — no new messages can arrive without incrementing messageCount.
-        messages = [];
-      } else if (hasCache && cachedScanIndex > 0 && cachedScanIndex < cachedMessageCount) {
-        // Delta scan — only load new messages
-        messages = await chatbotDb.getMessagesFromIndex(session.sessionId, cachedScanIndex);
-      } else {
-        // First time or no cache — full message scan
-        messages = await chatbotDb.getMessagesFromMessagesTable(session.sessionId);
-        existingCache = { images: [], videos: [], htmlReports: [] };
-      }
+        if (hasCache && cachedMessageCount > 0 && cachedScanIndex >= cachedMessageCount) {
+          messages = [];
+        } else if (hasCache && cachedMessageCount === 0) {
+          messages = [];
+        } else if (hasCache && cachedScanIndex > 0 && cachedScanIndex < cachedMessageCount) {
+          messages = await chatbotDb.getMessagesFromIndex(session.sessionId, cachedScanIndex);
+        } else {
+          messages = await chatbotDb.getMessagesFromMessagesTable(session.sessionId);
+          existingCache = { images: [], videos: [], htmlReports: [] };
+        }
 
-      // Scan new messages for assets (all types in one pass)
+        return { session, messages, existingCache };
+      }));
+      sessionResults.push(...batchResults);
+    }
+
+    // Phase 2: Process results sequentially (fast, no I/O)
+    for (const { session, messages, existingCache } of sessionResults) {
       if (messages.length > 0) {
         const newAssets = scanMessagesForAssets(messages, session);
         existingCache.images.push(...newAssets.images);
         existingCache.videos.push(...newAssets.videos);
         existingCache.htmlReports.push(...newAssets.htmlReports);
 
-        // Compute new scan index: max messageIndex + 1 from scanned messages, or total count
         const maxIndex = messages.reduce((max: number, m: any) => {
           const idx = m.messageIndex ?? 0;
           return idx > max ? idx : max;
         }, 0);
         const newScanIndex = maxIndex + 1;
 
-        // Update cache in background (don't await)
         chatbotDb.updateAssetCache(session.sessionId, existingCache, newScanIndex);
       }
 
-      // Now build result entries from the cache for the requested asset type
       const sessionKey = `agent-mode-${session.sessionId}`;
 
       if (assetType === 'images') {
