@@ -690,12 +690,19 @@ When making changes, these files are critical to understand:
 - Email notifications use both SMTP and Resend API
 - Slack integration for GTM plan approvals via webhooks
 
-## Test Account
+## Test Accounts
 
 For manual testing on test/staging environments:
 
+### Admin/Full Access Account
 - **Email:** `test@example.com`
 - **Password:** `Test123!`
+
+### Basic Subscription Account (DIY Users)
+- **Email:** `test1@example.com`
+- **Password:** `Test123!`
+- **Subscription:** Basic (default for DIY users)
+- **Purpose:** Test features available to users with Basic subscription
 
 ## Cloud Test Environment
 
