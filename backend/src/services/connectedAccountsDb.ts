@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'meta' | 'twitter' | 'instagram';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -43,6 +43,22 @@ export interface LinkedInConfig extends BaseOAuthConfig {
 }
 
 /**
+ * LinkedIn Outreach (Unipile) Configuration
+ * Unipile manages the actual credentials — we store the Unipile account ID
+ * and a far-future expiry so status checks always show 'active'.
+ */
+export interface LinkedInOutreachConfig {
+  account_type: 'personal';
+  unipile_account_id: string;
+  username?: string;
+  // Required by BaseOAuthConfig consumers — Unipile manages auth internally
+  access_token: string;
+  refresh_token?: undefined;
+  token_expires_at: number;
+  scopes?: string[];
+}
+
+/**
  * Meta Ad Account Configuration
  */
 export interface MetaAdAccountConfig extends BaseOAuthConfig {
@@ -76,7 +92,7 @@ export type MetaConfig = MetaAdAccountConfig | MetaPageConfig | MetaInstagramBus
  * Union type for all platform-specific configurations.
  * Add new platform configs here as they are implemented.
  */
-export type PlatformConfig = LinkedInConfig | MetaConfig; // | TwitterConfig
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig; // | TwitterConfig
 
 /**
  * Connected Account configuration stored in the User record

@@ -249,3 +249,44 @@ export async function getGoogleDriveServiceAccountEmail(): Promise<string> {
     throw new Error('Failed to fetch Google Drive service account email from Secrets Manager');
   }
 }
+/**
+ * Interface for Unipile credentials returned from Secrets Manager.
+ * Store as JSON: { "dsn": "https://api3.unipile.com:13311", "apiKey": "your_key" }
+ */
+export interface UnipileCredentials {
+  dsn: string;
+  apiKey: string;
+}
+
+/**
+ * Get Unipile credentials (DSN + API key) from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Unipile (or prod/AgentWeb/Unipile for production)
+ *
+ * @returns The Unipile DSN and API key
+ */
+export async function getUnipileCredentials(): Promise<UnipileCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Unipile'
+      : 'dev/AgentWeb/Unipile';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Unipile credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as UnipileCredentials;
+
+    if (!credentials.dsn || !credentials.apiKey) {
+      throw new Error('Unipile credentials missing dsn or apiKey');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Unipile credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Unipile credentials from Secrets Manager');
+  }
+}

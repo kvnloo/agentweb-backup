@@ -22,6 +22,7 @@ import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
+import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
@@ -16572,6 +16573,54 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         success: false,
         message: 'Failed to get post analytics',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Perform LinkedIn outreach actions using Unipile API.
+   * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
+   */
+  async linkedinOutreach(userId: string, args: any): Promise<any> {
+    const { action, account_id, profile_url, provider_id, message } = args;
+    console.log(`[AgentMode] linkedinOutreach called: action=${action}, account_id=${account_id}`);
+
+    // The service accepts either a LinkedIn URL or a raw provider_id.
+    // We know which one it is based on which arg was provided.
+    const isUrl = !!profile_url;
+    const target = profile_url || provider_id;
+
+    try {
+      switch (action) {
+        case 'send-invite': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
+          const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
+          return { success: true, data: inviteResult };
+        }
+
+        case 'send-message': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for send-message');
+          if (!message) throw new Error('message is required for send-message action');
+          const messageResponse = await linkedInOutreachService.sendMessage(account_id, target, isUrl, message);
+          return { success: true, data: messageResponse };
+        }
+
+        default:
+          throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      // Errors that went through handleError are already logged by the service; don't double-log.
+      // Also suppress user-facing errors like "Cannot send message: not a 1st-degree connection".
+      const alreadyLogged = error instanceof Error && !!(error as any).structuredError;
+      const isExpectedUserError = errorMessage.startsWith('Cannot send message:');
+      if (!alreadyLogged && !isExpectedUserError) {
+        console.error('AgentMode: LinkedIn outreach failed:', error);
+      }
+      return {
+        success: false,
+        message: 'LinkedIn outreach action failed',
+        error: errorMessage
       };
     }
   }
