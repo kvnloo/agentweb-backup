@@ -146,6 +146,10 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
+      - name: Copy dev env user-data script into dist
+        working-directory: backend
+        run: cp ../test-env/user-data-dev-auto.sh dist/
+
       - name: Package artifact
         working-directory: backend
         run: |

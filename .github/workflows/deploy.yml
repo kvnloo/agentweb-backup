@@ -78,6 +78,10 @@ jobs:
           fi
           echo "pr_num=$PR_NUM" >> $GITHUB_OUTPUT
 
+      - name: Copy dev env user-data script into dist
+        working-directory: backend
+        run: cp ../test-env/user-data-dev-auto.sh dist/
+
       - name: Package artifact
         working-directory: backend
         run: |
