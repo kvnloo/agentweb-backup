@@ -23,7 +23,7 @@ Emma exposes a Streamable HTTP MCP server. Configure your MCP client to connect:
   "mcpServers": {
     "emma": {
       "type": "streamable-http",
-      "url": "https://api.agentweb.pro/mcp",
+      "url": "https://api.agentweb.pro/mcp/server",
       "headers": {
         "Authorization": "Bearer YOUR_MCP_ACCESS_TOKEN"
       }
