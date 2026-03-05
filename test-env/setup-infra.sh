@@ -230,7 +230,7 @@ TRUST_POLICY='{
   }]
 }'
 
-# Permissions — read secrets, manage SG ingress, describe own tags
+# Permissions — read secrets, manage SG ingress, describe own tags, DynamoDB access
 PERMISSIONS_POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -258,6 +258,30 @@ PERMISSIONS_POLICY='{
       "Effect": "Allow",
       "Action": ["ec2:DescribeTags"],
       "Resource": "*"
+    },
+    {
+      "Sid": "DynamoDBListAndDescribe",
+      "Effect": "Allow",
+      "Action": ["dynamodb:ListTables", "dynamodb:DescribeTable"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DynamoDBProdReadOnly",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchGetItem"],
+      "Resource": [
+        "arn:aws:dynamodb:'"$REGION"':'"$ACCOUNT_ID"':table/AW-*",
+        "arn:aws:dynamodb:'"$REGION"':'"$ACCOUNT_ID"':table/AW-*/index/*"
+      ]
+    },
+    {
+      "Sid": "DynamoDBDevReadWrite",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchGetItem", "dynamodb:BatchWriteItem"],
+      "Resource": [
+        "arn:aws:dynamodb:'"$REGION"':'"$ACCOUNT_ID"':table/Dev-AW-*",
+        "arn:aws:dynamodb:'"$REGION"':'"$ACCOUNT_ID"':table/Dev-AW-*/index/*"
+      ]
     }
   ]
 }'
