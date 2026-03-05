@@ -734,13 +734,26 @@ export class ChatbotDB {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      if (!result.Items || result.Items.length === 0) {
+      // Paginate through all results (DynamoDB returns max 1MB per query)
+      let allItems: any[] = [];
+      let lastKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+        }).promise();
+        if (result.Items) {
+          allItems.push(...result.Items);
+        }
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+
+      if (allItems.length === 0) {
         return [];
       }
       // Extract messages and check if repair is needed in ONE pass (items already sorted asc by messageIndex)
       let shouldRepair = false;
-      const messages = result.Items.map((item) => {
+      const messages = allItems.map((item) => {
           const msg = item.message;
 
           // Check if this message has broken tool results (during the same map iteration)
