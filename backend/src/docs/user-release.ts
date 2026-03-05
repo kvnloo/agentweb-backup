@@ -18,6 +18,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-04',
     changes: [
+      'Performance: Images, Videos, and Reports Pages Load 10x Faster',
+      '- Pages now load in ~1 second instead of ~10 seconds thanks to incremental asset caching',
+      '- Previously, every page view scanned all chat session messages — now assets are cached and only new messages are scanned',
+      '- Image thumbnails now use lazy loading for faster initial page render',
+    ],
+  },
+  {
+    date: '2026-03-04',
+    changes: [
       'MCP: Skill-Gated Tool Discovery',
       '- External MCP clients (Claude Code, OpenClaw) now see only foundation tools by default, reducing cognitive overload from 100+ tools',
       '- Use list_available_skills() to browse Emma\'s skill catalog before installation',
