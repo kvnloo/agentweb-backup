@@ -314,7 +314,7 @@ export async function launchEnvironment(
     // 4. Read user-data script
     const userDataPath = path.resolve(
       __dirname,
-      "../../../test-env/user-data-dev-auto.sh"
+      "../user-data-dev-auto.sh"
     );
     const userDataScript = fs.readFileSync(userDataPath, "utf-8");
     const userDataBase64 = Buffer.from(userDataScript).toString("base64");
