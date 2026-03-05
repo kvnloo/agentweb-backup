@@ -18,6 +18,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-04',
     changes: [
+      'MCP: Skill-Gated Tool Discovery',
+      '- External MCP clients (Claude Code, OpenClaw) now see only foundation tools by default, reducing cognitive overload from 100+ tools',
+      '- Use list_available_skills() to browse Emma\'s skill catalog before installation',
+      '- Use install_skills([\'skill-id\']) to unlock tools progressively as needed',
+      '- Foundation tools now focus on Emma\'s unique GTM infrastructure: brand guidelines, market strategy, knowledge base, work plans, and discovery tools',
+      '- Internal clients (Agent Mode) bypass skill gating and continue to see all tools',
+      'MCP: Server Identity Updated',
+      '- MCP server now identifies as "Emma - GTM Automation Specialist" to signal GTM expertise to AI assistants',
       'Agent Mode: Stability Improvements for Long Sessions',
       '- Sessions with many tool calls (search, read, publish) no longer crash from exceeding the LLM context window',
       '- Transient LLM errors (503, 429, timeouts) are now automatically retried with exponential backoff',

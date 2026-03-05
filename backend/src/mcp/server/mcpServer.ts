@@ -18,6 +18,9 @@ const CLEANUP_INTERVAL_MS = parseInt(process.env.MCP_CLEANUP_INTERVAL_MS || '360
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;
   lastActivity: number;
+  installedSkills: Set<string>;  // Tracks installed skill IDs
+  agentUserId?: string;           // User ID from API key auth
+  isInternal: boolean;            // Internal clients bypass skill gating
 }
 
 /**
@@ -76,6 +79,7 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
 
       // Store the userId from the API key on the request for downstream use
       (req as any)._agentApiUserId = keyRecord.userId;
+      (req as any)._mcpIsInternal = false;  // External client
       return next();
     } catch (error) {
       console.error("[MCP] Error validating agent API key:", error);
@@ -86,6 +90,7 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
   // 2. Check static MCP_ACCESS_TOKEN (internal backend-to-backend)
   const expectedToken = process.env.MCP_ACCESS_TOKEN;
   if (expectedToken && providedToken === expectedToken) {
+    (req as any)._mcpIsInternal = true;  // Internal client
     return next();
   }
 
@@ -102,6 +107,7 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
         });
       }
       (req as any)._agentApiUserId = tokenRecord.userId;
+      (req as any)._mcpIsInternal = false;  // External client
       return next();
     }
   } catch (error) {
@@ -192,11 +198,16 @@ export function setupMcpServer(app: express.Express) {
   process.on('SIGTERM', () => handleShutdown('SIGTERM'));
   process.on('SIGINT', () => handleShutdown('SIGINT'));
 
-  // Use shared server factory from core module, passing API key userId if present
-  const createServer = (req?: Request) =>
-    createMcpServer("agentweb-http-server", {
-      agentUserId: (req as any)?._agentApiUserId,
+  // Use shared server factory from core module, passing session context
+  const createServer = (req?: Request, sessionId?: string) => {
+    const sessionEntry = sessionId ? sessions.get(sessionId) : undefined;
+    return createMcpServer("Emma - GTM Automation Specialist", {
+      agentUserId: sessionEntry?.agentUserId || (req as any)?._agentApiUserId,
+      sessionId: sessionId,
+      installedSkills: sessionEntry?.installedSkills || new Set(),
+      isInternal: sessionEntry?.isInternal || (req as any)?._mcpIsInternal || false
     });
+  };
 
   // POST handler - handles all JSON-RPC messages including initialization
   // Note: express.json() is added here because MCP routes are mounted before global body parser
@@ -217,14 +228,24 @@ export function setupMcpServer(app: express.Express) {
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // New initialization request - create new transport
         console.log("[MCP] New Streamable HTTP connection - initializing session");
-        
+
+        // Create session state that will be shared between server and session entry
+        const sharedState = {
+          installedSkills: new Set<string>(),
+          agentUserId: (req as any)._agentApiUserId,
+          isInternal: (req as any)._mcpIsInternal || false
+        };
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId: string) => {
             console.log(`[MCP-SERVER-DEBUG] New MCP session created: ${newSessionId}`);
             sessions.set(newSessionId, {
               transport,
-              lastActivity: Date.now()
+              lastActivity: Date.now(),
+              installedSkills: sharedState.installedSkills,
+              agentUserId: sharedState.agentUserId,
+              isInternal: sharedState.isInternal
             });
           }
         });
@@ -238,7 +259,13 @@ export function setupMcpServer(app: express.Express) {
         };
 
         // Connect server to transport BEFORE handling request
-        const server = createServer(req);
+        // Pass the shared state so server handlers can access the same Set
+        const server = createMcpServer("Emma - GTM Automation Specialist", {
+          agentUserId: sharedState.agentUserId,
+          sessionId: undefined,
+          installedSkills: sharedState.installedSkills,
+          isInternal: sharedState.isInternal
+        });
         await server.connect(transport);
         
         // Handle the initialization request
