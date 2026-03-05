@@ -731,8 +731,14 @@ When the user says **"prep for deploy \<date\>"** (default: today's date if omit
 1. Add release notes entries for the date, following existing format in each file:
    - **Backend changes:** `backend/src/docs/user-release.ts`
    - **Partner portal changes:** `partner-portal/src/docs/release.ts`
-2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: update/add unit tests as needed and run them (`npm test`), plus `npx tsc` for backend. **CI requires ≥90% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
+2. For each of `backend/`, `partner-portal/`, `customer-portal/` with code changes: 
+   - **Backend:** Run `npm run test:coverage -- --coverageReporters=text --coverageReporters=json-summary` to verify coverage ≥90% on all metrics
+   - **Backend:** Run `npx tsc` to verify TypeScript compilation
+   - **Frontend:** Run `npm test` for unit tests
+   - Fix any failing tests before proceeding
+   - **CI requires ≥90% coverage on statements, branches, functions, and lines.** Ensure new code branches are covered by tests.
 3. Commit changes and create PRs for **both** repos:
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
    - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR
 4. Return both PR URLs to the user
+
