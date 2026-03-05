@@ -709,8 +709,18 @@ export class ChatbotDB {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      return result.Count || 0;
+      // Paginate through all results (DynamoDB returns max 1MB per query, even for COUNT)
+      let totalCount = 0;
+      let lastKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+        } as any).promise();
+        totalCount += result.Count || 0;
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+      return totalCount;
     } catch (error) {
       // If table doesn't exist yet, return 0
       if ((error as any).code === 'ResourceNotFoundException') {
@@ -734,13 +744,26 @@ export class ChatbotDB {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      if (!result.Items || result.Items.length === 0) {
+      // Paginate through all results (DynamoDB returns max 1MB per query)
+      let allItems: any[] = [];
+      let lastKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+        }).promise();
+        if (result.Items) {
+          allItems.push(...result.Items);
+        }
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+
+      if (allItems.length === 0) {
         return [];
       }
       // Extract messages and check if repair is needed in ONE pass (items already sorted asc by messageIndex)
       let shouldRepair = false;
-      const messages = result.Items.map((item) => {
+      const messages = allItems.map((item) => {
           const msg = item.message;
 
           // Check if this message has broken tool results (during the same map iteration)
@@ -810,8 +833,19 @@ export class ChatbotDB {
       },
     };
 
-    const result = await dynamodb.query(params).promise();
-    const items = result.Items || [];
+    // Paginate through all results (DynamoDB returns max 1MB per query)
+    let items: any[] = [];
+    let lastKey: any = undefined;
+    do {
+      const result = await dynamodb.query({
+        ...params,
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+      }).promise();
+      if (result.Items) {
+        items.push(...result.Items);
+      }
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
 
     const stats = {
       totalMessages: items.length,

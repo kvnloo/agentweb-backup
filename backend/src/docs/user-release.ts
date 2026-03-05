@@ -36,6 +36,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed blog articles losing custom CSS formatting (stat cards, TL;DR boxes, CTA blocks, FAQ sections) when published to Webflow',
       '- Style blocks from the HTML head are now included with the article content sent to the CMS',
       '- Articles not formatted for CMS publishing now prompt repair_blog_article first, which restructures the HTML to separate header elements from article content',
+      'Fix: Chat Messages Missing After Page Reload',
+      '- Fixed a bug where long chat sessions lost recent messages after reloading the page',
+      '- The message retrieval query now paginates through all DynamoDB results instead of stopping at the first 1MB page',
     ],
   },
   {
