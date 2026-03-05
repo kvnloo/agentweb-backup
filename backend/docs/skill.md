@@ -8,56 +8,31 @@ This document is designed for **external AI agents** connecting to Emma via the 
 
 ## Authentication
 
-Emma supports two authentication methods: **OAuth 2.1** (recommended for web/GUI clients) and **API Keys** (for CLI/programmatic access).
+### Getting an API Key
 
-### Method 1: OAuth 2.1 (Recommended for GUI Clients)
-
-**For Claude.ai, Cursor, and other GUI clients:**
-
-1. Add a custom connector:
-   - **Name:** Emma (or AgentWeb)
-   - **URL:** `https://api.agentweb.pro/mcp/server`
-   - **OAuth Client ID:** (leave blank)
-   - **OAuth Client Secret:** (leave blank)
-2. Click **Add/Connect** and authorize with your AgentWeb account
-
-The MCP client will automatically register via OAuth 2.1 dynamic client registration. No manual OAuth configuration needed.
-
-**OAuth Endpoints (for reference):**
-- Authorization Server Metadata: `https://api.agentweb.pro/.well-known/oauth-authorization-server`
-- Dynamic Registration: `https://api.agentweb.pro/oauth/register` (RFC 7591)
-- Authorization: `https://api.agentweb.pro/oauth/authorize`
-- Token: `https://api.agentweb.pro/oauth/token`
-
-### Method 2: API Keys (For CLI/Programmatic Access)
-
-**Generate an API Key:**
-
-1. Log in to your AgentWeb account at `https://agentweb.pro`
+1. Log in to your AgentWeb partner portal at `https://agentweb.pro`
 2. Navigate to **Settings > API Keys**
-3. Click **Create API Key** and give it a name
-4. Copy the key (starts with `aw_...`)
+3. Generate an MCP access token
 
-**Configure Your MCP Client:**
+### Connecting via MCP
+
+Emma exposes a Streamable HTTP MCP server. Configure your MCP client to connect:
 
 ```json
 {
   "mcpServers": {
     "emma": {
       "type": "streamable-http",
-      "url": "https://api.agentweb.pro/mcp/server",
+      "url": "https://api.agentweb.pro/mcp",
       "headers": {
-        "Authorization": "Bearer aw_YOUR_API_KEY_HERE"
+        "Authorization": "Bearer YOUR_MCP_ACCESS_TOKEN"
       }
     }
   }
 }
 ```
 
-**Notes:**
-- The server uses session-based transport
-- Sessions auto-expire after 1 hour of inactivity
-- API keys can be managed in Settings > API Keys
+The server uses session-based transport. Sessions auto-expire after 1 hour of inactivity.
 
 ---
 
