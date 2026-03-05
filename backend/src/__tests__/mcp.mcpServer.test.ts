@@ -51,7 +51,7 @@ jest.mock('@modelcontextprotocol/sdk/types.js', () => ({
 }));
 
 // Mock the registry
-jest.mock('../mcp/registry', () => ({
+jest.mock('../mcp/server/registry', () => ({
   mcpToolRegistry: {
     getToolDefinitions: jest.fn().mockReturnValue([
       { name: 'test_tool', description: 'A test tool', inputSchema: { type: 'object' } }
@@ -61,10 +61,10 @@ jest.mock('../mcp/registry', () => ({
 }));
 
 // Mock tools import (it's a side-effect import)
-jest.mock('../mcp/tools', () => ({}));
+jest.mock('../mcp/server/tools', () => ({}));
 
 // Mock the shared core module
-jest.mock('../mcp/mcpServerCore', () => ({
+jest.mock('../mcp/server/mcpServerCore', () => ({
   createMcpServer: jest.fn().mockImplementation(() => ({
     setRequestHandler: jest.fn(),
     connect: jest.fn().mockResolvedValue(undefined),
@@ -78,8 +78,8 @@ jest.mock('../mcp/mcpServerCore', () => ({
   }
 }));
 
-import { setupMcpServer } from '../mcp/mcpServer';
-import { mcpToolRegistry } from '../mcp/registry';
+import { setupMcpServer } from '../mcp/server/mcpServer';
+import { mcpToolRegistry } from '../mcp/server/registry';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -300,7 +300,7 @@ describe('MCP Server', () => {
       jest.resetModules();
 
       const express = require('express');
-      const { setupMcpServer: setup } = require('../mcp/mcpServer');
+      const { setupMcpServer: setup } = require('../mcp/server/mcpServer');
       const { isInitializeRequest: isInit } = require('@modelcontextprotocol/sdk/types.js');
       const { StreamableHTTPServerTransport: Transport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 
