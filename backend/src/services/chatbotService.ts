@@ -709,8 +709,18 @@ export class ChatbotDB {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      return result.Count || 0;
+      // Paginate through all results (DynamoDB returns max 1MB per query, even for COUNT)
+      let totalCount = 0;
+      let lastKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+        } as any).promise();
+        totalCount += result.Count || 0;
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+      return totalCount;
     } catch (error) {
       // If table doesn't exist yet, return 0
       if ((error as any).code === 'ResourceNotFoundException') {
@@ -823,8 +833,19 @@ export class ChatbotDB {
       },
     };
 
-    const result = await dynamodb.query(params).promise();
-    const items = result.Items || [];
+    // Paginate through all results (DynamoDB returns max 1MB per query)
+    let items: any[] = [];
+    let lastKey: any = undefined;
+    do {
+      const result = await dynamodb.query({
+        ...params,
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+      }).promise();
+      if (result.Items) {
+        items.push(...result.Items);
+      }
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
 
     const stats = {
       totalMessages: items.length,
