@@ -301,8 +301,10 @@ describe('Tasks Routes - Image Feedback', () => {
         ],
       });
       // getUserSessions returns session stubs, getChatSession returns the full session with messages
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({ sessions: [session] });
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(session);
+      const { messages: msgs, ...sessionMeta } = session;
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{ ...sessionMeta, messages: [], messageCount: msgs.length }]);
+      (ChatbotDB.prototype.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(msgs);
+      (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);
 
       const response = await request(app)
         .get('/api/tasks/executions/with-images')
@@ -348,8 +350,10 @@ describe('Tasks Routes - Image Feedback', () => {
           },
         ],
       });
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({ sessions: [session] });
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(session);
+      const { messages: msgs, ...sessionMeta } = session;
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{ ...sessionMeta, messages: [], messageCount: msgs.length }]);
+      (ChatbotDB.prototype.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(msgs);
+      (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);
 
       const response = await request(app)
         .get('/api/tasks/executions/with-images')
@@ -399,8 +403,10 @@ describe('Tasks Routes - Image Feedback', () => {
           },
         ],
       });
-      (ChatbotDB.prototype.getUserSessions as jest.Mock).mockResolvedValue({ sessions: [session] });
-      (ChatbotDB.prototype.getChatSession as jest.Mock).mockResolvedValue(session);
+      const { messages: msgs, ...sessionMeta } = session;
+      (ChatbotDB.prototype.getSessionsWithoutMessages as jest.Mock).mockResolvedValue([{ ...sessionMeta, messages: [], messageCount: msgs.length }]);
+      (ChatbotDB.prototype.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(msgs);
+      (ChatbotDB.prototype.updateAssetCache as jest.Mock).mockResolvedValue(undefined);
 
       const response = await request(app)
         .get('/api/tasks/executions/with-images')

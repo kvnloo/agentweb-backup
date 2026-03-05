@@ -7,6 +7,56 @@
 **Impact:** For 50 users averaging 10 tasks each: **1,550 queries → 50 queries** (~97% reduction). Response time scales linearly with user count, not user × task count.
 
 **Files:** `backend/src/services/db.ts` (new `getUserTaskCount`, updated `getAllUsers`), `backend/src/__tests__/admin.usersPerformance.test.ts`
+# March 4, 2026: Speed Up Reports/Images/Videos Loading — Incremental Asset Caching
+
+**Problem:** The Images and Reports pages took ~10.5s to load for a test user with only 36 images / 74 reports.
+
+**Root Cause:** `getExecutionsWithAssets()` in `backend/src/routes/tasks.ts` loaded ALL agent-mode sessions with ALL their messages on every page view:
+1. `getUserSessions(userId, 'agent')` loaded 208 sessions with all messages (208 DynamoDB queries)
+2. For each session, `getChatSession()` redundantly reloaded the same messages (another 208 queries)
+3. This happened separately for images, videos, and html-reports — so the same data was loaded 2-3x
+4. Total: ~400-600 DynamoDB queries per page load, most redundant
+
+**Solution:** Rui's incremental asset caching approach — store discovered assets directly on the `AW-ChatSessions` record and only scan new messages on subsequent loads. This was the optimal solution, beating the alternatives considered (separate cache table, Redis cache, frontend pagination) by being simpler, requiring no new infrastructure, and achieving near-zero latency on warm loads.
+
+**Implementation:**
+
+1. **New fields on `ChatSession`:** `assetCache` (images/videos/htmlReports arrays), `assetScanIndex` (message index scanned up to), `messageCount` (total messages, atomically incremented)
+2. **New methods on `ChatbotDB`:**
+   - `getSessionsWithoutMessages()` — metadata-only session query (no message table reads), with DynamoDB pagination
+   - `getMessagesFromIndex(sessionId, fromIndex)` — partial message loading for delta scans
+   - `updateAssetCache()` — fire-and-forget cache writes to session record
+3. **Refactored `getExecutionsWithAssets()`:** Single session load shared across all asset types, with 3-tier cache logic:
+   - Cache up-to-date (`assetScanIndex >= messageCount`) → zero DB reads
+   - Delta scan (`assetScanIndex < messageCount`) → only load new messages
+   - First time (no cache) → full scan, then cache
+4. **`scanMessagesForAssets()` helper:** Single-pass extraction of images, videos, and HTML reports from messages (consolidates 3 separate scanning loops)
+5. **`messageCount` tracking:** Atomically incremented on `addMessageToSession`, `addMessagesToSession`, and `migrateMessagesToMessagesTable`
+6. **Frontend:** Added `loading="lazy"` to image grid in `customer-portal/src/pages/Images.tsx`
+
+**Bugs Fixed During Testing:**
+- `getSessionsWithoutMessages()` initially lacked DynamoDB pagination — sessions beyond the 1MB page limit were silently dropped
+- Cache logic for legacy sessions (no `messageCount` field) caused image count discrepancy between first/second loads
+- `migrateMessagesToMessagesTable()` didn't set `messageCount`, causing cache to miss new messages added to migrated sessions
+
+**Test Results:**
+
+| Scenario | Before | After |
+|---|---|---|
+| Images page (36 images, 15 tasks) | ~10.5s | **~1.0s** (warm cache) |
+| Reports page (74 reports, 34 tasks) | ~10.5s | **~1.0s** (warm cache) |
+
+Consistency verified: all loads return identical counts (36 images / 15 tasks, 74 reports / 34 tasks).
+
+**Tests Added:**
+- `chatbotService.assetCache.test.ts` — 10 tests covering getSessionsWithoutMessages, getMessagesFromIndex, updateAssetCache, incrementMessageCount
+- `scanMessagesForAssets.test.ts` — 12 tests covering image/video/HTML extraction, deduplication, timestamps, uploads, default filenames
+- Updated existing test files to use new mock patterns (agentModeMessageLoading, videoFavorites, imageFeedback, messagesTable)
+
+**Files Modified:**
+- `backend/src/services/chatbotService.ts` — ChatSession interface, 4 new methods, messageCount tracking in migration
+- `backend/src/routes/tasks.ts` — Refactored getExecutionsWithAssets, new scanMessagesForAssets helper, addCachedAssetsToResult helpers
+- `customer-portal/src/pages/Images.tsx` — loading="lazy" on img tags
 
 ---
 
