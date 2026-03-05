@@ -529,7 +529,6 @@ describe('AgentModeService - Skills', () => {
       const toolNames = result.map((t: any) => t.function?.name || t.name);
       // Foundation tools should bypass subscription filter
       expect(toolNames).toContain('create_work_plan');
-      expect(toolNames).toContain('search_web');
       expect(toolNames).toContain('install_skills');
       // Non-foundation tool allowed by subscription should also be present
       expect(toolNames).toContain('read_brand_guidelines');
@@ -718,17 +717,17 @@ describe('AgentModeService - Skills', () => {
 
       expect(foundationTools).toBeInstanceOf(Set);
       expect(foundationTools.has('install_skills')).toBe(true);
-      expect(foundationTools.has('search_web')).toBe(true);
-      expect(foundationTools.has('read_file_content')).toBe(true);
-      expect(foundationTools.has('read_page_source')).toBe(true);
+      expect(foundationTools.has('list_available_skills')).toBe(true);
+      expect(foundationTools.has('read_brand_guidelines')).toBe(true);
+      expect(foundationTools.has('update_brand_guidelines')).toBe(true);
       expect(foundationTools.has('search_knowledge_base')).toBe(true);
       expect(foundationTools.has('list_knowledge_base_files')).toBe(true);
       expect(foundationTools.has('read_knowledge_base_files')).toBe(true);
       expect(foundationTools.has('create_work_plan')).toBe(true);
       expect(foundationTools.has('modify_work_plan')).toBe(true);
       expect(foundationTools.has('set_work_plan_status')).toBe(true);
-      expect(foundationTools.has('save_file')).toBe(true);
-      expect(foundationTools.has('describe_image')).toBe(true);
+      expect(foundationTools.has('search_leads')).toBe(true);
+      expect(foundationTools.has('get_lead_lists')).toBe(true);
     });
 
     it('should not contain domain-specific tools', () => {

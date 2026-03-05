@@ -33,6 +33,7 @@ jest.mock('../services/agentModeService', () => ({
     generateSessionTitle: jest.fn(),
     generateMarketingResponse: jest.fn(),
     installSkills: jest.fn().mockResolvedValue({ success: true, installedSkills: [] }),
+    getSkillsForDisplay: jest.fn().mockResolvedValue([]),
     getFoundationToolNames: jest.fn().mockReturnValue(new Set([
       'install_skills', 'search_web', 'read_file_content', 'read_page_source',
       'search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files',
