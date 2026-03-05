@@ -409,19 +409,16 @@ class UserDB {
       // Get task and workflow counts for each user
       const usersWithCounts = await Promise.all(
         users.map(async (user) => {
-          // Get user's tasks
-          const tasks = await taskDb.getTasksByUserId(user.userId);
-
-          // Get user's workflow count
-          const workflowCount = await workflowDb.getUserWorkflowCount(
-            user.userId
-          );
-
-          const chatSessionCount = await this.getChatSessionCount(user.userId);
+          const [taskCount, workflowCount, chatSessionCount] =
+            await Promise.all([
+              taskDb.getUserTaskCount(user.userId),
+              workflowDb.getUserWorkflowCount(user.userId),
+              this.getChatSessionCount(user.userId),
+            ]);
 
           return {
             ...user,
-            taskCount: tasks ? tasks.length : 0,
+            taskCount,
             workflowCount,
             chatSessionCount,
           } as UserWithCounts;
@@ -754,6 +751,26 @@ export const taskDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, "getTaskSchedules");
+    }
+  },
+
+  async getUserTaskCount(userId: string): Promise<number> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-Tasks`,
+        IndexName: "UserTasksIndex",
+        KeyConditionExpression: "userId = :userId",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+        },
+        Select: "COUNT",
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Count || 0;
+    } catch (error) {
+      console.error("Error getting task count:", error);
+      return 0;
     }
   },
 
