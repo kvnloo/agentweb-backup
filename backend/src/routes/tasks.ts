@@ -14,7 +14,7 @@ import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
 import { TABLE_PREFIX } from '../config/constants';
-import { ChatbotDB } from '../services/chatbotService';
+import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -1925,22 +1925,22 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
 
 // Common function to get executions with specific asset types
 async function getExecutionsWithAssets(
-  userId: string, 
+  userId: string,
   assetType: 'images' | 'videos' | 'html-reports',
   errorMessage: string
 ): Promise<Record<string, any>> {
   // Get all task executions for the user
   const allExecutions = await taskDb.getAllTaskExecutionsByUserId(userId) || [];
-  
+
   // Define file filter functions for each asset type
   const fileFilters = {
     'images': (file: ResultFile) => {
       const filename = file.filename.toLowerCase();
-      return filename.endsWith('.jpg') || 
-             filename.endsWith('.jpeg') || 
-             filename.endsWith('.png') || 
-             filename.endsWith('.gif') || 
-             filename.endsWith('.webp') || 
+      return filename.endsWith('.jpg') ||
+             filename.endsWith('.jpeg') ||
+             filename.endsWith('.png') ||
+             filename.endsWith('.gif') ||
+             filename.endsWith('.webp') ||
              filename.endsWith('.svg');
     },
     'videos': (file: ResultFile) => {
@@ -1949,25 +1949,25 @@ async function getExecutionsWithAssets(
     },
     'html-reports': (file: ResultFile) => {
       const filename = file.filename.toLowerCase();
-      return filename.endsWith('.html') || 
+      return filename.endsWith('.html') ||
              filename.endsWith('.htm') ||
              (file.is_html === true);
     }
   };
-  
+
   const fileFilter = fileFilters[assetType];
-  
+
   // Filter executions that have result_files with the specified asset type and are not archived
   const executionsWithAssets = allExecutions.filter((execution: any) => {
     if (!execution.result_files || execution.result_files.length === 0) {
       return false;
     }
-    
+
     // Skip archived executions
     if (execution.archived === true) {
       return false;
     }
-    
+
     // Check if any result file matches the asset type
     return execution.result_files.some(fileFilter);
   });
@@ -1979,11 +1979,11 @@ async function getExecutionsWithAssets(
 
   // Group executions by taskId, but only for non-archived tasks
   const result: Record<string, any> = {};
-  
+
   executionsWithAssets.forEach((execution: any) => {
     const task = taskMap.get(execution.taskId);
     const taskId = execution.taskId;
-    
+
     // Only include executions from non-archived tasks
     if (task) {
       if (!result[taskId]) {
@@ -1995,7 +1995,7 @@ async function getExecutionsWithAssets(
           executions: []
         };
       }
-      
+
       result[taskId].executions.push({
         executionId: execution.executionId,
         startTime: execution.startTime || null,
@@ -2013,7 +2013,7 @@ async function getExecutionsWithAssets(
     const executionTimes = task.executions
       .map((execution: any) => execution.startTime)
       .filter((time: string) => time !== null);
-    
+
     if (executionTimes.length > 0) {
       task.latestExecutionTime = executionTimes.sort().pop(); // Get the latest time
     } else {
@@ -2022,16 +2022,16 @@ async function getExecutionsWithAssets(
 
     // Find the most recent pending or running execution for this task
     const allTaskExecutions = allExecutions.filter((execution: any) => execution.taskId === taskId);
-    const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) => 
+    const pendingOrRunningExecutions = allTaskExecutions.filter((execution: any) =>
       (execution.status === 'pending' || execution.status === 'running') && execution.archived !== true
     );
-    
+
     if (pendingOrRunningExecutions.length > 0) {
       // Sort by startTime and get the most recent one
-      const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) => 
+      const latestPendingOrRunning = pendingOrRunningExecutions.sort((a: any, b: any) =>
         new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
       )[0];
-      
+
       task.latestPendingOrRunningExecution = {
         executionId: latestPendingOrRunning.executionId,
         status: latestPendingOrRunning.status,
@@ -2042,457 +2042,349 @@ async function getExecutionsWithAssets(
     }
   });
 
-  // For images, also search Agent Mode sessions for generate_image function calls
-  if (assetType === 'images') {
-    try {
-      const chatbotDb = new ChatbotDB();
-      // Get all Agent Mode sessions for the user
-      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
-      const agentSessions = agentSessionsResult.sessions || [];
-      
-      // Process each session to find generate_image tool calls
-      // Note: getUserSessions now loads messages, but we still call getChatSession to ensure we have the full session data
-      for (const session of agentSessions) {
-        if (session.archived) {
-          continue;
-        }
-        
-        // Load full session data (messages are stored in AW-ChatMessages table)
-        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
-        if (!sessionWithMessages || !sessionWithMessages.messages) {
-          continue;
-        }
-        
-        // Search through messages for generate_image and upload_image tool calls
-        sessionWithMessages.messages.forEach((message: any) => {
-          if (message.metadata?.toolCalls) {
-            message.metadata.toolCalls.forEach((toolCall: any) => {
-              if ((toolCall.name === 'generate_image' || toolCall.name === 'upload_image') && toolCall.result?.success && toolCall.result?.imageUrl) {
-                const imageUrl = toolCall.result.imageUrl;
-                const filename = toolCall.result.filename || 'generated-image.png';
-                
-                // Extract timestamp from message or use session updatedAt
-                const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
-                
-                // Create a unique key for this session (using sessionId)
-                const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
-                
-                if (!result[sessionKey]) {
-                  result[sessionKey] = {
-                    taskId: sessionKey,
-                    taskName: sessionWithMessages.title || 'Agent Mode Session',
-                    createdAt: sessionWithMessages.createdAt,
-                    source: 'agent-mode',
-                    sessionId: sessionWithMessages.sessionId,
-                    executions: []
-                  };
-                }
-                
-                // Check if this image already exists in the executions (avoid duplicates)
-                const existingImage = result[sessionKey].executions.some((exec: any) => 
-                  exec.result_files.some((file: any) => file.url === imageUrl)
-                );
-                
-                if (!existingImage) {
-                  // Use a single execution per session to group all images
-                  const executionId = `${sessionWithMessages.sessionId}-images`;
-                  
-                  // Check if this execution already exists
-                  let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
-                  
-                  // Check favorites, archives, and feedbacks from session fields
-                  const isFavorited = sessionWithMessages.favorites?.[imageUrl] || false;
-                  const isArchived = sessionWithMessages.archives?.[imageUrl] || false;
-                  const imageFeedback = sessionWithMessages.feedbacks?.[imageUrl];
+  // Search Agent Mode sessions for assets using incremental caching
+  try {
+    const chatbotDb = new ChatbotDB();
+    // Load sessions metadata only (no messages) — single DynamoDB query
+    const agentSessions = await chatbotDb.getSessionsWithoutMessages(userId, 'agent');
 
-                  // Skip archived images (they will be filtered out, similar to task executions)
-                  if (isArchived) {
-                    return; // Skip this image
-                  }
+    for (const session of agentSessions) {
+      if (session.archived) continue;
 
-                  if (!execution) {
-                    execution = {
-                      executionId: executionId,
-                      startTime: timestamp, // Use the image generation timestamp
-                      result_files: []
-                    };
-                    result[sessionKey].executions.push(execution);
-                  } else {
-                    // Update startTime to the latest image generation time
-                    if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
-                      execution.startTime = timestamp;
-                    }
-                  }
+      // Determine if we need to scan messages at all
+      const cachedScanIndex = session.assetScanIndex ?? 0;
+      const cachedMessageCount = session.messageCount ?? 0;
+      const hasCache = session.assetCache !== undefined && session.assetScanIndex !== undefined;
 
-                  // Add the image file with its generation timestamp and status
-                  execution.result_files.push({
-                    url: imageUrl,
-                    filename: filename,
-                    token: '', // Not applicable for agent mode images
-                    source: 'agent-mode',
-                    sessionId: sessionWithMessages.sessionId,
-                    generatedAt: timestamp, // Store when this specific image was generated
-                    is_favorited: isFavorited,
-                    is_archived: false, // Always false since we filter out archived images
-                    feedback: imageFeedback,
-                  });
-                }
-              }
-            });
-          }
-        });
-      }
-      
-      // Calculate latest execution time for agent mode sessions
-      Object.keys(result).forEach(key => {
-        if (result[key].source === 'agent-mode') {
-          const task = result[key];
-          const executionTimes = task.executions
-            .map((execution: any) => execution.startTime)
-            .filter((time: string) => time !== null);
-          
-          if (executionTimes.length > 0) {
-            task.latestExecutionTime = executionTimes.sort().pop();
-          } else {
-            task.latestExecutionTime = null;
-          }
-          
-          // Agent mode sessions don't have pending/running executions
-          task.latestPendingOrRunningExecution = null;
-        }
-      });
-    } catch (error) {
-      console.error('Error fetching Agent Mode images:', error);
-      // Don't fail the whole request if agent mode image fetching fails
-    }
-  }
+      let messages: any[];
+      let existingCache = session.assetCache || { images: [], videos: [], htmlReports: [] };
 
-  // For videos, also search Agent Mode sessions for generate_video function calls
-  if (assetType === 'videos') {
-    try {
-      const chatbotDb = new ChatbotDB();
-      // Get all Agent Mode sessions for the user
-      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
-      const agentSessions = agentSessionsResult.sessions || [];
-      
-      // Process each session to find generate_video tool calls
-      // Note: getUserSessions now loads messages, but we still call getChatSession to ensure we have the full session data
-      for (const session of agentSessions) {
-        if (session.archived) {
-          continue;
-        }
-        
-        // Load full session data (messages are stored in AW-ChatMessages table)
-        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
-        if (!sessionWithMessages || !sessionWithMessages.messages) {
-          continue;
-        }
-        
-        // Search through messages for generate_video and upload_video tool calls
-        sessionWithMessages.messages.forEach((message: any) => {
-          if (message.metadata?.toolCalls) {
-            message.metadata.toolCalls.forEach((toolCall: any) => {
-              if ((toolCall.name === 'generate_video' || toolCall.name === 'upload_video') && toolCall.result?.success && toolCall.result?.videoUrl) {
-                const videoUrl = toolCall.result.videoUrl;
-                const filename = toolCall.result.filename || 'generated-video.mp4';
-                
-                // Extract timestamp from message or use session updatedAt
-                const timestamp = message.timestamp || message.metadata?.timestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
-                
-                // Create a unique key for this session (using sessionId)
-                const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
-                
-                if (!result[sessionKey]) {
-                  result[sessionKey] = {
-                    taskId: sessionKey,
-                    taskName: sessionWithMessages.title || 'Agent Mode Session',
-                    createdAt: sessionWithMessages.createdAt,
-                    source: 'agent-mode',
-                    sessionId: sessionWithMessages.sessionId,
-                    executions: []
-                  };
-                }
-                
-                // Check if this video already exists in the executions (avoid duplicates)
-                const existingVideo = result[sessionKey].executions.some((exec: any) => 
-                  exec.result_files.some((file: any) => file.url === videoUrl)
-                );
-                
-                if (!existingVideo) {
-                  // Use a single execution per session to group all videos
-                  const executionId = `${sessionWithMessages.sessionId}-videos`;
-                  
-                  // Check if this execution already exists
-                  let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
-                  
-                  // Check favorites, archives, and feedbacks from session fields
-                  const isFavorited = sessionWithMessages.favorites?.[videoUrl] || false;
-                  const isArchived = sessionWithMessages.archives?.[videoUrl] || false;
-                  const videoFeedback = sessionWithMessages.feedbacks?.[videoUrl];
-
-                  // Skip archived videos (they will be filtered out, similar to task executions)
-                  if (isArchived) {
-                    return; // Skip this video
-                  }
-
-                  if (!execution) {
-                    execution = {
-                      executionId: executionId,
-                      startTime: timestamp, // Use the video generation timestamp
-                      result_files: []
-                    };
-                    result[sessionKey].executions.push(execution);
-                  } else {
-                    // Update startTime to the latest video generation time
-                    if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
-                      execution.startTime = timestamp;
-                    }
-                  }
-
-                  // Add the video file with its generation timestamp and status
-                  execution.result_files.push({
-                    url: videoUrl,
-                    filename: filename,
-                    token: '', // Not applicable for agent mode videos
-                    source: 'agent-mode',
-                    sessionId: sessionWithMessages.sessionId,
-                    generatedAt: timestamp, // Store when this specific video was generated
-                    is_favorited: isFavorited,
-                    is_archived: false, // Always false since we filter out archived videos
-                    feedback: videoFeedback,
-                  });
-                }
-              }
-            });
-          }
-        });
-      }
-      
-      // Calculate latest execution time for agent mode sessions
-      Object.keys(result).forEach(key => {
-        if (result[key].source === 'agent-mode') {
-          const task = result[key];
-          const executionTimes = task.executions
-            .map((execution: any) => execution.startTime)
-            .filter((time: string) => time !== null);
-          
-          if (executionTimes.length > 0) {
-            task.latestExecutionTime = executionTimes.sort().pop();
-          } else {
-            task.latestExecutionTime = null;
-          }
-          
-          // Agent mode sessions don't have pending/running executions
-          task.latestPendingOrRunningExecution = null;
-        }
-      });
-    } catch (error) {
-      console.error('Error fetching Agent Mode videos:', error);
-      // Don't fail the whole request if agent mode video fetching fails
-    }
-  }
-
-  // For HTML reports, also search Agent Mode sessions for HTML file tool calls
-  if (assetType === 'html-reports') {
-    try {
-      const chatbotDb = new ChatbotDB();
-      const agentSessionsResult = await chatbotDb.getUserSessions(userId, 'agent');
-      const agentSessions = agentSessionsResult.sessions || [];
-
-      const addHtmlFile = (sessionKey: string, sessionWithMessages: any, url: string, filename?: string, timestamp?: string, isOwnTimestamp?: boolean) => {
-        const derivedFilename = filename || url.split('/').pop() || 'report.html';
-        const isArchived = sessionWithMessages.archives?.[url] || false;
-        const isFavorited = sessionWithMessages.favorites?.[url] || false;
-        const htmlFeedback = sessionWithMessages.feedbacks?.[url];
-
-        if (isArchived) {
-          return;
-        }
-
-        if (!result[sessionKey]) {
-          result[sessionKey] = {
-            taskId: sessionKey,
-            taskName: sessionWithMessages.title || 'Agent Mode Session',
-            createdAt: sessionWithMessages.createdAt,
-            source: 'agent-mode',
-            sessionId: sessionWithMessages.sessionId,
-            executions: []
-          };
-        }
-
-        const executionId = `${sessionWithMessages.sessionId}-html`;
-        let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
-
-        if (!execution) {
-          execution = {
-            executionId,
-            startTime: timestamp,
-            result_files: []
-          };
-          result[sessionKey].executions.push(execution);
-        } else if (timestamp && (!execution.startTime || timestamp > execution.startTime)) {
-          execution.startTime = timestamp;
-        }
-
-        const existingFile = execution.result_files.find((file: any) => file.url === url);
-        if (!existingFile) {
-          execution.result_files.push({
-            url,
-            filename: derivedFilename,
-            token: '',
-            source: 'agent-mode',
-            sessionId: sessionWithMessages.sessionId,
-            generatedAt: timestamp,
-            is_html: true,
-            is_favorited: isFavorited,
-            is_archived: false,
-            feedback: htmlFeedback,
-          });
-        } else if (isOwnTimestamp && timestamp) {
-          // A later message with a real per-message timestamp provides a more
-          // accurate generatedAt than the session-level fallback used earlier.
-          existingFile.generatedAt = timestamp;
-        }
-      };
-
-      const extractHtmlUrls = (toolCall: any): Array<{ url: string; filename?: string }> => {
-        const results: Array<{ url: string; filename?: string }> = [];
-        const toolResult = toolCall?.result || {};
-        const urlCandidates = [
-          toolResult.s3_url,
-          toolResult.file_url,
-          toolResult.htmlUrl,
-          toolResult.blog_html_url
-        ].filter(Boolean);
-
-        urlCandidates.forEach((url: string) => {
-          if (url.toLowerCase().endsWith('.html') || url.toLowerCase().endsWith('.htm')) {
-            results.push({
-              url,
-              filename: toolResult.filename || toolResult.file_name || toolResult.versioned_filename
-            });
-          }
-        });
-
-        return results;
-      };
-
-      const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
-
-      for (const session of agentSessions) {
-        if (session.archived) {
-          continue;
-        }
-
-        const sessionWithMessages = await chatbotDb.getChatSession(session.sessionId);
-        if (!sessionWithMessages || !sessionWithMessages.messages) {
-          continue;
-        }
-
-        const sessionKey = `agent-mode-${sessionWithMessages.sessionId}`;
-
-        // Track the last assistant message timestamp so tool-result messages
-        // (which lack metadata.timestamp) inherit the timestamp of the assistant
-        // message that triggered them, rather than falling back to session updatedAt.
-        let lastAssistantTimestamp: string | undefined;
-
-        sessionWithMessages.messages.forEach((message: any) => {
-          const ownTimestamp = message.timestamp || message.metadata?.timestamp;
-
-          if (message.role === 'assistant' && ownTimestamp) {
-            lastAssistantTimestamp = ownTimestamp;
-          }
-
-          const timestamp = ownTimestamp || lastAssistantTimestamp || sessionWithMessages.updatedAt || sessionWithMessages.createdAt;
-          const hasOwnTimestamp = !!ownTimestamp;
-
-          if (message.metadata?.toolCalls) {
-            message.metadata.toolCalls.forEach((toolCall: any) => {
-              const htmlUrls = extractHtmlUrls(toolCall);
-              htmlUrls.forEach(({ url, filename }) => {
-                addHtmlFile(sessionKey, sessionWithMessages, url, filename, timestamp, hasOwnTimestamp);
-              });
-            });
-          }
-
-          if (typeof message.content === 'string') {
-            htmlUrlRegex.lastIndex = 0;
-            let match;
-            while ((match = htmlUrlRegex.exec(message.content)) !== null) {
-              addHtmlFile(sessionKey, sessionWithMessages, match[1], undefined, timestamp, hasOwnTimestamp);
-            }
-          }
-        });
-
-        // Second pass: scan for publish_blog_article tool calls and annotate matching files
-        if (result[sessionKey]) {
-          sessionWithMessages.messages.forEach((message: any) => {
-            if (message.metadata?.toolCalls) {
-              message.metadata.toolCalls.forEach((toolCall: any) => {
-                if (toolCall.name === 'publish_blog_article') {
-                  const blogHtmlUrl = toolCall.arguments?.blog_html_url;
-                  if (!blogHtmlUrl) return;
-
-                  // Determine publish status: prefer result.data.status (new format),
-                  // fall back to arguments.status (old format where result was {})
-                  const publishStatus = toolCall.result?.data?.status
-                    || toolCall.arguments?.status
-                    || 'draft';
-
-                  // Determine success: check result.success if available,
-                  // otherwise assume success if no error field
-                  const isSuccess = toolCall.result?.success !== undefined
-                    ? toolCall.result.success
-                    : !toolCall.error;
-
-                  if (!isSuccess) return;
-
-                  // Find and annotate the matching file
-                  for (const execution of result[sessionKey].executions) {
-                    const matchingFile = execution.result_files.find(
-                      (file: any) => file.url === blogHtmlUrl
-                    );
-                    if (matchingFile) {
-                      matchingFile.publishStatus = publishStatus;
-                      break;
-                    }
-                  }
-                }
-              });
-            }
-          });
-
-          // Third pass: check session.publishStatuses map (set by publish-direct button)
-          const sessionPublishStatuses = sessionWithMessages.publishStatuses;
-          if (sessionPublishStatuses) {
-            for (const execution of result[sessionKey].executions) {
-              for (const file of execution.result_files) {
-                if (sessionPublishStatuses[file.url] && !file.publishStatus) {
-                  file.publishStatus = sessionPublishStatuses[file.url];
-                }
-              }
-            }
-          }
-        }
+      if (hasCache && cachedMessageCount > 0 && cachedScanIndex >= cachedMessageCount) {
+        // Cache is up to date and messageCount is tracked — no message reads needed
+        messages = [];
+      } else if (hasCache && cachedMessageCount === 0) {
+        // Legacy session: cache exists but messageCount was never set.
+        // Trust the cache — no new messages can arrive without incrementing messageCount.
+        messages = [];
+      } else if (hasCache && cachedScanIndex > 0 && cachedScanIndex < cachedMessageCount) {
+        // Delta scan — only load new messages
+        messages = await chatbotDb.getMessagesFromIndex(session.sessionId, cachedScanIndex);
+      } else {
+        // First time or no cache — full message scan
+        messages = await chatbotDb.getMessagesFromMessagesTable(session.sessionId);
+        existingCache = { images: [], videos: [], htmlReports: [] };
       }
 
-      Object.keys(result).forEach(key => {
-        if (result[key].source === 'agent-mode') {
-          const task = result[key];
-          const executionTimes = task.executions
-            .map((execution: any) => execution.startTime)
-            .filter((time: string) => time !== null);
+      // Scan new messages for assets (all types in one pass)
+      if (messages.length > 0) {
+        const newAssets = scanMessagesForAssets(messages, session);
+        existingCache.images.push(...newAssets.images);
+        existingCache.videos.push(...newAssets.videos);
+        existingCache.htmlReports.push(...newAssets.htmlReports);
 
-          task.latestExecutionTime = executionTimes.length > 0 ? executionTimes.sort().pop() : null;
-          task.latestPendingOrRunningExecution = null;
-        }
-      });
-    } catch (error) {
-      console.error('Error fetching Agent Mode HTML reports:', error);
+        // Compute new scan index: max messageIndex + 1 from scanned messages, or total count
+        const maxIndex = messages.reduce((max: number, m: any) => {
+          const idx = m.messageIndex ?? 0;
+          return idx > max ? idx : max;
+        }, 0);
+        const newScanIndex = maxIndex + 1;
+
+        // Update cache in background (don't await)
+        chatbotDb.updateAssetCache(session.sessionId, existingCache, newScanIndex);
+      }
+
+      // Now build result entries from the cache for the requested asset type
+      const sessionKey = `agent-mode-${session.sessionId}`;
+
+      if (assetType === 'images') {
+        addCachedAssetsToResult(result, sessionKey, session, existingCache.images, 'images');
+      } else if (assetType === 'videos') {
+        addCachedAssetsToResult(result, sessionKey, session, existingCache.videos, 'videos');
+      } else if (assetType === 'html-reports') {
+        addCachedHtmlReportsToResult(result, sessionKey, session, existingCache.htmlReports, messages);
+      }
     }
+
+    // Calculate latest execution time for agent mode sessions
+    Object.keys(result).forEach(key => {
+      if (result[key].source === 'agent-mode') {
+        const task = result[key];
+        const executionTimes = task.executions
+          .map((execution: any) => execution.startTime)
+          .filter((time: string) => time !== null);
+
+        task.latestExecutionTime = executionTimes.length > 0 ? executionTimes.sort().pop() : null;
+        task.latestPendingOrRunningExecution = null;
+      }
+    });
+  } catch (error) {
+    console.error(`Error fetching Agent Mode ${assetType}:`, error);
   }
 
   return result;
+}
+
+/**
+ * Scan messages in a single pass and extract all asset types.
+ * Returns arrays of discovered images, videos, and HTML reports.
+ */
+function scanMessagesForAssets(
+  messages: any[],
+  session: ChatSession
+): { images: Array<{ url: string; filename: string; generatedAt: string }>; videos: Array<{ url: string; filename: string; generatedAt: string }>; htmlReports: Array<{ url: string; filename: string; generatedAt: string }> } {
+  const images: Array<{ url: string; filename: string; generatedAt: string }> = [];
+  const videos: Array<{ url: string; filename: string; generatedAt: string }> = [];
+  const htmlReports: Array<{ url: string; filename: string; generatedAt: string }> = [];
+
+  const htmlUrlRegex = /(https?:\/\/[^\s"]+\.amazonaws\.com\/[^\s"]+\.html)/gi;
+  const seenUrls = new Set<string>();
+
+  let lastAssistantTimestamp: string | undefined;
+
+  for (const message of messages) {
+    const ownTimestamp = message.timestamp || message.metadata?.timestamp;
+
+    if (message.role === 'assistant' && ownTimestamp) {
+      lastAssistantTimestamp = ownTimestamp;
+    }
+
+    const timestamp = ownTimestamp || lastAssistantTimestamp || session.updatedAt || session.createdAt;
+
+    if (!message.metadata?.toolCalls) {
+      // Still check message content for HTML URLs
+      if (typeof message.content === 'string') {
+        htmlUrlRegex.lastIndex = 0;
+        let match;
+        while ((match = htmlUrlRegex.exec(message.content)) !== null) {
+          const url = match[1];
+          if (!seenUrls.has(url)) {
+            seenUrls.add(url);
+            htmlReports.push({ url, filename: url.split('/').pop() || 'report.html', generatedAt: timestamp });
+          }
+        }
+      }
+      continue;
+    }
+
+    for (const toolCall of message.metadata.toolCalls) {
+      // Images
+      if ((toolCall.name === 'generate_image' || toolCall.name === 'upload_image') && toolCall.result?.success && toolCall.result?.imageUrl) {
+        const url = toolCall.result.imageUrl;
+        if (!seenUrls.has(url)) {
+          seenUrls.add(url);
+          images.push({
+            url,
+            filename: toolCall.result.filename || 'generated-image.png',
+            generatedAt: timestamp,
+          });
+        }
+      }
+
+      // Videos
+      if ((toolCall.name === 'generate_video' || toolCall.name === 'upload_video') && toolCall.result?.success && toolCall.result?.videoUrl) {
+        const url = toolCall.result.videoUrl;
+        if (!seenUrls.has(url)) {
+          seenUrls.add(url);
+          videos.push({
+            url,
+            filename: toolCall.result.filename || 'generated-video.mp4',
+            generatedAt: timestamp,
+          });
+        }
+      }
+
+      // HTML reports from tool call results
+      const toolResult = toolCall?.result || {};
+      const urlCandidates = [
+        toolResult.s3_url,
+        toolResult.file_url,
+        toolResult.htmlUrl,
+        toolResult.blog_html_url
+      ].filter(Boolean);
+
+      for (const url of urlCandidates) {
+        if ((url.toLowerCase().endsWith('.html') || url.toLowerCase().endsWith('.htm')) && !seenUrls.has(url)) {
+          seenUrls.add(url);
+          htmlReports.push({
+            url,
+            filename: toolResult.filename || toolResult.file_name || toolResult.versioned_filename || url.split('/').pop() || 'report.html',
+            generatedAt: timestamp,
+          });
+        }
+      }
+    }
+
+    // Also check message content for HTML URLs
+    if (typeof message.content === 'string') {
+      htmlUrlRegex.lastIndex = 0;
+      let match;
+      while ((match = htmlUrlRegex.exec(message.content)) !== null) {
+        const url = match[1];
+        if (!seenUrls.has(url)) {
+          seenUrls.add(url);
+          htmlReports.push({ url, filename: url.split('/').pop() || 'report.html', generatedAt: timestamp });
+        }
+      }
+    }
+  }
+
+  return { images, videos, htmlReports };
+}
+
+/**
+ * Add cached image/video assets to the result, applying favorites/archives/feedbacks from session.
+ */
+function addCachedAssetsToResult(
+  result: Record<string, any>,
+  sessionKey: string,
+  session: ChatSession,
+  assets: Array<{ url: string; filename: string; generatedAt: string }>,
+  type: 'images' | 'videos'
+): void {
+  const urlField = type === 'images' ? 'imageUrl' : 'videoUrl';
+  const executionSuffix = type === 'images' ? '-images' : '-videos';
+
+  for (const asset of assets) {
+    const isArchived = session.archives?.[asset.url] || false;
+    if (isArchived) continue;
+
+    const isFavorited = session.favorites?.[asset.url] || false;
+    const feedback = session.feedbacks?.[asset.url];
+
+    if (!result[sessionKey]) {
+      result[sessionKey] = {
+        taskId: sessionKey,
+        taskName: session.title || 'Agent Mode Session',
+        createdAt: session.createdAt,
+        source: 'agent-mode',
+        sessionId: session.sessionId,
+        executions: []
+      };
+    }
+
+    const executionId = `${session.sessionId}${executionSuffix}`;
+    let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
+
+    if (!execution) {
+      execution = {
+        executionId,
+        startTime: asset.generatedAt,
+        result_files: []
+      };
+      result[sessionKey].executions.push(execution);
+    } else if (asset.generatedAt && (!execution.startTime || asset.generatedAt > execution.startTime)) {
+      execution.startTime = asset.generatedAt;
+    }
+
+    // Avoid duplicates
+    if (!execution.result_files.some((f: any) => f.url === asset.url)) {
+      execution.result_files.push({
+        url: asset.url,
+        filename: asset.filename,
+        token: '',
+        source: 'agent-mode',
+        sessionId: session.sessionId,
+        generatedAt: asset.generatedAt,
+        is_favorited: isFavorited,
+        is_archived: false,
+        feedback,
+      });
+    }
+  }
+}
+
+/**
+ * Add cached HTML report assets to the result, including publish status annotation.
+ */
+function addCachedHtmlReportsToResult(
+  result: Record<string, any>,
+  sessionKey: string,
+  session: ChatSession,
+  assets: Array<{ url: string; filename: string; generatedAt: string }>,
+  messages: any[]
+): void {
+  for (const asset of assets) {
+    const isArchived = session.archives?.[asset.url] || false;
+    if (isArchived) continue;
+
+    const isFavorited = session.favorites?.[asset.url] || false;
+    const feedback = session.feedbacks?.[asset.url];
+
+    if (!result[sessionKey]) {
+      result[sessionKey] = {
+        taskId: sessionKey,
+        taskName: session.title || 'Agent Mode Session',
+        createdAt: session.createdAt,
+        source: 'agent-mode',
+        sessionId: session.sessionId,
+        executions: []
+      };
+    }
+
+    const executionId = `${session.sessionId}-html`;
+    let execution = result[sessionKey].executions.find((exec: any) => exec.executionId === executionId);
+
+    if (!execution) {
+      execution = {
+        executionId,
+        startTime: asset.generatedAt,
+        result_files: []
+      };
+      result[sessionKey].executions.push(execution);
+    } else if (asset.generatedAt && (!execution.startTime || asset.generatedAt > execution.startTime)) {
+      execution.startTime = asset.generatedAt;
+    }
+
+    if (!execution.result_files.some((f: any) => f.url === asset.url)) {
+      execution.result_files.push({
+        url: asset.url,
+        filename: asset.filename,
+        token: '',
+        source: 'agent-mode',
+        sessionId: session.sessionId,
+        generatedAt: asset.generatedAt,
+        is_html: true,
+        is_favorited: isFavorited,
+        is_archived: false,
+        feedback,
+      });
+    }
+  }
+
+  // Annotate publish statuses from messages (publish_blog_article tool calls)
+  if (result[sessionKey] && messages.length > 0) {
+    for (const message of messages) {
+      if (!message.metadata?.toolCalls) continue;
+      for (const toolCall of message.metadata.toolCalls) {
+        if (toolCall.name !== 'publish_blog_article') continue;
+        const blogHtmlUrl = toolCall.arguments?.blog_html_url;
+        if (!blogHtmlUrl) continue;
+
+        const publishStatus = toolCall.result?.data?.status || toolCall.arguments?.status || 'draft';
+        const isSuccess = toolCall.result?.success !== undefined ? toolCall.result.success : !toolCall.error;
+        if (!isSuccess) continue;
+
+        for (const execution of result[sessionKey].executions) {
+          const matchingFile = execution.result_files.find((file: any) => file.url === blogHtmlUrl);
+          if (matchingFile) {
+            matchingFile.publishStatus = publishStatus;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Apply session-level publish statuses (set by publish-direct button)
+  if (result[sessionKey] && session.publishStatuses) {
+    for (const execution of result[sessionKey].executions) {
+      for (const file of execution.result_files) {
+        if (session.publishStatuses[file.url] && !file.publishStatus) {
+          file.publishStatus = session.publishStatuses[file.url];
+        }
+      }
+    }
+  }
 }
 
 // Get all executions with images for the current user
@@ -2925,3 +2817,4 @@ router.post('/executions/:executionId/image-feedback', authenticateToken, async 
 });
 
 export default router;
+export { scanMessagesForAssets };

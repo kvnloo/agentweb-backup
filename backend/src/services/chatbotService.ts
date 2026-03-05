@@ -200,6 +200,14 @@ export interface ChatSession {
     isDelegated: boolean;
   }; // Delegate access info when admin is acting on behalf of a user
   associatedSkills?: string[]; // List of skill IDs associated for this session
+  // Incremental asset cache for fast Images/Videos/Reports page loading
+  assetCache?: {
+    images: Array<{ url: string; filename: string; generatedAt: string }>;
+    videos: Array<{ url: string; filename: string; generatedAt: string }>;
+    htmlReports: Array<{ url: string; filename: string; generatedAt: string }>;
+  };
+  assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
+  messageCount?: number;      // total messages in AW-ChatMessages for this session
 }
 
 // Interface for context chunks
@@ -572,6 +580,26 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Atomically increment messageCount on the session record.
+   * Used for asset cache invalidation tracking.
+   */
+  private async incrementMessageCount(sessionId: string, count: number): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'ADD messageCount :count',
+        ExpressionAttributeValues: {
+          ':count': count,
+        },
+      }).promise();
+    } catch (error) {
+      // Non-critical: log but don't fail the message write
+      console.error(`Error incrementing messageCount for session ${sessionId}:`, error);
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -595,6 +623,9 @@ export class ChatbotDB {
 
     // Add message to AW-ChatMessages table
     await this.addMessagesToMessagesTable(sessionId, [message], messageIndex);
+
+    // Atomically increment messageCount on the session record for asset cache tracking
+    await this.incrementMessageCount(sessionId, 1);
 
     // Return session with updated messages (no need to update session table)
     return {
@@ -631,6 +662,9 @@ export class ChatbotDB {
 
     // Add messages to AW-ChatMessages table
     await this.addMessagesToMessagesTable(sessionId, messages, messageIndex);
+
+    // Atomically increment messageCount on the session record for asset cache tracking
+    await this.incrementMessageCount(sessionId, messages.length);
 
     // Return session with updated messages (no need to update session table)
     return {
@@ -925,6 +959,9 @@ export class ChatbotDB {
         await dynamodb.batchWrite(params).promise();
       }
       console.log(`Migrated ${messages.length} messages from session ${sessionId} to AW-ChatMessages`);
+
+      // Set messageCount so asset cache tracking works correctly for migrated sessions
+      await this.incrementMessageCount(sessionId, messages.length);
     } catch (error) {
       // If table doesn't exist yet, log and continue (table will be created later)
       if ((error as any).code === 'ResourceNotFoundException') {
@@ -1409,6 +1446,124 @@ export class ChatbotDB {
     } catch (error) {
       console.error("Error getting user chat sessions:", error);
       throw error;
+    }
+  }
+
+  /**
+   * Get sessions metadata only (no messages loaded).
+   * Used by getExecutionsWithAssets for fast asset loading via cache.
+   */
+  async getSessionsWithoutMessages(
+    userId: string,
+    portalType?: "customer" | "partner" | "genius" | "agent"
+  ): Promise<ChatSession[]> {
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
+      ExpressionAttributeValues: {
+        ":userId": userId,
+      },
+    };
+
+    if (portalType) {
+      params.FilterExpression = 'portalType = :portalType';
+      params.ExpressionAttributeValues[':portalType'] = portalType;
+    }
+
+    try {
+      let allItems: ChatSession[] = [];
+      let lastEvaluatedKey: any = undefined;
+
+      do {
+        if (lastEvaluatedKey) {
+          params.ExclusiveStartKey = lastEvaluatedKey;
+        }
+        const result = await dynamodb.query(params).promise();
+        allItems = allItems.concat((result.Items as ChatSession[]) || []);
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      // Filter out archived sessions
+      let sessions = allItems.filter(session => !session.archived);
+
+      // Return sessions with empty messages array (metadata only)
+      return sessions.map(session => {
+        const { messages: _, ...sessionWithoutMessages } = session;
+        return {
+          ...sessionWithoutMessages,
+          messages: [],
+        } as ChatSession;
+      });
+    } catch (error) {
+      console.error("Error getting sessions without messages:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get messages starting from a given messageIndex (inclusive).
+   * Used for delta scanning when asset cache needs updating.
+   */
+  async getMessagesFromIndex(sessionId: string, fromIndex: number): Promise<ChatMessage[]> {
+    const params = {
+      TableName: this.messagesTableName,
+      KeyConditionExpression: "sessionId = :sessionId AND messageIndex >= :fromIndex",
+      ExpressionAttributeValues: {
+        ":sessionId": sessionId,
+        ":fromIndex": fromIndex,
+      },
+      ScanIndexForward: true,
+    };
+
+    try {
+      let allItems: any[] = [];
+      let lastKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastKey ? { ExclusiveStartKey: lastKey } : {})
+        }).promise();
+        if (result.Items) {
+          allItems.push(...result.Items);
+        }
+        lastKey = result.LastEvaluatedKey;
+      } while (lastKey);
+
+      return allItems.map((item) => ({
+        ...(item.message as ChatMessage),
+        messageIndex: item.messageIndex,
+      }));
+    } catch (error) {
+      if ((error as any).code === 'ResourceNotFoundException') {
+        return [];
+      }
+      console.error(`Error getting messages from index ${fromIndex} for session ${sessionId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update the asset cache on a session record.
+   */
+  async updateAssetCache(
+    sessionId: string,
+    assetCache: ChatSession['assetCache'],
+    assetScanIndex: number
+  ): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: 'SET assetCache = :cache, assetScanIndex = :scanIndex',
+        ExpressionAttributeValues: {
+          ':cache': assetCache,
+          ':scanIndex': assetScanIndex,
+        },
+      }).promise();
+    } catch (error) {
+      // Non-critical: log but don't fail the request
+      console.error(`Error updating asset cache for session ${sessionId}:`, error);
     }
   }
 
