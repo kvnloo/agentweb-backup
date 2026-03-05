@@ -33,7 +33,7 @@ Add Emma to your MCP client's configuration using the examples below.
   "mcpServers": {
     "emma": {
       "type": "streamable-http",
-      "url": "https://api.agentweb.pro/mcp/server",
+      "url": "https://api.agentweb.pro/mcp",
       "headers": {
         "Authorization": "Bearer aw_YOUR_KEY_HERE"
       }
@@ -48,7 +48,7 @@ Add Emma to your MCP client's configuration using the examples below.
   "mcpServers": {
     "emma": {
       "transport": "streamable-http",
-      "url": "https://api.agentweb.pro/mcp/server",
+      "url": "https://api.agentweb.pro/mcp",
       "headers": {
         "Authorization": "Bearer aw_YOUR_KEY_HERE"
       }
@@ -62,7 +62,7 @@ Add Emma to your MCP client's configuration using the examples below.
 {
   "mcpServers": {
     "emma": {
-      "url": "https://api.agentweb.pro/mcp/server",
+      "url": "https://api.agentweb.pro/mcp",
       "headers": {
         "Authorization": "Bearer aw_YOUR_KEY_HERE"
       }
@@ -79,7 +79,7 @@ Add Emma to your MCP client's configuration using the examples below.
       "name": "emma",
       "transport": {
         "type": "streamable-http",
-        "url": "https://api.agentweb.pro/mcp/server",
+        "url": "https://api.agentweb.pro/mcp",
         "headers": {
           "Authorization": "Bearer aw_YOUR_KEY_HERE"
         }
@@ -94,7 +94,7 @@ Add Emma to your MCP client's configuration using the examples below.
 {
   "mcpServers": {
     "emma": {
-      "serverUrl": "https://api.agentweb.pro/mcp/server",
+      "serverUrl": "https://api.agentweb.pro/mcp",
       "headers": {
         "Authorization": "Bearer aw_YOUR_KEY_HERE"
       }
@@ -213,7 +213,7 @@ Once connected, your agent has access to 60+ tools across these categories:
 
 **"Active subscription required"** — You need to complete Stripe checkout before creating API keys. Go to Settings → API Keys and click the subscribe button.
 
-**Connection refused / timeout** — Make sure you're using the correct URL (`https://api.agentweb.pro/mcp/server` for MCP).
+**Connection refused / timeout** — Make sure you're using the correct URL (`https://api.agentweb.pro/mcp` for MCP).
 
 **401 or 403 errors** — Your API key may be invalid, revoked, or expired. Create a new one from Settings → API Keys.
 
@@ -227,4 +227,4 @@ Once connected, your agent has access to 60+ tools across these categories:
 
 - **Customer Portal:** [https://app.agentweb.pro](https://app.agentweb.pro)
 - **API Base URL:** `https://api.agentweb.pro`
-- **MCP Endpoint:** `https://api.agentweb.pro/mcp/server`
+- **MCP Endpoint:** `https://api.agentweb.pro/mcp`

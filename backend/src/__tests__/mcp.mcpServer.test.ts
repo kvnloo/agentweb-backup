@@ -51,7 +51,7 @@ jest.mock('@modelcontextprotocol/sdk/types.js', () => ({
 }));
 
 // Mock the registry
-jest.mock('../mcp/server/registry', () => ({
+jest.mock('../mcp/registry', () => ({
   mcpToolRegistry: {
     getToolDefinitions: jest.fn().mockReturnValue([
       { name: 'test_tool', description: 'A test tool', inputSchema: { type: 'object' } }
@@ -61,10 +61,10 @@ jest.mock('../mcp/server/registry', () => ({
 }));
 
 // Mock tools import (it's a side-effect import)
-jest.mock('../mcp/server/tools', () => ({}));
+jest.mock('../mcp/tools', () => ({}));
 
 // Mock the shared core module
-jest.mock('../mcp/server/mcpServerCore', () => ({
+jest.mock('../mcp/mcpServerCore', () => ({
   createMcpServer: jest.fn().mockImplementation(() => ({
     setRequestHandler: jest.fn(),
     connect: jest.fn().mockResolvedValue(undefined),
@@ -78,8 +78,8 @@ jest.mock('../mcp/server/mcpServerCore', () => ({
   }
 }));
 
-import { setupMcpServer } from '../mcp/server/mcpServer';
-import { mcpToolRegistry } from '../mcp/server/registry';
+import { setupMcpServer } from '../mcp/mcpServer';
+import { mcpToolRegistry } from '../mcp/registry';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -108,7 +108,7 @@ describe('MCP Server', () => {
 
     it('should reject request when no auth token is provided', async () => {
       const response = await request(app)
-        .post('/mcp/server')
+        .post('/mcp')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
       expect(response.status).toBe(401);
@@ -124,7 +124,7 @@ describe('MCP Server', () => {
       setupMcpServer(securedApp);
 
       const response = await request(securedApp)
-        .post('/mcp/server')
+        .post('/mcp')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
       expect(response.status).toBe(401);
@@ -139,7 +139,7 @@ describe('MCP Server', () => {
       setupMcpServer(securedApp);
 
       const response = await request(securedApp)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', 'Bearer wrong-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
@@ -157,7 +157,7 @@ describe('MCP Server', () => {
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(true);
 
       const response = await request(securedApp)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', 'Bearer valid-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
@@ -174,7 +174,7 @@ describe('MCP Server', () => {
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(true);
 
       const response = await request(securedApp)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', 'plain-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
@@ -183,7 +183,7 @@ describe('MCP Server', () => {
     });
   });
 
-  describe('POST /mcp/server endpoint', () => {
+  describe('POST /mcp endpoint', () => {
     const TEST_TOKEN = 'test-mcp-token';
 
     beforeEach(() => {
@@ -195,7 +195,7 @@ describe('MCP Server', () => {
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(true);
 
       const response = await request(app)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .send({
           jsonrpc: '2.0',
@@ -212,7 +212,7 @@ describe('MCP Server', () => {
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(false);
 
       const response = await request(app)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
 
@@ -224,7 +224,7 @@ describe('MCP Server', () => {
       (isInitializeRequest as unknown as jest.Mock).mockReturnValueOnce(false);
 
       const response = await request(app)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'nonexistent-session')
         .send({ jsonrpc: '2.0', method: 'tools/list', id: 1 });
@@ -233,7 +233,7 @@ describe('MCP Server', () => {
     });
   });
 
-  describe('GET /mcp/server endpoint (SSE)', () => {
+  describe('GET /mcp endpoint (SSE)', () => {
     const TEST_TOKEN = 'test-mcp-token';
 
     beforeEach(() => {
@@ -243,7 +243,7 @@ describe('MCP Server', () => {
 
     it('should return 400 for missing session ID', async () => {
       const response = await request(app)
-        .get('/mcp/server')
+        .get('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`);
 
       expect(response.status).toBe(400);
@@ -252,7 +252,7 @@ describe('MCP Server', () => {
 
     it('should return 400 for invalid session ID', async () => {
       const response = await request(app)
-        .get('/mcp/server')
+        .get('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'invalid-session');
 
@@ -260,7 +260,7 @@ describe('MCP Server', () => {
     });
   });
 
-  describe('DELETE /mcp/server endpoint', () => {
+  describe('DELETE /mcp endpoint', () => {
     const TEST_TOKEN = 'test-mcp-token';
 
     beforeEach(() => {
@@ -270,7 +270,7 @@ describe('MCP Server', () => {
 
     it('should return 400 for invalid session ID', async () => {
       const response = await request(app)
-        .delete('/mcp/server')
+        .delete('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`)
         .set('mcp-session-id', 'invalid-session');
 
@@ -280,7 +280,7 @@ describe('MCP Server', () => {
 
     it('should return 400 for missing session ID', async () => {
       const response = await request(app)
-        .delete('/mcp/server')
+        .delete('/mcp')
         .set('Authorization', `Bearer ${TEST_TOKEN}`);
 
       expect(response.status).toBe(400);
@@ -300,7 +300,7 @@ describe('MCP Server', () => {
       jest.resetModules();
 
       const express = require('express');
-      const { setupMcpServer: setup } = require('../mcp/server/mcpServer');
+      const { setupMcpServer: setup } = require('../mcp/mcpServer');
       const { isInitializeRequest: isInit } = require('@modelcontextprotocol/sdk/types.js');
       const { StreamableHTTPServerTransport: Transport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 
@@ -311,7 +311,7 @@ describe('MCP Server', () => {
       setup(testApp);
 
       await request(testApp)
-        .post('/mcp/server')
+        .post('/mcp')
         .set('Authorization', 'Bearer session-test-token')
         .send({ jsonrpc: '2.0', method: 'initialize', id: 1 });
 
