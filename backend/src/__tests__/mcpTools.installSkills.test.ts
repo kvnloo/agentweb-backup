@@ -57,12 +57,12 @@ describe('MCP Tool - install_skills', () => {
     // Test with missing userId
     await expect(
       tool?.execute({ skillIds: ['skill-1'] }, { sessionId: 'session-1' })
-    ).rejects.toThrow('Missing user or session context');
+    ).rejects.toThrow('Authentication required: no user context');
 
     // Test with missing sessionId
     await expect(
       tool?.execute({ skillIds: ['skill-1'] }, { userId: 'user-1' })
-    ).rejects.toThrow('Missing user or session context');
+    ).rejects.toThrow('Missing session context');
   });
 
   it('should throw error if context missing', async () => {
@@ -70,7 +70,7 @@ describe('MCP Tool - install_skills', () => {
 
     await expect(
       tool?.execute({ skillIds: ['skill-1'] }, {})
-    ).rejects.toThrow('Missing user or session context');
+    ).rejects.toThrow('Authentication required: no user context');
 
     await expect(
       tool?.execute({ skillIds: ['skill-1'] }, undefined)
