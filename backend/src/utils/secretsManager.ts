@@ -290,3 +290,45 @@ export async function getUnipileCredentials(): Promise<UnipileCredentials> {
     throw new Error('Failed to fetch Unipile credentials from Secrets Manager');
   }
 }
+
+/**
+ * Interface for Gmail OAuth credentials returned from Secrets Manager
+ */
+export interface GmailCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Gmail OAuth credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Google/Gmail (or prod/... for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns Gmail OAuth client credentials
+ */
+export async function getGmailCredentials(): Promise<GmailCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Google/Gmail'
+      : 'dev/AgentWeb/Google/Gmail';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Gmail credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as GmailCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Gmail credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Gmail credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Gmail credentials from Secrets Manager');
+  }
+}

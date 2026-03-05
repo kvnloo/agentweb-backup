@@ -81,5 +81,134 @@ describe('Connected Accounts Routes', () => {
             expect(response.status).toBe(200);
             expect(response.body.accounts[0].profile_image_url).toBeUndefined();
         });
+
+        it('Gmail account with refresh_token shows status=active and expiry_message=Connected', async () => {
+            const mockAccounts = [
+                {
+                    platform: 'gmail',
+                    account_id: 'user@gmail.com',
+                    account_name: 'Test User',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                    config: {
+                        account_type: 'gmail',
+                        email: 'user@gmail.com',
+                        access_token: 'access-token',
+                        refresh_token: 'refresh-token',
+                        token_expires_at: Date.now() + 3600000,
+                        granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+                    }
+                }
+            ];
+
+            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            const { getTokenStatus, formatExpiryMessage } = require('../utils/tokenUtils');
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            const account = response.body.accounts[0];
+            expect(account.status).toBe('active');
+            expect(account.expiry_message).toBe('Connected');
+            expect(getTokenStatus).not.toHaveBeenCalled();
+            expect(formatExpiryMessage).not.toHaveBeenCalled();
+        });
+
+        it('Gmail account uses picture_url for profile_image_url', async () => {
+            const mockAccounts = [
+                {
+                    platform: 'gmail',
+                    account_id: 'user@gmail.com',
+                    account_name: 'Test User',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                    config: {
+                        account_type: 'gmail',
+                        email: 'user@gmail.com',
+                        access_token: 'access-token',
+                        refresh_token: 'refresh-token',
+                        token_expires_at: Date.now() + 3600000,
+                        picture_url: 'https://example.com/gmail-photo.jpg',
+                        granted_scopes: [],
+                    }
+                }
+            ];
+
+            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].profile_image_url).toBe('https://example.com/gmail-photo.jpg');
+        });
+
+        it('non-Gmail account without refresh_token delegates status to getTokenStatus', async () => {
+            const mockAccounts = [
+                {
+                    platform: 'linkedin',
+                    account_id: 'li-123',
+                    account_name: 'LinkedIn User',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                    config: {
+                        account_type: 'personal',
+                        access_token: 'li-token',
+                        token_expires_at: Date.now() + 86400000,
+                    }
+                }
+            ];
+
+            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue(mockAccounts);
+            const { getTokenStatus, formatExpiryMessage } = require('../utils/tokenUtils');
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(getTokenStatus).toHaveBeenCalled();
+            expect(formatExpiryMessage).toHaveBeenCalled();
+        });
+
+        it('returns 500 when getAccountsByUserId throws', async () => {
+            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockRejectedValue(new Error('DB error'));
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+            expect(response.status).toBe(500);
+        });
+    });
+
+    describe('DELETE /connected-accounts/:platform', () => {
+        it('deletes all accounts for a platform and returns success', async () => {
+            (connectedAccountsDb.deleteAccount as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app).delete('/api/oauth/connected-accounts/gmail');
+            expect(response.status).toBe(200);
+            expect(response.body.success).toBe(true);
+            expect(connectedAccountsDb.deleteAccount).toHaveBeenCalledWith('test_user_id', 'gmail');
+        });
+
+        it('returns 500 when deleteAccount throws', async () => {
+            (connectedAccountsDb.deleteAccount as jest.Mock).mockRejectedValue(new Error('DB error'));
+
+            const response = await request(app).delete('/api/oauth/connected-accounts/gmail');
+            expect(response.status).toBe(500);
+        });
+    });
+
+    describe('DELETE /connected-accounts/:platform/:accountId', () => {
+        it('deletes a specific account by platform and accountId', async () => {
+            (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app).delete('/api/oauth/connected-accounts/gmail/user%40gmail.com');
+            expect(response.status).toBe(200);
+            expect(response.body.success).toBe(true);
+            expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'gmail', 'user@gmail.com');
+        });
+
+        it('returns 500 when deleteAccountById throws', async () => {
+            (connectedAccountsDb.deleteAccountById as jest.Mock).mockRejectedValue(new Error('DB error'));
+
+            const response = await request(app).delete('/api/oauth/connected-accounts/gmail/user@gmail.com');
+            expect(response.status).toBe(500);
+        });
     });
 });
