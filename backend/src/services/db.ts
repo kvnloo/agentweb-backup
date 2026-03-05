@@ -1144,18 +1144,27 @@ export const taskDb = {
 
   async getAllTaskExecutionsByUserId(userId: string) {
     try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
-        IndexName: "UserIdIndex",
-        KeyConditionExpression: "userId = :userId",
-        ExpressionAttributeValues: {
-          ":userId": userId,
-        },
-        ScanIndexForward: false, // Get latest executions first
-      };
+      const allItems: any[] = [];
+      let lastEvaluatedKey: any = undefined;
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      do {
+        const params: any = {
+          TableName: `${TABLE_PREFIX}AW-TaskExecutions`,
+          IndexName: "UserIdIndex",
+          KeyConditionExpression: "userId = :userId",
+          ExpressionAttributeValues: {
+            ":userId": userId,
+          },
+          ScanIndexForward: false, // Get latest executions first
+          ...(lastEvaluatedKey && { ExclusiveStartKey: lastEvaluatedKey }),
+        };
+
+        const result = await dynamodb.query(params).promise();
+        allItems.push(...(result.Items || []));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
+
+      return allItems;
     } catch (error) {
       handleDynamoDbError(error, "getAllTaskExecutionsByUserId");
     }
