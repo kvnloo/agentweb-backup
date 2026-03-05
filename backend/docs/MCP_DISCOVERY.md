@@ -11,8 +11,8 @@ This document tracks the implementation status of MCP discoverability features a
 | `GET /oauth/authorize` | Done | Authorization with PKCE → consent redirect |
 | `POST /oauth/authorize/decision` | Done | Consent callback (creates auth code) |
 | `POST /oauth/token` | Done | Token exchange (auth code + refresh) |
-| `POST /mcp/server` | Done | MCP Streamable HTTP endpoint |
-| `GET /mcp/server` | Done | MCP SSE stream |
+| `POST /mcp` | Done | MCP Streamable HTTP endpoint |
+| `GET /mcp` | Done | MCP SSE stream |
 | `GET /docs/agent-api` | Done | Public API documentation page |
 
 ## Auth Methods Supported
@@ -64,7 +64,7 @@ Steps to list Emma on the official Anthropic MCP registry:
    mcp-publisher publish --namespace io.github.AgentWebPro/agentweb
    ```
 4. The registry entry should include:
-   - Server URL: `https://api.agentweb.pro/mcp/server`
+   - Server URL: `https://api.agentweb.pro/mcp`
    - Auth: OAuth 2.1 discovery at `/.well-known/oauth-authorization-server`
    - Scopes: `mcp:tools`
    - Description: "Emma — AI marketing assistant with 60+ tools"
@@ -74,12 +74,12 @@ Steps to list Emma on the official Anthropic MCP registry:
 Submit to community registries for broader visibility:
 
 - **mcp.so** — Submit at https://mcp.so/submit
-- **glama.ai** — Submit at https://glama.ai/mcp/servers/submit
+- **glama.ai** — Submit at https://glama.ai/mcps/submit
 
 Include:
 - Name: Emma by AgentWeb
 - Description: AI marketing assistant with tools for content creation, social media, lead management, ad campaigns, and more
-- URL: https://api.agentweb.pro/mcp/server
+- URL: https://api.agentweb.pro/mcp
 - Auth: OAuth 2.1 + API Key
 - Tool count: 60+
 

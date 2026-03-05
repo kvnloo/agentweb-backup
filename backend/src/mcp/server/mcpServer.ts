@@ -200,7 +200,7 @@ export function setupMcpServer(app: express.Express) {
 
   // POST handler - handles all JSON-RPC messages including initialization
   // Note: express.json() is added here because MCP routes are mounted before global body parser
-  app.post("/mcp/server", express.json(), validateMcpAccessToken, async (req: Request, res: Response) => {
+  app.post("/mcp", express.json(), validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     // Log all incoming requests
@@ -275,7 +275,7 @@ export function setupMcpServer(app: express.Express) {
   });
 
   // GET handler - opens SSE stream for server-to-client notifications
-  app.get("/mcp/server", validateMcpAccessToken, async (req: Request, res: Response) => {
+  app.get("/mcp", validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     if (!sessionId || !sessions.has(sessionId)) {
@@ -296,7 +296,7 @@ export function setupMcpServer(app: express.Express) {
   });
 
   // DELETE handler - terminates session
-  app.delete("/mcp/server", validateMcpAccessToken, async (req: Request, res: Response) => {
+  app.delete("/mcp", validateMcpAccessToken, async (req: Request, res: Response) => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
     if (!sessionId || !sessions.has(sessionId)) {
