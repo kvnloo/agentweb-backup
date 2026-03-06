@@ -645,6 +645,10 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
+      // Track memory usage for optimization
+      const startMemory = process.memoryUsage();
+      const startTime = Date.now();
+
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       let [
         currentSession,
@@ -1008,15 +1012,30 @@ export class AgentModeService {
         console.warn('AgentMode: Reached maximum tool execution iterations');
       }
 
-      // Attach timing metadata and tool calls to the last assistant message
+      // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
         if (lastAssistantIdx < messages.length) {
           const lastMessage = messages[lastAssistantIdx];
+
+          // Calculate memory usage delta and current state
+          const endMemory = process.memoryUsage();
+          const endTime = Date.now();
+          const memoryUsage = {
+            heapUsedDeltaMB: Number(((endMemory.heapUsed - startMemory.heapUsed) / 1024 / 1024).toFixed(2)),
+            heapTotalDeltaMB: Number(((endMemory.heapTotal - startMemory.heapTotal) / 1024 / 1024).toFixed(2)),
+            rssDeltaMB: Number(((endMemory.rss - startMemory.rss) / 1024 / 1024).toFixed(2)),
+            currentHeapUsedMB: Number((endMemory.heapUsed / 1024 / 1024).toFixed(2)),
+            currentHeapTotalMB: Number((endMemory.heapTotal / 1024 / 1024).toFixed(2)),
+            currentRssMB: Number((endMemory.rss / 1024 / 1024).toFixed(2)),
+            durationMs: endTime - startTime
+          };
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
+            memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
           };
         }
