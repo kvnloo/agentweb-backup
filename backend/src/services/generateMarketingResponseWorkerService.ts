@@ -74,7 +74,7 @@ export class GenerateMarketingResponseWorkerService {
       if (readyReject) {
         readyReject(error);
       }
-    }, 60000); // 60 second timeout for initialization
+    }, 120000); // 120 second timeout for initialization (increased to handle MCP server connections)
     this.workerInitPromise = new Promise<void>((resolve, reject) => {
       readyResolve = () => {
         this.workerReady = true;
