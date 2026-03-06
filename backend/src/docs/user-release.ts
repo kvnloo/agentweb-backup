@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-06',
     changes: [
+      'Security: MCP API Key User Isolation',
+      '- Fixed an issue where MCP tool calls could access data belonging to other users',
+      '- External API key and OAuth sessions are now strictly scoped to the authenticated user',
+      '- Internal backend-to-backend calls continue to work as expected',
       'Fix: Prospect Customers Can Now Upload Screenshots on Plan/iShare Routes',
       '- Fixed issue where file upload was disabled for anonymous prospect customers accessing shared plans',
       '- Prospect customers can now upload LinkedIn profile screenshots for AI analysis',
