@@ -2462,11 +2462,12 @@ export const agentModeController = {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
 
-      // Upload to S3 using the session's userId
+      // Upload to S3 using ishare folder structure (not the session owner's userId)
+      // This prevents anonymous/guest uploads from being attributed to the session owner
       const uploadResult = await uploadFileToS3(
         file.buffer,
         file.originalname,
-        session.userId,
+        `ishare-sessions/${shareId}`, // Use session-specific folder instead of user folder
         file.mimetype
       );
 
