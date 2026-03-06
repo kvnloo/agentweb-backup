@@ -9,6 +9,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-06',
     changes: [
+      'CRM: Muted Alerts for System Emails',
+      '- Email event alerts are no longer sent when the sender is a system address (e.g. no-reply@, noreply@, mailer-daemon@)',
+      '- These automated messages are not real lead engagement and were generating noisy alerts',
+      '- Events are still recorded in CRM for reference — only the alert notification is suppressed',
+    ],
+  },
+  {
+    date: '2026-03-06',
+    changes: [
       'Security: MCP API Key User Isolation',
       '- Fixed an issue where MCP tool calls could access data belonging to other users',
       '- External API key and OAuth sessions are now strictly scoped to the authenticated user',
