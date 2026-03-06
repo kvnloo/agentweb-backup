@@ -53,16 +53,17 @@ export class GenerateMarketingResponseWorkerService {
 
     if (isLocalDevelopment) {
       workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
-      execArgv = ['-r', 'ts-node/register'];
+      execArgv = ['-r', 'ts-node/register', '--max-old-space-size=4096'];
     } else {
       workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
+      execArgv = ['--max-old-space-size=4096'];
     }
 
-    // Fork a new process
+    // Fork a new process with increased memory limit (4GB) to prevent OOM errors
     this.worker = fork(workerScript, [], {
       stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
       env: process.env,
-      execArgv: execArgv.length > 0 ? execArgv : undefined
+      execArgv
     });
     this.workerReady = false;
 
