@@ -28,6 +28,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Worker initialization timeout increased to 120 seconds to handle MCP server connections',
       '- Worker heap limit set to 4GB in both development and production to prevent OOM crashes',
     ],
+  },
+  {
     date: '2026-03-04',
     changes: [
       'New: Gmail Integration',
