@@ -1,8 +1,11 @@
 /**
  * MCP Server Core - Core logic for the MCP Streamable HTTP server
- * 
+ *
  * This module contains the core MCP server creation logic that is used
  * by the Streamable HTTP transport for the MCP server API.
+ *
+ * All 30 tools are API-wrapping (route through REST API via mcpFetch).
+ * No direct service calls. No skill-gating for external clients.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,91 +16,13 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { mcpToolRegistry } from './registry';
 
-// Import all tools to register them
-import './tools';
-import './portalTools';
-
-// Foundation tools always available (no skill required)
-// These are Emma's core GTM infrastructure - context and discovery tools
-const FOUNDATION_TOOLS = new Set([
-  // Discovery
-  'install_skills',
-  'list_available_skills',
-
-  // GTM Context (Read/Write)
-  'update_brand_guidelines',
-  'read_brand_guidelines',
-  'update_market_strategy',
-  'read_market_strategy',
-
-  // Knowledge Base
-  'search_knowledge_base',
-  'list_knowledge_base_files',
-  'read_knowledge_base_files',
-
-  // Work Plans (Emma's execution planning system)
-  'create_work_plan',
-  'modify_work_plan',
-  'set_work_plan_status',
-
-  // GTM Discovery (teasers - hint at Emma's capabilities)
-  'search_leads',           // CRM teaser
-  'get_lead_lists',         // Lead management teaser
-  'list_connected_accounts' // Social/ads integration teaser
-]);
-
-/**
- * Build skill-to-tool mapping from published skills in database
- */
-async function getSkillToolMapping(): Promise<Map<string, Set<string>>> {
-  const { skillService } = await import('../../services/skillService');
-  const skills = await skillService.getPublishedSkills();
-
-  const mapping = new Map<string, Set<string>>();
-  for (const skill of skills) {
-    mapping.set(skill.skillId, new Set(skill.toolNames || []));
-  }
-
-  return mapping;
-}
-
-/**
- * Get allowed tool names for a session based on installed skills
- */
-async function getAllowedToolNames(installedSkills: Set<string>): Promise<Set<string>> {
-  const allowedNames = new Set<string>(FOUNDATION_TOOLS);
-
-  if (installedSkills.size === 0) {
-    return allowedNames;
-  }
-
-  const skillMapping = await getSkillToolMapping();
-  const { skillService } = await import('../../services/skillService');
-
-  for (const skillId of installedSkills) {
-    if (skillId === '__other_skills__') {
-      // Add unassociated tools
-      const { agentModeService } = await import('../../services/agentModeService');
-      const publishedSkills = await skillService.getPublishedSkills();
-      const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
-      unassociatedTools.forEach((name: string) => allowedNames.add(name));
-    } else {
-      // Add tools from this skill
-      const toolNames = skillMapping.get(skillId);
-      if (toolNames) {
-        toolNames.forEach(name => allowedNames.add(name));
-      }
-    }
-  }
-
-  return allowedNames;
-}
+// Import API-wrapping tools (replaces direct tools.ts and portalTools.ts)
+import './apiTools';
 
 export interface McpSessionContext {
   agentUserId?: string;
   sessionId?: string;               // MCP session ID
-  installedSkills?: Set<string>;    // Installed skill IDs for this session
-  isInternal?: boolean;             // Internal clients bypass skill gating
+  isInternal?: boolean;             // Internal clients can override userId
 }
 
 /**
@@ -157,23 +82,14 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
       ? (userId || sessionContext?.agentUserId)
       : sessionContext?.agentUserId;
 
-    // Build context with session state and callback for install_skills
+    // Build context for tool execution
     const context = {
       userId: effectiveUserId,
       sessionId: sessionContext?.sessionId || sessionId,
       llmModel,
       agentUserId: sessionContext?.agentUserId,
-      installedSkills: sessionContext?.installedSkills,
       isInternal: sessionContext?.isInternal,
-      // Callback for install_skills to update session state
-      updateInstalledSkills: (skillIds: string[]) => {
-        if (sessionContext?.installedSkills) {
-          skillIds.forEach(id => sessionContext.installedSkills!.add(id));
-        }
-      }
     };
-
-    // All tools are available to all clients (no skill-gating validation)
 
     try {
       const result = await mcpToolRegistry.execute(name, toolArgs, context);

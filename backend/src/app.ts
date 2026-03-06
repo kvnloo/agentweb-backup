@@ -41,6 +41,7 @@ import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
 import agentApiRoutes from "./routes/agentApi";
+import emmaApiRoutes from "./routes/emmaApi";
 import landingPagesRoutes from "./routes/landingPages";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import { authenticateToken } from "./middleware/auth";
@@ -196,6 +197,7 @@ app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
+app.use("/api/emma", emmaApiRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.use("/review", reviewRouter);
 
