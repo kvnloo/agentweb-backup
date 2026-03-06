@@ -44,8 +44,7 @@ jest.mock('../mcp/server/registry', () => ({
   }
 }));
 
-jest.mock('../mcp/server/tools', () => ({}));
-jest.mock('../mcp/server/portalTools', () => ({}));
+jest.mock('../mcp/server/apiTools', () => ({}));
 
 import { createMcpServer, McpSessionContext } from '../mcp/server/mcpServerCore';
 

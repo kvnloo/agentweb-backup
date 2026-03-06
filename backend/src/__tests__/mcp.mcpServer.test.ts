@@ -61,7 +61,7 @@ jest.mock('../mcp/server/registry', () => ({
 }));
 
 // Mock tools import (it's a side-effect import)
-jest.mock('../mcp/server/tools', () => ({}));
+jest.mock('../mcp/server/apiTools', () => ({}));
 
 // Mock the shared core module
 jest.mock('../mcp/server/mcpServerCore', () => ({
