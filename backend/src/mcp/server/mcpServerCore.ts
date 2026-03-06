@@ -150,9 +150,16 @@ export function createMcpServer(serverName: string = "Emma - GTM Automation Spec
     // Extract context fields from args (injected by internal MCP clients)
     const { userId, sessionId, llmModel, ...toolArgs } = (args || {}) as any;
 
+    // SECURITY: Only internal clients (backend-to-backend via MCP_ACCESS_TOKEN) may
+    // override userId. External clients (API keys, OAuth tokens) MUST use the
+    // authenticated identity to prevent IDOR attacks.
+    const effectiveUserId = sessionContext?.isInternal
+      ? (userId || sessionContext?.agentUserId)
+      : sessionContext?.agentUserId;
+
     // Build context with session state and callback for install_skills
     const context = {
-      userId: userId || sessionContext?.agentUserId,
+      userId: effectiveUserId,
       sessionId: sessionContext?.sessionId || sessionId,
       llmModel,
       agentUserId: sessionContext?.agentUserId,
