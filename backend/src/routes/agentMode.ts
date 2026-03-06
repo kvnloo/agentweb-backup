@@ -55,6 +55,10 @@ router.get('/ishare/:shareId/progress', asyncHandler(agentModeController.getProg
 // Submit message feedback for ishare sessions (public, with conversable token)
 router.put('/ishare/:shareId/message/:messageIndex/feedback', asyncHandler(agentModeController.submitIShareMessageFeedback));
 
+// POST /api/agent-mode/ishare/:shareId/upload
+// Upload file attachment for ishare sessions (public, with conversable token)
+router.post('/ishare/:shareId/upload', upload.single('file'), asyncHandler(agentModeController.uploadIShareAttachment));
+
 // Note: Plan links also use ishare endpoint with conversable token, so they're covered by the above route
 
 // GET /api/agent-mode/public/welcome-message

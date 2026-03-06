@@ -415,6 +415,22 @@ VITE_DEBUG=true' > /home/ec2-user/agentweb/customer-portal/.env.local"
       done < /tmp/claude-code-env && \
       rm -f /tmp/claude-code-env"
 
+    # Write cloud-dev CLAUDE.md (user-level config for Claude Code)
+    log "Writing cloud-dev CLAUDE.md..."
+    remote "mkdir -p /home/ec2-user/.claude"
+    scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR -i "$KEY_FILE" \
+        "$SCRIPT_DIR/cloud-dev-claude.md" "$SSH_USER@$PUBLIC_IP:/home/ec2-user/.claude/CLAUDE.md"
+    remote "sed -i 's|PUBLIC_IP|$PUBLIC_IP|g' /home/ec2-user/.claude/CLAUDE.md"
+
+    # Authenticate gh CLI with GitHub PAT from Secrets Manager
+    log "Authenticating gh CLI..."
+    remote "aws secretsmanager get-secret-value \
+      --secret-id 'agentweb/test-env/github-pat' \
+      --region '$REGION' \
+      --query SecretString --output text \
+      | gh auth login --with-token"
+
     # Install npm dependencies
     log "Installing npm dependencies (this may take a few minutes)..."
     remote "cd /home/ec2-user/agentweb/backend && npm ci"

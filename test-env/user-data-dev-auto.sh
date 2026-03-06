@@ -62,7 +62,10 @@ get_public_ip() {
 ###############################################################################
 # 1. Install system packages + enable password SSH (do SSH early for debugging)
 ###############################################################################
-dnf install -y git tmux rsync cronie gcc-c++ make jq
+dnf install -y git tmux rsync cronie gcc-c++ make jq \
+  alsa-lib at-spi2-atk atk at-spi2-core cairo cups-libs dbus-libs \
+  libdrm mesa-libgbm glib2 nspr nss pango libX11 libxcb libXcomposite \
+  libXdamage libXext libXfixes libxkbcommon libXrandr
 systemctl enable crond
 systemctl start crond
 
@@ -87,6 +90,14 @@ dnf install -y nodejs
 # Install Claude Code CLI globally
 npm install -g @anthropic-ai/claude-code
 
+# Install GitHub CLI
+dnf install -y dnf-plugins-core
+dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+dnf install -y gh
+
+# Install Playwright browser for MCP
+sudo -u ec2-user npx playwright install chromium
+
 ###############################################################################
 # 3. Clone repos
 ###############################################################################
@@ -102,6 +113,9 @@ mkdir -p "$LOG_DIR"
 # Set up git config for ec2-user
 sudo -u ec2-user git config --global user.name "ec2-user"
 sudo -u ec2-user git config --global user.email "ec2-user@test-env"
+
+# Authenticate gh CLI with GitHub PAT
+echo "$GITHUB_PAT" | sudo -u ec2-user gh auth login --with-token
 
 ###############################################################################
 # 4. Configure backend .env
@@ -145,7 +159,15 @@ CLAUDE_ENV=$(get_secret "agentweb/test-env/claude-code-env")
 } >> /home/ec2-user/.bashrc
 
 ###############################################################################
-# 7. npm ci in all projects
+# 7. Write cloud-dev CLAUDE.md (user-level config for Claude Code)
+###############################################################################
+mkdir -p /home/ec2-user/.claude
+sed "s|PUBLIC_IP|$PUBLIC_IP|g" "$APP_DIR/test-env/cloud-dev-claude.md" \
+  > /home/ec2-user/.claude/CLAUDE.md
+chown -R ec2-user:ec2-user /home/ec2-user/.claude
+
+###############################################################################
+# 8. npm ci in all projects
 ###############################################################################
 cd "$APP_DIR/backend" && sudo -u ec2-user npm ci
 cd "$APP_DIR/partner-portal" && sudo -u ec2-user npm ci
@@ -153,7 +175,7 @@ cd "$APP_DIR/customer-portal" && sudo -u ec2-user npm ci
 cd "$APP_DIR/test-env-access" && sudo -u ec2-user npm ci
 
 ###############################################################################
-# 8. Configure test-env-access
+# 9. Configure test-env-access
 ###############################################################################
 SG_ID=$(get_instance_tag "sg-id")
 
@@ -168,7 +190,7 @@ AWS_REGION=${REGION}
 ENVEOF
 
 ###############################################################################
-# 9. Start all services (including test-env-access)
+# 10. Start all services (including test-env-access)
 ###############################################################################
 sudo -u ec2-user tmux new-session -d -s backend -c "$APP_DIR/backend" \
   "npx ts-node-dev --respawn --exit-child --transpile-only src/server.ts 2>&1 | tee -a $LOG_DIR/backend.log; exec bash"
@@ -183,7 +205,7 @@ sudo -u ec2-user tmux new-session -d -s test-env-access -c "$APP_DIR/test-env-ac
   "node server.js 2>&1 | tee -a $LOG_DIR/test-env-access.log; exec bash"
 
 ###############################################################################
-# 10. Set up watchdog cron
+# 11. Set up watchdog cron
 ###############################################################################
 if [ -f "$APP_DIR/test-env/watchdog.sh" ]; then
   cp "$APP_DIR/test-env/watchdog.sh" /opt/watchdog.sh
@@ -192,7 +214,7 @@ if [ -f "$APP_DIR/test-env/watchdog.sh" ]; then
 fi
 
 ###############################################################################
-# 11. Launch Claude Code with Notion task context
+# 12. Launch Claude Code with Notion task context
 ###############################################################################
 NOTION_PAGE_ID=$(get_instance_tag "notion-page-id")
 NOTION_TOKEN=$(get_secret "agentweb/test-env/notion-token")
@@ -247,6 +269,6 @@ sudo -u ec2-user tmux new-session -d -s claude \
   "source ~/.bashrc && cd $APP_DIR && claude -p \"\$(cat .claude-prompt)\"; exec bash"
 
 ###############################################################################
-# 12. Signal readiness
+# 13. Signal readiness
 ###############################################################################
 touch /home/ec2-user/.test-env-dev-ready

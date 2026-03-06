@@ -2435,6 +2435,60 @@ export const agentModeController = {
     }
   },
 
+  // Upload file attachment for ishare sessions (public with conversable token)
+  async uploadIShareAttachment(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+      const file = (req as any).file;
+
+      if (!file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Get the session to verify the conversable token
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Check if conversable sharing is active and token matches
+      if (!conversable) {
+        return res.status(401).json({ error: 'Conversable token required' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      // Upload to S3 using ishare folder structure (not the session owner's userId)
+      // This prevents anonymous/guest uploads from being attributed to the session owner
+      const uploadResult = await uploadFileToS3(
+        file.buffer,
+        file.originalname,
+        `ishare-sessions/${shareId}`, // Use session-specific folder instead of user folder
+        file.mimetype
+      );
+
+      if (!uploadResult.success) {
+        return res.status(500).json({ error: 'Failed to upload file to S3' });
+      }
+
+      res.json({
+        url: uploadResult.url,
+        key: uploadResult.key,
+        filename: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype,
+        uploadedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('AgentMode: Upload ishare attachment error:', error);
+      res.status(500).json({ error: 'Failed to upload attachment' });
+    }
+  },
+
   // Upload file attachment for Agent Mode
   async uploadAttachment(req: Request, res: Response) {
     try {
