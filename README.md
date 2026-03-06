@@ -1354,6 +1354,82 @@ After setting up the CMS secrets, you need to configure which CMS each user shou
 
 **Note:** Users must have a CMS Type configured to publish blog posts. If not configured, the "Publish" button will show an error when attempting to publish.
 
+### Testing MCP Server with Claude Code
+
+The Emma MCP server exposes ~30 API-wrapping tools via [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http). You can connect Claude Code (or any MCP-compatible client) to test the tools.
+
+#### 1. Get an API Key
+
+1. Sign up at [agentweb.pro](https://agentweb.pro) and subscribe to a plan
+2. Go to **Settings → API Keys**
+3. Create a new key (starts with `aw_`)
+
+#### 2. Configure Claude Code
+
+Add the following to your project's `.mcp.json` (or `~/.claude.json` for global config):
+
+```json
+{
+  "mcpServers": {
+    "emma": {
+      "type": "streamable-http",
+      "url": "https://api.agentweb.pro/mcp",
+      "headers": {
+        "Authorization": "Bearer aw_YOUR_KEY_HERE"
+      }
+    }
+  }
+}
+```
+
+For the **test environment**, use:
+
+```json
+{
+  "mcpServers": {
+    "emma": {
+      "type": "streamable-http",
+      "url": "http://<TEST_ENV_IP>:3001/mcp",
+      "headers": {
+        "Authorization": "Bearer aw_YOUR_KEY_HERE"
+      }
+    }
+  }
+}
+```
+
+#### 3. Verify Connection
+
+After restarting Claude Code, the Emma tools should appear in the tool list. Try calling:
+
+- `list_tasks` — list your automation tasks
+- `list_connected_accounts` — list linked social accounts
+- `search_web` — perform a web search
+- `list_lead_lists` — list CRM lead lists
+- `list_gtm_plans` — list GTM plans
+
+#### 4. Available Tools
+
+| Category | Tools |
+|----------|-------|
+| Emma Chat | `emma_create_session`, `emma_send_message`, `emma_get_session`, `emma_list_sessions` |
+| Tasks | `list_tasks`, `manage_task`, `execute_task`, `list_task_executions` |
+| Schedules | `list_schedules`, `manage_schedule` |
+| CRM/Leads | `list_lead_lists`, `manage_lead_list`, `manage_leads`, `search_leads` |
+| GTM Plans | `list_gtm_plans`, `manage_gtm_plan`, `manage_gtm_items` |
+| Knowledge Base | `list_knowledge_bases`, `search_knowledge_base`, `read_knowledge_base_files` |
+| Brand & Strategy | `manage_brand`, `manage_market_strategy` |
+| Content | `generate_blog_post`, `publish_blog_post` |
+| Connected Accounts | `list_connected_accounts`, `post_on_account` |
+| AI Operations | `search_web`, `generate_image`, `send_email`, `save_file` |
+| Skills | `install_skills`, `list_available_skills` |
+
+#### 5. Security Notes
+
+- All tool calls go through the backend's REST API middleware (authentication, validation, rate limiting)
+- The API key identifies the user; `userId` cannot be overridden in tool arguments (IDOR protection)
+- API keys can be revoked at any time from **Settings → API Keys**
+
 ### Client Subdomain Setup for Lead Forms
 
 AgentWeb supports hosting client lead forms on custom subdomains under `agentwebforms.com` (e.g., `clientname.agentwebforms.com`). This section describes how to configure the infrastructure to serve HTML files from S3 through CloudFront with proper caching and domain configuration.
