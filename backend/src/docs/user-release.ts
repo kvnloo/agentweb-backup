@@ -7,6 +7,29 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-06',
+    changes: [
+      'Fix: Prospect Customers Can Now Upload Screenshots on Plan/iShare Routes',
+      '- Fixed issue where file upload was disabled for anonymous prospect customers accessing shared plans',
+      '- Prospect customers can now upload LinkedIn profile screenshots for AI analysis',
+      '- File uploads use conversable token authentication and are stored in session-specific folders',
+      'Security: iShare File Uploads Use Session-Specific Folders',
+      '- iShare and plan route file uploads now store files in ishare-sessions/{sessionId}/ instead of user folders',
+      '- This prevents prospect customers from accessing files uploaded by other users',
+      '- Each session has isolated storage for better security and privacy',
+      'Admin: Max Heap Column Added to Chat History',
+      '- Admin Dashboard Chat History tab now displays the maximum heap memory used by each session',
+      '- Values shown in MB or GB with color coding: green (<2GB), orange (2-3GB), red (>3GB)',
+      '- Helps identify sessions with high memory usage for performance monitoring',
+      'Performance: Fixed Memory Leak in Backend Worker Process',
+      '- Fixed unbounded cache in worker process that could accumulate 2-3 GB of memory over time',
+      '- File content cache now limited to 1000 entries with 1-hour TTL and automatic cleanup every 10 minutes',
+      '- Expected 80%+ memory reduction in production worker processes',
+      '- Worker initialization timeout increased to 120 seconds to handle MCP server connections',
+      '- Worker heap limit increased to 4GB to prevent OOM crashes during peak usage',
+    ],
+  },
+  {
     date: '2026-03-05',
     changes: [
       'Bug Fix: Web Search Now Available in Scheduled Chats',
