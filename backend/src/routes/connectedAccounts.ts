@@ -18,8 +18,16 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
     const accounts = await getAccountsByUserId(userId);
 
     const accountsWithStatus = accounts.map(acc => {
-      const status = getTokenStatus(acc.config.token_expires_at);
-      const expiryMessage = formatExpiryMessage(acc.config.token_expires_at);
+      // Accounts with a refresh token (e.g. Gmail) auto-renew — don't show the
+      // short-lived access token expiry; just show them as permanently connected.
+      const hasRefreshToken = !!(acc.config as any).refresh_token;
+      const status = hasRefreshToken ? 'active' : getTokenStatus(acc.config.token_expires_at);
+      const expiryMessage = hasRefreshToken ? 'Connected' : formatExpiryMessage(acc.config.token_expires_at);
+
+      // Gmail stores picture as picture_url; other platforms use profile_image_url
+      const profileImageUrl =
+        (acc.config as any).picture_url ||
+        (acc.config as any).profile_image_url;
 
       return {
         platform: acc.platform,
@@ -28,7 +36,7 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         account_type: acc.config.account_type,
         profile_id: (acc.config as any).profile_id,
         page_id: (acc.config as any).page_id,
-        profile_image_url: (acc.config as any).profile_image_url,
+        profile_image_url: profileImageUrl,
         account_handle: (acc.config as any).account_handle,
         follower_count: (acc.config as any).follower_count,
         created_at: acc.created_at,

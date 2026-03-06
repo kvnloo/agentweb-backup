@@ -75,6 +75,17 @@ KEY_FILE=~/.ssh/my-keypair.pem
 
 `curl ifconfig.me` (without `-4`) can return an IPv6 address on dual-stack networks. IPv6 rules won't grant access to IPv4-only EC2 instances, causing silent connectivity failures (SSH hangs, browser timeouts).
 
+### Cloud-Dev CLAUDE.md
+
+In dev mode, a user-level `~/.claude/CLAUDE.md` is automatically written to the EC2 instance during setup. This file overrides project-level CLAUDE.md instructions that don't apply in the cloud dev context:
+
+- Tells Claude Code it **is** the test environment (no `sync` needed)
+- Provides the actual service URLs using the instance's public IP
+- Documents service management via `dev-services.sh`
+- Notes that services auto-reload on file changes
+
+The template lives at `test-env/cloud-dev-claude.md`. During setup, `PUBLIC_IP` is substituted with the real EC2 public IP. Because the file is at `~/.claude/CLAUDE.md` (outside the repo), `sync` operations won't overwrite it.
+
 ### Architecture
 
 - Three Docker containers on one EC2 instance (t3.large)

@@ -28,6 +28,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Worker initialization timeout increased to 120 seconds to handle MCP server connections',
       '- Worker heap limit set to 4GB in both development and production to prevent OOM crashes',
     ],
+    date: '2026-03-04',
+    changes: [
+      'New: Gmail Integration',
+      '- Connect your Gmail account to Emma via Settings → Connected Accounts',
+      '- Emma can now read, search, and send emails on your behalf using your connected Gmail',
+      '- OAuth-based connection with automatic token refresh — no passwords stored',
+      '- Supports reply threading, CC/BCC, and HTML emails',
+      '- Available as an MCP tool for external clients (email search, read, send)',
+    ],
   },
   {
     date: '2026-03-05',

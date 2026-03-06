@@ -3788,3 +3788,146 @@ mcpToolRegistry.register({
     );
   }
 });
+
+// ── Email Tool (unified, multi-provider) ───────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'email',
+  definition: {
+    name: 'email',
+    description:
+      'Read, search, and send emails across connected email accounts (Gmail, and more providers in the future). ' +
+      'Always call list_connected_accounts first to get the account_id for the user\'s email account. ' +
+      'Actions:\n' +
+      '  \u2022 search \u2014 find emails by query. Gmail syntax: "from:alice@example.com subject:invoice newer_than:7d is:unread has:attachment"\n' +
+      '  \u2022 list   \u2014 list recent emails from a folder (INBOX, SENT, TRASH, SPAM, or custom label)\n' +
+      '  \u2022 get    \u2014 read full body of one or more emails using message_ids from search/list results\n' +
+      '  \u2022 send   \u2014 send a new email or reply to an existing thread',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'Email account ID from list_connected_accounts (e.g. the user\'s Gmail address)'
+        },
+        action: {
+          type: 'string',
+          enum: ['search', 'list', 'get', 'send'],
+          description: 'Action to perform: search, list, get, or send'
+        },
+        query: {
+          type: 'string',
+          description: 'search action only \u2014 provider-specific search query. Gmail: "from:alice@example.com subject:invoice newer_than:7d"'
+        },
+        folder: {
+          type: 'string',
+          description: 'list action only \u2014 folder or label to list. Defaults to INBOX. Gmail examples: INBOX, SENT, TRASH, SPAM, or a custom label name'
+        },
+        message_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'get action only \u2014 one or more message IDs from search or list results. Pass all IDs you need in one call.'
+        },
+        max_results: {
+          type: 'number',
+          description: 'search/list actions \u2014 max emails to return (default 10 for search, 20 for list, max 50)'
+        },
+        to: {
+          type: ['string', 'array'],
+          items: { type: 'string' },
+          description: 'send action \u2014 recipient email address(es)'
+        },
+        subject: {
+          type: 'string',
+          description: 'send action \u2014 email subject line'
+        },
+        body: {
+          type: 'string',
+          description: 'send action \u2014 email body content (plain text by default; set is_html=true for HTML)'
+        },
+        cc: {
+          type: ['string', 'array'],
+          items: { type: 'string' },
+          description: 'send action \u2014 CC recipient(s)'
+        },
+        bcc: {
+          type: ['string', 'array'],
+          items: { type: 'string' },
+          description: 'send action \u2014 BCC recipient(s)'
+        },
+        reply_to_message_id: {
+          type: 'string',
+          description: 'send action \u2014 message ID to reply to. Sets the thread and In-Reply-To/References headers automatically.'
+        },
+        is_html: {
+          type: 'boolean',
+          description: 'send action \u2014 set to true if body contains HTML. Defaults to false (plain text).'
+        }
+      },
+      required: ['account_id', 'action']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../../services/emailProviderService');
+    const { GmailNotConnectedError, GmailTokenRevokedError, GmailQuotaError, GmailBodyTooLargeError, GmailSendNotAuthorizedError } = await import('../../services/gmailService');
+
+    const userId = context?.userId;
+    if (!userId) throw new Error('Missing user context');
+
+    await bootstrapEmailProviders();
+
+    try {
+      const { provider } = await resolveEmailAccount(userId, args.account_id);
+
+      switch (args.action) {
+        case 'search': {
+          if (!args.query) return { error: 'search action requires a query parameter.' };
+          const maxResults = Math.min(args.max_results || 10, 50);
+          const results = await provider.searchEmails(userId, args.account_id, args.query, maxResults);
+          if (results.length === 0) return { message: 'No emails found matching your search.' };
+          return { emails: results, count: results.length };
+        }
+
+        case 'list': {
+          const maxResults = Math.min(args.max_results || 20, 50);
+          const results = await provider.listEmails(userId, args.account_id, args.folder || 'INBOX', maxResults);
+          if (results.length === 0) return { message: 'No emails found.' };
+          return { emails: results, count: results.length };
+        }
+
+        case 'get': {
+          const ids: string[] = Array.isArray(args.message_ids) ? args.message_ids : [];
+          if (ids.length === 0) return { error: 'get action requires a message_ids array with at least one ID.' };
+          const emails = await provider.getEmails(userId, args.account_id, ids);
+          return { emails, count: emails.length };
+        }
+
+        case 'send': {
+          if (!args.to) return { error: 'send action requires a "to" parameter.' };
+          if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
+          if (!args.body) return { error: 'send action requires a "body" parameter.' };
+          const result = await provider.sendEmail(userId, args.account_id, {
+            to: args.to,
+            subject: args.subject,
+            body: args.body,
+            cc: args.cc,
+            bcc: args.bcc,
+            replyToMessageId: args.reply_to_message_id,
+            isHtml: args.is_html,
+          });
+          return { success: true, messageId: result.messageId, threadId: result.threadId };
+        }
+
+        default:
+          return { error: `Unknown action "${args.action}". Valid actions: search, list, get, send.` };
+      }
+    } catch (err: any) {
+      if (err instanceof GmailBodyTooLargeError) return { error: err.message };
+      if (err instanceof GmailNotConnectedError || err instanceof GmailTokenRevokedError) return { error: err.message };
+      if (err instanceof GmailQuotaError) return { error: err.message };
+      if (err instanceof GmailSendNotAuthorizedError) return { error: err.message };
+      if (err.message?.includes('not found') || err.message?.includes('not an email account')) return { error: err.message };
+      throw err;
+    }
+  }
+});
