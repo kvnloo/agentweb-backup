@@ -2,6 +2,20 @@ import { crmDb, userDb } from './db';
 import { emailService } from './emailService';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
+
+const SYSTEM_EMAIL_PREFIXES = [
+  'no-reply@',
+  'noreply@',
+  'do-not-reply@',
+  'donotreply@',
+  'mailer-daemon@',
+  'postmaster@',
+];
+
+const isSystemEmail = (email: string): boolean => {
+  const lower = email.toLowerCase();
+  return SYSTEM_EMAIL_PREFIXES.some((prefix) => lower.startsWith(prefix));
+};
 const getAlertEvents = (list: any) => {
   const rawEvents = Array.isArray(list.alertEvents) ? list.alertEvents : ['email.received'];
   return rawEvents.map(normalizeEventType);
@@ -200,6 +214,9 @@ export const leadListAlertService = {
     const eventType = typeof emailEvent.eventType === 'string' ? emailEvent.eventType : '';
     const emailDomain = typeof emailEvent.emailDomain === 'string' ? emailEvent.emailDomain : '';
     if (!leadEmail || !eventType || !emailDomain) {
+      return;
+    }
+    if (isSystemEmail(leadEmail)) {
       return;
     }
     const users = await userDb.getUsersByEmailDomain(emailDomain);

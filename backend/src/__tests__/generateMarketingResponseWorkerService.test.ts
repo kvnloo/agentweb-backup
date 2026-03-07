@@ -278,8 +278,8 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
       const forkCall = (fork as jest.Mock).mock.calls[0];
       expect(forkCall[0]).toContain('workers/generateMarketingResponseWorker.js');
-      // execArgv should be undefined (not set) for compiled JavaScript
-      expect(forkCall[2].execArgv).toBeUndefined();
+      // execArgv should include heap limit for compiled JavaScript
+      expect(forkCall[2].execArgv).toEqual(['--max-old-space-size=4096']);
       expect(forkCall[2].env).toEqual(process.env);
 
       // Wait for ready and complete the promise
@@ -303,8 +303,8 @@ describe('GenerateMarketingResponseWorkerService', () => {
 
       const forkCall = (fork as jest.Mock).mock.calls[0];
       expect(forkCall[0]).toContain('workers/generateMarketingResponseWorker.js');
-      // execArgv should be undefined (not set) for compiled JavaScript
-      expect(forkCall[2].execArgv).toBeUndefined();
+      // execArgv should include heap limit for compiled JavaScript
+      expect(forkCall[2].execArgv).toEqual(['--max-old-space-size=4096']);
       expect(forkCall[2].env).toEqual(process.env);
 
       // Wait for ready and complete the promise
@@ -332,11 +332,11 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // In test environment, __dirname is in src/__tests__, so it should detect as local dev
       // and use TypeScript with ts-node
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
-        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register']);
+        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register', '--max-old-space-size=4096']);
       } else {
         // If it uses .js, it means __dirname contains 'dist' (deployed environment)
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');
-        expect(forkCall[2].execArgv).toBeUndefined();
+        expect(forkCall[2].execArgv).toEqual(['--max-old-space-size=4096']);
       }
 
       // Wait for ready and complete the promise
@@ -369,11 +369,11 @@ describe('GenerateMarketingResponseWorkerService', () => {
       // But the logic should handle the case where __dirname contains 'dist' even with NODE_ENV=development
       if (scriptPath.includes('generateMarketingResponseWorker.ts')) {
         // Local development: uses TypeScript with ts-node
-        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register']);
+        expect(forkCall[2].execArgv).toEqual(['-r', 'ts-node/register', '--max-old-space-size=4096']);
       } else {
         // Deployed environment (even with NODE_ENV=development): uses compiled JavaScript
         expect(scriptPath).toContain('generateMarketingResponseWorker.js');
-        expect(forkCall[2].execArgv).toBeUndefined();
+        expect(forkCall[2].execArgv).toEqual(['--max-old-space-size=4096']);
       }
 
       // Verify the logic correctly distinguishes between local dev and deployed environments

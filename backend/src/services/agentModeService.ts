@@ -82,10 +82,14 @@ interface LLMCallOptions {
 
 
 export class AgentModeService {
-  private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number }> = new Map();
+  private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
   private toolRegistry: ToolRegistry;
   private mcpClientService: McpClientService;
   private static toolsRegistered: boolean = false;
+  private fileCacheCleanupInterval?: NodeJS.Timeout;
+  private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
+  private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
+  private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
   default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5-chat-2';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
@@ -105,10 +109,20 @@ export class AgentModeService {
     } else {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
+
+    // Start periodic file cache cleanup
+    this.startFileCacheCleanup();
   }
 
   public async shutdown() {
     try {
+      // Stop file cache cleanup interval
+      if (this.fileCacheCleanupInterval) {
+        clearInterval(this.fileCacheCleanupInterval);
+        this.fileCacheCleanupInterval = undefined;
+        console.log('AgentMode: File cache cleanup interval stopped');
+      }
+
       if ((AgentModeService as any).mcpInitialized) {
         console.log('AgentMode: Shutting down MCP clients...');
         await this.mcpClientService.shutdown();
@@ -117,6 +131,52 @@ export class AgentModeService {
       }
     } catch (error) {
       console.error('AgentMode: Error during shutdown:', error);
+    }
+  }
+
+  /**
+   * Start periodic cleanup of file content cache
+   */
+  private startFileCacheCleanup() {
+    this.fileCacheCleanupInterval = setInterval(() => {
+      this.cleanupFileCache();
+    }, this.FILE_CACHE_CLEANUP_INTERVAL_MS);
+    console.log(`AgentMode: File cache cleanup started (interval: ${this.FILE_CACHE_CLEANUP_INTERVAL_MS}ms)`);
+  }
+
+  /**
+   * Cleanup file content cache by removing old entries and enforcing size limit
+   */
+  private cleanupFileCache() {
+    const initialSize = this.fileContentCache.size;
+    if (initialSize === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const entries = Array.from(this.fileContentCache.entries());
+
+    // Remove expired entries (older than FILE_CACHE_MAX_AGE_MS)
+    for (const [hash, entry] of entries) {
+      if (now - entry.timestamp > this.FILE_CACHE_MAX_AGE_MS) {
+        this.fileContentCache.delete(hash);
+      }
+    }
+
+    // If still over size limit, remove oldest entries
+    if (this.fileContentCache.size > this.FILE_CACHE_MAX_SIZE) {
+      const remainingEntries = Array.from(this.fileContentCache.entries())
+        .sort((a, b) => a[1].timestamp - b[1].timestamp); // Sort by timestamp ascending (oldest first)
+
+      const toRemove = this.fileContentCache.size - this.FILE_CACHE_MAX_SIZE;
+      for (let i = 0; i < toRemove; i++) {
+        this.fileContentCache.delete(remainingEntries[i][0]);
+      }
+    }
+
+    const finalSize = this.fileContentCache.size;
+    if (finalSize < initialSize) {
+      console.log(`AgentMode: File cache cleanup - removed ${initialSize - finalSize} entries (${initialSize} → ${finalSize})`);
     }
   }
 
@@ -645,6 +705,10 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
+      // Track memory usage for optimization
+      const startMemory = process.memoryUsage();
+      const startTime = Date.now();
+
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
       let [
         currentSession,
@@ -1008,15 +1072,30 @@ export class AgentModeService {
         console.warn('AgentMode: Reached maximum tool execution iterations');
       }
 
-      // Attach timing metadata and tool calls to the last assistant message
+      // Attach timing metadata, memory usage, and tool calls to the last assistant message
       if (messages.length > 0) {
         const lastAssistantIdx = messages.length - 1 - [...messages].reverse().findIndex((m: any) => m.role === 'assistant');
         if (lastAssistantIdx < messages.length) {
           const lastMessage = messages[lastAssistantIdx];
+
+          // Calculate memory usage delta and current state
+          const endMemory = process.memoryUsage();
+          const endTime = Date.now();
+          const memoryUsage = {
+            heapUsedDeltaMB: Number(((endMemory.heapUsed - startMemory.heapUsed) / 1024 / 1024).toFixed(2)),
+            heapTotalDeltaMB: Number(((endMemory.heapTotal - startMemory.heapTotal) / 1024 / 1024).toFixed(2)),
+            rssDeltaMB: Number(((endMemory.rss - startMemory.rss) / 1024 / 1024).toFixed(2)),
+            currentHeapUsedMB: Number((endMemory.heapUsed / 1024 / 1024).toFixed(2)),
+            currentHeapTotalMB: Number((endMemory.heapTotal / 1024 / 1024).toFixed(2)),
+            currentRssMB: Number((endMemory.rss / 1024 / 1024).toFixed(2)),
+            durationMs: endTime - startTime
+          };
+
           lastMessage.metadata = {
             ...lastMessage.metadata,
             timestamp: new Date().toISOString(),
             iterationTimings,
+            memoryUsage,
             ...(toolCalls.length > 0 ? { toolCalls } : {}),
           };
         }
@@ -11680,10 +11759,17 @@ Format the response as JSON with this structure:
       // Generate content hash for deduplication
       const contentHash = createHash('sha256').update(fileContent).digest('hex');
 
+      // Cleanup cache before checking/adding entries
+      this.cleanupFileCache();
+
       // Check if we already have this content cached
       const cachedFile = this.fileContentCache.get(contentHash);
       if (cachedFile) {
         console.log('AgentMode: File content already exists, returning cached URL:', cachedFile.file_url);
+        // Update timestamp to mark as recently used
+        cachedFile.timestamp = Date.now();
+        this.fileContentCache.set(contentHash, cachedFile);
+
         // Format the save result for LLM consumption
         const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${cachedFile.file_url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;
 
@@ -11727,14 +11813,15 @@ Format the response as JSON with this structure:
       );
 
       if (uploadResult.success) {
-        // Cache the file content hash to URL mapping
+        // Cache the file content hash to URL mapping with timestamp
         this.fileContentCache.set(contentHash, {
           file_url: uploadResult.url || '',
           file_name: fileName || 'unknown',
-          file_size: fileContent.length
+          file_size: fileContent.length,
+          timestamp: Date.now()
         });
 
-        console.log('AgentMode: File uploaded and cached with hash:', contentHash);
+        console.log(`AgentMode: File uploaded and cached with hash: ${contentHash} (cache size: ${this.fileContentCache.size})`);
 
         // Format the save result for LLM consumption
         const formattedContent = `📁 **File Saved Successfully**\nFile: ${fileName}\nSize: ${fileContent.length} bytes\nURL: ${uploadResult.url}\n\nThe file has been uploaded to S3 and is ready for sharing or reference.`;

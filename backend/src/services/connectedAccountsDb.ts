@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -92,7 +92,18 @@ export type MetaConfig = MetaAdAccountConfig | MetaPageConfig | MetaInstagramBus
  * Union type for all platform-specific configurations.
  * Add new platform configs here as they are implemented.
  */
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig; // | TwitterConfig
+/**
+ * Gmail OAuth configuration
+ */
+export interface GmailConfig extends BaseOAuthConfig {
+  account_type: 'gmail';
+  email: string;           // Google account email (used as account_id)
+  display_name?: string;   // User's display name from Google profile
+  picture_url?: string;    // Profile picture URL
+  granted_scopes: string[]; // Actual scopes granted (may differ from requested)
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig; // | TwitterConfig
 
 /**
  * Connected Account configuration stored in the User record
@@ -211,7 +222,9 @@ export const getAccountByPlatform = async (
 };
 
 /**
- * Update a connected account's tokens (e.g., after refresh)
+ * Update a connected account's tokens (e.g., after refresh).
+ * When accountId is provided, matches by account_id (exact account).
+ * Falls back to matching by platform only (first match) when accountId is omitted.
  */
 export const updateAccountTokens = async (
   userId: string,
@@ -220,7 +233,8 @@ export const updateAccountTokens = async (
     access_token: string;
     refresh_token?: string;
     token_expires_at: number;
-  }
+  },
+  accountId?: string
 ): Promise<void> => {
   const user = await userDb.getUserById(userId);
   if (!user) {
@@ -228,10 +242,12 @@ export const updateAccountTokens = async (
   }
 
   const accounts = normalizeAccounts((user as User).connected_accounts);
-  const accountIndex = accounts.findIndex(acc => acc.platform === platform);
-  
+  const accountIndex = accountId
+    ? accounts.findIndex(acc => acc.platform === platform && acc.account_id === accountId)
+    : accounts.findIndex(acc => acc.platform === platform);
+
   if (accountIndex < 0) {
-    throw new Error(`No ${platform} account connected`);
+    throw new Error(`No ${platform} account${accountId ? ` with id "${accountId}"` : ''} connected`);
   }
 
   const existingAccount = accounts[accountIndex];

@@ -1,3 +1,52 @@
+# March 6, 2026: MCP Server IDOR Vulnerability — userId Override in Tool Arguments
+
+**Problem:** The Emma MCP server (`backend/src/mcp/server/mcpServerCore.ts`) allows tool callers to override the authenticated user's identity by passing a `userId` in tool call arguments. In the request handler:
+
+```typescript
+const context = {
+  userId: userId || sessionContext?.agentUserId,
+  // userId from tool args takes precedence over the authenticated user
+};
+```
+
+Any authenticated user (with a valid API key, OAuth token, or static MCP token) can pass any `userId` and operate on another user's private data.
+
+**Reproduction (tested on production `api.agentweb.pro`):**
+
+1. Initialize MCP session with a valid API key:
+   ```
+   POST /mcp with Authorization: Bearer aw_<key>
+   → Returns mcp-session-id header
+   ```
+
+2. Call `list_knowledge_base_files` with a different user's ID:
+   ```json
+   {"method":"tools/call","params":{"name":"list_knowledge_base_files","arguments":{"userId":"<other_user_id>"}}}
+   ```
+
+3. Result: Returns the target user's **private** knowledge bases (16 KBs, 116 files), including private persona data, LinkedIn posts, Google Drive folders, ClickUp docs, and signed GCS download URLs.
+
+**Severity:** High — IDOR (Insecure Direct Object Reference). Affects all MCP tools that accept `userId` in arguments, potentially including leads, tasks, GTM plans, brand guidelines, connected accounts, etc.
+
+**Root cause:** The MCP tool execution layer trusts caller-supplied `userId` over the authenticated identity (`agentUserId` from the API key). Standard REST API routes don't have this issue because `req.user` is derived from the JWT token and cannot be overridden by request parameters.
+
+**Architecture context:** We evaluated two approaches for exposing Emma capabilities:
+- **Approach A (current):** 90+ internal Emma tools exposed directly via MCP. Suffers from this IDOR issue, large tool surface area, and tight coupling to internal schemas.
+- **Approach B (recommended):** Expose AgentWeb backend REST APIs as MCP tools. All requests go through JWT auth middleware where `req.user` is derived from the token, not caller parameters. Smaller tool surface (~20-30 tools), stable API contract, consistent auth model.
+
+**Immediate fix needed:** In `mcpServerCore.ts`, stop allowing `userId` from tool arguments to override the authenticated user:
+```typescript
+// Before (vulnerable):
+userId: userId || sessionContext?.agentUserId,
+
+// After (fixed):
+userId: sessionContext?.agentUserId,  // Always use authenticated identity
+```
+
+**Long-term fix:** Migrate to Approach B — backend API MCP wrapper with JWT-based auth for all operations.
+
+**Files:** `backend/src/mcp/server/mcpServerCore.ts` (tool request handler), `backend/src/mcp/server/mcpServer.ts` (session/auth management)
+
 # March 5, 2026: Dev Env Launch Fails on Elastic Beanstalk
 
 **Problem:** Notion-triggered cloud dev env launch failed with `ENOENT: no such file or directory, open '/var/app/test-env/user-data-dev-auto.sh'`. The `devEnvService.ts` reads the script via `fs.readFileSync` with a path relative to `__dirname`, but `test-env/` is at the repo root and not included in the backend deploy zip.

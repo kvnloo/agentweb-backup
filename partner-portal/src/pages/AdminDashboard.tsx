@@ -4435,6 +4435,7 @@ export default function AdminDashboard() {
                   <TableCell>Updated At</TableCell>
                   <TableCell>Message Count</TableCell>
                   <TableCell>Longest Wait</TableCell>
+                  <TableCell>Max Heap</TableCell>
                   <TableCell>Feedback</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -4442,7 +4443,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={11} align="center">
+                    <TableCell colSpan={12} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4564,6 +4565,18 @@ export default function AdminDashboard() {
                             const label = maxWaitSec >= 60 ? `${(maxWaitSec / 60).toFixed(1)}m` : `${maxWaitSec.toFixed(1)}s`;
                             const color = maxWaitSec > 60 ? '#d32f2f' : maxWaitSec > 30 ? '#ed6c02' : '#666';
                             return <span style={{ color, fontWeight: maxWaitSec > 30 ? 'bold' : 'normal' }}>{label}</span>;
+                          })()}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            const heapUsages = (session.messages || [])
+                              .filter((msg: any) => msg?.role === 'assistant' && msg?.metadata?.memoryUsage?.currentHeapUsedMB != null)
+                              .map((msg: any) => msg.metadata.memoryUsage.currentHeapUsedMB);
+                            if (heapUsages.length === 0) return <span style={{ color: '#999' }}>-</span>;
+                            const maxHeapMB = Math.max(...heapUsages);
+                            const label = maxHeapMB >= 1000 ? `${(maxHeapMB / 1024).toFixed(2)}GB` : `${maxHeapMB.toFixed(0)}MB`;
+                            const color = maxHeapMB > 3000 ? '#d32f2f' : maxHeapMB > 2000 ? '#ed6c02' : '#666';
+                            return <span style={{ color, fontWeight: maxHeapMB > 2000 ? 'bold' : 'normal' }}>{label}</span>;
                           })()}
                         </TableCell>
                         <TableCell>
