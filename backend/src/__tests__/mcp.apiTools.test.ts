@@ -52,10 +52,16 @@ describe('apiTools', () => {
   // ─── Registration checks ──────────────────────────────────────────────
 
   describe('tool registrations', () => {
-    it('should NOT register install_skills or list_available_skills (internal-only)', () => {
-      const names = mcpToolRegistry.getToolNames();
-      expect(names).not.toContain('install_skills');
-      expect(names).not.toContain('list_available_skills');
+    it('should register install_skills and list_available_skills as internal tools', () => {
+      const allNames = mcpToolRegistry.getToolNames();
+      const externalDefs = mcpToolRegistry.getToolDefinitions();
+      const externalNames = externalDefs.map((d: any) => d.name);
+      // Registered (available to Emma internally)
+      expect(allNames).toContain('install_skills');
+      expect(allNames).toContain('list_available_skills');
+      // But NOT exposed to external MCP clients
+      expect(externalNames).not.toContain('install_skills');
+      expect(externalNames).not.toContain('list_available_skills');
     });
 
     it('should register API-wrapping tools', () => {
@@ -80,7 +86,7 @@ describe('apiTools', () => {
       const allNames = mcpToolRegistry.getToolNames();
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
-      const internalTools = ['search_web', 'generate_image', 'send_email', 'save_file'];
+      const internalTools = ['install_skills', 'list_available_skills', 'search_web', 'generate_image', 'send_email', 'save_file'];
       for (const name of internalTools) {
         // Registered in the registry (available to Emma internally)
         expect(allNames).toContain(name);

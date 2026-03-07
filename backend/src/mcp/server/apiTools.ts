@@ -37,10 +37,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    // Pass installAllSkills to pre-install all published skills into the session.
-    // This gives Emma full tool access without requiring the skill-first chat flow
-    // that the customer portal UI uses.
-    const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/sessions', context: ctx(context), body: { llmModel: args.llm_model, installAllSkills: true } });
+    const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/sessions', context: ctx(context), body: { llmModel: args.llm_model } });
     return jsonResult(data);
   }
 });
@@ -818,9 +815,65 @@ mcpToolRegistry.register({
 });
 
 // ─── Internal-only tools (hidden from external MCP clients) ─────────────────
-// These tools use backend infrastructure (API keys, SMTP, cloud storage).
-// They are registered with internal: true so Emma can use them in chat,
+// These tools are registered with internal: true so Emma can use them in chat,
 // but they are NOT listed to external MCP clients.
+
+// Session-state tools: install_skills and list_available_skills manipulate
+// chat session state (associatedSkills). They call agentModeService directly
+// because they're part of Emma's skill-first chat flow, same as customer portal.
+
+mcpToolRegistry.register({
+  name: 'install_skills',
+  internal: true,
+  definition: {
+    name: 'install_skills',
+    description: 'Install one or more skills by their IDs. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        skillIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of skill IDs to install.'
+        }
+      },
+      required: ['skillIds']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required: no user context');
+    if (!Array.isArray(args.skillIds) || args.skillIds.length === 0) {
+      return { message: 'skillIds must be a non-empty array of skill IDs.' };
+    }
+    if (!context?.sessionId) throw new Error('Missing session context');
+    const { agentModeService } = await import('../../services/agentModeService');
+    return await agentModeService.installSkills(args.skillIds, userId, context.sessionId);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_available_skills',
+  internal: true,
+  definition: {
+    name: 'list_available_skills',
+    description: 'List all available skills with their descriptions and tool lists. Use this to discover what capabilities Emma offers before installing skills.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    if (!context?.sessionId) throw new Error('Missing session context');
+    const { agentModeService } = await import('../../services/agentModeService');
+    return await agentModeService.listSkills(userId, context.sessionId);
+  }
+});
+
+// Infrastructure tools: use backend APIs (search, image gen, email, storage).
 
 mcpToolRegistry.register({
   name: 'search_web',
