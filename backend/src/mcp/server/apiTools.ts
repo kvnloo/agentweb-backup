@@ -721,22 +721,22 @@ mcpToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        title_draft: { type: 'string', description: 'Draft title for the blog post' },
-        content_draft: { type: 'string', description: 'Draft content or outline' },
+        topic: { type: 'string', description: 'Topic for the blog post' },
+        keywords: { type: 'string', description: 'Comma-separated keywords to include' },
+        tone: { type: 'string', description: 'Writing tone (e.g., "professional", "casual")', default: 'professional' },
         length: { type: 'string', enum: ['short', 'medium', 'long'], description: 'Post length', default: 'medium' },
-        style: { type: 'string', description: 'Writing style', default: 'default' },
-        deep_research: { type: 'boolean', description: 'Use deep research for comprehensive content', default: false }
+        research_context: { type: 'string', description: 'Additional research context' }
       },
-      required: ['title_draft', 'content_draft']
+      required: ['topic']
     }
   },
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/blog/generate', context: ctx(context),
       body: {
-        titleDraft: args.title_draft, contentDraft: args.content_draft,
-        length: args.length || 'medium', style: args.style || 'default',
-        deepResearch: args.deep_research || false
+        topic: args.topic, keywords: args.keywords,
+        tone: args.tone || 'professional', length: args.length || 'medium',
+        researchContext: args.research_context
       }
     });
     return jsonResult(data);
