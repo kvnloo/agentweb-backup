@@ -37,7 +37,10 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/sessions', context: ctx(context), body: { llmModel: args.llm_model } });
+    // Pass installAllSkills to pre-install all published skills into the session.
+    // This gives Emma full tool access without requiring the skill-first chat flow
+    // that the customer portal UI uses.
+    const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/sessions', context: ctx(context), body: { llmModel: args.llm_model, installAllSkills: true } });
     return jsonResult(data);
   }
 });
@@ -60,7 +63,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/agent-mode/generate', context: ctx(context),
-      body: { sessionId: args.session_id, message: args.message, llmModel: args.llm_model }
+      body: { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model }
     });
     return jsonResult(data);
   }
@@ -814,10 +817,14 @@ mcpToolRegistry.register({
   }
 });
 
-// ─── AI Operations ──────────────────────────────────────────────────────────
+// ─── Internal-only tools (hidden from external MCP clients) ─────────────────
+// These tools use backend infrastructure (API keys, SMTP, cloud storage).
+// They are registered with internal: true so Emma can use them in chat,
+// but they are NOT listed to external MCP clients.
 
 mcpToolRegistry.register({
   name: 'search_web',
+  internal: true,
   definition: {
     name: 'search_web',
     description: 'Search the web for information.',
@@ -841,6 +848,7 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'generate_image',
+  internal: true,
   definition: {
     name: 'generate_image',
     description: 'Generate images using AI image generation models.',
@@ -874,6 +882,7 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'send_email',
+  internal: true,
   definition: {
     name: 'send_email',
     description: 'Read, search, and send emails across connected email accounts (Gmail, etc.).',
@@ -908,6 +917,7 @@ mcpToolRegistry.register({
 
 mcpToolRegistry.register({
   name: 'save_file',
+  internal: true,
   definition: {
     name: 'save_file',
     description: 'Save a file to cloud storage.',

@@ -1320,7 +1320,7 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType } = req.body;
+      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, installAllSkills } = req.body;
 
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
@@ -1349,6 +1349,21 @@ export const agentModeController = {
         ? await agentModeService.getReportsModel()
         : await agentModeService.getDefaultModel();
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+
+      // MCP sessions: pre-install all published skills so Emma has full tool access
+      // without requiring the skill-first chat flow
+      if (installAllSkills) {
+        try {
+          const publishedSkills = await skillService.getPublishedSkills();
+          const allSkillIds = publishedSkills.map((s: any) => s.skillId);
+          if (allSkillIds.length > 0) {
+            await chatbotDb.addAssociatedSkills(session.sessionId, allSkillIds);
+          }
+        } catch (skillError) {
+          console.warn('AgentMode: Failed to pre-install skills:', skillError);
+          // Non-fatal — session still created, just without pre-installed skills
+        }
+      }
 
       res.status(201).json(sessionWithModel);
     } catch (error) {
