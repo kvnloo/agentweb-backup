@@ -91,4 +91,92 @@ describe('leadListAlertService', () => {
     expect(crmDb.getLeadByEmail).toHaveBeenCalledWith('list-1', 'lead@example.com');
     expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
   });
+
+  describe('system email filtering', () => {
+    const systemEmails = [
+      'no-reply@example.com',
+      'noreply@example.com',
+      'do-not-reply@example.com',
+      'donotreply@example.com',
+      'mailer-daemon@example.com',
+      'postmaster@example.com',
+      'NO-REPLY@EXAMPLE.COM',
+    ];
+
+    it.each(systemEmails)(
+      'does not send alert for system email: %s',
+      async (systemEmail) => {
+        await leadListAlertService.notifyForEmailEvent({
+          eventType: 'email.received',
+          leadEmail: systemEmail,
+          emailDomain: 'example.com',
+          data: { subject: 'Auto-generated message' },
+          createdAt: '2024-03-01T10:00:00.000Z',
+        });
+
+        expect(userDb.getUsersByEmailDomain).not.toHaveBeenCalled();
+        expect(emailService.sendEmail).not.toHaveBeenCalled();
+      }
+    );
+
+    it('still sends alert for regular lead emails', async () => {
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([
+        { userId: 'user-1', email: 'owner@example.com', emailDomain: 'example.com' },
+      ]);
+      (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([
+        { listId: 'list-1', name: 'List One', userId: 'user-1', alertEvents: ['email.received'] },
+      ]);
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+        leadId: 'lead-1',
+        email: 'real-person@company.com',
+        firstName: 'Jane',
+        lastName: 'Doe',
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        email: 'owner@example.com',
+        emailDomain: 'example.com',
+      });
+      (emailService.sendEmail as jest.Mock).mockResolvedValue(undefined);
+
+      await leadListAlertService.notifyForEmailEvent({
+        eventType: 'email.received',
+        leadEmail: 'real-person@company.com',
+        emailDomain: 'example.com',
+        data: { subject: 'Interested in your product' },
+        createdAt: '2024-03-01T10:00:00.000Z',
+      });
+
+      expect(userDb.getUsersByEmailDomain).toHaveBeenCalled();
+      expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not filter system-like substrings in normal emails', async () => {
+      (userDb.getUsersByEmailDomain as jest.Mock).mockResolvedValue([
+        { userId: 'user-1', email: 'owner@example.com', emailDomain: 'example.com' },
+      ]);
+      (crmDb.getLeadListsByUserId as jest.Mock).mockResolvedValue([
+        { listId: 'list-1', name: 'List One', userId: 'user-1', alertEvents: ['email.received'] },
+      ]);
+      (crmDb.getLeadByEmail as jest.Mock).mockResolvedValue({
+        leadId: 'lead-1',
+        email: 'reply-needed@example.com',
+        firstName: 'Bob',
+      });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        email: 'owner@example.com',
+        emailDomain: 'example.com',
+      });
+      (emailService.sendEmail as jest.Mock).mockResolvedValue(undefined);
+
+      await leadListAlertService.notifyForEmailEvent({
+        eventType: 'email.received',
+        leadEmail: 'reply-needed@example.com',
+        emailDomain: 'example.com',
+        data: { subject: 'Question' },
+        createdAt: '2024-03-01T10:00:00.000Z',
+      });
+
+      expect(emailService.sendEmail).toHaveBeenCalledTimes(1);
+    });
+  });
 });

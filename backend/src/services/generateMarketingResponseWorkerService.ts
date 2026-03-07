@@ -53,16 +53,17 @@ export class GenerateMarketingResponseWorkerService {
 
     if (isLocalDevelopment) {
       workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.ts');
-      execArgv = ['-r', 'ts-node/register'];
+      execArgv = ['-r', 'ts-node/register', '--max-old-space-size=4096'];
     } else {
       workerScript = path.join(__dirname, '../workers/generateMarketingResponseWorker.js');
+      execArgv = ['--max-old-space-size=4096'];
     }
 
-    // Fork a new process
+    // Fork a new process with increased memory limit (4GB) to prevent OOM errors
     this.worker = fork(workerScript, [], {
       stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
       env: process.env,
-      execArgv: execArgv.length > 0 ? execArgv : undefined
+      execArgv
     });
     this.workerReady = false;
 
@@ -73,7 +74,7 @@ export class GenerateMarketingResponseWorkerService {
       if (readyReject) {
         readyReject(error);
       }
-    }, 60000); // 60 second timeout for initialization
+    }, 120000); // 120 second timeout for initialization (increased to handle MCP server connections)
     this.workerInitPromise = new Promise<void>((resolve, reject) => {
       readyResolve = () => {
         this.workerReady = true;

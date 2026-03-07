@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getMetaCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getMetaCredentials, getGmailCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -67,6 +67,20 @@ export const INTEGRATION_CONFIG = {
     instagramAuthorizationUrl: `https://api.instagram.com/oauth/authorize`,
     instagramTokenUrl: `https://api.instagram.com/oauth/access_token`,
     instagramApiBaseUrl: `https://graph.instagram.com/${META_INSTAGRAM_VERSION}`
+  },
+
+  gmail: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/gmail/callback`,
+    authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    revokeUrl: 'https://oauth2.googleapis.com/revoke',
+    profileUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
+    scopes: [
+      'https://www.googleapis.com/auth/gmail.readonly',
+      'https://www.googleapis.com/auth/gmail.send',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+    ],
   }
 };
 
@@ -133,6 +147,47 @@ export function getMetaFlowConfig(flow: MetaFlowType): {
     tokenUrl: cfg.tokenUrl,
     apiBaseUrl: cfg.apiBaseUrl
   };
+}
+
+// Gmail configuration interface
+export interface GmailOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  revokeUrl: string;
+  profileUrl: string;
+}
+
+// Module-level cache — avoids hitting Secrets Manager on every Gmail API call
+let cachedGmailConfig: GmailOAuthConfig | null = null;
+let gmailConfigCacheExpiresAt = 0;
+const GMAIL_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Returns Gmail OAuth configuration.
+ * Credentials are fetched from AWS Secrets Manager (dev/AgentWeb/Google/Gmail or prod/...).
+ * Result is cached for 5 minutes to avoid per-request Secrets Manager calls.
+ */
+export async function getGmailConfig(): Promise<GmailOAuthConfig> {
+  if (cachedGmailConfig && Date.now() < gmailConfigCacheExpiresAt) {
+    return cachedGmailConfig;
+  }
+  const credentials = await getGmailCredentials();
+  cachedGmailConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.gmail.redirectUri,
+    scopes: INTEGRATION_CONFIG.gmail.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.gmail.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.gmail.tokenUrl,
+    revokeUrl: INTEGRATION_CONFIG.gmail.revokeUrl,
+    profileUrl: INTEGRATION_CONFIG.gmail.profileUrl,
+  };
+  gmailConfigCacheExpiresAt = Date.now() + GMAIL_CONFIG_CACHE_TTL_MS;
+  return cachedGmailConfig;
 }
 
 /**
