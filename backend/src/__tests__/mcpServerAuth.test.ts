@@ -195,16 +195,16 @@ describe('MCP Server Auth - Agent API Key Support', () => {
     });
   });
 
-  describe('portalTools import', () => {
-    it('should import portalTools alongside tools', () => {
-      // Verify that mcpServerCore.ts imports portalTools
+  describe('apiTools import', () => {
+    it('should import apiTools and register tools', () => {
       const mcpServerCore = require('../mcp/server/mcpServerCore');
       const { mcpToolRegistry } = mcpServerCore;
 
-      // Portal tools should be registered
+      // API-wrapping tools should be registered
       const toolNames = mcpToolRegistry.getToolNames();
-      const portalTools = toolNames.filter((n: string) => n.startsWith('portal_'));
-      expect(portalTools.length).toBeGreaterThan(0);
+      expect(toolNames).toContain('list_tasks');
+      expect(toolNames).toContain('manage_task');
+      expect(toolNames).toContain('emma_send_message');
     });
   });
 

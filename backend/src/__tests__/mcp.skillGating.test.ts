@@ -18,12 +18,16 @@ jest.mock('../services/chatbotService');
 
 describe('MCP Skill-Gated Tool Discovery', () => {
   describe('Internal-only tools are not exposed', () => {
-    it('install_skills is NOT registered in the external MCP tool registry', () => {
-      expect(mcpToolRegistry.getTool('install_skills')).toBeUndefined();
+    it('install_skills is registered but hidden from external MCP clients', () => {
+      expect(mcpToolRegistry.getTool('install_skills')).toBeDefined();
+      const externalNames = mcpToolRegistry.getToolDefinitions().map((d: any) => d.name);
+      expect(externalNames).not.toContain('install_skills');
     });
 
-    it('list_available_skills is NOT registered in the external MCP tool registry', () => {
-      expect(mcpToolRegistry.getTool('list_available_skills')).toBeUndefined();
+    it('list_available_skills is registered but hidden from external MCP clients', () => {
+      expect(mcpToolRegistry.getTool('list_available_skills')).toBeDefined();
+      const externalNames = mcpToolRegistry.getToolDefinitions().map((d: any) => d.name);
+      expect(externalNames).not.toContain('list_available_skills');
     });
   });
 
