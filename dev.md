@@ -45,7 +45,76 @@ userId: sessionContext?.agentUserId,  // Always use authenticated identity
 
 **Long-term fix:** Migrate to Approach B — backend API MCP wrapper with JWT-based auth for all operations.
 
-**Files:** `backend/src/mcp/server/mcpServerCore.ts` (tool request handler), `backend/src/mcp/server/mcpServer.ts` (session/auth management)
+**Production log analysis (no external attacks detected):**
+
+Reviewed full bundle logs from production (`Agentweb-backend-env-prod-3`) for March 6, 2026. All `/mcp` requests came from only two source IPs:
+- `98.46.137.148` — external user via `claude-code/2.1.69-2.1.70`. Two sessions (`b773311b`, `485aac4a`) at 02:48-02:49 UTC. Actions: `initialize` → `tools/list` only. No `tools/call` with userId override.
+- `73.157.80.155` — our IP. Four sessions for testing: two via claude-code (session setup), two via curl (IDOR reproduction).
+
+No evidence of exploitation by external users beyond our own security testing.
+
+**Fix deployed and verified (PR #613, merged March 6):**
+
+The fix allows `userId` override only for internal clients (`isInternal=true`, i.e. backend-to-backend via `MCP_ACCESS_TOKEN`). External clients (API keys, OAuth) always use the authenticated `agentUserId`.
+
+Post-deploy verification on production:
+1. Called `list_knowledge_base_files` with `userId: "1743956381327"` (different user) → returned the API key owner's 19 KBs / 20 files (not the target user's data).
+2. Called `list_knowledge_base_files` without userId → returned identical 19 KBs / 20 files.
+3. Before the fix, the same call with userId override returned the target user's 16 KBs / 116 files (including private data like "Harsha's persona", "Harsha's worst LinkedIn posts").
+
+The userId parameter is now correctly ignored for external clients.
+
+**Files:** `backend/src/mcp/server/mcpServerCore.ts` (tool request handler), `backend/src/mcp/server/mcpServer.ts` (session/auth management), `backend/src/__tests__/mcp.userIdOverride.test.ts` (regression tests)
+
+**Approach B implemented (March 7, 2026):**
+
+Migrated from Approach A (90+ internal tools exposed directly) to Approach B (REST API wrappers). The MCP server now exposes ~26 tools that call backend REST APIs via HTTP self-calls with short-lived JWTs, going through the same `authenticateToken` middleware as web UI requests. This eliminates the entire class of IDOR vulnerabilities by design.
+
+**Why Approach A (direct internal tools) was problematic:**
+1. **IDOR vulnerability** — caller-supplied `userId` in tool args overrode the authenticated identity, allowing cross-user data access.
+2. **No audit trail** — direct service calls bypass the REST API layer where request logging, rate limiting, and usage tracking happen. Actions taken via MCP tools were invisible to the audit/analytics pipeline.
+3. **No data recording** — REST API route handlers record metrics (response times, error rates, request counts per user) and trigger side effects (webhooks, notifications, activity feeds). Direct service calls skip all of this, creating data gaps between MCP and portal usage.
+4. **Large attack surface** — 90+ tools exposed internal schemas and service methods that were never designed for external consumption.
+
+**Key changes:**
+- Replaced `tools.ts` (75 tools) and `portalTools.ts` (12 tools) with `apiTools.ts` (~30 tools). Each tool calls `mcpFetch()` which generates a short-lived JWT for the authenticated user and makes an HTTP request to `localhost` REST endpoints.
+- Internal tools (`install_skills`, `list_available_skills`, `search_web`, `generate_image`, `send_email`, `save_file`) are registered with `internal: true` flag — available to Emma's agent engine internally but hidden from external MCP clients via `getToolDefinitions()` filtering.
+- External agents access AI capabilities (image gen, web search, email) through Emma chat sessions (`emma_send_message`) rather than direct tool calls.
+- MCP Emma sessions use the exact same skill-first flow as the customer portal — no MCP-specific behavior.
+- Tool count: External MCP clients see 26 tools, Emma's internal registry has 32.
+
+**Architecture:**
+```
+MCP Client → MCP Server (API key auth) → mcpFetch() → localhost REST API → authenticateToken middleware → route handler → service → DB
+```
+
+**Verification — 10 side-by-side MCP vs REST API comparison tests (all passed):**
+
+| # | Test | MCP Result | REST Result (Portal) |
+|---|------|-----------|---------------------|
+| 1 | list_tasks | 18 tasks | 18 tasks |
+| 2 | list_lead_lists | 3 lists | 3 lists |
+| 3 | list_gtm_plans | dict (matching) | dict (matching) |
+| 4 | manage_brand (read) | same company_name | same company_name |
+| 5 | manage_market_strategy (read) | dict (matching) | dict (matching) |
+| 6 | list_knowledge_bases | dict (matching) | dict (matching) |
+| 7 | list_connected_accounts | dict (matching) | dict (matching) |
+| 8 | emma_create_session | `associatedSkills=[]`, `portalType=agent` | identical |
+| 9 | emma_list_sessions | 36 sessions | 36 sessions |
+| 10 | list_task_executions | 1 execution | 1 execution |
+
+**End-to-end Emma session tests via MCP (all use same skill-first flow as customer portal):**
+
+| Test | Tool Calls | Result |
+|------|-----------|--------|
+| Image generation | `install_skills` (147ms) → `search_knowledge_base` (1533ms) → `generate_image` (189s) | S3 image URL returned |
+| Market report | `search_web` (439ms) → `search_web` (617ms) | 1916-char report with market data |
+| Blog article | `install_skills` (126ms) → `generate_blog_post` (42s) | Full blog post generated via AI pipeline |
+| Short video | `install_skills` (181ms) → `list_available_skills` (78ms) | Correctly reported video gen not available (skill not published on test env) |
+
+Bug found and fixed during testing: `generate_blog_post` tool had wrong input schema (`title_draft`/`content_draft` instead of `topic`), causing 400 errors. Fixed to match the actual REST API (`POST /api/blog/generate` expects `topic`, `keywords`, `tone`, `length`).
+
+**Files:** `backend/src/mcp/server/apiTools.ts` (tool registrations), `backend/src/mcp/server/httpClient.ts` (JWT + fetch helper), `backend/src/mcp/server/registry.ts` (internal flag support), `backend/src/__tests__/mcp.apiTools.test.ts` (tests)
 
 # March 5, 2026: Dev Env Launch Fails on Elastic Beanstalk
 

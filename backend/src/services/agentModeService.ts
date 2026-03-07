@@ -233,7 +233,7 @@ export class AgentModeService {
         // Import the registry and the tools definitions (for side effects)
         // Dynamic import to avoid circular dependencies
         await import('../mcp/server/registry');
-        await import('../mcp/server/tools');
+        await import('../mcp/server/apiTools');
         
         AgentModeService.toolsRegistered = true;
       } catch (error) {
