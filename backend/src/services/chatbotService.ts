@@ -114,6 +114,7 @@ export interface ChatMessage {
       uploadedAt: string;
     }>;
     feedback?: MessageFeedback;        // NEW: Feedback data
+    isErrorMessage?: boolean;           // True when message is an auto-persisted error
   };
 }
 
