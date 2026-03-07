@@ -9,10 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-07',
     changes: [
-      'Improvement: MCP Server Tool Security & Emma Parity',
+      'Improvement: MCP Server — REST API Wrappers & Emma Parity',
+      '- Replaced 90+ internal MCP tools with ~30 REST API wrapper tools that go through standard auth middleware',
       '- Internal tools (search_web, generate_image, send_email, save_file) are no longer exposed to external MCP clients',
-      '- External agents access these capabilities through Emma chat sessions instead',
-      '- MCP-created Emma sessions now auto-install all skills for full tool access',
+      '- External agents access AI capabilities through Emma chat sessions, same as the customer portal',
+      '- MCP Emma sessions now use the same skill-first flow as the portal UI (no MCP-specific behavior)',
       '- Fixed emma_send_message to correctly pass user messages to the backend',
     ],
   },

@@ -72,17 +72,17 @@ Migrated from Approach A (90+ internal tools exposed directly) to Approach B (RE
 
 Key changes:
 - Replaced `tools.ts` (75 tools) and `portalTools.ts` (12 tools) with `apiTools.ts` (~30 tools). Each tool calls `mcpFetch()` which generates a short-lived JWT for the authenticated user and makes an HTTP request to `localhost` REST endpoints.
-- Internal infrastructure tools (`search_web`, `generate_image`, `send_email`, `save_file`) are registered with `internal: true` flag — available to Emma's agent engine internally but hidden from external MCP clients via `getToolDefinitions()` filtering.
+- Internal tools (`install_skills`, `list_available_skills`, `search_web`, `generate_image`, `send_email`, `save_file`) are registered with `internal: true` flag — available to Emma's agent engine internally but hidden from external MCP clients via `getToolDefinitions()` filtering.
 - External agents access AI capabilities (image gen, web search, email) through Emma chat sessions (`emma_send_message`) rather than direct tool calls.
-- MCP-created Emma sessions use `installAllSkills: true` to pre-install all published skills, giving Emma full tool access without the skill-first chat flow.
-- Tool count: External MCP clients see 26 tools, Emma's internal registry has 30.
+- MCP Emma sessions use the exact same skill-first flow as the customer portal — no MCP-specific behavior. Verified with 10 side-by-side comparison tests (list_tasks, lead_lists, gtm_plans, brand, market_strategy, knowledge_bases, connected_accounts, create_session, list_sessions, task_executions).
+- Tool count: External MCP clients see 26 tools, Emma's internal registry has 32.
 
 Architecture:
 ```
 MCP Client → MCP Server (API key auth) → mcpFetch() → localhost REST API → authenticateToken middleware → route handler → service → DB
 ```
 
-Files: `backend/src/mcp/server/apiTools.ts` (tool registrations), `backend/src/mcp/server/httpClient.ts` (JWT + fetch helper), `backend/src/mcp/server/registry.ts` (internal flag support), `backend/src/controllers/agentModeController.ts` (installAllSkills), `backend/src/__tests__/mcp.apiTools.test.ts` (tests)
+Files: `backend/src/mcp/server/apiTools.ts` (tool registrations), `backend/src/mcp/server/httpClient.ts` (JWT + fetch helper), `backend/src/mcp/server/registry.ts` (internal flag support), `backend/src/__tests__/mcp.apiTools.test.ts` (tests)
 
 # March 5, 2026: Dev Env Launch Fails on Elastic Beanstalk
 
