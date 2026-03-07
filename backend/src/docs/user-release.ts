@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-06',
+    changes: [
+      'Reliability: Better Error Recovery in Chat Sessions',
+      '- When an AI model fails mid-conversation, an error message is now saved to the session so you see feedback on reload instead of a dead-end',
+      '- Server errors (HTTP 500) from AI providers are now automatically retried with exponential backoff, reducing transient failures',
+    ],
+  },
+  {
     date: '2026-03-05',
     changes: [
       'Bug Fix: Web Search Now Available in Scheduled Chats',
