@@ -70,6 +70,22 @@ describe('isTransientLLMError', () => {
     expect(isTransientLLMError('503 status code')).toBe(true);
     expect(isTransientLLMError('random error')).toBe(false);
   });
+
+  it('should return true for 500 Internal Server Error (status code)', () => {
+    const error: any = new Error('Internal Server Error');
+    error.status = 500;
+    expect(isTransientLLMError(error)).toBe(true);
+  });
+
+  it('should return true for "internal server error" message pattern', () => {
+    expect(isTransientLLMError(new Error('InternalServerError: service unavailable'))).toBe(true);
+    expect(isTransientLLMError(new Error('internal server error'))).toBe(true);
+  });
+
+  it('should return true for "500" in error message', () => {
+    expect(isTransientLLMError(new Error('500 status code (no body)'))).toBe(true);
+    expect(isTransientLLMError('500 error from upstream')).toBe(true);
+  });
 });
 
 // ─── 2. callLLM() retry logic ────────────────────────────────────────────────

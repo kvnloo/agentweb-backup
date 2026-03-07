@@ -30,7 +30,7 @@ export function isContextLimitError(error: unknown): boolean {
   return CONTEXT_LIMIT_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-const TRANSIENT_STATUS_CODES = [429, 502, 503, 504];
+const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
 
 const TRANSIENT_MESSAGE_PATTERNS = [
   /throttl/i,
@@ -41,8 +41,10 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /econnreset/i,
   /etimedout/i,
   /socket hang up/i,
-  /503/,
+  /500/,
   /502/,
+  /503/,
+  /internal.?server.?error/i,
 ];
 
 export function isTransientLLMError(error: unknown): boolean {

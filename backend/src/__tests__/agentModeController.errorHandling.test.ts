@@ -148,6 +148,127 @@ describe('AgentModeController - Error Handling', () => {
     });
   });
 
+  describe('generateResponse - Error message persistence', () => {
+    it('should persist error message to session when LLM fails', async () => {
+      const llmError = new Error('Gemini 500: internal server error');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(llmError);
+
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+          llmModel: 'gemini-3.1-pro-preview',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      // Should persist an error assistant message
+      // addMessageToSession is called once for the user message (inside generateSessionResponse)
+      // and once for the error message in the catch block
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
+      expect(errorCall![0]).toBe(mockSessionId);
+      expect(errorCall![1]).toEqual(expect.objectContaining({
+        role: 'assistant',
+        content: 'I encountered an error processing your request. Please try sending your message again.',
+        metadata: expect.objectContaining({
+          isErrorMessage: true,
+        }),
+      }));
+    });
+
+    it('should NOT persist error message for SESSION_MESSAGE_LIMIT_EXCEEDED', async () => {
+      const sessionLimitError = new Error('SESSION_MESSAGE_LIMIT_EXCEEDED: Too many messages');
+      mockChatbotDb.addMessageToSession.mockRejectedValue(sessionLimitError);
+
+      // Use a session with existing messages so isFirstMessage=false (avoids system msg call)
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+      } as any);
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      // addMessageToSession should be called once (user message save that threw)
+      // but NOT again for the error message (session limit guard skips it)
+      expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledTimes(1);
+      expect(mockRes.status).toHaveBeenCalledWith(413);
+    });
+
+    it('should handle addMessageToSession failure gracefully during error persistence', async () => {
+      const llmError = new Error('LLM call failed');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(llmError);
+
+      // Use a session with existing messages so isFirstMessage=false (avoids system msg call)
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+      } as any);
+
+      // Make the error message persistence fail too
+      mockChatbotDb.addMessageToSession
+        .mockResolvedValueOnce(mockSession as any)  // user message save succeeds
+        .mockRejectedValueOnce(new Error('DynamoDB write failed'));  // error message save fails
+
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      const mockReq = {
+        user: { userId: mockUserId },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Test message',
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      // Should log the error but still return 500
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        'AgentMode: Failed to persist error message to session:',
+        expect.any(Error)
+      );
+      expect(mockRes.status).toHaveBeenCalledWith(500);
+
+      consoleErrorSpy.mockRestore();
+    });
+  });
+
   describe('generateResponse - Unknown error with oncall alert', () => {
     it('should send oncall alert for unknown errors', async () => {
       const unknownError = new Error('Unexpected database error');
@@ -178,6 +299,12 @@ describe('AgentModeController - Error Handling', () => {
 
       await agentModeController.generateResponse(mockReq, mockRes);
       await new Promise((resolve) => setImmediate(resolve));
+
+      // Should persist error message to session
+      const errorCall = mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+      expect(errorCall).toBeDefined();
 
       // Should send oncall alert
       expect(mockEmailService.sendOncallAlert).toHaveBeenCalledWith(
