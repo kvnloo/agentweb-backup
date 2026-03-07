@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-07',
+    changes: [
+      'Improvement: MCP Server Tool Security & Emma Parity',
+      '- Internal tools (search_web, generate_image, send_email, save_file) are no longer exposed to external MCP clients',
+      '- External agents access these capabilities through Emma chat sessions instead',
+      '- MCP-created Emma sessions now auto-install all skills for full tool access',
+      '- Fixed emma_send_message to correctly pass user messages to the backend',
+    ],
+  },
+  {
     date: '2026-03-06',
     changes: [
       'Security: MCP API Key User Isolation',
