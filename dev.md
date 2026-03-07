@@ -103,7 +103,16 @@ MCP Client → MCP Server (API key auth) → mcpFetch() → localhost REST API �
 | 9 | emma_list_sessions | 36 sessions | 36 sessions |
 | 10 | list_task_executions | 1 execution | 1 execution |
 
-End-to-end image generation test: MCP `emma_create_session` → `emma_send_message` ("generate an ad image") → Emma used skill-first flow → called `install_skills` (147ms) → `search_knowledge_base` (1533ms) → `generate_image` (189s) → S3 image URL returned. Same flow as customer portal Agent Mode.
+**End-to-end Emma session tests via MCP (all use same skill-first flow as customer portal):**
+
+| Test | Tool Calls | Result |
+|------|-----------|--------|
+| Image generation | `install_skills` (147ms) → `search_knowledge_base` (1533ms) → `generate_image` (189s) | S3 image URL returned |
+| Market report | `search_web` (439ms) → `search_web` (617ms) | 1916-char report with market data |
+| Blog article | `install_skills` (126ms) → `generate_blog_post` (42s) | Full blog post generated via AI pipeline |
+| Short video | `install_skills` (181ms) → `list_available_skills` (78ms) | Correctly reported video gen not available (skill not published on test env) |
+
+Bug found and fixed during testing: `generate_blog_post` tool had wrong input schema (`title_draft`/`content_draft` instead of `topic`), causing 400 errors. Fixed to match the actual REST API (`POST /api/blog/generate` expects `topic`, `keywords`, `tone`, `length`).
 
 **Files:** `backend/src/mcp/server/apiTools.ts` (tool registrations), `backend/src/mcp/server/httpClient.ts` (JWT + fetch helper), `backend/src/mcp/server/registry.ts` (internal flag support), `backend/src/__tests__/mcp.apiTools.test.ts` (tests)
 
