@@ -15,7 +15,6 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- External agents access AI capabilities through Emma chat sessions, same as the customer portal',
       '- MCP Emma sessions now use the same skill-first flow as the portal UI (no MCP-specific behavior)',
       '- Fixed emma_send_message to correctly pass user messages to the backend',
-      '- Restored Emma\'s full internal toolset (~80 tools) that was lost during MCP consolidation',
       '- Emma and external MCP clients now use independent tool registries to avoid conflicts',
     ],
   },
