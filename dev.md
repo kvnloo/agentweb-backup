@@ -45,7 +45,44 @@ userId: sessionContext?.agentUserId,  // Always use authenticated identity
 
 **Long-term fix:** Migrate to Approach B — backend API MCP wrapper with JWT-based auth for all operations.
 
-**Files:** `backend/src/mcp/server/mcpServerCore.ts` (tool request handler), `backend/src/mcp/server/mcpServer.ts` (session/auth management)
+**Production log analysis (no external attacks detected):**
+
+Reviewed full bundle logs from production (`Agentweb-backend-env-prod-3`) for March 6, 2026. All `/mcp` requests came from only two source IPs:
+- `98.46.137.148` — external user via `claude-code/2.1.69-2.1.70`. Two sessions (`b773311b`, `485aac4a`) at 02:48-02:49 UTC. Actions: `initialize` → `tools/list` only. No `tools/call` with userId override.
+- `73.157.80.155` — our IP. Four sessions for testing: two via claude-code (session setup), two via curl (IDOR reproduction).
+
+No evidence of exploitation by external users beyond our own security testing.
+
+**Fix deployed and verified (PR #613, merged March 6):**
+
+The fix allows `userId` override only for internal clients (`isInternal=true`, i.e. backend-to-backend via `MCP_ACCESS_TOKEN`). External clients (API keys, OAuth) always use the authenticated `agentUserId`.
+
+Post-deploy verification on production:
+1. Called `list_knowledge_base_files` with `userId: "1743956381327"` (different user) → returned the API key owner's 19 KBs / 20 files (not the target user's data).
+2. Called `list_knowledge_base_files` without userId → returned identical 19 KBs / 20 files.
+3. Before the fix, the same call with userId override returned the target user's 16 KBs / 116 files (including private data like "Harsha's persona", "Harsha's worst LinkedIn posts").
+
+The userId parameter is now correctly ignored for external clients.
+
+**Files:** `backend/src/mcp/server/mcpServerCore.ts` (tool request handler), `backend/src/mcp/server/mcpServer.ts` (session/auth management), `backend/src/__tests__/mcp.userIdOverride.test.ts` (regression tests)
+
+**Approach B implemented (March 7, 2026):**
+
+Migrated from Approach A (90+ internal tools exposed directly) to Approach B (REST API wrappers). The MCP server now exposes ~26 tools that call backend REST APIs via HTTP self-calls with short-lived JWTs, going through the same `authenticateToken` middleware as web UI requests. This eliminates the entire class of IDOR vulnerabilities by design.
+
+Key changes:
+- Replaced `tools.ts` (75 tools) and `portalTools.ts` (12 tools) with `apiTools.ts` (~30 tools). Each tool calls `mcpFetch()` which generates a short-lived JWT for the authenticated user and makes an HTTP request to `localhost` REST endpoints.
+- Internal infrastructure tools (`search_web`, `generate_image`, `send_email`, `save_file`) are registered with `internal: true` flag — available to Emma's agent engine internally but hidden from external MCP clients via `getToolDefinitions()` filtering.
+- External agents access AI capabilities (image gen, web search, email) through Emma chat sessions (`emma_send_message`) rather than direct tool calls.
+- MCP-created Emma sessions use `installAllSkills: true` to pre-install all published skills, giving Emma full tool access without the skill-first chat flow.
+- Tool count: External MCP clients see 26 tools, Emma's internal registry has 30.
+
+Architecture:
+```
+MCP Client → MCP Server (API key auth) → mcpFetch() → localhost REST API → authenticateToken middleware → route handler → service → DB
+```
+
+Files: `backend/src/mcp/server/apiTools.ts` (tool registrations), `backend/src/mcp/server/httpClient.ts` (JWT + fetch helper), `backend/src/mcp/server/registry.ts` (internal flag support), `backend/src/controllers/agentModeController.ts` (installAllSkills), `backend/src/__tests__/mcp.apiTools.test.ts` (tests)
 
 # March 5, 2026: Dev Env Launch Fails on Elastic Beanstalk
 
