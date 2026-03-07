@@ -227,27 +227,27 @@ export class AgentModeService {
   }
 
   private async registerTools() {
-    // 1. Ensure server tools are loaded into the global mcpToolRegistry (only needs to happen once)
+    // 1. Ensure Emma's tools are loaded into the emmaToolRegistry (only needs to happen once)
     if (!AgentModeService.toolsRegistered) {
       try {
         // Import the registry and the tools definitions (for side effects)
         // Dynamic import to avoid circular dependencies
-        await import('../mcp/server/registry');
-        await import('../mcp/server/apiTools');
-        
+        await import('../emma/registry');
+        await import('../emma/tools');
+
         AgentModeService.toolsRegistered = true;
       } catch (error) {
          console.error('AgentMode: Error loading server tools:', error);
       }
     }
 
-    // 2. Register tools from the global mcpToolRegistry into THIS instance's toolRegistry check
+    // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
     try {
-       const { mcpToolRegistry } = await import('../mcp/server/registry');
-       const toolNames = mcpToolRegistry.getToolNames();
-      
+       const { emmaToolRegistry } = await import('../emma/registry');
+       const toolNames = emmaToolRegistry.getToolNames();
+
       for (const name of toolNames) {
-        const toolHandler = mcpToolRegistry.getTool(name);
+        const toolHandler = emmaToolRegistry.getTool(name);
         if (toolHandler) {
           // Wrap MCP definition in OpenAI definition format
           const mcpDef = toolHandler.definition;
