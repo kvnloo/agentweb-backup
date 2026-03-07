@@ -70,10 +70,22 @@ describe('apiTools', () => {
         'manage_brand', 'manage_market_strategy',
         'generate_blog_post', 'publish_blog_post',
         'list_connected_accounts', 'post_on_account',
-        'search_web', 'generate_image', 'send_email', 'save_file',
       ];
       for (const tool of expectedTools) {
         expect(names).toContain(tool);
+      }
+    });
+
+    it('should register internal tools but hide them from external MCP clients', () => {
+      const allNames = mcpToolRegistry.getToolNames();
+      const externalDefs = mcpToolRegistry.getToolDefinitions();
+      const externalNames = externalDefs.map((d: any) => d.name);
+      const internalTools = ['search_web', 'generate_image', 'send_email', 'save_file'];
+      for (const name of internalTools) {
+        // Registered in the registry (available to Emma internally)
+        expect(allNames).toContain(name);
+        // But NOT exposed to external MCP clients
+        expect(externalNames).not.toContain(name);
       }
     });
 
@@ -176,20 +188,6 @@ describe('apiTools', () => {
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'POST',
         path: '/api/tasks/t1/execute',
-      }));
-    });
-  });
-
-  describe('search_web', () => {
-    it('should call POST /api/emma/search-web', async () => {
-      mockMcpFetch.mockResolvedValue({ results: [] });
-
-      await mcpToolRegistry.execute('search_web', { query: 'test' }, context);
-
-      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
-        method: 'POST',
-        path: '/api/emma/search-web',
-        body: { query: 'test', max_results: 10 },
       }));
     });
   });
