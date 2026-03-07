@@ -74,7 +74,6 @@ describe('apiTools', () => {
         'list_gtm_plans', 'manage_gtm_plan', 'manage_gtm_items',
         'list_knowledge_bases', 'search_knowledge_base', 'read_knowledge_base_files',
         'manage_brand', 'manage_market_strategy',
-        'generate_blog_post', 'publish_blog_post',
         'list_connected_accounts', 'post_on_account',
       ];
       for (const tool of expectedTools) {
@@ -86,7 +85,7 @@ describe('apiTools', () => {
       const allNames = mcpToolRegistry.getToolNames();
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
-      const internalTools = ['install_skills', 'list_available_skills', 'search_web', 'generate_image', 'send_email', 'save_file'];
+      const internalTools = ['install_skills', 'list_available_skills', 'create_blog_article', 'publish_blog_article', 'search_web', 'generate_image', 'send_email', 'save_file'];
       for (const name of internalTools) {
         // Registered in the registry (available to Emma internally)
         expect(allNames).toContain(name);
@@ -103,6 +102,7 @@ describe('apiTools', () => {
         'read_market_strategy', 'update_market_strategy',
         'get_lead_lists', 'list_knowledge_base_files',
         'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
+        'generate_blog_post', 'publish_blog_post',
       ];
       for (const name of oldNames) {
         expect(names).not.toContain(name);

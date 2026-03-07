@@ -711,59 +711,66 @@ mcpToolRegistry.register({
   }
 });
 
-// ─── Content ────────────────────────────────────────────────────────────────
+// ─── Content (internal tools — call agentModeService directly) ──────────────
 
 mcpToolRegistry.register({
-  name: 'generate_blog_post',
+  name: 'create_blog_article',
+  internal: true,
   definition: {
-    name: 'generate_blog_post',
-    description: 'Generate a blog post using AI.',
+    name: 'create_blog_article',
+    description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3.',
     inputSchema: {
       type: 'object',
       properties: {
-        topic: { type: 'string', description: 'Topic for the blog post' },
-        keywords: { type: 'string', description: 'Comma-separated keywords to include' },
-        tone: { type: 'string', description: 'Writing tone (e.g., "professional", "casual")', default: 'professional' },
-        length: { type: 'string', enum: ['short', 'medium', 'long'], description: 'Post length', default: 'medium' },
-        research_context: { type: 'string', description: 'Additional research context' }
+        title_draft: { type: 'string', description: 'A draft title for the blog article.' },
+        content_draft: { type: 'string', description: 'The blog article content in markdown format' },
+        length: { type: 'string', enum: ['short', 'medium', 'long'], description: 'Desired article length', default: 'medium' },
+        researchContext: { type: 'string', description: 'Optional research context or background information' },
+        requirements: { type: 'string', description: 'Specific requirements (e.g., internal links, CTAs, branding)' },
+        style: { type: 'string', enum: ['default', 'substack'], description: 'Writing style. "substack" for newsletter-like personal tone.', default: 'default' },
+        deep_research: { type: 'boolean', description: 'When true, performs deep research and includes inline images. Takes several minutes.', default: false }
       },
-      required: ['topic']
+      required: ['title_draft', 'content_draft']
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/blog/generate', context: ctx(context),
-      body: {
-        topic: args.topic, keywords: args.keywords,
-        tone: args.tone || 'professional', length: args.length || 'medium',
-        researchContext: args.research_context
-      }
-    });
-    return jsonResult(data);
+    const { agentModeService } = await import('../../services/agentModeService');
+    return await agentModeService.createBlogArticle(
+      args.title_draft, args.content_draft, args.length || 'medium',
+      args.researchContext || '', args.requirements || '',
+      context?.userId, context?.sessionId,
+      args.style || 'default', args.deep_research || false
+    );
   }
 });
 
 mcpToolRegistry.register({
-  name: 'publish_blog_post',
+  name: 'publish_blog_article',
+  internal: true,
   definition: {
-    name: 'publish_blog_post',
-    description: 'Publish a blog post to the CMS.',
+    name: 'publish_blog_article',
+    description: 'Publish a blog article to CMS (Basehub or Webflow). Takes title, description, hero image URL, and blog HTML URL from create_blog_article. CRITICAL: Always review with user before publishing.',
     inputSchema: {
       type: 'object',
       properties: {
-        article_url: { type: 'string', description: 'URL of the generated article HTML' },
-        cms_type: { type: 'string', description: 'CMS to publish to (e.g., "basehub", "webflow")' },
-        category: { type: 'string', description: 'Blog category' }
+        title: { type: 'string', description: 'Article title' },
+        description: { type: 'string', description: 'Article description/meta description' },
+        hero_image_url: { type: 'string', description: 'URL of the hero image' },
+        blog_html_url: { type: 'string', description: 'URL of the HTML file from create_blog_article' },
+        status: { type: 'string', enum: ['draft', 'published'], description: 'Publication status', default: 'draft' },
+        author: { type: 'string', description: 'Optional author name or ID' },
+        categories: { type: 'array', items: { type: 'string' }, description: 'Blog categories (required when status is "published")' }
       },
-      required: ['article_url']
+      required: ['title', 'description', 'hero_image_url', 'blog_html_url']
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: '/api/blog/publish', context: ctx(context),
-      body: { articleUrl: args.article_url, cmsType: args.cms_type, category: args.category }
-    });
-    return jsonResult(data);
+    const { agentModeService } = await import('../../services/agentModeService');
+    return await agentModeService.publishBlogArticle(
+      args.title, args.description, args.hero_image_url, args.blog_html_url,
+      context?.userId, context?.sessionId,
+      args.status, args.author, args.categories
+    );
   }
 });
 
