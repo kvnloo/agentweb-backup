@@ -754,15 +754,19 @@ export class AgentModeService {
 
       // Inject account memory context (cross-session knowledge)
       try {
-        const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
-        if (recentMemories.length > 0) {
-          const memoryLines = recentMemories.map(
-            (m: any) => `- [${m.category}] ${m.content}`
-          );
-          messages.push({
-            role: 'assistant',
-            content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
-          });
+        const { userDb } = await import('./db');
+        const memoryUser = await userDb.getUserById(userId);
+        if (memoryUser?.memoryEnabled !== false) {
+          const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
+          if (recentMemories.length > 0) {
+            const memoryLines = recentMemories.map(
+              (m: any) => `- [${m.category}] ${m.content}`
+            );
+            messages.push({
+              role: 'assistant',
+              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
+            });
+          }
         }
       } catch (err) {
         console.error('Failed to load account memories:', err);
@@ -1257,7 +1261,7 @@ export class AgentModeService {
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
 
       ## Account Memory
-      You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Use \`search_memory\` to recall past context. Be selective — only save facts that would be valuable in future sessions.
+      You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
 
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
@@ -1762,7 +1766,6 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Account Memory (cross-session knowledge)
     'save_memory',
-    'search_memory',
     'delete_memory'
   ]);
 

@@ -1,10 +1,38 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { accountMemoryDb } from '../services/db';
+import { accountMemoryDb, userDb } from '../services/db';
 
 const router = express.Router();
 
 router.use(authenticateToken);
+
+// GET /api/memory/settings — get memory enabled status
+router.get('/settings', async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const user = await userDb.getUserById(userId);
+    res.json({ memoryEnabled: user?.memoryEnabled !== false });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to get memory settings' });
+  }
+});
+
+// PUT /api/memory/settings — toggle memory on/off
+router.put('/settings', async (req, res) => {
+  try {
+    const userId = (req as any).user.userId;
+    const { memoryEnabled } = req.body;
+
+    if (typeof memoryEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'memoryEnabled must be a boolean' });
+    }
+
+    await userDb.updateUser(userId, { memoryEnabled });
+    res.json({ memoryEnabled });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to update memory settings' });
+  }
+});
 
 // GET /api/memory — list all memories, optionally filtered by category
 router.get('/', async (req, res) => {

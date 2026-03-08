@@ -255,7 +255,7 @@ describe('Memory API Routes', () => {
       requireAdmin: (_req: any, _res: any, next: any) => next(),
     }));
 
-    // Mock accountMemoryDb
+    // Mock accountMemoryDb and userDb
     jest.mock('../services/db', () => {
       const original = jest.requireActual('../services/db');
       return {
@@ -266,6 +266,10 @@ describe('Memory API Routes', () => {
           getRecentMemories: jest.fn(),
           updateMemory: jest.fn(),
           deleteMemory: jest.fn(),
+        },
+        userDb: {
+          getUserById: jest.fn().mockResolvedValue({ userId: 'user1', memoryEnabled: true }),
+          updateUser: jest.fn().mockResolvedValue({ userId: 'user1', memoryEnabled: false }),
         },
       };
     });
@@ -376,5 +380,42 @@ describe('Memory API Routes', () => {
 
     expect(res.status).toBe(200);
     expect(mockDb.deleteMemory).toHaveBeenCalledWith('user1', 'mem1');
+  });
+
+  it('GET /api/memory/settings should return memoryEnabled status', async () => {
+    const { userDb: mockUserDb } = require('../services/db');
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'user1', memoryEnabled: true });
+
+    const res = await request.get('/api/memory/settings');
+
+    expect(res.status).toBe(200);
+    expect(res.body.memoryEnabled).toBe(true);
+  });
+
+  it('GET /api/memory/settings should default to true when field is missing', async () => {
+    const { userDb: mockUserDb } = require('../services/db');
+    mockUserDb.getUserById.mockResolvedValue({ userId: 'user1' });
+
+    const res = await request.get('/api/memory/settings');
+
+    expect(res.status).toBe(200);
+    expect(res.body.memoryEnabled).toBe(true);
+  });
+
+  it('PUT /api/memory/settings should toggle memory off', async () => {
+    const { userDb: mockUserDb } = require('../services/db');
+    mockUserDb.updateUser.mockResolvedValue({ userId: 'user1', memoryEnabled: false });
+
+    const res = await request.put('/api/memory/settings').send({ memoryEnabled: false });
+
+    expect(res.status).toBe(200);
+    expect(res.body.memoryEnabled).toBe(false);
+    expect(mockUserDb.updateUser).toHaveBeenCalledWith('user1', { memoryEnabled: false });
+  });
+
+  it('PUT /api/memory/settings should reject non-boolean', async () => {
+    const res = await request.put('/api/memory/settings').send({ memoryEnabled: 'yes' });
+
+    expect(res.status).toBe(400);
   });
 });

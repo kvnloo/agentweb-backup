@@ -3960,6 +3960,12 @@ emmaToolRegistry.register({
     const userId = context?.userId || context?.agentUserId;
     if (!userId) throw new Error('Authentication required');
 
+    const { userDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (user?.memoryEnabled === false) {
+      return { success: false, message: 'Memory is disabled for this account.' };
+    }
+
     const memory = await accountMemoryDb.addMemory(
       userId,
       args.category,
@@ -3970,40 +3976,6 @@ emmaToolRegistry.register({
       success: true,
       memoryId: memory.memoryId,
       message: `Saved memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
-    };
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'search_memory',
-  definition: {
-    name: 'search_memory',
-    description: 'Retrieve saved memories about this account. Use this to recall facts from previous sessions. Optionally filter by category.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        category: {
-          type: 'string',
-          enum: ['preference', 'history', 'insight', 'workflow'],
-          description: 'Optional: filter by category.'
-        }
-      },
-      required: []
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    const memories = await accountMemoryDb.getUserMemories(userId, args.category);
-    return {
-      memories: memories.map((m: any) => ({
-        memoryId: m.memoryId,
-        category: m.category,
-        content: m.content,
-        createdAt: m.createdAt,
-      })),
-      count: memories.length,
     };
   }
 });
