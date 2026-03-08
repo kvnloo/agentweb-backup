@@ -136,25 +136,28 @@ router.post('/replay-sessions', authenticateToken, async (req, res) => {
 
 // Email Templates endpoints (customer accessible) - MUST be before /:settingName route
 
-// Get all email templates for a user
+// Get all email templates for a user (merges user-specific + public templates)
 router.get('/email-templates', authenticateToken, async (req, res) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
-    const settingName = `email_templates_${userId}`;
-    const setting = await settingsService.getSetting(settingName);
-    
-    let templates = [];
-    if (setting) {
+
+    const userSettingName = `email_templates_${userId}`;
+    const [userSetting, publicSetting] = await Promise.all([
+      settingsService.getSetting(userSettingName),
+      settingsService.getSetting('email_templates_public')
+    ]);
+
+    // Parse and apply backward-compat to user templates
+    let userTemplates: any[] = [];
+    if (userSetting) {
       try {
-        templates = JSON.parse(setting.settingValue);
-        
-        // Add backward compatibility: extract variables for templates that don't have them
+        userTemplates = JSON.parse(userSetting.settingValue);
+
         let needsUpdate = false;
-        templates = templates.map((template: any) => {
+        userTemplates = userTemplates.map((template: any) => {
           if (!template.variables || !template.arrayVariables) {
             const { variables, arrayVariables } = extractVariables(template.html_content, template.subject);
             needsUpdate = true;
@@ -166,28 +169,56 @@ router.get('/email-templates', authenticateToken, async (req, res) => {
           }
           return template;
         });
-        
-        // If we updated any templates, save them back to the database
+
         if (needsUpdate) {
           try {
             await settingsService.setSetting(
-              settingName, 
-              JSON.stringify(templates), 
-              'User email templates', 
+              userSettingName,
+              JSON.stringify(userTemplates),
+              'User email templates',
               req.user?.email
             );
           } catch (error) {
             console.error('Error updating templates with variables:', error);
-            // Don't fail the request, just log the error
           }
         }
       } catch (error) {
-        console.error('Error parsing email templates:', error);
-        templates = [];
+        console.error('Error parsing user email templates:', error);
+        userTemplates = [];
       }
     }
-    
-    res.json({ templates });
+
+    // Parse public templates (backward-compat extraction only, no save-back)
+    let publicTemplates: any[] = [];
+    if (publicSetting) {
+      try {
+        publicTemplates = JSON.parse(publicSetting.settingValue).map((template: any) => {
+          if (!template.variables || !template.arrayVariables) {
+            const { variables, arrayVariables } = extractVariables(template.html_content, template.subject);
+            return {
+              ...template,
+              variables: template.variables || variables,
+              arrayVariables: template.arrayVariables || arrayVariables
+            };
+          }
+          return template;
+        });
+      } catch (error) {
+        console.error('Error parsing public email templates:', error);
+        publicTemplates = [];
+      }
+    }
+
+    // Merge: user templates win on name collision, tag public templates
+    const userNames = new Set(userTemplates.map((t: any) => t.template_name));
+    const merged = [
+      ...userTemplates,
+      ...publicTemplates
+        .filter((t: any) => !userNames.has(t.template_name))
+        .map((t: any) => ({ ...t, isPublic: true }))
+    ];
+
+    res.json({ templates: merged });
   } catch (error) {
     console.error('Error getting email templates:', error);
     res.status(500).json({ error: 'Failed to get email templates' });
