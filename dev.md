@@ -1,3 +1,50 @@
+# March 8, 2026: Daily AI News - Amino Scheduled Chat Failure — Missing Tools for Basic Subscription
+
+**User:** `sue@aminocapital.com` (Amino Capital, Basic subscription)
+
+**Problem:** The "Daily AI News - Amino" scheduled chat failed to run because some required tools are not available under the Basic subscription. New skills were recently created (e.g., Landing Page skill for Advanced/Super Premium) that claimed tools previously available via the `__other_skills__` virtual skill. This moved those tools out of `__other_skills__`, causing Basic subscription users to lose access.
+
+**Root cause:** The `__other_skills__` virtual skill dynamically resolves to tools NOT associated with any published skill. When new skills are published and claim tools, those tools leave `__other_skills__`. If a subscription type (e.g., Basic) relies on `__other_skills__` for tool access, users silently lose tools whenever new skills are created.
+
+**How subscription → tools resolution works:**
+1. User's `subscriptionType` → `getSubscriptionTypeConfig()` → `allowedSkills[]` (skill IDs)
+2. `resolveSkillsToToolNames(skillIds)` → expands each skill ID to its `toolNames[]`
+3. `__other_skills__` resolves to tools not claimed by any published skill (dynamic, shrinks as skills are added)
+4. Foundation tools (18) are always available regardless of subscription
+5. Scheduled chat pre-flight check (`agentModeController.ts:810-867`) validates `requiredFunctionCalls` against allowed tools, fails with error email if any are disallowed
+
+**Action taken:** Created a new skill "Tools for Basic Subscription" via admin UI with 38 explicit tools and no system prompt. This skill is added to the Basic subscription's `allowedSkills`, ensuring Basic users have a stable set of tools regardless of how other skills change.
+
+**Tools in "Tools for Basic Subscription" (38):**
+```
+create_blog_article, publish_blog_article, repair_blog_article, create_social_media_posts,
+list_cms_categories, generate_image, create_image_task_from_prompt, generate_video,
+list_task_templates, create_task_from_template, create_task_from_prompt, create_revision,
+perform_deep_research, list_connected_account_posts, load_connected_account_metrics,
+post_on_connected_account, get_post_analytics, create_knowledge_base, update_knowledge_base_file,
+attach_knowledge_base_files, create_gtm_plan, read_gtm_plan, update_gtm_plan, list_gtm_plans,
+add_gtm_phase, update_gtm_phase, add_gtm_work_items, update_gtm_work_item, delete_gtm_items,
+get_gtm_common_items, add_gtm_common_items, send_gtm_status_report, comment_on_linkedin_post,
+react_to_linkedin_post, linkedin_outreach, create_html_from_template, update_html_file,
+list_html_templates
+```
+
+**Tools excluded from Basic (in other premium skills):**
+- CRM/Leads (17 tools): get_leads, get_lead_details, create_lead_list, etc.
+- Books (8 tools): create_book, generate_book_content, add_characters, etc.
+- Email: email, send_for_review
+- Meta Ads: get_meta_ads_metrics, list_meta_ads_campaigns
+
+**Key files:**
+- `backend/src/services/subscriptionService.ts` — subscription → skill → tool resolution
+- `backend/src/services/skillService.ts` — skill CRUD (AW-Skills table)
+- `backend/src/controllers/agentModeController.ts:810-867` — scheduled chat tool validation
+- `backend/src/services/agentModeService.ts:1717` — FOUNDATION_TOOLS definition
+
+**Lesson:** When creating new skills, always check if the tools being claimed are currently accessed by subscription tiers via `__other_skills__`. Prefer explicit tool skills per subscription tier over relying on `__other_skills__` for stable access.
+
+---
+
 # March 6, 2026: xcures SEO Config — GA Permission Denied
 
 **User:** `agentwebintegration@xcures.com` (userId: `f958eb3e-4e82-4227-8aa8-634476498a62`)
