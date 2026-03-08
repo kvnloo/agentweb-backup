@@ -4515,3 +4515,152 @@ export const crmDb = {
     }
   },
 };
+
+// ─── Account Memory ───────────────────────────────────────────────
+
+const VALID_MEMORY_CATEGORIES = ['preference', 'history', 'insight', 'workflow'] as const;
+type MemoryCategory = typeof VALID_MEMORY_CATEGORIES[number];
+
+const ACCOUNT_MEMORY_TABLE = `${TABLE_PREFIX}AW-AccountMemory`;
+
+export const accountMemoryDb = {
+  async addMemory(
+    userId: string,
+    category: string,
+    content: string,
+    sourceSessionId?: string
+  ) {
+    if (!VALID_MEMORY_CATEGORIES.includes(category as MemoryCategory)) {
+      throw new Error(`Invalid category: ${category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
+    }
+    if (!content || content.trim().length === 0) {
+      throw new Error('Content is required');
+    }
+    if (content.length > 2000) {
+      throw new Error('Content must be 2000 characters or less');
+    }
+
+    const { ulid } = await import('ulid');
+    const now = new Date().toISOString();
+    const item: Record<string, any> = {
+      userId,
+      memoryId: ulid(),
+      category,
+      content: content.trim(),
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (sourceSessionId) {
+      item.sourceSessionId = sourceSessionId;
+    }
+
+    try {
+      await dynamodb.put({ TableName: ACCOUNT_MEMORY_TABLE, Item: item }).promise();
+      return item;
+    } catch (error) {
+      handleDynamoDbError(error, 'addMemory');
+      throw error;
+    }
+  },
+
+  async getUserMemories(userId: string, category?: string, limit?: number) {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = category
+        ? {
+            TableName: ACCOUNT_MEMORY_TABLE,
+            IndexName: 'UserIdCategoryIndex',
+            KeyConditionExpression: 'userId = :userId AND category = :category',
+            ExpressionAttributeValues: { ':userId': userId, ':category': category },
+            ...(limit ? { Limit: limit } : {}),
+          }
+        : {
+            TableName: ACCOUNT_MEMORY_TABLE,
+            KeyConditionExpression: 'userId = :userId',
+            ExpressionAttributeValues: { ':userId': userId },
+            ...(limit ? { Limit: limit } : {}),
+          };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getUserMemories');
+      throw error;
+    }
+  },
+
+  async getRecentMemories(userId: string, limit: number = 20) {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: ACCOUNT_MEMORY_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+        ScanIndexForward: false,
+        Limit: limit,
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getRecentMemories');
+      throw error;
+    }
+  },
+
+  async updateMemory(
+    userId: string,
+    memoryId: string,
+    updates: { content?: string; category?: string }
+  ) {
+    if (updates.category && !VALID_MEMORY_CATEGORIES.includes(updates.category as MemoryCategory)) {
+      throw new Error(`Invalid category: ${updates.category}. Must be one of: ${VALID_MEMORY_CATEGORIES.join(', ')}`);
+    }
+    if (updates.content !== undefined && updates.content.trim().length === 0) {
+      throw new Error('Content cannot be empty');
+    }
+    if (updates.content !== undefined && updates.content.length > 2000) {
+      throw new Error('Content must be 2000 characters or less');
+    }
+
+    const expressions: string[] = ['#updatedAt = :updatedAt'];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':updatedAt': new Date().toISOString() };
+
+    if (updates.content !== undefined) {
+      expressions.push('#content = :content');
+      names['#content'] = 'content';
+      values[':content'] = updates.content.trim();
+    }
+    if (updates.category) {
+      expressions.push('#category = :category');
+      names['#category'] = 'category';
+      values[':category'] = updates.category;
+    }
+
+    try {
+      const result = await dynamodb.update({
+        TableName: ACCOUNT_MEMORY_TABLE,
+        Key: { userId, memoryId },
+        UpdateExpression: `SET ${expressions.join(', ')}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ReturnValues: 'ALL_NEW',
+      }).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, 'updateMemory');
+      throw error;
+    }
+  },
+
+  async deleteMemory(userId: string, memoryId: string) {
+    try {
+      await dynamodb.delete({
+        TableName: ACCOUNT_MEMORY_TABLE,
+        Key: { userId, memoryId },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteMemory');
+      throw error;
+    }
+  },
+};

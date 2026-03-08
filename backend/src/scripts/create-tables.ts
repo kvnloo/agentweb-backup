@@ -1439,6 +1439,45 @@ const createMcpOAuthTokensTable = async () => {
   }
 };
 
+const createAccountMemoryTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-AccountMemory`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'memoryId', AttributeType: 'S' },
+      { AttributeName: 'category', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'memoryId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'UserIdCategoryIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'category', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1470,6 +1509,7 @@ const main = async () => {
     await createMcpOAuthClientsTable();
     await createMcpOAuthCodesTable();
     await createMcpOAuthTokensTable();
+    await createAccountMemoryTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

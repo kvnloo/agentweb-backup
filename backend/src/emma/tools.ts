@@ -1,5 +1,6 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
+import { accountMemoryDb } from '../services/db';
 
 emmaToolRegistry.register({
   name: 'install_skills',
@@ -3929,5 +3930,105 @@ emmaToolRegistry.register({
       if (err.message?.includes('not found') || err.message?.includes('not an email account')) return { error: err.message };
       throw err;
     }
+  }
+});
+
+// ─── Account Memory Tools ────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'save_memory',
+  definition: {
+    name: 'save_memory',
+    description: 'Save a fact about this account for future sessions. Use this when you learn something important about the user, their preferences, business context, or workflow patterns. Categories: preference (user likes/dislikes), history (past actions/decisions), insight (business learnings), workflow (process patterns).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
+        },
+        category: {
+          type: 'string',
+          enum: ['preference', 'history', 'insight', 'workflow'],
+          description: 'Category for the memory fact.'
+        }
+      },
+      required: ['content', 'category']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const memory = await accountMemoryDb.addMemory(
+      userId,
+      args.category,
+      args.content,
+      context?.sessionId
+    );
+    return {
+      success: true,
+      memoryId: memory.memoryId,
+      message: `Saved memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'search_memory',
+  definition: {
+    name: 'search_memory',
+    description: 'Retrieve saved memories about this account. Use this to recall facts from previous sessions. Optionally filter by category.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        category: {
+          type: 'string',
+          enum: ['preference', 'history', 'insight', 'workflow'],
+          description: 'Optional: filter by category.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const memories = await accountMemoryDb.getUserMemories(userId, args.category);
+    return {
+      memories: memories.map((m: any) => ({
+        memoryId: m.memoryId,
+        category: m.category,
+        content: m.content,
+        createdAt: m.createdAt,
+      })),
+      count: memories.length,
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'delete_memory',
+  definition: {
+    name: 'delete_memory',
+    description: 'Delete a specific memory by its ID. Use this when a fact is no longer accurate or relevant.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memoryId: {
+          type: 'string',
+          description: 'The ID of the memory to delete.'
+        }
+      },
+      required: ['memoryId']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    await accountMemoryDb.deleteMemory(userId, args.memoryId);
+    return { success: true, message: `Memory ${args.memoryId} deleted.` };
   }
 });
