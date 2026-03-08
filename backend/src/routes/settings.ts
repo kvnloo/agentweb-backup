@@ -246,19 +246,9 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Only admins can manage public templates' });
     }
 
-    const settingName = isPublic ? 'email_templates_public' : `email_templates_${userId}`;
-    const existingSetting = await settingsService.getSetting(settingName);
-    
-    let templates = [];
-    if (existingSetting) {
-      try {
-        templates = JSON.parse(existingSetting.settingValue);
-      } catch (error) {
-        console.error('Error parsing existing templates:', error);
-        templates = [];
-      }
-    }
-    
+    const targetSettingName = isPublic ? 'email_templates_public' : `email_templates_${userId}`;
+    const oppositeSettingName = isPublic ? `email_templates_${userId}` : 'email_templates_public';
+
     // Use provided variables if available, otherwise extract them
     let finalVariables = variables;
     let finalArrayVariables = arrayVariables;
@@ -267,12 +257,23 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       finalVariables = extracted.variables;
       finalArrayVariables = extracted.arrayVariables;
     }
-    
-    // Check if template already exists
+
+    // Fetch target store
+    const existingSetting = await settingsService.getSetting(targetSettingName);
+    let templates: any[] = [];
+    if (existingSetting) {
+      try {
+        templates = JSON.parse(existingSetting.settingValue);
+      } catch (error) {
+        console.error('Error parsing existing templates:', error);
+        templates = [];
+      }
+    }
+
     const existingTemplateIndex = templates.findIndex(
       (t: any) => t.template_name === template_name
     );
-    
+
     const newTemplate = {
       template_name,
       subject,
@@ -282,22 +283,44 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
       created_at: existingTemplateIndex >= 0 ? templates[existingTemplateIndex].created_at : new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
-    
+
     if (existingTemplateIndex >= 0) {
       templates[existingTemplateIndex] = newTemplate;
     } else {
       templates.push(newTemplate);
     }
-    
+
     await settingsService.setSetting(
-      settingName, 
-      JSON.stringify(templates), 
-      'User email templates', 
+      targetSettingName,
+      JSON.stringify(templates),
+      isPublic ? 'Public email templates' : 'User email templates',
       req.user?.email
     );
-    
-    res.json({ 
-      success: true, 
+
+    // If admin is toggling visibility, remove from the opposite store
+    if (req.user?.isAdmin) {
+      const oppositeSetting = await settingsService.getSetting(oppositeSettingName);
+      if (oppositeSetting) {
+        try {
+          let oppositeTemplates = JSON.parse(oppositeSetting.settingValue);
+          const beforeLen = oppositeTemplates.length;
+          oppositeTemplates = oppositeTemplates.filter((t: any) => t.template_name !== template_name);
+          if (oppositeTemplates.length < beforeLen) {
+            await settingsService.setSetting(
+              oppositeSettingName,
+              JSON.stringify(oppositeTemplates),
+              oppositeSettingName === 'email_templates_public' ? 'Public email templates' : 'User email templates',
+              req.user?.email
+            );
+          }
+        } catch (error) {
+          console.error('Error cleaning opposite store:', error);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
       message: 'Email template saved successfully',
       template: newTemplate
     });
