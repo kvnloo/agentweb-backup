@@ -232,16 +232,21 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
-    const { template_name, subject, html_content, variables, arrayVariables } = req.body;
-    
+
+    const { template_name, subject, html_content, variables, arrayVariables, isPublic } = req.body;
+
     if (!template_name || !subject || !html_content) {
-      return res.status(400).json({ 
-        error: 'template_name, subject, and html_content are required' 
+      return res.status(400).json({
+        error: 'template_name, subject, and html_content are required'
       });
     }
-    
-    const settingName = `email_templates_${userId}`;
+
+    // Admin can save to public store
+    if (isPublic && !req.user?.isAdmin) {
+      return res.status(403).json({ error: 'Only admins can manage public templates' });
+    }
+
+    const settingName = isPublic ? 'email_templates_public' : `email_templates_${userId}`;
     const existingSetting = await settingsService.getSetting(settingName);
     
     let templates = [];
@@ -307,16 +312,22 @@ router.delete('/email-templates/:templateName', authenticateToken, async (req, r
   try {
     const userId = req.user?.userId;
     const { templateName } = req.params;
-    
+    const isPublic = req.query.isPublic === 'true';
+
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
     if (!templateName) {
       return res.status(400).json({ error: 'templateName is required' });
     }
-    
-    const settingName = `email_templates_${userId}`;
+
+    // Admin can delete from public store
+    if (isPublic && !req.user?.isAdmin) {
+      return res.status(403).json({ error: 'Only admins can manage public templates' });
+    }
+
+    const settingName = isPublic ? 'email_templates_public' : `email_templates_${userId}`;
     const existingSetting = await settingsService.getSetting(settingName);
     
     if (!existingSetting) {
