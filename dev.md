@@ -1,3 +1,25 @@
+# March 6, 2026: xcures SEO Config — GA Permission Denied
+
+**User:** `agentwebintegration@xcures.com` (userId: `f958eb3e-4e82-4227-8aa8-634476498a62`)
+
+**Config in DynamoDB (AW-Users):**
+- `seoDomains`: `["xcures.com"]`
+- `googleAnalyticsPropertyId`: `"277333489"`
+- `gaFilteredDomains`: `[]`
+
+**Findings:**
+- **Google Search Console:** Working. No errors in prod logs for `sc-domain:xcures.com`.
+- **Google Analytics:** `PERMISSION_DENIED` — service account does not have access to GA4 property `277333489`.
+
+**Prod log (Mar 6):**
+```
+Error fetching Google Analytics metrics: Error: 7 PERMISSION_DENIED: User does not have sufficient permissions for this property.
+```
+
+**Action needed:** xcures team must grant **Viewer** access to the service account email in GA4 Admin → Property access management for property `277333489`. The same service account (from `prod/AgentWeb/Google/SearchConsole` secret) is used for both GSC and GA.
+
+---
+
 # March 6, 2026: MCP Server IDOR Vulnerability — userId Override in Tool Arguments
 
 **Problem:** The Emma MCP server (`backend/src/mcp/server/mcpServerCore.ts`) allows tool callers to override the authenticated user's identity by passing a `userId` in tool call arguments. In the request handler:
