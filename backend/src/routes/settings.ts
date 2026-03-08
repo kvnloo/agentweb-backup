@@ -242,7 +242,7 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
     }
 
     // Admin can save to public store
-    if (isPublic && !req.user?.isAdmin) {
+    if (isPublic && !(req.user as any)?.isAdmin) {
       return res.status(403).json({ error: 'Only admins can manage public templates' });
     }
 
@@ -298,7 +298,7 @@ router.post('/email-templates', authenticateToken, async (req, res) => {
     );
 
     // If admin is toggling visibility, remove from the opposite store
-    if (req.user?.isAdmin) {
+    if ((req.user as any)?.isAdmin) {
       const oppositeSetting = await settingsService.getSetting(oppositeSettingName);
       if (oppositeSetting) {
         try {
@@ -346,7 +346,7 @@ router.delete('/email-templates/:templateName', authenticateToken, async (req, r
     }
 
     // Admin can delete from public store
-    if (isPublic && !req.user?.isAdmin) {
+    if (isPublic && !(req.user as any)?.isAdmin) {
       return res.status(403).json({ error: 'Only admins can manage public templates' });
     }
 
