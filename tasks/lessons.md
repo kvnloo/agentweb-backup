@@ -37,7 +37,7 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Example:** See `backend/src/__tests__/agentModeService.*.test.ts`
 
 ### Coverage Requirements
-- **Lesson:** CI requires ≥90% coverage on statements, branches, functions, lines
+- **Lesson:** CI requires ≥95% coverage on statements, branches, functions, lines
   - **Why:** Enforced by Jest config and CI pipeline
   - **Fix:** Ensure all new code paths have test coverage before committing
 

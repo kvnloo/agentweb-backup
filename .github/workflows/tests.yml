@@ -81,18 +81,18 @@ jobs:
             }
             const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
             const { statements, branches, functions, lines } = coverage.total;
-            const allMet = statements.pct >= 90 && branches.pct >= 90 && functions.pct >= 90 && lines.pct >= 90;
+            const allMet = statements.pct >= 95 && branches.pct >= 95 && functions.pct >= 95 && lines.pct >= 95;
 
             const body = `## 📊 Backend Test Coverage
 
             | Metric | Coverage | Threshold | Status |
             |--------|----------|-----------|--------|
-            | Statements | ${statements.pct}% | 90% | ${statements.pct >= 90 ? '✅' : '❌'} |
-            | Branches | ${branches.pct}% | 90% | ${branches.pct >= 90 ? '✅' : '❌'} |
-            | Functions | ${functions.pct}% | 90% | ${functions.pct >= 90 ? '✅' : '❌'} |
-            | Lines | ${lines.pct}% | 90% | ${lines.pct >= 90 ? '✅' : '❌'} |
+            | Statements | ${statements.pct}% | 95% | ${statements.pct >= 95 ? '✅' : '❌'} |
+            | Branches | ${branches.pct}% | 95% | ${branches.pct >= 95 ? '✅' : '❌'} |
+            | Functions | ${functions.pct}% | 95% | ${functions.pct >= 95 ? '✅' : '❌'} |
+            | Lines | ${lines.pct}% | 95% | ${lines.pct >= 95 ? '✅' : '❌'} |
 
-            ${allMet ? '✅' : '❌'} **All thresholds must be ≥ 90%**`;
+            ${allMet ? '✅' : '❌'} **All thresholds must be ≥ 95%**`;
 
             // Find existing coverage comment
             const { data: comments } = await github.rest.issues.listComments({

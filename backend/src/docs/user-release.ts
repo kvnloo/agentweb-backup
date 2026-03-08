@@ -7,6 +7,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-08',
+    changes: [
+      'Security: Comprehensive Auth & MCP Security Tests',
+      '- Added 36 security tests covering auth middleware, login, register, and password reset controllers',
+      '- Added 17 MCP server security tests: internal tool isolation, IDOR protection, JWT boundary, rate limiting',
+      '- Tests verify internal tools (search_web, generate_image, send_email, save_file) are never exposed to external MCP clients',
+      'Quality: Coverage Threshold Raised to 95%',
+      '- CI and Jest config now require ≥95% coverage on statements, branches, functions, and lines (previously 90%)',
+    ],
+  },
+  {
     date: '2026-03-07',
     changes: [
       'Improvement: MCP Server — REST API Wrappers & Emma Parity',
