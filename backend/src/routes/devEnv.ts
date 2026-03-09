@@ -53,19 +53,23 @@ router.post(
         `[devEnv] Webhook for page ${pageId}: status="${page.status}", title="${page.title}", instanceId="${page.instanceId}"`
       );
 
-      if (page.status === "Start" && !page.instanceId) {
+      const isProduction = process.env.NODE_ENV === "production";
+      const isLaunchStatus = isProduction ? page.status === "Start" : page.status === "Start_Test";
+      const isTeardownStatus = isProduction ? page.status === "Done" : page.status === "Done_Test";
+
+      if (isLaunchStatus && !page.instanceId) {
         // Launch: respond 200 immediately, then fire-and-forget
         res.status(200).json({ action: "launching", pageId });
 
         void (async () => {
           try {
-            const content = await getNotionPageContent(pageId);
-            await launchEnvironment(pageId, page.title, content, page.databaseId);
+            const { text } = await getNotionPageContent(pageId);
+            await launchEnvironment(pageId, page.title, text, page.databaseId);
           } catch (err) {
             console.error(`[devEnv] Background launch failed:`, err);
           }
         })();
-      } else if (page.status === "Done" && page.instanceId) {
+      } else if (isTeardownStatus && page.instanceId) {
         // Teardown: respond 200 immediately, then fire-and-forget
         res.status(200).json({ action: "tearing_down", pageId });
 

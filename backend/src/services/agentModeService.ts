@@ -7,7 +7,7 @@ import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent } from './clickupService';
-import { taskDb, taskTemplateDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
@@ -752,6 +752,26 @@ export class AgentModeService {
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
+      // Inject account memory context (cross-session knowledge)
+      try {
+        const { userDb } = await import('./db');
+        const memoryUser = await userDb.getUserById(userId);
+        if (memoryUser?.memoryEnabled !== false) {
+          const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
+          if (recentMemories.length > 0) {
+            const memoryLines = recentMemories.map(
+              (m: any) => `- [${m.category}] ${m.content}`
+            );
+            messages.push({
+              role: 'assistant',
+              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load account memories:', err);
+      }
+
       messages.push(...marketingMessages);
 
       let content = '';
@@ -1239,6 +1259,9 @@ export class AgentModeService {
       * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
+
+      ## Account Memory
+      You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
 
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
@@ -1739,7 +1762,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
-    'list_connected_accounts' // Social/ads integration teaser
+    'list_connected_accounts', // Social/ads integration teaser
+
+    // Account Memory (cross-session knowledge)
+    'save_memory',
+    'delete_memory'
   ]);
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
@@ -13910,32 +13937,80 @@ Format the response as JSON with this structure:
     };
   }
 
+  // Fetch both user-specific and public templates
+  private async getTemplatesForUser(userId: string): Promise<{ userTemplates: any[], publicTemplates: any[] }> {
+    const [userSetting, publicSetting] = await Promise.all([
+      settingsService.getSetting(`email_templates_${userId}`),
+      settingsService.getSetting('email_templates_public')
+    ]);
+
+    let userTemplates: any[] = [];
+    let publicTemplates: any[] = [];
+
+    if (userSetting) {
+      try {
+        userTemplates = JSON.parse(userSetting.settingValue);
+      } catch (error) {
+        console.error('Error parsing user email templates:', error);
+      }
+    }
+
+    if (publicSetting) {
+      try {
+        publicTemplates = JSON.parse(publicSetting.settingValue);
+      } catch (error) {
+        console.error('Error parsing public email templates:', error);
+      }
+    }
+
+    return { userTemplates, publicTemplates };
+  }
+
+  // Find a template by name, searching user templates first then public
+  private async findTemplateByName(templateName: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+    const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
+
+    const userMatch = userTemplates.find((t: any) => t.template_name === templateName);
+    if (userMatch) {
+      return { template: userMatch, isPublic: false };
+    }
+
+    const publicMatch = publicTemplates.find((t: any) => t.template_name === templateName);
+    if (publicMatch) {
+      return { template: publicMatch, isPublic: true };
+    }
+
+    return { template: null, isPublic: false };
+  }
+
   // List all HTML templates for the user (including email templates)
   public async listHtmlTemplates(userId: string): Promise<any> {
     try {
-      const settingName = `email_templates_${userId}`;
-      const setting = await settingsService.getSetting(settingName);
+      const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
-      let templates = [];
-      if (setting) {
-        try {
-          templates = JSON.parse(setting.settingValue);
-        } catch (error) {
-          console.error('Error parsing email templates:', error);
-          templates = [];
-        }
-      }
+      // Build a name set from user templates for dedup
+      const userTemplateNames = new Set(userTemplates.map((t: any) => t.template_name));
+
+      const mapTemplate = (template: any, isPublic: boolean) => ({
+        template_name: template.template_name,
+        subject: template.subject,
+        variables: template.variables || [],
+        arrayVariables: template.arrayVariables || [],
+        created_at: template.created_at,
+        updated_at: template.updated_at,
+        ...(isPublic ? { isPublic: true } : {})
+      });
+
+      const merged = [
+        ...userTemplates.map((t: any) => mapTemplate(t, false)),
+        ...publicTemplates
+          .filter((t: any) => !userTemplateNames.has(t.template_name))
+          .map((t: any) => mapTemplate(t, true))
+      ];
 
       return {
         success: true,
-        email_templates: templates.map((template: any) => ({
-          template_name: template.template_name,
-          subject: template.subject,
-          variables: template.variables || [],
-          arrayVariables: template.arrayVariables || [],
-          created_at: template.created_at,
-          updated_at: template.updated_at
-        }))
+        email_templates: merged
       };
     } catch (error) {
       console.error('Error listing email templates:', error);
@@ -14412,30 +14487,9 @@ Format the response as JSON with this structure:
     sessionId: string
   ): Promise<any> {
     try {
-      // Get the template
-      const settingName = `email_templates_${userId}`;
-      const setting = await settingsService.getSetting(settingName);
+      // Get the template from user or public store
+      const { template, isPublic } = await this.findTemplateByName(templateName, userId);
 
-      if (!setting) {
-        return {
-          success: false,
-          message: 'No email templates found for user'
-        };
-      }
-
-      let templates = [];
-      try {
-        templates = JSON.parse(setting.settingValue);
-      } catch (error) {
-        console.error('Error parsing email templates:', error);
-        return {
-          success: false,
-          message: 'Failed to parse email templates'
-        };
-      }
-
-      // Find the specific template
-      const template = templates.find((t: any) => t.template_name === templateName);
       if (!template) {
         return {
           success: false,
