@@ -7,7 +7,7 @@ import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent } from './clickupService';
-import { taskDb, taskTemplateDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
 import { createWriteStream, promises as fs, default as fsSync } from 'fs';
@@ -752,6 +752,26 @@ export class AgentModeService {
       // Use helper to inject installed skills and templates
       this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
 
+      // Inject account memory context (cross-session knowledge)
+      try {
+        const { userDb } = await import('./db');
+        const memoryUser = await userDb.getUserById(userId);
+        if (memoryUser?.memoryEnabled !== false) {
+          const recentMemories = await accountMemoryDb.getRecentMemories(userId, 20);
+          if (recentMemories.length > 0) {
+            const memoryLines = recentMemories.map(
+              (m: any) => `- [${m.category}] ${m.content}`
+            );
+            messages.push({
+              role: 'assistant',
+              content: `Account Memory (facts from previous sessions):\n${memoryLines.join('\n')}`
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load account memories:', err);
+      }
+
       messages.push(...marketingMessages);
 
       let content = '';
@@ -1239,6 +1259,9 @@ export class AgentModeService {
       * **Batch Skill Installation**: Install ALL required skills in a single install_skills call
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
+
+      ## Account Memory
+      You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
 
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
@@ -1739,7 +1762,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
     'get_lead_lists',         // Lead management teaser
-    'list_connected_accounts' // Social/ads integration teaser
+    'list_connected_accounts', // Social/ads integration teaser
+
+    // Account Memory (cross-session knowledge)
+    'save_memory',
+    'delete_memory'
   ]);
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode

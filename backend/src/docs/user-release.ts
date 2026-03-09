@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-09',
+    changes: [
+      'Feature: Long-Term Memory for Emma',
+      '- Emma now remembers important facts about your account across sessions (preferences, history, insights, workflow patterns)',
+      '- At the start of each session, Emma loads your recent memories for context-aware conversations',
+      '- Emma can save, search, and delete memories using built-in tools during conversations',
+      '- New "Memory" tab in Settings lets you view, add, edit, and delete memories manually',
+    ],
+  },
+  {
     date: '2026-03-08',
     changes: [
       'Security: Comprehensive Auth & MCP Security Tests',
