@@ -1,4 +1,7 @@
 import { chatbotDb } from './chatbotService';
+import { userDb, crmDb } from './db';
+import { emailEventsDb } from './emailEventsDb';
+import { agentModeService } from './agentModeService';
 
 const TIME_RANGE_DAYS: Record<string, number> = {
   '1d': 1,
@@ -33,6 +36,21 @@ export interface AccountSummary {
     note: string;
   };
   top_tools_used: Record<string, number>;
+  impact_metrics: {
+    leads_added: number;
+    email: {
+      delivered: number;
+      opened: number;
+      clicked: number;
+      replied: number;
+      bounced: number;
+    };
+    social_media: {
+      total_impressions: number;
+      total_engagements: number;
+      total_clicks: number;
+    };
+  };
 }
 
 export async function getAccountSummary(
@@ -43,7 +61,14 @@ export async function getAccountSummary(
   const now = new Date();
   const startDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
 
-  const allSessions = await chatbotDb.getSessionsWithoutMessages(userId);
+  // Run all queries in parallel
+  const [allSessions, leadsAdded, emailMetrics, socialMetrics] = await Promise.all([
+    chatbotDb.getSessionsWithoutMessages(userId),
+    getLeadsAdded(userId, startDate),
+    getEmailMetrics(userId, startDate),
+    getSocialMediaMetrics(userId, startDate),
+  ]);
+
   const sessions = allSessions.filter(
     (s) => new Date(s.createdAt) >= startDate
   );
@@ -56,14 +81,12 @@ export async function getAccountSummary(
   const toolCounts: Record<string, number> = {};
 
   for (const session of sessions) {
-    // Asset counts from cache
     if (session.assetCache) {
       images += session.assetCache.images?.length ?? 0;
       videos += session.assetCache.videos?.length ?? 0;
       reports += session.assetCache.htmlReports?.length ?? 0;
     }
 
-    // Social media posts + tool aggregation from calledFunctions
     if (session.calledFunctions) {
       for (const [toolName, count] of Object.entries(session.calledFunctions)) {
         const c = count as number;
@@ -77,7 +100,6 @@ export async function getAccountSummary(
       }
     }
 
-    // Published assets
     if (session.publishStatuses) {
       for (const status of Object.values(session.publishStatuses)) {
         if (status === 'published') {
@@ -87,7 +109,6 @@ export async function getAccountSummary(
     }
   }
 
-  // Sort tools by count descending, keep top 5
   const sortedTools = Object.entries(toolCounts)
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5);
@@ -112,5 +133,104 @@ export async function getAccountSummary(
       note: 'This may not reflect assets published manually outside of Emma.',
     },
     top_tools_used: topTools,
+    impact_metrics: {
+      leads_added: leadsAdded,
+      email: emailMetrics,
+      social_media: socialMetrics,
+    },
   };
+}
+
+async function getLeadsAdded(userId: string, startDate: Date): Promise<number> {
+  try {
+    const leadLists = await crmDb.getLeadListsByUserId(userId);
+    if (!leadLists || leadLists.length === 0) return 0;
+
+    let totalNew = 0;
+    for (const list of leadLists) {
+      let lastKey: any = null;
+      do {
+        const result = await crmDb.getLeadsByListId(list.listId, 100, lastKey);
+        for (const lead of result.items) {
+          if (lead.createdAt && new Date(lead.createdAt) >= startDate) {
+            totalNew++;
+          }
+        }
+        lastKey = result.lastEvaluatedKey;
+      } while (lastKey);
+    }
+    return totalNew;
+  } catch (error) {
+    console.error('accountSummary: Error fetching leads:', error);
+    return 0;
+  }
+}
+
+async function getEmailMetrics(
+  userId: string,
+  startDate: Date
+): Promise<AccountSummary['impact_metrics']['email']> {
+  const empty = { delivered: 0, opened: 0, clicked: 0, replied: 0, bounced: 0 };
+  try {
+    const user = await userDb.getUserById(userId);
+    if (!user?.emailDomain) return empty;
+
+    const events = await emailEventsDb.getEventsByEmailDomain(user.emailDomain);
+    const counts = { ...empty };
+
+    for (const event of events) {
+      if (!event.createdAt || new Date(event.createdAt) < startDate) continue;
+      switch (event.eventType) {
+        case 'email.delivered': counts.delivered++; break;
+        case 'email.opened': counts.opened++; break;
+        case 'email.clicked': counts.clicked++; break;
+        case 'email.received': counts.replied++; break;
+        case 'email.bounced': counts.bounced++; break;
+      }
+    }
+    return counts;
+  } catch (error) {
+    console.error('accountSummary: Error fetching email metrics:', error);
+    return empty;
+  }
+}
+
+async function getSocialMediaMetrics(
+  userId: string,
+  startDate: Date
+): Promise<AccountSummary['impact_metrics']['social_media']> {
+  const empty = { total_impressions: 0, total_engagements: 0, total_clicks: 0 };
+  try {
+    const result = await agentModeService.listConnectedAccounts(userId);
+    if (!result?.success || !result.accounts?.length) return empty;
+
+    const activeAccounts = result.accounts.filter((a: any) => a.is_active);
+    if (activeAccounts.length === 0) return empty;
+
+    const postResults = await Promise.all(
+      activeAccounts.map((acc: any) =>
+        agentModeService.loadConnectedAccountPosts(userId, acc.id, { limit: 50, include_metrics: true })
+      )
+    );
+
+    let impressions = 0;
+    let engagements = 0;
+    let clicks = 0;
+
+    for (const postResult of postResults) {
+      if (!postResult?.success || !postResult.posts) continue;
+      for (const post of postResult.posts) {
+        if (!post.createdAt || new Date(post.createdAt) < startDate) continue;
+        if (!post.metrics) continue;
+        impressions += post.metrics.impressionCount ?? 0;
+        engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
+        clicks += post.metrics.clickCount ?? 0;
+      }
+    }
+
+    return { total_impressions: impressions, total_engagements: engagements, total_clicks: clicks };
+  } catch (error) {
+    console.error('accountSummary: Error fetching social media metrics:', error);
+    return empty;
+  }
 }
