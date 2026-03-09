@@ -1,0 +1,47 @@
+[
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage e-commerce company",
+      "objective": "Create a GTM plan for our Q2 product launch",
+      "background": "Launching a new sustainable packaging line, budget is $50K, target is eco-conscious consumers aged 25-40"
+    },
+    "result": "Emma creates a structured GTM plan with channels, timeline, work items, and budget allocation"
+  },
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Show me the current status of our GTM plan",
+      "background": "TaskFlow has an existing GTM plan, wants to check progress on work items"
+    },
+    "result": "Emma retrieves the GTM plan and presents status of work items, highlighting completed, in-progress, and pending items"
+  },
+  {
+    "input": {
+      "persona_name": "Tom",
+      "persona_description": "solo founder of a fitness app startup",
+      "objective": "I need a marketing plan but I have almost no budget. What can I do?",
+      "background": "FitTrack is bootstrapped, $500/month marketing budget, needs organic growth strategies"
+    },
+    "result": "Emma creates a lean GTM plan focused on low-cost channels (content marketing, social media, community building) with realistic milestones"
+  },
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage e-commerce company",
+      "objective": "Add a work item to our GTM plan for influencer partnerships",
+      "background": "Want to add a new initiative to partner with 10 eco-influencers for the Q2 launch"
+    },
+    "result": "Emma adds the work item to the existing GTM plan with description, timeline, and success metrics"
+  },
+  {
+    "input": {
+      "persona_name": "Mike",
+      "persona_description": "content marketing lead at a fintech company",
+      "objective": "Review our GTM plan and suggest improvements based on our recent performance",
+      "background": "PayStream Q1 plan had mixed results - blog traffic up 30% but social engagement down 15%"
+    },
+    "result": "Emma reviews the plan, analyzes the performance data, and suggests specific adjustments with rationale"
+  }
+]

@@ -1,0 +1,47 @@
+[
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Research our competitors, then write a blog post positioning us against them, and create social media posts to promote it",
+      "background": "TaskFlow vs Asana, Monday.com. Want competitive content pipeline from research to distribution"
+    },
+    "result": "Emma performs competitor research, writes a comparison/positioning blog post, then creates social media posts to promote the blog across platforms"
+  },
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage e-commerce company",
+      "objective": "Create a complete product launch campaign: email announcement, blog post, social media posts, and a GTM work item to track it",
+      "background": "Launching new biodegradable packaging, need a coordinated multi-channel campaign"
+    },
+    "result": "Emma creates all campaign assets (email, blog, social posts) and adds a GTM work item to track the launch initiative"
+  },
+  {
+    "input": {
+      "persona_name": "Mike",
+      "persona_description": "content marketing lead at a fintech company",
+      "objective": "Check our SEO performance, identify underperforming pages, and create optimized content to improve them",
+      "background": "PayStream blog has declining organic traffic on several key pages"
+    },
+    "result": "Emma analyzes SEO data, identifies weak pages, and creates improved content or optimization suggestions for each"
+  },
+  {
+    "input": {
+      "persona_name": "Tom",
+      "persona_description": "solo founder of a fitness app startup",
+      "objective": "Find fitness influencers, add them as leads, and draft personalized outreach emails for each",
+      "background": "FitTrack wants to build an influencer partnership program"
+    },
+    "result": "Emma researches fitness influencers, adds them to the CRM as leads, and drafts personalized outreach emails referencing each influencer's content"
+  },
+  {
+    "input": {
+      "persona_name": "Rachel",
+      "persona_description": "social media manager at a DTC brand",
+      "objective": "Pull our brand guidelines from the knowledge base, then create a month of on-brand social media content with images",
+      "background": "GreenGlow needs consistent branded content for April"
+    },
+    "result": "Emma retrieves brand guidelines from KB, then creates a content calendar with posts and generated images that match brand specifications"
+  }
+]

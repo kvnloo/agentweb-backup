@@ -1,0 +1,56 @@
+[
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Show me my current leads and their engagement status",
+      "background": "TaskFlow has been running email campaigns, wants to see which leads are active"
+    },
+    "result": "Emma queries the CRM and presents lead data with engagement metrics, filtering or sorting as appropriate"
+  },
+  {
+    "input": {
+      "persona_name": "David",
+      "persona_description": "sales development rep at a mid-size tech company",
+      "objective": "Add a list of 5 new leads from a recent conference",
+      "background": "Collected business cards at SaaS Connect conference, needs to add them to the CRM"
+    },
+    "result": "Emma helps add the leads to the CRM with relevant details (name, email, company, source)"
+  },
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Send a follow-up email to leads who opened our last campaign but didn't respond",
+      "background": "Last campaign was about the AI scheduling feature, sent 2 weeks ago"
+    },
+    "result": "Emma identifies the relevant lead segment and drafts/sends a follow-up email appropriate for re-engagement"
+  },
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage e-commerce company",
+      "objective": "Create a targeted email campaign for our top 20 most engaged leads",
+      "background": "Want to invite high-value leads to an exclusive product preview event"
+    },
+    "result": "Emma identifies top engaged leads, drafts a personalized invitation email, and offers to send the campaign"
+  },
+  {
+    "input": {
+      "persona_name": "David",
+      "persona_description": "sales development rep at a mid-size tech company",
+      "objective": "What's the engagement rate for leads from our Google Ads campaigns?",
+      "background": "Running multiple ad campaigns, wants to understand which source produces the best leads"
+    },
+    "result": "Emma queries lead data filtered by source, calculates engagement metrics, and presents insights"
+  },
+  {
+    "input": {
+      "persona_name": "Tom",
+      "persona_description": "solo founder of a fitness app startup",
+      "objective": "Help me set up email outreach to fitness bloggers for partnerships",
+      "background": "Wants to reach out to 10 fitness bloggers for app review partnerships"
+    },
+    "result": "Emma helps create a lead list of target bloggers and drafts personalized outreach emails"
+  }
+]

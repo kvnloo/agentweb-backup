@@ -1,0 +1,47 @@
+[
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup, just signed up",
+      "objective": "Introduce yourself and ask what Emma can help with",
+      "background": "Company sells project management software, 50 employees, new to AgentWeb"
+    },
+    "result": "Emma introduces herself, explains her capabilities, and guides the user to set up their brand or explore available skills"
+  },
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Set up brand information for the company",
+      "background": "Company is called TaskFlow, B2B SaaS for project management, target audience is mid-market engineering teams"
+    },
+    "result": "Emma helps configure brand settings including company name, description, target audience, and tone of voice"
+  },
+  {
+    "input": {
+      "persona_name": "Tom",
+      "persona_description": "solo founder of an early-stage startup",
+      "objective": "Ask what marketing skills are available and how to get started",
+      "background": "Just launched a fitness app, no marketing team, limited budget"
+    },
+    "result": "Emma lists available skill categories (content, SEO, lead management, etc.) and recommends a starting point based on the user's situation"
+  },
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage company",
+      "objective": "Ask Emma to create a first work plan for the quarter",
+      "background": "E-commerce company with 200 employees, wants to improve organic traffic and social presence"
+    },
+    "result": "Emma creates or offers to create a GTM plan with work items covering SEO, content, and social media"
+  },
+  {
+    "input": {
+      "persona_name": "Alex",
+      "persona_description": "marketing coordinator, not very technical",
+      "objective": "Ask how to connect social media accounts",
+      "background": "Works at a local bakery chain, wants to post on LinkedIn and manage leads"
+    },
+    "result": "Emma explains the connected accounts feature and guides the user through linking their social media profiles"
+  }
+]

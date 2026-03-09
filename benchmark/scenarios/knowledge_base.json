@@ -1,0 +1,47 @@
+[
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Search our knowledge base for brand guidelines",
+      "background": "TaskFlow uploaded brand guidelines to the knowledge base, needs to reference them for a campaign"
+    },
+    "result": "Emma searches the knowledge base, finds relevant files, and presents the brand guidelines information"
+  },
+  {
+    "input": {
+      "persona_name": "Mike",
+      "persona_description": "content marketing lead at a fintech company",
+      "objective": "What files do we have in our knowledge base?",
+      "background": "PayStream has uploaded various documents, wants an overview of available resources"
+    },
+    "result": "Emma lists the knowledge base contents with file names, types, and brief descriptions"
+  },
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage e-commerce company",
+      "objective": "Use our product catalog from the knowledge base to create a promotional email",
+      "background": "Product catalog PDF was uploaded to KB, need to reference specific products in the email"
+    },
+    "result": "Emma reads the product catalog from KB and uses the information to create an accurate, product-specific promotional email"
+  },
+  {
+    "input": {
+      "persona_name": "Rachel",
+      "persona_description": "social media manager at a DTC brand",
+      "objective": "Find our competitor analysis document and summarize the key findings",
+      "background": "Team uploaded a competitor analysis spreadsheet last month"
+    },
+    "result": "Emma searches KB for the competitor analysis, reads it, and provides a concise summary of key findings"
+  },
+  {
+    "input": {
+      "persona_name": "Tom",
+      "persona_description": "solo founder of a fitness app startup",
+      "objective": "I uploaded our user persona document. Use it to write a targeted blog post.",
+      "background": "FitTrack has a user persona document in KB describing their ideal customer"
+    },
+    "result": "Emma retrieves the persona document from KB and uses the persona details to write a blog post tailored to that audience"
+  }
+]

@@ -1,0 +1,47 @@
+[
+  {
+    "input": {
+      "persona_name": "Sarah",
+      "persona_description": "marketing manager at a B2B SaaS startup",
+      "objective": "Research our top competitors in the project management space",
+      "background": "TaskFlow competes with Asana, Monday.com, and ClickUp. Want to understand their content strategy"
+    },
+    "result": "Emma performs web research on competitors, summarizes their content strategies, and provides actionable competitive insights"
+  },
+  {
+    "input": {
+      "persona_name": "Mike",
+      "persona_description": "content marketing lead at a fintech company",
+      "objective": "What are our top performing pages in Google Search Console?",
+      "background": "PayStream has Google Search Console connected, wants to understand organic traffic patterns"
+    },
+    "result": "Emma queries Search Console data and presents top pages with impressions, clicks, CTR, and position data"
+  },
+  {
+    "input": {
+      "persona_name": "Lisa",
+      "persona_description": "CMO at a growth-stage e-commerce company",
+      "objective": "Do a deep research report on sustainable packaging trends in e-commerce",
+      "background": "Want a comprehensive report to inform Q3 content strategy"
+    },
+    "result": "Emma conducts deep research using web search, compiles findings into a structured report with sources and key takeaways"
+  },
+  {
+    "input": {
+      "persona_name": "Tom",
+      "persona_description": "solo founder of a fitness app startup",
+      "objective": "Find keyword opportunities for our blog to rank for fitness tracking terms",
+      "background": "FitTrack blog has 20 posts, wants to improve organic discovery"
+    },
+    "result": "Emma researches relevant keywords, analyzes search intent, and recommends content topics with keyword targeting strategy"
+  },
+  {
+    "input": {
+      "persona_name": "Rachel",
+      "persona_description": "social media manager at a DTC brand",
+      "objective": "Analyze our website's page speed and SEO health",
+      "background": "GreenGlow website is greenglow.com, concerned about slow loading times affecting conversions"
+    },
+    "result": "Emma runs SEO/PageSpeed analysis and presents findings with prioritized recommendations for improvement"
+  }
+]
