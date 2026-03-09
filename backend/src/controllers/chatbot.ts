@@ -54,7 +54,8 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const result = await chatbotDb.getUserSessions(userId);
+    const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
+    const result = await chatbotDb.getUserSessions(userId, undefined, limitParam);
     
     // Remove page content from response to reduce payload size
     const sanitizedSessions = result.sessions.map(session => {
@@ -66,6 +67,24 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
   } catch (error) {
     console.error('Error listing chat sessions:', error);
     res.status(500).json({ error: 'Failed to list chat sessions' });
+  }
+};
+
+// List Emma (customer-portal) sessions only — filtered server-side
+export const listEmmaSessions = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+    const sessions = await chatbotDb.getEmmaSessions(userId, limit);
+    // Strip heavy fields not needed for the history list
+    const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => rest);
+    res.status(200).json(sanitized);
+  } catch (error) {
+    console.error('Error listing Emma sessions:', error);
+    res.status(500).json({ error: 'Failed to list Emma sessions' });
   }
 };
 
@@ -99,7 +118,7 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
 export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const sessionId = req.params.sessionId;
-    const { message, currentUrl, pageContext } = req.body;
+    const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
     const portal = req.query.portal as string | undefined;
 
     let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
@@ -130,7 +149,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext, portalType, userId);
+      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext, portalType, userId, structuredContext, screenshot, model);
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);

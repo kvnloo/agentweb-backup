@@ -709,6 +709,31 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'get_visual_context',
+  definition: {
+    name: 'get_visual_context',
+    description: 'Request a screenshot of the current page to understand visual layout, colors, design elements, UI structure. Use when the user asks about visual aspects, colors, design, or when you need to see the page to answer accurately.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Why you need the screenshot'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any) => {
+    return {
+      needs_screenshot: true,
+      reason: args.reason || 'Visual context requested',
+      message: 'Screenshot will be captured from the browser and included in the next message.'
+    };
+  }
+});
+
+mcpToolRegistry.register({
   name: 'perform_deep_research',
   definition: {
     name: 'perform_deep_research',

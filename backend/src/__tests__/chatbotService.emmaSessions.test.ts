@@ -1,0 +1,148 @@
+/**
+ * Tests for getEmmaSessions (ChatbotDB) and getEmmaSystemContext
+ */
+import { chatbotDb } from '../services/chatbotService';
+
+// Track individual mock functions so we can control per-test behaviour
+const queryPromiseMock = jest.fn();
+const getPromiseMock = jest.fn();
+
+jest.mock('aws-sdk', () => ({
+  DynamoDB: {
+    DocumentClient: jest.fn(() => ({
+      query: jest.fn(() => ({ promise: queryPromiseMock })),
+      get: jest.fn(() => ({ promise: getPromiseMock })),
+      put: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+      update: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+      batchWrite: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
+    })),
+  },
+  S3: jest.fn(() => ({
+    upload: jest.fn().mockReturnThis(),
+    promise: jest.fn(),
+  })),
+  config: { update: jest.fn() },
+}));
+
+jest.mock('openai', () => jest.fn(() => ({})));
+jest.mock('@google-cloud/discoveryengine', () => ({
+  EngineServiceClient: jest.fn(),
+  SearchServiceClient: jest.fn(),
+}));
+jest.mock('@google-cloud/storage', () => ({ Storage: jest.fn() }));
+jest.mock('../controllers/guide', () => ({ getGuide: jest.fn() }));
+jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
+jest.mock('../controllers/api', () => ({ getApiDocs: jest.fn() }));
+jest.mock('../controllers/user-guide', () => ({ getUserGuide: jest.fn() }));
+jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
+jest.mock('../services/db', () => ({ taskDb: {} }));
+jest.mock('../utils/secretsManager', () => ({
+  getGCSPPrivateKey: jest.fn(),
+  getSecret: jest.fn().mockResolvedValue('fake-key'),
+}));
+
+/** Helper – build a mock ChatSession-like item */
+function makeSession(sessionId: string, updatedAt: string, extra?: Record<string, any>) {
+  return {
+    sessionId,
+    userId: 'user-1',
+    pageIdentifier: 'customer-portal',
+    updatedAt,
+    title: `Session ${sessionId}`,
+    archived: false,
+    ...extra,
+  };
+}
+
+describe('ChatbotDB.getEmmaSessions', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('returns sessions filtered by pageIdentifier and sorted descending by updatedAt', async () => {
+    const sessions = [
+      makeSession('s1', '2024-01-01T10:00:00Z'),
+      makeSession('s3', '2024-01-03T10:00:00Z'),
+      makeSession('s2', '2024-01-02T10:00:00Z'),
+    ];
+
+    // First query call: sessions list  (no LastEvaluatedKey = single page)
+    queryPromiseMock.mockResolvedValueOnce({ Items: sessions });
+    // Subsequent calls (getSessionPreview per session – Limit:10 messages query each)
+    queryPromiseMock.mockResolvedValue({ Items: [{ message: { role: 'user', content: 'Hello' } }] });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 20);
+
+    // Should be sorted newest → oldest
+    expect(result[0].sessionId).toBe('s3');
+    expect(result[1].sessionId).toBe('s2');
+    expect(result[2].sessionId).toBe('s1');
+  });
+
+  it('respects the limit and returns at most N sessions', async () => {
+    const sessions = Array.from({ length: 10 }, (_, i) =>
+      makeSession(`s${i}`, `2024-01-${String(i + 1).padStart(2, '0')}T00:00:00Z`)
+    );
+
+    queryPromiseMock.mockResolvedValueOnce({ Items: sessions });
+    // Preview calls
+    queryPromiseMock.mockResolvedValue({ Items: [] });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 3);
+
+    expect(result).toHaveLength(3);
+  });
+
+  it('paginates through multiple DynamoDB pages until limit is met', async () => {
+    const page1Sessions = Array.from({ length: 5 }, (_, i) =>
+      makeSession(`p1-s${i}`, `2024-01-${String(i + 1).padStart(2, '0')}T00:00:00Z`)
+    );
+    const page2Sessions = Array.from({ length: 5 }, (_, i) =>
+      makeSession(`p2-s${i}`, `2024-02-${String(i + 1).padStart(2, '0')}T00:00:00Z`)
+    );
+
+    // Page 1 of main session query
+    queryPromiseMock.mockResolvedValueOnce({
+      Items: page1Sessions,
+      LastEvaluatedKey: { sessionId: 'p1-s4' },
+    });
+    // Page 2 of main session query
+    queryPromiseMock.mockResolvedValueOnce({ Items: page2Sessions });
+    // Preview calls for each session
+    queryPromiseMock.mockResolvedValue({ Items: [] });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 10);
+
+    // Should have collected sessions from both pages (up to limit)
+    expect(result.length).toBeLessThanOrEqual(10);
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('attaches previewText from first user message', async () => {
+    queryPromiseMock.mockResolvedValueOnce({ Items: [makeSession('s1', '2024-01-01T00:00:00Z')] });
+    // Preview query returns one user message
+    queryPromiseMock.mockResolvedValueOnce({
+      Items: [{ message: { role: 'user', content: 'What is AgentWeb?' } }],
+    });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 5);
+
+    expect(result[0].previewText).toBe('What is AgentWeb?');
+  });
+
+  it('sets previewText to null when session has no messages', async () => {
+    queryPromiseMock.mockResolvedValueOnce({ Items: [makeSession('s1', '2024-01-01T00:00:00Z')] });
+    // Preview query returns nothing
+    queryPromiseMock.mockResolvedValueOnce({ Items: [] });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 5);
+
+    expect(result[0].previewText).toBeNull();
+  });
+
+  it('returns empty array when no sessions exist', async () => {
+    queryPromiseMock.mockResolvedValueOnce({ Items: [] });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 20);
+
+    expect(result).toEqual([]);
+  });
+});

@@ -13,9 +13,10 @@ import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
 import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
-import { getGCSPPrivateKey } from '../utils/secretsManager';
+import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
+import { LLMService } from '../utils/llmService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -442,7 +443,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     const selectedSystemMessage =
-      portalType === "customer" ? emmaSystemMessage :
+      portalType === "customer" ? await getEmmaSystemContext() :
       portalType === "genius" ? geniusSystemMessage :
       portalType === "agent" ? null : // Agent Mode uses its own system prompt
       partnerSystemMessage;
@@ -763,6 +764,23 @@ export class ChatbotDB {
       }
       console.error("Error getting message count from messages table:", error);
       throw error;
+    }
+  }
+
+  // Get the first user message text for history list preview (lightweight — Limit:10)
+  private async getSessionPreview(sessionId: string): Promise<string | null> {
+    try {
+      const result = await dynamodb.query({
+        TableName: this.messagesTableName,
+        KeyConditionExpression: 'sessionId = :sessionId',
+        ExpressionAttributeValues: { ':sessionId': sessionId },
+        ScanIndexForward: true,
+        Limit: 10,
+      }).promise();
+      const firstUser = (result.Items || []).find((item: any) => item.message?.role === 'user');
+      return firstUser ? (firstUser.message.content as string) || null : null;
+    } catch {
+      return null;
     }
   }
 
@@ -1447,6 +1465,55 @@ export class ChatbotDB {
       console.error("Error getting user chat sessions:", error);
       throw error;
     }
+  }
+
+  /**
+   * Get Emma (customer-portal) sessions for a user.
+   * Filters server-side by pageIdentifier so Agent Mode sessions are excluded.
+   * Returns lean session objects (no full message fetch) suitable for the history panel.
+   */
+  async getEmmaSessions(userId: string, limit: number = 20): Promise<ChatSession[]> {
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: 'UserIdIndex',
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'pageIdentifier = :pageIdentifier AND (attribute_not_exists(archived) OR archived = :false)',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+        ':pageIdentifier': 'customer-portal',
+        ':false': false,
+      },
+      ScanIndexForward: false,
+    };
+
+    const collected: ChatSession[] = [];
+    let lastEvaluatedKey: any = undefined;
+
+    // Paginate until we have enough results (DynamoDB Limit is scan limit, not result limit)
+    do {
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+      const result = await dynamodb.query(params).promise();
+      const items = (result.Items as ChatSession[]) || [];
+      collected.push(...items);
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && collected.length < limit);
+
+    // Sort by updatedAt descending and take top N
+    const topSessions = collected
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+      .slice(0, limit);
+
+    // Fetch first user message preview for each session in parallel
+    const sessionsWithPreview = await Promise.all(
+      topSessions.map(async (session) => {
+        const previewText = await this.getSessionPreview(session.sessionId);
+        return { ...session, previewText };
+      })
+    );
+
+    return sessionsWithPreview;
   }
 
   /**
@@ -2666,19 +2733,44 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 
-const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
+const emmaSystemMessage = `You are Emma Chat, a helpful 24/7 support assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
 
 Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
 
-You have access to tools that allow you to manage knowledge bases. Here are the tools and when to use each:
+You have access to tools that allow you to read and update the user's marketing data directly. Key capabilities:
 
-1. **create_knowledge_base**: Create a brand new knowledge base. Use when the user wants to start fresh with new research, documentation, or data collection. Provide a name and initial content.
+**Knowledge Base:**
+1. **create_knowledge_base**: Create a new knowledge base with initial content.
+2. **update_knowledge_base_file**: Update content in an existing knowledge base file.
+3. **attach_knowledge_base_files**: Save multiple pieces of content as separate files in a knowledge base.
+Always use list_knowledge_base_files first to see available knowledge bases and their identifiers before updating.
 
-2. **update_knowledge_base_file**: Update or append content to a specific file in an existing knowledge base. Use list_knowledge_base_files first to get the correct taskId (kb_identifier). Specify fileName "knowledge-base.txt" for the main file, or the name of an attached file.
+**Brand & Strategy:**
+- **read_brand_guidelines** / **update_brand_guidelines**: Read or update brand name, colors, fonts, tone, messaging.
+- **read_market_strategy** / **update_market_strategy**: Read or update ICP, competitors, positioning, value proposition.
+Always call the read tool first before updating to get current values.
 
-3. **attach_knowledge_base_files**: Save multiple pieces of content as separate named files in an existing knowledge base. Use when the user wants to save several distinct items (e.g., research summaries, data files) at once.
+**GTM Plan:**
+- **list_gtm_plans** / **read_gtm_plan** / **create_gtm_plan** / **update_gtm_plan**: Manage GTM plans.
+- **add_gtm_phase** / **add_gtm_work_items** / **update_gtm_work_item**: Manage phases and work items within a plan.
 
-IMPORTANT: Always use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds) before using update_knowledge_base_file or attach_knowledge_base_files.
+**CRM:** **get_leads**, **search_leads**, **update_lead**, **create_lead_list**
+
+**Books:** **list_books**, **create_book**, **update_book_content**
+
+**Email Templates:** **list_html_templates**, **create_html_from_template**, **update_html_file**
+
+**Visual Context:**
+- **get_visual_context**: Call this when you need to SEE the page visually (colors, layout, design). A screenshot will be captured and sent in the follow-up message.
+
+**Structured Page Context:**
+With each message you receive structured page context:
+- buttons[]: clickable elements on the page (use exact button text in your guidance)
+- inputs[]: form fields with labels, placeholders, and current values
+- headings[]: page section titles
+- visibleText: visible page text
+
+Use this to give SPECIFIC UI guidance. Example: "Click the 'Save Brand Colors' button" instead of "find the save button".
 
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
@@ -2715,6 +2807,43 @@ Example of good formatting:
 Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="${
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
+
+// Cache for Emma system context (60s TTL)
+// Cached Gemini OpenAI-compatible client
+let cachedGeminiClient: OpenAI | null = null;
+async function getGeminiClient(): Promise<OpenAI> {
+  if (cachedGeminiClient) return cachedGeminiClient;
+  const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+  let apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    apiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
+  }
+  if (!apiKey || !apiKey.trim()) throw new Error('Gemini API key not found');
+  cachedGeminiClient = new OpenAI({
+    apiKey: apiKey.trim(),
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta',
+  });
+  return cachedGeminiClient;
+}
+
+let cachedSystemContext: { value: string; expiry: number } | null = null;
+
+async function getEmmaSystemContext(): Promise<string> {
+  if (cachedSystemContext && Date.now() < cachedSystemContext.expiry) {
+    return cachedSystemContext.value;
+  }
+  try {
+    const res = await dynamodb.get({
+      TableName: `${TABLE_PREFIX}AW-Settings`,
+      Key: { settingName: 'emma_system_context' },
+    }).promise();
+    const value = res.Item?.settingValue || emmaSystemMessage;
+    cachedSystemContext = { value, expiry: Date.now() + 60_000 };
+    return value;
+  } catch {
+    return emmaSystemMessage;
+  }
+}
 
 const geniusSystemMessage = `You are Growth Genius, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
 
@@ -2970,8 +3099,11 @@ export async function generateChatResponse(
   currentUrl?: string,
   pageContent?: string,
   portalType: "customer" | "partner" = "partner",
-  userId?: string
-): Promise<string | { content: string; toolCalls?: any[] }> {
+  userId?: string,
+  structuredContext?: string,
+  screenshot?: string,
+  model?: string
+): Promise<string | { content: string; toolCalls?: any[]; invalidations?: string[] }> {
   try {
     const timestamp = new Date().toISOString();
 
@@ -2999,6 +3131,18 @@ export async function generateChatResponse(
 
     // Get messages for OpenAI
     const messages = [...session.messages];
+
+    // Support vision: if screenshot provided, modify last user message for visual analysis
+    if (screenshot) {
+      const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
+      if (lastUserIdx >= 0) {
+        (messages[lastUserIdx] as any).content = [
+          { type: 'text', text: messages[lastUserIdx].content },
+          { type: 'image_url', image_url: { url: screenshot, detail: 'low' } }
+        ];
+      }
+    }
+
     let contextInfo = "";
 
     let activeKnowledgeBase: ContextChunk[];
@@ -3073,6 +3217,13 @@ export async function generateChatResponse(
         .map((m) => m.role)
         .lastIndexOf("user");
 
+      // Append structured page context (buttons, inputs, headings) if provided
+      if (structuredContext) {
+        contextInfo = contextInfo
+          ? `${contextInfo}\n\n--- Current Page UI Elements ---\n${structuredContext}`
+          : `--- Current Page UI Elements ---\n${structuredContext}`;
+      }
+
       // Insert the context right before the user's message if we have any
       if (contextInfo && lastUserMsgIndex > 0) {
         messages.splice(lastUserMsgIndex, 0, {
@@ -3103,7 +3254,41 @@ export async function generateChatResponse(
         await agentModeService.initialize();
 
         // KB tools and other tools available to Emma
-        const toolsToInclude = ['create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source'];
+        const toolsToInclude = [
+          // Knowledge base (existing)
+          'create_knowledge_base',
+          'update_knowledge_base_file',
+          'attach_knowledge_base_files',
+          'read_page_source',
+          // Brand & strategy
+          'read_brand_guidelines',
+          'update_brand_guidelines',
+          'read_market_strategy',
+          'update_market_strategy',
+          // GTM Plan
+          'list_gtm_plans',
+          'read_gtm_plan',
+          'create_gtm_plan',
+          'update_gtm_plan',
+          'add_gtm_phase',
+          'add_gtm_work_items',
+          'update_gtm_work_item',
+          // CRM
+          'get_leads',
+          'search_leads',
+          'update_lead',
+          'create_lead_list',
+          // Books
+          'list_books',
+          'create_book',
+          'update_book_content',
+          // Email templates
+          'list_html_templates',
+          'create_html_from_template',
+          'update_html_file',
+          // Visual context (on-demand screenshot)
+          'get_visual_context',
+        ];
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
 
@@ -3137,12 +3322,66 @@ export async function generateChatResponse(
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
+    // Route non-Azure models (Gemini, Claude/Bedrock) via LLMService
+    const isGeminiModel = model ? model.toLowerCase().includes('gemini') : false;
+    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.')) : false;
+
+    if (isGeminiModel || isClaudeModel) {
+      let responseText: string;
+      if (isGeminiModel) {
+        const geminiClient = await getGeminiClient();
+        const completion = await geminiClient.chat.completions.create({
+          model: model!,
+          messages: messages.map(m => ({
+            role: m.role as 'system' | 'user' | 'assistant',
+            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+          })),
+        });
+        responseText = completion.choices[0]?.message?.content || '';
+      } else {
+        // Claude via Bedrock using LLMService
+        const llmSvc = new LLMService(model!);
+        const systemMsg = messages.find(m => m.role === 'system')?.content || '';
+        const conversationStr = messages
+          .filter(m => m.role !== 'system')
+          .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
+          .join('\n');
+        responseText = await llmSvc.generateContent(systemMsg, conversationStr);
+      }
+      const assistantMessageMetadata = {
+        currentUrl,
+        pageContentLength: pageContent?.length,
+        knowledgeBaseChunks: activeKnowledgeBase.length,
+        pageChunks: pageChunksCount,
+        relevantChunks: relevantChunksInfo,
+        timestamp,
+        portalType,
+      };
+      await chatbotDb.addMessageToSession(sessionId, {
+        role: "assistant",
+        content: responseText,
+        metadata: assistantMessageMetadata,
+      });
+      return responseText;
+    }
+
+    // Use a model-specific client if a model override is provided
+    const activeDeployment = model || process.env.AZURE_OPENAI_DEPLOYMENT || '';
+    const activeClient = model
+      ? new OpenAI({
+          apiKey: process.env.AZURE_OPENAI_API_KEY,
+          baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${model}`,
+          defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview" },
+          defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+        })
+      : openai;
+
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
 
       // Generate response using OpenAI (with tools if available)
-      const response = await openai.chat.completions.create({
-        model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
+      const response = await activeClient.chat.completions.create({
+        model: activeDeployment,
         messages: messages.map(({ role, content, name, tool_call_id, tool_calls }) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
@@ -3291,11 +3530,37 @@ export async function generateChatResponse(
       metadata: assistantMessageMetadata,
     });
 
+    // Compute page invalidations from successful tool calls
+    const PAGE_INVALIDATION_MAP: Record<string, string[]> = {
+      'update_brand_guidelines': ['brand-guidelines'],
+      'update_market_strategy': ['market-strategy'],
+      'update_gtm_plan': ['gtm-plan'],
+      'add_gtm_phase': ['gtm-plan'],
+      'add_gtm_work_items': ['gtm-plan'],
+      'update_gtm_work_item': ['gtm-plan'],
+      'create_gtm_plan': ['gtm-plan'],
+      'update_lead': ['crm'],
+      'create_lead_list': ['crm'],
+      'update_book_content': ['books'],
+      'create_book': ['books'],
+      'create_html_from_template': ['email-templates'],
+      'update_html_file': ['email-templates'],
+      'create_knowledge_base': ['knowledge-base'],
+      'update_knowledge_base_file': ['knowledge-base'],
+    };
+
+    const allInvalidations = [...new Set(
+      toolCalls
+        .filter((tc) => !tc.error)
+        .flatMap((tc) => PAGE_INVALIDATION_MAP[tc.name] || [])
+    )];
+
     // Return response object (like Agent Mode, not just string)
     if (toolCalls.length > 0) {
       return {
         content: finalAssistantMessage,
-        toolCalls: toolCalls
+        toolCalls: toolCalls,
+        ...(allInvalidations.length > 0 ? { invalidations: allInvalidations } : {})
       };
     } else {
       // For backward compatibility with partner portal

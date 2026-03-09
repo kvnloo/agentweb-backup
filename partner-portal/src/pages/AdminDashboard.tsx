@@ -46,6 +46,7 @@ import { buildApiUrl, CUSTOMER_FRONTEND_URL } from "../config";
 import DOMPurify from "dompurify";
 import ImageModelsSettings from "../components/admin/ImageModelsSettings";
 import DefaultPromptsSettings from "../components/admin/DefaultPromptsSettings";
+import EmmaSettings from "../components/admin/EmmaSettings";
 import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
@@ -617,6 +618,7 @@ export default function AdminDashboard() {
     'subscriptions': 12,
     'mcp-servers': 13,
     'result-endpoints': 14,
+    'emma-settings': 15,
   };
   
   // Get initial tab value from URL or default to Users
@@ -2299,6 +2301,7 @@ export default function AdminDashboard() {
             <Tab label="Subscriptions" {...a11yProps(12)} />
             <Tab label="MCP Servers" {...a11yProps(13)} />
             <Tab label="Result Endpoints" {...a11yProps(14)} />
+            <Tab label="Emma Chat Settings" {...a11yProps(15)} />
           </Tabs>
         </Box>
 
@@ -4932,6 +4935,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={14}>
           <ResultEndpointsTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={15}>
+          <EmmaSettings />
         </TabPanel>
       </Paper>
 
