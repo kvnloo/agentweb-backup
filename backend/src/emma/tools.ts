@@ -3931,3 +3931,40 @@ emmaToolRegistry.register({
     }
   }
 });
+
+// =============================================================================
+// Landing Page Tools
+// =============================================================================
+
+emmaToolRegistry.register({
+  name: 'list_my_landing_pages',
+  definition: {
+    name: 'list_my_landing_pages',
+    description: 'List all landing pages generated for the current user. Returns each page\'s id, name, status, GitHub repo URL, and deployed URL. Use this to discover which repos to read/edit via the GitHub MCP tools (github_get_file_contents, github_create_or_update_file).',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      throw new Error("Authentication required: no user context");
+    }
+
+    const { listLandingPages } = await import('../services/v0Service');
+    const pages = await listLandingPages(userId);
+
+    return {
+      landingPages: pages.map(p => ({
+        id: p.id,
+        name: p.name,
+        status: p.status,
+        githubRepoUrl: p.githubRepoUrl,
+        deployedUrl: p.deployedUrl,
+      })),
+      count: pages.length,
+    };
+  }
+});
