@@ -147,24 +147,135 @@ describe('devEnvService', () => {
             { paragraph: { rich_text: [{ plain_text: 'Line 1' }] } },
             { heading_1: { rich_text: [{ plain_text: 'Heading' }] } },
             { bulleted_list_item: { rich_text: [{ plain_text: 'Bullet' }] } },
-            { image: {} }, // non-text block, should be skipped
+            { image: {} }, // non-text block, should be skipped from text
           ],
         },
       });
 
-      const content = await getNotionPageContent('page-123');
+      const result = await getNotionPageContent('page-123');
 
-      expect(content).toBe('Line 1\nHeading\nBullet');
+      expect(result.text).toBe('Line 1\nHeading\nBullet');
+      expect(result.attachments).toEqual([]);
     });
 
-    it('should return empty string for page with no text blocks', async () => {
+    it('should return empty text and no attachments for page with no text blocks', async () => {
       mockAxios.mockResolvedValue({
-        data: { results: [{ image: {} }, { divider: {} }] },
+        data: { results: [{ type: 'divider', divider: {} }] },
       });
 
-      const content = await getNotionPageContent('page-empty');
+      const result = await getNotionPageContent('page-empty');
 
-      expect(content).toBe('');
+      expect(result.text).toBe('');
+      expect(result.attachments).toEqual([]);
+    });
+
+    it('should extract image attachment with Notion-hosted file URL', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          results: [
+            { paragraph: { rich_text: [{ plain_text: 'Some text' }] } },
+            {
+              type: 'image',
+              image: {
+                type: 'file',
+                file: { url: 'https://prod-files-secure.s3.amazonaws.com/screenshot.png' },
+                caption: [{ plain_text: 'My screenshot' }],
+              },
+            },
+          ],
+        },
+      });
+
+      const result = await getNotionPageContent('page-img');
+
+      expect(result.text).toBe('Some text');
+      expect(result.attachments).toEqual([
+        {
+          url: 'https://prod-files-secure.s3.amazonaws.com/screenshot.png',
+          name: 'My screenshot',
+          type: 'image',
+        },
+      ]);
+    });
+
+    it('should extract file attachment with external URL', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          results: [
+            {
+              type: 'file',
+              file: {
+                type: 'external',
+                external: { url: 'https://example.com/spec.pdf' },
+                name: 'spec.pdf',
+              },
+            },
+          ],
+        },
+      });
+
+      const result = await getNotionPageContent('page-file');
+
+      expect(result.attachments).toEqual([
+        {
+          url: 'https://example.com/spec.pdf',
+          name: 'spec.pdf',
+          type: 'file',
+        },
+      ]);
+    });
+
+    it('should extract mixed text and attachment blocks', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          results: [
+            { paragraph: { rich_text: [{ plain_text: 'Intro' }] } },
+            {
+              type: 'image',
+              image: {
+                type: 'file',
+                file: { url: 'https://s3.amazonaws.com/mockup.png' },
+                caption: [],
+              },
+            },
+            { heading_2: { rich_text: [{ plain_text: 'Section' }] } },
+            {
+              type: 'pdf',
+              pdf: {
+                type: 'file',
+                file: { url: 'https://s3.amazonaws.com/doc.pdf' },
+              },
+            },
+            {
+              type: 'video',
+              video: {
+                type: 'external',
+                external: { url: 'https://youtube.com/watch?v=abc' },
+              },
+            },
+          ],
+        },
+      });
+
+      const result = await getNotionPageContent('page-mixed');
+
+      expect(result.text).toBe('Intro\nSection');
+      expect(result.attachments).toHaveLength(3);
+      expect(result.attachments[0]).toEqual({
+        url: 'https://s3.amazonaws.com/mockup.png',
+        name: 'mockup.png',
+        type: 'image',
+      });
+      expect(result.attachments[1]).toEqual({
+        url: 'https://s3.amazonaws.com/doc.pdf',
+        name: 'doc.pdf',
+        type: 'pdf',
+      });
+      expect(result.attachments[2]).toEqual({
+        url: 'https://youtube.com/watch?v=abc',
+        name: 'video_attachment',
+        type: 'video',
+      });
     });
   });
 

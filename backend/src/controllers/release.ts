@@ -8,6 +8,18 @@ interface Release {
 // Release data moved from frontend
 const releases: Release[] = [
   {
+    date: "2026-03-09",
+    changes: [
+      "Notion Attachments in Dev Environments",
+      "- Screenshots, files, PDFs, and videos attached to Notion sprint items are now downloaded to the EC2 instance when a dev environment launches",
+      "- Claude Code prompt includes paths to downloaded attachments so it can view and reference them",
+      "- Supports both Notion-hosted and externally-linked files",
+      "Dev/Prod Status Isolation for Notion Webhooks",
+      "- Dev and test environments now use Start_Test/Done_Test status values to trigger launches and teardowns",
+      "- Production continues to use Start/Done, preventing test activity from accidentally triggering production environments",
+    ],
+  },
+  {
     date: "2026-03-03",
     changes: [
       "Cloud Dev Environment",
