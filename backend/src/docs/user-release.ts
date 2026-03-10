@@ -14,6 +14,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- At the start of each session, Emma loads your recent memories for context-aware conversations',
       '- Emma can save, search, and delete memories using built-in tools during conversations',
       '- New "Memory" tab in Settings lets you view, add, edit, and delete memories manually',
+      'Feature: Stripe Subscription Lifecycle Tracking',
+      '- Subscription status (active, canceled, past_due, paused) is now automatically synced via Stripe webhooks',
+      '- Churned users are automatically deactivated when their subscription is deleted',
+      '- Resumed subscriptions automatically reactivate the user account',
+      '- Failed payments are tracked and subscription status updated to past_due',
+      '- API key generation now checks subscription status in addition to Stripe customer ID',
+      '- CRM sync now includes subscription status, churn date, and last payment date',
     ],
   },
   {
