@@ -2,6 +2,7 @@ import { chatbotDb } from './chatbotService';
 import { userDb, crmDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { agentModeService } from './agentModeService';
+import { getPostsByUserId } from './linkedInPostsDb';
 
 const TIME_RANGE_DAYS: Record<string, number> = {
   '1d': 1,
@@ -49,6 +50,7 @@ export interface AccountSummary {
       bounced: number;
     };
     social_media: {
+      posts_published: number;
       impressions: number;
       engagements: number;
       clicks: number;
@@ -193,36 +195,47 @@ async function getSocialMediaMetrics(
   userId: string,
   startDate: Date
 ): Promise<AccountSummary['results']['social_media']> {
-  const empty = { impressions: 0, engagements: 0, clicks: 0 };
+  const empty = { posts_published: 0, impressions: 0, engagements: 0, clicks: 0 };
   try {
-    const result = await agentModeService.listConnectedAccounts(userId);
-    if (!result?.success || !result.accounts?.length) return empty;
-
-    const activeAccounts = result.accounts.filter((a: any) => a.is_active);
-    if (activeAccounts.length === 0) return empty;
-
-    const postResults = await Promise.all(
-      activeAccounts.map((acc: any) =>
-        agentModeService.loadConnectedAccountPosts(userId, acc.id, { limit: 50, include_metrics: true })
-      )
+    // Get post count from stored posts (reliable, doesn't depend on token validity)
+    const storedPosts = await getPostsByUserId(userId);
+    const postsInRange = storedPosts.filter(
+      (p) => p.createdAt && new Date(p.createdAt) >= startDate
     );
 
+    // Try to get live metrics from connected accounts (best-effort)
     let impressions = 0;
     let engagements = 0;
     let clicks = 0;
 
-    for (const postResult of postResults) {
-      if (!postResult?.success || !postResult.posts) continue;
-      for (const post of postResult.posts) {
-        if (!post.createdAt || new Date(post.createdAt) < startDate) continue;
-        if (!post.metrics) continue;
-        impressions += post.metrics.impressionCount ?? 0;
-        engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
-        clicks += post.metrics.clickCount ?? 0;
+    try {
+      const result = await agentModeService.listConnectedAccounts(userId);
+      if (result?.success && result.accounts?.length) {
+        const activeAccounts = result.accounts.filter((a: any) => a.is_active);
+        if (activeAccounts.length > 0) {
+          const postResults = await Promise.all(
+            activeAccounts.map((acc: any) =>
+              agentModeService.loadConnectedAccountPosts(userId, acc.id, { limit: 50, include_metrics: true })
+            )
+          );
+
+          for (const postResult of postResults) {
+            if (!postResult?.success || !postResult.posts) continue;
+            for (const post of postResult.posts) {
+              if (!post.createdAt || new Date(post.createdAt) < startDate) continue;
+              if (!post.metrics) continue;
+              impressions += post.metrics.impressionCount ?? 0;
+              engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
+              clicks += post.metrics.clickCount ?? 0;
+            }
+          }
+        }
       }
+    } catch (liveError) {
+      console.error('accountSummary: Error fetching live social media metrics (continuing with stored posts):', liveError);
     }
 
-    return { impressions, engagements, clicks };
+    return { posts_published: postsInRange.length, impressions, engagements, clicks };
   } catch (error) {
     console.error('accountSummary: Error fetching social media metrics:', error);
     return empty;

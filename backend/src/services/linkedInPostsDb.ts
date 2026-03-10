@@ -93,6 +93,33 @@ export async function getPostsByAccount(
 }
 
 /**
+ * Get posts for a specific user, sorted by timestamp (newest first)
+ * Uses the primary key (userId) for efficient querying.
+ */
+export async function getPostsByUserId(
+    userId: string,
+    limit: number = 100
+): Promise<LinkedInPost[]> {
+    try {
+        const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+            TableName: LINKEDIN_POSTS_TABLE,
+            KeyConditionExpression: 'userId = :userId',
+            ExpressionAttributeValues: {
+                ':userId': userId,
+            },
+            ScanIndexForward: false,
+            Limit: limit,
+        };
+
+        const result = await dynamodb.query(params).promise();
+        return (result.Items || []) as LinkedInPost[];
+    } catch (error) {
+        handleDbError('getPostsByUserId', error);
+        return [];
+    }
+}
+
+/**
  * Get a specific post by ID
  */
 export async function getPostByUrn(
