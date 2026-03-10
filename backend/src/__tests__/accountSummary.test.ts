@@ -43,6 +43,7 @@ import { userDb, crmDb } from '../services/db';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { agentModeService } from '../services/agentModeService';
 import { getPostsByUserId } from '../services/linkedInPostsDb';
+import { getAccountsByUserId } from '../services/connectedAccountsDb';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -62,7 +63,6 @@ jest.mock('../services/db', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    listConnectedAccounts: jest.fn().mockResolvedValue({ success: true, accounts: [] }),
     loadConnectedAccountPosts: jest.fn().mockResolvedValue({ success: true, posts: [] }),
   },
 }));
@@ -71,14 +71,18 @@ jest.mock('../services/linkedInPostsDb', () => ({
   getPostsByUserId: jest.fn().mockResolvedValue([]),
 }));
 
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountsByUserId: jest.fn().mockResolvedValue([]),
+}));
+
 const mockGetSessions = chatbotDb.getSessionsWithoutMessages as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
 const mockGetLeads = crmDb.getLeadsByListId as jest.Mock;
 const mockGetEmailEvents = emailEventsDb.getEventsByEmailDomain as jest.Mock;
-const mockListAccounts = agentModeService.listConnectedAccounts as jest.Mock;
 const mockLoadPosts = agentModeService.loadConnectedAccountPosts as jest.Mock;
 const mockGetStoredPosts = getPostsByUserId as jest.Mock;
+const mockGetAccounts = getAccountsByUserId as jest.Mock;
 
 function makeSession(overrides: Record<string, any> = {}) {
   return {
@@ -99,7 +103,7 @@ describe('getAccountSummary', () => {
     mockGetLeadLists.mockResolvedValue([]);
     mockGetLeads.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
     mockGetEmailEvents.mockResolvedValue([]);
-    mockListAccounts.mockResolvedValue({ success: true, accounts: [] });
+    mockGetAccounts.mockResolvedValue([]);
     mockLoadPosts.mockResolvedValue({ success: true, posts: [] });
     mockGetStoredPosts.mockResolvedValue([]);
   });
@@ -392,12 +396,9 @@ describe('getAccountSummary', () => {
       { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post 1', createdAt: '2026-03-08T10:00:00.000Z' },
       { userId: 'user-1', postId: 'post-2', accountId: 'acc-1', content: 'Post 2', createdAt: '2026-03-07T10:00:00.000Z' },
     ]);
-    mockListAccounts.mockResolvedValue({
-      success: true,
-      accounts: [
-        { id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', is_active: true },
-      ],
-    });
+    mockGetAccounts.mockResolvedValue([
+      { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: Date.now() + 999999 } },
+    ]);
     mockLoadPosts.mockResolvedValue({
       success: true,
       posts: [
@@ -427,12 +428,15 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.clicks).toBe(129); // 89 + 40
   });
 
-  test('returns posts_published even when live API fails', async () => {
+  test('returns posts_published even when live API fails per account', async () => {
     mockGetSessions.mockResolvedValue([]);
     mockGetStoredPosts.mockResolvedValue([
       { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post', createdAt: '2026-03-08T10:00:00.000Z' },
     ]);
-    mockListAccounts.mockRejectedValue(new Error('Token expired'));
+    mockGetAccounts.mockResolvedValue([
+      { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: 0 } },
+    ]);
+    mockLoadPosts.mockRejectedValue(new Error('Token expired'));
 
     const result = await getAccountSummary('user-1', '7d');
 
@@ -442,9 +446,9 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.clicks).toBe(0);
   });
 
-  test('handles social media API failure gracefully', async () => {
+  test('handles no connected accounts gracefully', async () => {
     mockGetSessions.mockResolvedValue([]);
-    mockListAccounts.mockResolvedValue({ success: false, accounts: [] });
+    mockGetAccounts.mockResolvedValue([]);
 
     const result = await getAccountSummary('user-1', '7d');
 
@@ -453,15 +457,12 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.engagements).toBe(0);
   });
 
-  test('skips inactive connected accounts', async () => {
+  test('queries all connected accounts without token validity check', async () => {
     mockGetSessions.mockResolvedValue([]);
-    mockListAccounts.mockResolvedValue({
-      success: true,
-      accounts: [
-        { id: 'acc-1', platform: 'linkedin', is_active: false },
-        { id: 'acc-2', platform: 'meta', is_active: true },
-      ],
-    });
+    mockGetAccounts.mockResolvedValue([
+      { account_id: 'acc-1', platform: 'linkedin', account_name: 'LinkedIn', config: { access_token: 'tok', token_expires_at: 0 } },
+      { account_id: 'acc-2', platform: 'meta', account_name: 'Meta', config: { access_token: 'tok2', token_expires_at: Date.now() + 999999 } },
+    ]);
     mockLoadPosts.mockResolvedValue({
       success: true,
       posts: [
@@ -475,9 +476,10 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    // Only acc-2 should be queried
-    expect(mockLoadPosts).toHaveBeenCalledTimes(1);
+    // Both accounts should be queried (no is_active filter)
+    expect(mockLoadPosts).toHaveBeenCalledTimes(2);
+    expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-1', { limit: 50, include_metrics: true });
     expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-2', { limit: 50, include_metrics: true });
-    expect(result.results.social_media.impressions).toBe(500);
+    expect(result.results.social_media.impressions).toBe(1000); // 500 * 2 accounts
   });
 });
