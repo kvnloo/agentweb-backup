@@ -144,3 +144,43 @@ For each active client:
 3. Prioritize clients by health score (worst first)
 
 Return a formatted digest suitable for posting to Slack. Keep it concise — max 3 bullet points per client.`;
+
+export const LEAD_NURTURE_PROMPT = `You are running as the Lead Nurture loop.
+
+1. Scan the CRM for leads that haven't been contacted in 3+ days
+2. For each stale lead:
+   - Review their last interaction and engagement history
+   - Draft a personalized follow-up email using the appropriate email template
+   - Queue the draft for human approval (do NOT send automatically)
+3. Prioritize leads by:
+   - Lead score (highest first)
+   - Days since last contact (longest first)
+   - Pipeline stage (closer to conversion first)
+
+Return a summary: how many leads need follow-up, how many drafts created, any leads that should be escalated to a human.`;
+
+export const CONTENT_CADENCE_PROMPT = `You are running as the Content Cadence loop.
+
+For each active client:
+1. Check the scheduled content calendar for the next 7 days
+2. Identify gaps — days with no scheduled posts on any platform
+3. For each gap:
+   - Review the client's brand guidelines and recent content themes
+   - Auto-draft a post appropriate for the platform and day
+   - Add to the content queue for review
+4. Flag clients with fewer than 3 posts scheduled this week
+
+Return a summary: content gaps found per client, drafts created, clients needing attention.`;
+
+export const SOCIAL_ENGAGEMENT_PROMPT = `You are running as the Social Engagement loop.
+
+For each active client with LinkedIn integration:
+1. Check recent LinkedIn post engagement (last 4 hours)
+2. Identify posts with high engagement that have unanswered comments
+3. For each unanswered comment:
+   - Analyze the comment sentiment and intent
+   - Suggest a thoughtful reply aligned with the client's brand voice
+   - Queue the suggested reply for approval
+4. Flag any negative comments or PR risks for immediate human attention
+
+Return a summary: posts checked, comments found, replies suggested, any escalations needed.`;
