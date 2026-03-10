@@ -25,6 +25,22 @@ export interface Setting {
   updatedBy: string;
 }
 
+/**
+ * Patterns that identify user-scoped settings containing per-user data.
+ * These are filtered out of the admin GET /api/settings response to prevent
+ * cross-user data leakage.
+ */
+const USER_SCOPED_PATTERNS = [
+  /^email_templates_(?!public$)/,   // email_templates_{userId} but NOT email_templates_public
+  /^replay_sessions_/,               // replay_sessions_{trackingUserId}
+  /^user-.+-email_campaign_tasks$/,  // user-{userId}-email_campaign_tasks
+  /^funnels_/,                       // funnels_{userId}
+];
+
+export function isUserScopedSetting(settingName: string): boolean {
+  return USER_SCOPED_PATTERNS.some(pattern => pattern.test(settingName));
+}
+
 export class SettingsService {
   private tableName: string;
 
@@ -86,6 +102,15 @@ export class SettingsService {
       console.error('Error getting all settings:', error);
       throw error;
     }
+  }
+
+  /**
+   * Returns only global/system settings, filtering out user-scoped settings
+   * that contain per-user data (email templates, replay sessions, etc.)
+   */
+  async getGlobalSettings(): Promise<Setting[]> {
+    const allSettings = await this.getAllSettings();
+    return allSettings.filter(s => !isUserScopedSetting(s.settingName));
   }
 
   async deleteSetting(settingName: string): Promise<void> {

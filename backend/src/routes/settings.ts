@@ -88,10 +88,10 @@ const extractVariables = (htmlContent: string, subject?: string): { variables: s
   return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
 };
 
-// Get all settings
+// Get settings (global only — filters out user-scoped settings to prevent cross-user data leakage)
 router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const settings = await settingsService.getAllSettings();
+    const settings = await settingsService.getGlobalSettings();
     res.json(settings);
   } catch (error) {
     console.error('Error getting settings:', error);
