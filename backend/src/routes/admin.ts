@@ -332,7 +332,7 @@ router.get("/users", async (req, res) => {
     const users = await userDb.getAllUsers();
     // Transform: replace encrypted secrets map with just key names for the frontend
     const sanitized = users.map((user: any) => {
-      const { secrets, ...rest } = user;
+      const { secrets, password, ...rest } = user;
       return {
         ...rest,
         secretNames: secrets ? Object.keys(secrets) : [],
@@ -374,8 +374,8 @@ router.get("/users/:userId", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Strip encrypted secret values, expose only key names
-    const { secrets, ...rest } = user as any;
+    // Strip encrypted secret values and password hash, expose only key names
+    const { secrets, password, ...rest } = user as any;
     res.json({
       ...rest,
       secretNames: secrets ? Object.keys(secrets) : [],

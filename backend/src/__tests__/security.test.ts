@@ -305,7 +305,7 @@ describe('Security Tests', () => {
       expect(res.json).toHaveBeenCalledWith({ message: 'Email and password are required' });
     });
 
-    it('FAIL: user not found → 404', async () => {
+    it('FAIL: user not found → 401 (same as wrong password to prevent enumeration)', async () => {
       const req: any = { body: { email: 'nobody@example.com', password: 'pass123' } };
       const res = createRes();
 
@@ -313,8 +313,8 @@ describe('Security Tests', () => {
 
       await login(req, res);
 
-      expect(res.status).toHaveBeenCalledWith(404);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'user_not_found' }));
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'invalid_credentials' }));
     });
 
     it('FAIL: account deactivated → 403', async () => {
