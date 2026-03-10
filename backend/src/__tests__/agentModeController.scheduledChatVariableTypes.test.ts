@@ -80,6 +80,7 @@ jest.mock('../services/skillService', () => ({
 
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn(),
+  isAllowedUploadType: jest.fn().mockReturnValue(true),
 }));
 
 import { chatbotDb } from '../services/chatbotService';

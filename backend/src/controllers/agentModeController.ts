@@ -6,7 +6,7 @@ import { scheduleDb, userDb, taskDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
 import crypto from 'crypto';
-import { uploadFileToS3 } from '../utils/s3Utils';
+import { uploadFileToS3, isAllowedUploadType } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
@@ -2480,6 +2480,11 @@ export const agentModeController = {
         return res.status(400).json({ error: 'No file uploaded' });
       }
 
+      // Validate file type to prevent stored XSS
+      if (!isAllowedUploadType(file.originalname, file.mimetype)) {
+        return res.status(400).json({ error: 'File type not allowed' });
+      }
+
       // Get the session to verify the conversable token
       const session = await chatbotDb.getChatSession(shareId);
       if (!session) {
@@ -2531,6 +2536,11 @@ export const agentModeController = {
 
       if (!file) {
         return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Validate file type to prevent stored XSS
+      if (!isAllowedUploadType(file.originalname, file.mimetype)) {
+        return res.status(400).json({ error: 'File type not allowed' });
       }
 
       // Upload to S3 using common utility
@@ -3304,6 +3314,11 @@ export const agentModeController = {
       const file = (req as any).file;
       if (!file) {
         return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Validate file type to prevent stored XSS
+      if (!isAllowedUploadType(file.originalname, file.mimetype)) {
+        return res.status(400).json({ error: 'File type not allowed' });
       }
 
       const uploadResult = await uploadFileToS3(

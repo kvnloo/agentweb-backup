@@ -8,6 +8,56 @@ const s3 = new AWS.S3({
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 });
 
+/**
+ * Allowed MIME types for file uploads. Blocks XSS vectors like text/html,
+ * application/javascript, image/svg+xml (can contain script tags), and executables.
+ */
+const ALLOWED_MIME_TYPES = new Set([
+  // Images (raster only — SVG excluded due to script injection risk)
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/tiff',
+  // Documents
+  'application/pdf', 'text/plain', 'text/csv', 'application/json',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation', // pptx
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
+  'application/vnd.ms-excel', // xls
+  'application/msword', // doc
+  // Video
+  'video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo', 'video/ogg',
+  // Audio
+  'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm',
+  // Archives
+  'application/zip', 'application/gzip',
+]);
+
+/**
+ * File extensions that are always blocked regardless of MIME type.
+ * These can execute code in browsers or on servers.
+ */
+const BLOCKED_EXTENSIONS = new Set([
+  'html', 'htm', 'xhtml', 'svg', 'xml',
+  'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx',
+  'php', 'asp', 'aspx', 'jsp', 'py', 'rb', 'pl', 'cgi',
+  'exe', 'bat', 'cmd', 'sh', 'ps1', 'vbs', 'wsf',
+  'dll', 'so', 'dylib',
+  'swf', 'jar', 'war',
+]);
+
+/**
+ * Validate if a file is safe to upload based on both MIME type and extension.
+ * Rejects known XSS vectors and executables.
+ */
+export function isAllowedUploadType(filename: string, mimeType: string): boolean {
+  // Check extension blocklist first (catches MIME spoofing)
+  const ext = (filename || '').split('.').pop()?.toLowerCase() || '';
+  if (BLOCKED_EXTENSIONS.has(ext)) {
+    return false;
+  }
+
+  // Check MIME type allowlist
+  return ALLOWED_MIME_TYPES.has(mimeType.toLowerCase());
+}
+
 export interface S3UploadResult {
   success: boolean;
   url?: string;
@@ -67,6 +117,7 @@ export async function uploadFileToS3(
       Key: key,
       Body: content,
       ContentType: contentType,
+      ContentDisposition: 'attachment', // Prevent inline rendering of potentially dangerous files
       Metadata: {
         'original-filename': asciiMetadataFilename,
         'uploaded-by': 'agent-mode',
@@ -142,6 +193,7 @@ export async function uploadFileToS3WithPath(
       Key: key,
       Body: content,
       ContentType: contentType,
+      ContentDisposition: 'attachment', // Prevent inline rendering of potentially dangerous files
       Metadata: {
         'original-filename': asciiMetadataFilename,
         'uploaded-by': 'agent-mode',

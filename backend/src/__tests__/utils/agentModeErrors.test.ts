@@ -160,5 +160,32 @@ describe('agentModeErrors utils', () => {
     it('should return false for context limit errors (not retryable)', () => {
       expect(isTransientLLMError(new Error('context length exceeded'))).toBe(false);
     });
+
+    it('should handle error with status: 0 (falsy but not nullish)', () => {
+      // 0 is not nullish for ??, so statusCode = 0, which is not in transient list
+      const error = { status: 0, message: 'some error' };
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should fallback to response.status when status is null and code is null', () => {
+      const error = { status: null, code: null, response: { status: 500 }, message: 'error' };
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should handle error with response object but no status inside', () => {
+      const error = { response: {}, message: 'some non-transient error' };
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should handle error with status: undefined explicitly', () => {
+      const error = { status: undefined, code: undefined, message: 'throttled' };
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should handle string statusCode (not a number)', () => {
+      const error = { status: '503', message: 'non-matching' };
+      // typeof '503' !== 'number', so statusCode check fails, falls to pattern matching
+      expect(isTransientLLMError(error)).toBe(false);
+    });
   });
 });
