@@ -2,6 +2,7 @@ import app from './app';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import { loopCoordinatorService } from './services/loopCoordinatorService';
+import { SprintWorkerExecutor } from './services/sprintWorkerExecutor';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import http from 'http';
@@ -229,6 +230,23 @@ createTestAccount().then(async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
+
+    // Register sprint worker loop if enabled via env var
+    if (process.env.ENABLE_SPRINT_WORKER === 'true') {
+      const sprintWorker = new SprintWorkerExecutor({
+        claudePath: process.env.CLAUDE_CLI_PATH || '/Users/harshmoney/.local/bin/claude',
+        repoPath: process.env.SPRINT_WORKER_REPO_PATH || process.cwd(),
+        timeoutMs: parseInt(process.env.SPRINT_WORKER_TIMEOUT_MS || '600000', 10),
+      });
+
+      loopCoordinatorService.registerLoop({
+        id: 'sprint-worker',
+        name: 'Sprint Worker',
+        intervalMs: parseInt(process.env.SPRINT_WORKER_INTERVAL_MS || '300000', 10),
+        executor: sprintWorker.createExecutor(),
+      });
+      console.log('Sprint Worker loop registered (not started — use POST /api/loops/start)');
+    }
 
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
