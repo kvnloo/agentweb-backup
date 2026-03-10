@@ -3,6 +3,7 @@ import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import { loopCoordinatorService } from './services/loopCoordinatorService';
 import { SprintWorkerExecutor } from './services/sprintWorkerExecutor';
+import { EmmaLoopExecutor, CAMPAIGN_WATCHDOG_PROMPT, CLIENT_HEALTH_DIGEST_PROMPT } from './services/emmaLoopExecutor';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import http from 'http';
@@ -246,6 +247,35 @@ createTestAccount().then(async () => {
         executor: sprintWorker.createExecutor(),
       });
       console.log('Sprint Worker loop registered (not started — use POST /api/loops/start)');
+    }
+
+    // Register Emma loops if enabled via env var
+    if (process.env.ENABLE_EMMA_LOOPS === 'true') {
+      const systemUserId = process.env.EMMA_LOOP_USER_ID || 'system';
+
+      const campaignWatchdog = new EmmaLoopExecutor({
+        systemUserId,
+        prompt: CAMPAIGN_WATCHDOG_PROMPT,
+      });
+      loopCoordinatorService.registerLoop({
+        id: 'campaign-watchdog',
+        name: 'Campaign Watchdog',
+        intervalMs: parseInt(process.env.CAMPAIGN_WATCHDOG_INTERVAL_MS || '10800000', 10), // 3 hours
+        executor: campaignWatchdog.createExecutor(),
+      });
+
+      const clientHealthDigest = new EmmaLoopExecutor({
+        systemUserId,
+        prompt: CLIENT_HEALTH_DIGEST_PROMPT,
+      });
+      loopCoordinatorService.registerLoop({
+        id: 'client-health-digest',
+        name: 'Client Health Digest',
+        intervalMs: parseInt(process.env.CLIENT_HEALTH_DIGEST_INTERVAL_MS || '86400000', 10), // 24 hours
+        executor: clientHealthDigest.createExecutor(),
+      });
+
+      console.log('Emma loops registered: Campaign Watchdog (3h), Client Health Digest (24h)');
     }
 
     // Initialize Agent Mode tools in background - don't block server startup
