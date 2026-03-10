@@ -310,13 +310,16 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
 
     // Organization accounts - use existing batch API
+    // LinkedIn Posts API returns urn:li:ugcPost:X but share statistics API expects urn:li:share:X
     const { token } = await this.getValidToken(account, userId);
     const authorUrn = account.account_id;
+    const shareUrns = postIds.map(id => id.replace('urn:li:ugcPost:', 'urn:li:share:'));
+    const shareToPostId = new Map(postIds.map((id, i) => [shareUrns[i], id]));
 
     try {
-      const stats = await linkedInService.getShareStatistics(token, authorUrn, postIds);
+      const stats = await linkedInService.getShareStatistics(token, authorUrn, shareUrns);
       return stats.map(s => ({
-        share: s.share || '',
+        share: (s.share && shareToPostId.get(s.share)) || s.share || '',
         likes: s.totalShareStatistics.likeCount,
         comments: s.totalShareStatistics.commentCount,
         shares: s.totalShareStatistics.shareCount,
@@ -488,10 +491,13 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
 
     // Organization accounts: use batch share statistics API
+    // Convert ugcPost URNs to share URNs (LinkedIn stats API expects share URNs)
+    const shareUrns = postIds.map(id => id.replace('urn:li:ugcPost:', 'urn:li:share:'));
+    const shareToPostId = new Map(postIds.map((id, i) => [shareUrns[i], id]));
     try {
-      const stats = await linkedInService.getShareStatistics(token, account.account_id, postIds);
+      const stats = await linkedInService.getShareStatistics(token, account.account_id, shareUrns);
       return stats.map(s => ({
-        postId: s.share || '',
+        postId: (s.share && shareToPostId.get(s.share)) || s.share || '',
         likes: s.totalShareStatistics.likeCount || 0,
         comments: s.totalShareStatistics.commentCount || 0,
         shares: s.totalShareStatistics.shareCount || 0,
