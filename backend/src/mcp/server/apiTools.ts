@@ -52,15 +52,23 @@ mcpToolRegistry.register({
       properties: {
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
-        llm_model: { type: 'string', description: 'LLM model to use (optional)' }
+        llm_model: { type: 'string', description: 'LLM model to use (optional)' },
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
     }
   },
   execute: async (args: any, context: any) => {
+    const body: any = { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model };
+    if (args.media_urls && args.media_urls.length > 0) {
+      body.attachments = args.media_urls.map((url: string) => {
+        const filename = url.split('/').pop()?.split('?')[0] || 'image';
+        return { url, filename };
+      });
+    }
     const data = await mcpFetch({
       method: 'POST', path: '/api/agent-mode/generate', context: ctx(context),
-      body: { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model }
+      body
     });
     return jsonResult(data);
   }
