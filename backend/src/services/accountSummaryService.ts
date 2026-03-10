@@ -224,7 +224,13 @@ async function getSocialMediaMetrics(
         for (const postResult of postResults) {
           if (!postResult?.success || !postResult.posts) continue;
           for (const post of postResult.posts) {
-            if (!post.createdAt || new Date(post.createdAt) < startDate) continue;
+            // LinkedIn adapter returns created.time (epoch ms), not createdAt
+            const postDate = post.createdAt
+              ? new Date(post.createdAt)
+              : post.created?.time
+                ? new Date(post.created.time)
+                : null;
+            if (!postDate || postDate < startDate) continue;
             if (!post.metrics) continue;
             impressions += post.metrics.impressionCount ?? 0;
             engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
