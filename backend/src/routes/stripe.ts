@@ -453,24 +453,21 @@ router.post(
       const subscription = subscriptions.data[0];
 
       // Cancel at period end (graceful cancellation)
-      const updated = await stripe.subscriptions.update(subscription.id, {
+      const updated: Stripe.Subscription = await stripe.subscriptions.update(subscription.id, {
         cancel_at_period_end: true,
       });
 
       // Update user record
+      const periodEnd = new Date(updated.current_period_end * 1000).toISOString();
       await userDb.updateUser(userId, {
         subscription_status: "canceling",
-        current_period_end: new Date(
-          updated.current_period_end * 1000
-        ).toISOString(),
+        current_period_end: periodEnd,
       });
 
       res.json({
         message: "Subscription will be canceled at the end of the billing period.",
         cancel_at_period_end: updated.cancel_at_period_end,
-        current_period_end: new Date(
-          updated.current_period_end * 1000
-        ).toISOString(),
+        current_period_end: periodEnd,
       });
     } catch (error: any) {
       console.error("Error canceling subscription:", error.message);
@@ -531,24 +528,21 @@ router.post(
       }
 
       // Reactivate by removing the cancel_at_period_end flag
-      const updated = await stripe.subscriptions.update(subscription.id, {
+      const updated: Stripe.Subscription = await stripe.subscriptions.update(subscription.id, {
         cancel_at_period_end: false,
       });
 
       // Update user record
+      const periodEnd = new Date(updated.current_period_end * 1000).toISOString();
       await userDb.updateUser(userId, {
         subscription_status: "active",
-        current_period_end: new Date(
-          updated.current_period_end * 1000
-        ).toISOString(),
+        current_period_end: periodEnd,
       });
 
       res.json({
         message: "Subscription reactivated successfully.",
         cancel_at_period_end: updated.cancel_at_period_end,
-        current_period_end: new Date(
-          updated.current_period_end * 1000
-        ).toISOString(),
+        current_period_end: periodEnd,
       });
     } catch (error: any) {
       console.error("Error reactivating subscription:", error.message);
@@ -590,7 +584,7 @@ router.post("/webhook", async (req: Request, res: Response) => {
     switch (event.type) {
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
-        const subscription = event.data.object;
+        const subscription = event.data.object as Stripe.Subscription;
         const stripeCustomerId =
           typeof subscription.customer === "string"
             ? subscription.customer
