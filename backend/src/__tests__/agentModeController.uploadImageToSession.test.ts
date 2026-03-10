@@ -13,6 +13,7 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn(),
+  isAllowedUploadType: jest.fn().mockReturnValue(true),
 }));
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
