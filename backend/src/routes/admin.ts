@@ -434,6 +434,36 @@ router.put("/users/:userId/support-note", async (req, res) => {
   }
 });
 
+// Update user Stripe Customer ID
+router.put("/users/:userId/stripe-customer-id", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { stripeCustomerId } = req.body;
+
+    if (stripeCustomerId === undefined || stripeCustomerId === null) {
+      return res.status(400).json({ message: "stripeCustomerId is required" });
+    }
+
+    // Allow empty string to clear, but validate format if non-empty
+    if (stripeCustomerId !== "" && !stripeCustomerId.startsWith("cus_")) {
+      return res.status(400).json({ message: 'Invalid Stripe Customer ID format. Must start with "cus_"' });
+    }
+
+    // Check if user exists
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the user's Stripe Customer ID
+    const updatedUser = await userDb.updateUser(userId, { stripe_customer_id: stripeCustomerId });
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error updating Stripe Customer ID:", error);
+    res.status(500).json({ message: "Error updating Stripe Customer ID" });
+  }
+});
+
 // Update user ad account
 router.put("/users/:userId/ad-account", async (req, res) => {
   try {
