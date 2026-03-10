@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-10',
     changes: [
+      'Feature: SEO & Website Analytics in Agent Mode',
+      '- Ask Emma "how are my SEO metrics?" to get Google Search Console data — clicks, impressions, CTR, average position, top queries, top pages, and daily trends',
+      '- Ask Emma "show me my website analytics" to get GA4 data — sessions, users, page views, bounce rate, traffic sources, top pages by engagement',
+      '- Both tools support timeframe selection: 7d, 14d, 30d, or 90d',
+      '- Technical SEO score (PageSpeed) included with search console metrics',
       'Feature: CRM Group Email (Newsletter)',
       '- Send a single email to all leads in a CRM lead list — ideal for newsletters and announcements',
       '- Compose with Text, HTML, or load content from a URL; preview renders in a live email preview pane',
