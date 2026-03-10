@@ -200,9 +200,11 @@ async function getSocialMediaMetrics(
   try {
     // Get post count from stored posts (reliable, doesn't depend on token validity)
     const storedPosts = await getPostsByUserId(userId);
+    console.log(`[accountSummary] storedPosts: ${storedPosts.length} total`);
     const postsInRange = storedPosts.filter(
       (p) => p.createdAt && new Date(p.createdAt) >= startDate
     );
+    console.log(`[accountSummary] postsInRange: ${postsInRange.length} (startDate: ${startDate.toISOString()})`);
 
     // Try to get live metrics from connected accounts (best-effort)
     // Uses getAccountsByUserId directly to skip expensive isTokenValid API check
@@ -213,16 +215,22 @@ async function getSocialMediaMetrics(
 
     try {
       const accounts = await getAccountsByUserId(userId);
+      console.log(`[accountSummary] connected accounts: ${accounts.length}`, accounts.map(a => ({ id: a.account_id, platform: a.platform })));
       if (accounts.length > 0) {
         const postResults = await Promise.all(
           accounts.map((acc) =>
             agentModeService.loadConnectedAccountPosts(userId, acc.account_id, { limit: 50, include_metrics: true })
-              .catch(() => null)
+              .catch((err) => { console.error(`[accountSummary] loadPosts failed for ${acc.account_id}:`, err?.message); return null; })
           )
         );
 
-        for (const postResult of postResults) {
-          if (!postResult?.success || !postResult.posts) continue;
+        for (let i = 0; i < postResults.length; i++) {
+          const postResult = postResults[i];
+          if (!postResult?.success || !postResult.posts) {
+            console.log(`[accountSummary] account[${i}] no posts or failed:`, postResult?.success, postResult?.message);
+            continue;
+          }
+          console.log(`[accountSummary] account[${i}] returned ${postResult.posts.length} posts`);
           for (const post of postResult.posts) {
             // LinkedIn adapter returns created.time (epoch ms), not createdAt
             const postDate = post.createdAt
@@ -230,6 +238,14 @@ async function getSocialMediaMetrics(
               : post.created?.time
                 ? new Date(post.created.time)
                 : null;
+            const hasMetrics = !!post.metrics;
+            const inRange = postDate && postDate >= startDate;
+            if (!inRange || !hasMetrics) {
+              if (postResult.posts.indexOf(post) === 0) {
+                // Log first post's structure for debugging
+                console.log(`[accountSummary] sample post keys:`, Object.keys(post), `createdAt: ${post.createdAt}, created:`, post.created, `metrics:`, post.metrics ? 'present' : 'null');
+              }
+            }
             if (!postDate || postDate < startDate) continue;
             if (!post.metrics) continue;
             impressions += post.metrics.impressionCount ?? 0;
@@ -242,6 +258,7 @@ async function getSocialMediaMetrics(
       console.error('accountSummary: Error fetching live social media metrics (continuing with stored posts):', liveError);
     }
 
+    console.log(`[accountSummary] final social metrics: posts_published=${postsInRange.length}, impressions=${impressions}, engagements=${engagements}, clicks=${clicks}`);
     return { posts_published: postsInRange.length, impressions, engagements, clicks };
   } catch (error) {
     console.error('accountSummary: Error fetching social media metrics:', error);
