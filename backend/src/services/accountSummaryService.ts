@@ -22,6 +22,11 @@ const REPORT_TOOLS = new Set([
   'perform_deep_research',
 ]);
 
+const PUBLISH_TOOLS = new Set([
+  'publish_blog_article',
+  'post_on_connected_account',
+]);
+
 export interface AccountSummary {
   period: string;
   sessions: number;
@@ -92,6 +97,9 @@ export async function getAccountSummary(
         }
         if (REPORT_TOOLS.has(toolName)) {
           reports += c;
+        }
+        if (PUBLISH_TOOLS.has(toolName)) {
+          publishedCount += c;
         }
       }
     }
