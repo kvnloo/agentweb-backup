@@ -3,7 +3,7 @@ import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
 import { loopCoordinatorService } from './services/loopCoordinatorService';
 import { SprintWorkerExecutor } from './services/sprintWorkerExecutor';
-import { EmmaLoopExecutor, CAMPAIGN_WATCHDOG_PROMPT, CLIENT_HEALTH_DIGEST_PROMPT } from './services/emmaLoopExecutor';
+import { EmmaLoopExecutor, CAMPAIGN_WATCHDOG_PROMPT, CLIENT_HEALTH_DIGEST_PROMPT, LEAD_NURTURE_PROMPT, CONTENT_CADENCE_PROMPT, SOCIAL_ENGAGEMENT_PROMPT } from './services/emmaLoopExecutor';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import http from 'http';
@@ -275,7 +275,40 @@ createTestAccount().then(async () => {
         executor: clientHealthDigest.createExecutor(),
       });
 
-      console.log('Emma loops registered: Campaign Watchdog (3h), Client Health Digest (24h)');
+      const leadNurture = new EmmaLoopExecutor({
+        systemUserId,
+        prompt: LEAD_NURTURE_PROMPT,
+      });
+      loopCoordinatorService.registerLoop({
+        id: 'lead-nurture',
+        name: 'Lead Nurture',
+        intervalMs: parseInt(process.env.LEAD_NURTURE_INTERVAL_MS || '86400000', 10), // 24 hours
+        executor: leadNurture.createExecutor(),
+      });
+
+      const contentCadence = new EmmaLoopExecutor({
+        systemUserId,
+        prompt: CONTENT_CADENCE_PROMPT,
+      });
+      loopCoordinatorService.registerLoop({
+        id: 'content-cadence',
+        name: 'Content Cadence',
+        intervalMs: parseInt(process.env.CONTENT_CADENCE_INTERVAL_MS || '86400000', 10), // 24 hours
+        executor: contentCadence.createExecutor(),
+      });
+
+      const socialEngagement = new EmmaLoopExecutor({
+        systemUserId,
+        prompt: SOCIAL_ENGAGEMENT_PROMPT,
+      });
+      loopCoordinatorService.registerLoop({
+        id: 'social-engagement',
+        name: 'Social Engagement',
+        intervalMs: parseInt(process.env.SOCIAL_ENGAGEMENT_INTERVAL_MS || '14400000', 10), // 4 hours
+        executor: socialEngagement.createExecutor(),
+      });
+
+      console.log('Emma loops registered: Campaign Watchdog (3h), Client Health Digest (24h), Lead Nurture (24h), Content Cadence (24h), Social Engagement (4h)');
     }
 
     // Initialize Agent Mode tools in background - don't block server startup

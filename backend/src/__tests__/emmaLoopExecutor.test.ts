@@ -1,4 +1,8 @@
-import { EmmaLoopExecutor, EmmaLoopConfig } from '../services/emmaLoopExecutor';
+import {
+  EmmaLoopExecutor, EmmaLoopConfig,
+  LEAD_NURTURE_PROMPT, CONTENT_CADENCE_PROMPT, SOCIAL_ENGAGEMENT_PROMPT,
+  CAMPAIGN_WATCHDOG_PROMPT, CLIENT_HEALTH_DIGEST_PROMPT,
+} from '../services/emmaLoopExecutor';
 
 // Mock the fetch function globally
 const mockFetch = jest.fn();
@@ -140,5 +144,88 @@ describe('EmmaLoopExecutor', () => {
 
     expect(result.status).toBe('completed');
     expect(result.summary!.length).toBeLessThanOrEqual(2000);
+  });
+
+  // Phase 5: Prompt constants are defined and non-empty
+  describe('Loop prompt constants', () => {
+    it('should export all 5 loop prompt constants', () => {
+      expect(CAMPAIGN_WATCHDOG_PROMPT).toBeDefined();
+      expect(CLIENT_HEALTH_DIGEST_PROMPT).toBeDefined();
+      expect(LEAD_NURTURE_PROMPT).toBeDefined();
+      expect(CONTENT_CADENCE_PROMPT).toBeDefined();
+      expect(SOCIAL_ENGAGEMENT_PROMPT).toBeDefined();
+
+      // Each should be a non-trivial prompt string
+      expect(LEAD_NURTURE_PROMPT.length).toBeGreaterThan(100);
+      expect(CONTENT_CADENCE_PROMPT.length).toBeGreaterThan(100);
+      expect(SOCIAL_ENGAGEMENT_PROMPT.length).toBeGreaterThan(100);
+    });
+
+    it('should send the correct prompt to Emma for lead nurture loop', async () => {
+      const leadNurtureExecutor = new EmmaLoopExecutor({
+        ...defaultConfig,
+        prompt: LEAD_NURTURE_PROMPT,
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ sessionId: 'lead-session' }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ response: '5 leads need follow-up, 3 drafts created' }),
+      });
+
+      const result = await leadNurtureExecutor.executeTick();
+      expect(result.status).toBe('completed');
+      expect(result.summary).toContain('leads need follow-up');
+
+      const body = JSON.parse(mockFetch.mock.calls[1][1].body);
+      expect(body.userMessage).toContain('Lead Nurture');
+    });
+
+    it('should send the correct prompt to Emma for content cadence loop', async () => {
+      const contentExecutor = new EmmaLoopExecutor({
+        ...defaultConfig,
+        prompt: CONTENT_CADENCE_PROMPT,
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ sessionId: 'content-session' }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ response: 'Content gaps found for 2 clients' }),
+      });
+
+      const result = await contentExecutor.executeTick();
+      expect(result.status).toBe('completed');
+
+      const body = JSON.parse(mockFetch.mock.calls[1][1].body);
+      expect(body.userMessage).toContain('Content Cadence');
+    });
+
+    it('should send the correct prompt to Emma for social engagement loop', async () => {
+      const socialExecutor = new EmmaLoopExecutor({
+        ...defaultConfig,
+        prompt: SOCIAL_ENGAGEMENT_PROMPT,
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ sessionId: 'social-session' }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true, status: 200,
+        json: async () => ({ response: '3 posts checked, 2 replies suggested' }),
+      });
+
+      const result = await socialExecutor.executeTick();
+      expect(result.status).toBe('completed');
+
+      const body = JSON.parse(mockFetch.mock.calls[1][1].body);
+      expect(body.userMessage).toContain('Social Engagement');
+    });
   });
 });
