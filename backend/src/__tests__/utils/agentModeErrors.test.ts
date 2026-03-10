@@ -178,12 +178,12 @@ describe('agentModeErrors utils', () => {
     });
 
     it('should handle error with status: undefined explicitly', () => {
-      const error = { status: undefined, code: undefined, message: 'throttled' };
+      const error = Object.assign(new Error('throttled'), { status: undefined, code: undefined });
       expect(isTransientLLMError(error)).toBe(true);
     });
 
     it('should handle string statusCode (not a number)', () => {
-      const error = { status: '503', message: 'non-matching' };
+      const error = Object.assign(new Error('non-matching'), { status: '503' });
       // typeof '503' !== 'number', so statusCode check fails, falls to pattern matching
       expect(isTransientLLMError(error)).toBe(false);
     });
