@@ -4031,3 +4031,56 @@ emmaToolRegistry.register({
     return await getAccountSummary(userId, timeRange);
   }
 });
+
+// --- SEO & Analytics Tools ---
+emmaToolRegistry.register({
+  name: 'get_seo_metrics',
+  definition: {
+    name: 'get_seo_metrics',
+    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). User must have SEO domains configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for metrics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchSearchConsoleMetrics } = await import('../services/seoService');
+    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_website_analytics',
+  definition: {
+    name: 'get_website_analytics',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. User must have a Google Analytics Property ID configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for analytics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
+    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
+  }
+});
