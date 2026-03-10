@@ -45,6 +45,7 @@ import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import landingPagesRoutes from "./routes/landingPages";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
+import clientHealthRoutes from "./routes/clientHealth";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -195,6 +196,7 @@ app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
+app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
