@@ -77,6 +77,28 @@ describe('Settings value redaction — API key protection', () => {
     expect(original[0].settingValue).toBe(originalValue);
   });
 
+  it('should handle JSON with null values inside objects', () => {
+    const settings = [
+      { settingName: 'config', settingValue: '{"api_key": null, "name": "test"}', description: '', updatedAt: '', updatedBy: '' },
+    ];
+    const result = redactSensitiveValues(settings);
+    const parsed = JSON.parse(result[0].settingValue);
+    // null api_key should not be redacted (it's null, not a string)
+    expect(parsed.api_key).toBeNull();
+    expect(parsed.name).toBe('test');
+  });
+
+  it('should handle JSON with nested null and primitive values', () => {
+    const settings = [
+      { settingName: 'data', settingValue: '{"count": 42, "flag": true, "empty": null}', description: '', updatedAt: '', updatedBy: '' },
+    ];
+    const result = redactSensitiveValues(settings);
+    const parsed = JSON.parse(result[0].settingValue);
+    expect(parsed.count).toBe(42);
+    expect(parsed.flag).toBe(true);
+    expect(parsed.empty).toBeNull();
+  });
+
   it('should handle invalid JSON that starts with { or [ gracefully', () => {
     const settings = [
       { settingName: 'broken_json', settingValue: '{not valid json', description: '', updatedAt: '', updatedBy: '' },
