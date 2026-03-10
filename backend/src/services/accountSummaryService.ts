@@ -200,65 +200,45 @@ async function getSocialMediaMetrics(
   try {
     // Get post count from stored posts (reliable, doesn't depend on token validity)
     const storedPosts = await getPostsByUserId(userId);
-    console.log(`[accountSummary] storedPosts: ${storedPosts.length} total`);
     const postsInRange = storedPosts.filter(
       (p) => p.createdAt && new Date(p.createdAt) >= startDate
     );
-    console.log(`[accountSummary] postsInRange: ${postsInRange.length} (startDate: ${startDate.toISOString()})`);
 
-    // Try to get live metrics from connected accounts (best-effort)
-    // Uses getAccountsByUserId directly to skip expensive isTokenValid API check
-    // that would mark accounts as inactive even when the adapter can still fetch metrics
+    // Get account-level metrics directly via adapter (same as load_connected_account_metrics tool)
+    // This is more reliable than loadConnectedAccountPosts which has metric merging issues
+    // for org accounts where share URN format doesn't match post ID
     let impressions = 0;
     let engagements = 0;
     let clicks = 0;
 
     try {
       const accounts = await getAccountsByUserId(userId);
-      console.log(`[accountSummary] connected accounts: ${accounts.length}`, accounts.map(a => ({ id: a.account_id, platform: a.platform })));
       if (accounts.length > 0) {
-        const postResults = await Promise.all(
+        const metricsResults = await Promise.all(
           accounts.map((acc) =>
-            agentModeService.loadConnectedAccountPosts(userId, acc.account_id, { limit: 50, include_metrics: true })
-              .catch((err) => { console.error(`[accountSummary] loadPosts failed for ${acc.account_id}:`, err?.message); return null; })
+            agentModeService.loadConnectedAccountMetrics(userId, acc.account_id)
+              .catch(() => null)
           )
         );
 
-        for (let i = 0; i < postResults.length; i++) {
-          const postResult = postResults[i];
-          if (!postResult?.success || !postResult.posts) {
-            console.log(`[accountSummary] account[${i}] no posts or failed:`, postResult?.success, postResult?.message);
-            continue;
-          }
-          console.log(`[accountSummary] account[${i}] returned ${postResult.posts.length} posts`);
-          for (const post of postResult.posts) {
-            // LinkedIn adapter returns created.time (epoch ms), not createdAt
-            const postDate = post.createdAt
-              ? new Date(post.createdAt)
-              : post.created?.time
-                ? new Date(post.created.time)
-                : null;
-            const hasMetrics = !!post.metrics;
-            const inRange = postDate && postDate >= startDate;
-            if (!inRange || !hasMetrics) {
-              if (postResult.posts.indexOf(post) === 0) {
-                // Log first post's structure for debugging
-                console.log(`[accountSummary] sample post keys:`, Object.keys(post), `createdAt: ${post.createdAt}, created:`, post.created, `metrics:`, post.metrics ? 'present' : 'null');
-              }
+        for (const result of metricsResults) {
+          if (!result?.success || !result.metrics) continue;
+          const stats = result.metrics.shareStatistics;
+          if (stats && Array.isArray(stats)) {
+            for (const s of stats) {
+              const t = s.totalShareStatistics;
+              if (!t) continue;
+              impressions += t.impressionCount ?? 0;
+              engagements += (t.likeCount ?? 0) + (t.commentCount ?? 0) + (t.shareCount ?? 0);
+              clicks += t.clickCount ?? 0;
             }
-            if (!postDate || postDate < startDate) continue;
-            if (!post.metrics) continue;
-            impressions += post.metrics.impressionCount ?? 0;
-            engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
-            clicks += post.metrics.clickCount ?? 0;
           }
         }
       }
     } catch (liveError) {
-      console.error('accountSummary: Error fetching live social media metrics (continuing with stored posts):', liveError);
+      console.error('accountSummary: Error fetching social media metrics (continuing with stored posts):', liveError);
     }
 
-    console.log(`[accountSummary] final social metrics: posts_published=${postsInRange.length}, impressions=${impressions}, engagements=${engagements}, clicks=${clicks}`);
     return { posts_published: postsInRange.length, impressions, engagements, clicks };
   } catch (error) {
     console.error('accountSummary: Error fetching social media metrics:', error);
