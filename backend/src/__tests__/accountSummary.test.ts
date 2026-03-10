@@ -63,7 +63,7 @@ jest.mock('../services/db', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    loadConnectedAccountMetrics: jest.fn().mockResolvedValue({ success: true, metrics: {} }),
+    loadConnectedAccountPosts: jest.fn().mockResolvedValue({ success: true, posts: [] }),
   },
 }));
 
@@ -80,7 +80,7 @@ const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
 const mockGetLeads = crmDb.getLeadsByListId as jest.Mock;
 const mockGetEmailEvents = emailEventsDb.getEventsByEmailDomain as jest.Mock;
-const mockLoadMetrics = agentModeService.loadConnectedAccountMetrics as jest.Mock;
+const mockLoadPosts = agentModeService.loadConnectedAccountPosts as jest.Mock;
 const mockGetStoredPosts = getPostsByUserId as jest.Mock;
 const mockGetAccounts = getAccountsByUserId as jest.Mock;
 
@@ -104,7 +104,7 @@ describe('getAccountSummary', () => {
     mockGetLeads.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false });
     mockGetEmailEvents.mockResolvedValue([]);
     mockGetAccounts.mockResolvedValue([]);
-    mockLoadMetrics.mockResolvedValue({ success: true, metrics: {} });
+    mockLoadPosts.mockResolvedValue({ success: true, posts: [] });
     mockGetStoredPosts.mockResolvedValue([]);
   });
 
@@ -390,7 +390,7 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.posts_published).toBe(2);
   });
 
-  test('aggregates social media metrics from account-level metrics (shareStatistics)', async () => {
+  test('aggregates per-post metrics filtered by time range', async () => {
     mockGetSessions.mockResolvedValue([]);
     mockGetStoredPosts.mockResolvedValue([
       { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post 1', createdAt: '2026-03-08T10:00:00.000Z' },
@@ -399,29 +399,62 @@ describe('getAccountSummary', () => {
     mockGetAccounts.mockResolvedValue([
       { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: Date.now() + 999999 } },
     ]);
-    mockLoadMetrics.mockResolvedValue({
+    mockLoadPosts.mockResolvedValue({
       success: true,
-      metrics: {
-        shareStatistics: [
-          {
-            totalShareStatistics: {
-              impressionCount: 2000,
-              likeCount: 65,
-              commentCount: 17,
-              shareCount: 11,
-              clickCount: 129,
-            },
-          },
-        ],
-      },
+      posts: [
+        {
+          id: 'post-1',
+          createdAt: '2026-03-08T10:00:00.000Z',
+          metrics: { impressionCount: 1200, likeCount: 45, commentCount: 12, shareCount: 8, clickCount: 89 },
+        },
+        {
+          id: 'post-2',
+          createdAt: '2026-03-07T10:00:00.000Z',
+          metrics: { impressionCount: 800, likeCount: 20, commentCount: 5, shareCount: 3, clickCount: 40 },
+        },
+        {
+          id: 'post-3',
+          createdAt: '2026-01-01T10:00:00.000Z', // outside range
+          metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 10 },
+        },
+      ],
     });
 
     const result = await getAccountSummary('user-1', '7d');
 
     expect(result.results.social_media.posts_published).toBe(2);
-    expect(result.results.social_media.impressions).toBe(2000);
-    expect(result.results.social_media.engagements).toBe(93); // 65+17+11
-    expect(result.results.social_media.clicks).toBe(129);
+    expect(result.results.social_media.impressions).toBe(2000); // 1200 + 800
+    expect(result.results.social_media.engagements).toBe(93); // (45+12+8) + (20+5+3)
+    expect(result.results.social_media.clicks).toBe(129); // 89 + 40
+  });
+
+  test('handles LinkedIn created.time format for time filtering', async () => {
+    mockGetSessions.mockResolvedValue([]);
+    mockGetStoredPosts.mockResolvedValue([]);
+    mockGetAccounts.mockResolvedValue([
+      { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: Date.now() + 999999 } },
+    ]);
+    mockLoadPosts.mockResolvedValue({
+      success: true,
+      posts: [
+        {
+          id: 'post-1',
+          created: { time: new Date('2026-03-08T10:00:00.000Z').getTime() },
+          metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 5 },
+        },
+        {
+          id: 'post-2',
+          created: { time: new Date('2026-01-01T10:00:00.000Z').getTime() }, // outside range
+          metrics: { impressionCount: 300, likeCount: 5, commentCount: 1, shareCount: 0, clickCount: 2 },
+        },
+      ],
+    });
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.results.social_media.impressions).toBe(500);
+    expect(result.results.social_media.engagements).toBe(13); // 10+2+1
+    expect(result.results.social_media.clicks).toBe(5);
   });
 
   test('returns posts_published even when live API fails per account', async () => {
@@ -432,7 +465,7 @@ describe('getAccountSummary', () => {
     mockGetAccounts.mockResolvedValue([
       { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: 0 } },
     ]);
-    mockLoadMetrics.mockRejectedValue(new Error('Token expired'));
+    mockLoadPosts.mockRejectedValue(new Error('Token expired'));
 
     const result = await getAccountSummary('user-1', '7d');
 
@@ -459,29 +492,23 @@ describe('getAccountSummary', () => {
       { account_id: 'acc-1', platform: 'linkedin', account_name: 'LinkedIn', config: { access_token: 'tok', token_expires_at: 0 } },
       { account_id: 'acc-2', platform: 'meta', account_name: 'Meta', config: { access_token: 'tok2', token_expires_at: Date.now() + 999999 } },
     ]);
-    mockLoadMetrics.mockResolvedValue({
+    mockLoadPosts.mockResolvedValue({
       success: true,
-      metrics: {
-        shareStatistics: [
-          {
-            totalShareStatistics: {
-              impressionCount: 500,
-              likeCount: 10,
-              commentCount: 2,
-              shareCount: 1,
-              clickCount: 5,
-            },
-          },
-        ],
-      },
+      posts: [
+        {
+          id: 'post-1',
+          createdAt: '2026-03-08T10:00:00.000Z',
+          metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 5 },
+        },
+      ],
     });
 
     const result = await getAccountSummary('user-1', '7d');
 
     // Both accounts should be queried (no is_active filter)
-    expect(mockLoadMetrics).toHaveBeenCalledTimes(2);
-    expect(mockLoadMetrics).toHaveBeenCalledWith('user-1', 'acc-1');
-    expect(mockLoadMetrics).toHaveBeenCalledWith('user-1', 'acc-2');
+    expect(mockLoadPosts).toHaveBeenCalledTimes(2);
+    expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-1', { limit: 50, include_metrics: true });
+    expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-2', { limit: 50, include_metrics: true });
     expect(result.results.social_media.impressions).toBe(1000); // 500 * 2 accounts
   });
 });
