@@ -1,11 +1,10 @@
-import express, { Response } from 'express';
-import { AuthenticatedRequest } from '../middleware/auth';
+import express from 'express';
 import { getLeadMagnetConfigDb } from '../services/leadMagnetConfigDb';
 
 const router = express.Router();
 
 // POST /api/admin/lead-magnets — create config
-router.post('/', async (req: AuthenticatedRequest, res: Response) => {
+router.post('/', async (req, res) => {
   try {
     const { name, inputSchema, taskTemplateId, resultGate, ctaText, landingPageSlug, enabled } = req.body;
     if (!name || !taskTemplateId) {
@@ -30,7 +29,7 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // GET /api/admin/lead-magnets — list all configs
-router.get('/', async (_req: AuthenticatedRequest, res: Response) => {
+router.get('/', async (_req, res) => {
   try {
     const configs = await getLeadMagnetConfigDb().listAll();
     res.json(configs);
@@ -40,7 +39,7 @@ router.get('/', async (_req: AuthenticatedRequest, res: Response) => {
 });
 
 // GET /api/admin/lead-magnets/:id — get config by ID
-router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
+router.get('/:id', async (req, res) => {
   try {
     const config = await getLeadMagnetConfigDb().getById(req.params.id);
     if (!config) {
@@ -54,7 +53,7 @@ router.get('/:id', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // PUT /api/admin/lead-magnets/:id — update config
-router.put('/:id', async (req: AuthenticatedRequest, res: Response) => {
+router.put('/:id', async (req, res) => {
   try {
     const config = await getLeadMagnetConfigDb().update(req.params.id, req.body);
     res.json(config);
@@ -68,7 +67,7 @@ router.put('/:id', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 // DELETE /api/admin/lead-magnets/:id — delete config
-router.delete('/:id', async (req: AuthenticatedRequest, res: Response) => {
+router.delete('/:id', async (req, res) => {
   try {
     await getLeadMagnetConfigDb().deleteById(req.params.id);
     res.json({ deleted: true });
