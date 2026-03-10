@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-09',
     changes: [
+      'Feature: Account Summary Tool',
+      '- Ask Emma "show me my account summary" to get a high-level overview of your account activity',
+      '- Shows sessions, assets generated (images, videos, reports, social posts), published content, leads added, email performance, and social media metrics',
+      '- Supports time ranges: 1 day, 7 days (default), 30 days, or 90 days',
       'Feature: Long-Term Memory for Emma',
       '- Emma now remembers important facts about your account across sessions (preferences, history, insights, workflow patterns)',
       '- At the start of each session, Emma loads your recent memories for context-aware conversations',
