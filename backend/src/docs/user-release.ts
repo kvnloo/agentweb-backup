@@ -7,8 +7,32 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-10',
+    changes: [
+      'Feature: CRM Group Email (Newsletter)',
+      '- Send a single email to all leads in a CRM lead list — ideal for newsletters and announcements',
+      '- Compose with Text, HTML, or load content from a URL; preview renders in a live email preview pane',
+      '- Variable substitution: use {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{title}}, or {{customFields.xxx}} for personalization',
+      '- "Prepare for sending" validates variable coverage across leads before sending, showing which leads are ready and which are missing data',
+      '- Only leads with all required variable values receive the email; others are skipped automatically',
+      '- Real-time progress bar via WebSocket while emails are sending',
+      '- Send test emails to specific addresses before sending to the full list',
+      '- Customizable unsubscribe footer with {{unsubscribeUrl}} placeholder appended to every email',
+      '- Public unsubscribe page lets recipients opt out with optional feedback; resubscribe option available',
+      '- Unsubscribed leads are marked with an icon in the lead list and can be manually resubscribed from the edit dialog',
+    ],
+  },
+  {
     date: '2026-03-09',
     changes: [
+      'Feature: Account Summary Tool',
+      '- Ask Emma "show me my account summary" to get a high-level overview of your account activity',
+      '- Shows sessions, assets generated (images, videos, reports, social posts), published content, leads added, email performance, and social media metrics',
+      '- Supports time ranges: 1 day, 7 days (default), 30 days, or 90 days',
+      'Fix: Account Summary — Published count and social media metrics',
+      '- Published count now correctly counts from tool calls (publish_blog_article, post_on_connected_account) in addition to publish statuses',
+      '- Social media posts_published count now comes from stored posts in the database (reliable even when tokens are expired)',
+      '- Social media metrics (impressions, engagements, clicks) no longer blocked by token validity checks on connected accounts',
       'Feature: Long-Term Memory for Emma',
       '- Emma now remembers important facts about your account across sessions (preferences, history, insights, workflow patterns)',
       '- At the start of each session, Emma loads your recent memories for context-aware conversations',

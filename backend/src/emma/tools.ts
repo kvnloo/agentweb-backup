@@ -1,6 +1,7 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
+import { getAccountSummary } from '../services/accountSummaryService';
 
 emmaToolRegistry.register({
   name: 'install_skills',
@@ -4002,5 +4003,31 @@ emmaToolRegistry.register({
 
     await accountMemoryDb.deleteMemory(userId, args.memoryId);
     return { success: true, message: `Memory ${args.memoryId} deleted.` };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'account_summary',
+  definition: {
+    name: 'account_summary',
+    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        time_range: {
+          type: 'string',
+          enum: ['1d', '7d', '30d', '90d'],
+          description: 'Time range for the summary. Defaults to 7d.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const timeRange = args.time_range || '7d';
+    return await getAccountSummary(userId, timeRange);
   }
 });

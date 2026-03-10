@@ -5,6 +5,8 @@ import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
 import { agentModeService } from '../services/agentModeService';
+import { substituteVariables, extractVariables, leadHasVariable } from '../utils/emailVariables';
+import axios from 'axios';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import AdmZip from 'adm-zip';
@@ -2945,6 +2947,459 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error syncing subscribers to CRM:', error);
     res.status(500).json({ message: error.message || 'Failed to sync subscribers to CRM' });
+  }
+});
+
+// ============================================================
+// Group Email Endpoints
+// ============================================================
+
+/**
+ * Helper: fetch all leads in a list (paginated)
+ */
+const fetchAllLeadsForGroupEmail = async (listId: string): Promise<any[]> => {
+  let lastKey: any = undefined;
+  const items: any[] = [];
+  do {
+    const result = await crmDb.getLeadsByListId(listId, 200, lastKey);
+    items.push(...result.items);
+    lastKey = result.lastEvaluatedKey;
+  } while (lastKey);
+  return items;
+};
+
+/**
+ * @route POST /api/crm/lists/:listId/group-email/preview
+ * @desc Get recipient counts before sending a group email
+ */
+router.post('/lists/:listId/group-email/preview', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { leadIds } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    let leads = await fetchAllLeadsForGroupEmail(listId);
+
+    // Filter by leadIds if provided
+    if (Array.isArray(leadIds) && leadIds.length > 0) {
+      const idSet = new Set(leadIds);
+      leads = leads.filter((l: any) => idSet.has(l.leadId));
+    }
+
+    const totalLeads = leads.length;
+    const unsubscribedCount = leads.filter((l: any) => l.unsubscribedFromGroupEmail === true).length;
+    const noEmailCount = leads.filter((l: any) => !l.email).length;
+    const eligibleLeads = totalLeads - unsubscribedCount - noEmailCount;
+
+    return res.json({
+      totalLeads,
+      eligibleLeads,
+      unsubscribedCount,
+      noEmailCount,
+    });
+  } catch (error) {
+    console.error('Error previewing group email:', error);
+    return res.status(500).json({ message: 'Failed to preview group email' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/group-email/prepare
+ * @desc Check readiness of leads for sending — validates variable coverage
+ */
+router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { subject, htmlContent } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!subject && !htmlContent) {
+      return res.status(400).json({ message: 'subject or htmlContent is required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Extract all variables from subject + htmlContent
+    const allTemplate = (subject || '') + (htmlContent || '');
+    const variables = extractVariables(allTemplate);
+
+    let leads = await fetchAllLeadsForGroupEmail(listId);
+
+    // Only consider eligible leads (have email, not unsubscribed)
+    const eligibleLeads = leads.filter((l: any) => l.email && l.unsubscribedFromGroupEmail !== true);
+    const eligibleCount = eligibleLeads.length;
+
+    if (variables.length === 0) {
+      // No variables used — all eligible leads are ready
+      return res.json({
+        eligibleCount,
+        readyCount: eligibleCount,
+        notReadyCount: 0,
+        variables: [],
+        variableCoverage: {},
+      });
+    }
+
+    // Check each eligible lead for variable coverage
+    const variableCoverage: Record<string, { present: number; missing: number }> = {};
+    for (const v of variables) {
+      variableCoverage[v] = { present: 0, missing: 0 };
+    }
+
+    let readyCount = 0;
+    for (const lead of eligibleLeads) {
+      let allPresent = true;
+      for (const v of variables) {
+        if (leadHasVariable(lead, v)) {
+          variableCoverage[v].present++;
+        } else {
+          variableCoverage[v].missing++;
+          allPresent = false;
+        }
+      }
+      if (allPresent) readyCount++;
+    }
+
+    return res.json({
+      eligibleCount,
+      readyCount,
+      notReadyCount: eligibleCount - readyCount,
+      variables,
+      variableCoverage,
+    });
+  } catch (error) {
+    console.error('Error preparing group email:', error);
+    return res.status(500).json({ message: 'Failed to prepare group email' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/group-email/send
+ * @desc Send a group email to leads in a list
+ */
+router.post('/lists/:listId/group-email/send', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { socketId, senderEmail, senderName, subject, htmlContent, textContent, leadIds, unsubscribeFooterHtml } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!senderEmail || !senderName || !subject || !htmlContent) {
+      return res.status(400).json({ message: 'senderEmail, senderName, subject, and htmlContent are required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    let leads = await fetchAllLeadsForGroupEmail(listId);
+
+    // Filter by leadIds if provided
+    if (Array.isArray(leadIds) && leadIds.length > 0) {
+      const idSet = new Set(leadIds);
+      leads = leads.filter((l: any) => idSet.has(l.leadId));
+    }
+
+    // Separate eligible leads from skipped ones
+    const skippedUnsubscribed = leads.filter((l: any) => l.unsubscribedFromGroupEmail === true).length;
+    let eligibleLeads = leads.filter((l: any) => l.email && l.unsubscribedFromGroupEmail !== true);
+
+    // Filter out leads missing required variable values
+    const allTemplate = (subject || '') + (htmlContent || '');
+    const variables = extractVariables(allTemplate);
+    let skippedMissingVars = 0;
+    if (variables.length > 0) {
+      const beforeCount = eligibleLeads.length;
+      eligibleLeads = eligibleLeads.filter((lead: any) =>
+        variables.every((v) => leadHasVariable(lead, v))
+      );
+      skippedMissingVars = beforeCount - eligibleLeads.length;
+    }
+
+    const total = eligibleLeads.length;
+
+    const CUSTOMER_FRONTEND_URL = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+    const from = `${senderName} <${senderEmail}>`;
+
+    let sent = 0;
+    let failed = 0;
+    const failedEmails: string[] = [];
+
+    for (const lead of eligibleLeads) {
+      try {
+        // Substitute variables in subject and content
+        const personalizedSubject = substituteVariables(subject, lead);
+        let personalizedHtml = substituteVariables(htmlContent, lead);
+        const personalizedText = textContent ? substituteVariables(textContent, lead) : undefined;
+
+        // Append unsubscribe footer
+        const unsubscribeUrl = `${CUSTOMER_FRONTEND_URL}/crm-unsubscribe?listId=${encodeURIComponent(listId)}&leadId=${encodeURIComponent(lead.leadId)}&email=${encodeURIComponent(lead.email)}`;
+        const defaultFooter = `<div style="text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid #eee;font-size:12px;color:#999;"><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a> from future emails</div>`;
+        const unsubscribeFooter = unsubscribeFooterHtml
+          ? unsubscribeFooterHtml.replace(/\{\{unsubscribeUrl\}\}/g, unsubscribeUrl)
+          : defaultFooter;
+        personalizedHtml += unsubscribeFooter;
+
+        const result = await resendService.sendEmail({
+          from,
+          to: lead.email,
+          subject: personalizedSubject,
+          html: personalizedHtml,
+          text: personalizedText,
+        });
+
+        if (result && result.id) {
+          sent++;
+        } else {
+          failed++;
+          failedEmails.push(lead.email);
+        }
+      } catch (err: any) {
+        console.error(`Failed to send group email to ${lead.email}:`, err.message || err);
+        failed++;
+        failedEmails.push(lead.email);
+      }
+
+      // Emit progress
+      if (socketId) {
+        io.to(socketId).emit('group-email-progress', { sent, failed, total });
+      }
+    }
+
+    return res.json({
+      total,
+      sent,
+      failed,
+      failedEmails,
+      skippedUnsubscribed,
+      skippedMissingVars,
+    });
+  } catch (error) {
+    console.error('Error sending group email:', error);
+    return res.status(500).json({ message: 'Failed to send group email' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/group-email/test
+ * @desc Send a test group email to specific addresses
+ */
+router.post('/lists/:listId/group-email/test', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { senderEmail, senderName, subject, htmlContent, textContent, recipients, unsubscribeFooterHtml } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!senderEmail || !senderName || !subject || !htmlContent) {
+      return res.status(400).json({ message: 'senderEmail, senderName, subject, and htmlContent are required' });
+    }
+
+    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ message: 'At least one recipient email is required' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const validEmails = recipients.filter((e: string) => emailRegex.test(e.trim()));
+
+    if (validEmails.length === 0) {
+      return res.status(400).json({ message: 'No valid email addresses provided' });
+    }
+
+    const testBanner = `<div style="background-color: #ff9800; color: white; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 20px;">TEST EMAIL - This is a test group email</div>`;
+    const testFooter = unsubscribeFooterHtml
+      ? unsubscribeFooterHtml.replace(/\{\{unsubscribeUrl\}\}/g, '#unsubscribe-test')
+      : `<div style="text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid #eee;font-size:12px;color:#999;"><a href="#unsubscribe-test" style="color:#999;">Unsubscribe</a> from future emails</div>`;
+    const testHtml = testBanner + htmlContent + testFooter;
+    const from = `${senderName} <${senderEmail}>`;
+
+    let sent = 0;
+    let failedCount = 0;
+    const failedEmails: string[] = [];
+
+    for (const email of validEmails) {
+      try {
+        const result = await resendService.sendEmail({
+          from,
+          to: email.trim(),
+          subject: `[TEST] ${subject}`,
+          html: testHtml,
+          text: textContent,
+        });
+
+        if (result && result.id) {
+          sent++;
+        } else {
+          failedCount++;
+          failedEmails.push(email);
+        }
+      } catch (err: any) {
+        console.error(`Failed to send test group email to ${email}:`, err.message || err);
+        failedCount++;
+        failedEmails.push(email);
+      }
+    }
+
+    return res.json({
+      total: validEmails.length,
+      sent,
+      failed: failedCount,
+      failedEmails,
+    });
+  } catch (error) {
+    console.error('Error sending test group email:', error);
+    return res.status(500).json({ message: 'Failed to send test group email' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/group-email/load-from-url
+ * @desc Load HTML content from a URL for group email
+ */
+router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { url } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ message: 'URL is required and must be a string' });
+    }
+
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      return res.status(400).json({ message: 'Invalid URL format. Must be HTTP or HTTPS.' });
+    }
+
+    const response = await axios.get(url, {
+      timeout: 15000,
+      responseType: 'text',
+      headers: { 'User-Agent': 'AgentWeb-Backend/1.0' },
+    });
+
+    const html = response.data as string;
+
+    // Extract title
+    const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+    let extractedTitle = titleMatch ? titleMatch[1].trim() : '';
+    if (!extractedTitle) {
+      const h1Match = html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+      extractedTitle = h1Match ? h1Match[1].trim() : 'Newsletter';
+    }
+    extractedTitle = extractedTitle
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/g, "'");
+
+    // Extract body content
+    let bodyContent = '';
+    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    if (bodyMatch) {
+      bodyContent = bodyMatch[1];
+    } else {
+      bodyContent = html;
+    }
+
+    // Remove script and style tags
+    bodyContent = bodyContent
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
+
+    // Try to extract main content from semantic tags
+    const mainContentSelectors = [
+      /<main[^>]*>([\s\S]*?)<\/main>/i,
+      /<article[^>]*>([\s\S]*?)<\/article>/i,
+      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
+    ];
+
+    for (const selector of mainContentSelectors) {
+      const match = bodyContent.match(selector);
+      if (match && match[1].trim().length > 50) {
+        bodyContent = match[1];
+        break;
+      }
+    }
+
+    // Clean up
+    bodyContent = bodyContent
+      .replace(/<!--[\s\S]*?-->/g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/>\s+</g, '><')
+      .trim();
+
+    if (bodyContent.length > 50000) {
+      bodyContent = bodyContent.substring(0, 50000);
+    }
+
+    return res.json({
+      success: true,
+      title: extractedTitle,
+      message: bodyContent,
+    });
+  } catch (error: any) {
+    console.error('Error loading HTML from URL:', error.message || error);
+    return res.status(500).json({ message: 'Failed to load content from URL' });
   }
 });
 
