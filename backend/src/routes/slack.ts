@@ -544,11 +544,81 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
         console.log(`📧 Opened test email modal for: ${assetUrl}`);
         res.status(200).json({}); // Empty response for modal trigger
 
+      // ─── Landing Page Deployment Approval ─────────────────────────────
+      } else if (action.action_id === 'approve_landing_page') {
+        const { deploymentUrl, projectName } = assetData;
+
+        // Promote to production via Vercel
+        try {
+          const { vercelService } = await import('../services/vercelService');
+          await vercelService.promoteToProduction(deploymentUrl);
+        } catch (vercelError: any) {
+          console.error('❌ Vercel promotion failed:', vercelError);
+          // Update message to show error
+          await updateApprovalMessage(
+            channel.id,
+            message.ts,
+            'needs_changes',
+            user.username || user.id,
+            `Vercel promotion failed: ${vercelError.message}`,
+            'html'
+          );
+          return res.status(200).json({});
+        }
+
+        // Update Slack message
+        await updateApprovalMessage(
+          channel.id,
+          message.ts,
+          'approved',
+          user.username || user.id,
+          undefined,
+          'html'
+        );
+
+        // Update approval DB
+        await approvalDb.updateApprovalStatus(
+          deploymentUrl,
+          'approved',
+          user.username || user.id
+        );
+
+        console.log(`✅ Landing page approved and promoted: ${projectName}`);
+        res.status(200).json({});
+
+      } else if (action.action_id === 'request_changes_landing_page') {
+        const { deploymentUrl, projectName } = assetData;
+
+        await openFeedbackModal(
+          payload.trigger_id,
+          deploymentUrl,
+          projectName || 'Landing Page',
+          '',
+          'html'
+        );
+
+        console.log(`📝 Opened feedback modal for landing page: ${deploymentUrl}`);
+        res.status(200).json({});
+
+      } else if (action.action_id === 'reject_landing_page') {
+        const { deploymentUrl, projectName } = assetData;
+
+        await openRejectModal(
+          payload.trigger_id,
+          deploymentUrl,
+          projectName || 'Landing Page',
+          '',
+          'html'
+        );
+
+        console.log(`📝 Opened reject modal for landing page: ${deploymentUrl}`);
+        res.status(200).json({});
+
       } else {
         return res.status(200).json({ text: "Unknown action" });
       }
     }
-    
+
     // Handle modal submission
     else if (payload.type === 'view_submission') {
       const user = payload.user;

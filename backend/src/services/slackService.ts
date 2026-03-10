@@ -9,6 +9,10 @@ if (process.env.SLACK_BOT_TOKEN) {
   console.warn("⚠️ SLACK_BOT_TOKEN not found in environment variables. Slack integration will not work.");
 }
 
+export function getSlackClient(): WebClient | null {
+  return slackClient;
+}
+
 export const APPROVAL_CHANNEL = process.env.SLACK_APPROVAL_CHANNEL || "#approvals";
 
 export interface SlackChannel {
