@@ -98,6 +98,37 @@ describe('llmService', () => {
       expect(AzureChatOpenAI).toHaveBeenCalled();
     });
 
+    it('should fall back to gpt-4 when no modelName and no AZURE_OPENAI_DEPLOYMENT env', () => {
+      delete process.env.AZURE_OPENAI_DEPLOYMENT;
+      new LLMService();
+      expect(AzureChatOpenAI).toHaveBeenCalled();
+    });
+
+    it('should fall back to AWS_DEFAULT_REGION when AWS_REGION is not set for Claude models', () => {
+      delete process.env.AWS_REGION;
+      process.env.AWS_DEFAULT_REGION = 'eu-west-1';
+      new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({ region: 'eu-west-1' })
+      );
+      delete process.env.AWS_DEFAULT_REGION;
+    });
+
+    it('should fall back to us-west-2 when neither AWS_REGION nor AWS_DEFAULT_REGION is set for Claude models', () => {
+      delete process.env.AWS_REGION;
+      delete process.env.AWS_DEFAULT_REGION;
+      new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({ region: 'us-west-2' })
+      );
+    });
+
+    it('should use empty string for secretAccessKey when AWS_SECRET_ACCESS_KEY is not set', () => {
+      delete process.env.AWS_SECRET_ACCESS_KEY;
+      new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
     it('should throw error when Azure credentials are missing for non-Claude models', () => {
       delete process.env.AZURE_OPENAI_API_KEY;
       expect(() => new LLMService('gpt-4')).toThrow(

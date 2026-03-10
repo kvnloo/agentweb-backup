@@ -160,5 +160,32 @@ describe('agentModeErrors utils', () => {
     it('should return false for context limit errors (not retryable)', () => {
       expect(isTransientLLMError(new Error('context length exceeded'))).toBe(false);
     });
+
+    it('should return false when statusCode is a string, not a number', () => {
+      const error = Object.assign(new Error('some error'), { status: 'ENOENT' });
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should handle error with no status/code/response properties', () => {
+      const error = new Error('random unrelated error');
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should detect transient errors from message patterns like throttling', () => {
+      expect(isTransientLLMError(new Error('Request was throttled'))).toBe(true);
+      expect(isTransientLLMError(new Error('too many requests'))).toBe(true);
+      expect(isTransientLLMError(new Error('rate limit exceeded'))).toBe(true);
+      expect(isTransientLLMError(new Error('rate exceeded'))).toBe(true);
+      expect(isTransientLLMError(new Error('temporarily unavailable'))).toBe(true);
+      expect(isTransientLLMError(new Error('ETIMEDOUT'))).toBe(true);
+      expect(isTransientLLMError(new Error('internal server error'))).toBe(true);
+    });
+
+    it('should detect all transient status codes', () => {
+      [429, 500, 502, 503, 504].forEach((code) => {
+        const error = Object.assign(new Error('fail'), { status: code });
+        expect(isTransientLLMError(error)).toBe(true);
+      });
+    });
   });
 });

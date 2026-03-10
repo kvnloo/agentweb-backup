@@ -14,7 +14,10 @@ import {
   getLinkedInCredentials,
   getMetaCredentials,
   getInstagramCredentials,
-  getGoogleDriveServiceAccountEmail
+  getGoogleDriveServiceAccountEmail,
+  getUnipileCredentials,
+  getGmailCredentials,
+  getV0ApiKey
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -538,6 +541,254 @@ describe('secretsManager utils', () => {
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/Google/Share'
       });
+    });
+  });
+
+  describe('getUnipileCredentials', () => {
+    it('should return Unipile credentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            dsn: 'https://api3.unipile.com:13311',
+            apiKey: 'test-api-key'
+          })
+        })
+      });
+
+      const result = await getUnipileCredentials();
+      expect(result.dsn).toBe('https://api3.unipile.com:13311');
+      expect(result.apiKey).toBe('test-api-key');
+    });
+
+    it('should throw error when credentials are empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getUnipileCredentials()).rejects.toThrow(
+        'Failed to fetch Unipile credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when dsn is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ apiKey: 'key' })
+        })
+      });
+
+      await expect(getUnipileCredentials()).rejects.toThrow(
+        'Failed to fetch Unipile credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when apiKey is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ dsn: 'https://api.test.com' })
+        })
+      });
+
+      await expect(getUnipileCredentials()).rejects.toThrow(
+        'Failed to fetch Unipile credentials from Secrets Manager'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ dsn: 'https://api.test.com', apiKey: 'key' })
+        })
+      });
+
+      await getUnipileCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/Unipile'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ dsn: 'https://api.test.com', apiKey: 'key' })
+        })
+      });
+
+      await getUnipileCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Unipile'
+      });
+    });
+  });
+
+  describe('getGmailCredentials', () => {
+    it('should return Gmail credentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            clientId: 'gmail-client-123',
+            clientSecret: 'gmail-secret-456'
+          })
+        })
+      });
+
+      const result = await getGmailCredentials();
+      expect(result.clientId).toBe('gmail-client-123');
+      expect(result.clientSecret).toBe('gmail-secret-456');
+    });
+
+    it('should throw error when credentials are empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getGmailCredentials()).rejects.toThrow(
+        'Failed to fetch Gmail credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when clientId is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientSecret: 'secret' })
+        })
+      });
+
+      await expect(getGmailCredentials()).rejects.toThrow(
+        'Failed to fetch Gmail credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when clientSecret is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'client' })
+        })
+      });
+
+      await expect(getGmailCredentials()).rejects.toThrow(
+        'Failed to fetch Gmail credentials from Secrets Manager'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getGmailCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/Google/Gmail'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getGmailCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Google/Gmail'
+      });
+    });
+  });
+
+  describe('getV0ApiKey', () => {
+    afterEach(() => {
+      delete process.env.V0_API_KEY;
+    });
+
+    it('should return V0_API_KEY from env var when set', async () => {
+      process.env.V0_API_KEY = 'v1:team_test_key';
+
+      const result = await getV0ApiKey();
+      expect(result).toBe('v1:team_test_key');
+    });
+
+    it('should fetch from Secrets Manager when env var is not set', async () => {
+      delete process.env.V0_API_KEY;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ apiKey: 'v1:team_secret_key' })
+        })
+      });
+
+      const result = await getV0ApiKey();
+      expect(result).toBe('v1:team_secret_key');
+    });
+
+    it('should throw error when secret is empty and no env var', async () => {
+      delete process.env.V0_API_KEY;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getV0ApiKey()).rejects.toThrow(
+        'Failed to fetch V0 API key'
+      );
+    });
+
+    it('should throw error when apiKey is missing from secret', async () => {
+      delete process.env.V0_API_KEY;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ otherKey: 'value' })
+        })
+      });
+
+      await expect(getV0ApiKey()).rejects.toThrow(
+        'Failed to fetch V0 API key'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      delete process.env.V0_API_KEY;
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ apiKey: 'key' })
+        })
+      });
+
+      await getV0ApiKey();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/V0'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      delete process.env.V0_API_KEY;
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ apiKey: 'key' })
+        })
+      });
+
+      await getV0ApiKey();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/V0'
+      });
+    });
+
+    it('should throw error when Secrets Manager call fails and no env var', async () => {
+      delete process.env.V0_API_KEY;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getV0ApiKey()).rejects.toThrow(
+        'Failed to fetch V0 API key'
+      );
     });
   });
 });
