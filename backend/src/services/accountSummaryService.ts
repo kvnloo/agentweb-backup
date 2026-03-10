@@ -204,9 +204,7 @@ async function getSocialMediaMetrics(
       (p) => p.createdAt && new Date(p.createdAt) >= startDate
     );
 
-    // Get account-level metrics directly via adapter (same as load_connected_account_metrics tool)
-    // This is more reliable than loadConnectedAccountPosts which has metric merging issues
-    // for org accounts where share URN format doesn't match post ID
+    // Get per-post metrics from connected accounts filtered by time range
     let impressions = 0;
     let engagements = 0;
     let clicks = 0;
@@ -214,24 +212,26 @@ async function getSocialMediaMetrics(
     try {
       const accounts = await getAccountsByUserId(userId);
       if (accounts.length > 0) {
-        const metricsResults = await Promise.all(
+        const postResults = await Promise.all(
           accounts.map((acc) =>
-            agentModeService.loadConnectedAccountMetrics(userId, acc.account_id)
+            agentModeService.loadConnectedAccountPosts(userId, acc.account_id, { limit: 50, include_metrics: true })
               .catch(() => null)
           )
         );
 
-        for (const result of metricsResults) {
-          if (!result?.success || !result.metrics) continue;
-          const stats = result.metrics.shareStatistics;
-          if (stats && Array.isArray(stats)) {
-            for (const s of stats) {
-              const t = s.totalShareStatistics;
-              if (!t) continue;
-              impressions += t.impressionCount ?? 0;
-              engagements += (t.likeCount ?? 0) + (t.commentCount ?? 0) + (t.shareCount ?? 0);
-              clicks += t.clickCount ?? 0;
-            }
+        for (const postResult of postResults) {
+          if (!postResult?.success || !postResult.posts) continue;
+          for (const post of postResult.posts) {
+            const postDate = post.createdAt
+              ? new Date(post.createdAt)
+              : post.created?.time
+                ? new Date(post.created.time)
+                : null;
+            if (!postDate || postDate < startDate) continue;
+            if (!post.metrics) continue;
+            impressions += post.metrics.impressionCount ?? 0;
+            engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
+            clicks += post.metrics.clickCount ?? 0;
           }
         }
       }
