@@ -1105,6 +1105,12 @@ emmaToolRegistry.register({
           type: 'boolean',
           description: 'When true, performs Gemini Deep Research for comprehensive information and includes 3-5 inline images. When false, uses standard content generation with hero image only. Takes several minutes when enabled.',
           default: false
+        },
+        image_urls: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional array of image/screenshot URLs to embed inline in the article. Images are distributed between content sections. Useful for user guides, tutorials, and step-by-step articles that need screenshots.',
+          default: []
         }
       },
       required: ['title_draft', 'content_draft']
@@ -1112,15 +1118,16 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     return await agentModeService.createBlogArticle(
-      args.title_draft, 
-      args.content_draft, 
-      args.length || 'medium', 
-      args.researchContext || '', 
-      args.requirements || '', 
-      context?.userId, 
-      context?.sessionId, 
-      args.style || 'default', 
-      args.deep_research || false
+      args.title_draft,
+      args.content_draft,
+      args.length || 'medium',
+      args.researchContext || '',
+      args.requirements || '',
+      context?.userId,
+      context?.sessionId,
+      args.style || 'default',
+      args.deep_research || false,
+      args.image_urls || []
     );
   }
 });

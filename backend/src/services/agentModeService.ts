@@ -12410,7 +12410,8 @@ Format the response as JSON with this structure:
     userId: string,
     sessionId: string,
     style: string = 'default',
-    deepResearch: boolean = false
+    deepResearch: boolean = false,
+    imageUrls: string[] = []
   ): Promise<any> {
     try {
       // Import required services
@@ -12518,6 +12519,19 @@ Format the response as JSON with this structure:
       }
 
       // ========================================
+      // COMMON: Inject provided screenshot/image URLs
+      // ========================================
+      if (imageUrls && imageUrls.length > 0) {
+        const validUrls = imageUrls.filter(
+          (url) => url && typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'))
+        );
+        if (validUrls.length > 0) {
+          console.log(`AgentMode: Injecting ${validUrls.length} provided images into content`);
+          finalContent = this.injectImagesIntoContent(finalContent, validUrls);
+        }
+      }
+
+      // ========================================
       // COMMON: Generate Hero Image
       // ========================================
       console.log('AgentMode: Generating hero image...');
@@ -12594,6 +12608,54 @@ Format the response as JSON with this structure:
       parts.push(`and ${inlineCount} inline images`);
     }
     return parts.join(' ');
+  }
+
+  /**
+   * Inject provided image URLs into markdown content, distributing them between sections.
+   * Images are placed after section headings (# or ##) or appended at the end if no headings exist.
+   */
+  private injectImagesIntoContent(content: string, imageUrls: string[]): string {
+    if (imageUrls.length === 0) return content;
+
+    const lines = content.split('\n');
+    const sectionBreaks: number[] = [];
+
+    // Find section breaks (lines starting with # or ##)
+    for (let i = 0; i < lines.length; i++) {
+      if (/^#{1,2}\s/.test(lines[i])) {
+        sectionBreaks.push(i);
+      }
+    }
+
+    if (sectionBreaks.length <= 1) {
+      // No section breaks or just one heading — append all images at the end
+      const imageMarkdown = imageUrls
+        .map((url) => `\n![Screenshot](${url})\n`)
+        .join('');
+      return content + imageMarkdown;
+    }
+
+    // Distribute images evenly between sections (after each section's first paragraph)
+    const result = [...lines];
+    let insertOffset = 0;
+
+    for (let i = 0; i < imageUrls.length; i++) {
+      // Place image after the i-th section (skip the first heading, place after subsequent ones)
+      const sectionIndex = Math.min(i + 1, sectionBreaks.length - 1);
+      const insertLine = sectionBreaks[sectionIndex] + insertOffset;
+
+      // Find the next blank line after the heading to insert after the first paragraph
+      let insertAt = insertLine + 1;
+      while (insertAt < result.length && result[insertAt].trim() !== '') {
+        insertAt++;
+      }
+
+      const imgLine = `\n![Screenshot](${imageUrls[i]})\n`;
+      result.splice(insertAt, 0, imgLine);
+      insertOffset++;
+    }
+
+    return result.join('\n');
   }
 
   /**
@@ -12765,12 +12827,9 @@ Format the response as JSON with this structure:
           }
         };
 
-        // For draft endpoint, use _archived and _draft
-        // For live endpoint, use isArchived and isDraft
-        if (status === 'draft') {
-          cmsItemData.fieldData._archived = false;
-          cmsItemData.fieldData._draft = true;
-        } else {
+        // Draft items are drafts by default when using the draft endpoint
+        // For live endpoint, set isArchived and isDraft at the top level (not in fieldData)
+        if (status !== 'draft') {
           cmsItemData.isArchived = false;
           cmsItemData.isDraft = false;
         }
@@ -12909,12 +12968,10 @@ Format the response as JSON with this structure:
           'accept-version': '2.0.0'
         };
 
-        // Use /items/live endpoint for published articles, /items for drafts
-        // Note: The live endpoint uses /collections/{id}/items/live (without /sites/ prefix)
-        // while the draft endpoint uses /sites/{siteId}/collections/{id}/items
+        // Webflow v2 API: both draft and live use /collections/{id}/items
         const endpoint = status === 'published'
           ? `https://api.webflow.com/v2/collections/${collectionId}/items/live?skipInvalidFiles=true`
-          : `https://api.webflow.com/v2/sites/${siteId}/collections/${collectionId}/items`;
+          : `https://api.webflow.com/v2/collections/${collectionId}/items`;
 
         console.log(`AgentMode: Publishing to Webflow ${status === 'published' ? 'live' : 'draft'} endpoint: ${endpoint}`);
 
@@ -12925,10 +12982,20 @@ Format the response as JSON with this structure:
             { headers }
           );
 
-          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}`);
+          // Validate that Webflow actually created the item
+          const responseData = response.data as any;
+          if (!responseData || !responseData.id) {
+            console.error('AgentMode: Webflow returned success but no item id in response:', JSON.stringify(responseData).substring(0, 500));
+            return {
+              success: false,
+              message: 'Webflow API returned a response but no CMS item was created. The item may not have been saved. Check Webflow field mappings and collection configuration.',
+              error: 'Webflow response missing item id',
+            };
+          }
+
+          console.log(`AgentMode: Blog article published successfully to Webflow as ${status}, item id: ${responseData.id}`);
 
           // Sanitize response to remove large content fields before sending to LLM
-          const responseData = response.data as any;
           const sanitizedResponse = responseData && typeof responseData === 'object'
             ? { ...responseData }
             : responseData;

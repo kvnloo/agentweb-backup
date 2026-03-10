@@ -358,13 +358,13 @@ describe('AgentModeService - publish_blog_article function', () => {
         'draft'
       );
 
-      // Verify draft endpoint was used
+      // Verify draft endpoint was used (Webflow v2: /collections/{id}/items without /sites/)
       const webflowCall = mockAxiosPost.mock.calls[0];
       const endpoint = webflowCall[0];
-      expect(endpoint).toContain('/sites/');
       expect(endpoint).toContain('/collections/');
       expect(endpoint).toContain('/items');
       expect(endpoint).not.toContain('/items/live');
+      expect(endpoint).not.toContain('/sites/');
     });
 
     it('should use live endpoint when status is "published"', async () => {
@@ -434,11 +434,12 @@ describe('AgentModeService - publish_blog_article function', () => {
         // status not provided
       );
 
-      // Verify draft endpoint was used
+      // Verify draft endpoint was used (Webflow v2: /collections/{id}/items without /sites/)
       const webflowCall = mockAxiosPost.mock.calls[0];
       const endpoint = webflowCall[0];
-      expect(endpoint).toContain('/sites/');
+      expect(endpoint).toContain('/collections/');
       expect(endpoint).not.toContain('/items/live');
+      expect(endpoint).not.toContain('/sites/');
     });
   });
 
