@@ -16564,7 +16564,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // Assume posts have an 'id' field as per LinkedIn/generic structure
             const postIds = posts.map(p => p.id).filter(Boolean);
             if (postIds.length > 0) {
-              const metrics = await adapter.getPostMetrics(account, postIds);
+              const metrics = await adapter.getPostMetrics(account, postIds, userId);
               
               // Merge metrics into posts
               posts = posts.map(post => {
