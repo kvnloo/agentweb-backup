@@ -12659,7 +12659,8 @@ Format the response as JSON with this structure:
     sessionId: string,
     status: string = 'draft',
     author?: string,
-    categories: string[] = []
+    categories: string[] = [],
+    inlineImageUrls: string[] = []
   ): Promise<any> {
     try {
       console.log('AgentMode: Publishing blog article - Title:', title, 'Status:', status);
@@ -12773,6 +12774,12 @@ Format the response as JSON with this structure:
         } else {
           cmsItemData.isArchived = false;
           cmsItemData.isDraft = false;
+        }
+
+        // Embed inline images at the end of the body content
+        if (inlineImageUrls && inlineImageUrls.length > 0) {
+          const imgTags = inlineImageUrls.map(url => `<img src="${url}" alt="" style="max-width:100%;height:auto;margin:16px 0;" />`).join('');
+          bodyHtml += imgTags;
         }
 
         // Use body HTML directly for Webflow

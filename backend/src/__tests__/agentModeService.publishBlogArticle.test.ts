@@ -701,6 +701,84 @@ describe('AgentModeService - publish_blog_article function', () => {
     });
   });
 
+  describe('Inline image embedding', () => {
+    const setupMocks = () => {
+      mockGetUserById.mockResolvedValue({ userId: mockUserId, cmsType: 'Webflow' });
+      mockGetWebflowConfig.mockResolvedValue(mockWebflowConfig);
+      mockAxiosGet.mockResolvedValue({ data: mockHtmlContent });
+      mockAxiosPost.mockResolvedValueOnce(mockWebflowResponse as any);
+    };
+
+    // FAIL test: inline images should be appended to body HTML
+    it('should embed inline_image_urls as img tags in body HTML', async () => {
+      setupMocks();
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft',
+        undefined,
+        [],
+        ['https://s3.amazonaws.com/screenshot1.png', 'https://s3.amazonaws.com/screenshot2.jpg']
+      );
+
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const bodyContent = webflowCall[1].fieldData['post-body'];
+      expect(bodyContent).toContain('<img src="https://s3.amazonaws.com/screenshot1.png"');
+      expect(bodyContent).toContain('<img src="https://s3.amazonaws.com/screenshot2.jpg"');
+    });
+
+    // FAIL test: no inline images should not modify body
+    it('should not add img tags when inline_image_urls is empty', async () => {
+      setupMocks();
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft',
+        undefined,
+        [],
+        [] // empty
+      );
+
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const bodyContent = webflowCall[1].fieldData['post-body'];
+      // Should only contain the original content, no extra img tags
+      expect(bodyContent).toContain('Test blog content here');
+      expect((bodyContent.match(/<img /g) || []).length).toBe(0);
+    });
+
+    // FAIL test: inline images should not add when param is undefined
+    it('should not add img tags when inline_image_urls is undefined', async () => {
+      setupMocks();
+
+      await (agentModeService as any).publishBlogArticle(
+        'Test Blog Title',
+        'Test description',
+        mockHeroImageUrl,
+        mockBlogHtmlUrl,
+        mockUserId,
+        mockSessionId,
+        'draft',
+        undefined,
+        []
+        // inline_image_urls not provided
+      );
+
+      const webflowCall = mockAxiosPost.mock.calls[0];
+      const bodyContent = webflowCall[1].fieldData['post-body'];
+      expect((bodyContent.match(/<img /g) || []).length).toBe(0);
+    });
+  });
+
   describe('HTML content extraction and format validation', () => {
     const setupMocks = (htmlContent: string) => {
       mockGetUserById.mockResolvedValue({

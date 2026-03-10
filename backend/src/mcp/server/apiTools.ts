@@ -759,7 +759,8 @@ mcpToolRegistry.register({
         blog_html_url: { type: 'string', description: 'URL of the HTML file from create_blog_article' },
         status: { type: 'string', enum: ['draft', 'published'], description: 'Publication status', default: 'draft' },
         author: { type: 'string', description: 'Optional author name or ID' },
-        categories: { type: 'array', items: { type: 'string' }, description: 'Blog categories (required when status is "published")' }
+        categories: { type: 'array', items: { type: 'string' }, description: 'Blog categories (required when status is "published")' },
+        inline_image_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs to embed inline within the article body (e.g., screenshots, diagrams)' }
       },
       required: ['title', 'description', 'hero_image_url', 'blog_html_url']
     }
@@ -769,7 +770,7 @@ mcpToolRegistry.register({
     return await agentModeService.publishBlogArticle(
       args.title, args.description, args.hero_image_url, args.blog_html_url,
       context?.userId, context?.sessionId,
-      args.status, args.author, args.categories
+      args.status, args.author, args.categories, args.inline_image_urls || []
     );
   }
 });
