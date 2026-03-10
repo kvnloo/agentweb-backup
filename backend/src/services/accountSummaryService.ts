@@ -25,30 +25,28 @@ const REPORT_TOOLS = new Set([
 export interface AccountSummary {
   period: string;
   sessions: number;
-  assets_generated: {
+  assets: {
     images: number;
     videos: number;
     reports: number;
-    social_media_posts: number;
+    social_posts: number;
   };
-  assets_published: {
-    count: number;
-    note: string;
-  };
-  top_tools_used: Record<string, number>;
-  impact_metrics: {
+  results: {
+    published: {
+      count: number;
+      note: string;
+    };
     leads_added: number;
     email: {
       delivered: number;
-      opened: number;
       clicked: number;
       replied: number;
       bounced: number;
     };
     social_media: {
-      total_impressions: number;
-      total_engagements: number;
-      total_clicks: number;
+      impressions: number;
+      engagements: number;
+      clicks: number;
     };
   };
 }
@@ -76,9 +74,8 @@ export async function getAccountSummary(
   let images = 0;
   let videos = 0;
   let reports = 0;
-  let socialMediaPosts = 0;
+  let socialPosts = 0;
   let publishedCount = 0;
-  const toolCounts: Record<string, number> = {};
 
   for (const session of sessions) {
     if (session.assetCache) {
@@ -91,30 +88,21 @@ export async function getAccountSummary(
       for (const [toolName, count] of Object.entries(session.calledFunctions)) {
         const c = count as number;
         if (SOCIAL_MEDIA_TOOLS.has(toolName)) {
-          socialMediaPosts += c;
+          socialPosts += c;
         }
         if (REPORT_TOOLS.has(toolName)) {
           reports += c;
         }
-        toolCounts[toolName] = (toolCounts[toolName] ?? 0) + c;
       }
     }
 
     if (session.publishStatuses) {
       for (const status of Object.values(session.publishStatuses)) {
-        if (status === 'published') {
+        if (status === 'published' || status === 'manually_published' || status === 'draft') {
           publishedCount++;
         }
       }
     }
-  }
-
-  const sortedTools = Object.entries(toolCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5);
-  const topTools: Record<string, number> = {};
-  for (const [name, count] of sortedTools) {
-    topTools[name] = count;
   }
 
   const periodLabel = `Last ${days} day${days > 1 ? 's' : ''}`;
@@ -122,18 +110,17 @@ export async function getAccountSummary(
   return {
     period: periodLabel,
     sessions: sessions.length,
-    assets_generated: {
+    assets: {
       images,
       videos,
       reports,
-      social_media_posts: socialMediaPosts,
+      social_posts: socialPosts,
     },
-    assets_published: {
-      count: publishedCount,
-      note: 'This may not reflect assets published manually outside of Emma.',
-    },
-    top_tools_used: topTools,
-    impact_metrics: {
+    results: {
+      published: {
+        count: publishedCount,
+        note: 'This may not reflect assets published manually outside of Emma.',
+      },
       leads_added: leadsAdded,
       email: emailMetrics,
       social_media: socialMetrics,
@@ -169,8 +156,8 @@ async function getLeadsAdded(userId: string, startDate: Date): Promise<number> {
 async function getEmailMetrics(
   userId: string,
   startDate: Date
-): Promise<AccountSummary['impact_metrics']['email']> {
-  const empty = { delivered: 0, opened: 0, clicked: 0, replied: 0, bounced: 0 };
+): Promise<AccountSummary['results']['email']> {
+  const empty = { delivered: 0, clicked: 0, replied: 0, bounced: 0 };
   try {
     const user = await userDb.getUserById(userId);
     if (!user?.emailDomain) return empty;
@@ -182,7 +169,6 @@ async function getEmailMetrics(
       if (!event.createdAt || new Date(event.createdAt) < startDate) continue;
       switch (event.eventType) {
         case 'email.delivered': counts.delivered++; break;
-        case 'email.opened': counts.opened++; break;
         case 'email.clicked': counts.clicked++; break;
         case 'email.received': counts.replied++; break;
         case 'email.bounced': counts.bounced++; break;
@@ -198,8 +184,8 @@ async function getEmailMetrics(
 async function getSocialMediaMetrics(
   userId: string,
   startDate: Date
-): Promise<AccountSummary['impact_metrics']['social_media']> {
-  const empty = { total_impressions: 0, total_engagements: 0, total_clicks: 0 };
+): Promise<AccountSummary['results']['social_media']> {
+  const empty = { impressions: 0, engagements: 0, clicks: 0 };
   try {
     const result = await agentModeService.listConnectedAccounts(userId);
     if (!result?.success || !result.accounts?.length) return empty;
@@ -228,7 +214,7 @@ async function getSocialMediaMetrics(
       }
     }
 
-    return { total_impressions: impressions, total_engagements: engagements, total_clicks: clicks };
+    return { impressions, engagements, clicks };
   } catch (error) {
     console.error('accountSummary: Error fetching social media metrics:', error);
     return empty;

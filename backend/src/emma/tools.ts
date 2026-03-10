@@ -4010,7 +4010,7 @@ emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
     name: 'account_summary',
-    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets generated (images, videos, reports, social media posts), assets published, top tools used, and impact metrics (leads added, email delivery/opens/clicks/replies, social media impressions/engagements/clicks).',
+    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets generated (images, videos, reports, social posts), and results (published count, leads added, email delivery/opens/clicks/replies, social media impressions/engagements/clicks).',
     inputSchema: {
       type: 'object',
       properties: {

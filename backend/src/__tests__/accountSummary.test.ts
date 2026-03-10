@@ -103,14 +103,14 @@ describe('getAccountSummary', () => {
     const result = await getAccountSummary('user-1', '7d');
 
     expect(result.sessions).toBe(0);
-    expect(result.assets_generated.images).toBe(0);
-    expect(result.assets_generated.videos).toBe(0);
-    expect(result.assets_generated.reports).toBe(0);
-    expect(result.assets_generated.social_media_posts).toBe(0);
-    expect(result.assets_published.count).toBe(0);
-    expect(result.impact_metrics.leads_added).toBe(0);
-    expect(result.impact_metrics.email.delivered).toBe(0);
-    expect(result.impact_metrics.social_media.total_impressions).toBe(0);
+    expect(result.assets.images).toBe(0);
+    expect(result.assets.videos).toBe(0);
+    expect(result.assets.reports).toBe(0);
+    expect(result.assets.social_posts).toBe(0);
+    expect(result.results.published.count).toBe(0);
+    expect(result.results.leads_added).toBe(0);
+    expect(result.results.email.delivered).toBe(0);
+    expect(result.results.social_media.impressions).toBe(0);
   });
 
   test('filters out sessions outside the time range', async () => {
@@ -169,9 +169,9 @@ describe('getAccountSummary', () => {
     const result = await getAccountSummary('user-1', '7d');
 
     expect(result.sessions).toBe(2);
-    expect(result.assets_generated.images).toBe(3);
-    expect(result.assets_generated.videos).toBe(1);
-    expect(result.assets_generated.reports).toBe(1);
+    expect(result.assets.images).toBe(3);
+    expect(result.assets.videos).toBe(1);
+    expect(result.assets.reports).toBe(1);
   });
 
   test('counts social media posts from calledFunctions', async () => {
@@ -188,7 +188,7 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.assets_generated.social_media_posts).toBe(5); // 3 + 2
+    expect(result.assets.social_posts).toBe(5); // 3 + 2
   });
 
   test('counts blog articles and deep research as reports via calledFunctions', async () => {
@@ -212,7 +212,7 @@ describe('getAccountSummary', () => {
     const result = await getAccountSummary('user-1', '7d');
 
     // 1 from htmlReports + 3 blog articles + 1 deep research = 5
-    expect(result.assets_generated.reports).toBe(5);
+    expect(result.assets.reports).toBe(5);
   });
 
   test('counts published assets from publishStatuses with incomplete note', async () => {
@@ -222,7 +222,7 @@ describe('getAccountSummary', () => {
         publishStatuses: {
           'https://s3/img1.png': 'published',
           'https://s3/img2.png': 'draft',
-          'https://s3/report.html': 'published',
+          'https://s3/report.html': 'manually_published',
         },
       }),
       makeSession({
@@ -235,35 +235,8 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.assets_published.count).toBe(3);
-    expect(result.assets_published.note).toMatch(/may not reflect/i);
-  });
-
-  test('aggregates top tools used from calledFunctions', async () => {
-    mockGetSessions.mockResolvedValue([
-      makeSession({
-        createdAt: '2026-03-08T10:00:00.000Z',
-        calledFunctions: {
-          'generate_image': 5,
-          'create_blog_article': 2,
-        },
-      }),
-      makeSession({
-        createdAt: '2026-03-07T10:00:00.000Z',
-        calledFunctions: {
-          'generate_image': 3,
-          'generate_video': 1,
-        },
-      }),
-    ]);
-
-    const result = await getAccountSummary('user-1', '7d');
-
-    expect(result.top_tools_used).toEqual({
-      generate_image: 8,
-      create_blog_article: 2,
-      generate_video: 1,
-    });
+    expect(result.results.published.count).toBe(4); // published + draft + manually_published + published
+    expect(result.results.published.note).toMatch(/may not reflect/i);
   });
 
   test('supports different time ranges (1d, 30d, 90d)', async () => {
@@ -291,14 +264,14 @@ describe('getAccountSummary', () => {
     const result = await getAccountSummary('user-1', '7d');
 
     expect(result.sessions).toBe(1);
-    expect(result.assets_generated.images).toBe(0);
-    expect(result.assets_generated.videos).toBe(0);
-    expect(result.assets_generated.reports).toBe(0);
-    expect(result.assets_generated.social_media_posts).toBe(0);
-    expect(result.assets_published.count).toBe(0);
+    expect(result.assets.images).toBe(0);
+    expect(result.assets.videos).toBe(0);
+    expect(result.assets.reports).toBe(0);
+    expect(result.assets.social_posts).toBe(0);
+    expect(result.results.published.count).toBe(0);
   });
 
-  // --- IMPACT METRICS: Leads ---
+  // --- RESULTS: Leads ---
 
   test('counts leads added within time range across lead lists', async () => {
     mockGetSessions.mockResolvedValue([]);
@@ -326,7 +299,7 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.impact_metrics.leads_added).toBe(3); // lead-1, lead-2, lead-4
+    expect(result.results.leads_added).toBe(3); // lead-1, lead-2, lead-4
   });
 
   test('handles paginated lead results', async () => {
@@ -346,10 +319,10 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.impact_metrics.leads_added).toBe(2);
+    expect(result.results.leads_added).toBe(2);
   });
 
-  // --- IMPACT METRICS: Email ---
+  // --- RESULTS: Email ---
 
   test('counts email events by type within time range', async () => {
     mockGetSessions.mockResolvedValue([]);
@@ -357,7 +330,6 @@ describe('getAccountSummary', () => {
     mockGetEmailEvents.mockResolvedValue([
       { eventType: 'email.delivered', createdAt: '2026-03-08T10:00:00.000Z' },
       { eventType: 'email.delivered', createdAt: '2026-03-07T10:00:00.000Z' },
-      { eventType: 'email.opened', createdAt: '2026-03-08T11:00:00.000Z' },
       { eventType: 'email.clicked', createdAt: '2026-03-08T12:00:00.000Z' },
       { eventType: 'email.received', createdAt: '2026-03-08T13:00:00.000Z' }, // reply
       { eventType: 'email.bounced', createdAt: '2026-03-08T14:00:00.000Z' },
@@ -366,11 +338,10 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.impact_metrics.email.delivered).toBe(2);
-    expect(result.impact_metrics.email.opened).toBe(1);
-    expect(result.impact_metrics.email.clicked).toBe(1);
-    expect(result.impact_metrics.email.replied).toBe(1);
-    expect(result.impact_metrics.email.bounced).toBe(1);
+    expect(result.results.email.delivered).toBe(2);
+    expect(result.results.email.clicked).toBe(1);
+    expect(result.results.email.replied).toBe(1);
+    expect(result.results.email.bounced).toBe(1);
   });
 
   test('skips email metrics when user has no emailDomain', async () => {
@@ -379,11 +350,11 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.impact_metrics.email.delivered).toBe(0);
+    expect(result.results.email.delivered).toBe(0);
     expect(mockGetEmailEvents).not.toHaveBeenCalled();
   });
 
-  // --- IMPACT METRICS: Social Media ---
+  // --- RESULTS: Social Media ---
 
   test('aggregates social media impressions and engagements from connected accounts', async () => {
     mockGetSessions.mockResolvedValue([]);
@@ -416,9 +387,9 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.impact_metrics.social_media.total_impressions).toBe(2000); // 1200 + 800
-    expect(result.impact_metrics.social_media.total_engagements).toBe(93); // (45+12+8) + (20+5+3)
-    expect(result.impact_metrics.social_media.total_clicks).toBe(129); // 89 + 40
+    expect(result.results.social_media.impressions).toBe(2000); // 1200 + 800
+    expect(result.results.social_media.engagements).toBe(93); // (45+12+8) + (20+5+3)
+    expect(result.results.social_media.clicks).toBe(129); // 89 + 40
   });
 
   test('handles social media API failure gracefully', async () => {
@@ -427,8 +398,8 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.impact_metrics.social_media.total_impressions).toBe(0);
-    expect(result.impact_metrics.social_media.total_engagements).toBe(0);
+    expect(result.results.social_media.impressions).toBe(0);
+    expect(result.results.social_media.engagements).toBe(0);
   });
 
   test('skips inactive connected accounts', async () => {
@@ -456,6 +427,6 @@ describe('getAccountSummary', () => {
     // Only acc-2 should be queried
     expect(mockLoadPosts).toHaveBeenCalledTimes(1);
     expect(mockLoadPosts).toHaveBeenCalledWith('user-1', 'acc-2', { limit: 50, include_metrics: true });
-    expect(result.impact_metrics.social_media.total_impressions).toBe(500);
+    expect(result.results.social_media.impressions).toBe(500);
   });
 });
