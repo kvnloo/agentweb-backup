@@ -94,6 +94,12 @@ router.get('/me', authenticateToken, async (req, res) => {
       }
     }
 
+    // Add trial status
+    if (user.trial_start || user.trial_end) {
+      const { getTrialStatus } = await import('../services/trialService');
+      response.trialStatus = getTrialStatus(user.trial_start, user.trial_end);
+    }
+
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
 
     res.json(response);

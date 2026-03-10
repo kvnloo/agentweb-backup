@@ -151,6 +151,8 @@ export interface User {
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  trial_start?: string; // ISO date when free trial began
+  trial_end?: string; // ISO date when free trial expires
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook' 
     | 'meta' | 'twitter' | 'instagram';

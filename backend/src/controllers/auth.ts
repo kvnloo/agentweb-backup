@@ -7,6 +7,7 @@ import { waitlistDb } from "../services/waitlistDb";
 import { v4 as uuidv4 } from "uuid";
 import { emailService } from "../services/emailService";
 import crypto from "crypto";
+import { DEFAULT_TRIAL_DAYS, calculateTrialEnd } from "../services/trialService";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -91,6 +92,21 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist // from waitlist
     );
+
+    // Set up free trial for new users (unless they already have a Stripe subscription)
+    if (!stripe_customer_id) {
+      const trialStart = new Date();
+      const trialEnd = calculateTrialEnd(trialStart, DEFAULT_TRIAL_DAYS);
+      try {
+        await userDb.updateUser(userId, {
+          trial_start: trialStart.toISOString(),
+          trial_end: trialEnd.toISOString(),
+        });
+      } catch (trialError) {
+        console.error("Error setting trial dates:", trialError);
+        // Don't fail registration if trial setup fails
+      }
+    }
 
     // JWT includes roles array
     const token = jwt.sign(

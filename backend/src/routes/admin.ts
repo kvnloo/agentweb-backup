@@ -386,6 +386,36 @@ router.get("/users/:userId", async (req, res) => {
   }
 });
 
+// Extend a user's trial period
+router.put("/users/:userId/extend-trial", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { days } = req.body;
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const { EXTENDED_TRIAL_DAYS, calculateTrialEnd } = await import("../services/trialService");
+    const durationDays = typeof days === "number" && days > 0 ? days : EXTENDED_TRIAL_DAYS;
+    const trialEnd = calculateTrialEnd(new Date(), durationDays);
+
+    await userDb.updateUser(userId, {
+      trial_start: user.trial_start || new Date().toISOString(),
+      trial_end: trialEnd.toISOString(),
+    });
+
+    res.json({
+      message: `Trial extended to ${durationDays} days`,
+      trial_end: trialEnd.toISOString(),
+    });
+  } catch (error: any) {
+    console.error("Error extending trial:", error);
+    res.status(500).json({ message: error.message || "Error extending trial" });
+  }
+});
+
 // Deactivate user
 router.post("/users/:userId/deactivate", async (req, res) => {
   try {
