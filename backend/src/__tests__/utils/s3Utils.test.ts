@@ -13,7 +13,7 @@ jest.mock('aws-sdk', () => {
 });
 
 // Import after mocking
-import { uploadFileToS3, uploadFileToS3WithPath } from '../../utils/s3Utils';
+import { uploadFileToS3, uploadFileToS3WithPath, isAllowedUploadType } from '../../utils/s3Utils';
 
 describe('s3Utils', () => {
   beforeEach(() => {
@@ -155,6 +155,70 @@ describe('s3Utils', () => {
       );
 
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('isAllowedUploadType', () => {
+    it('should allow safe image types', () => {
+      expect(isAllowedUploadType('photo.jpg', 'image/jpeg')).toBe(true);
+      expect(isAllowedUploadType('image.png', 'image/png')).toBe(true);
+      expect(isAllowedUploadType('anim.gif', 'image/gif')).toBe(true);
+      expect(isAllowedUploadType('pic.webp', 'image/webp')).toBe(true);
+    });
+
+    it('should allow safe document types', () => {
+      expect(isAllowedUploadType('doc.pdf', 'application/pdf')).toBe(true);
+      expect(isAllowedUploadType('data.csv', 'text/csv')).toBe(true);
+      expect(isAllowedUploadType('notes.txt', 'text/plain')).toBe(true);
+    });
+
+    it('should allow video and audio types', () => {
+      expect(isAllowedUploadType('clip.mp4', 'video/mp4')).toBe(true);
+      expect(isAllowedUploadType('song.mp3', 'audio/mpeg')).toBe(true);
+    });
+
+    it('should block HTML files (XSS vector)', () => {
+      expect(isAllowedUploadType('page.html', 'text/html')).toBe(false);
+      expect(isAllowedUploadType('page.htm', 'text/html')).toBe(false);
+      expect(isAllowedUploadType('page.xhtml', 'application/xhtml+xml')).toBe(false);
+    });
+
+    it('should block SVG files (script injection vector)', () => {
+      expect(isAllowedUploadType('icon.svg', 'image/svg+xml')).toBe(false);
+    });
+
+    it('should block JavaScript files', () => {
+      expect(isAllowedUploadType('script.js', 'application/javascript')).toBe(false);
+      expect(isAllowedUploadType('module.mjs', 'application/javascript')).toBe(false);
+    });
+
+    it('should block executable files', () => {
+      expect(isAllowedUploadType('app.exe', 'application/octet-stream')).toBe(false);
+      expect(isAllowedUploadType('script.sh', 'application/x-sh')).toBe(false);
+      expect(isAllowedUploadType('run.bat', 'application/x-msdos-program')).toBe(false);
+    });
+
+    it('should block server-side script extensions', () => {
+      expect(isAllowedUploadType('page.php', 'text/plain')).toBe(false);
+      expect(isAllowedUploadType('page.jsp', 'text/plain')).toBe(false);
+      expect(isAllowedUploadType('app.py', 'text/plain')).toBe(false);
+    });
+
+    it('should block based on extension even with allowed MIME type', () => {
+      // MIME spoofing: claims to be image/jpeg but has .html extension
+      expect(isAllowedUploadType('malicious.html', 'image/jpeg')).toBe(false);
+    });
+
+    it('should reject unknown MIME types with safe extensions', () => {
+      expect(isAllowedUploadType('data.bin', 'application/octet-stream')).toBe(false);
+    });
+
+    it('should handle empty filename gracefully', () => {
+      expect(isAllowedUploadType('', 'image/jpeg')).toBe(true);
+    });
+
+    it('should be case-insensitive for MIME types', () => {
+      expect(isAllowedUploadType('photo.jpg', 'IMAGE/JPEG')).toBe(true);
     });
   });
 
