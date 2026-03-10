@@ -1,10 +1,11 @@
 import express from 'express';
 import { settingsService } from '../services/settingsService';
+import { authenticateToken, requireAdmin } from '../middleware/auth';
 
 const router = express.Router();
 
 // Get image model configuration (default model and supported models)
-router.get('/', async (req, res) => {
+router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Get default image model
     const defaultModelSetting = await settingsService.getSetting('default_image_model');

@@ -2,6 +2,7 @@ import express from 'express';
 import { settingsService } from '../services/settingsService';
 import { authenticateToken, requireAdmin } from '../middleware/auth';
 import { userDb } from '../services/db';
+import { redactSensitiveValues } from '../utils/settingsRedaction';
 
 const router = express.Router();
 
@@ -92,7 +93,7 @@ const extractVariables = (htmlContent: string, subject?: string): { variables: s
 router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const settings = await settingsService.getGlobalSettings();
-    res.json(settings);
+    res.json(redactSensitiveValues(settings));
   } catch (error) {
     console.error('Error getting settings:', error);
     res.status(500).json({ error: 'Failed to get settings' });
