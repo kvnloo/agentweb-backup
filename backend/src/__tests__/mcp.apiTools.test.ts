@@ -261,7 +261,7 @@ describe('apiTools', () => {
         }),
       }));
       // No attachments when media_urls not provided
-      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
       expect(callBody.attachments).toBeUndefined();
     });
 
@@ -274,7 +274,7 @@ describe('apiTools', () => {
         media_urls: ['https://s3.amazonaws.com/img1.png', 'https://s3.amazonaws.com/img2.jpg'],
       }, context);
 
-      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
       expect(callBody.attachments).toEqual([
         { url: 'https://s3.amazonaws.com/img1.png', filename: 'img1.png' },
         { url: 'https://s3.amazonaws.com/img2.jpg', filename: 'img2.jpg' },
@@ -290,7 +290,7 @@ describe('apiTools', () => {
         media_urls: [],
       }, context);
 
-      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
       expect(callBody.attachments).toBeUndefined();
     });
 
@@ -303,7 +303,7 @@ describe('apiTools', () => {
         media_urls: ['https://bucket.s3.us-west-2.amazonaws.com/uploads/screenshot-dashboard.png'],
       }, context);
 
-      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      const callBody = mockMcpFetch.mock.calls[0][0].body as any;
       expect(callBody.attachments[0].filename).toBe('screenshot-dashboard.png');
     });
 
