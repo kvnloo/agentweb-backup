@@ -42,6 +42,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { userDb, crmDb } from '../services/db';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { agentModeService } from '../services/agentModeService';
+import { getPostsByUserId } from '../services/linkedInPostsDb';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
@@ -66,6 +67,10 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
+jest.mock('../services/linkedInPostsDb', () => ({
+  getPostsByUserId: jest.fn().mockResolvedValue([]),
+}));
+
 const mockGetSessions = chatbotDb.getSessionsWithoutMessages as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
@@ -73,6 +78,7 @@ const mockGetLeads = crmDb.getLeadsByListId as jest.Mock;
 const mockGetEmailEvents = emailEventsDb.getEventsByEmailDomain as jest.Mock;
 const mockListAccounts = agentModeService.listConnectedAccounts as jest.Mock;
 const mockLoadPosts = agentModeService.loadConnectedAccountPosts as jest.Mock;
+const mockGetStoredPosts = getPostsByUserId as jest.Mock;
 
 function makeSession(overrides: Record<string, any> = {}) {
   return {
@@ -95,6 +101,7 @@ describe('getAccountSummary', () => {
     mockGetEmailEvents.mockResolvedValue([]);
     mockListAccounts.mockResolvedValue({ success: true, accounts: [] });
     mockLoadPosts.mockResolvedValue({ success: true, posts: [] });
+    mockGetStoredPosts.mockResolvedValue([]);
   });
 
   // --- FAIL CASES ---
@@ -110,6 +117,7 @@ describe('getAccountSummary', () => {
     expect(result.results.published.count).toBe(0);
     expect(result.results.leads_added).toBe(0);
     expect(result.results.email.delivered).toBe(0);
+    expect(result.results.social_media.posts_published).toBe(0);
     expect(result.results.social_media.impressions).toBe(0);
   });
 
@@ -189,6 +197,7 @@ describe('getAccountSummary', () => {
     const result = await getAccountSummary('user-1', '7d');
 
     expect(result.assets.social_posts).toBe(5); // 3 + 2
+    expect(result.results.published.count).toBe(2); // post_on_connected_account: 2
   });
 
   test('counts blog articles and deep research as reports via calledFunctions', async () => {
@@ -215,7 +224,7 @@ describe('getAccountSummary', () => {
     expect(result.assets.reports).toBe(5);
   });
 
-  test('counts published assets from publishStatuses with incomplete note', async () => {
+  test('counts published from both publishStatuses and calledFunctions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({
         createdAt: '2026-03-08T10:00:00.000Z',
@@ -223,6 +232,10 @@ describe('getAccountSummary', () => {
           'https://s3/img1.png': 'published',
           'https://s3/img2.png': 'draft',
           'https://s3/report.html': 'manually_published',
+        },
+        calledFunctions: {
+          'publish_blog_article': 2,
+          'post_on_connected_account': 1,
         },
       }),
       makeSession({
@@ -235,7 +248,9 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.results.published.count).toBe(4); // published + draft + manually_published + published
+    // 3 from calledFunctions (2 publish_blog_article + 1 post_on_connected_account)
+    // + 4 from publishStatuses (published + draft + manually_published + published)
+    expect(result.results.published.count).toBe(7);
     expect(result.results.published.note).toMatch(/may not reflect/i);
   });
 
@@ -358,8 +373,25 @@ describe('getAccountSummary', () => {
 
   // --- RESULTS: Social Media ---
 
+  test('counts posts_published from stored posts within time range', async () => {
+    mockGetSessions.mockResolvedValue([]);
+    mockGetStoredPosts.mockResolvedValue([
+      { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Hello', createdAt: '2026-03-08T10:00:00.000Z' },
+      { userId: 'user-1', postId: 'post-2', accountId: 'acc-1', content: 'World', createdAt: '2026-03-07T10:00:00.000Z' },
+      { userId: 'user-1', postId: 'post-3', accountId: 'acc-1', content: 'Old', createdAt: '2026-01-01T10:00:00.000Z' }, // outside range
+    ]);
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.results.social_media.posts_published).toBe(2);
+  });
+
   test('aggregates social media impressions and engagements from connected accounts', async () => {
     mockGetSessions.mockResolvedValue([]);
+    mockGetStoredPosts.mockResolvedValue([
+      { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post 1', createdAt: '2026-03-08T10:00:00.000Z' },
+      { userId: 'user-1', postId: 'post-2', accountId: 'acc-1', content: 'Post 2', createdAt: '2026-03-07T10:00:00.000Z' },
+    ]);
     mockListAccounts.mockResolvedValue({
       success: true,
       accounts: [
@@ -389,9 +421,25 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
+    expect(result.results.social_media.posts_published).toBe(2);
     expect(result.results.social_media.impressions).toBe(2000); // 1200 + 800
     expect(result.results.social_media.engagements).toBe(93); // (45+12+8) + (20+5+3)
     expect(result.results.social_media.clicks).toBe(129); // 89 + 40
+  });
+
+  test('returns posts_published even when live API fails', async () => {
+    mockGetSessions.mockResolvedValue([]);
+    mockGetStoredPosts.mockResolvedValue([
+      { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post', createdAt: '2026-03-08T10:00:00.000Z' },
+    ]);
+    mockListAccounts.mockRejectedValue(new Error('Token expired'));
+
+    const result = await getAccountSummary('user-1', '7d');
+
+    expect(result.results.social_media.posts_published).toBe(1);
+    expect(result.results.social_media.impressions).toBe(0);
+    expect(result.results.social_media.engagements).toBe(0);
+    expect(result.results.social_media.clicks).toBe(0);
   });
 
   test('handles social media API failure gracefully', async () => {
@@ -400,6 +448,7 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
+    expect(result.results.social_media.posts_published).toBe(0);
     expect(result.results.social_media.impressions).toBe(0);
     expect(result.results.social_media.engagements).toBe(0);
   });
