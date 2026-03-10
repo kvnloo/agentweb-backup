@@ -45,6 +45,7 @@ import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import landingPagesRoutes from "./routes/landingPages";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
+import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -128,13 +129,14 @@ const corsOptions = {
 
 // CORS middleware with exception for public subscriber join endpoint
 app.use((req, res, next) => {
-  // Check if this is the public subscriber join endpoint
-  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/)) {
-    // Allow all origins for this endpoint only
+  // Check if this is a public endpoint that needs open CORS
+  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
+      req.path.startsWith('/api/lead-magnet/')) {
+    // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
+
     // Handle preflight requests
     if (req.method === 'OPTIONS') {
       return res.status(200).end();
@@ -202,7 +204,7 @@ app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.use("/review", reviewRouter);
-
+app.use("/api/lead-magnet", leadMagnetRoutes);
 
 
 // Agent API documentation (public, no auth)
