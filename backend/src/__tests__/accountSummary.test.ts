@@ -189,6 +189,7 @@ describe('getAccountSummary', () => {
     const result = await getAccountSummary('user-1', '7d');
 
     expect(result.assets.social_posts).toBe(5); // 3 + 2
+    expect(result.results.published.count).toBe(2); // post_on_connected_account: 2
   });
 
   test('counts blog articles and deep research as reports via calledFunctions', async () => {
@@ -215,7 +216,7 @@ describe('getAccountSummary', () => {
     expect(result.assets.reports).toBe(5);
   });
 
-  test('counts published assets from publishStatuses with incomplete note', async () => {
+  test('counts published from both publishStatuses and calledFunctions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({
         createdAt: '2026-03-08T10:00:00.000Z',
@@ -223,6 +224,10 @@ describe('getAccountSummary', () => {
           'https://s3/img1.png': 'published',
           'https://s3/img2.png': 'draft',
           'https://s3/report.html': 'manually_published',
+        },
+        calledFunctions: {
+          'publish_blog_article': 2,
+          'post_on_connected_account': 1,
         },
       }),
       makeSession({
@@ -235,7 +240,9 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.results.published.count).toBe(4); // published + draft + manually_published + published
+    // 3 from calledFunctions (2 publish_blog_article + 1 post_on_connected_account)
+    // + 4 from publishStatuses (published + draft + manually_published + published)
+    expect(result.results.published.count).toBe(7);
     expect(result.results.published.note).toMatch(/may not reflect/i);
   });
 
