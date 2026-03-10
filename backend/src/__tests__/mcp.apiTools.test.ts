@@ -241,6 +241,81 @@ describe('apiTools', () => {
     });
   });
 
+  // ─── emma_send_message media_urls ────────────────────────────────────
+
+  describe('emma_send_message', () => {
+    it('should send message without media_urls', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'Hello!' });
+
+      await mcpToolRegistry.execute('emma_send_message', {
+        session_id: 'sess-1',
+        message: 'Hi Emma',
+      }, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        body: expect.objectContaining({
+          sessionId: 'sess-1',
+          userMessage: 'Hi Emma',
+        }),
+      }));
+      // No attachments when media_urls not provided
+      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      expect(callBody.attachments).toBeUndefined();
+    });
+
+    it('should map media_urls to attachments array', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'Got the images!' });
+
+      await mcpToolRegistry.execute('emma_send_message', {
+        session_id: 'sess-1',
+        message: 'Check these screenshots',
+        media_urls: ['https://s3.amazonaws.com/img1.png', 'https://s3.amazonaws.com/img2.jpg'],
+      }, context);
+
+      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      expect(callBody.attachments).toEqual([
+        { url: 'https://s3.amazonaws.com/img1.png', filename: 'img1.png' },
+        { url: 'https://s3.amazonaws.com/img2.jpg', filename: 'img2.jpg' },
+      ]);
+    });
+
+    it('should handle empty media_urls array (no attachments)', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_send_message', {
+        session_id: 'sess-1',
+        message: 'No images',
+        media_urls: [],
+      }, context);
+
+      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      expect(callBody.attachments).toBeUndefined();
+    });
+
+    it('should extract filename from URL path', async () => {
+      mockMcpFetch.mockResolvedValue({ response: 'OK' });
+
+      await mcpToolRegistry.execute('emma_send_message', {
+        session_id: 'sess-1',
+        message: 'test',
+        media_urls: ['https://bucket.s3.us-west-2.amazonaws.com/uploads/screenshot-dashboard.png'],
+      }, context);
+
+      const callBody = mockMcpFetch.mock.calls[0][0].body;
+      expect(callBody.attachments[0].filename).toBe('screenshot-dashboard.png');
+    });
+
+    it('should include media_urls in tool input schema', () => {
+      const defs = mcpToolRegistry.getToolDefinitions();
+      const emmaSend = defs.find((d: any) => d.name === 'emma_send_message');
+      expect(emmaSend).toBeDefined();
+      expect(emmaSend!.inputSchema.properties.media_urls).toBeDefined();
+      expect(emmaSend!.inputSchema.properties.media_urls.type).toBe('array');
+    });
+  });
+
   describe('manage_gtm_items - add_phase', () => {
     it('should call POST /api/gtm-plan/:id/phases', async () => {
       mockMcpFetch.mockResolvedValue({ phaseId: 'phase-1' });
