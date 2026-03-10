@@ -168,10 +168,10 @@ describe('Stripe Customer ID Consistency - Admin Upgrade Path', () => {
   });
 
   it('should copy stripe_customer_id from waitlist when upgrading free user to customer', async () => {
-    const freeUser = {
+    const freeUser: { userId: string; email: string; roles: string[]; stripe_customer_id?: string } = {
       userId: 'user-123',
       email: 'free@example.com',
-      roles: ['free'] as string[],
+      roles: ['free'],
       // No stripe_customer_id
     };
 
@@ -232,10 +232,10 @@ describe('Stripe Customer ID Consistency - Admin Upgrade Path', () => {
   });
 
   it('should handle case where waitlist has no stripe_customer_id', async () => {
-    const freeUser = {
+    const freeUser: { userId: string; email: string; roles: string[]; stripe_customer_id?: string } = {
       userId: 'user-789',
       email: 'nostripe@example.com',
-      roles: ['free'] as string[],
+      roles: ['free'],
     };
 
     const waitlistEntry = {
