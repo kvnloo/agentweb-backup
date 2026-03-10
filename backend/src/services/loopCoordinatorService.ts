@@ -1,6 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
 import { loopDb } from './db';
 
+export type OnLoopFailure = (loopId: string, loopName: string, error: string, runId: string) => Promise<void>;
+
 export interface LoopDefinition {
   id: string;
   name: string;
@@ -28,6 +30,11 @@ export interface LoopStatus {
 
 export class LoopCoordinatorService {
   private loops: Map<string, LoopState> = new Map();
+  private onFailure: OnLoopFailure | null = null;
+
+  setOnFailure(handler: OnLoopFailure): void {
+    this.onFailure = handler;
+  }
 
   registerLoop(definition: LoopDefinition): void {
     if (this.loops.has(definition.id)) {
@@ -151,6 +158,12 @@ export class LoopCoordinatorService {
       }).catch((e: any) => console.error('Failed to update loop run:', e));
 
       console.error(`Loop "${state.definition.id}" execution failed:`, error.message);
+
+      // Trigger escalation callback if configured
+      if (this.onFailure) {
+        this.onFailure(state.definition.id, state.definition.name, error.message || 'Unknown error', runId)
+          .catch((e: any) => console.error('Escalation callback failed:', e));
+      }
     } finally {
       state.executing = false;
     }

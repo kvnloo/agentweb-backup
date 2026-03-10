@@ -455,4 +455,51 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
   }
 });
 
+// Queue for Fireflies transcript processing
+const firefliesQueue: Array<{
+  transcriptId: string;
+  meetingTitle: string;
+  receivedAt: string;
+}> = [];
+
+/**
+ * POST /api/webhooks/fireflies
+ * Receives Fireflies.ai webhook events when a transcript is ready.
+ * Queues the transcript for action item extraction by the loop coordinator.
+ */
+router.post('/fireflies', (req: express.Request, res: express.Response) => {
+  const { event_type, data } = req.body;
+
+  if (!event_type) {
+    res.status(400).json({ error: 'event_type is required' });
+    return;
+  }
+
+  // Only process transcript-ready events
+  if (event_type !== 'Transcription completed') {
+    res.status(200).json({ status: 'ignored', event_type });
+    return;
+  }
+
+  if (!data?.transcript_id) {
+    res.status(400).json({ error: 'transcript_id is required in data' });
+    return;
+  }
+
+  firefliesQueue.push({
+    transcriptId: data.transcript_id,
+    meetingTitle: data.meeting_title || 'Untitled Meeting',
+    receivedAt: new Date().toISOString(),
+  });
+
+  res.status(200).json({
+    status: 'queued',
+    transcript_id: data.transcript_id,
+  });
+});
+
+export function getFirefliesQueue() {
+  return firefliesQueue;
+}
+
 export default router;
