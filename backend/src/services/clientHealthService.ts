@@ -1,0 +1,385 @@
+/**
+ * Client Health Assessment Service
+ *
+ * Provides admin-only tools for assessing client health across three layers:
+ * 1. Ads layer — Meta ad account connectivity and campaign status
+ * 2. Lander layer — Landing page / website presence
+ * 3. Lead quality layer — CRM / lead capture setup
+ *
+ * Also provides creative variety heuristics from ad-level data.
+ */
+
+import { userDb } from './db';
+import { getAccountsByUserId } from './connectedAccountsDb';
+
+type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
+
+interface AdsLayerHealth {
+  connected: boolean;
+  ad_account_id?: string;
+  active_campaigns: number;
+  campaigns?: Array<{ id: string; name: string; status: string; objective: string }>;
+}
+
+interface LanderLayerHealth {
+  has_lander: boolean;
+  platforms: string[];
+}
+
+interface LeadQualityLayerHealth {
+  has_crm: boolean;
+  platforms: string[];
+}
+
+interface CreativeVariety {
+  distinct_creatives: number;
+  cannibalization_warning: boolean;
+  fatigue_warning: boolean;
+  top_creatives?: Array<{ id: string; name: string; spend_pct: number }>;
+}
+
+interface ClientHealthAssessment {
+  client: { userId: string; email: string; displayName: string };
+  ads_layer: AdsLayerHealth;
+  lander_layer: LanderLayerHealth;
+  lead_quality_layer: LeadQualityLayerHealth;
+  creative_variety: CreativeVariety;
+  status: HealthStatus;
+  status_reasons: string[];
+}
+
+interface ClientSummary {
+  userId: string;
+  email: string;
+  displayName: string;
+  roles: string[];
+  has_ads: boolean;
+  has_lander: boolean;
+  has_crm: boolean;
+  last_activity: string | null;
+}
+
+/**
+ * Determine overall health status based on the three layers.
+ */
+function determineStatus(
+  adsLayer: AdsLayerHealth,
+  landerLayer: LanderLayerHealth,
+  leadQualityLayer: LeadQualityLayerHealth,
+  creativeVariety: CreativeVariety
+): { status: HealthStatus; reasons: string[] } {
+  const reasons: string[] = [];
+
+  if (!adsLayer.connected) {
+    reasons.push('No Meta ad account connected');
+  }
+  if (adsLayer.connected && adsLayer.active_campaigns === 0) {
+    reasons.push('No active ad campaigns');
+  }
+  if (!landerLayer.has_lander) {
+    reasons.push('No landing page or website detected');
+  }
+  if (!leadQualityLayer.has_crm) {
+    reasons.push('No CRM or lead capture integration');
+  }
+  if (creativeVariety.cannibalization_warning) {
+    reasons.push('Creative cannibalization: 2 ads taking >80% of spend');
+  }
+  if (creativeVariety.fatigue_warning) {
+    reasons.push('Potential creative fatigue: limited creative variety');
+  }
+
+  // Determine status
+  let status: HealthStatus;
+  if (!adsLayer.connected) {
+    status = 'blocked';
+  } else if (adsLayer.active_campaigns === 0 && !landerLayer.has_lander) {
+    status = 'blocked';
+  } else if (reasons.length === 0) {
+    status = 'healthy';
+  } else if (reasons.length <= 2) {
+    status = 'mediocre';
+  } else {
+    status = 'at-risk';
+  }
+
+  return { status, reasons };
+}
+
+/**
+ * Assess a single client's health. Admin-only.
+ */
+export async function assessClientHealth(
+  callerUserId: string,
+  clientNameOrEmail: string
+): Promise<any> {
+  try {
+    // Auth gate: check caller is admin
+    const caller = await userDb.getUserById(callerUserId);
+    if (!caller || !caller.isAdmin) {
+      return {
+        success: false,
+        message: 'Access denied. Only admin users can assess client health.',
+        error: 'Admin access required',
+      };
+    }
+
+    // Look up client by email first, then by name
+    let client = await userDb.getUserByEmail(clientNameOrEmail);
+
+    if (!client) {
+      // Try name match
+      const allUsers = await userDb.getAllUsers();
+      const searchLower = clientNameOrEmail.toLowerCase();
+      client = allUsers.find(
+        (u: any) =>
+          (u.displayName && u.displayName.toLowerCase().includes(searchLower)) ||
+          (u.email && u.email.toLowerCase().includes(searchLower))
+      );
+    }
+
+    if (!client) {
+      return {
+        success: false,
+        message: `Client "${clientNameOrEmail}" not found.`,
+        error: 'Client not found',
+      };
+    }
+
+    // Get connected accounts
+    const connectedAccounts = await getAccountsByUserId(client.userId);
+
+    // --- Ads Layer ---
+    const metaAdAccounts = connectedAccounts.filter(
+      (acc: any) => acc.platform === 'meta' && acc.config?.account_type === 'ad_account'
+    );
+    const hasAds = metaAdAccounts.length > 0 || (client.adAccount && client.adAccount.trim() !== '');
+
+    let activeCampaigns: any[] = [];
+    let adLevelData: any[] = [];
+
+    if (hasAds) {
+      try {
+        const { getMetaAccessToken } = await import('../utils/secretsManager');
+        const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
+
+        const accessToken = await getMetaAccessToken();
+        const apiVersion = process.env.META_API_VERSION || 'v18.0';
+        const adAccountId = client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id;
+
+        if (adAccountId) {
+          // Fetch campaigns
+          const campaignsData = await fetchWithRetryAndPaging(
+            `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/campaigns?fields=id,name,status,objective&access_token=${accessToken}`
+          );
+          activeCampaigns = (campaignsData.data || []).filter(
+            (c: any) => c.status === 'ACTIVE'
+          );
+
+          // Fetch ad-level data for creative variety analysis
+          if (activeCampaigns.length > 0) {
+            const adData = await fetchWithRetryAndPaging(
+              `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/ads?fields=id,name,creative{id,name},status,insights.date_preset(last_14d){spend}&filtering=[{"field":"campaign.id","operator":"IN","value":${JSON.stringify(activeCampaigns.map((c: any) => c.id))}}]&access_token=${accessToken}`
+            );
+            adLevelData = adData.data || [];
+          }
+        }
+      } catch (err) {
+        // Non-fatal: ads data unavailable
+        console.error('Client health: Error fetching Meta ads data:', err);
+      }
+    }
+
+    const adsLayer: AdsLayerHealth = {
+      connected: !!hasAds,
+      ad_account_id: client.adAccount || (metaAdAccounts[0]?.config as any)?.ad_account_id,
+      active_campaigns: activeCampaigns.length,
+      campaigns: activeCampaigns.map((c: any) => ({
+        id: c.id,
+        name: c.name,
+        status: c.status,
+        objective: c.objective,
+      })),
+    };
+
+    // --- Lander Layer ---
+    // Check for landing page indicators: productDomain, seoDomains, or website-related configs
+    const hasLander = !!(
+      client.productDomain ||
+      (client.seoDomains && client.seoDomains.length > 0)
+    );
+    const landerPlatforms: string[] = [];
+    if (client.productDomain) landerPlatforms.push('product_domain');
+    if (client.seoDomains && client.seoDomains.length > 0) landerPlatforms.push('seo_domains');
+
+    const landerLayer: LanderLayerHealth = {
+      has_lander: hasLander,
+      platforms: landerPlatforms,
+    };
+
+    // --- Lead Quality Layer ---
+    // Check for CRM integrations via connected accounts or email domain setup
+    const hasCrm = !!(
+      client.emailDomain ||
+      connectedAccounts.some((acc: any) =>
+        acc.platform === 'linkedin' && acc.config?.account_type === 'personal'
+      )
+    );
+    const crmPlatforms: string[] = [];
+    if (client.emailDomain) crmPlatforms.push('email_outreach');
+    if (connectedAccounts.some((acc: any) => acc.platform === 'linkedin')) {
+      crmPlatforms.push('linkedin');
+    }
+
+    const leadQualityLayer: LeadQualityLayerHealth = {
+      has_crm: hasCrm,
+      platforms: crmPlatforms,
+    };
+
+    // --- Creative Variety Heuristic ---
+    const activeAds = adLevelData.filter((ad: any) => ad.status === 'ACTIVE');
+    const distinctCreatives = new Set(
+      activeAds.map((ad: any) => ad.creative?.id).filter(Boolean)
+    ).size;
+
+    // Compute spend distribution
+    let cannibalizationWarning = false;
+    let fatigueWarning = false;
+    const topCreatives: Array<{ id: string; name: string; spend_pct: number }> = [];
+
+    if (activeAds.length > 0) {
+      const adSpends = activeAds.map((ad: any) => ({
+        id: ad.id,
+        name: ad.name,
+        creativeId: ad.creative?.id,
+        spend: parseFloat(ad.insights?.data?.[0]?.spend || '0'),
+      }));
+
+      const totalSpend = adSpends.reduce((sum: number, a: any) => sum + a.spend, 0);
+
+      if (totalSpend > 0) {
+        const sorted = adSpends.sort((a: any, b: any) => b.spend - a.spend);
+        const topTwoSpend = sorted.slice(0, 2).reduce((sum: number, a: any) => sum + a.spend, 0);
+
+        if (sorted.length >= 2 && topTwoSpend / totalSpend > 0.8) {
+          cannibalizationWarning = true;
+        }
+
+        for (const ad of sorted.slice(0, 5)) {
+          topCreatives.push({
+            id: ad.id,
+            name: ad.name,
+            spend_pct: Math.round((ad.spend / totalSpend) * 100),
+          });
+        }
+      }
+
+      if (distinctCreatives <= 1) {
+        fatigueWarning = true;
+      }
+    }
+
+    const creativeVariety: CreativeVariety = {
+      distinct_creatives: distinctCreatives,
+      cannibalization_warning: cannibalizationWarning,
+      fatigue_warning: fatigueWarning,
+      top_creatives: topCreatives,
+    };
+
+    // --- Overall Status ---
+    const { status, reasons } = determineStatus(adsLayer, landerLayer, leadQualityLayer, creativeVariety);
+
+    const health: ClientHealthAssessment = {
+      client: {
+        userId: client.userId,
+        email: client.email,
+        displayName: client.displayName || client.email,
+      },
+      ads_layer: adsLayer,
+      lander_layer: landerLayer,
+      lead_quality_layer: leadQualityLayer,
+      creative_variety: creativeVariety,
+      status,
+      status_reasons: reasons,
+    };
+
+    return {
+      success: true,
+      message: `Health assessment for ${client.displayName || client.email}: ${status.toUpperCase()}`,
+      health,
+    };
+  } catch (error) {
+    console.error('Client health assessment error:', error);
+    return {
+      success: false,
+      message: 'Failed to assess client health',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
+
+/**
+ * List all non-admin clients with quick health indicators. Admin-only.
+ */
+export async function listAllClients(callerUserId: string): Promise<any> {
+  try {
+    // Auth gate: check caller is admin
+    const caller = await userDb.getUserById(callerUserId);
+    if (!caller || !caller.isAdmin) {
+      return {
+        success: false,
+        message: 'Access denied. Only admin users can list clients.',
+        error: 'Admin access required',
+      };
+    }
+
+    const allUsers = await userDb.getAllUsers();
+    const nonAdminUsers = allUsers.filter((u: any) => !u.isAdmin);
+
+    const clients: ClientSummary[] = await Promise.all(
+      nonAdminUsers.map(async (user: any) => {
+        const accounts = await getAccountsByUserId(user.userId);
+
+        const hasAds = !!(
+          accounts.some(
+            (acc: any) => acc.platform === 'meta' && acc.config?.account_type === 'ad_account'
+          ) || (user.adAccount && user.adAccount.trim() !== '')
+        );
+
+        const hasLander = !!(
+          user.productDomain ||
+          (user.seoDomains && user.seoDomains.length > 0)
+        );
+
+        const hasCrm = !!(
+          user.emailDomain ||
+          accounts.some((acc: any) => acc.platform === 'linkedin')
+        );
+
+        return {
+          userId: user.userId,
+          email: user.email,
+          displayName: user.displayName || user.email,
+          roles: user.roles || [],
+          has_ads: hasAds,
+          has_lander: hasLander,
+          has_crm: hasCrm,
+          last_activity: user.lastLoginTime || null,
+        };
+      })
+    );
+
+    return {
+      success: true,
+      message: `Found ${clients.length} client(s)`,
+      clients,
+    };
+  } catch (error) {
+    console.error('List all clients error:', error);
+    return {
+      success: false,
+      message: 'Failed to list clients',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
