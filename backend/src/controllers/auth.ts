@@ -27,7 +27,7 @@ export const register = async (req: Request, res: Response) => {
     // Check if user exists
     const existingUser = await userDb.getUserByEmail(email);
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
+      return res.status(400).json({ message: "Unable to create account. Please try again or use a different email." });
     }
 
     // Determine roles: use reqRoles if provided, otherwise default to ["customer"]
@@ -129,9 +129,9 @@ export const login = async (req: Request, res: Response) => {
 
     const user = await userDb.getUserByEmail(email);
     if (!user) {
-      return res.status(404).json({
-        message: "User not found. Please create an account to continue.",
-        code: "user_not_found",
+      return res.status(401).json({
+        message: "Invalid credentials. Please check your email and password.",
+        code: "invalid_credentials",
       });
     }
 
