@@ -7,6 +7,22 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-10',
+    changes: [
+      'Feature: CRM Group Email (Newsletter)',
+      '- Send a single email to all leads in a CRM lead list — ideal for newsletters and announcements',
+      '- Compose with Text, HTML, or load content from a URL; preview renders in a live email preview pane',
+      '- Variable substitution: use {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{title}}, or {{customFields.xxx}} for personalization',
+      '- "Prepare for sending" validates variable coverage across leads before sending, showing which leads are ready and which are missing data',
+      '- Only leads with all required variable values receive the email; others are skipped automatically',
+      '- Real-time progress bar via WebSocket while emails are sending',
+      '- Send test emails to specific addresses before sending to the full list',
+      '- Customizable unsubscribe footer with {{unsubscribeUrl}} placeholder appended to every email',
+      '- Public unsubscribe page lets recipients opt out with optional feedback; resubscribe option available',
+      '- Unsubscribed leads are marked with an icon in the lead list and can be manually resubscribed from the edit dialog',
+    ],
+  },
+  {
     date: '2026-03-09',
     changes: [
       'Feature: Account Summary Tool',
