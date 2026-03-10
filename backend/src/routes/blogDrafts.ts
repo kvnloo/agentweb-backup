@@ -1,5 +1,5 @@
-import express, { Response } from 'express';
-import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import express from 'express';
+import { authenticateToken } from '../middleware/auth';
 import { isAdmin } from '../middleware/admin';
 import { BlogPostGenerator } from '../services/blogPostGenerator';
 
@@ -28,7 +28,7 @@ router.post(
   '/generate',
   authenticateToken,
   isAdmin,
-  async (req: AuthenticatedRequest, res: Response) => {
+  async (req, res) => {
     try {
       const {
         feature_name,
