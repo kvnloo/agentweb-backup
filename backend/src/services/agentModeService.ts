@@ -16765,6 +16765,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       };
     }
   }
+
+  // --- Client Health Assessment (admin-only) ---
+
+  async assessClientHealth(callerUserId: string, clientNameOrEmail: string): Promise<any> {
+    const { assessClientHealth } = await import('./clientHealthService');
+    return assessClientHealth(callerUserId, clientNameOrEmail);
+  }
+
+  async listAllClients(callerUserId: string): Promise<any> {
+    const { listAllClients } = await import('./clientHealthService');
+    return listAllClients(callerUserId);
+  }
 }
 
 export const agentModeService = new AgentModeService();
