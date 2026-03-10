@@ -896,9 +896,13 @@ router.post("/waitlist/:email/create-user", async (req, res) => {
     let temporaryPassword;
 
     if (existingUser) {
-      // Update existing free user with new roles
+      // Update existing free user with new roles and copy stripe_customer_id if missing
       const updatedRoles = [...(existingUser.roles || []), ...roles];
-      await userDb.updateUser(existingUser.userId, { roles: updatedRoles });
+      const updatePayload: any = { roles: updatedRoles };
+      if (waitlistEntry.stripe_customer_id && !existingUser.stripe_customer_id) {
+        updatePayload.stripe_customer_id = waitlistEntry.stripe_customer_id;
+      }
+      await userDb.updateUser(existingUser.userId, updatePayload);
       resultUser = {
         userId: existingUser.userId,
         email: existingUser.email,
