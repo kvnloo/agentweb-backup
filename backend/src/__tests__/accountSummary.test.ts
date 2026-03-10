@@ -390,7 +390,7 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.posts_published).toBe(2);
   });
 
-  test('aggregates social media impressions and engagements from connected accounts', async () => {
+  test('aggregates social media metrics from posts with created.time format (LinkedIn)', async () => {
     mockGetSessions.mockResolvedValue([]);
     mockGetStoredPosts.mockResolvedValue([
       { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post 1', createdAt: '2026-03-08T10:00:00.000Z' },
@@ -404,17 +404,17 @@ describe('getAccountSummary', () => {
       posts: [
         {
           id: 'post-1',
-          createdAt: '2026-03-08T10:00:00.000Z',
+          created: { time: new Date('2026-03-08T10:00:00.000Z').getTime() },
           metrics: { impressionCount: 1200, likeCount: 45, commentCount: 12, shareCount: 8, clickCount: 89 },
         },
         {
           id: 'post-2',
-          createdAt: '2026-03-07T10:00:00.000Z',
+          created: { time: new Date('2026-03-07T10:00:00.000Z').getTime() },
           metrics: { impressionCount: 800, likeCount: 20, commentCount: 5, shareCount: 3, clickCount: 40 },
         },
         {
           id: 'post-3',
-          createdAt: '2026-01-01T10:00:00.000Z', // outside range
+          created: { time: new Date('2026-01-01T10:00:00.000Z').getTime() }, // outside range
           metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 10 },
         },
       ],
