@@ -76,4 +76,15 @@ describe('Settings value redaction — API key protection', () => {
     redactSensitiveValues(original);
     expect(original[0].settingValue).toBe(originalValue);
   });
+
+  it('should handle invalid JSON that starts with { or [ gracefully', () => {
+    const settings = [
+      { settingName: 'broken_json', settingValue: '{not valid json', description: '', updatedAt: '', updatedBy: '' },
+      { settingName: 'broken_array', settingValue: '[also broken', description: '', updatedAt: '', updatedBy: '' },
+    ];
+    const result = redactSensitiveValues(settings);
+    // Should return as-is since it's not valid JSON and name isn't sensitive
+    expect(result[0].settingValue).toBe('{not valid json');
+    expect(result[1].settingValue).toBe('[also broken');
+  });
 });
