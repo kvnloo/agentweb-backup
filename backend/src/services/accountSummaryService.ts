@@ -3,6 +3,7 @@ import { userDb, crmDb } from './db';
 import { emailEventsDb } from './emailEventsDb';
 import { agentModeService } from './agentModeService';
 import { getPostsByUserId } from './linkedInPostsDb';
+import { getAccountsByUserId } from './connectedAccountsDb';
 
 const TIME_RANGE_DAYS: Record<string, number> = {
   '1d': 1,
@@ -204,30 +205,30 @@ async function getSocialMediaMetrics(
     );
 
     // Try to get live metrics from connected accounts (best-effort)
+    // Uses getAccountsByUserId directly to skip expensive isTokenValid API check
+    // that would mark accounts as inactive even when the adapter can still fetch metrics
     let impressions = 0;
     let engagements = 0;
     let clicks = 0;
 
     try {
-      const result = await agentModeService.listConnectedAccounts(userId);
-      if (result?.success && result.accounts?.length) {
-        const activeAccounts = result.accounts.filter((a: any) => a.is_active);
-        if (activeAccounts.length > 0) {
-          const postResults = await Promise.all(
-            activeAccounts.map((acc: any) =>
-              agentModeService.loadConnectedAccountPosts(userId, acc.id, { limit: 50, include_metrics: true })
-            )
-          );
+      const accounts = await getAccountsByUserId(userId);
+      if (accounts.length > 0) {
+        const postResults = await Promise.all(
+          accounts.map((acc) =>
+            agentModeService.loadConnectedAccountPosts(userId, acc.account_id, { limit: 50, include_metrics: true })
+              .catch(() => null)
+          )
+        );
 
-          for (const postResult of postResults) {
-            if (!postResult?.success || !postResult.posts) continue;
-            for (const post of postResult.posts) {
-              if (!post.createdAt || new Date(post.createdAt) < startDate) continue;
-              if (!post.metrics) continue;
-              impressions += post.metrics.impressionCount ?? 0;
-              engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
-              clicks += post.metrics.clickCount ?? 0;
-            }
+        for (const postResult of postResults) {
+          if (!postResult?.success || !postResult.posts) continue;
+          for (const post of postResult.posts) {
+            if (!post.createdAt || new Date(post.createdAt) < startDate) continue;
+            if (!post.metrics) continue;
+            impressions += post.metrics.impressionCount ?? 0;
+            engagements += (post.metrics.likeCount ?? 0) + (post.metrics.commentCount ?? 0) + (post.metrics.shareCount ?? 0);
+            clicks += post.metrics.clickCount ?? 0;
           }
         }
       }
