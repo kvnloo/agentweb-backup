@@ -2948,4 +2948,285 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * @route POST /api/crm/lists/:listId/batch-email/preview
+ * @desc Generate preview of batch emails with template variable substitution
+ * @access Private
+ */
+router.post('/lists/:listId/batch-email/preview', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { templateName, senderAccountId, partnerEmails, leadIds } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!templateName || !leadIds || !Array.isArray(leadIds) || leadIds.length === 0) {
+      return res.status(400).json({ message: 'Missing required fields: templateName, leadIds' });
+    }
+
+    // Verify list access
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get template
+    const userSettingName = `email_templates_${userId}`;
+    const [userSetting, publicSetting] = await Promise.all([
+      settingsService.getSetting(userSettingName),
+      settingsService.getSetting('email_templates_public')
+    ]);
+
+    let allTemplates: any[] = [];
+    if (userSetting) {
+      try { allTemplates = JSON.parse(userSetting.settingValue); } catch { /* ignore */ }
+    }
+    if (publicSetting) {
+      try {
+        const publicTemplates = JSON.parse(publicSetting.settingValue);
+        allTemplates = [...allTemplates, ...publicTemplates];
+      } catch { /* ignore */ }
+    }
+
+    const template = allTemplates.find((t: any) => t.template_name === templateName);
+    if (!template) {
+      return res.status(404).json({ message: `Template "${templateName}" not found` });
+    }
+
+    // Get leads
+    const previews: any[] = [];
+    for (const leadId of leadIds) {
+      const lead = await crmDb.getLeadById(listId, leadId);
+      if (!lead) continue;
+
+      const partnerName = lead.customFields?.['Backpocket Partner'];
+      const recipientEmail = partnerName && partnerEmails?.[partnerName];
+
+      if (!recipientEmail && !lead.email) continue;
+
+      // Simple variable substitution
+      const variables: Record<string, string> = {
+        fundName: lead.company || '',
+        partnerName: partnerName || '',
+        firstName: lead.firstName || '',
+        lastName: lead.lastName || '',
+        company: lead.company || '',
+        email: lead.email || '',
+        personalizedReason: `Their focus on ${lead.customFields?.['Sector Focus'] || 'technology'} at the ${lead.customFields?.['Stage Focus'] || 'early'} stage aligns well with AgentWeb's positioning.`,
+      };
+
+      // Also add all custom fields as variables
+      if (lead.customFields) {
+        for (const [key, value] of Object.entries(lead.customFields)) {
+          variables[key.replace(/\s+/g, '')] = String(value || '');
+        }
+      }
+
+      let subject = template.subject || '';
+      let htmlBody = template.html_content || '';
+      for (const [key, value] of Object.entries(variables)) {
+        const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'gi');
+        subject = subject.replace(regex, value);
+        htmlBody = htmlBody.replace(regex, value);
+      }
+
+      previews.push({
+        leadId,
+        to: recipientEmail || lead.email,
+        subject,
+        htmlBody,
+        personalizedReason: variables.personalizedReason,
+      });
+    }
+
+    res.json({ previews });
+  } catch (error: any) {
+    console.error('Error generating batch email preview:', error);
+    res.status(500).json({ message: error.message || 'Failed to generate previews' });
+  }
+});
+
+/**
+ * @route POST /api/crm/lists/:listId/batch-email/send
+ * @desc Send batch emails using a template with variable substitution
+ * @access Private
+ */
+router.post('/lists/:listId/batch-email/send', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { templateName, senderAccountId, partnerEmails, leadIds } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!templateName || !senderAccountId || !leadIds || !Array.isArray(leadIds) || leadIds.length === 0) {
+      return res.status(400).json({ message: 'Missing required fields: templateName, senderAccountId, leadIds' });
+    }
+
+    // Verify list access
+    const list = await crmDb.getLeadListById(listId);
+    if (!list || list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Get sender email info
+    const senderSettingName = `crm_sender_emails_${userId}`;
+    const senderSetting = await settingsService.getSetting(senderSettingName);
+    let senderEmail = '';
+    let senderName = '';
+
+    if (senderSetting) {
+      try {
+        const senderEmails = JSON.parse(senderSetting.settingValue);
+        const sender = senderEmails.find((s: any) => s.accountId === senderAccountId || s.email === senderAccountId);
+        if (sender) {
+          senderEmail = sender.email;
+          senderName = sender.name || sender.email.split('@')[0];
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Fallback: try connected accounts
+    if (!senderEmail) {
+      const connectedAccounts = await settingsService.getSetting(`connected_accounts_${userId}`);
+      if (connectedAccounts) {
+        try {
+          const accounts = JSON.parse(connectedAccounts.settingValue);
+          const gmailAccount = accounts.find((a: any) =>
+            a.platform === 'gmail' && (a.accountId === senderAccountId || a.email === senderAccountId)
+          );
+          if (gmailAccount) {
+            senderEmail = gmailAccount.email;
+            senderName = gmailAccount.displayName || gmailAccount.email.split('@')[0];
+          }
+        } catch { /* ignore */ }
+      }
+    }
+
+    if (!senderEmail) {
+      return res.status(400).json({ message: 'Could not resolve sender email. Please configure a sender in CRM settings.' });
+    }
+
+    // Get template
+    const userSettingName = `email_templates_${userId}`;
+    const [userSetting, publicSetting] = await Promise.all([
+      settingsService.getSetting(userSettingName),
+      settingsService.getSetting('email_templates_public')
+    ]);
+
+    let allTemplates: any[] = [];
+    if (userSetting) {
+      try { allTemplates = JSON.parse(userSetting.settingValue); } catch { /* ignore */ }
+    }
+    if (publicSetting) {
+      try {
+        const publicTemplates = JSON.parse(publicSetting.settingValue);
+        allTemplates = [...allTemplates, ...publicTemplates];
+      } catch { /* ignore */ }
+    }
+
+    const template = allTemplates.find((t: any) => t.template_name === templateName);
+    if (!template) {
+      return res.status(404).json({ message: `Template "${templateName}" not found` });
+    }
+
+    // Process each lead
+    const results: any[] = [];
+    let sent = 0;
+    let failed = 0;
+
+    for (const leadId of leadIds) {
+      try {
+        const lead = await crmDb.getLeadById(listId, leadId);
+        if (!lead) {
+          results.push({ leadId, status: 'failed', error: 'Lead not found' });
+          failed++;
+          continue;
+        }
+
+        const partnerName = lead.customFields?.['Backpocket Partner'];
+        const recipientEmail = partnerName && partnerEmails?.[partnerName];
+
+        if (!recipientEmail && !lead.email) {
+          results.push({ leadId, status: 'failed', error: 'No recipient email' });
+          failed++;
+          continue;
+        }
+
+        // Variable substitution
+        const variables: Record<string, string> = {
+          fundName: lead.company || '',
+          partnerName: partnerName || '',
+          firstName: lead.firstName || '',
+          lastName: lead.lastName || '',
+          company: lead.company || '',
+          email: lead.email || '',
+          personalizedReason: `Their focus on ${lead.customFields?.['Sector Focus'] || 'technology'} at the ${lead.customFields?.['Stage Focus'] || 'early'} stage aligns well with AgentWeb's positioning.`,
+        };
+
+        if (lead.customFields) {
+          for (const [key, value] of Object.entries(lead.customFields)) {
+            variables[key.replace(/\s+/g, '')] = String(value || '');
+          }
+        }
+
+        let subject = template.subject || '';
+        let htmlBody = template.html_content || '';
+        for (const [key, value] of Object.entries(variables)) {
+          const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'gi');
+          subject = subject.replace(regex, value);
+          htmlBody = htmlBody.replace(regex, value);
+        }
+
+        const to = recipientEmail || lead.email;
+        const from = `${senderName} <${senderEmail}>`;
+
+        const result = await resendService.sendEmail({
+          from,
+          to,
+          subject,
+          html: htmlBody,
+        });
+
+        if (result) {
+          // Log engagement on the lead record
+          await crmDb.addLeadEngagement(listId, leadId, {
+            eventType: 'email.sent',
+            eventData: {
+              subject,
+              to,
+              from: senderEmail,
+              emailId: result.id,
+              source: 'batch-send',
+              templateName,
+            },
+            createdAt: new Date().toISOString(),
+          });
+
+          results.push({ leadId, status: 'sent' });
+          sent++;
+        } else {
+          results.push({ leadId, status: 'failed', error: 'Send returned no result' });
+          failed++;
+        }
+      } catch (err: any) {
+        results.push({ leadId, status: 'failed', error: err.message || 'Unknown error' });
+        failed++;
+      }
+    }
+
+    res.json({ sent, failed, results });
+  } catch (error: any) {
+    console.error('Error sending batch emails:', error);
+    res.status(500).json({ message: error.message || 'Failed to send batch emails' });
+  }
+});
+
 export default router;
