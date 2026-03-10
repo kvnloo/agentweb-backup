@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
 import { userDb, User } from "../services/db"; // Added userDb and User
+import * as stripeController from "../controllers/stripeController";
 
 dotenv.config();
 
@@ -395,5 +396,34 @@ router.post(
     }
   }
 );
+
+/**
+ * @route POST /api/stripe/create-checkout-session
+ * @desc Create a Stripe Checkout Session for subscription purchase
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/create-checkout-session",
+  authenticateToken,
+  stripeController.createCheckoutSession
+);
+
+/**
+ * @route POST /api/stripe/webhook
+ * @desc Handle Stripe webhook events (signature-verified, raw body)
+ * @access Public (Stripe sends directly — no auth)
+ */
+router.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  stripeController.handleWebhook
+);
+
+/**
+ * @route GET /api/stripe/products
+ * @desc List active Stripe products with prices
+ * @access Public
+ */
+router.get("/products", stripeController.listProducts);
 
 export default router;

@@ -146,7 +146,13 @@ app.use((req, res, next) => {
   // Apply CORS middleware for all other routes
   cors(corsOptions)(req, res, next);
 });
-app.use(express.json({ limit: "50mb" }));
+// Skip JSON parsing for Stripe webhook endpoint (needs raw body for signature verification)
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/stripe/webhook') {
+    return next();
+  }
+  express.json({ limit: "50mb" })(req, res, next);
+});
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
 
