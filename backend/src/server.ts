@@ -1,6 +1,7 @@
 import app from './app';
 import { agentModeService } from './services/agentModeService';
 import { generateMarketingResponseWorkerService } from './services/generateMarketingResponseWorkerService';
+import { loopCoordinatorService } from './services/loopCoordinatorService';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import http from 'http';
@@ -186,6 +187,9 @@ const gracefulShutdown = async (signal: string) => {
 
   // Shutdown worker service
   await generateMarketingResponseWorkerService.shutdown();
+
+  // Shutdown loop coordinator (stops all running loops)
+  await loopCoordinatorService.shutdown();
 
   // Close Socket.IO connections
   io.close((err) => {

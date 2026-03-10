@@ -4665,3 +4665,90 @@ export const accountMemoryDb = {
     }
   },
 };
+
+// ============================
+// Loop Coordinator Database
+// ============================
+const LOOP_RUNS_TABLE = `${TABLE_PREFIX}AW-LoopRuns`;
+
+export const loopDb = {
+  async createLoopRun(run: {
+    runId: string;
+    loopId: string;
+    loopName: string;
+    startedAt: string;
+    status: string;
+  }) {
+    try {
+      await dynamodb.put({
+        TableName: LOOP_RUNS_TABLE,
+        Item: run,
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'createLoopRun');
+      throw error;
+    }
+  },
+
+  async updateLoopRun(runId: string, updates: {
+    status?: string;
+    finishedAt?: string;
+    resultSummary?: string;
+    error?: string;
+  }) {
+    try {
+      const updateParts: string[] = [];
+      const expressionValues: Record<string, any> = {};
+      const expressionNames: Record<string, string> = {};
+
+      if (updates.status !== undefined) {
+        updateParts.push('#status = :status');
+        expressionValues[':status'] = updates.status;
+        expressionNames['#status'] = 'status';
+      }
+      if (updates.finishedAt !== undefined) {
+        updateParts.push('finishedAt = :finishedAt');
+        expressionValues[':finishedAt'] = updates.finishedAt;
+      }
+      if (updates.resultSummary !== undefined) {
+        updateParts.push('resultSummary = :resultSummary');
+        expressionValues[':resultSummary'] = updates.resultSummary;
+      }
+      if (updates.error !== undefined) {
+        updateParts.push('#error = :error');
+        expressionValues[':error'] = updates.error;
+        expressionNames['#error'] = 'error';
+      }
+
+      if (updateParts.length === 0) return;
+
+      await dynamodb.update({
+        TableName: LOOP_RUNS_TABLE,
+        Key: { runId },
+        UpdateExpression: `SET ${updateParts.join(', ')}`,
+        ExpressionAttributeValues: expressionValues,
+        ...(Object.keys(expressionNames).length > 0 ? { ExpressionAttributeNames: expressionNames } : {}),
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'updateLoopRun');
+      throw error;
+    }
+  },
+
+  async getLoopRuns(loopId: string, limit: number = 20): Promise<any[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: LOOP_RUNS_TABLE,
+        IndexName: 'LoopIdIndex',
+        KeyConditionExpression: 'loopId = :loopId',
+        ExpressionAttributeValues: { ':loopId': loopId },
+        ScanIndexForward: false,
+        Limit: limit,
+      }).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getLoopRuns');
+      throw error;
+    }
+  },
+};
