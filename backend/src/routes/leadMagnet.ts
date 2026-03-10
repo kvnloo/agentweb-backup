@@ -69,6 +69,9 @@ router.post('/execute', async (req, res) => {
     if (!taskInput) {
       return res.status(400).json({ message: 'taskInput is required' });
     }
+    if (typeof taskInput !== 'string' || taskInput.length > 2000) {
+      return res.status(400).json({ message: 'taskInput must be a string of 2000 characters or fewer' });
+    }
 
     // Rate limiting — email (1 per day)
     if (isEmailRateLimited(email)) {
