@@ -240,9 +240,11 @@ describe('getAccountSummary', () => {
   });
 
   test('supports different time ranges (1d, 30d, 90d)', async () => {
-    const recentSession = makeSession({ createdAt: '2026-03-09T01:00:00.000Z' });
-    const weekOldSession = makeSession({ createdAt: '2026-03-03T10:00:00.000Z' });
-    const monthOldSession = makeSession({ createdAt: '2026-02-10T10:00:00.000Z' });
+    const now = new Date();
+    const hoursAgo = (h: number) => new Date(now.getTime() - h * 60 * 60 * 1000).toISOString();
+    const recentSession = makeSession({ createdAt: hoursAgo(2) });       // 2 hours ago
+    const weekOldSession = makeSession({ createdAt: hoursAgo(5 * 24) }); // 5 days ago
+    const monthOldSession = makeSession({ createdAt: hoursAgo(25 * 24) }); // 25 days ago
 
     mockGetSessions.mockResolvedValue([recentSession, weekOldSession, monthOldSession]);
 
