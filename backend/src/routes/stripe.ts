@@ -458,7 +458,7 @@ router.post(
       });
 
       // Update user record
-      const periodEnd = new Date(updated.current_period_end * 1000).toISOString();
+      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
       await userDb.updateUser(userId, {
         subscription_status: "canceling",
         current_period_end: periodEnd,
@@ -533,7 +533,7 @@ router.post(
       });
 
       // Update user record
-      const periodEnd = new Date(updated.current_period_end * 1000).toISOString();
+      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
       await userDb.updateUser(userId, {
         subscription_status: "active",
         current_period_end: periodEnd,
@@ -601,7 +601,7 @@ router.post("/webhook", async (req: Request, res: Response) => {
         }
 
         // Map Stripe status to our status
-        let status = subscription.status; // active, past_due, canceled, trialing, etc.
+        let status: string = subscription.status; // active, past_due, canceled, trialing, etc.
         if (
           subscription.status === "active" &&
           subscription.cancel_at_period_end
@@ -612,7 +612,7 @@ router.post("/webhook", async (req: Request, res: Response) => {
         await userDb.updateUser(user.userId, {
           subscription_status: status,
           current_period_end: new Date(
-            subscription.current_period_end * 1000
+            (subscription as any).current_period_end * 1000
           ).toISOString(),
         });
 
