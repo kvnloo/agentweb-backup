@@ -53,6 +53,61 @@ interface McpServerConfig {
   discoveredTools?: string[];
 }
 
+// Redact sensitive values from MCP server configs before returning to clients
+const SENSITIVE_ARG_FLAGS = ['--api-key', '--api_key', '--token', '--secret', '--password', '--key'];
+const SENSITIVE_URL_PARAMS = ['api_key', 'apikey', 'api-key', 'token', 'secret', 'key', 'password'];
+
+function redactValue(val: string): string {
+  if (val.length <= 4) return '***';
+  return val.slice(0, 2) + '***' + val.slice(-2);
+}
+
+function redactConfig(config: McpServerConfig): McpServerConfig {
+  const redacted = { ...config };
+
+  // Redact accessToken
+  if (redacted.accessToken) {
+    redacted.accessToken = redactValue(redacted.accessToken);
+  }
+
+  // Redact env values that look like secrets (keys containing KEY, TOKEN, SECRET, PASSWORD)
+  if (redacted.env) {
+    redacted.env = { ...redacted.env };
+    for (const [k, v] of Object.entries(redacted.env)) {
+      if (/key|token|secret|password|api/i.test(k) && v) {
+        redacted.env[k] = redactValue(v);
+      }
+    }
+  }
+
+  // Redact args values that follow sensitive flags
+  if (redacted.args) {
+    redacted.args = [...redacted.args];
+    for (let i = 0; i < redacted.args.length - 1; i++) {
+      if (SENSITIVE_ARG_FLAGS.includes(redacted.args[i].toLowerCase())) {
+        redacted.args[i + 1] = redactValue(redacted.args[i + 1]);
+      }
+    }
+  }
+
+  // Redact sensitive query params in URLs
+  if (redacted.url) {
+    try {
+      const urlObj = new URL(redacted.url);
+      let changed = false;
+      for (const param of SENSITIVE_URL_PARAMS) {
+        if (urlObj.searchParams.has(param)) {
+          urlObj.searchParams.set(param, redactValue(urlObj.searchParams.get(param) || ''));
+          changed = true;
+        }
+      }
+      if (changed) redacted.url = urlObj.toString();
+    } catch { /* invalid URL, leave as-is */ }
+  }
+
+  return redacted;
+}
+
 // Get all MCP servers
 router.get("/", async (req, res) => {
   try {
@@ -61,7 +116,8 @@ router.get("/", async (req, res) => {
       return res.json([]);
     }
     try {
-      return res.json(JSON.parse(setting.settingValue));
+      const configs: McpServerConfig[] = JSON.parse(setting.settingValue);
+      return res.json(configs.map(redactConfig));
     } catch {
       return res.json([]);
     }
