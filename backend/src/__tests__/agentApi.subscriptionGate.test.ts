@@ -83,6 +83,94 @@ describe('Agent API - Subscription Gate', () => {
       expect(res.body.error).toContain('subscription');
     });
 
+    it('should return 403 when stripeSubscriptionStatus is canceled', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        email: 'test@example.com',
+        stripe_customer_id: 'cus_abc123',
+        stripeSubscriptionStatus: 'canceled',
+      });
+
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'My Key' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain('subscription');
+    });
+
+    it('should return 403 when stripeSubscriptionStatus is past_due', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        email: 'test@example.com',
+        stripe_customer_id: 'cus_abc123',
+        stripeSubscriptionStatus: 'past_due',
+      });
+
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'My Key' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain('subscription');
+    });
+
+    it('should return 201 when stripeSubscriptionStatus is active', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        email: 'test@example.com',
+        stripe_customer_id: 'cus_abc123',
+        stripeSubscriptionStatus: 'active',
+      });
+
+      mockGenerateKey.mockResolvedValue({
+        rawKey: 'aw_testapikey123',
+        keyRecord: {
+          keyId: 'key-uuid',
+          maskedKey: 'aw_...123',
+          keyName: 'My Key',
+          scopes: ['tools:read', 'tools:execute'],
+          rateLimitPerMin: 60,
+          createdAt: '2025-01-01T00:00:00.000Z',
+          status: 'active',
+        },
+      });
+
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'My Key' });
+
+      expect(res.status).toBe(201);
+    });
+
+    it('should return 201 when stripeSubscriptionStatus is trialing', async () => {
+      mockGetUserById.mockResolvedValue({
+        userId: 'test-user-id',
+        email: 'test@example.com',
+        stripe_customer_id: 'cus_abc123',
+        stripeSubscriptionStatus: 'trialing',
+      });
+
+      mockGenerateKey.mockResolvedValue({
+        rawKey: 'aw_testapikey123',
+        keyRecord: {
+          keyId: 'key-uuid',
+          maskedKey: 'aw_...123',
+          keyName: 'My Key',
+          scopes: ['tools:read', 'tools:execute'],
+          rateLimitPerMin: 60,
+          createdAt: '2025-01-01T00:00:00.000Z',
+          status: 'active',
+        },
+      });
+
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({ keyName: 'My Key' });
+
+      expect(res.status).toBe(201);
+    });
+
     it('should return 201 when user has valid stripe_customer_id', async () => {
       mockGetUserById.mockResolvedValue({
         userId: 'test-user-id',
