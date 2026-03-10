@@ -27,6 +27,14 @@ router.post(
         });
       }
 
+      // If we have subscription status tracking, enforce it
+      if (user.stripeSubscriptionStatus &&
+          !['active', 'trialing'].includes(user.stripeSubscriptionStatus)) {
+        return res.status(403).json({
+          error: "Active subscription required to generate API keys",
+        });
+      }
+
       const { rawKey, keyRecord } = await agentApiKeyService.generateKey(
         authReq.user.userId,
         keyName,

@@ -151,6 +151,15 @@ export interface User {
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  stripeSubscriptionId?: string;
+  stripeSubscriptionStatus?: string; // "active", "canceled", "past_due", "paused", "trialing"
+  stripeCurrentPeriodEnd?: string; // ISO date
+  stripeCanceledAt?: string; // ISO date
+  stripeCancelReason?: string;
+  stripeLastPaymentAt?: string; // ISO date
+  stripeLastPaymentAmount?: number; // cents
+  stripeFailedPaymentAt?: string; // ISO date
+  stripeChurnedAt?: string; // ISO date when subscription ended
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook' 
     | 'meta' | 'twitter' | 'instagram';
@@ -632,6 +641,24 @@ class UserDB {
       return result.Items && result.Items.length > 0 ? (result.Items[0] as User) : null;
     } catch (error) {
       this.handleError(error, "getUserByResetToken");
+      return null;
+    }
+  }
+
+  async getUserByStripeCustomerId(stripeCustomerId: string): Promise<User | null> {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: "stripe_customer_id = :customerId",
+        ExpressionAttributeValues: {
+          ":customerId": stripeCustomerId,
+        },
+      };
+
+      const result = await this.docClient.scan(params).promise();
+      return result.Items && result.Items.length > 0 ? (result.Items[0] as User) : null;
+    } catch (error) {
+      this.handleError(error, "getUserByStripeCustomerId");
       return null;
     }
   }

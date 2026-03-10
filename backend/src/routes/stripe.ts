@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
 import { userDb, User } from "../services/db"; // Added userDb and User
+import { handleWebhookEvent, isHandledEvent } from "../services/stripeWebhookService";
 
 dotenv.config();
 
@@ -395,5 +396,45 @@ router.post(
     }
   }
 );
+
+/**
+ * @route POST /api/stripe/webhook
+ * @desc Handle Stripe webhook events for subscription lifecycle
+ * @access Public (verified via Stripe signature)
+ */
+router.post("/webhook", async (req: Request, res: Response) => {
+  if (!stripe) {
+    console.error("Stripe SDK not initialized. Missing STRIPE_SECRET_KEY.");
+    return res.status(500).json({ error: "Stripe integration is not configured correctly." });
+  }
+
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    console.error("STRIPE_WEBHOOK_SECRET is not set.");
+    return res.status(500).json({ error: "Webhook secret not configured." });
+  }
+
+  const sig = req.headers["stripe-signature"];
+  if (!sig) {
+    return res.status(400).json({ error: "Missing stripe-signature header." });
+  }
+
+  let event: Stripe.Event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig as string, webhookSecret);
+  } catch (err: any) {
+    console.error(`[Stripe Webhook] Signature verification failed: ${err.message}`);
+    return res.status(400).json({ error: `Invalid signature: ${err.message}` });
+  }
+
+  try {
+    await handleWebhookEvent(event as any);
+  } catch (err: any) {
+    console.error(`[Stripe Webhook] Error processing event ${event.type}:`, err.message);
+    // Return 200 to prevent Stripe retries for processing errors
+  }
+
+  return res.json({ received: true });
+});
 
 export default router;
