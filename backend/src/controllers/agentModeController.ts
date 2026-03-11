@@ -1209,7 +1209,7 @@ export async function generateSessionResponse(
 }
 
 // Helper function to calculate next run time based on frequency
-const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
+const calculateNextRunTime = (frequency: string, fromDate: Date, frequencyIntervalDays?: number): Date => {
   const now = new Date();
   let nextRun = new Date(fromDate);
 
@@ -1223,6 +1223,17 @@ const calculateNextRunTime = (frequency: string, fromDate: Date): Date => {
         nextRun.setUTCHours(nextRun.getUTCHours() + 1);
       }
       break;
+    case 'every_n_days': {
+      const interval = frequencyIntervalDays && frequencyIntervalDays >= 1 ? frequencyIntervalDays : 1;
+      nextRun.setUTCDate(nextRun.getUTCDate() + interval);
+      // Preserve the time from fromDate
+
+      // If still in the past, keep adding intervals until we're in the future
+      while (nextRun <= now) {
+        nextRun.setUTCDate(nextRun.getUTCDate() + interval);
+      }
+      break;
+    }
     case 'daily':
       nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       // Preserve the time from fromDate
@@ -2736,11 +2747,19 @@ export const agentModeController = {
         llmModel,
         runCount,
         variables,
-        variableValues
+        variableValues,
+        frequencyIntervalDays
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Validate frequencyIntervalDays for every_n_days frequency
+      if (scheduleFrequency === 'every_n_days') {
+        if (frequencyIntervalDays === undefined || !Number.isInteger(frequencyIntervalDays) || frequencyIntervalDays < 1) {
+          return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer when frequency is every_n_days' });
+        }
       }
 
       // Validate runCount if provided
@@ -2773,7 +2792,7 @@ export const agentModeController = {
         scheduledNextRunTime = providedDate.toISOString();
       } else {
         // Default behavior: calculate next run time (9 AM UTC = 1 AM PST)
-        const calculatedTime = calculateNextRunTime(scheduleFrequency, now);
+        const calculatedTime = calculateNextRunTime(scheduleFrequency, now, frequencyIntervalDays);
         scheduledNextRunTime = calculatedTime.toISOString();
       }
 
@@ -2782,6 +2801,7 @@ export const agentModeController = {
         taskId: sessionId || 'global', // Use sessionId if provided, otherwise 'global'
         userId: user.userId,
         frequency: scheduleFrequency, // Map scheduleFrequency to frequency
+        ...(scheduleFrequency === 'every_n_days' && { frequencyIntervalDays }),
         scheduleName,
         description: description || '',
         startingMessage,
@@ -2890,11 +2910,19 @@ export const agentModeController = {
         llmModel,
         runCount,
         variables,
-        variableValues
+        variableValues,
+        frequencyIntervalDays
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Validate frequencyIntervalDays for every_n_days frequency
+      if (scheduleFrequency === 'every_n_days') {
+        if (frequencyIntervalDays === undefined || !Number.isInteger(frequencyIntervalDays) || frequencyIntervalDays < 1) {
+          return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer when frequency is every_n_days' });
+        }
       }
 
       // Validate runCount if provided
@@ -2930,6 +2958,7 @@ export const agentModeController = {
         description: description || '',
         startingMessage,
         frequency: scheduleFrequency,
+        ...(scheduleFrequency === 'every_n_days' && { frequencyIntervalDays }),
         keywords: keywords || [],
         requiredFunctionCalls: requiredFunctionCalls || [],
         functionCallMinCalls: functionCallMinCalls || {},
@@ -3608,7 +3637,7 @@ export const agentModeController = {
 
           // Calculate next run based on the current nextRunTime to preserve the scheduled time
           const currentNextRun = new Date(schedule.nextRunTime);
-          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun);
+          const nextRunTime = calculateNextRunTime(schedule.frequency, currentNextRun, schedule.frequencyIntervalDays);
 
           if (scheduleVariables.length > 0 && !isVariableRequestSatisfied) {
             const requestedVariableNames = missingVariableNames.length > 0
