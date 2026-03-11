@@ -3135,8 +3135,12 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // KB tools and other tools available to Emma
-        const toolsToInclude = ['create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source'];
+        // KB tools, scheduled chat tools, and other tools available to Emma
+        const toolsToInclude = [
+          'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source',
+          'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
+          'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables',
+        ];
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
 

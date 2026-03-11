@@ -4084,3 +4084,31 @@ emmaToolRegistry.register({
     return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
   }
 });
+
+// ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
+// These tools wrap REST endpoints via mcpFetch. Rather than duplicating
+// definitions, we re-register them from the MCP server registry.
+// Ensure apiTools has registered its tools before we try to bridge them.
+import '../mcp/server/apiTools';
+import { mcpToolRegistry } from '../mcp/server/registry';
+
+const scheduledChatToolNames = [
+  'list_scheduled_chats',
+  'manage_scheduled_chat',
+  'test_scheduled_chat',
+  'get_scheduled_chat_test_history',
+  'submit_scheduled_chat_variables',
+];
+
+for (const toolName of scheduledChatToolNames) {
+  const handler = mcpToolRegistry.getTool(toolName);
+  if (handler) {
+    emmaToolRegistry.register({
+      name: handler.name,
+      definition: handler.definition,
+      execute: handler.execute,
+    });
+  } else {
+    console.warn(`[emma/tools] Failed to bridge scheduled chat tool "${toolName}" — not found in mcpToolRegistry`);
+  }
+}
