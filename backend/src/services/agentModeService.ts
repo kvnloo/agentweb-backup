@@ -16741,6 +16741,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
     try {
       switch (action) {
+        case 'search-people': {
+          const { keywords, search_url, title, company, cursor } = args;
+          if (!keywords && !search_url && !cursor) throw new Error('Either keywords, search_url, or cursor is required for search-people');
+          const searchResult = await linkedInOutreachService.searchPeople(account_id, {
+            keywords, url: search_url, title, company, cursor
+          });
+          return { success: true, data: searchResult };
+        }
+
+        case 'get-profile': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for get-profile');
+          if (isUrl) {
+            const profileResult = await linkedInOutreachService.getLinkedInProfile(target, account_id);
+            return { success: true, data: profileResult };
+          }
+          const profileResult = await linkedInOutreachService.getProfile(target, account_id);
+          return { success: true, data: profileResult };
+        }
+
+        case 'list-connections': {
+          const connectionsResult = await linkedInOutreachService.listConnections(account_id, args.cursor);
+          return { success: true, data: connectionsResult };
+        }
+
+        case 'list-sent-invitations': {
+          const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          return { success: true, data: invitationsResult };
+        }
+
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
           const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
@@ -16754,6 +16783,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: messageResponse };
         }
 
+        case 'get-company': {
+          const companyId = args.company_id;
+          if (!companyId) throw new Error('company_id is required for get-company');
+          const companyResult = await linkedInOutreachService.getCompanyProfile(companyId, account_id);
+          return { success: true, data: companyResult };
+        }
+
+        case 'cancel-invitation': {
+          const invitationId = args.invitation_id;
+          if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          return { success: true, data: cancelResult };
+        }
+
         default:
           throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
       }
@@ -16762,7 +16805,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // Errors that went through handleError are already logged by the service; don't double-log.
       // Also suppress user-facing errors like "Cannot send message: not a 1st-degree connection".
       const alreadyLogged = error instanceof Error && !!(error as any).structuredError;
-      const isExpectedUserError = errorMessage.startsWith('Cannot send message:');
+      const isExpectedUserError = errorMessage.startsWith('Cannot send message:') || errorMessage.startsWith('Cannot send invite:');
       if (!alreadyLogged && !isExpectedUserError) {
         console.error('AgentMode: LinkedIn outreach failed:', error);
       }
