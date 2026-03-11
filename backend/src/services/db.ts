@@ -381,7 +381,11 @@ class UserDB {
         },
       };
 
+      // Note: This is a full table scan — consider adding a GSI on stripe_customer_id at scale
       const result = await this.docClient.scan(params).promise();
+      if (result.Items && result.Items.length > 1) {
+        console.warn(`getUserByStripeCustomerId: found ${result.Items.length} users with stripe_customer_id=${stripeCustomerId} — expected 1. Using first match.`);
+      }
       return (result.Items?.[0] as User) || null;
     } catch (error) {
       console.error("Error in getUserByStripeCustomerId:", error);

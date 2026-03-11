@@ -31,6 +31,9 @@ router.post(
           error: "Active subscription required to generate API keys",
         });
       }
+      if (hasCustomerRole && !hasStripeId) {
+        console.warn(`API key generation: user ${user.userId} has customer role but no stripe_customer_id — using role-based fallback`);
+      }
 
       const { rawKey, keyRecord } = await agentApiKeyService.generateKey(
         authReq.user.userId,
