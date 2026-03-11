@@ -16,7 +16,7 @@ import { taskDb } from '../services/db';
 import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
-import { LLMService } from '../utils/llmService';
+import { isTransientLLMError } from '../utils/agentModeErrors';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -2842,10 +2842,13 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
 }" target="_blank">Discord community</a>`;
 
 // Cache for Emma system context (60s TTL)
-// Cached Gemini OpenAI-compatible client
+// Cached Gemini OpenAI-compatible client (1-hour TTL so key rotation is picked up)
 let cachedGeminiClient: OpenAI | null = null;
+let cachedGeminiClientExpiry: number = 0;
+const GEMINI_CLIENT_TTL_MS = 60 * 60 * 1000; // 1 hour
+
 async function getGeminiClient(): Promise<OpenAI> {
-  if (cachedGeminiClient) return cachedGeminiClient;
+  if (cachedGeminiClient && Date.now() < cachedGeminiClientExpiry) return cachedGeminiClient;
   const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
   let apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -2856,12 +2859,20 @@ async function getGeminiClient(): Promise<OpenAI> {
     apiKey: apiKey.trim(),
     baseURL: 'https://generativelanguage.googleapis.com/v1beta',
   });
+  cachedGeminiClientExpiry = Date.now() + GEMINI_CLIENT_TTL_MS;
   return cachedGeminiClient;
 }
 
 let cachedSystemContext: { value: string; expiry: number } | null = null;
 
-async function getEmmaSystemContext(): Promise<string> {
+// Exported for testing only — not part of the public API
+export function __resetEmmaSystemContextCache(): void {
+  cachedSystemContext = null;
+  cachedGeminiClient = null;
+  cachedGeminiClientExpiry = 0;
+}
+
+export async function getEmmaSystemContext(): Promise<string> {
   if (cachedSystemContext && Date.now() < cachedSystemContext.expiry) {
     return cachedSystemContext.value;
   }
@@ -3359,67 +3370,70 @@ export async function generateChatResponse(
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
-    // Route non-Azure models (Gemini, Claude/Bedrock) via LLMService
     const isGeminiModel = model ? model.toLowerCase().includes('gemini') : false;
-    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.')) : false;
+    // Match 'claude' or 'anthropic.' prefixed Bedrock IDs (e.g. anthropic.claude-3-5-sonnet-20241022)
+    // Deliberately excludes generic 'sonnet' to avoid false positives on unrelated model names.
+    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.startsWith('anthropic.')) : false;
 
-    if (isGeminiModel || isClaudeModel) {
-      let responseText: string;
-      if (isGeminiModel) {
-        const geminiClient = await getGeminiClient();
-        const completion = await geminiClient.chat.completions.create({
-          model: model!,
-          messages: messages.map(m => ({
-            role: m.role as 'system' | 'user' | 'assistant',
-            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-          })),
-        });
-        responseText = completion.choices[0]?.message?.content || '';
-      } else {
-        // Claude via Bedrock using LLMService
-        const llmSvc = new LLMService(model!);
-        const systemMsg = messages.find(m => m.role === 'system')?.content || '';
-        const conversationStr = messages
-          .filter(m => m.role !== 'system')
-          .map(m => `${m.role}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
-          .join('\n');
-        responseText = await llmSvc.generateContent(systemMsg, conversationStr);
-      }
-      const assistantMessageMetadata = {
-        currentUrl,
-        pageContentLength: pageContent?.length,
-        knowledgeBaseChunks: activeKnowledgeBase.length,
-        pageChunks: pageChunksCount,
-        relevantChunks: relevantChunksInfo,
-        timestamp,
-        portalType,
-      };
-      await chatbotDb.addMessageToSession(sessionId, {
-        role: "assistant",
-        content: responseText,
-        metadata: assistantMessageMetadata,
-      });
-      return responseText;
+    // Select the active client:
+    // - Claude/Bedrock: use agentModeService.getBedrockClient() which returns an
+    //   OpenAI-compatible wrapper that fully supports tool calling via ChatBedrockConverse.
+    // - Gemini: use agentModeService.getGeminiClient() which returns an 
+    //   OpenAI-compatible wrapper that supports tool calling.
+    // - Azure OpenAI (default): use the standard OpenAI SDK client.
+    const activeDeployment = isClaudeModel ? model! : (model || process.env.AZURE_OPENAI_DEPLOYMENT || '');
+    let activeClient: any;
+    
+    if (isClaudeModel) {
+      activeClient = await agentModeService!.getBedrockClient(model!);
+    } else if (isGeminiModel) {
+      activeClient = await agentModeService!.getGeminiClient();
+    } else {
+      activeClient = model
+        ? new OpenAI({
+            apiKey: process.env.AZURE_OPENAI_API_KEY,
+            baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${model}`,
+            defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview" },
+            defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+          })
+        : openai;
     }
 
-    // Use a model-specific client if a model override is provided
-    const activeDeployment = model || process.env.AZURE_OPENAI_DEPLOYMENT || '';
-    const activeClient = model
-      ? new OpenAI({
-          apiKey: process.env.AZURE_OPENAI_API_KEY,
-          baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${model}`,
-          defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview" },
-          defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
-        })
-      : openai;
+    // Helper: Sleep function for exponential backoff
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Helper: Trim tool messages for context
+    const trimToolMessagesForContext = (messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] => {
+      const toolIndices: number[] = [];
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].role === 'tool') {
+          toolIndices.push(i);
+        }
+      }
+      const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+      return messages.map((msg, idx) => {
+        if (msg.role === 'tool' && !preserveSet.has(idx) && typeof msg.content === 'string' && msg.content.length > maxToolContentLength) {
+          return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
+        }
+        return msg;
+      });
+    };
 
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
 
+      // Trim large old tool results to prevent context window overflow
+      const trimmedMessages = trimToolMessagesForContext(messages);
+
       // Generate response using OpenAI (with tools if available)
-      const response = await activeClient.chat.completions.create({
-        model: activeDeployment,
-        messages: messages.map(({ role, content, name, tool_call_id, tool_calls }) => {
+      let response: any;
+      const maxAttempts = 3;
+      const baseDelayMs = 2000;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          response = await activeClient.chat.completions.create({
+            model: activeDeployment,
+            messages: trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
             message.tool_call_id = tool_call_id;
@@ -3434,7 +3448,19 @@ export async function generateChatResponse(
         }),
         // Add tools only for customer portal with tools loaded
         ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
-      });
+          });
+          break; // Success, break the retry loop
+        } catch (error) {
+          const isLastAttempt = attempt >= maxAttempts;
+          if (!isTransientLLMError(error) || isLastAttempt) {
+            throw error;
+          }
+          const jitterMs = Math.floor(Math.random() * 500);
+          const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
+          console.warn(`[generateChatResponse] Rate limit/transient error for model "${activeDeployment}", attempt ${attempt}/${maxAttempts}. Waiting ${delayMs}ms before retry...`);
+          await sleep(delayMs);
+        }
+      }
 
       const responseMessage = response.choices[0]?.message;
       if (!responseMessage) {
@@ -3467,8 +3493,8 @@ export async function generateChatResponse(
 
       console.log(`[generateChatResponse] Executing ${responseMessage.tool_calls.length} tool calls`);
 
-      // Execute each tool call
-      for (const toolCall of responseMessage.tool_calls) {
+      // Map tool calls to an array of promises for parallel execution
+      const toolPromises = responseMessage.tool_calls.map(async (toolCall: any) => {
         let functionArgs: any;
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
@@ -3494,6 +3520,20 @@ export async function generateChatResponse(
 
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
 
+          return { status: 'success' as const, toolCall, functionArgs, result };
+        } catch (error) {
+          console.error(`[generateChatResponse] Tool execution error for ${toolCall.function.name}:`, error);
+          return { status: 'error' as const, toolCall, functionArgs, error };
+        }
+      });
+
+      const toolResults = await Promise.all(toolPromises);
+
+      // Process results in original order — append to messages and toolCalls sequentially
+      for (const toolResult of toolResults) {
+        if (toolResult.status === 'success') {
+          const { toolCall, functionArgs, result } = toolResult;
+          
           // Track tool call for response
           toolCalls.push({
             id: toolCall.id,
@@ -3513,10 +3553,9 @@ export async function generateChatResponse(
             content: toolContent,
             metadata: { timestamp: new Date().toISOString() }
           });
-
-        } catch (error) {
-          console.error(`[generateChatResponse] Tool execution error for ${toolCall.function.name}:`, error);
-
+        } else {
+          const { toolCall, functionArgs, error } = toolResult;
+          
           // Track failed tool call
           toolCalls.push({
             id: toolCall.id,

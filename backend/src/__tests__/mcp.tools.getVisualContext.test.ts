@@ -21,7 +21,12 @@ jest.mock('../utils/secretsManager', () => ({
 jest.mock('../services/chatbotService', () => ({ chatbotDb: {} }));
 jest.mock('../services/db', () => ({ taskDb: {} }));
 
-describe('get_visual_context MCP tool', () => {
+// get_visual_context is registered in BOTH registries:
+//   - emmaToolRegistry: used by Emma chatbot (customer portal)
+//   - mcpToolRegistry:  used by MCP protocol clients
+// Both registrations are intentional — verify each independently.
+
+describe('get_visual_context — emmaToolRegistry', () => {
   let registry: any;
 
   beforeAll(async () => {
@@ -31,7 +36,7 @@ describe('get_visual_context MCP tool', () => {
     await import('../emma/tools');
   });
 
-  it('is registered in the tool registry', () => {
+  it('is registered in emmaToolRegistry', () => {
     const tool = registry.getTool('get_visual_context');
     expect(tool).toBeDefined();
   });
@@ -69,5 +74,28 @@ describe('get_visual_context MCP tool', () => {
     const required = tool.definition.inputSchema.required;
     expect(Array.isArray(required)).toBe(true);
     expect(required).toHaveLength(0);
+  });
+});
+
+describe('get_visual_context — mcpToolRegistry', () => {
+  let mcpRegistry: any;
+
+  beforeAll(async () => {
+    // emma/tools.ts registers get_visual_context into the mcpToolRegistry singleton
+    // exported from mcp/server/registry.ts. Import that singleton after loading tools.
+    await import('../emma/tools'); // ensure tools module has run and registered
+    const mod = await import('../mcp/server/registry');
+    mcpRegistry = mod.mcpToolRegistry;
+  });
+
+  it('is registered in mcpToolRegistry', () => {
+    const tool = mcpRegistry.getTool('get_visual_context');
+    expect(tool).toBeDefined();
+  });
+
+  it('returns needs_screenshot: true from mcpToolRegistry', async () => {
+    const tool = mcpRegistry.getTool('get_visual_context');
+    const result = await tool.execute({ reason: 'Layout check' });
+    expect(result.needs_screenshot).toBe(true);
   });
 });

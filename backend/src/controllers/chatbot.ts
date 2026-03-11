@@ -194,6 +194,13 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
 
   const portalType: 'customer' | 'partner' = portal === 'customer' ? 'customer' : 'partner';
 
+  // Auth guard — must be before any DB access so unauthenticated requests get 401, not 403
+  const userId = req.user?.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'User not authenticated' });
+    return;
+  }
+
   if (!message) {
     res.status(400).json({ error: 'Message is required' });
     return;
@@ -212,7 +219,6 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     return;
   }
 
-  const userId = req.user?.userId;
   if (session.userId !== userId) {
     res.status(403).json({ error: 'Unauthorized access to chat session' });
     return;
@@ -245,7 +251,14 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     sendEvent({ type: 'complete', ...formattedResponse, session: updatedSession });
   } catch (error) {
     console.error('Error in chatbot stream:', error);
-    const currentSession = await chatbotDb.getChatSession(sessionId);
+    // getChatSession can itself throw (e.g. DB down). Wrap to avoid unhandled rejection
+    // after SSE headers are already flushed.
+    let currentSession = null;
+    try {
+      currentSession = await chatbotDb.getChatSession(sessionId);
+    } catch {
+      // Ignore — we still need to send the error event
+    }
     sendEvent({
       type: 'complete',
       content: "I'm sorry, I encountered an error processing your request. Please try again.",
