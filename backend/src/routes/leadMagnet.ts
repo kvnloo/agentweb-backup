@@ -83,7 +83,7 @@ router.post('/execute', async (req, res) => {
     if (!isValidEmail(email)) {
       return res.status(400).json({ message: 'Invalid email format' });
     }
-    if (!taskInput) {
+    if (!taskInput || (typeof taskInput === 'string' && !taskInput.trim())) {
       return res.status(400).json({ message: 'taskInput is required' });
     }
     if (typeof taskInput !== 'string' || taskInput.length > 2000) {
@@ -98,6 +98,8 @@ router.post('/execute', async (req, res) => {
     }
 
     // Rate limiting — IP (5 per day)
+    // Note: req.ip returns ::1 or ::ffff:127.0.0.1 behind a proxy without 'trust proxy' set.
+    // If running behind nginx/ALB, ensure app.set('trust proxy', 1) is configured in server.ts.
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     if (isIpRateLimited(clientIp)) {
       return res.status(429).json({
