@@ -13,6 +13,15 @@ const dynamodb = new AWS.DynamoDB.DocumentClient();
 /**
  * LinkedIn Post stored in database
  */
+export interface PostMetricsCache {
+    impressionCount: number;
+    likeCount: number;
+    commentCount: number;
+    shareCount: number;
+    clickCount: number;
+    engagement: number;
+}
+
 export interface LinkedInPost {
     userId: string;           // Partition key
     postId: string;          // Sort key (e.g., "urn:li:share:123")
@@ -20,6 +29,8 @@ export interface LinkedInPost {
     content: string;          // Post text content
     mediaUrls?: string[];     // Optional image URLs
     createdAt: string;        // ISO timestamp
+    metrics?: PostMetricsCache;
+    metricsFetchedAt?: string; // ISO timestamp of last metrics fetch
 }
 
 /**
@@ -116,6 +127,30 @@ export async function getPostsByUserId(
     } catch (error) {
         handleDbError('getPostsByUserId', error);
         return [];
+    }
+}
+
+/**
+ * Update cached metrics for a stored post.
+ * Called by the LinkedIn adapter after fetching fresh metrics from the API.
+ */
+export async function updatePostMetrics(
+    userId: string,
+    postId: string,
+    metrics: PostMetricsCache
+): Promise<void> {
+    try {
+        await dynamodb.update({
+            TableName: LINKEDIN_POSTS_TABLE,
+            Key: { userId, postId },
+            UpdateExpression: 'SET metrics = :m, metricsFetchedAt = :ts',
+            ExpressionAttributeValues: {
+                ':m': metrics,
+                ':ts': new Date().toISOString(),
+            },
+        }).promise();
+    } catch (error) {
+        handleDbError('updatePostMetrics', error);
     }
 }
 
