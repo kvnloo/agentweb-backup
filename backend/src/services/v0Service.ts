@@ -128,15 +128,17 @@ export async function generateLandingPage(
     });
 
     // Step 2: Generate the landing page via chat
-    const chat = await v0.chats.create({
+    const chatResponse = await v0.chats.create({
       message: enrichedPrompt,
       projectId: project.id,
     });
 
-    const chatId = chat.id;
-    if (!chatId) {
-      throw new Error("v0 chat creation did not return an id");
+    // Narrow the union type — streaming responses don't have 'id'
+    if (!("id" in chatResponse) || !chatResponse.id) {
+      throw new Error("v0 chat creation did not return a ChatDetail with an id");
     }
+    const chat = chatResponse;
+    const chatId = chat.id;
 
     // Update record with v0 IDs and mark as draft
     const updatedRecord: Partial<GeneratedLandingPage> = {
@@ -147,8 +149,8 @@ export async function generateLandingPage(
     };
 
     // Extract web URL if available
-    if (chat.webUrl) {
-      updatedRecord.githubRepoUrl = chat.webUrl;
+    if ("webUrl" in chat && chat.webUrl) {
+      updatedRecord.githubRepoUrl = chat.webUrl as string;
     }
 
     await dynamodb
