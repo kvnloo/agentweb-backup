@@ -151,6 +151,8 @@ export interface User {
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
+  current_period_end?: string; // ISO date of current billing period end
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook' 
     | 'meta' | 'twitter' | 'instagram';
@@ -365,6 +367,28 @@ class UserDB {
       return result.Items?.[0];
     } catch (error) {
       console.error("Error in getUserById:", error);
+      throw error;
+    }
+  }
+
+  async getUserByStripeCustomerId(stripeCustomerId: string): Promise<User | null> {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: "stripe_customer_id = :scid",
+        ExpressionAttributeValues: {
+          ":scid": stripeCustomerId,
+        },
+      };
+
+      // Note: This is a full table scan — consider adding a GSI on stripe_customer_id at scale
+      const result = await this.docClient.scan(params).promise();
+      if (result.Items && result.Items.length > 1) {
+        console.warn(`getUserByStripeCustomerId: found ${result.Items.length} users with stripe_customer_id=${stripeCustomerId} — expected 1. Using first match.`);
+      }
+      return (result.Items?.[0] as User) || null;
+    } catch (error) {
+      console.error("Error in getUserByStripeCustomerId:", error);
       throw error;
     }
   }

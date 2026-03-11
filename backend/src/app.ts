@@ -148,6 +148,9 @@ app.use((req, res, next) => {
   // Apply CORS middleware for all other routes
   cors(corsOptions)(req, res, next);
 });
+// Stripe webhook needs the raw body (Buffer) for signature verification.
+// This MUST come before express.json() which parses the body.
+app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
