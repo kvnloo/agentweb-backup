@@ -45,7 +45,6 @@ export const INTEGRATION_CONFIG = {
     marketingScopes: [
       'ads_management',
       'ads_read',
-      'business_management',
       'pages_show_list',
     ],
 
