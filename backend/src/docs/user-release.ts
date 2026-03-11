@@ -7,8 +7,85 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-11',
+    changes: [
+      'Feature: LinkedIn Outreach — Search & Discovery in Agent Mode',
+      '- Ask Emma to search LinkedIn for people by keyword, job title, or company name',
+      '- View detailed LinkedIn profiles including headline, location, and connection degree',
+      '- List your existing LinkedIn connections and sent invitations with status tracking',
+      '- Browse company profiles for research before outreach',
+      '- Cancel pending connection invitations',
+      '- Full outreach workflow: search → view profile → send invite → track status',
+    ],
+  },
+  {
+    date: '2026-03-11',
+    changes: [
+      'Feature: Custom Interval Scheduling ("Every N Days")',
+      '- New "Every N days" frequency option for scheduled chats — set any interval from 1 to 365 days',
+      '- Available in the schedule creation/edit form and via Emma\'s manage_scheduled_chat tool',
+      '- Schedule list displays friendly labels like "Every 5 days" with next run time',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
+      'Feature: Scheduled Chat Management in Agent Mode',
+      '- Ask Emma to list, create, update, pause/resume, or delete your scheduled chats',
+      '- Test scheduled chats on demand with optional email notification',
+      '- View test run history and submit variables for scheduled chats',
+      '- Available as foundation tools — no skill installation required',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
+      'Feature: Session Satisfaction Scoring (Admin)',
+      '- AI-powered satisfaction scoring (1-5) for chat sessions on the Admin Chat History tab',
+      '- Scores auto-generate when admins view the Chat History tab — no impact on user experience',
+      '- Admins can override scores manually by clicking the score chip',
+      '- Retry button appears for sessions where scoring failed',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
+      'Bug Fix: Reports Page Crash for Some Accounts',
+      '- Fixed crash on the Reports page when a task or file had a missing name, causing a "Cannot read properties of undefined" error',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
+      'Feature: SEO & Website Analytics in Agent Mode',
+      '- Ask Emma "how are my SEO metrics?" to get Google Search Console data — clicks, impressions, CTR, average position, top queries, top pages, and daily trends',
+      '- Ask Emma "show me my website analytics" to get GA4 data — sessions, users, page views, bounce rate, traffic sources, top pages by engagement',
+      '- Both tools support timeframe selection: 7d, 14d, 30d, or 90d',
+      '- Technical SEO score (PageSpeed) included with search console metrics',
+      'Feature: CRM Group Email (Newsletter)',
+      '- Send a single email to all leads in a CRM lead list — ideal for newsletters and announcements',
+      '- Compose with Text, HTML, or load content from a URL; preview renders in a live email preview pane',
+      '- Variable substitution: use {{firstName}}, {{lastName}}, {{company}}, {{email}}, {{title}}, or {{customFields.xxx}} for personalization',
+      '- "Prepare for sending" validates variable coverage across leads before sending, showing which leads are ready and which are missing data',
+      '- Only leads with all required variable values receive the email; others are skipped automatically',
+      '- Real-time progress bar via WebSocket while emails are sending',
+      '- Send test emails to specific addresses before sending to the full list',
+      '- Customizable unsubscribe footer with {{unsubscribeUrl}} placeholder appended to every email',
+      '- Public unsubscribe page lets recipients opt out with optional feedback; resubscribe option available',
+      '- Unsubscribed leads are marked with an icon in the lead list and can be manually resubscribed from the edit dialog',
+    ],
+  },
+  {
     date: '2026-03-09',
     changes: [
+      'Feature: Account Summary Tool',
+      '- Ask Emma "show me my account summary" to get a high-level overview of your account activity',
+      '- Shows sessions, assets generated (images, videos, reports, social posts), published content, leads added, email performance, and social media metrics',
+      '- Supports time ranges: 1 day, 7 days (default), 30 days, or 90 days',
+      'Fix: Account Summary — Published count and social media metrics',
+      '- Published count now correctly counts from tool calls (publish_blog_article, post_on_connected_account) in addition to publish statuses',
+      '- Social media posts_published count now comes from stored posts in the database (reliable even when tokens are expired)',
+      '- Social media metrics (impressions, engagements, clicks) no longer blocked by token validity checks on connected accounts',
       'Feature: Long-Term Memory for Emma',
       '- Emma now remembers important facts about your account across sessions (preferences, history, insights, workflow patterns)',
       '- At the start of each session, Emma loads your recent memories for context-aware conversations',
