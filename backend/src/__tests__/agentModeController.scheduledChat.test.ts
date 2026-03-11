@@ -1907,6 +1907,124 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         }
       });
 
+      it('should create schedule with every_n_days frequency and frequencyIntervalDays', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Every 3 Days Schedule',
+            startingMessage: 'Test message',
+            scheduleFrequency: 'every_n_days',
+            frequencyIntervalDays: 3,
+            keywords: [],
+            requiredFunctionCalls: [],
+            functionCallMinCalls: {},
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.objectContaining({
+            frequency: 'every_n_days',
+            frequencyIntervalDays: 3,
+          })
+        );
+      });
+
+      it('should reject every_n_days without frequencyIntervalDays', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Bad Schedule',
+            startingMessage: 'Test message',
+            scheduleFrequency: 'every_n_days',
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockRes.status).toHaveBeenCalledWith(400);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({
+            error: 'frequencyIntervalDays must be a positive integer when frequency is every_n_days',
+          })
+        );
+      });
+
+      it('should reject every_n_days with invalid frequencyIntervalDays', async () => {
+        const testCases = [
+          { frequencyIntervalDays: 0 },
+          { frequencyIntervalDays: -1 },
+          { frequencyIntervalDays: 1.5 },
+        ];
+
+        for (const testCase of testCases) {
+          const mockReq = {
+            user: { userId: mockUserId },
+            body: {
+              scheduleName: 'Bad Schedule',
+              startingMessage: 'Test message',
+              scheduleFrequency: 'every_n_days',
+              frequencyIntervalDays: testCase.frequencyIntervalDays,
+            },
+          } as unknown as Request;
+
+          const mockRes = {
+            json: jest.fn(),
+            status: jest.fn().mockReturnThis(),
+          } as unknown as Response;
+
+          await agentModeController.createScheduledChat(mockReq, mockRes);
+
+          expect(mockRes.status).toHaveBeenCalledWith(400);
+          expect(mockRes.json).toHaveBeenCalledWith(
+            expect.objectContaining({
+              error: 'frequencyIntervalDays must be a positive integer when frequency is every_n_days',
+            })
+          );
+        }
+      });
+
+      it('should not include frequencyIntervalDays for non-every_n_days frequency', async () => {
+        const mockReq = {
+          user: { userId: mockUserId },
+          body: {
+            scheduleName: 'Daily Schedule',
+            startingMessage: 'Test message',
+            scheduleFrequency: 'daily',
+            frequencyIntervalDays: 5, // Should be ignored
+            keywords: [],
+            requiredFunctionCalls: [],
+            functionCallMinCalls: {},
+            emailNotifications: [],
+          },
+        } as unknown as Request;
+
+        const mockRes = {
+          json: jest.fn(),
+          status: jest.fn().mockReturnThis(),
+        } as unknown as Response;
+
+        await agentModeController.createScheduledChat(mockReq, mockRes);
+
+        expect(mockCreateSchedule).toHaveBeenCalledWith(
+          expect.not.objectContaining({
+            frequencyIntervalDays: expect.anything(),
+          })
+        );
+      });
+
       it('should parse variables from startingMessage and keep provided descriptions', async () => {
         const mockReq = {
           user: { userId: mockUserId },
