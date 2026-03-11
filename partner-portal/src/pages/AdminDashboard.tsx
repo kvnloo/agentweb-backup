@@ -38,6 +38,8 @@ import {
   FormGroup,
   Link,
   Collapse,
+  Popover,
+  ButtonGroup,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -76,6 +78,7 @@ import {
   ThumbUp as ThumbUpIcon,
   ThumbDown as ThumbDownIcon,
   Sync as SyncIcon,
+  Replay as ReplayIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -156,7 +159,14 @@ interface AdminChatSession {
     autocomplete?: boolean;
   };
   llmModel?: string;
-  // Add other fields if the backend sends more for the session list
+  messageCount?: number;
+  satisfactionScore?: {
+    score: number;
+    reason: string;
+    evaluatedAt: string;
+    evaluatedMessageIndex: number;
+    adminOverride?: boolean;
+  };
 }
 
 interface User {
@@ -660,6 +670,12 @@ export default function AdminDashboard() {
   const [selectedSession, setSelectedSession] =
     useState<AdminChatSession | null>(null);
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
+  const [scoringSessionIds, setScoringSessionIds] = useState<Set<string>>(new Set());
+  const [failedScoringIds, setFailedScoringIds] = useState<Set<string>>(new Set());
+  const [scoreOverrideAnchor, setScoreOverrideAnchor] = useState<HTMLElement | null>(null);
+  const [scoreOverrideSession, setScoreOverrideSession] = useState<AdminChatSession | null>(null);
+  const [scoreOverrideValue, setScoreOverrideValue] = useState<number>(3);
+  const [scoreOverrideReason, setScoreOverrideReason] = useState("");
   const [roleDialogOpen, setRoleDialogOpen] = useState(false);
   const [selectedUserRoles, setSelectedUserRoles] = useState<
     ("partner" | "customer" | "free")[]
@@ -983,6 +999,114 @@ export default function AdminDashboard() {
     observer.observe(target);
     return () => observer.disconnect();
   }, [tabValue, chatSessionsHasMore, chatSessionsLoading, loadChatSessions]);
+
+  // Trigger satisfaction scoring for sessions that need it
+  useEffect(() => {
+    if (!token || chatSessions.length === 0) return;
+
+    const needsScoring = chatSessions.filter((s) => {
+      if (scoringSessionIds.has(s.sessionId)) return false;
+      if (failedScoringIds.has(s.sessionId)) return false;
+      if (s.satisfactionScore?.adminOverride) return false;
+      const msgCount = s.messageCount ?? s.messages?.length ?? 0;
+      if (msgCount < 2) return false; // Need at least 1 user + 1 assistant message
+      if (s.satisfactionScore && s.satisfactionScore.evaluatedMessageIndex >= msgCount) return false;
+      return true;
+    });
+
+    if (needsScoring.length === 0) return;
+
+    // Batch into groups of 5
+    const batches: string[][] = [];
+    for (let i = 0; i < needsScoring.length; i += 5) {
+      batches.push(needsScoring.slice(i, i + 5).map((s) => s.sessionId));
+    }
+
+    const scoreBatches = async () => {
+      // Mark all as in-flight
+      setScoringSessionIds((prev) => {
+        const next = new Set(prev);
+        needsScoring.forEach((s) => next.add(s.sessionId));
+        return next;
+      });
+
+      for (const batch of batches) {
+        try {
+          const response = await axios.post(
+            buildApiUrl("/api/admin/chat-sessions/score"),
+            { sessionIds: batch },
+            { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
+          );
+          const { scores, failed = [] } = response.data as {
+            scores: Record<string, AdminChatSession["satisfactionScore"] | null>;
+            failed?: string[];
+          };
+          setChatSessions((prev) =>
+            prev.map((s) => {
+              const newScore = scores[s.sessionId];
+              if (newScore) return { ...s, satisfactionScore: newScore };
+              return s;
+            })
+          );
+          // Remove entire batch from scoring state
+          setScoringSessionIds((prev) => {
+            const next = new Set(prev);
+            batch.forEach((id) => next.delete(id));
+            return next;
+          });
+          // Mark sessions that didn't get a score as failed (retryable)
+          const noResult = batch.filter((id) => !scores[id] && !failed.includes(id));
+          const allFailed = [...failed, ...noResult];
+          if (allFailed.length > 0) {
+            setFailedScoringIds((prev) => {
+              const next = new Set(prev);
+              allFailed.forEach((id) => next.add(id));
+              return next;
+            });
+          }
+        } catch (error) {
+          console.error("Error scoring sessions:", error);
+          // Mark entire batch as failed
+          setFailedScoringIds((prev) => {
+            const next = new Set(prev);
+            batch.forEach((id) => next.add(id));
+            return next;
+          });
+          setScoringSessionIds((prev) => {
+            const next = new Set(prev);
+            batch.forEach((id) => next.delete(id));
+            return next;
+          });
+        }
+      }
+    };
+
+    scoreBatches();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatSessions.length, token]);
+
+  const handleScoreOverrideSave = async () => {
+    if (!scoreOverrideSession || !token) return;
+    try {
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/chat-sessions/${scoreOverrideSession.sessionId}/score`),
+        { score: scoreOverrideValue, reason: scoreOverrideReason || undefined },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const { satisfactionScore } = response.data;
+      setChatSessions((prev) =>
+        prev.map((s) =>
+          s.sessionId === scoreOverrideSession.sessionId
+            ? { ...s, satisfactionScore }
+            : s
+        )
+      );
+      setScoreOverrideAnchor(null);
+      setScoreOverrideSession(null);
+    } catch (error) {
+      console.error("Error saving score override:", error);
+    }
+  };
 
   useEffect(() => {
     const loadKnowledgeBaseMetrics = async () => {
@@ -4437,6 +4561,7 @@ export default function AdminDashboard() {
                   <TableCell>Longest Wait</TableCell>
                   <TableCell>Max Heap</TableCell>
                   <TableCell>Feedback</TableCell>
+                  <TableCell>Satisfaction</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
               </TableHead>
@@ -4619,6 +4744,83 @@ export default function AdminDashboard() {
                                   />
                                 )}
                               </Box>
+                            );
+                          })()}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            const sat = session.satisfactionScore;
+                            if (scoringSessionIds.has(session.sessionId) && !sat) {
+                              return <CircularProgress size={16} />;
+                            }
+                            if (failedScoringIds.has(session.sessionId) && !sat) {
+                              return (
+                                <Tooltip title="Scoring failed. Click to retry.">
+                                  <IconButton
+                                    size="small"
+                                    color="error"
+                                    onClick={async () => {
+                                      setFailedScoringIds((prev) => {
+                                        const next = new Set(prev);
+                                        next.delete(session.sessionId);
+                                        return next;
+                                      });
+                                      setScoringSessionIds((prev) => new Set(prev).add(session.sessionId));
+                                      try {
+                                        const response = await axios.post(
+                                          buildApiUrl("/api/admin/chat-sessions/score"),
+                                          { sessionIds: [session.sessionId] },
+                                          { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 }
+                                        );
+                                        const { scores, failed = [] } = response.data;
+                                        const newScore = scores[session.sessionId];
+                                        if (newScore) {
+                                          setChatSessions((prev) =>
+                                            prev.map((s) =>
+                                              s.sessionId === session.sessionId ? { ...s, satisfactionScore: newScore } : s
+                                            )
+                                          );
+                                        }
+                                        if (failed.includes(session.sessionId)) {
+                                          setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
+                                        }
+                                      } catch {
+                                        setFailedScoringIds((prev) => new Set(prev).add(session.sessionId));
+                                      } finally {
+                                        setScoringSessionIds((prev) => {
+                                          const next = new Set(prev);
+                                          next.delete(session.sessionId);
+                                          return next;
+                                        });
+                                      }
+                                    }}
+                                  >
+                                    <ReplayIcon sx={{ fontSize: '1rem' }} />
+                                  </IconButton>
+                                </Tooltip>
+                              );
+                            }
+                            if (!sat) {
+                              return <span style={{ color: '#999' }}>-</span>;
+                            }
+                            const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
+                            return (
+                              <Tooltip title={`${sat.reason}${sat.adminOverride ? ' (admin override)' : ''}`}>
+                                <Chip
+                                  label={sat.score}
+                                  size="small"
+                                  color={color}
+                                  variant={sat.adminOverride ? 'filled' : 'outlined'}
+                                  icon={sat.adminOverride ? <EditIcon sx={{ fontSize: '0.8rem' }} /> : undefined}
+                                  onClick={(e) => {
+                                    setScoreOverrideAnchor(e.currentTarget);
+                                    setScoreOverrideSession(session);
+                                    setScoreOverrideValue(sat.score);
+                                    setScoreOverrideReason(sat.reason);
+                                  }}
+                                  sx={{ cursor: 'pointer' }}
+                                />
+                              </Tooltip>
                             );
                           })()}
                         </TableCell>
@@ -4934,6 +5136,43 @@ export default function AdminDashboard() {
           <ResultEndpointsTab />
         </TabPanel>
       </Paper>
+
+      {/* Satisfaction Score Override Popover */}
+      <Popover
+        open={Boolean(scoreOverrideAnchor)}
+        anchorEl={scoreOverrideAnchor}
+        onClose={() => { setScoreOverrideAnchor(null); setScoreOverrideSession(null); }}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        transformOrigin={{ vertical: 'top', horizontal: 'center' }}
+      >
+        <Box sx={{ p: 2, display: 'flex', flexDirection: 'column', gap: 1.5, width: 400 }}>
+          <Typography variant="subtitle2">Override Satisfaction Score</Typography>
+          <ButtonGroup size="small" fullWidth>
+            {[1, 2, 3, 4, 5].map((v) => (
+              <Button
+                key={v}
+                variant={scoreOverrideValue === v ? 'contained' : 'outlined'}
+                color={v <= 2 ? 'error' : v === 3 ? 'warning' : 'success'}
+                onClick={() => setScoreOverrideValue(v)}
+              >
+                {v}
+              </Button>
+            ))}
+          </ButtonGroup>
+          <TextField
+            size="small"
+            label="Reason (optional)"
+            value={scoreOverrideReason}
+            onChange={(e) => setScoreOverrideReason(e.target.value)}
+            multiline
+            minRows={3}
+            maxRows={8}
+          />
+          <Button variant="contained" size="small" onClick={handleScoreOverrideSave}>
+            Save
+          </Button>
+        </Box>
+      </Popover>
 
       {/* Deactivation Confirmation Dialog */}
       <Dialog
