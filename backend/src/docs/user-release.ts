@@ -9,6 +9,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-10',
     changes: [
+      'Feature: Scheduled Chat Management in Agent Mode',
+      '- Ask Emma to list, create, update, pause/resume, or delete your scheduled chats',
+      '- Test scheduled chats on demand with optional email notification',
+      '- View test run history and submit variables for scheduled chats',
+      '- Available as foundation tools — no skill installation required',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
       'Feature: Session Satisfaction Scoring (Admin)',
       '- AI-powered satisfaction scoring (1-5) for chat sessions on the Admin Chat History tab',
       '- Scores auto-generate when admins view the Chat History tab — no impact on user experience',

@@ -1767,7 +1767,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Account Memory (cross-session knowledge)
     'save_memory',
-    'delete_memory'
+    'delete_memory',
+
+    // Scheduled Chat Management
+    'list_scheduled_chats',
+    'manage_scheduled_chat',
+    'test_scheduled_chat',
+    'get_scheduled_chat_test_history',
+    'submit_scheduled_chat_variables'
   ]);
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
