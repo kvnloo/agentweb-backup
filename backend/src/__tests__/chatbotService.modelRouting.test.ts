@@ -1,8 +1,8 @@
 /**
  * Tests for generateChatResponse model routing:
- * - Gemini  → early-exit text-only path (getGeminiClient)
- * - Claude  → agentModeService.getBedrockClient() → full tool-calling loop
- * - Azure   → default OpenAI client → full tool-calling loop
+ * - Gemini  → agentModeService.getGeminiClient() → tool-calling loop
+ * - Claude  → agentModeService.getBedrockClient() → tool-calling loop
+ * - Azure   → default OpenAI client → tool-calling loop
  */
 
 // ── DynamoDB mock (module-level, shared by chatbotService on import) ──────────
@@ -28,35 +28,34 @@ jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
 }));
 
-// ── Bedrock client mock — captures calls to getBedrockClient ─────────────────
+// ── Client create mocks ───────────────────────────────────────────────────────
 const mockBedrockClientCreate = jest.fn();
+const mockGeminiClientCreate = jest.fn();
+
 const mockGetBedrockClient = jest.fn().mockResolvedValue({
-  chat: {
-    completions: {
-      create: mockBedrockClientCreate,
-    },
-  },
+  chat: { completions: { create: mockBedrockClientCreate } },
+});
+const mockGetGeminiClient = jest.fn().mockResolvedValue({
+  chat: { completions: { create: mockGeminiClientCreate } },
 });
 
 jest.mock('../services/agentModeService', () => ({
   AgentModeService: jest.fn().mockImplementation(() => ({
     getBedrockClient: mockGetBedrockClient,
+    getGeminiClient: mockGetGeminiClient,
     executeTool: jest.fn(),
   })),
   agentModeService: {
     getBedrockClient: mockGetBedrockClient,
+    getGeminiClient: mockGetGeminiClient,
     executeTool: jest.fn(),
   },
 }));
 
-// ── Gemini client mock — captures calls ──────────────────────────────────────
-const mockGeminiCreate = jest.fn();
-const mockGeminiClientInstance = {
-  chat: { completions: { create: mockGeminiCreate } },
-};
-jest.mock('openai', () =>
-  jest.fn().mockImplementation(() => mockGeminiClientInstance)
-);
+// ── OpenAI mock (used for the module-level default `openai` client init) ─────
+jest.mock('openai', () => jest.fn().mockImplementation(() => ({
+  chat: { completions: { create: jest.fn() } },
+})));
 
 jest.mock('@google-cloud/discoveryengine', () => ({
   EngineServiceClient: jest.fn(),
@@ -71,7 +70,7 @@ jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn
 jest.mock('../services/db', () => ({ taskDb: {} }));
 jest.mock('../utils/secretsManager', () => ({
   getGCSPPrivateKey: jest.fn(),
-  getSecret: jest.fn().mockResolvedValue('fake-gemini-key'),
+  getSecret: jest.fn().mockResolvedValue('fake-key'),
 }));
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({ success: false }),
@@ -81,7 +80,7 @@ import { generateChatResponse, __resetEmmaSystemContextCache } from '../services
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** A minimal OpenAI-format completion with no tool calls */
+/** Minimal OpenAI-format completion with no tool calls */
 function makeCompletion(content = 'Hello') {
   return {
     choices: [{ message: { role: 'assistant', content, tool_calls: null } }],
@@ -90,27 +89,18 @@ function makeCompletion(content = 'Hello') {
   };
 }
 
-/**
- * Seed the DynamoDB mock so that:
- *  1. addMessageToSession (put) succeeds
- *  2. getChatSession (get) returns a session with one user message
- *  3. getEmmaSystemContext (get) returns the hardcoded fallback
- *  4. searchKnowledgeBase / platform KB (query) returns empty
- */
-function seedSessionMocks(sessionId = 'sess-1', userId = 'user-1') {
+/** Seed DynamoDB so getChatSession returns a valid session */
+function seedSessionMocks() {
   const session = {
-    sessionId,
-    userId,
+    sessionId: 'sess-1',
+    userId: 'user-1',
     portalType: 'customer',
     messages: [{ role: 'user', content: 'Hello' }],
     pageIdentifier: 'customer-portal',
     createdAt: '2024-01-01T00:00:00Z',
     updatedAt: '2024-01-01T00:00:00Z',
   };
-
-  // getChatSession call returns the session
   getPromiseMock.mockResolvedValue({ Item: session });
-  // All DynamoDB queries (KB search) return empty
   queryPromiseMock.mockResolvedValue({ Items: [] });
 }
 
@@ -127,23 +117,35 @@ describe('generateChatResponse — model routing', () => {
   // ── Gemini ────────────────────────────────────────────────────────────────
 
   describe('Gemini model', () => {
-    it('calls getGeminiClient (OpenAI constructor) and takes the early-exit path', async () => {
+    it('calls agentModeService.getGeminiClient for gemini models', async () => {
       seedSessionMocks();
-      mockGeminiCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
+      mockGeminiClientCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
+
+      await generateChatResponse(
+        'sess-1', 'Hello', undefined, undefined, 'customer', 'user-1',
+        undefined, undefined, 'gemini-2.5-flash'
+      );
+
+      expect(mockGetGeminiClient).toHaveBeenCalledTimes(1);
+      expect(mockGetBedrockClient).not.toHaveBeenCalled();
+    });
+
+    it('returns content from the Gemini completion', async () => {
+      seedSessionMocks();
+      mockGeminiClientCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
 
       const result = await generateChatResponse(
         'sess-1', 'Hello', undefined, undefined, 'customer', 'user-1',
         undefined, undefined, 'gemini-2.5-flash'
       );
 
-      expect(mockGeminiCreate).toHaveBeenCalledTimes(1);
-      expect(mockGetBedrockClient).not.toHaveBeenCalled();
-      expect(result).toBe('Gemini says hi');
+      const content = typeof result === 'string' ? result : (result as any).content;
+      expect(content).toBe('Gemini says hi');
     });
 
     it('does NOT call Bedrock for a gemini model', async () => {
       seedSessionMocks();
-      mockGeminiCreate.mockResolvedValue(makeCompletion());
+      mockGeminiClientCreate.mockResolvedValue(makeCompletion());
 
       await generateChatResponse(
         'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
@@ -159,7 +161,6 @@ describe('generateChatResponse — model routing', () => {
   describe('Claude / Bedrock model', () => {
     it('calls agentModeService.getBedrockClient with the model ID', async () => {
       seedSessionMocks();
-      // Bedrock client returns a completion with no tool calls
       mockBedrockClientCreate.mockResolvedValue(makeCompletion('Claude says hi'));
 
       await generateChatResponse(
@@ -168,22 +169,7 @@ describe('generateChatResponse — model routing', () => {
       );
 
       expect(mockGetBedrockClient).toHaveBeenCalledWith('anthropic.claude-sonnet-4-6');
-    });
-
-    it('does NOT call the Gemini client path for a Claude model', async () => {
-      seedSessionMocks();
-      mockBedrockClientCreate.mockResolvedValue(makeCompletion('Claude'));
-
-      await generateChatResponse(
-        'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'anthropic.claude-sonnet-4-6'
-      );
-
-      // mockGeminiCreate is the create fn on the OpenAI mock instance used as Gemini client.
-      // It should NOT have been called because Claude takes the Bedrock path.
-      // (The OpenAI constructor IS called once for the default openai client at module init,
-      //  but mockGeminiCreate should not be called for Claude requests.)
-      expect(mockGeminiCreate).not.toHaveBeenCalled();
+      expect(mockGetGeminiClient).not.toHaveBeenCalled();
     });
 
     it('returns the assistant message from the Bedrock completion', async () => {
@@ -195,12 +181,11 @@ describe('generateChatResponse — model routing', () => {
         undefined, undefined, 'anthropic.claude-sonnet-4-6'
       );
 
-      // Result is a string (no tool calls) or an object with content
       const content = typeof result === 'string' ? result : (result as any).content;
       expect(content).toBe('Bedrock response');
     });
 
-    it('routes claude-* models (not just anthropic. prefix) to Bedrock', async () => {
+    it('routes claude-* model names (not just anthropic. prefix) to Bedrock', async () => {
       seedSessionMocks();
       mockBedrockClientCreate.mockResolvedValue(makeCompletion('ok'));
 
@@ -212,12 +197,10 @@ describe('generateChatResponse — model routing', () => {
       expect(mockGetBedrockClient).toHaveBeenCalledWith('claude-opus-4');
     });
 
-    it('does NOT route generic model named "sonnet-x" to Bedrock (fragile-match guard)', async () => {
-      // A hypothetical model named "sonnet-v2" that is NOT Claude should use Azure OpenAI,
-      // not the Bedrock client. The isClaudeModel check no longer matches on 'sonnet' alone.
+    it('does NOT route generic model "sonnet-x" to Bedrock (fragile-match guard)', async () => {
+      // A hypothetical model named "sonnet-v2" that is NOT Claude should use Azure OpenAI.
+      // The isClaudeModel check no longer matches on 'sonnet' alone.
       seedSessionMocks();
-      // The Azure OpenAI client will throw (not configured in test), but getBedrockClient should never be called.
-      // We check the call counts before any error propagates.
       try {
         await generateChatResponse(
           'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
@@ -228,6 +211,7 @@ describe('generateChatResponse — model routing', () => {
       }
 
       expect(mockGetBedrockClient).not.toHaveBeenCalled();
+      expect(mockGetGeminiClient).not.toHaveBeenCalled();
     });
   });
 });
