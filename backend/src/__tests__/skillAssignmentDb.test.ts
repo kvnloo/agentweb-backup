@@ -237,6 +237,12 @@ describe('SkillAssignmentDb', () => {
       ).rejects.toThrow('assignmentId is required');
     });
 
+    it('FAIL: should reject update with invalid status', async () => {
+      await expect(
+        skillAssignmentDb.updateAssignment('a1', { status: 'banana' as any })
+      ).rejects.toThrow('Invalid status');
+    });
+
     it('SUCCESS: should update assignment fields', async () => {
       mockPromise.mockResolvedValueOnce({
         Attributes: {

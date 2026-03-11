@@ -75,9 +75,9 @@ export class SkillAssignmentDb {
       skillId: input.skillId,
       userId: input.userId,
       status: input.status,
-      schedule: input.schedule,
-      nextRunTime: input.nextRunTime,
-      config: input.config,
+      ...(input.schedule && { schedule: input.schedule }),
+      ...(input.nextRunTime && { nextRunTime: input.nextRunTime }),
+      ...(input.config && { config: input.config }),
       createdAt: timestamp,
       updatedAt: timestamp,
     };
@@ -179,6 +179,9 @@ export class SkillAssignmentDb {
   ): Promise<SkillAssignment> {
     if (!assignmentId) {
       throw new Error('assignmentId is required');
+    }
+    if (updates.status !== undefined && !VALID_STATUSES.includes(updates.status)) {
+      throw new Error(`Invalid status: ${updates.status}. Must be one of: ${VALID_STATUSES.join(', ')}`);
     }
 
     const timestamp = new Date().toISOString();
