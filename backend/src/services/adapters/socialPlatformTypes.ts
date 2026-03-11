@@ -88,7 +88,7 @@ export interface SocialPlatformAdapter {
   /**
    * Get metrics for specific posts
    */
-  getPostMetrics(account: ConnectedAccount, postIds: string[]): Promise<PostMetric[]>;
+  getPostMetrics(account: ConnectedAccount, postIds: string[], userId?: string): Promise<PostMetric[]>;
 
   /**
    * Get overall account metrics (followers, page views, etc.)

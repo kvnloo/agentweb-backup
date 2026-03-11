@@ -1,6 +1,7 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
+import { getAccountSummary } from '../services/accountSummaryService';
 
 emmaToolRegistry.register({
   name: 'install_skills',
@@ -4111,3 +4112,110 @@ Use this for a quick overview of all clients before diving into individual healt
     return await agentModeService.listAllClients(userId);
   }
 });
+
+emmaToolRegistry.register({
+  name: 'account_summary',
+  definition: {
+    name: 'account_summary',
+    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        time_range: {
+          type: 'string',
+          enum: ['1d', '7d', '30d', '90d'],
+          description: 'Time range for the summary. Defaults to 7d.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const timeRange = args.time_range || '7d';
+    return await getAccountSummary(userId, timeRange);
+  }
+});
+
+// --- SEO & Analytics Tools ---
+emmaToolRegistry.register({
+  name: 'get_seo_metrics',
+  definition: {
+    name: 'get_seo_metrics',
+    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). User must have SEO domains configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for metrics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchSearchConsoleMetrics } = await import('../services/seoService');
+    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_website_analytics',
+  definition: {
+    name: 'get_website_analytics',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. User must have a Google Analytics Property ID configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for analytics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
+    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+// ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
+// These tools wrap REST endpoints via mcpFetch. Rather than duplicating
+// definitions, we re-register them from the MCP server registry.
+// Ensure apiTools has registered its tools before we try to bridge them.
+import '../mcp/server/apiTools';
+import { mcpToolRegistry } from '../mcp/server/registry';
+
+const scheduledChatToolNames = [
+  'list_scheduled_chats',
+  'manage_scheduled_chat',
+  'test_scheduled_chat',
+  'get_scheduled_chat_test_history',
+  'submit_scheduled_chat_variables',
+];
+
+for (const toolName of scheduledChatToolNames) {
+  const handler = mcpToolRegistry.getTool(toolName);
+  if (handler) {
+    emmaToolRegistry.register({
+      name: handler.name,
+      definition: handler.definition,
+      execute: handler.execute,
+    });
+  } else {
+    console.warn(`[emma/tools] Failed to bridge scheduled chat tool "${toolName}" — not found in mcpToolRegistry`);
+  }
+}
