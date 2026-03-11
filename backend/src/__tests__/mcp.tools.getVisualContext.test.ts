@@ -25,10 +25,10 @@ describe('get_visual_context MCP tool', () => {
   let registry: any;
 
   beforeAll(async () => {
-    const mod = await import('../mcp/server/registry');
-    registry = mod.mcpToolRegistry;
+    const mod = await import('../emma/registry');
+    registry = mod.emmaToolRegistry;
     // Load tools (registers all tools including get_visual_context)
-    await import('../mcp/server/tools');
+    await import('../emma/tools');
   });
 
   it('is registered in the tool registry', () => {
