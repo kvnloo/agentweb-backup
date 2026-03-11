@@ -69,7 +69,7 @@ jest.mock("../services/v0Service", () => ({
   BrandContext: {},
 }));
 
-import landingPageGenerationRouter from "../routes/landingPageGeneration";
+import landingPageGenerationRouter, { _resetRateLimitState } from "../routes/landingPageGeneration";
 
 const app = express();
 app.use(express.json());
@@ -79,6 +79,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockGetUserById.mockResolvedValue(null);
   mockListLandingPages.mockResolvedValue([]);
+  _resetRateLimitState();
 });
 
 // =============================================================================
@@ -110,6 +111,26 @@ describe("POST /api/landing-pages/v0/generate", () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/prompt is required/);
+  });
+
+  it("FAIL: prompt exceeds 10,000 chars → 400", async () => {
+    const longPrompt = "a".repeat(10_001);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: longPrompt });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/must not exceed 10000 characters/);
+  });
+
+  it("SUCCESS: prompt exactly 10,000 chars is accepted", async () => {
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-1", status: "draft" });
+    const exactPrompt = "a".repeat(10_000);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: exactPrompt });
+
+    expect(res.status).toBe(201);
   });
 
   it("FAIL: service throws → 500", async () => {
@@ -230,6 +251,16 @@ describe("POST /api/landing-pages/v0/generated/:id/iterate", () => {
     expect(res.body.error).toMatch(/message is required/);
   });
 
+  it("FAIL: message exceeds 10,000 chars → 400", async () => {
+    const longMessage = "b".repeat(10_001);
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/iterate")
+      .send({ message: longMessage });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/must not exceed 10000 characters/);
+  });
+
   it("FAIL: service throws not found → 404", async () => {
     mockIterateLandingPage.mockRejectedValueOnce(
       new Error("Landing page not found")
@@ -337,5 +368,73 @@ describe("DELETE /api/landing-pages/v0/generated/:id", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
+  });
+});
+
+// =============================================================================
+// Rate Limiting
+// =============================================================================
+describe("Rate limiting on expensive endpoints", () => {
+  it("FAIL: 11th generate request in same hour → 429", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
+
+    // Fire 10 requests — all should succeed
+    for (let i = 0; i < 10; i++) {
+      const res = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Create a page" });
+      expect(res.status).toBe(201);
+    }
+
+    // 11th request should be rate limited
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Create a page" });
+
+    expect(res.status).toBe(429);
+    expect(res.body.error).toMatch(/Rate limit exceeded/);
+  });
+
+  it("FAIL: rate limit applies across generate, deploy, and iterate", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
+    mockDeployLandingPage.mockResolvedValue({ id: "page-1", status: "deployed" });
+    mockIterateLandingPage.mockResolvedValue({ id: "page-1", status: "draft", iterations: 1 });
+
+    // 4 generate
+    for (let i = 0; i < 4; i++) {
+      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    }
+    // 3 deploy
+    for (let i = 0; i < 3; i++) {
+      await request(app).post("/api/landing-pages/v0/generated/page-1/deploy");
+    }
+    // 3 iterate (= 10 total)
+    for (let i = 0; i < 3; i++) {
+      await request(app).post("/api/landing-pages/v0/generated/page-1/iterate").send({ message: "Edit" });
+    }
+
+    // 11th request on any endpoint → 429
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/deploy");
+
+    expect(res.status).toBe(429);
+  });
+
+  it("SUCCESS: rate limit resets after clearing state", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
+
+    for (let i = 0; i < 10; i++) {
+      await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    }
+
+    // Rate limited
+    let res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    expect(res.status).toBe(429);
+
+    // Reset (simulates window expiration)
+    _resetRateLimitState();
+
+    res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
+    expect(res.status).toBe(201);
   });
 });

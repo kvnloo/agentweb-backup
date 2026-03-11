@@ -1,4 +1,4 @@
-import { Router, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import {
@@ -13,13 +13,54 @@ import {
 
 const router = Router();
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const MAX_INPUT_LENGTH = 10_000;
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+// ---------------------------------------------------------------------------
+// In-memory per-user rate limiter for expensive endpoints
+// ---------------------------------------------------------------------------
+const rateLimitMap = new Map<string, number[]>();
+
+/** Exported for testing — allows tests to clear state between runs. */
+export function _resetRateLimitState(): void {
+  rateLimitMap.clear();
+}
+
+function rateLimiter(req: Request, res: Response, next: NextFunction): void {
+  const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+  if (!userId) {
+    // Auth middleware will catch this; just pass through
+    next();
+    return;
+  }
+
+  const now = Date.now();
+  const timestamps = rateLimitMap.get(userId) || [];
+
+  // Evict entries outside the current window
+  const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+
+  if (recent.length >= RATE_LIMIT_MAX) {
+    res.status(429).json({ error: "Rate limit exceeded. Max 10 requests per hour for generation endpoints." });
+    return;
+  }
+
+  recent.push(now);
+  rateLimitMap.set(userId, recent);
+  next();
+}
+
 router.use(authenticateToken);
 
 /**
  * POST /api/landing-pages/generate
  * Generate a new landing page using v0 Platform API + brand guidelines
  */
-router.post("/generate", async (req, res: Response) => {
+router.post("/generate", rateLimiter, async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {
@@ -29,6 +70,10 @@ router.post("/generate", async (req, res: Response) => {
     const { prompt, name } = req.body;
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "prompt is required and must be a string" });
+    }
+
+    if (prompt.length > MAX_INPUT_LENGTH) {
+      return res.status(400).json({ error: `prompt must not exceed ${MAX_INPUT_LENGTH} characters` });
     }
 
     const pageName = name || prompt.slice(0, 60);
@@ -78,7 +123,7 @@ router.post("/generate", async (req, res: Response) => {
  * POST /api/landing-pages/generated/:id/deploy
  * Deploy a generated landing page to Vercel
  */
-router.post("/generated/:id/deploy", async (req, res: Response) => {
+router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {
@@ -99,7 +144,7 @@ router.post("/generated/:id/deploy", async (req, res: Response) => {
  * POST /api/landing-pages/generated/:id/iterate
  * Refine a landing page with follow-up instructions
  */
-router.post("/generated/:id/iterate", async (req, res: Response) => {
+router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {
@@ -110,6 +155,10 @@ router.post("/generated/:id/iterate", async (req, res: Response) => {
     const { message } = req.body;
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "message is required and must be a string" });
+    }
+
+    if (message.length > MAX_INPUT_LENGTH) {
+      return res.status(400).json({ error: `message must not exceed ${MAX_INPUT_LENGTH} characters` });
     }
 
     const result = await iterateLandingPage(id, userId, message);
