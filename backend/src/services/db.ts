@@ -3524,6 +3524,8 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    unsubscribedFromGroupEmail?: boolean;
+    unsubscribedFromGroupEmailAt?: string;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -3666,6 +3668,16 @@ export const crmDb = {
       if (updates.dealCurrency !== undefined) {
         setExpressions.push('dealCurrency = :dealCurrency');
         expressionAttributeValues[':dealCurrency'] = updates.dealCurrency;
+      }
+
+      if (updates.unsubscribedFromGroupEmail !== undefined) {
+        setExpressions.push('unsubscribedFromGroupEmail = :unsubGE');
+        expressionAttributeValues[':unsubGE'] = updates.unsubscribedFromGroupEmail;
+      }
+
+      if (updates.unsubscribedFromGroupEmailAt !== undefined) {
+        setExpressions.push('unsubscribedFromGroupEmailAt = :unsubGEAt');
+        expressionAttributeValues[':unsubGEAt'] = updates.unsubscribedFromGroupEmailAt;
       }
 
       // Always update updatedAt
