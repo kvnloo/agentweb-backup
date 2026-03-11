@@ -1,0 +1,626 @@
+import { userDb } from "./db";
+import { getSecret } from "../utils/secretsManager";
+import { JWT } from "google-auth-library";
+import { BetaAnalyticsDataClient } from "@google-analytics/data";
+
+const pageSpeedStrategy = "mobile";
+
+export async function getGoogleSearchConsoleAccessToken(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+
+    const serviceAccountJson = await getSecret(secretName);
+    const serviceAccount = JSON.parse(serviceAccountJson);
+
+    if (!serviceAccount.private_key || !serviceAccount.client_email) {
+      console.error("Service account JSON missing required fields (private_key or client_email)");
+      return null;
+    }
+
+    const client = new JWT({
+      email: serviceAccount.client_email,
+      key: serviceAccount.private_key,
+      scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
+    });
+
+    const accessToken = await client.getAccessToken();
+    return accessToken.token || null;
+  } catch (error: any) {
+    console.error("Error fetching Google Search Console access token:", error);
+    return null;
+  }
+}
+
+export async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataClient | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/SearchConsole"
+      : "dev/AgentWeb/Google/SearchConsole";
+
+    const serviceAccountJson = await getSecret(secretName);
+    const serviceAccount = JSON.parse(serviceAccountJson);
+
+    if (!serviceAccount.private_key || !serviceAccount.client_email) {
+      console.error("Service account JSON missing required fields (private_key or client_email)");
+      return null;
+    }
+
+    const client = new BetaAnalyticsDataClient({
+      credentials: {
+        client_email: serviceAccount.client_email,
+        private_key: serviceAccount.private_key,
+      },
+    });
+
+    return client;
+  } catch (error: any) {
+    console.error("Error creating Google Analytics Data client:", error);
+    return null;
+  }
+}
+
+export async function getPageSpeedApiKey(): Promise<string | null> {
+  try {
+    const secretName = process.env.NODE_ENV === "production"
+      ? "prod/AgentWeb/Google/PageSpeed"
+      : "dev/AgentWeb/Google/PageSpeed";
+    const secretString = await getSecret(secretName);
+    const trimmed = secretString.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      const apiKey = parsed?.apiKey;
+      return typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : null;
+    } catch (parseError) {
+      return trimmed;
+    }
+  } catch (error) {
+    console.error("Error fetching PageSpeed API key:", error);
+    return null;
+  }
+}
+
+function buildPageSpeedUrl(domain: string): string {
+  if (!domain) {
+    return "";
+  }
+  if (domain.startsWith("http://") || domain.startsWith("https://")) {
+    return domain;
+  }
+  return `https://${domain}`;
+}
+
+export async function getTechnicalSeoScore(domain: string): Promise<number | null> {
+  const pageSpeedApiKey = await getPageSpeedApiKey();
+  if (!pageSpeedApiKey) {
+    return null;
+  }
+
+  const targetUrl = buildPageSpeedUrl(domain);
+  if (!targetUrl) {
+    return null;
+  }
+
+  try {
+    const pageSpeedUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(targetUrl)}&category=seo&strategy=${encodeURIComponent(pageSpeedStrategy)}&key=${encodeURIComponent(pageSpeedApiKey)}`;
+    const response = await fetch(pageSpeedUrl);
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null);
+      console.error("PageSpeed Insights API error:", errorData || response.statusText);
+      return null;
+    }
+
+    const data = await response.json();
+    const score = data?.lighthouseResult?.categories?.seo?.score;
+    if (typeof score !== "number") {
+      return null;
+    }
+
+    return Math.round(score * 100);
+  } catch (error) {
+    console.error("Error fetching PageSpeed Insights data:", error);
+    return null;
+  }
+}
+
+function calculateDateRange(timeframe: string): { startDateStr: string; endDateStr: string } {
+  const now = new Date();
+  const endDate = new Date(now);
+  endDate.setUTCHours(0, 0, 0, 0);
+
+  const startDate = new Date(endDate);
+
+  if (timeframe === "7d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 7);
+  } else if (timeframe === "14d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 14);
+  } else if (timeframe === "30d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 30);
+  } else if (timeframe === "90d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 90);
+  } else {
+    startDate.setUTCDate(endDate.getUTCDate() - 30);
+  }
+  startDate.setUTCHours(0, 0, 0, 0);
+
+  return {
+    startDateStr: startDate.toISOString().split("T")[0],
+    endDateStr: endDate.toISOString().split("T")[0],
+  };
+}
+
+function calculateGaDateRange(timeframe: string): { startDateStr: string; endDateStr: string } {
+  const now = new Date();
+  const endDate = new Date(now);
+  endDate.setUTCHours(0, 0, 0, 0);
+
+  const startDate = new Date(endDate);
+
+  if (timeframe === "7d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 6);
+  } else if (timeframe === "14d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 13);
+  } else if (timeframe === "30d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 29);
+  } else if (timeframe === "90d") {
+    startDate.setUTCDate(endDate.getUTCDate() - 89);
+  } else {
+    startDate.setUTCDate(endDate.getUTCDate() - 29);
+  }
+  startDate.setUTCHours(0, 0, 0, 0);
+
+  return {
+    startDateStr: startDate.toISOString().split("T")[0],
+    endDateStr: endDate.toISOString().split("T")[0],
+  };
+}
+
+export async function fetchSearchConsoleMetrics(userId: string, timeframe: string = "30d"): Promise<any> {
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    return { error: "User not found" };
+  }
+
+  if (!user.seoDomains || user.seoDomains.length === 0) {
+    return { message: "No SEO domains configured. Please configure SEO domains in your account settings." };
+  }
+
+  const accessToken = await getGoogleSearchConsoleAccessToken();
+  if (!accessToken) {
+    return { error: "Google Search Console API not configured. Please contact support." };
+  }
+
+  const { startDateStr, endDateStr } = calculateDateRange(timeframe);
+
+  const metricsPromises = user.seoDomains.map(async (domain: string) => {
+    try {
+      const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
+      const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
+
+      // Fetch daily data
+      const dailyDataResponse = await fetch(searchAnalyticsUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          startDate: startDateStr,
+          endDate: endDateStr,
+          dimensions: ["date"],
+          rowLimit: 25000,
+        }),
+      });
+
+      let dailyData: Array<{ date: string; clicks: number; impressions: number }> = [];
+      if (!dailyDataResponse.ok) {
+        const errorData = await dailyDataResponse.json();
+        console.error(`Error fetching daily data for ${domain}:`, errorData);
+        return {
+          domain,
+          error: errorData.error?.message || "Failed to fetch daily search analytics",
+          clicks: 0, impressions: 0, ctr: 0, position: 0,
+          technicalSeoScore: null, dailyData: [], topQueries: [], topPages: [],
+        };
+      }
+
+      const dailyDataResult = await dailyDataResponse.json();
+      dailyData = (dailyDataResult.rows || [])
+        .map((row: any) => ({
+          date: row.keys?.[0] || "",
+          clicks: row.clicks || 0,
+          impressions: row.impressions || 0,
+        }))
+        .filter((item: any) => item.date)
+        .sort((a: any, b: any) => a.date.localeCompare(b.date));
+
+      // Fetch overall totals
+      const overallResponse = await fetch(searchAnalyticsUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          startDate: startDateStr,
+          endDate: endDateStr,
+        }),
+      });
+
+      let totalClicks = 0;
+      let totalImpressions = 0;
+      let avgPosition = 0;
+      let avgCtr = 0;
+
+      if (overallResponse.ok) {
+        const overallData = await overallResponse.json();
+        if (overallData.rows && overallData.rows.length > 0) {
+          const overallRow = overallData.rows[0];
+          totalClicks = overallRow.clicks || 0;
+          totalImpressions = overallRow.impressions || 0;
+          avgPosition = overallRow.position || 0;
+          avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+        } else {
+          totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
+          totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
+          avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+        }
+      } else {
+        await overallResponse.json().catch(() => ({}));
+        totalClicks = dailyData.reduce((sum, day) => sum + day.clicks, 0);
+        totalImpressions = dailyData.reduce((sum, day) => sum + day.impressions, 0);
+        avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+      }
+
+      // Fetch top queries
+      const queriesResponse = await fetch(searchAnalyticsUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          startDate: startDateStr,
+          endDate: endDateStr,
+          dimensions: ["query"],
+          rowLimit: 25000,
+        }),
+      });
+
+      let topQueries: Array<{ query: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
+      let allQueriesData: any = null;
+      if (queriesResponse.ok) {
+        allQueriesData = await queriesResponse.json();
+        topQueries = (allQueriesData.rows || [])
+          .map((row: any) => ({
+            query: row.keys?.[0] || "Unknown",
+            clicks: row.clicks || 0,
+            impressions: row.impressions || 0,
+            ctr: row.impressions > 0 ? ((row.clicks || 0) / row.impressions) * 100 : 0,
+            position: row.position || 0,
+          }))
+          .sort((a: { clicks: number }, b: { clicks: number }) => b.clicks - a.clicks)
+          .slice(0, 10);
+      }
+
+      // Calculate weighted average position from queries if needed
+      if (avgPosition === 0 && allQueriesData && allQueriesData.rows && allQueriesData.rows.length > 0) {
+        let totalPositionWeighted = 0;
+        let totalImpressionsForPosition = 0;
+        allQueriesData.rows.forEach((row: any) => {
+          const impressions = row.impressions || 0;
+          const position = row.position || 0;
+          if (impressions > 0 && position > 0) {
+            totalPositionWeighted += position * impressions;
+            totalImpressionsForPosition += impressions;
+          }
+        });
+        if (totalImpressionsForPosition > 0) {
+          avgPosition = totalPositionWeighted / totalImpressionsForPosition;
+        }
+      }
+
+      // Fetch top pages
+      const pagesResponse = await fetch(searchAnalyticsUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          startDate: startDateStr,
+          endDate: endDateStr,
+          dimensions: ["page"],
+          rowLimit: 25000,
+        }),
+      });
+
+      let topPages: Array<{ page: string; clicks: number; impressions: number; ctr: number; position: number }> = [];
+      if (pagesResponse.ok) {
+        const pagesData = await pagesResponse.json();
+        topPages = (pagesData.rows || [])
+          .map((row: any) => ({
+            page: row.keys?.[0] || "Unknown",
+            clicks: row.clicks || 0,
+            impressions: row.impressions || 0,
+            ctr: row.impressions > 0 ? ((row.clicks || 0) / row.impressions) * 100 : 0,
+            position: row.position || 0,
+          }))
+          .sort((a: { clicks: number }, b: { clicks: number }) => b.clicks - a.clicks)
+          .slice(0, 10);
+      }
+
+      const technicalSeoScore = await getTechnicalSeoScore(domain);
+
+      return {
+        domain,
+        clicks: totalClicks,
+        impressions: totalImpressions,
+        ctr: avgCtr,
+        position: avgPosition,
+        technicalSeoScore,
+        dailyData,
+        topQueries,
+        topPages,
+        dateRange: { startDate: startDateStr, endDate: endDateStr },
+      };
+    } catch (error: any) {
+      console.error(`Error processing domain ${domain}:`, error);
+      return {
+        domain,
+        error: error.message || "Failed to fetch metrics",
+        clicks: 0, impressions: 0, ctr: 0, position: 0,
+        technicalSeoScore: null, dailyData: [], topQueries: [], topPages: [],
+      };
+    }
+  });
+
+  const metrics = await Promise.all(metricsPromises);
+  return { metrics, timeframe, timestamp: new Date().toISOString() };
+}
+
+export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d"): Promise<any> {
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    return { error: "User not found" };
+  }
+
+  if (!user.googleAnalyticsPropertyId) {
+    return { message: "No Google Analytics Property ID configured. Please configure GA4 in your account settings." };
+  }
+
+  const gaClient = await getGoogleAnalyticsDataClient();
+  if (!gaClient) {
+    return { error: "Google Analytics API not configured. Please contact support." };
+  }
+
+  try {
+    const { startDateStr, endDateStr } = calculateGaDateRange(timeframe);
+    const propertyId = user.googleAnalyticsPropertyId;
+
+    // Build dimension filter to exclude filtered domains
+    let dimensionFilter: any = undefined;
+    if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
+      const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
+        notExpression: {
+          filter: {
+            fieldName: "hostName",
+            stringFilter: {
+              matchType: "CONTAINS" as const,
+              value: domain,
+            },
+          },
+        },
+      }));
+
+      dimensionFilter = {
+        andGroup: {
+          expressions: notExpressions,
+        },
+      };
+    }
+
+    // Fetch overall metrics
+    const [overallResponse] = await gaClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+      metrics: [
+        { name: "sessions" },
+        { name: "activeUsers" },
+        { name: "screenPageViews" },
+        { name: "averageSessionDuration" },
+        { name: "bounceRate" },
+      ],
+      ...(dimensionFilter && { dimensionFilter }),
+    });
+
+    // Fetch top pages by engagement
+    let topPagesByEngagement: Array<{
+      pageTitle: string;
+      pagePath: string;
+      sessions: number;
+      engagementRate: number;
+      userEngagementDuration: number;
+      eventCount: number;
+    }> = [];
+
+    try {
+      const [pagesEngagementResponse] = await gaClient.runReport({
+        property: `properties/${propertyId}`,
+        dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+        dimensions: [
+          { name: "pagePath" },
+          { name: "hostName" },
+        ],
+        metrics: [
+          { name: "sessions" },
+          { name: "engagementRate" },
+          { name: "userEngagementDuration" },
+          { name: "eventCount" },
+        ],
+        orderBys: [
+          { metric: { metricName: "userEngagementDuration" }, desc: true },
+        ],
+        limit: 20,
+        ...(dimensionFilter && { dimensionFilter }),
+      });
+
+      if (pagesEngagementResponse.rows) {
+        pagesEngagementResponse.rows.forEach((row) => {
+          const dimensions = row.dimensionValues || [];
+          const metrics = row.metricValues || [];
+          const pagePath = dimensions[0]?.value || "";
+          const hostName = dimensions[1]?.value || "";
+          const sessions = parseInt(metrics[0]?.value || "0");
+          const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
+          const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
+          const eventCount = parseInt(metrics[3]?.value || "0");
+
+          let fullUrl = pagePath;
+          if (hostName) {
+            const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+            fullUrl = `https://${hostName}${path}`;
+          } else if (user.seoDomains && user.seoDomains.length > 0) {
+            const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+            fullUrl = `https://${user.seoDomains[0]}${path}`;
+          }
+
+          topPagesByEngagement.push({
+            pageTitle: pagePath,
+            pagePath: fullUrl,
+            sessions,
+            engagementRate,
+            userEngagementDuration,
+            eventCount,
+          });
+        });
+      }
+    } catch (engagementError: any) {
+      console.warn("Error fetching top pages by engagement:", engagementError.message);
+    }
+
+    // Fetch daily data for timeline
+    const [dailyResponse] = await gaClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+      dimensions: [{ name: "date" }],
+      metrics: [
+        { name: "sessions" },
+        { name: "activeUsers" },
+        { name: "screenPageViews" },
+      ],
+      keepEmptyRows: false,
+      ...(dimensionFilter && { dimensionFilter }),
+    });
+
+    // Fetch traffic sources
+    const [trafficSourcesResponse] = await gaClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: startDateStr, endDate: endDateStr }],
+      dimensions: [
+        { name: "sessionSource" },
+        { name: "sessionMedium" },
+      ],
+      metrics: [
+        { name: "sessions" },
+        { name: "activeUsers" },
+        { name: "screenPageViews" },
+        { name: "averageSessionDuration" },
+      ],
+      orderBys: [
+        { metric: { metricName: "sessions" }, desc: true },
+      ],
+      limit: 50,
+      ...(dimensionFilter && { dimensionFilter }),
+    });
+
+    // Process overall metrics
+    let totalSessions = 0;
+    let totalUsers = 0;
+    let totalPageViews = 0;
+    let avgSessionDuration = 0;
+    let bounceRate = 0;
+
+    if (overallResponse.rows && overallResponse.rows.length > 0) {
+      const row = overallResponse.rows[0];
+      const metrics = row.metricValues || [];
+      totalSessions = parseInt(metrics[0]?.value || "0");
+      totalUsers = parseInt(metrics[1]?.value || "0");
+      totalPageViews = parseInt(metrics[2]?.value || "0");
+      avgSessionDuration = parseFloat(metrics[3]?.value || "0");
+      bounceRate = parseFloat(metrics[4]?.value || "0") * 100;
+    }
+
+    // Process daily data
+    const dailyData: Array<{ date: string; sessions: number; users: number; pageViews: number }> = [];
+    if (dailyResponse.rows) {
+      dailyResponse.rows.forEach((row) => {
+        const dimensions = row.dimensionValues || [];
+        const metrics = row.metricValues || [];
+        const dateValue = dimensions[0]?.value || "";
+
+        if (!dateValue || dateValue.length !== 8) {
+          return;
+        }
+
+        const sessions = parseInt(metrics[0]?.value || "0");
+        const users = parseInt(metrics[1]?.value || "0");
+        const pageViews = parseInt(metrics[2]?.value || "0");
+        const formattedDate = `${dateValue.substring(0, 4)}-${dateValue.substring(4, 6)}-${dateValue.substring(6, 8)}`;
+
+        dailyData.push({ date: formattedDate, sessions, users, pageViews });
+      });
+    }
+    dailyData.sort((a, b) => a.date.localeCompare(b.date));
+
+    // Process traffic sources
+    interface TrafficSource {
+      source: string;
+      medium: string;
+      sessions: number;
+      users: number;
+      pageViews: number;
+      avgSessionDuration: number;
+    }
+
+    const trafficSources: TrafficSource[] = [];
+    if (trafficSourcesResponse.rows) {
+      trafficSourcesResponse.rows.forEach((row) => {
+        const dimensions = row.dimensionValues || [];
+        const metrics = row.metricValues || [];
+        trafficSources.push({
+          source: dimensions[0]?.value || "(direct)",
+          medium: dimensions[1]?.value || "(none)",
+          sessions: parseInt(metrics[0]?.value || "0"),
+          users: parseInt(metrics[1]?.value || "0"),
+          pageViews: parseInt(metrics[2]?.value || "0"),
+          avgSessionDuration: parseFloat(metrics[3]?.value || "0"),
+        });
+      });
+    }
+
+    return {
+      propertyId,
+      sessions: totalSessions,
+      users: totalUsers,
+      pageViews: totalPageViews,
+      avgSessionDuration,
+      bounceRate,
+      dailyData,
+      trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
+      topPagesByEngagement,
+      dateRange: { startDate: startDateStr, endDate: endDateStr },
+      timeframe,
+      timestamp: new Date().toISOString(),
+    };
+  } catch (error: any) {
+    console.error("Error fetching Google Analytics metrics:", error);
+    return { error: error.message || "Failed to fetch Google Analytics metrics" };
+  }
+}
