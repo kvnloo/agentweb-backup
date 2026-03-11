@@ -7,6 +7,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-11',
+    changes: [
+      'Feature: LinkedIn Outreach — Search & Discovery in Agent Mode',
+      '- Ask Emma to search LinkedIn for people by keyword, job title, or company name',
+      '- View detailed LinkedIn profiles including headline, location, and connection degree',
+      '- List your existing LinkedIn connections and sent invitations with status tracking',
+      '- Browse company profiles for research before outreach',
+      '- Cancel pending connection invitations',
+      '- Full outreach workflow: search → view profile → send invite → track status',
+    ],
+  },
+  {
     date: '2026-03-10',
     changes: [
       'Feature: Scheduled Chat Management in Agent Mode',
