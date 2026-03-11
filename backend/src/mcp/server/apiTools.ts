@@ -300,7 +300,8 @@ mcpToolRegistry.register({
         schedule_id: { type: 'string', description: 'Schedule ID (required for update/toggle/delete)' },
         schedule_name: { type: 'string', description: 'Schedule name (create/update)' },
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (create/update)' },
-        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly (create/update)' },
+        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
+        frequency_interval_days: { type: 'number', description: 'Number of days between runs (required when schedule_frequency is "every_n_days", must be >= 1)' },
         next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
@@ -339,6 +340,7 @@ mcpToolRegistry.register({
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
       }
@@ -359,6 +361,7 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
         return jsonResult(data);
       }
