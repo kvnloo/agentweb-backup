@@ -25,6 +25,7 @@ import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, Me
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
+import { getActionIntentsForTools } from '../utils/sseProgress';
 
 type MetaApiResult = {
   success: boolean;
@@ -703,7 +704,7 @@ export class AgentModeService {
     llmModel: string,
     sessionId: string,
     mockMode: boolean = false,
-    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; actions?: import('../utils/sseProgress').ActionIntent[] }) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
       // Track memory usage for optimization
@@ -1057,13 +1058,18 @@ export class AgentModeService {
           }
         }
 
-        // Send progress update after all tools complete
+        // Send progress update after all tools complete, with action intents for navigable tools
         if (onProgress) {
+          const successfulToolNames = toolResults
+            .filter(r => r.status === 'success')
+            .map(r => r.toolCall.function.name);
+          const actions = getActionIntentsForTools(successfulToolNames);
           onProgress({
             iteration,
             status: 'tool_executed',
             toolCalls: toolCalls.slice(),
-            pendingTools: []
+            pendingTools: [],
+            ...(actions.length > 0 ? { actions } : {})
           });
         }
 

@@ -3,9 +3,35 @@
  * Uses a simple in-memory store to track progress by sessionId
  */
 
+// Action intent types — used by the frontend to navigate/highlight UI elements
+export type ActionIntent = {
+  type: 'navigate';
+  route: string;
+  label: string;
+} | {
+  type: 'highlight';
+  elementId: string;
+  label: string;
+};
+
 // Progress type definition
-type ProgressUpdate = { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] };
+type ProgressUpdate = {
+  iteration: number;
+  status: string;
+  toolCalls?: any[];
+  pendingTools?: string[];
+  actions?: ActionIntent[];
+};
 type ProgressCallback = (progress: ProgressUpdate) => void;
+
+// Mapping of tool names to navigation routes
+const TOOL_NAVIGATION_MAP: Record<string, { route: string; label: string }> = {
+  update_brand_guidelines: { route: '/brand-guidelines', label: 'View Brand Guidelines' },
+  update_market_strategy: { route: '/gtm-tracker', label: 'View GTM Tracker' },
+  manage_crm_leads: { route: '/crm', label: 'View CRM' },
+  create_email_template: { route: '/email-templates', label: 'View Email Templates' },
+  create_landing_page: { route: '/landing-pages', label: 'View Landing Pages' },
+};
 
 // Store progress updates by sessionId
 export const progressStore = new Map<string, ProgressUpdate>();
@@ -55,6 +81,52 @@ export function emitProgress(sessionId: string, progress: ProgressUpdate) {
       }
     });
   }
+}
+
+/**
+ * Emit an action intent (navigate or highlight) for a session.
+ * This is a convenience wrapper that creates a progress update with a single action.
+ */
+export function emitActionIntent(
+  sessionId: string,
+  iteration: number,
+  type: 'navigate' | 'highlight',
+  target: string,
+  label: string
+) {
+  const action: ActionIntent = type === 'navigate'
+    ? { type: 'navigate', route: target, label }
+    : { type: 'highlight', elementId: target, label };
+
+  emitProgress(sessionId, {
+    iteration,
+    status: 'action_intent',
+    actions: [action]
+  });
+}
+
+/**
+ * Given a list of tool names that were just executed, return navigation
+ * action intents for any tools that have a known page mapping.
+ * Deduplicates by route.
+ */
+export function getActionIntentsForTools(toolNames: string[]): ActionIntent[] {
+  const seenRoutes = new Set<string>();
+  const actions: ActionIntent[] = [];
+
+  for (const toolName of toolNames) {
+    const mapping = TOOL_NAVIGATION_MAP[toolName];
+    if (mapping && !seenRoutes.has(mapping.route)) {
+      seenRoutes.add(mapping.route);
+      actions.push({
+        type: 'navigate',
+        route: mapping.route,
+        label: mapping.label
+      });
+    }
+  }
+
+  return actions;
 }
 
 /**

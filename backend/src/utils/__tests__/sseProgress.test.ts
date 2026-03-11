@@ -7,7 +7,9 @@ import {
   registerProgressCallback,
   getLatestProgress,
   cleanupProgress,
-  progressStore
+  progressStore,
+  emitActionIntent,
+  getActionIntentsForTools
 } from '../sseProgress';
 
 describe('SSE Progress Utility', () => {
@@ -224,6 +226,164 @@ describe('SSE Progress Utility', () => {
 
       expect(callback).toHaveBeenCalledWith(progressWithTools);
       expect(getLatestProgress(sessionId)?.pendingTools).toEqual(['create_task_from_template', 'search_knowledge_base']);
+    });
+  });
+
+  describe('Action intents', () => {
+    it('should pass through progress with actions array to callbacks', () => {
+      const progressWithActions = {
+        iteration: 1,
+        status: 'tool_executed',
+        toolCalls: [],
+        actions: [
+          { type: 'navigate' as const, route: '/brand-guidelines', label: 'View Brand Guidelines' }
+        ]
+      };
+
+      const callback = jest.fn();
+      registerProgressCallback(sessionId, callback);
+
+      emitProgress(sessionId, progressWithActions);
+
+      expect(callback).toHaveBeenCalledWith(progressWithActions);
+      const stored = getLatestProgress(sessionId);
+      expect(stored?.actions).toHaveLength(1);
+      expect(stored?.actions?.[0]).toEqual({
+        type: 'navigate',
+        route: '/brand-guidelines',
+        label: 'View Brand Guidelines'
+      });
+    });
+
+    it('should preserve backward compatibility when no actions field is present', () => {
+      const progressWithoutActions = {
+        iteration: 1,
+        status: 'tool_executed',
+        toolCalls: []
+      };
+
+      const callback = jest.fn();
+      registerProgressCallback(sessionId, callback);
+
+      emitProgress(sessionId, progressWithoutActions);
+
+      expect(callback).toHaveBeenCalledWith(progressWithoutActions);
+      const stored = getLatestProgress(sessionId);
+      expect(stored?.actions).toBeUndefined();
+    });
+
+    it('should support multiple actions in a single progress update', () => {
+      const progressWithMultipleActions = {
+        iteration: 1,
+        status: 'tool_executed',
+        toolCalls: [],
+        actions: [
+          { type: 'navigate' as const, route: '/brand-guidelines', label: 'View Brand Guidelines' },
+          { type: 'highlight' as const, elementId: 'brand-logo', label: 'Brand Logo Updated' }
+        ]
+      };
+
+      const callback = jest.fn();
+      registerProgressCallback(sessionId, callback);
+
+      emitProgress(sessionId, progressWithMultipleActions);
+
+      const stored = getLatestProgress(sessionId);
+      expect(stored?.actions).toHaveLength(2);
+      expect(stored?.actions?.[0].type).toBe('navigate');
+      expect(stored?.actions?.[1].type).toBe('highlight');
+    });
+  });
+
+  describe('emitActionIntent', () => {
+    it('should emit a navigation action intent for a session', () => {
+      const callback = jest.fn();
+      registerProgressCallback(sessionId, callback);
+
+      emitActionIntent(sessionId, 1, 'navigate', '/brand-guidelines', 'View Brand Guidelines');
+
+      expect(callback).toHaveBeenCalledTimes(1);
+      const emittedProgress = callback.mock.calls[0][0];
+      expect(emittedProgress.status).toBe('action_intent');
+      expect(emittedProgress.iteration).toBe(1);
+      expect(emittedProgress.actions).toHaveLength(1);
+      expect(emittedProgress.actions[0]).toEqual({
+        type: 'navigate',
+        route: '/brand-guidelines',
+        label: 'View Brand Guidelines'
+      });
+    });
+
+    it('should emit a highlight action intent', () => {
+      const callback = jest.fn();
+      registerProgressCallback(sessionId, callback);
+
+      emitActionIntent(sessionId, 2, 'highlight', 'brand-logo', 'Logo Updated');
+
+      const emittedProgress = callback.mock.calls[0][0];
+      expect(emittedProgress.actions[0]).toEqual({
+        type: 'highlight',
+        elementId: 'brand-logo',
+        label: 'Logo Updated'
+      });
+    });
+  });
+
+  describe('getActionIntentsForTools', () => {
+    it('should return navigation action for update_brand_guidelines', () => {
+      const actions = getActionIntentsForTools(['update_brand_guidelines']);
+      expect(actions).toHaveLength(1);
+      expect(actions[0]).toEqual({
+        type: 'navigate',
+        route: '/brand-guidelines',
+        label: 'View Brand Guidelines'
+      });
+    });
+
+    it('should return navigation action for update_market_strategy', () => {
+      const actions = getActionIntentsForTools(['update_market_strategy']);
+      expect(actions).toHaveLength(1);
+      expect(actions[0].route).toBe('/gtm-tracker');
+    });
+
+    it('should return navigation action for manage_crm_leads', () => {
+      const actions = getActionIntentsForTools(['manage_crm_leads']);
+      expect(actions).toHaveLength(1);
+      expect(actions[0].route).toBe('/crm');
+    });
+
+    it('should return navigation action for create_email_template', () => {
+      const actions = getActionIntentsForTools(['create_email_template']);
+      expect(actions).toHaveLength(1);
+      expect(actions[0].route).toBe('/email-templates');
+    });
+
+    it('should return navigation action for create_landing_page', () => {
+      const actions = getActionIntentsForTools(['create_landing_page']);
+      expect(actions).toHaveLength(1);
+      expect(actions[0].route).toBe('/landing-pages');
+    });
+
+    it('should return empty array for tools without navigation mapping', () => {
+      const actions = getActionIntentsForTools(['search_knowledge_base']);
+      expect(actions).toHaveLength(0);
+    });
+
+    it('should return multiple actions for multiple mapped tools', () => {
+      const actions = getActionIntentsForTools(['update_brand_guidelines', 'manage_crm_leads']);
+      expect(actions).toHaveLength(2);
+      expect(actions[0].route).toBe('/brand-guidelines');
+      expect(actions[1].route).toBe('/crm');
+    });
+
+    it('should deduplicate actions for the same route', () => {
+      const actions = getActionIntentsForTools(['update_brand_guidelines', 'update_brand_guidelines']);
+      expect(actions).toHaveLength(1);
+    });
+
+    it('should handle empty tool list', () => {
+      const actions = getActionIntentsForTools([]);
+      expect(actions).toHaveLength(0);
     });
   });
 });
