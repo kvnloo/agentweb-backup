@@ -571,10 +571,9 @@ router.post("/webhook", async (req: Request, res: Response) => {
 
   let event: any;
   try {
-    // In production, use raw body. For now, construct from parsed body.
-    const body =
-      typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-    event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
+    // req.body is a raw Buffer thanks to express.raw() middleware on this path.
+    // This is required for Stripe signature verification to work correctly.
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err: any) {
     console.error("Webhook signature verification failed:", err.message);
     return res.status(400).json({ error: "Invalid webhook signature." });
