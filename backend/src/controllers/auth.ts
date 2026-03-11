@@ -259,6 +259,19 @@ export const googleCallback = async (
             null
           );
         }
+
+        // Set up free trial for new OAuth users (same as email registration)
+        try {
+          const trialStart = new Date();
+          const trialEnd = calculateTrialEnd(trialStart, DEFAULT_TRIAL_DAYS);
+          await userDb.updateUser(userId, {
+            trial_start: trialStart.toISOString(),
+            trial_end: trialEnd.toISOString(),
+          });
+        } catch (trialError) {
+          console.error("Error setting trial dates for OAuth user:", trialError);
+          // Don't fail signup if trial setup fails
+        }
       } else {
         // For other portals, check waitlist as before
         const waitlistEntry = await waitlistDb.getByEmail(email);
@@ -315,6 +328,21 @@ export const googleCallback = async (
             new Error("User creation failed after Google OAuth process."),
             null
           );
+        }
+
+        // Set up free trial for new OAuth users without a Stripe subscription
+        if (!stripe_customer_id) {
+          try {
+            const trialStart = new Date();
+            const trialEnd = calculateTrialEnd(trialStart, DEFAULT_TRIAL_DAYS);
+            await userDb.updateUser(userId, {
+              trial_start: trialStart.toISOString(),
+              trial_end: trialEnd.toISOString(),
+            });
+          } catch (trialError) {
+            console.error("Error setting trial dates for OAuth user:", trialError);
+            // Don't fail signup if trial setup fails
+          }
         }
       }
     }

@@ -9,6 +9,7 @@ import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { ChatbotDB } from '../services/chatbotService';
 import * as authController from '../controllers/auth';
+import { getTrialStatus } from '../services/trialService';
 
 const router = express.Router();
 
@@ -96,7 +97,6 @@ router.get('/me', authenticateToken, async (req, res) => {
 
     // Add trial status
     if (user.trial_start || user.trial_end) {
-      const { getTrialStatus } = await import('../services/trialService');
       response.trialStatus = getTrialStatus(user.trial_start, user.trial_end);
     }
 

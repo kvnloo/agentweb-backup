@@ -14,6 +14,7 @@ import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { EXTENDED_TRIAL_DAYS, calculateTrialEnd as calcTrialEnd } from "../services/trialService";
 
 const router = express.Router();
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
@@ -397,9 +398,8 @@ router.put("/users/:userId/extend-trial", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    const { EXTENDED_TRIAL_DAYS, calculateTrialEnd } = await import("../services/trialService");
     const durationDays = typeof days === "number" && days > 0 ? days : EXTENDED_TRIAL_DAYS;
-    const trialEnd = calculateTrialEnd(new Date(), durationDays);
+    const trialEnd = calcTrialEnd(new Date(), durationDays);
 
     await userDb.updateUser(userId, {
       trial_start: user.trial_start || new Date().toISOString(),
