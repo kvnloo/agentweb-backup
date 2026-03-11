@@ -73,7 +73,7 @@ import landingPageGenerationRouter from "../routes/landingPageGeneration";
 
 const app = express();
 app.use(express.json());
-app.use("/api/landing-pages", landingPageGenerationRouter);
+app.use("/api/landing-pages/v0", landingPageGenerationRouter);
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -84,10 +84,10 @@ beforeEach(() => {
 // =============================================================================
 // POST /generate
 // =============================================================================
-describe("POST /api/landing-pages/generate", () => {
+describe("POST /api/landing-pages/v0/generate", () => {
   it("FAIL: no body → 400", async () => {
     const res = await request(app)
-      .post("/api/landing-pages/generate")
+      .post("/api/landing-pages/v0/generate")
       .send({});
 
     expect(res.status).toBe(400);
@@ -96,7 +96,7 @@ describe("POST /api/landing-pages/generate", () => {
 
   it("FAIL: prompt is number → 400", async () => {
     const res = await request(app)
-      .post("/api/landing-pages/generate")
+      .post("/api/landing-pages/v0/generate")
       .send({ prompt: 123 });
 
     expect(res.status).toBe(400);
@@ -105,7 +105,7 @@ describe("POST /api/landing-pages/generate", () => {
 
   it("FAIL: prompt is empty string → 400", async () => {
     const res = await request(app)
-      .post("/api/landing-pages/generate")
+      .post("/api/landing-pages/v0/generate")
       .send({ prompt: "" });
 
     expect(res.status).toBe(400);
@@ -116,7 +116,7 @@ describe("POST /api/landing-pages/generate", () => {
     mockGenerateLandingPage.mockRejectedValueOnce(new Error("Unexpected"));
 
     const res = await request(app)
-      .post("/api/landing-pages/generate")
+      .post("/api/landing-pages/v0/generate")
       .send({ prompt: "Create a page" });
 
     expect(res.status).toBe(500);
@@ -154,7 +154,7 @@ describe("POST /api/landing-pages/generate", () => {
     mockGenerateLandingPage.mockResolvedValueOnce(mockRecord);
 
     const res = await request(app)
-      .post("/api/landing-pages/generate")
+      .post("/api/landing-pages/v0/generate")
       .send({ prompt: "Create a pricing page", name: "Test Page" });
 
     expect(res.status).toBe(201);
@@ -176,14 +176,14 @@ describe("POST /api/landing-pages/generate", () => {
 // =============================================================================
 // POST /generated/:id/deploy
 // =============================================================================
-describe("POST /api/landing-pages/generated/:id/deploy", () => {
+describe("POST /api/landing-pages/v0/generated/:id/deploy", () => {
   it("FAIL: service throws not found → 404", async () => {
     mockDeployLandingPage.mockRejectedValueOnce(
       new Error("Landing page not found")
     );
 
     const res = await request(app).post(
-      "/api/landing-pages/generated/nonexistent/deploy"
+      "/api/landing-pages/v0/generated/nonexistent/deploy"
     );
 
     expect(res.status).toBe(404);
@@ -195,7 +195,7 @@ describe("POST /api/landing-pages/generated/:id/deploy", () => {
     );
 
     const res = await request(app).post(
-      "/api/landing-pages/generated/page-1/deploy"
+      "/api/landing-pages/v0/generated/page-1/deploy"
     );
 
     expect(res.status).toBe(500);
@@ -209,7 +209,7 @@ describe("POST /api/landing-pages/generated/:id/deploy", () => {
     });
 
     const res = await request(app).post(
-      "/api/landing-pages/generated/page-1/deploy"
+      "/api/landing-pages/v0/generated/page-1/deploy"
     );
 
     expect(res.status).toBe(200);
@@ -220,10 +220,10 @@ describe("POST /api/landing-pages/generated/:id/deploy", () => {
 // =============================================================================
 // POST /generated/:id/iterate
 // =============================================================================
-describe("POST /api/landing-pages/generated/:id/iterate", () => {
+describe("POST /api/landing-pages/v0/generated/:id/iterate", () => {
   it("FAIL: no message → 400", async () => {
     const res = await request(app)
-      .post("/api/landing-pages/generated/page-1/iterate")
+      .post("/api/landing-pages/v0/generated/page-1/iterate")
       .send({});
 
     expect(res.status).toBe(400);
@@ -236,7 +236,7 @@ describe("POST /api/landing-pages/generated/:id/iterate", () => {
     );
 
     const res = await request(app)
-      .post("/api/landing-pages/generated/nonexistent/iterate")
+      .post("/api/landing-pages/v0/generated/nonexistent/iterate")
       .send({ message: "Make bigger" });
 
     expect(res.status).toBe(404);
@@ -250,7 +250,7 @@ describe("POST /api/landing-pages/generated/:id/iterate", () => {
     });
 
     const res = await request(app)
-      .post("/api/landing-pages/generated/page-1/iterate")
+      .post("/api/landing-pages/v0/generated/page-1/iterate")
       .send({ message: "Add testimonials" });
 
     expect(res.status).toBe(200);
@@ -261,11 +261,11 @@ describe("POST /api/landing-pages/generated/:id/iterate", () => {
 // =============================================================================
 // GET /generated
 // =============================================================================
-describe("GET /api/landing-pages/generated", () => {
+describe("GET /api/landing-pages/v0/generated", () => {
   it("SUCCESS: empty list → 200 { pages: [] }", async () => {
     mockListLandingPages.mockResolvedValueOnce([]);
 
-    const res = await request(app).get("/api/landing-pages/generated");
+    const res = await request(app).get("/api/landing-pages/v0/generated");
 
     expect(res.status).toBe(200);
     expect(res.body.pages).toEqual([]);
@@ -277,7 +277,7 @@ describe("GET /api/landing-pages/generated", () => {
       { id: "page-2", name: "Page 2" },
     ]);
 
-    const res = await request(app).get("/api/landing-pages/generated");
+    const res = await request(app).get("/api/landing-pages/v0/generated");
 
     expect(res.status).toBe(200);
     expect(res.body.pages).toHaveLength(2);
@@ -287,12 +287,12 @@ describe("GET /api/landing-pages/generated", () => {
 // =============================================================================
 // GET /generated/:id
 // =============================================================================
-describe("GET /api/landing-pages/generated/:id", () => {
+describe("GET /api/landing-pages/v0/generated/:id", () => {
   it("FAIL: not found → 404", async () => {
     mockGetLandingPage.mockResolvedValueOnce(null);
 
     const res = await request(app).get(
-      "/api/landing-pages/generated/nonexistent"
+      "/api/landing-pages/v0/generated/nonexistent"
     );
 
     expect(res.status).toBe(404);
@@ -305,7 +305,7 @@ describe("GET /api/landing-pages/generated/:id", () => {
       status: "draft",
     });
 
-    const res = await request(app).get("/api/landing-pages/generated/page-1");
+    const res = await request(app).get("/api/landing-pages/v0/generated/page-1");
 
     expect(res.status).toBe(200);
     expect(res.body.name).toBe("My Page");
@@ -315,14 +315,14 @@ describe("GET /api/landing-pages/generated/:id", () => {
 // =============================================================================
 // DELETE /generated/:id
 // =============================================================================
-describe("DELETE /api/landing-pages/generated/:id", () => {
+describe("DELETE /api/landing-pages/v0/generated/:id", () => {
   it("FAIL: not found → 404", async () => {
     mockDeleteLandingPage.mockRejectedValueOnce(
       new Error("Landing page not found")
     );
 
     const res = await request(app).delete(
-      "/api/landing-pages/generated/nonexistent"
+      "/api/landing-pages/v0/generated/nonexistent"
     );
 
     expect(res.status).toBe(404);
@@ -332,7 +332,7 @@ describe("DELETE /api/landing-pages/generated/:id", () => {
     mockDeleteLandingPage.mockResolvedValueOnce(undefined);
 
     const res = await request(app).delete(
-      "/api/landing-pages/generated/page-1"
+      "/api/landing-pages/v0/generated/page-1"
     );
 
     expect(res.status).toBe(200);

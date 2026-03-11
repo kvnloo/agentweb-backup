@@ -131,9 +131,12 @@ export async function generateLandingPage(
     const chat = await v0.chats.create({
       message: enrichedPrompt,
       projectId: project.id,
-    }) as any;
+    });
 
-    const chatId = chat.id || chat.chatId;
+    const chatId = chat.id;
+    if (!chatId) {
+      throw new Error("v0 chat creation did not return an id");
+    }
 
     // Update record with v0 IDs and mark as draft
     const updatedRecord: Partial<GeneratedLandingPage> = {

@@ -171,7 +171,7 @@ app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
-app.use("/api/landing-pages", landingPageGenerationRoutes);
+app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);
