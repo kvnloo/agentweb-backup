@@ -9,6 +9,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-10',
     changes: [
+      'Feature: Session Satisfaction Scoring (Admin)',
+      '- AI-powered satisfaction scoring (1-5) for chat sessions on the Admin Chat History tab',
+      '- Scores auto-generate when admins view the Chat History tab — no impact on user experience',
+      '- Admins can override scores manually by clicking the score chip',
+      '- Retry button appears for sessions where scoring failed',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
       'Bug Fix: Reports Page Crash for Some Accounts',
       '- Fixed crash on the Reports page when a task or file had a missing name, causing a "Cannot read properties of undefined" error',
     ],
