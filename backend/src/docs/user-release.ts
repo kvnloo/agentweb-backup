@@ -19,6 +19,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-03-11',
+    changes: [
+      'Feature: Custom Interval Scheduling ("Every N Days")',
+      '- New "Every N days" frequency option for scheduled chats — set any interval from 1 to 365 days',
+      '- Available in the schedule creation/edit form and via Emma\'s manage_scheduled_chat tool',
+      '- Schedule list displays friendly labels like "Every 5 days" with next run time',
+    ],
+  },
+  {
     date: '2026-03-10',
     changes: [
       'Feature: Scheduled Chat Management in Agent Mode',

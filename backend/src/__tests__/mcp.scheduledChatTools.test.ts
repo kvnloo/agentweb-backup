@@ -155,6 +155,38 @@ describe('Scheduled Chat MCP Tools', () => {
     });
   });
 
+  describe('manage_scheduled_chat - create with every_n_days', () => {
+    it('should pass frequencyIntervalDays on create with every_n_days', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-new' });
+
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Every 3 Days Chat',
+        starting_message: 'Run report',
+        schedule_frequency: 'every_n_days',
+        frequency_interval_days: 3,
+      }, context);
+
+      const callBody = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(callBody.scheduleFrequency).toBe('every_n_days');
+      expect(callBody.frequencyIntervalDays).toBe(3);
+    });
+
+    it('should not pass frequencyIntervalDays when not provided', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-new' });
+
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Daily Chat',
+        starting_message: 'Run report',
+        schedule_frequency: 'daily',
+      }, context);
+
+      const callBody = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(callBody.frequencyIntervalDays).toBeUndefined();
+    });
+  });
+
   describe('manage_scheduled_chat - update', () => {
     it('should call PUT /api/agent-mode/scheduled-chats/:id with body', async () => {
       mockMcpFetch.mockResolvedValue({ message: 'Updated' });
@@ -176,6 +208,25 @@ describe('Scheduled Chat MCP Tools', () => {
           scheduleFrequency: 'monthly',
         }),
       }));
+    });
+  });
+
+  describe('manage_scheduled_chat - update with every_n_days', () => {
+    it('should pass frequencyIntervalDays on update with every_n_days', async () => {
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        schedule_name: 'Every 5 Days',
+        starting_message: 'New prompt',
+        schedule_frequency: 'every_n_days',
+        frequency_interval_days: 5,
+      }, context);
+
+      const callBody = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(callBody.scheduleFrequency).toBe('every_n_days');
+      expect(callBody.frequencyIntervalDays).toBe(5);
     });
   });
 
