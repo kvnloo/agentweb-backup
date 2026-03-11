@@ -10,6 +10,7 @@ import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
+import { scoreSessionIfNeeded } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { settingsService } from "../services/settingsService";
@@ -3712,6 +3713,76 @@ router.delete("/result-endpoints/:name", async (req, res) => {
   } catch (error) {
     console.error("Error deleting result endpoint config:", error);
     return res.status(500).json({ success: false, error: "Failed to delete result endpoint config" });
+  }
+});
+
+// Score chat sessions for satisfaction
+router.post("/chat-sessions/score", async (req, res) => {
+  try {
+    const { sessionIds } = req.body;
+
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return res.status(400).json({ message: "sessionIds must be a non-empty array" });
+    }
+    if (sessionIds.length > 5) {
+      return res.status(400).json({ message: "Maximum 5 sessionIds per request" });
+    }
+
+    const results = await Promise.allSettled(
+      sessionIds.map(async (sessionId: string) => {
+        const session = await chatbotDb.getChatSession(sessionId);
+        if (!session) return { sessionId, score: null };
+        const score = await scoreSessionIfNeeded(session);
+        return { sessionId, score };
+      })
+    );
+
+    const scores: Record<string, any> = {};
+    const failed: string[] = [];
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        scores[result.value.sessionId] = result.value.score;
+      } else {
+        failed.push(sessionIds[i]);
+      }
+    });
+
+    res.json({ scores, failed });
+  } catch (error: any) {
+    console.error("Error scoring chat sessions:", error);
+    res.status(500).json({ message: "Failed to score chat sessions" });
+  }
+});
+
+// Admin override satisfaction score
+router.put("/chat-sessions/:sessionId/score", async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { score, reason } = req.body;
+
+    if (typeof score !== "number" || score < 1 || score > 5 || !Number.isInteger(score)) {
+      return res.status(400).json({ message: "score must be an integer between 1 and 5" });
+    }
+
+    const session = await chatbotDb.getChatSession(sessionId);
+    if (!session) {
+      return res.status(404).json({ message: "Session not found" });
+    }
+
+    const satisfactionScore = {
+      score,
+      reason: reason || "Admin override",
+      evaluatedAt: new Date().toISOString(),
+      evaluatedMessageIndex: session.messageCount ?? session.messages?.length ?? 0,
+      adminOverride: true as const,
+    };
+
+    await chatbotDb.updateSessionSatisfactionScore(sessionId, satisfactionScore);
+
+    res.json({ satisfactionScore });
+  } catch (error: any) {
+    console.error("Error overriding satisfaction score:", error);
+    res.status(500).json({ message: "Failed to update satisfaction score" });
   }
 });
 

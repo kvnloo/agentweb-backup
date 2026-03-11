@@ -209,6 +209,13 @@ export interface ChatSession {
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
+  satisfactionScore?: {
+    score: number;              // 1-5 (1=unsatisfied, 5=very satisfied)
+    reason: string;             // LLM-generated explanation
+    evaluatedAt: string;        // ISO timestamp
+    evaluatedMessageIndex: number; // messageIndex up to which we evaluated
+    adminOverride?: boolean;    // When true, auto-scoring skips this session
+  };
 }
 
 // Interface for context chunks
@@ -1755,6 +1762,31 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session title:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionSatisfactionScore(
+    sessionId: string,
+    satisfactionScore: ChatSession["satisfactionScore"]
+  ): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET satisfactionScore = :score",
+      ExpressionAttributeValues: {
+        ":score": satisfactionScore,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session satisfaction score:", error);
       throw error;
     }
   }
