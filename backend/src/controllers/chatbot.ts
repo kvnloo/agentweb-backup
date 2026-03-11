@@ -78,7 +78,8 @@ export const listEmmaSessions = async (req: AuthenticatedRequest, res: Response)
       return res.status(401).json({ error: 'User not authenticated' });
     }
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
-    const sessions = await chatbotDb.getEmmaSessions(userId, limit);
+    const pageId = (req.query.pageIdentifier as string) || 'customer-portal';
+    const sessions = await chatbotDb.getEmmaSessions(userId, limit, pageId);
     // Strip heavy fields not needed for the history list
     const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => rest);
     res.status(200).json(sanitized);
@@ -182,6 +183,77 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   } catch (error) {
     console.error('Error sending message:', error);
     res.status(500).json({ error: 'Failed to process message' });
+  }
+};
+
+// Send a message with SSE streaming for real-time tool call visibility
+export const sendMessageStream = async (req: AuthenticatedRequest, res: Response) => {
+  const sessionId = req.params.sessionId;
+  const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
+  const portal = req.query.portal as string | undefined;
+
+  const portalType: 'customer' | 'partner' = portal === 'customer' ? 'customer' : 'partner';
+
+  if (!message) {
+    res.status(400).json({ error: 'Message is required' });
+    return;
+  }
+
+  let session;
+  try {
+    session = await chatbotDb.getChatSession(sessionId);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to retrieve chat session' });
+    return;
+  }
+
+  if (!session) {
+    res.status(404).json({ error: 'Chat session not found' });
+    return;
+  }
+
+  const userId = req.user?.userId;
+  if (session.userId !== userId) {
+    res.status(403).json({ error: 'Unauthorized access to chat session' });
+    return;
+  }
+
+  // Set up SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (data: object) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    // Flush immediately so the client receives events without buffering
+    if (typeof (res as any).flush === 'function') {
+      (res as any).flush();
+    }
+  };
+
+  try {
+    const response = await generateChatResponse(
+      sessionId, message, currentUrl, pageContext, portalType, userId,
+      structuredContext, screenshot, model,
+      (toolName: string) => sendEvent({ type: 'tool_start', name: toolName })
+    );
+
+    const updatedSession = await chatbotDb.getChatSession(sessionId);
+    const formattedResponse = typeof response === 'string' ? { content: response } : response;
+
+    sendEvent({ type: 'complete', ...formattedResponse, session: updatedSession });
+  } catch (error) {
+    console.error('Error in chatbot stream:', error);
+    const currentSession = await chatbotDb.getChatSession(sessionId);
+    sendEvent({
+      type: 'complete',
+      content: "I'm sorry, I encountered an error processing your request. Please try again.",
+      session: currentSession,
+      error: true
+    });
+  } finally {
+    res.end();
   }
 };
 

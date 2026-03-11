@@ -55,7 +55,7 @@ describe('listEmmaSessions controller', () => {
 
     await listEmmaSessions(req, res);
 
-    expect(mockChatbotDb.getEmmaSessions).toHaveBeenCalledWith('user-123', 20);
+    expect(mockChatbotDb.getEmmaSessions).toHaveBeenCalledWith('user-123', 20, 'customer-portal');
     expect(res.status).toHaveBeenCalledWith(200);
   });
 
@@ -87,7 +87,19 @@ describe('listEmmaSessions controller', () => {
 
     await listEmmaSessions(req, res);
 
-    expect(mockChatbotDb.getEmmaSessions).toHaveBeenCalledWith('user-123', 5);
+    expect(mockChatbotDb.getEmmaSessions).toHaveBeenCalledWith('user-123', 5, 'customer-portal');
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('passes pageIdentifier from query param', async () => {
+    (mockChatbotDb.getEmmaSessions as jest.Mock).mockResolvedValue([]);
+
+    const req = makeReq({ query: { pageIdentifier: 'brand-guidelines' } });
+    const res = makeRes();
+
+    await listEmmaSessions(req, res);
+
+    expect(mockChatbotDb.getEmmaSessions).toHaveBeenCalledWith('user-123', 20, 'brand-guidelines');
     expect(res.status).toHaveBeenCalledWith(200);
   });
 

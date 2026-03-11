@@ -125,7 +125,7 @@ describe('ChatbotDB.getEmmaSessions', () => {
 
     const result = await chatbotDb.getEmmaSessions('user-1', 5);
 
-    expect(result[0].previewText).toBe('What is AgentWeb?');
+    expect((result[0] as any).previewText).toBe('What is AgentWeb?');
   });
 
   it('sets previewText to null when session has no messages', async () => {
@@ -135,7 +135,7 @@ describe('ChatbotDB.getEmmaSessions', () => {
 
     const result = await chatbotDb.getEmmaSessions('user-1', 5);
 
-    expect(result[0].previewText).toBeNull();
+    expect((result[0] as any).previewText).toBeNull();
   });
 
   it('returns empty array when no sessions exist', async () => {
@@ -144,5 +144,16 @@ describe('ChatbotDB.getEmmaSessions', () => {
     const result = await chatbotDb.getEmmaSessions('user-1', 20);
 
     expect(result).toEqual([]);
+  });
+
+  it('uses custom pageId when provided and returns matching sessions', async () => {
+    const session = makeSession('s-custom', '2024-06-01T00:00:00Z', { pageIdentifier: 'brand-guidelines' });
+    queryPromiseMock.mockResolvedValueOnce({ Items: [session] });
+    queryPromiseMock.mockResolvedValue({ Items: [{ message: { role: 'user', content: 'Brand help' } }] });
+
+    const result = await chatbotDb.getEmmaSessions('user-1', 20, 'brand-guidelines');
+
+    expect(result).toHaveLength(1);
+    expect(result[0].sessionId).toBe('s-custom');
   });
 });

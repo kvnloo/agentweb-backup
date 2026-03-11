@@ -6,6 +6,7 @@ import {
   listEmmaSessions,
   getChatSession,
   sendMessage,
+  sendMessageStream,
   deleteChatSession
 } from '../controllers/chatbot';
 
@@ -28,6 +29,9 @@ router.get('/sessions/:sessionId', (req: Request, res: Response) => getChatSessi
 
 // Send a message and get a response
 router.post('/sessions/:sessionId/messages', (req: Request, res: Response) => sendMessage(req as AuthenticatedRequest, res));
+
+// Send a message with SSE streaming for real-time tool call visibility
+router.post('/sessions/:sessionId/messages/stream', (req: Request, res: Response) => sendMessageStream(req as AuthenticatedRequest, res));
 
 // Delete a chat session
 router.delete('/sessions/:sessionId', (req: Request, res: Response) => deleteChatSession(req as AuthenticatedRequest, res));

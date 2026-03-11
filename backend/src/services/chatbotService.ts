@@ -1472,7 +1472,7 @@ export class ChatbotDB {
    * Filters server-side by pageIdentifier so Agent Mode sessions are excluded.
    * Returns lean session objects (no full message fetch) suitable for the history panel.
    */
-  async getEmmaSessions(userId: string, limit: number = 20): Promise<ChatSession[]> {
+  async getEmmaSessions(userId: string, limit: number = 20, pageId: string = 'customer-portal'): Promise<ChatSession[]> {
     const params: any = {
       TableName: this.tableName,
       IndexName: 'UserIdIndex',
@@ -1480,7 +1480,7 @@ export class ChatbotDB {
       FilterExpression: 'pageIdentifier = :pageIdentifier AND (attribute_not_exists(archived) OR archived = :false)',
       ExpressionAttributeValues: {
         ':userId': userId,
-        ':pageIdentifier': 'customer-portal',
+        ':pageIdentifier': pageId,
         ':false': false,
       },
       ScanIndexForward: false,
@@ -3102,13 +3102,44 @@ export async function generateChatResponse(
   userId?: string,
   structuredContext?: string,
   screenshot?: string,
-  model?: string
+  model?: string,
+  onToolStart?: (toolName: string) => void
 ): Promise<string | { content: string; toolCalls?: any[]; invalidations?: string[] }> {
   try {
     const timestamp = new Date().toISOString();
 
+    // Upload screenshot to S3 if provided
+    let uploadedScreenshotUrl = screenshot;
+    let attachments: any[] | undefined;
+    
+    if (screenshot && screenshot.startsWith('data:image')) {
+      try {
+        const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, "");
+        const buffer = Buffer.from(base64Data, 'base64');
+        const { uploadFileToS3 } = require('../utils/s3Utils');
+        const uploadResult = await uploadFileToS3(
+          buffer,
+          `screenshot-${Date.now()}.jpg`,
+          userId || 'anonymous',
+          'image/jpeg'
+        );
+        if (uploadResult.success && uploadResult.url) {
+          uploadedScreenshotUrl = uploadResult.url;
+          attachments = [{
+            url: uploadResult.url,
+            filename: 'screenshot.jpg',
+            size: buffer.length,
+            mimetype: 'image/jpeg',
+            uploadedAt: timestamp
+          }];
+        }
+      } catch (err) {
+        console.error('Failed to upload screenshot to S3:', err);
+      }
+    }
+
     // Add user message to session with metadata
-    const userMessageMetadata = {
+    const userMessageMetadata: any = {
       currentUrl,
       pageContentLength: pageContent?.length,
       knowledgeBaseChunks: knowledgeBase.length,
@@ -3116,6 +3147,9 @@ export async function generateChatResponse(
       timestamp,
       portalType,
     };
+    if (attachments) {
+      userMessageMetadata.attachments = attachments;
+    }
 
     await chatbotDb.addMessageToSession(sessionId, {
       role: "user",
@@ -3133,12 +3167,12 @@ export async function generateChatResponse(
     const messages = [...session.messages];
 
     // Support vision: if screenshot provided, modify last user message for visual analysis
-    if (screenshot) {
+    if (uploadedScreenshotUrl) {
       const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
       if (lastUserIdx >= 0) {
         (messages[lastUserIdx] as any).content = [
           { type: 'text', text: messages[lastUserIdx].content },
-          { type: 'image_url', image_url: { url: screenshot, detail: 'low' } }
+          { type: 'image_url', image_url: { url: uploadedScreenshotUrl, detail: 'low' } }
         ];
       }
     }
@@ -3437,6 +3471,9 @@ export async function generateChatResponse(
           functionArgs = JSON.parse(toolCall.function.arguments);
 
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
+
+          // Notify caller that a tool is starting (enables real-time SSE streaming)
+          onToolStart?.(toolCall.function.name);
 
           // Execute tool via AgentModeService (reuse existing infrastructure)
           if (!agentModeService) {
