@@ -23,8 +23,9 @@ jest.mock('../services/linkedInService', () => ({
 // Mock linkedInPostsDb
 jest.mock('../services/linkedInPostsDb', () => ({
   createPost: jest.fn(),
-  getPostsByAccount: jest.fn(),
+  getPostsByAccount: jest.fn().mockResolvedValue([]),
   getPostByUrn: jest.fn(),
+  updatePostMetrics: jest.fn().mockResolvedValue(undefined),
 }));
 
 // Mock getLinkedInConfig to prevent real secrets manager calls
@@ -545,7 +546,7 @@ describe('LinkedInAdapter', () => {
 
     it('should throw error with message on DB error', async () => {
       // Arrange
-      mockPostsDb.getPostsByAccount.mockRejectedValue(new Error('DB error'));
+      mockPostsDb.getPostsByAccount.mockRejectedValueOnce(new Error('DB error'));
 
       // Act & Assert - Now throws error instead of returning empty array
       await expect(adapter.listPosts(mockPersonalAccount)).rejects.toThrow(
@@ -590,14 +591,14 @@ describe('LinkedInAdapter', () => {
         { postUrn: 'urn:li:share:post-1' }
       );
       expect(result).toHaveLength(2);
-      expect(result[0]).toEqual({
+      expect(result[0]).toEqual(expect.objectContaining({
         share: 'urn:li:share:post-1',
         likes: 25,
         comments: 10,
         shares: 5,
         impressions: 150,
         engagement: 40, // 25 + 10 + 5
-      });
+      }));
     });
 
     it('should include failed metrics with error info instead of filtering', async () => {

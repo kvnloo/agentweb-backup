@@ -18,9 +18,8 @@ const CLEANUP_INTERVAL_MS = parseInt(process.env.MCP_CLEANUP_INTERVAL_MS || '360
 interface SessionEntry {
   transport: StreamableHTTPServerTransport;
   lastActivity: number;
-  installedSkills: Set<string>;  // Tracks installed skill IDs
   agentUserId?: string;           // User ID from API key auth
-  isInternal: boolean;            // Internal clients bypass skill gating
+  isInternal: boolean;            // Internal clients can override userId
 }
 
 /**
@@ -204,7 +203,6 @@ export function setupMcpServer(app: express.Express) {
     return createMcpServer("Emma - GTM Automation Specialist", {
       agentUserId: sessionEntry?.agentUserId || (req as any)?._agentApiUserId,
       sessionId: sessionId,
-      installedSkills: sessionEntry?.installedSkills || new Set(),
       isInternal: sessionEntry?.isInternal || (req as any)?._mcpIsInternal || false
     });
   };
@@ -231,7 +229,6 @@ export function setupMcpServer(app: express.Express) {
 
         // Create session state that will be shared between server and session entry
         const sharedState = {
-          installedSkills: new Set<string>(),
           agentUserId: (req as any)._agentApiUserId,
           isInternal: (req as any)._mcpIsInternal || false
         };
@@ -243,7 +240,6 @@ export function setupMcpServer(app: express.Express) {
             sessions.set(newSessionId, {
               transport,
               lastActivity: Date.now(),
-              installedSkills: sharedState.installedSkills,
               agentUserId: sharedState.agentUserId,
               isInternal: sharedState.isInternal
             });
@@ -259,11 +255,9 @@ export function setupMcpServer(app: express.Express) {
         };
 
         // Connect server to transport BEFORE handling request
-        // Pass the shared state so server handlers can access the same Set
         const server = createMcpServer("Emma - GTM Automation Specialist", {
           agentUserId: sharedState.agentUserId,
           sessionId: undefined,
-          installedSkills: sharedState.installedSkills,
           isInternal: sharedState.isInternal
         });
         await server.connect(transport);

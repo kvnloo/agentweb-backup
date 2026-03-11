@@ -32,7 +32,7 @@ jest.mock('../utils/crypto', () => ({
 
 jest.mock('axios');
 
-import landingPagesRouter from '../routes/landingPages';
+import landingPagesRouter, { extractProductionUrls } from '../routes/landingPages';
 import { userDb } from '../services/db';
 import { decryptPassword } from '../utils/crypto';
 
@@ -49,6 +49,50 @@ let tokenCounter = 0;
 function uniqueToken() {
   return `ghp_unique_${++tokenCounter}`;
 }
+
+describe('extractProductionUrls', () => {
+  it('returns empty array when no URLs in markdown', () => {
+    expect(extractProductionUrls('# Just a heading')).toEqual([]);
+  });
+
+  it('filters out GitHub URLs', () => {
+    const md = `
+      Check https://github.com/AgentWebPro/repo-1 and
+      also https://mysite.github.io/docs for more info.
+    `;
+    expect(extractProductionUrls(md)).toEqual([]);
+  });
+
+  it('filters out Vercel preview URLs', () => {
+    const md = 'Preview at https://mysite-git-feature-branch.vercel.app';
+    expect(extractProductionUrls(md)).toEqual([]);
+  });
+
+  it('deduplicates URLs', () => {
+    const md = `
+      Visit https://start.waldium.com and also https://start.waldium.com/
+      and https://start.waldium.com again.
+    `;
+    const result = extractProductionUrls(md);
+    expect(result).toHaveLength(1);
+    expect(result[0]).toBe('https://start.waldium.com');
+  });
+
+  it('extracts production URLs from realistic AGENT.md', () => {
+    const md = `
+# Waldium Landing Page
+
+- Repo: https://github.com/AgentWebPro/waldium-landing
+- Production: https://start.waldium.com
+- V2: https://start.waldium.com/v2
+- Preview: https://waldium-landing-git-dev.vercel.app
+    `;
+    expect(extractProductionUrls(md)).toEqual([
+      'https://start.waldium.com',
+      'https://start.waldium.com/v2',
+    ]);
+  });
+});
 
 describe('Landing Pages Route', () => {
   beforeEach(() => {
@@ -86,6 +130,7 @@ describe('Landing Pages Route', () => {
     } as any);
     mockedDecrypt.mockReturnValueOnce({ password: token, userId: 'test-user-id' });
 
+    const agentMdContent = '# Hello World\n\nProduction: https://example.com\nRepo: https://github.com/AgentWebPro/repo-1';
     mockedAxios.get.mockImplementation(((url: string) => {
       if (url.includes('/orgs/AgentWebPro/repos')) {
         return Promise.resolve({
@@ -96,7 +141,7 @@ describe('Landing Pages Route', () => {
       }
       if (url.includes('/contents/AGENT.md')) {
         return Promise.resolve({
-          data: { content: Buffer.from('# Hello World').toString('base64') },
+          data: { content: Buffer.from(agentMdContent).toString('base64') },
         });
       }
       return Promise.reject(new Error('Not found'));
@@ -110,7 +155,8 @@ describe('Landing Pages Route', () => {
     expect(res.body.repos[0]).toEqual({
       name: 'repo-1',
       htmlUrl: 'https://github.com/AgentWebPro/repo-1',
-      agentMd: '# Hello World',
+      agentMd: agentMdContent,
+      deployedUrls: ['https://example.com'],
     });
 
     // Verify Authorization header was used
@@ -204,6 +250,37 @@ describe('Landing Pages Route', () => {
     expect(res.status).toBe(200);
     expect(res.body.repos).toHaveLength(1);
     expect(res.body.repos[0].agentMd).toBe('# lowercase agent');
+  });
+
+  it('returns deployedUrls: [] when AGENT.md has no production URLs', async () => {
+    const token = uniqueToken();
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'test-user-id',
+      secrets: { GITHUB_PERSONAL_ACCESS_TOKEN: 'encrypted-token' },
+    } as any);
+    mockedDecrypt.mockReturnValueOnce({ password: token, userId: 'test-user-id' });
+
+    mockedAxios.get.mockImplementation(((url: string) => {
+      if (url.includes('/orgs/AgentWebPro/repos')) {
+        return Promise.resolve({
+          data: [
+            { name: 'repo-no-urls', html_url: 'https://github.com/AgentWebPro/repo-no-urls' },
+          ],
+        });
+      }
+      if (url.includes('/contents/AGENT.md')) {
+        return Promise.resolve({
+          data: { content: Buffer.from('# Just docs, no URLs').toString('base64') },
+        });
+      }
+      return Promise.reject(new Error('Not found'));
+    }) as any);
+
+    const res = await request(app).get('/api/landing-pages');
+
+    expect(res.status).toBe(200);
+    expect(res.body.repos).toHaveLength(1);
+    expect(res.body.repos[0].deployedUrls).toEqual([]);
   });
 
   it('returns 500 when GitHub API throws on repo list', async () => {

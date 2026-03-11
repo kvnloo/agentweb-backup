@@ -88,6 +88,11 @@ describe('llmService', () => {
       expect(ChatBedrockConverse).toHaveBeenCalled();
     });
 
+    it('should create Bedrock model for anthropic. prefix without claude or sonnet in name', () => {
+      new LLMService('anthropic.haiku-v1');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
     it('should use default deployment from env when model not specified', () => {
       new LLMService();
       expect(AzureChatOpenAI).toHaveBeenCalled();

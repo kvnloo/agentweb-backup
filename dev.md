@@ -1,3 +1,190 @@
+# March 8, 2026: Daily AI News - Amino Scheduled Chat Failure — Missing Tools for Basic Subscription
+
+**User:** `sue@aminocapital.com` (Amino Capital, Basic subscription)
+
+**Problem:** The "Daily AI News - Amino" scheduled chat failed to run because some required tools are not available under the Basic subscription. New skills were recently created (e.g., Landing Page skill for Advanced/Super Premium) that claimed tools previously available via the `__other_skills__` virtual skill. This moved those tools out of `__other_skills__`, causing Basic subscription users to lose access.
+
+**Root cause:** The `__other_skills__` virtual skill dynamically resolves to tools NOT associated with any published skill. When new skills are published and claim tools, those tools leave `__other_skills__`. If a subscription type (e.g., Basic) relies on `__other_skills__` for tool access, users silently lose tools whenever new skills are created.
+
+**How subscription → tools resolution works:**
+1. User's `subscriptionType` → `getSubscriptionTypeConfig()` → `allowedSkills[]` (skill IDs)
+2. `resolveSkillsToToolNames(skillIds)` → expands each skill ID to its `toolNames[]`
+3. `__other_skills__` resolves to tools not claimed by any published skill (dynamic, shrinks as skills are added)
+4. Foundation tools (18) are always available regardless of subscription
+5. Scheduled chat pre-flight check (`agentModeController.ts:810-867`) validates `requiredFunctionCalls` against allowed tools, fails with error email if any are disallowed
+
+**Action taken:** Created a new skill "Tools for Basic Subscription" via admin UI with 38 explicit tools and no system prompt. This skill is added to the Basic subscription's `allowedSkills`, ensuring Basic users have a stable set of tools regardless of how other skills change.
+
+**Tools in "Tools for Basic Subscription" (38):**
+```
+create_blog_article, publish_blog_article, repair_blog_article, create_social_media_posts,
+list_cms_categories, generate_image, create_image_task_from_prompt, generate_video,
+list_task_templates, create_task_from_template, create_task_from_prompt, create_revision,
+perform_deep_research, list_connected_account_posts, load_connected_account_metrics,
+post_on_connected_account, get_post_analytics, create_knowledge_base, update_knowledge_base_file,
+attach_knowledge_base_files, create_gtm_plan, read_gtm_plan, update_gtm_plan, list_gtm_plans,
+add_gtm_phase, update_gtm_phase, add_gtm_work_items, update_gtm_work_item, delete_gtm_items,
+get_gtm_common_items, add_gtm_common_items, send_gtm_status_report, comment_on_linkedin_post,
+react_to_linkedin_post, linkedin_outreach, create_html_from_template, update_html_file,
+list_html_templates
+```
+
+**Tools excluded from Basic (in other premium skills):**
+- CRM/Leads (17 tools): get_leads, get_lead_details, create_lead_list, etc.
+- Books (8 tools): create_book, generate_book_content, add_characters, etc.
+- Email: email, send_for_review
+- Meta Ads: get_meta_ads_metrics, list_meta_ads_campaigns
+
+**Key files:**
+- `backend/src/services/subscriptionService.ts` — subscription → skill → tool resolution
+- `backend/src/services/skillService.ts` — skill CRUD (AW-Skills table)
+- `backend/src/controllers/agentModeController.ts:810-867` — scheduled chat tool validation
+- `backend/src/services/agentModeService.ts:1717` — FOUNDATION_TOOLS definition
+
+**Lesson:** When creating new skills, always check if the tools being claimed are currently accessed by subscription tiers via `__other_skills__`. Prefer explicit tool skills per subscription tier over relying on `__other_skills__` for stable access.
+
+---
+
+# March 6, 2026: xcures SEO Config — GA Permission Denied
+
+**User:** `agentwebintegration@xcures.com` (userId: `f958eb3e-4e82-4227-8aa8-634476498a62`)
+
+**Config in DynamoDB (AW-Users):**
+- `seoDomains`: `["xcures.com"]`
+- `googleAnalyticsPropertyId`: `"277333489"`
+- `gaFilteredDomains`: `[]`
+
+**Findings:**
+- **Google Search Console:** Working. No errors in prod logs for `sc-domain:xcures.com`.
+- **Google Analytics:** `PERMISSION_DENIED` — service account does not have access to GA4 property `277333489`.
+
+**Prod log (Mar 6):**
+```
+Error fetching Google Analytics metrics: Error: 7 PERMISSION_DENIED: User does not have sufficient permissions for this property.
+```
+
+**Action needed:** xcures team must grant **Viewer** access to the service account email in GA4 Admin → Property access management for property `277333489`. The same service account (from `prod/AgentWeb/Google/SearchConsole` secret) is used for both GSC and GA.
+
+---
+
+# March 6, 2026: MCP Server IDOR Vulnerability — userId Override in Tool Arguments
+
+**Problem:** The Emma MCP server (`backend/src/mcp/server/mcpServerCore.ts`) allows tool callers to override the authenticated user's identity by passing a `userId` in tool call arguments. In the request handler:
+
+```typescript
+const context = {
+  userId: userId || sessionContext?.agentUserId,
+  // userId from tool args takes precedence over the authenticated user
+};
+```
+
+Any authenticated user (with a valid API key, OAuth token, or static MCP token) can pass any `userId` and operate on another user's private data.
+
+**Reproduction (tested on production `api.agentweb.pro`):**
+
+1. Initialize MCP session with a valid API key:
+   ```
+   POST /mcp with Authorization: Bearer aw_<key>
+   → Returns mcp-session-id header
+   ```
+
+2. Call `list_knowledge_base_files` with a different user's ID:
+   ```json
+   {"method":"tools/call","params":{"name":"list_knowledge_base_files","arguments":{"userId":"<other_user_id>"}}}
+   ```
+
+3. Result: Returns the target user's **private** knowledge bases (16 KBs, 116 files), including private persona data, LinkedIn posts, Google Drive folders, ClickUp docs, and signed GCS download URLs.
+
+**Severity:** High — IDOR (Insecure Direct Object Reference). Affects all MCP tools that accept `userId` in arguments, potentially including leads, tasks, GTM plans, brand guidelines, connected accounts, etc.
+
+**Root cause:** The MCP tool execution layer trusts caller-supplied `userId` over the authenticated identity (`agentUserId` from the API key). Standard REST API routes don't have this issue because `req.user` is derived from the JWT token and cannot be overridden by request parameters.
+
+**Architecture context:** We evaluated two approaches for exposing Emma capabilities:
+- **Approach A (current):** 90+ internal Emma tools exposed directly via MCP. Suffers from this IDOR issue, large tool surface area, and tight coupling to internal schemas.
+- **Approach B (recommended):** Expose AgentWeb backend REST APIs as MCP tools. All requests go through JWT auth middleware where `req.user` is derived from the token, not caller parameters. Smaller tool surface (~20-30 tools), stable API contract, consistent auth model.
+
+**Immediate fix needed:** In `mcpServerCore.ts`, stop allowing `userId` from tool arguments to override the authenticated user:
+```typescript
+// Before (vulnerable):
+userId: userId || sessionContext?.agentUserId,
+
+// After (fixed):
+userId: sessionContext?.agentUserId,  // Always use authenticated identity
+```
+
+**Long-term fix:** Migrate to Approach B — backend API MCP wrapper with JWT-based auth for all operations.
+
+**Production log analysis (no external attacks detected):**
+
+Reviewed full bundle logs from production (`Agentweb-backend-env-prod-3`) for March 6, 2026. All `/mcp` requests came from only two source IPs:
+- `98.46.137.148` — external user via `claude-code/2.1.69-2.1.70`. Two sessions (`b773311b`, `485aac4a`) at 02:48-02:49 UTC. Actions: `initialize` → `tools/list` only. No `tools/call` with userId override.
+- `73.157.80.155` — our IP. Four sessions for testing: two via claude-code (session setup), two via curl (IDOR reproduction).
+
+No evidence of exploitation by external users beyond our own security testing.
+
+**Fix deployed and verified (PR #613, merged March 6):**
+
+The fix allows `userId` override only for internal clients (`isInternal=true`, i.e. backend-to-backend via `MCP_ACCESS_TOKEN`). External clients (API keys, OAuth) always use the authenticated `agentUserId`.
+
+Post-deploy verification on production:
+1. Called `list_knowledge_base_files` with `userId: "1743956381327"` (different user) → returned the API key owner's 19 KBs / 20 files (not the target user's data).
+2. Called `list_knowledge_base_files` without userId → returned identical 19 KBs / 20 files.
+3. Before the fix, the same call with userId override returned the target user's 16 KBs / 116 files (including private data like "Harsha's persona", "Harsha's worst LinkedIn posts").
+
+The userId parameter is now correctly ignored for external clients.
+
+**Files:** `backend/src/mcp/server/mcpServerCore.ts` (tool request handler), `backend/src/mcp/server/mcpServer.ts` (session/auth management), `backend/src/__tests__/mcp.userIdOverride.test.ts` (regression tests)
+
+**Approach B implemented (March 7, 2026):**
+
+Migrated from Approach A (90+ internal tools exposed directly) to Approach B (REST API wrappers). The MCP server now exposes ~26 tools that call backend REST APIs via HTTP self-calls with short-lived JWTs, going through the same `authenticateToken` middleware as web UI requests. This eliminates the entire class of IDOR vulnerabilities by design.
+
+**Why Approach A (direct internal tools) was problematic:**
+1. **IDOR vulnerability** — caller-supplied `userId` in tool args overrode the authenticated identity, allowing cross-user data access.
+2. **No audit trail** — direct service calls bypass the REST API layer where request logging, rate limiting, and usage tracking happen. Actions taken via MCP tools were invisible to the audit/analytics pipeline.
+3. **No data recording** — REST API route handlers record metrics (response times, error rates, request counts per user) and trigger side effects (webhooks, notifications, activity feeds). Direct service calls skip all of this, creating data gaps between MCP and portal usage.
+4. **Large attack surface** — 90+ tools exposed internal schemas and service methods that were never designed for external consumption.
+
+**Key changes:**
+- Replaced `tools.ts` (75 tools) and `portalTools.ts` (12 tools) with `apiTools.ts` (~30 tools). Each tool calls `mcpFetch()` which generates a short-lived JWT for the authenticated user and makes an HTTP request to `localhost` REST endpoints.
+- Internal tools (`install_skills`, `list_available_skills`, `search_web`, `generate_image`, `send_email`, `save_file`) are registered with `internal: true` flag — available to Emma's agent engine internally but hidden from external MCP clients via `getToolDefinitions()` filtering.
+- External agents access AI capabilities (image gen, web search, email) through Emma chat sessions (`emma_send_message`) rather than direct tool calls.
+- MCP Emma sessions use the exact same skill-first flow as the customer portal — no MCP-specific behavior.
+- Tool count: External MCP clients see 26 tools, Emma's internal registry has 32.
+
+**Architecture:**
+```
+MCP Client → MCP Server (API key auth) → mcpFetch() → localhost REST API → authenticateToken middleware → route handler → service → DB
+```
+
+**Verification — 10 side-by-side MCP vs REST API comparison tests (all passed):**
+
+| # | Test | MCP Result | REST Result (Portal) |
+|---|------|-----------|---------------------|
+| 1 | list_tasks | 18 tasks | 18 tasks |
+| 2 | list_lead_lists | 3 lists | 3 lists |
+| 3 | list_gtm_plans | dict (matching) | dict (matching) |
+| 4 | manage_brand (read) | same company_name | same company_name |
+| 5 | manage_market_strategy (read) | dict (matching) | dict (matching) |
+| 6 | list_knowledge_bases | dict (matching) | dict (matching) |
+| 7 | list_connected_accounts | dict (matching) | dict (matching) |
+| 8 | emma_create_session | `associatedSkills=[]`, `portalType=agent` | identical |
+| 9 | emma_list_sessions | 36 sessions | 36 sessions |
+| 10 | list_task_executions | 1 execution | 1 execution |
+
+**End-to-end Emma session tests via MCP (all use same skill-first flow as customer portal):**
+
+| Test | Tool Calls | Result |
+|------|-----------|--------|
+| Image generation | `install_skills` (147ms) → `search_knowledge_base` (1533ms) → `generate_image` (189s) | S3 image URL returned |
+| Market report | `search_web` (439ms) → `search_web` (617ms) | 1916-char report with market data |
+| Blog article | `install_skills` (126ms) → `generate_blog_post` (42s) | Full blog post generated via AI pipeline |
+| Short video | `install_skills` (181ms) → `list_available_skills` (78ms) | Correctly reported video gen not available (skill not published on test env) |
+
+Bug found and fixed during testing: `generate_blog_post` tool had wrong input schema (`title_draft`/`content_draft` instead of `topic`), causing 400 errors. Fixed to match the actual REST API (`POST /api/blog/generate` expects `topic`, `keywords`, `tone`, `length`).
+
+**Files:** `backend/src/mcp/server/apiTools.ts` (tool registrations), `backend/src/mcp/server/httpClient.ts` (JWT + fetch helper), `backend/src/mcp/server/registry.ts` (internal flag support), `backend/src/__tests__/mcp.apiTools.test.ts` (tests)
+
 # March 5, 2026: Dev Env Launch Fails on Elastic Beanstalk
 
 **Problem:** Notion-triggered cloud dev env launch failed with `ENOENT: no such file or directory, open '/var/app/test-env/user-data-dev-auto.sh'`. The `devEnvService.ts` reads the script via `fs.readFileSync` with a path relative to `__dirname`, but `test-env/` is at the repo root and not included in the backend deploy zip.

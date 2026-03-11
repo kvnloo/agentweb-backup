@@ -132,10 +132,71 @@ async function ensureDatabaseProperties(databaseId: string): Promise<void> {
   }
 }
 
+export interface NotionAttachment {
+  url: string;
+  name: string;
+  type: "image" | "file" | "pdf" | "video";
+}
+
+export interface NotionPageContent {
+  text: string;
+  attachments: NotionAttachment[];
+}
+
+const ATTACHMENT_BLOCK_TYPES = ["image", "file", "pdf", "video"] as const;
+
 /**
- * Fetch a Notion page's block content as plain text.
+ * Extract the URL from a Notion file/image/pdf/video block.
+ * Notion blocks store files either as `{ type: "file", file: { url } }` (hosted)
+ * or `{ type: "external", external: { url } }`.
  */
-export async function getNotionPageContent(pageId: string): Promise<string> {
+function extractAttachmentUrl(blockData: any): string | null {
+  if (blockData?.type === "file" && blockData.file?.url) {
+    return blockData.file.url;
+  }
+  if (blockData?.type === "external" && blockData.external?.url) {
+    return blockData.external.url;
+  }
+  return null;
+}
+
+/**
+ * Derive a filename for an attachment block.
+ * Tries caption (image), name (file), then falls back to extracting from URL or a default.
+ */
+function extractAttachmentName(
+  blockData: any,
+  url: string,
+  blockType: string
+): string {
+  // Image blocks use caption
+  const caption = blockData?.caption;
+  if (Array.isArray(caption) && caption.length > 0) {
+    const text = caption.map((c: any) => c.plain_text).join("");
+    if (text) return text;
+  }
+  // File blocks use name
+  if (blockData?.name) return blockData.name;
+  // Try to extract filename from URL path
+  try {
+    const pathname = new URL(url).pathname;
+    const segments = pathname.split("/");
+    const lastSegment = segments[segments.length - 1];
+    if (lastSegment && lastSegment.includes(".")) {
+      return decodeURIComponent(lastSegment);
+    }
+  } catch {
+    // ignore URL parse errors
+  }
+  return `${blockType}_attachment`;
+}
+
+/**
+ * Fetch a Notion page's block content as plain text and attachment metadata.
+ */
+export async function getNotionPageContent(
+  pageId: string
+): Promise<NotionPageContent> {
   const res = await notionRequest(
     "get",
     `/blocks/${pageId}/children?page_size=100`
@@ -143,7 +204,10 @@ export async function getNotionPageContent(pageId: string): Promise<string> {
   const blocks = res.data.results || [];
 
   const lines: string[] = [];
+  const attachments: NotionAttachment[] = [];
+
   for (const block of blocks) {
+    // Extract text from text-bearing blocks
     const richText =
       block.paragraph?.rich_text ||
       block.heading_1?.rich_text ||
@@ -158,9 +222,27 @@ export async function getNotionPageContent(pageId: string): Promise<string> {
       [];
     const text = richText.map((t: any) => t.plain_text).join("");
     if (text) lines.push(text);
+
+    // Extract attachments from file-bearing blocks
+    const blockType = block.type as string;
+    if (
+      ATTACHMENT_BLOCK_TYPES.includes(
+        blockType as (typeof ATTACHMENT_BLOCK_TYPES)[number]
+      )
+    ) {
+      const blockData = block[blockType];
+      const url = extractAttachmentUrl(blockData);
+      if (url) {
+        attachments.push({
+          url,
+          name: extractAttachmentName(blockData, url, blockType),
+          type: blockType as NotionAttachment["type"],
+        });
+      }
+    }
   }
 
-  return lines.join("\n");
+  return { text: lines.join("\n"), attachments };
 }
 
 /**

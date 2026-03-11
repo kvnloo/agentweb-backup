@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
-import { chatbotDb, updateTaskExecutionStatus } from '../services/chatbotService';
+import { chatbotDb, updateTaskExecutionStatus, ChatMessage } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
@@ -1491,11 +1491,28 @@ export const agentModeController = {
         progressStore.delete(sessionId);
       }
 
+      // Persist an error message to the session so the user sees feedback on reload.
+      // Skip for session-limit errors (user message wasn't saved either).
+      if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
+        const errorAssistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: 'I encountered an error processing your request. Please try sending your message again.',
+          timestamp: new Date().toISOString(),
+          metadata: {
+            timestamp: new Date().toISOString(),
+            isErrorMessage: true,
+          },
+        };
+        await chatbotDb.addMessageToSession(sessionId, errorAssistantMessage).catch(err => {
+          console.error('AgentMode: Failed to persist error message to session:', err);
+        });
+      }
+
       // Handle specific error types
       if (error instanceof Error) {
         if (error.message.includes('SESSION_MESSAGE_LIMIT_EXCEEDED')) {
           // Extract the actual error message from the error
-          const errorMessage = error.message.includes(':') 
+          const errorMessage = error.message.includes(':')
             ? error.message.split(':').slice(1).join(':').trim()
             : `This session has reached the maximum of ${MAX_MESSAGE_SIZE_PER_SESSION} messages. Please start a new session to continue the conversation.`;
           res.status(413).json({
@@ -1988,6 +2005,23 @@ export const agentModeController = {
       if (shareId) {
         emitProgress(shareId, { iteration: 0, status: 'complete' });
         progressStore.delete(shareId);
+      }
+
+      // Persist an error message to the session so the user sees feedback on reload.
+      // Skip for session-limit errors (user message wasn't saved either).
+      if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+        const errorAssistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: 'I encountered an error processing your request. Please try sending your message again.',
+          timestamp: new Date().toISOString(),
+          metadata: {
+            timestamp: new Date().toISOString(),
+            isErrorMessage: true,
+          },
+        };
+        await chatbotDb.addMessageToSession(shareId, errorAssistantMessage).catch(err => {
+          console.error('AgentMode: Failed to persist error message to session:', err);
+        });
       }
 
       // Handle specific error types (same as generateResponse)

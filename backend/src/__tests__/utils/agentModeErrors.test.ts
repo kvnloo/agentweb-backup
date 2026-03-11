@@ -1,7 +1,8 @@
 import {
   SESSION_LIMIT_ERROR_CODES,
   isSessionLimitError,
-  isContextLimitError
+  isContextLimitError,
+  isTransientLLMError
 } from '../../utils/agentModeErrors';
 
 describe('agentModeErrors utils', () => {
@@ -122,6 +123,42 @@ describe('agentModeErrors utils', () => {
     it('should handle string errors', () => {
       expect(isContextLimitError('context length exceeded')).toBe(true);
       expect(isContextLimitError('random error')).toBe(false);
+    });
+  });
+
+  describe('isTransientLLMError', () => {
+    it('should return false for falsy errors', () => {
+      expect(isTransientLLMError(null)).toBe(false);
+      expect(isTransientLLMError(undefined)).toBe(false);
+    });
+
+    it('should detect transient status via .status property', () => {
+      const error = Object.assign(new Error('Server error'), { status: 503 });
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should detect transient status via .code when .status is absent', () => {
+      const error = { code: 429, message: 'Rate limited' };
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should detect transient status via .response.status when .status and .code are absent', () => {
+      const error = { response: { status: 502 }, message: 'Bad gateway' };
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should return false for non-transient status codes', () => {
+      const error = Object.assign(new Error('Bad request'), { status: 400 });
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should detect transient errors by message pattern', () => {
+      expect(isTransientLLMError(new Error('ECONNRESET'))).toBe(true);
+      expect(isTransientLLMError(new Error('socket hang up'))).toBe(true);
+    });
+
+    it('should return false for context limit errors (not retryable)', () => {
+      expect(isTransientLLMError(new Error('context length exceeded'))).toBe(false);
     });
   });
 });

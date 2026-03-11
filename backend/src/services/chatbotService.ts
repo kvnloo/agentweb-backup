@@ -115,6 +115,7 @@ export interface ChatMessage {
       uploadedAt: string;
     }>;
     feedback?: MessageFeedback;        // NEW: Feedback data
+    isErrorMessage?: boolean;           // True when message is an auto-persisted error
   };
 }
 
@@ -209,6 +210,13 @@ export interface ChatSession {
   };
   assetScanIndex?: number;   // messageIndex up to which we've scanned (exclusive)
   messageCount?: number;      // total messages in AW-ChatMessages for this session
+  satisfactionScore?: {
+    score: number;              // 1-5 (1=unsatisfied, 5=very satisfied)
+    reason: string;             // LLM-generated explanation
+    evaluatedAt: string;        // ISO timestamp
+    evaluatedMessageIndex: number; // messageIndex up to which we evaluated
+    adminOverride?: boolean;    // When true, auto-scoring skips this session
+  };
 }
 
 // Interface for context chunks
@@ -1825,6 +1833,31 @@ export class ChatbotDB {
     }
   }
 
+  async updateSessionSatisfactionScore(
+    sessionId: string,
+    satisfactionScore: ChatSession["satisfactionScore"]
+  ): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression: "SET satisfactionScore = :score",
+      ExpressionAttributeValues: {
+        ":score": satisfactionScore,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session satisfaction score:", error);
+      throw error;
+    }
+  }
+
   async updateSessionPortalType(
     sessionId: string,
     portalType: "customer" | "partner" | "genius" | "agent"
@@ -3287,41 +3320,11 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // KB tools and other tools available to Emma
+        // KB tools, scheduled chat tools, and other tools available to Emma
         const toolsToInclude = [
-          // Knowledge base (existing)
-          'create_knowledge_base',
-          'update_knowledge_base_file',
-          'attach_knowledge_base_files',
-          'read_page_source',
-          // Brand & strategy
-          'read_brand_guidelines',
-          'update_brand_guidelines',
-          'read_market_strategy',
-          'update_market_strategy',
-          // GTM Plan
-          'list_gtm_plans',
-          'read_gtm_plan',
-          'create_gtm_plan',
-          'update_gtm_plan',
-          'add_gtm_phase',
-          'add_gtm_work_items',
-          'update_gtm_work_item',
-          // CRM
-          'get_leads',
-          'search_leads',
-          'update_lead',
-          'create_lead_list',
-          // Books
-          'list_books',
-          'create_book',
-          'update_book_content',
-          // Email templates
-          'list_html_templates',
-          'create_html_from_template',
-          'update_html_file',
-          // Visual context (on-demand screenshot)
-          'get_visual_context',
+          'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source',
+          'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
+          'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables',
         ];
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');

@@ -1,41 +1,40 @@
-import { mcpToolRegistry } from '../mcp/server/registry';
+/**
+ * Tests for Meta Ads tools — now accessed via API-wrapping tools.
+ * The old get_meta_ads_metrics tool has been consolidated into the
+ * /api/emma/meta-ads/* REST endpoints.
+ */
 
-// Mock dependencies to avoid ESM import issues
+jest.mock('../mcp/server/httpClient', () => ({
+  mcpFetch: jest.fn(),
+  generateSelfCallToken: jest.fn().mockReturnValue('mock-token'),
+  clearUserCache: jest.fn(),
+}));
+
+jest.mock('../services/skillService', () => ({
+  skillService: { getPublishedSkills: jest.fn().mockResolvedValue([]) },
+}));
+
+jest.mock('../services/subscriptionService', () => ({
+  getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+}));
+
 jest.mock('../services/agentModeService', () => ({
-  agentModeService: {
-    listMetaAdsCampaigns: jest.fn(),
-    callMetaMarketingApi: jest.fn(),
-    callMetaAdsInsightsApiWrapper: jest.fn(),
-    getMetaAdsMetrics: jest.fn(),
-    getPostAnalytics: jest.fn(),
-    readBrandGuidelines: jest.fn(),
-    updateBrandGuidelines: jest.fn(),
-    readMarketStrategy: jest.fn(),
-    updateMarketStrategy: jest.fn(),
-    performDeepResearch: jest.fn(),
-    tasks: {
-      performDataAnalysis: jest.fn(),
-    }
-  }
+  agentModeService: { getUnassociatedToolNames: jest.fn().mockReturnValue([]) },
 }));
 
-jest.mock('../mcp/client/mcpClientService', () => ({
-  McpClientService: jest.fn(),
-}));
+import { mcpToolRegistry } from '../mcp/server/registry';
+import '../mcp/server/apiTools';
 
-// Import the tools to ensure they are registered
-import '../mcp/server/tools';
+describe('MCP Meta Ads (via API tools)', () => {
+  it('should no longer expose individual meta ads tools (consolidated into REST API)', () => {
+    // Old tool names should not exist
+    expect(mcpToolRegistry.getTool('get_meta_ads_metrics')).toBeUndefined();
+    expect(mcpToolRegistry.getTool('list_meta_ads_campaigns')).toBeUndefined();
+    expect(mcpToolRegistry.getTool('call_meta_marketing_api')).toBeUndefined();
+  });
 
-describe('MCP Meta Ads Tools', () => {
-  it('should require campaign_ids array for get_meta_ads_metrics', () => {
-    const tool = mcpToolRegistry.getTool('get_meta_ads_metrics');
-    expect(tool).toBeDefined();
-
-    const schema = tool?.definition.inputSchema;
-    expect(schema?.required).toContain('campaign_ids');
-    expect(schema?.properties?.campaign_ids?.type).toBe('array');
-    expect(schema?.properties?.campaign_ids?.items?.type).toBe('string');
-    expect(schema?.properties?.campaign_ids?.minItems).toBe(1);
-    expect(schema?.properties?.campaign_id).toBeUndefined();
+  it('should expose search_web and generate_image as API-wrapping tools', () => {
+    expect(mcpToolRegistry.getTool('search_web')).toBeDefined();
+    expect(mcpToolRegistry.getTool('generate_image')).toBeDefined();
   });
 });

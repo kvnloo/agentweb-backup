@@ -1,7 +1,9 @@
-import { agentModeService } from '../../services/agentModeService';
-import { mcpToolRegistry } from './registry';
+import { agentModeService } from '../services/agentModeService';
+import { emmaToolRegistry } from './registry';
+import { accountMemoryDb } from '../services/db';
+import { getAccountSummary } from '../services/accountSummaryService';
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
     name: 'install_skills',
@@ -31,8 +33,8 @@ mcpToolRegistry.register({
 
     // For external MCP clients: validate and update session state
     if (context?.updateInstalledSkills) {
-      const { skillService } = await import('../../services/skillService');
-      const { getAllowedSkills } = await import('../../services/subscriptionService');
+      const { skillService } = await import('../services/skillService');
+      const { getAllowedSkills } = await import('../services/subscriptionService');
 
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
         skillService.getPublishedSkills(),
@@ -77,7 +79,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_available_skills',
   definition: {
     name: 'list_available_skills',
@@ -95,8 +97,8 @@ mcpToolRegistry.register({
       throw new Error("Authentication required");
     }
 
-    const { skillService } = await import('../../services/skillService');
-    const { getAllowedSkills } = await import('../../services/subscriptionService');
+    const { skillService } = await import('../services/skillService');
+    const { getAllowedSkills } = await import('../services/subscriptionService');
 
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       skillService.getPublishedSkills(),
@@ -119,7 +121,7 @@ mcpToolRegistry.register({
 
     // Add __other_skills__ virtual skill
     if (isWildcard || allowedSkillSet.has('__other_skills__')) {
-      const { agentModeService } = await import('../../services/agentModeService');
+      const { agentModeService } = await import('../services/agentModeService');
       const unassociatedTools = agentModeService.getUnassociatedToolNames(publishedSkills);
 
       availableSkills.push({
@@ -139,7 +141,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'linkedin_outreach',
   definition: {
     name: 'linkedin_outreach',
@@ -186,7 +188,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_meta_ads_campaigns',
   definition: {
     name: 'list_meta_ads_campaigns',
@@ -203,7 +205,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from marketingTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "call_meta_marketing_api",
     definition: {
       name: "call_meta_marketing_api",
@@ -375,7 +377,7 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
     }
   });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "call_meta_ads_insights_api",
   definition: {
     name: "call_meta_ads_insights_api",
@@ -493,7 +495,7 @@ mcpToolRegistry.register({
   },
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_meta_ads_metrics',
   definition: {
     name: 'get_meta_ads_metrics',
@@ -531,7 +533,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_post_analytics',
   definition: {
     name: 'get_post_analytics',
@@ -558,7 +560,7 @@ mcpToolRegistry.register({
   }
 );
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'read_brand_guidelines',
   definition: {
     name: 'read_brand_guidelines',
@@ -575,7 +577,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_brand_guidelines',
   definition: {
     name: 'update_brand_guidelines',
@@ -644,7 +646,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'read_market_strategy',
   definition: {
     name: 'read_market_strategy',
@@ -661,7 +663,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_market_strategy',
   definition: {
     name: 'update_market_strategy',
@@ -733,7 +735,33 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
+  name: 'get_visual_context',
+  definition: {
+    name: 'get_visual_context',
+    description: 'Request a screenshot of the current page to understand visual layout, colors, design elements, UI structure. Use when the user asks about visual aspects, colors, design, or when you need to see the page to answer accurately.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          description: 'Why you need the screenshot'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any) => {
+    return {
+      needs_screenshot: true,
+      reason: args.reason || 'Visual context requested',
+      message: 'Screenshot will be captured from the browser and included in the next message.'
+    };
+  }
+});
+
+
+emmaToolRegistry.register({
   name: 'perform_deep_research',
   definition: {
     name: 'perform_deep_research',
@@ -783,7 +811,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from contentTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_books',
   definition: {
     name: 'list_books',
@@ -810,7 +838,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_book_details',
   definition: {
     name: 'get_book_details',
@@ -831,7 +859,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_book_content',
   definition: {
     name: 'get_book_content',
@@ -879,7 +907,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_book_content',
   definition: {
     name: 'update_book_content',
@@ -931,7 +959,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'generate_book_content',
   definition: {
     name: 'generate_book_content',
@@ -988,7 +1016,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_book',
   definition: {
     name: 'create_book',
@@ -1037,7 +1065,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_book_outline',
   definition: {
     name: 'create_book_outline',
@@ -1062,7 +1090,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'add_characters',
   definition: {
     name: 'add_characters',
@@ -1087,7 +1115,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_blog_article',
   definition: {
     name: 'create_blog_article',
@@ -1149,7 +1177,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'publish_blog_article',
   definition: {
     name: 'publish_blog_article',
@@ -1208,7 +1236,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_cms_categories',
   definition: {
     name: 'list_cms_categories',
@@ -1225,7 +1253,7 @@ mcpToolRegistry.register({
       return { success: false, message: 'User context required' };
     }
     try {
-      const { userDb } = await import('../../services/db');
+      const { userDb } = await import('../services/db');
       const user = await userDb.getUserById(userId);
       const cmsType = user?.cmsType;
 
@@ -1233,7 +1261,7 @@ mcpToolRegistry.register({
         return { success: true, cmsType: cmsType || null, categories: [] };
       }
 
-      const { getWebflowConfig } = await import('../../controllers/blog');
+      const { getWebflowConfig } = await import('../controllers/blog');
       const config = await getWebflowConfig(userId);
       const categoryNames = config.categories ? Object.keys(config.categories) : [];
 
@@ -1244,7 +1272,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'repair_blog_article',
   definition: {
     name: 'repair_blog_article',
@@ -1269,7 +1297,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_social_media_posts',
   definition: {
     name: 'create_social_media_posts',
@@ -1312,7 +1340,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_html_templates',
   definition: {
     name: 'list_html_templates',
@@ -1329,7 +1357,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_html_from_template',
   definition: {
     name: 'create_html_from_template',
@@ -1393,7 +1421,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_html_file',
   definition: {
     name: 'update_html_file',
@@ -1458,7 +1486,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from leadGtmTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_gtm_plans',
   definition: {
     name: 'list_gtm_plans',
@@ -1475,7 +1503,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'read_gtm_plan',
   definition: {
     name: 'read_gtm_plan',
@@ -1496,7 +1524,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_gtm_plan',
   definition: {
     name: 'create_gtm_plan',
@@ -1579,7 +1607,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_gtm_plan',
   definition: {
     name: 'update_gtm_plan',
@@ -1621,7 +1649,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'add_gtm_phase',
   definition: {
     name: 'add_gtm_phase',
@@ -1690,7 +1718,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'add_gtm_work_items',
   definition: {
     name: 'add_gtm_work_items',
@@ -1741,7 +1769,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_gtm_work_item',
   definition: {
     name: 'update_gtm_work_item',
@@ -1827,7 +1855,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_gtm_phase',
   definition: {
     name: 'update_gtm_phase',
@@ -1873,7 +1901,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'delete_gtm_items',
   definition: {
     name: 'delete_gtm_items',
@@ -1902,7 +1930,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_gtm_common_items',
   definition: {
     name: 'get_gtm_common_items',
@@ -1918,7 +1946,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'add_gtm_common_items',
   definition: {
     name: 'add_gtm_common_items',
@@ -1965,7 +1993,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'send_gtm_status_report',
   definition: {
     name: 'send_gtm_status_report',
@@ -2016,7 +2044,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_lead_lists',
   definition: {
     name: 'get_lead_lists',
@@ -2032,7 +2060,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_lead_list',
   definition: {
     name: 'create_lead_list',
@@ -2062,7 +2090,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'add_leads_to_list',
   definition: {
     name: 'add_leads_to_list',
@@ -2098,7 +2126,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_email_draft_for_lead',
   definition: {
     name: 'update_email_draft_for_lead',
@@ -2139,7 +2167,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_leads',
   definition: {
     name: 'get_leads',
@@ -2186,7 +2214,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'search_leads',
   definition: {
     name: 'search_leads',
@@ -2233,7 +2261,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_lead_details',
   definition: {
     name: 'get_lead_details',
@@ -2258,7 +2286,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_lead',
   definition: {
     name: 'update_lead',
@@ -2288,7 +2316,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'delete_leads',
   definition: {
     name: 'delete_leads',
@@ -2314,7 +2342,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_lead_list',
   definition: {
     name: 'update_lead_list',
@@ -2387,7 +2415,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'delete_lead_list',
   definition: {
     name: 'delete_lead_list',
@@ -2408,7 +2436,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_lead_status',
   definition: {
     name: 'update_lead_status',
@@ -2452,7 +2480,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_lead_list_statuses',
   definition: {
     name: 'get_lead_list_statuses',
@@ -2473,7 +2501,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'configure_lead_statuses',
   definition: {
     name: 'configure_lead_statuses',
@@ -2508,7 +2536,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_lead_engagements',
   definition: {
     name: 'get_lead_engagements',
@@ -2537,7 +2565,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'add_lead_engagement',
   definition: {
     name: 'add_lead_engagement',
@@ -2578,7 +2606,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'send_email_to_lead',
   definition: {
     name: 'send_email_to_lead',
@@ -2603,7 +2631,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
@@ -2625,7 +2653,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_connected_account_posts',
   definition: {
     name: 'list_connected_account_posts',
@@ -2652,7 +2680,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'load_connected_account_metrics',
   definition: {
     name: 'load_connected_account_metrics',
@@ -2673,7 +2701,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
@@ -2697,7 +2725,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'comment_on_linkedin_post',
   definition: {
     name: 'comment_on_linkedin_post',
@@ -2726,7 +2754,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'react_to_linkedin_post',
   definition: {
     name: 'react_to_linkedin_post',
@@ -2757,7 +2785,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'list_task_templates',
   definition: {
     name: 'list_task_templates',
@@ -2774,7 +2802,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from taskTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_task_from_template',
   definition: {
     name: 'create_task_from_template',
@@ -2827,7 +2855,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_task_from_prompt',
   definition: {
     name: 'create_task_from_prompt',
@@ -2881,7 +2909,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_image_task_from_prompt',
   definition: {
     name: 'create_image_task_from_prompt',
@@ -2923,7 +2951,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_revision',
   definition: {
     name: 'create_revision',
@@ -2963,7 +2991,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_task_subscriber_metrics',
   definition: {
     name: 'get_task_subscriber_metrics',
@@ -2984,7 +3012,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'get_task_subscriber_engagement_events',
   definition: {
     name: 'get_task_subscriber_engagement_events',
@@ -3010,7 +3038,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from mediaTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "describe_image",
   definition: {
     name: "describe_image",
@@ -3036,7 +3064,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "describe_video",
   definition: {
     name: "describe_video",
@@ -3062,7 +3090,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "remove_c2pa_from_image",
   definition: {
     name: "remove_c2pa_from_image",
@@ -3087,7 +3115,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
@@ -3149,7 +3177,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'generate_video',
   definition: {
     name: 'generate_video',
@@ -3188,7 +3216,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from searchTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "search_web",
   definition: {
     name: "search_web",
@@ -3214,7 +3242,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "search_knowledge_base",
   definition: {
     name: "search_knowledge_base",
@@ -3240,7 +3268,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "list_knowledge_base_files",
   definition: {
     name: "list_knowledge_base_files",
@@ -3256,7 +3284,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "read_knowledge_base_files",
   definition: {
     name: "read_knowledge_base_files",
@@ -3291,7 +3319,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_knowledge_base',
   definition: {
     name: 'create_knowledge_base',
@@ -3330,7 +3358,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'update_knowledge_base_file',
   definition: {
     name: 'update_knowledge_base_file',
@@ -3374,7 +3402,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'attach_knowledge_base_files',
   definition: {
     name: 'attach_knowledge_base_files',
@@ -3421,7 +3449,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
@@ -3461,7 +3489,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "read_page_source",
   definition: {
     name: "read_page_source",
@@ -3512,7 +3540,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from utilityTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "perform_data_analysis",
   definition: {
     name: "perform_data_analysis",
@@ -3538,7 +3566,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "create_html_file",
   definition: {
     name: "create_html_file",
@@ -3558,7 +3586,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "create_html_template",
   definition: {
     name: "create_html_template",
@@ -3598,7 +3626,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: "save_file",
   definition: {
     name: "save_file",
@@ -3633,7 +3661,7 @@ mcpToolRegistry.register({
 });
 
 // --- Tools from workflowTools.ts ---
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'create_work_plan',
   definition: {
     name: 'create_work_plan',
@@ -3683,7 +3711,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'modify_work_plan',
   definition: {
     name: 'modify_work_plan',
@@ -3736,7 +3764,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'set_work_plan_status',
   definition: {
     name: 'set_work_plan_status',
@@ -3776,7 +3804,7 @@ mcpToolRegistry.register({
   }
 });
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'send_for_review',
   definition: {
     name: 'send_for_review',
@@ -3816,7 +3844,7 @@ mcpToolRegistry.register({
 
 // ── Email Tool (unified, multi-provider) ───────────────────────────────────
 
-mcpToolRegistry.register({
+emmaToolRegistry.register({
   name: 'email',
   definition: {
     name: 'email',
@@ -3893,8 +3921,8 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../../services/emailProviderService');
-    const { GmailNotConnectedError, GmailTokenRevokedError, GmailQuotaError, GmailBodyTooLargeError, GmailSendNotAuthorizedError } = await import('../../services/gmailService');
+    const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
+    const { GmailNotConnectedError, GmailTokenRevokedError, GmailQuotaError, GmailBodyTooLargeError, GmailSendNotAuthorizedError } = await import('../services/gmailService');
 
     const userId = context?.userId;
     if (!userId) throw new Error('Missing user context');
@@ -3956,3 +3984,182 @@ mcpToolRegistry.register({
     }
   }
 });
+
+// ─── Account Memory Tools ────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'save_memory',
+  definition: {
+    name: 'save_memory',
+    description: 'Save a fact about this account for future sessions. Use this when you learn something important about the user, their preferences, business context, or workflow patterns. Categories: preference (user likes/dislikes), history (past actions/decisions), insight (business learnings), workflow (process patterns).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: {
+          type: 'string',
+          description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
+        },
+        category: {
+          type: 'string',
+          enum: ['preference', 'history', 'insight', 'workflow'],
+          description: 'Category for the memory fact.'
+        }
+      },
+      required: ['content', 'category']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { userDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    if (user?.memoryEnabled === false) {
+      return { success: false, message: 'Memory is disabled for this account.' };
+    }
+
+    const memory = await accountMemoryDb.addMemory(
+      userId,
+      args.category,
+      args.content,
+      context?.sessionId
+    );
+    return {
+      success: true,
+      memoryId: memory.memoryId,
+      message: `Saved memory: "${args.content.substring(0, 80)}${args.content.length > 80 ? '...' : ''}"`
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'delete_memory',
+  definition: {
+    name: 'delete_memory',
+    description: 'Delete a specific memory by its ID. Use this when a fact is no longer accurate or relevant.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memoryId: {
+          type: 'string',
+          description: 'The ID of the memory to delete.'
+        }
+      },
+      required: ['memoryId']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    await accountMemoryDb.deleteMemory(userId, args.memoryId);
+    return { success: true, message: `Memory ${args.memoryId} deleted.` };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'account_summary',
+  definition: {
+    name: 'account_summary',
+    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        time_range: {
+          type: 'string',
+          enum: ['1d', '7d', '30d', '90d'],
+          description: 'Time range for the summary. Defaults to 7d.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const timeRange = args.time_range || '7d';
+    return await getAccountSummary(userId, timeRange);
+  }
+});
+
+// --- SEO & Analytics Tools ---
+emmaToolRegistry.register({
+  name: 'get_seo_metrics',
+  definition: {
+    name: 'get_seo_metrics',
+    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). User must have SEO domains configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for metrics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchSearchConsoleMetrics } = await import('../services/seoService');
+    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_website_analytics',
+  definition: {
+    name: 'get_website_analytics',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. User must have a Google Analytics Property ID configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for analytics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
+    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+// ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
+// These tools wrap REST endpoints via mcpFetch. Rather than duplicating
+// definitions, we re-register them from the MCP server registry.
+// Ensure apiTools has registered its tools before we try to bridge them.
+import '../mcp/server/apiTools';
+import { mcpToolRegistry } from '../mcp/server/registry';
+
+const scheduledChatToolNames = [
+  'list_scheduled_chats',
+  'manage_scheduled_chat',
+  'test_scheduled_chat',
+  'get_scheduled_chat_test_history',
+  'submit_scheduled_chat_variables',
+];
+
+for (const toolName of scheduledChatToolNames) {
+  const handler = mcpToolRegistry.getTool(toolName);
+  if (handler) {
+    emmaToolRegistry.register({
+      name: handler.name,
+      definition: handler.definition,
+      execute: handler.execute,
+    });
+  } else {
+    console.warn(`[emma/tools] Failed to bridge scheduled chat tool "${toolName}" — not found in mcpToolRegistry`);
+  }
+}

@@ -10,6 +10,37 @@ interface RepoInfo {
   name: string;
   htmlUrl: string;
   agentMd: string;
+  deployedUrls: string[];
+}
+
+export function extractProductionUrls(markdown: string): string[] {
+  // Find all https:// URLs
+  const urlRegex = /https:\/\/[^\s"'<>\])]+/g;
+  const matches = markdown.match(urlRegex) || [];
+
+  const seen = new Set<string>();
+  const results: string[] = [];
+
+  for (let url of matches) {
+    // Strip trailing punctuation
+    url = url.replace(/[.,;:)]+$/, '');
+
+    // Filter out GitHub URLs
+    if (/github\.com|github\.io/i.test(url)) continue;
+
+    // Filter out Vercel preview URLs (e.g. project-git-branch.vercel.app)
+    if (/-git-[^.]+\.vercel\.app/i.test(url)) continue;
+
+    // Normalize: remove trailing slash for dedup
+    const normalized = url.replace(/\/+$/, '');
+
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      results.push(normalized);
+    }
+  }
+
+  return results;
 }
 
 // In-memory cache keyed by token hash, with 5 min TTL
@@ -80,6 +111,7 @@ async function fetchReposWithAgentMd(githubToken: string | null): Promise<RepoIn
             name: repo.name,
             htmlUrl: repo.html_url,
             agentMd: content,
+            deployedUrls: extractProductionUrls(content),
           };
         } catch {
           // Try next filename variant

@@ -445,6 +445,20 @@ describe('secretsManager utils', () => {
         SecretId: 'dev/AgentWeb/MetaApp'
       });
     });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ instagramClientId: 'id', instagramClientSecret: 'secret' })
+        })
+      });
+
+      await getInstagramCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/MetaApp'
+      });
+    });
   });
 
   describe('getGoogleDriveServiceAccountEmail', () => {

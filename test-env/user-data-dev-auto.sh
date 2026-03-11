@@ -254,10 +254,56 @@ PAGE_CONTENT=$(echo "$BLOCKS_JSON" | jq -r '
   ) | map(.plain_text) | join("")
 ' | sed '/^$/d')
 
+# Extract and download attachments (image, file, pdf, video blocks)
+ATTACHMENTS_DIR="$APP_DIR/.notion-attachments"
+mkdir -p "$ATTACHMENTS_DIR"
+chown ec2-user:ec2-user "$ATTACHMENTS_DIR"
+
+ATTACHMENT_LIST=""
+while IFS=$'\t' read -r url name; do
+  [[ -z "$url" ]] && continue
+  # URL-decode the filename
+  decoded_name=$(printf '%b' "${name//%/\\x}")
+  # Sanitize: remove path separators and control characters
+  decoded_name=$(echo "$decoded_name" | tr -d '/' | tr -cd '[:print:]')
+  [[ -z "$decoded_name" ]] && decoded_name="attachment_$(date +%s%N)"
+  dest="$ATTACHMENTS_DIR/$decoded_name"
+  echo "Downloading attachment: $decoded_name"
+  if curl -sL -o "$dest" "$url"; then
+    chown ec2-user:ec2-user "$dest"
+    ATTACHMENT_LIST="${ATTACHMENT_LIST}
+- ${dest}"
+  else
+    echo "WARNING: Failed to download $url"
+  fi
+done < <(echo "$BLOCKS_JSON" | jq -r '
+  .results[] |
+  select(.type == "image" or .type == "file" or .type == "pdf" or .type == "video") |
+  . as $block |
+  ($block[$block.type] |
+    (if .type == "file" then .file.url
+     elif .type == "external" then .external.url
+     else empty end)
+  ) as $url |
+  ($block[$block.type] |
+    (if .caption and (.caption | length > 0) then (.caption | map(.plain_text) | join(""))
+     elif .name then .name
+     else ($url | split("/") | last | split("?") | first)
+     end)
+  ) as $name |
+  "\($url)\t\($name)"
+')
+
 # Build the Claude prompt
 CLAUDE_PROMPT="Prep branch for ${PAGE_TITLE}."
 if [[ -n "$PAGE_CONTENT" ]]; then
   CLAUDE_PROMPT="${CLAUDE_PROMPT} More details: ${PAGE_CONTENT}"
+fi
+if [[ -n "$ATTACHMENT_LIST" ]]; then
+  CLAUDE_PROMPT="${CLAUDE_PROMPT}
+
+The following attachments from the Notion page have been downloaded to the EC2 instance. Read/view them as needed:
+${ATTACHMENT_LIST}"
 fi
 
 # Write prompt file
