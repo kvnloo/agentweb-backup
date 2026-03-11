@@ -1295,6 +1295,67 @@ const createSkillsTable = async () => {
   }
 };
 
+// Create Skill Assignments table
+const createSkillAssignmentsTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SkillAssignments`,
+    AttributeDefinitions: [
+      { AttributeName: 'assignmentId', AttributeType: 'S' },
+      { AttributeName: 'skillId', AttributeType: 'S' },
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'status', AttributeType: 'S' },
+      { AttributeName: 'nextRunTime', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'assignmentId', KeyType: 'HASH' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'SkillIndex',
+        KeySchema: [
+          { AttributeName: 'skillId', KeyType: 'HASH' },
+          { AttributeName: 'status', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'UserIndex',
+        KeySchema: [
+          { AttributeName: 'userId', KeyType: 'HASH' },
+          { AttributeName: 'status', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      },
+      {
+        IndexName: 'RunnerIndex',
+        KeySchema: [
+          { AttributeName: 'status', KeyType: 'HASH' },
+          { AttributeName: 'nextRunTime', KeyType: 'RANGE' }
+        ],
+        Projection: {
+          ProjectionType: 'ALL'
+        }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Agent API Keys table
 const createAgentApiKeysTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -1505,6 +1566,7 @@ const main = async () => {
     await createBookContentsTable();
     await createConnectedAccountPostsTable();
     await createSkillsTable();
+    await createSkillAssignmentsTable();
     await createAgentApiKeysTable();
     await createMcpOAuthClientsTable();
     await createMcpOAuthCodesTable();
