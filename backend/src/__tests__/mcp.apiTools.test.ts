@@ -70,6 +70,8 @@ describe('apiTools', () => {
         'emma_create_session', 'emma_send_message', 'emma_get_session', 'emma_list_sessions',
         'list_tasks', 'manage_task', 'execute_task', 'list_task_executions',
         'list_schedules', 'manage_schedule',
+        'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
+        'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables',
         'list_lead_lists', 'manage_lead_list', 'manage_leads', 'search_leads',
         'list_gtm_plans', 'manage_gtm_plan', 'manage_gtm_items',
         'list_knowledge_bases', 'search_knowledge_base', 'read_knowledge_base_files',
