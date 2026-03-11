@@ -145,13 +145,27 @@ emmaToolRegistry.register({
   name: 'linkedin_outreach',
   definition: {
     name: 'linkedin_outreach',
-    description: 'Send a LinkedIn connection invite or a direct message via a connected Unipile account. To find the account_id, call list_connected_accounts(platform=\'unipile\') tool.\n\nFor the target person, pass EITHER:\n- profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/) - this tool will resolve it to a provider_id automatically.\n- provider_id: the Unipile provider_id directly if you already have it.\n\nActions:\n- send-invite: Send a connection request (message optional but recommended).\n- send-message: Send a direct message (message required).',
+    description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
+
+Actions:
+- search-people: Search LinkedIn for people by keywords, title, company. Pass keywords for broad search, or use title/company for targeted search. Alternatively pass search_url with a LinkedIn search URL copied from the browser. Returns paginated results with provider_id for each person.
+- get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
+- list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
+- list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
+- send-message: Send a direct message. Requires profile_url or provider_id. message required.
+- get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
+- cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+
+For target person identification (send-invite, send-message, get-profile), pass EITHER:
+- profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
+- provider_id: the Unipile provider_id directly if you already have it`,
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['send-invite', 'send-message'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -160,15 +174,43 @@ emmaToolRegistry.register({
         },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message. Provide this OR provider_id.'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile. Provide this OR profile_url.'
         },
         message: {
           type: 'string',
           description: 'Message content. Required for send-message; recommended for send-invite.'
+        },
+        keywords: {
+          type: 'string',
+          description: 'Free text search keywords for search-people action.'
+        },
+        search_url: {
+          type: 'string',
+          description: 'A LinkedIn search URL copied from the browser for search-people action. Alternative to keyword-based search.'
+        },
+        title: {
+          type: 'string',
+          description: 'Job title filter for search-people (e.g. "CTO").'
+        },
+        company: {
+          type: 'string',
+          description: 'Company name filter for search-people.'
+        },
+        company_id: {
+          type: 'string',
+          description: 'LinkedIn company identifier/slug for get-company action.'
+        },
+        invitation_id: {
+          type: 'string',
+          description: 'Invitation ID for cancel-invitation action. Obtain from list-sent-invitations.'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations.'
         }
       },
       required: ['action', 'account_id']
@@ -178,11 +220,14 @@ emmaToolRegistry.register({
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    if (!args.profile_url && !args.provider_id) {
-      return { success: false, message: 'Either profile_url or provider_id is required.' };
-    }
-    if (args.profile_url && args.provider_id) {
-      return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
+    const targetActions = ['send-invite', 'send-message', 'get-profile'];
+    if (targetActions.includes(args.action)) {
+      if (!args.profile_url && !args.provider_id) {
+        return { success: false, message: 'Either profile_url or provider_id is required.' };
+      }
+      if (args.profile_url && args.provider_id) {
+        return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
+      }
     }
     return await agentModeService.linkedinOutreach(context.userId, args);
   }
