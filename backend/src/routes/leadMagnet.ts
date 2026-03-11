@@ -17,8 +17,25 @@ const dailyEmailTracker = new Map<string, number>(); // email -> last execution 
 const dailyIpTracker = new Map<string, number[]>(); // ip -> execution timestamps (last 24h)
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const MAX_PER_EMAIL_PER_DAY = 1;
 const MAX_PER_IP_PER_DAY = 5;
+
+// Periodic cleanup to prevent unbounded Map growth
+setInterval(() => {
+  const cutoff = Date.now() - DAY_MS;
+  for (const [email, ts] of dailyEmailTracker) {
+    if (ts < cutoff) dailyEmailTracker.delete(email);
+  }
+  for (const [ip, timestamps] of dailyIpTracker) {
+    const recent = timestamps.filter(t => t > cutoff);
+    if (recent.length === 0) {
+      dailyIpTracker.delete(ip);
+    } else {
+      dailyIpTracker.set(ip, recent);
+    }
+  }
+}, CLEANUP_INTERVAL_MS);
 
 function isEmailRateLimited(email: string): boolean {
   const lastExec = dailyEmailTracker.get(email.toLowerCase());
