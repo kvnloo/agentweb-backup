@@ -17,6 +17,7 @@ import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { isTransientLLMError } from '../utils/agentModeErrors';
+import { uploadFileToS3 } from '../utils/s3Utils';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -2842,34 +2843,11 @@ Be helpful, concise, and accurate. If you don't know the answer or the request i
 }" target="_blank">Discord community</a>`;
 
 // Cache for Emma system context (60s TTL)
-// Cached Gemini OpenAI-compatible client (1-hour TTL so key rotation is picked up)
-let cachedGeminiClient: OpenAI | null = null;
-let cachedGeminiClientExpiry: number = 0;
-const GEMINI_CLIENT_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-async function getGeminiClient(): Promise<OpenAI> {
-  if (cachedGeminiClient && Date.now() < cachedGeminiClientExpiry) return cachedGeminiClient;
-  const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
-  let apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    apiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
-  }
-  if (!apiKey || !apiKey.trim()) throw new Error('Gemini API key not found');
-  cachedGeminiClient = new OpenAI({
-    apiKey: apiKey.trim(),
-    baseURL: 'https://generativelanguage.googleapis.com/v1beta',
-  });
-  cachedGeminiClientExpiry = Date.now() + GEMINI_CLIENT_TTL_MS;
-  return cachedGeminiClient;
-}
-
 let cachedSystemContext: { value: string; expiry: number } | null = null;
 
 // Exported for testing only — not part of the public API
 export function __resetEmmaSystemContextCache(): void {
   cachedSystemContext = null;
-  cachedGeminiClient = null;
-  cachedGeminiClientExpiry = 0;
 }
 
 export async function getEmmaSystemContext(): Promise<string> {
@@ -3136,6 +3114,22 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
   }
 }
 
+function trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+  const toolIndices: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'tool') {
+      toolIndices.push(i);
+    }
+  }
+  const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+  return messages.map((msg, idx) => {
+    if (msg.role === 'tool' && !preserveSet.has(idx) && typeof msg.content === 'string' && msg.content.length > maxToolContentLength) {
+      return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
+    }
+    return msg;
+  });
+}
+
 // Update generateChatResponse to use platform knowledge base when needed
 export async function generateChatResponse(
   sessionId: string,
@@ -3160,7 +3154,6 @@ export async function generateChatResponse(
       try {
         const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, "");
         const buffer = Buffer.from(base64Data, 'base64');
-        const { uploadFileToS3 } = require('../utils/s3Utils');
         const uploadResult = await uploadFileToS3(
           buffer,
           `screenshot-${Date.now()}.jpg`,
@@ -3176,9 +3169,14 @@ export async function generateChatResponse(
             mimetype: 'image/jpeg',
             uploadedAt: timestamp
           }];
+        } else {
+          // Upload did not return a URL — don't send raw base64 to the LLM
+          uploadedScreenshotUrl = undefined;
         }
       } catch (err) {
         console.error('Failed to upload screenshot to S3:', err);
+        // Don't send raw base64 to the LLM on upload failure
+        uploadedScreenshotUrl = undefined;
       }
     }
 
@@ -3378,12 +3376,18 @@ export async function generateChatResponse(
     // Select the active client:
     // - Claude/Bedrock: use agentModeService.getBedrockClient() which returns an
     //   OpenAI-compatible wrapper that fully supports tool calling via ChatBedrockConverse.
-    // - Gemini: use agentModeService.getGeminiClient() which returns an 
+    // - Gemini: use agentModeService.getGeminiClient() which returns an
     //   OpenAI-compatible wrapper that supports tool calling.
     // - Azure OpenAI (default): use the standard OpenAI SDK client.
     const activeDeployment = isClaudeModel ? model! : (model || process.env.AZURE_OPENAI_DEPLOYMENT || '');
     let activeClient: any;
-    
+
+    if (isClaudeModel || isGeminiModel) {
+      if (!agentModeService) {
+        throw new Error('AgentModeService not initialized');
+      }
+    }
+
     if (isClaudeModel) {
       activeClient = await agentModeService!.getBedrockClient(model!);
     } else if (isGeminiModel) {
@@ -3401,23 +3405,6 @@ export async function generateChatResponse(
 
     // Helper: Sleep function for exponential backoff
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-    // Helper: Trim tool messages for context
-    const trimToolMessagesForContext = (messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] => {
-      const toolIndices: number[] = [];
-      for (let i = 0; i < messages.length; i++) {
-        if (messages[i].role === 'tool') {
-          toolIndices.push(i);
-        }
-      }
-      const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
-      return messages.map((msg, idx) => {
-        if (msg.role === 'tool' && !preserveSet.has(idx) && typeof msg.content === 'string' && msg.content.length > maxToolContentLength) {
-          return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
-        }
-        return msg;
-      });
-    };
 
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);

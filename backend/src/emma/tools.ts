@@ -710,7 +710,7 @@ emmaToolRegistry.register({
   }
 });
 
-emmaToolRegistry.register({
+const visualContextTool = {
   name: 'get_visual_context',
   definition: {
     name: 'get_visual_context',
@@ -733,7 +733,9 @@ emmaToolRegistry.register({
       message: 'Screenshot will be captured from the browser and included in the next message.'
     };
   }
-});
+};
+
+emmaToolRegistry.register(visualContextTool);
 
 
 emmaToolRegistry.register({
@@ -4118,33 +4120,9 @@ emmaToolRegistry.register({
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
 
-// Register get_visual_context in mcpToolRegistry here (after the import above).
-// It was intentionally placed here rather than earlier in the file to avoid
-// a temporal dead zone error with ts-jest (mid-file imports are not hoisted reliably).
-mcpToolRegistry.register({
-  name: 'get_visual_context',
-  definition: {
-    name: 'get_visual_context',
-    description: 'Request a screenshot of the current page to understand visual layout, colors, design elements, UI structure. Use when the user asks about visual aspects, colors, design, or when you need to see the page to answer accurately.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        reason: {
-          type: 'string',
-          description: 'Why you need the screenshot'
-        }
-      },
-      required: []
-    }
-  },
-  execute: async (args: any) => {
-    return {
-      needs_screenshot: true,
-      reason: args.reason || 'Visual context requested',
-      message: 'Screenshot will be captured from the browser and included in the next message.'
-    };
-  }
-});
+// Also register get_visual_context in mcpToolRegistry (after the import above, which is needed
+// for mcpToolRegistry to be available).
+mcpToolRegistry.register(visualContextTool);
 
 const scheduledChatToolNames = [
   'list_scheduled_chats',
