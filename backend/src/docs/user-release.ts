@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-10',
     changes: [
+      'Bug Fix: Reports Page Crash for Some Accounts',
+      '- Fixed crash on the Reports page when a task or file had a missing name, causing a "Cannot read properties of undefined" error',
+    ],
+  },
+  {
+    date: '2026-03-10',
+    changes: [
       'Feature: SEO & Website Analytics in Agent Mode',
       '- Ask Emma "how are my SEO metrics?" to get Google Search Console data — clicks, impressions, CTR, average position, top queries, top pages, and daily trends',
       '- Ask Emma "show me my website analytics" to get GA4 data — sessions, users, page views, bounce rate, traffic sources, top pages by engagement',
