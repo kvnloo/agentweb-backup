@@ -266,7 +266,8 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(mockAdapter.getPostMetrics).toHaveBeenCalledWith(
         mockLinkedInAccount,
-        ['urn:li:share:post1']
+        ['urn:li:share:post1'],
+        'user-123'
       );
       expect(result.posts[0].metrics).toBeDefined();
       expect(result.posts[0].metrics.likeCount).toBe(50);

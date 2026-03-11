@@ -42,7 +42,6 @@ import { chatbotDb } from '../services/chatbotService';
 import { userDb, crmDb } from '../services/db';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { agentModeService } from '../services/agentModeService';
-import { getPostsByUserId } from '../services/linkedInPostsDb';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
 
 jest.mock('../services/chatbotService', () => ({
@@ -67,10 +66,6 @@ jest.mock('../services/agentModeService', () => ({
   },
 }));
 
-jest.mock('../services/linkedInPostsDb', () => ({
-  getPostsByUserId: jest.fn().mockResolvedValue([]),
-}));
-
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn().mockResolvedValue([]),
 }));
@@ -81,7 +76,6 @@ const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
 const mockGetLeads = crmDb.getLeadsByListId as jest.Mock;
 const mockGetEmailEvents = emailEventsDb.getEventsByEmailDomain as jest.Mock;
 const mockLoadPosts = agentModeService.loadConnectedAccountPosts as jest.Mock;
-const mockGetStoredPosts = getPostsByUserId as jest.Mock;
 const mockGetAccounts = getAccountsByUserId as jest.Mock;
 
 function makeSession(overrides: Record<string, any> = {}) {
@@ -105,7 +99,6 @@ describe('getAccountSummary', () => {
     mockGetEmailEvents.mockResolvedValue([]);
     mockGetAccounts.mockResolvedValue([]);
     mockLoadPosts.mockResolvedValue({ success: true, posts: [] });
-    mockGetStoredPosts.mockResolvedValue([]);
   });
 
   // --- FAIL CASES ---
@@ -377,25 +370,36 @@ describe('getAccountSummary', () => {
 
   // --- RESULTS: Social Media ---
 
-  test('counts posts_published from stored posts within time range', async () => {
+  test('counts posts_published from all connected accounts (personal + org)', async () => {
     mockGetSessions.mockResolvedValue([]);
-    mockGetStoredPosts.mockResolvedValue([
-      { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Hello', createdAt: '2026-03-08T10:00:00.000Z' },
-      { userId: 'user-1', postId: 'post-2', accountId: 'acc-1', content: 'World', createdAt: '2026-03-07T10:00:00.000Z' },
-      { userId: 'user-1', postId: 'post-3', accountId: 'acc-1', content: 'Old', createdAt: '2026-01-01T10:00:00.000Z' }, // outside range
+    mockGetAccounts.mockResolvedValue([
+      { account_id: 'acc-personal', platform: 'linkedin', account_name: 'Personal', config: {} },
+      { account_id: 'acc-org', platform: 'linkedin', account_name: 'Company', config: {} },
     ]);
+    mockLoadPosts
+      .mockResolvedValueOnce({
+        success: true,
+        posts: [
+          { id: 'p1', created: { time: new Date('2026-03-08T10:00:00.000Z').getTime() }, metrics: null },
+          { id: 'p2', created: { time: new Date('2026-01-01T10:00:00.000Z').getTime() }, metrics: null }, // outside range
+        ],
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        posts: [
+          { id: 'o1', createdAt: '2026-03-08T10:00:00.000Z', metrics: null },
+          { id: 'o2', createdAt: '2026-03-07T10:00:00.000Z', metrics: null },
+        ],
+      });
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.results.social_media.posts_published).toBe(2);
+    // 1 personal + 2 org = 3 posts in range
+    expect(result.results.social_media.posts_published).toBe(3);
   });
 
   test('aggregates per-post metrics filtered by time range', async () => {
     mockGetSessions.mockResolvedValue([]);
-    mockGetStoredPosts.mockResolvedValue([
-      { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post 1', createdAt: '2026-03-08T10:00:00.000Z' },
-      { userId: 'user-1', postId: 'post-2', accountId: 'acc-1', content: 'Post 2', createdAt: '2026-03-07T10:00:00.000Z' },
-    ]);
     mockGetAccounts.mockResolvedValue([
       { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: Date.now() + 999999 } },
     ]);
@@ -430,7 +434,6 @@ describe('getAccountSummary', () => {
 
   test('handles LinkedIn created.time format for time filtering', async () => {
     mockGetSessions.mockResolvedValue([]);
-    mockGetStoredPosts.mockResolvedValue([]);
     mockGetAccounts.mockResolvedValue([
       { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: Date.now() + 999999 } },
     ]);
@@ -457,11 +460,8 @@ describe('getAccountSummary', () => {
     expect(result.results.social_media.clicks).toBe(5);
   });
 
-  test('returns posts_published even when live API fails per account', async () => {
+  test('returns zero metrics when live API fails per account', async () => {
     mockGetSessions.mockResolvedValue([]);
-    mockGetStoredPosts.mockResolvedValue([
-      { userId: 'user-1', postId: 'post-1', accountId: 'acc-1', content: 'Post', createdAt: '2026-03-08T10:00:00.000Z' },
-    ]);
     mockGetAccounts.mockResolvedValue([
       { account_id: 'acc-1', platform: 'linkedin', account_name: 'My LinkedIn', config: { access_token: 'tok', token_expires_at: 0 } },
     ]);
@@ -469,7 +469,7 @@ describe('getAccountSummary', () => {
 
     const result = await getAccountSummary('user-1', '7d');
 
-    expect(result.results.social_media.posts_published).toBe(1);
+    expect(result.results.social_media.posts_published).toBe(0);
     expect(result.results.social_media.impressions).toBe(0);
     expect(result.results.social_media.engagements).toBe(0);
     expect(result.results.social_media.clicks).toBe(0);
