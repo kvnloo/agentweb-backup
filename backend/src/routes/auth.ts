@@ -9,8 +9,18 @@ import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { ChatbotDB } from '../services/chatbotService';
 import * as authController from '../controllers/auth';
+import rateLimit from 'express-rate-limit';
 
 const router = express.Router();
+
+// Rate limiter for login and register — 10 attempts per 15 minutes per IP
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many authentication attempts. Please try again later.' },
+});
 
 // Define Frontend URLs based on environment or defaults
 const PARTNER_FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -145,9 +155,9 @@ router.get('/slack-channel-name', authenticateToken, async (req, res) => {
   }
 });
 
-// Regular auth routes
-router.post('/register', authController.register);
-router.post('/login', authController.login);
+// Regular auth routes (rate-limited to prevent brute-force)
+router.post('/register', authRateLimiter, authController.register);
+router.post('/login', authRateLimiter, authController.login);
 
 // Password reset routes
 router.post('/forgot-password', authController.forgotPassword);

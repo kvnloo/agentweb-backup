@@ -257,47 +257,99 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const config = account.config as LinkedInConfig;
 
     if (config.account_type === 'personal') {
-      // Fetch analytics for personal accounts using per-post API
+      // Personal accounts: use cached metrics when fresh, fetch from API when stale
+      const { getPostsByAccount, updatePostMetrics } = await import('../linkedInPostsDb');
+      const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+      const now = Date.now();
+
+      // Load stored posts to check cached metrics
+      const storedPosts = await getPostsByAccount(account.account_id, 100);
+      const postMap = new Map(storedPosts.map(p => [p.postId, p]));
+
+      // Split into fresh-cached vs stale/missing
+      const freshMetrics: PostMetric[] = [];
+      const stalePostIds: string[] = [];
+
+      for (const postUrn of postIds) {
+        const stored = postMap.get(postUrn);
+        if (stored?.metrics && stored.metricsFetchedAt) {
+          const age = now - new Date(stored.metricsFetchedAt).getTime();
+          if (age < CACHE_TTL_MS) {
+            freshMetrics.push({
+              share: postUrn,
+              likes: stored.metrics.likeCount,
+              comments: stored.metrics.commentCount,
+              shares: stored.metrics.shareCount,
+              impressions: stored.metrics.impressionCount,
+              clicks: stored.metrics.clickCount,
+              engagement: stored.metrics.engagement,
+            });
+            continue;
+          }
+        }
+        stalePostIds.push(postUrn);
+      }
+
+      // If all metrics are fresh, skip API call entirely
+      if (stalePostIds.length === 0) {
+        return freshMetrics;
+      }
+
+      // Fetch fresh metrics for stale posts from LinkedIn API
       let token: string;
       try {
         const tokenResult = await this.getValidToken(account, userId);
         token = tokenResult.token;
       } catch (error: any) {
-        // Check for deactivated app error
         if (error?.message?.includes('deactivated')) {
-          throw error; // Re-throw deactivated app errors
+          throw error;
         }
         throw new Error('Failed to authenticate with LinkedIn. Please reconnect your account.');
       }
 
-      const metrics = await Promise.all(
-        postIds.map(async (postUrn) => {
+      const fetchedMetrics = await Promise.all(
+        stalePostIds.map(async (postUrn) => {
           try {
             const analytics = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
-            return {
+            const metric = {
               share: postUrn,
               likes: analytics.reaction || 0,
               comments: analytics.comment || 0,
               shares: analytics.reshare || 0,
-              impressions: analytics.impression,
+              impressions: analytics.impression || 0,
+              clicks: 0,
               engagement: (analytics.reaction || 0) + (analytics.comment || 0) + (analytics.reshare || 0)
             };
+
+            // Cache the metrics in the stored posts table
+            const stored = postMap.get(postUrn);
+            if (stored) {
+              updatePostMetrics(stored.userId, postUrn, {
+                impressionCount: metric.impressions,
+                likeCount: metric.likes,
+                commentCount: metric.comments,
+                shareCount: metric.shares,
+                clickCount: metric.clicks ?? 0,
+                engagement: metric.engagement,
+              }).catch(err => console.warn(`[LinkedInAdapter] Failed to cache metrics for ${postUrn}:`, err?.message));
+            }
+
+            return metric;
           } catch (error: any) {
             const errorMsg = error?.message || 'Unknown error';
             console.warn(`[LinkedInAdapter] Failed to fetch metrics for post ${postUrn}:`, errorMsg);
-            
-            // Check for deactivated app error
+
             if (errorMsg.includes('deactivated') || errorMsg.includes('invalid_client')) {
               throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
             }
-            
-            // Return metric with error info instead of null
+
             return {
               share: postUrn,
               likes: 0,
               comments: 0,
               shares: 0,
               impressions: 0,
+              clicks: 0,
               engagement: 0,
               error: errorMsg
             };
@@ -305,18 +357,20 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         })
       );
 
-      // Return all metrics including those with errors
-      return metrics as PostMetric[];
+      return [...freshMetrics, ...fetchedMetrics] as PostMetric[];
     }
 
     // Organization accounts - use existing batch API
+    // LinkedIn Posts API returns urn:li:ugcPost:X but share statistics API expects urn:li:share:X
     const { token } = await this.getValidToken(account, userId);
     const authorUrn = account.account_id;
+    const shareUrns = postIds.map(id => id.replace('urn:li:ugcPost:', 'urn:li:share:'));
+    const shareToPostId = new Map(postIds.map((id, i) => [shareUrns[i], id]));
 
     try {
-      const stats = await linkedInService.getShareStatistics(token, authorUrn, postIds);
+      const stats = await linkedInService.getShareStatistics(token, authorUrn, shareUrns);
       return stats.map(s => ({
-        share: s.share || '',
+        share: (s.share && shareToPostId.get(s.share)) || s.share || '',
         likes: s.totalShareStatistics.likeCount,
         comments: s.totalShareStatistics.commentCount,
         shares: s.totalShareStatistics.shareCount,
@@ -435,13 +489,47 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     const fetchedAt = new Date().toISOString();
 
     if (config.account_type === 'personal') {
-      // Personal accounts: use per-post analytics API
+      // Personal accounts: use cached metrics when fresh, fetch from API when stale
+      const { getPostsByAccount, updatePostMetrics } = await import('../linkedInPostsDb');
+      const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+      const now = Date.now();
+
+      const storedPosts = await getPostsByAccount(account.account_id, 100);
+      const postMap = new Map(storedPosts.map(p => [p.postId, p]));
+
+      const freshAnalytics: PostAnalytics[] = [];
+      const stalePostIds: string[] = [];
+
+      for (const postUrn of postIds) {
+        const stored = postMap.get(postUrn);
+        if (stored?.metrics && stored.metricsFetchedAt) {
+          const age = now - new Date(stored.metricsFetchedAt).getTime();
+          if (age < CACHE_TTL_MS) {
+            freshAnalytics.push({
+              postId: postUrn,
+              likes: stored.metrics.likeCount,
+              comments: stored.metrics.commentCount,
+              shares: stored.metrics.shareCount,
+              impressions: stored.metrics.impressionCount,
+              clicks: stored.metrics.clickCount,
+              engagement: stored.metrics.engagement,
+              fetchedAt: stored.metricsFetchedAt,
+            });
+            continue;
+          }
+        }
+        stalePostIds.push(postUrn);
+      }
+
+      if (stalePostIds.length === 0) {
+        return freshAnalytics;
+      }
+
       const analytics = await Promise.all(
-        postIds.map(async (postUrn) => {
+        stalePostIds.map(async (postUrn) => {
           try {
             const data = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
-            
-            // Build base analytics response
+
             const result: any = {
               postId: postUrn,
               likes: data.reaction || 0,
@@ -451,8 +539,20 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
               engagement: (data.reaction || 0) + (data.comment || 0) + (data.reshare || 0),
               fetchedAt,
             };
-            
-            // If there were metric errors, include them so Emma can see what failed
+
+            // Cache the metrics
+            const stored = postMap.get(postUrn);
+            if (stored) {
+              updatePostMetrics(stored.userId, postUrn, {
+                impressionCount: result.impressions,
+                likeCount: result.likes,
+                commentCount: result.comments,
+                shareCount: result.shares,
+                clickCount: 0,
+                engagement: result.engagement,
+              }).catch(err => console.warn(`[LinkedInAdapter] Failed to cache analytics for ${postUrn}:`, err?.message));
+            }
+
             if (data.metricErrors && data.metricErrors.length > 0) {
               const errorSummary = data.metricErrors
                 .map(e => `${e.metric}: ${e.error}${e.status ? ` (HTTP ${e.status})` : ''}`)
@@ -460,17 +560,16 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
               result.error = `Some metrics failed: ${errorSummary}`;
               result.metricErrors = data.metricErrors;
             }
-            
+
             return result;
           } catch (error: any) {
             const errorMsg = error?.message || 'Failed to fetch analytics';
             console.warn(`[LinkedInAdapter] Failed to fetch analytics for post ${postUrn}:`, errorMsg);
-            
-            // Check for deactivated app error
+
             if (errorMsg.includes('deactivated') || errorMsg.includes('invalid_client')) {
               throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
             }
-            
+
             return {
               postId: postUrn,
               likes: 0,
@@ -484,14 +583,17 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           }
         })
       );
-      return analytics;
+      return [...freshAnalytics, ...analytics];
     }
 
     // Organization accounts: use batch share statistics API
+    // Convert ugcPost URNs to share URNs (LinkedIn stats API expects share URNs)
+    const shareUrns = postIds.map(id => id.replace('urn:li:ugcPost:', 'urn:li:share:'));
+    const shareToPostId = new Map(postIds.map((id, i) => [shareUrns[i], id]));
     try {
-      const stats = await linkedInService.getShareStatistics(token, account.account_id, postIds);
+      const stats = await linkedInService.getShareStatistics(token, account.account_id, shareUrns);
       return stats.map(s => ({
-        postId: s.share || '',
+        postId: (s.share && shareToPostId.get(s.share)) || s.share || '',
         likes: s.totalShareStatistics.likeCount || 0,
         comments: s.totalShareStatistics.commentCount || 0,
         shares: s.totalShareStatistics.shareCount || 0,
