@@ -310,27 +310,43 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       const fetchedMetrics = await Promise.all(
         stalePostIds.map(async (postUrn) => {
           try {
-            const analytics = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
-            const metric = {
-              share: postUrn,
-              likes: analytics.reaction || 0,
-              comments: analytics.comment || 0,
-              shares: analytics.reshare || 0,
-              impressions: analytics.impression || 0,
-              clicks: 0,
-              engagement: (analytics.reaction || 0) + (analytics.comment || 0) + (analytics.reshare || 0)
-            };
+            let metric: PostMetric;
+
+            // Activity URNs can't use the memberCreatorPostAnalytics API — use socialMetadata fallback
+            if (postUrn.startsWith('urn:li:activity:')) {
+              const metadata = await linkedInService.getActivityMetadata(token, postUrn);
+              metric = {
+                share: postUrn,
+                likes: metadata.likeCount,
+                comments: metadata.commentCount,
+                shares: 0,
+                impressions: 0,
+                clicks: 0,
+                engagement: metadata.likeCount + metadata.commentCount,
+              };
+            } else {
+              const analytics = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
+              metric = {
+                share: postUrn,
+                likes: analytics.reaction || 0,
+                comments: analytics.comment || 0,
+                shares: analytics.reshare || 0,
+                impressions: analytics.impression || 0,
+                clicks: 0,
+                engagement: (analytics.reaction || 0) + (analytics.comment || 0) + (analytics.reshare || 0),
+              };
+            }
 
             // Cache the metrics in the stored posts table
             const stored = postMap.get(postUrn);
             if (stored) {
               updatePostMetrics(stored.userId, postUrn, {
-                impressionCount: metric.impressions,
-                likeCount: metric.likes,
-                commentCount: metric.comments,
-                shareCount: metric.shares,
+                impressionCount: metric.impressions ?? 0,
+                likeCount: metric.likes ?? 0,
+                commentCount: metric.comments ?? 0,
+                shareCount: metric.shares ?? 0,
                 clickCount: metric.clicks ?? 0,
-                engagement: metric.engagement,
+                engagement: metric.engagement ?? 0,
               }).catch(err => console.warn(`[LinkedInAdapter] Failed to cache metrics for ${postUrn}:`, err?.message));
             }
 
@@ -341,6 +357,20 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
             if (errorMsg.includes('deactivated') || errorMsg.includes('invalid_client')) {
               throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+            }
+
+            // On API failure (rate limit, etc.), return stale cached metrics instead of 0s
+            const stored = postMap.get(postUrn);
+            if (stored?.metrics) {
+              return {
+                share: postUrn,
+                likes: stored.metrics.likeCount,
+                comments: stored.metrics.commentCount,
+                shares: stored.metrics.shareCount,
+                impressions: stored.metrics.impressionCount,
+                clicks: stored.metrics.clickCount,
+                engagement: stored.metrics.engagement,
+              };
             }
 
             return {
@@ -528,17 +558,40 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       const analytics = await Promise.all(
         stalePostIds.map(async (postUrn) => {
           try {
-            const data = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
+            let result: any;
 
-            const result: any = {
-              postId: postUrn,
-              likes: data.reaction || 0,
-              comments: data.comment || 0,
-              shares: data.reshare || 0,
-              impressions: data.impression || 0,
-              engagement: (data.reaction || 0) + (data.comment || 0) + (data.reshare || 0),
-              fetchedAt,
-            };
+            // Activity URNs can't use memberCreatorPostAnalytics — use socialMetadata fallback
+            if (postUrn.startsWith('urn:li:activity:')) {
+              const metadata = await linkedInService.getActivityMetadata(token, postUrn);
+              result = {
+                postId: postUrn,
+                likes: metadata.likeCount,
+                comments: metadata.commentCount,
+                shares: 0,
+                impressions: 0,
+                engagement: metadata.likeCount + metadata.commentCount,
+                fetchedAt,
+              };
+            } else {
+              const data = await linkedInService.getPersonalPostAnalytics(token, { postUrn });
+              result = {
+                postId: postUrn,
+                likes: data.reaction || 0,
+                comments: data.comment || 0,
+                shares: data.reshare || 0,
+                impressions: data.impression || 0,
+                engagement: (data.reaction || 0) + (data.comment || 0) + (data.reshare || 0),
+                fetchedAt,
+              };
+
+              if (data.metricErrors && data.metricErrors.length > 0) {
+                const errorSummary = data.metricErrors
+                  .map(e => `${e.metric}: ${e.error}${e.status ? ` (HTTP ${e.status})` : ''}`)
+                  .join('; ');
+                result.error = `Some metrics failed: ${errorSummary}`;
+                result.metricErrors = data.metricErrors;
+              }
+            }
 
             // Cache the metrics
             const stored = postMap.get(postUrn);
@@ -553,14 +606,6 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
               }).catch(err => console.warn(`[LinkedInAdapter] Failed to cache analytics for ${postUrn}:`, err?.message));
             }
 
-            if (data.metricErrors && data.metricErrors.length > 0) {
-              const errorSummary = data.metricErrors
-                .map(e => `${e.metric}: ${e.error}${e.status ? ` (HTTP ${e.status})` : ''}`)
-                .join('; ');
-              result.error = `Some metrics failed: ${errorSummary}`;
-              result.metricErrors = data.metricErrors;
-            }
-
             return result;
           } catch (error: any) {
             const errorMsg = error?.message || 'Failed to fetch analytics';
@@ -568,6 +613,21 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
 
             if (errorMsg.includes('deactivated') || errorMsg.includes('invalid_client')) {
               throw new Error('The LinkedIn app used for authentication has been deactivated. Please reconnect your personal account with the new app.');
+            }
+
+            // On API failure (rate limit, etc.), return stale cached metrics instead of 0s
+            const stored = postMap.get(postUrn);
+            if (stored?.metrics) {
+              return {
+                postId: postUrn,
+                likes: stored.metrics.likeCount,
+                comments: stored.metrics.commentCount,
+                shares: stored.metrics.shareCount,
+                impressions: stored.metrics.impressionCount,
+                clicks: stored.metrics.clickCount,
+                engagement: stored.metrics.engagement,
+                fetchedAt: stored.metricsFetchedAt || fetchedAt,
+              };
             }
 
             return {
