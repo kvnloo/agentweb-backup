@@ -53,6 +53,19 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Why:** Session state in AW-ChatSessions table persists longer
   - **Fix:** Query by sessionId to get messages, errors, work plan status
 
+### Portal Distinction
+- **Lesson:** partner-portal is admin-only; customer-portal is for ALL user-facing features
+  - **Why:** Put social posts page in partner-portal instead of customer-portal — had to revert
+  - **Fix:** Always use customer-portal for end-user pages (tasks, chat, marketing, social posts, settings)
+  - **Date:** 2026-03-11
+
+### Adding New Customer Portal Pages
+- **Lesson:** `customerPortalPages.ts` exists in TWO places — both must be updated
+  - **Why:** Forgot backend copy; admin subscription UI didn't show the new page
+  - **Fix:** Update both `backend/src/services/customerPortalPages.ts` AND `customer-portal/src/services/customerPortalPages.ts`
+  - **Also:** `customer-portal/src/App.tsx` (route), `customer-portal/src/utils/pageTitles.ts` (title)
+  - **Date:** 2026-03-11
+
 ## Code Patterns
 
 ### DynamoDB Queries
