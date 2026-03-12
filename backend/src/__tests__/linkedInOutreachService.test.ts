@@ -36,7 +36,23 @@ describe('LinkedInOutreachService', () => {
     mockUnipileClient = {
       users: {
         sendInvitation: jest.fn().mockResolvedValue({ id: 'invitation-id' }),
-        getProfile: jest.fn().mockResolvedValue({ network_distance: 'SECOND_DEGREE', is_open_profile: false })
+        getProfile: jest.fn().mockResolvedValue({ network_distance: 'SECOND_DEGREE', is_open_profile: false }),
+        getAllRelations: jest.fn().mockResolvedValue({
+          object: 'RelationList',
+          items: [{ provider_id: 'rel-1', first_name: 'Alice', last_name: 'Smith' }],
+          cursor: null
+        }),
+        getAllInvitationsSent: jest.fn().mockResolvedValue({
+          object: 'InvitationList',
+          items: [{ id: 'inv-1', provider_id: 'inv-target-1', status: 'PENDING' }],
+          cursor: null
+        }),
+        cancelInvitationSent: jest.fn().mockResolvedValue({ success: true }),
+        getCompanyProfile: jest.fn().mockResolvedValue({
+          name: 'Acme Corp',
+          industry: 'Technology',
+          provider_id: 'company-123'
+        })
       },
       messaging: {
         startNewChat: jest.fn().mockResolvedValue({ id: 'chat-id' })
@@ -266,6 +282,314 @@ describe('LinkedInOutreachService', () => {
       await expect(
         linkedInOutreachService.sendMessage('account-id', 'provider-id', false, 'Hello!')
       ).rejects.toThrow('not a 1st-degree connection');
+    });
+  });
+
+  describe('searchPeople', () => {
+    it('should call POST /linkedin/search with classic api and keyword params', async () => {
+      const mockResults = {
+        object: 'SearchResults',
+        items: [{ provider_id: 'p-1', first_name: 'John', last_name: 'Doe' }],
+        cursor: null
+      };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockResults);
+
+      const result = await linkedInOutreachService.searchPeople('account-123', {
+        keywords: 'software engineer'
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'POST',
+        path: ['linkedin', 'search'],
+        parameters: { account_id: 'account-123' },
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          api: 'classic',
+          category: 'people',
+          keywords: 'software engineer'
+        }
+      });
+      expect(result).toEqual(mockResults);
+    });
+
+    it('should put title and company into advanced_keywords', async () => {
+      const mockResults = { object: 'SearchResults', items: [], cursor: null };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockResults);
+
+      await linkedInOutreachService.searchPeople('account-123', {
+        keywords: 'engineer',
+        title: 'CTO',
+        company: 'Acme'
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'POST',
+        path: ['linkedin', 'search'],
+        parameters: { account_id: 'account-123' },
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          api: 'classic',
+          category: 'people',
+          keywords: 'engineer',
+          advanced_keywords: { title: 'CTO', company: 'Acme' }
+        }
+      });
+    });
+
+    it('should support URL-based search (overrides all other body params)', async () => {
+      const mockResults = { object: 'SearchResults', items: [], cursor: null };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockResults);
+
+      await linkedInOutreachService.searchPeople('account-123', {
+        url: 'https://www.linkedin.com/search/results/people/?keywords=cto'
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'POST',
+        path: ['linkedin', 'search'],
+        parameters: { account_id: 'account-123' },
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          url: 'https://www.linkedin.com/search/results/people/?keywords=cto'
+        }
+      });
+    });
+
+    it('should support pagination via cursor only', async () => {
+      const mockResults = { object: 'SearchResults', items: [], cursor: 'next-page' };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockResults);
+
+      await linkedInOutreachService.searchPeople('account-123', {
+        cursor: 'page-2-cursor'
+      });
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'POST',
+        path: ['linkedin', 'search'],
+        parameters: { account_id: 'account-123' },
+        headers: { 'Content-Type': 'application/json' },
+        body: {
+          cursor: 'page-2-cursor'
+        }
+      });
+    });
+
+    it('should throw a structured error on API failure', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 400, title: 'Bad search request' }
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.searchPeople('account-123', { keywords: '' })
+      ).rejects.toThrow('Bad search request');
+    });
+  });
+
+  describe('getProfile', () => {
+    it('should return full profile for a provider_id', async () => {
+      const mockProfile = {
+        provider_id: 'john-doe',
+        first_name: 'John',
+        last_name: 'Doe',
+        headline: 'Software Engineer',
+        network_distance: 'SECOND_DEGREE',
+        is_open_profile: false
+      };
+      (mockUnipileClient.request.send as jest.Mock).mockResolvedValueOnce(mockProfile);
+
+      const result = await linkedInOutreachService.getProfile('john-doe', 'account-123');
+
+      expect(mockUnipileClient.request.send).toHaveBeenCalledWith({
+        method: 'GET',
+        path: ['users', 'john-doe'],
+        parameters: { account_id: 'account-123' }
+      });
+      expect(result).toEqual(mockProfile);
+    });
+
+    it('should throw a structured error when profile is not found', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Profile not found' }
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getProfile('nonexistent', 'account-123')
+      ).rejects.toThrow('Profile not found');
+    });
+
+    it('should throw a structured error on auth failure', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 401, title: 'Unauthorized' }
+      });
+      (mockUnipileClient.request.send as jest.Mock).mockRejectedValueOnce(apiError);
+
+      await expect(
+        linkedInOutreachService.getProfile('some-id', 'bad-account')
+      ).rejects.toThrow('Unauthorized');
+    });
+  });
+
+  describe('listConnections', () => {
+    it('should return connections list', async () => {
+      const mockRelations = {
+        object: 'RelationList',
+        items: [
+          { provider_id: 'rel-1', first_name: 'Alice', last_name: 'Smith' },
+          { provider_id: 'rel-2', first_name: 'Bob', last_name: 'Jones' }
+        ],
+        cursor: null
+      };
+      mockUnipileClient.users.getAllRelations = jest.fn().mockResolvedValue(mockRelations);
+
+      const result = await linkedInOutreachService.listConnections('account-123');
+
+      expect(mockUnipileClient.users.getAllRelations).toHaveBeenCalledWith({
+        account_id: 'account-123'
+      });
+      expect(result).toEqual(mockRelations);
+    });
+
+    it('should pass cursor for pagination', async () => {
+      const mockRelations = { object: 'RelationList', items: [], cursor: null };
+      mockUnipileClient.users.getAllRelations = jest.fn().mockResolvedValue(mockRelations);
+
+      await linkedInOutreachService.listConnections('account-123', 'cursor-abc');
+
+      expect(mockUnipileClient.users.getAllRelations).toHaveBeenCalledWith({
+        account_id: 'account-123',
+        cursor: 'cursor-abc'
+      });
+    });
+
+    it('should throw on API failure', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 500, title: 'Internal server error' }
+      });
+      mockUnipileClient.users.getAllRelations = jest.fn().mockRejectedValue(apiError);
+
+      await expect(
+        linkedInOutreachService.listConnections('account-123')
+      ).rejects.toThrow('Internal server error');
+    });
+  });
+
+  describe('listSentInvitations', () => {
+    it('should return sent invitations list', async () => {
+      const mockInvitations = {
+        object: 'InvitationList',
+        items: [{ id: 'inv-1', provider_id: 'target-1', status: 'PENDING' }],
+        cursor: null
+      };
+      mockUnipileClient.users.getAllInvitationsSent = jest.fn().mockResolvedValue(mockInvitations);
+
+      const result = await linkedInOutreachService.listSentInvitations('account-123');
+
+      expect(mockUnipileClient.users.getAllInvitationsSent).toHaveBeenCalledWith({
+        account_id: 'account-123'
+      });
+      expect(result).toEqual(mockInvitations);
+    });
+
+    it('should pass cursor for pagination', async () => {
+      const mockInvitations = { object: 'InvitationList', items: [], cursor: null };
+      mockUnipileClient.users.getAllInvitationsSent = jest.fn().mockResolvedValue(mockInvitations);
+
+      await linkedInOutreachService.listSentInvitations('account-123', 'cursor-xyz');
+
+      expect(mockUnipileClient.users.getAllInvitationsSent).toHaveBeenCalledWith({
+        account_id: 'account-123',
+        cursor: 'cursor-xyz'
+      });
+    });
+
+    it('should throw on API failure', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 403, title: 'Forbidden' }
+      });
+      mockUnipileClient.users.getAllInvitationsSent = jest.fn().mockRejectedValue(apiError);
+
+      await expect(
+        linkedInOutreachService.listSentInvitations('account-123')
+      ).rejects.toThrow('Forbidden');
+    });
+  });
+
+  describe('getCompanyProfile', () => {
+    it('should return company profile', async () => {
+      const mockCompany = {
+        name: 'Acme Corp',
+        industry: 'Technology',
+        provider_id: 'company-123'
+      };
+      mockUnipileClient.users.getCompanyProfile = jest.fn().mockResolvedValue(mockCompany);
+
+      const result = await linkedInOutreachService.getCompanyProfile('company-123', 'account-123');
+
+      expect(mockUnipileClient.users.getCompanyProfile).toHaveBeenCalledWith({
+        account_id: 'account-123',
+        identifier: 'company-123'
+      });
+      expect(result).toEqual(mockCompany);
+    });
+
+    it('should throw when company is not found', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Company not found' }
+      });
+      mockUnipileClient.users.getCompanyProfile = jest.fn().mockRejectedValue(apiError);
+
+      await expect(
+        linkedInOutreachService.getCompanyProfile('bad-id', 'account-123')
+      ).rejects.toThrow('Company not found');
+    });
+
+    it('should throw on rate limit', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 429, title: 'Rate limit exceeded' }
+      });
+      mockUnipileClient.users.getCompanyProfile = jest.fn().mockRejectedValue(apiError);
+
+      await expect(
+        linkedInOutreachService.getCompanyProfile('company-123', 'account-123')
+      ).rejects.toThrow('Rate limit exceeded');
+    });
+  });
+
+  describe('cancelInvitation', () => {
+    it('should cancel a sent invitation', async () => {
+      mockUnipileClient.users.cancelInvitationSent = jest.fn().mockResolvedValue({ success: true });
+
+      const result = await linkedInOutreachService.cancelInvitation('inv-123', 'account-123');
+
+      expect(mockUnipileClient.users.cancelInvitationSent).toHaveBeenCalledWith({
+        account_id: 'account-123',
+        invitation_id: 'inv-123'
+      });
+      expect(result).toEqual({ success: true });
+    });
+
+    it('should throw when invitation is not found', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 404, title: 'Invitation not found' }
+      });
+      mockUnipileClient.users.cancelInvitationSent = jest.fn().mockRejectedValue(apiError);
+
+      await expect(
+        linkedInOutreachService.cancelInvitation('bad-id', 'account-123')
+      ).rejects.toThrow('Invitation not found');
+    });
+
+    it('should throw on server error', async () => {
+      const apiError = Object.assign(new Error('UnsuccessfulRequestError'), {
+        body: { status: 500, title: 'Server error' }
+      });
+      mockUnipileClient.users.cancelInvitationSent = jest.fn().mockRejectedValue(apiError);
+
+      await expect(
+        linkedInOutreachService.cancelInvitation('inv-123', 'account-123')
+      ).rejects.toThrow('Server error');
     });
   });
 });

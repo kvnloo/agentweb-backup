@@ -939,6 +939,60 @@ BACKEND_URL=https://<your-subdomain>.ngrok-free.app
 
 Restart the backend after changing `BACKEND_URL`.
 
+### Gmail Connected Account Configuration
+
+Gmail uses Google OAuth 2.0 with offline access to let users connect their Gmail account for reading and sending email.
+
+#### 1. Enable the Gmail API
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Select your project, then go to **APIs & Services > Library**
+3. Search for **Gmail API** and enable it
+
+#### 2. Add Redirect URIs
+
+In your OAuth 2.0 Client ID (under **APIs & Services > Credentials**), add these redirect URIs:
+- Production: `https://api.agentweb.pro/api/oauth/gmail/callback`
+- Staging: `https://api-stage.agentweb.pro/api/oauth/gmail/callback`
+- Local: `http://localhost:3001/api/oauth/gmail/callback`
+
+Scopes (`gmail.readonly`, `gmail.send`, `userinfo.email`, `userinfo.profile`) are requested at runtime in the authorization URL — no console configuration needed.
+
+#### 3. Store Credentials in AWS Secrets Manager
+
+- Secret Name: `dev/AgentWeb/Google/Gmail` (development) or `prod/AgentWeb/Google/Gmail` (production)
+- Secret Value (JSON):
+```json
+{
+  "clientId": "your_google_client_id",
+  "clientSecret": "your_google_client_secret"
+}
+```
+
+### YouTube Connected Account Configuration
+
+YouTube uses the same Google OAuth 2.0 credentials as Gmail (same Google Cloud project). It allows users to connect their YouTube channel for reading channel data, listing videos, viewing analytics, and uploading videos.
+
+#### 1. Enable the YouTube Data API v3
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Select the **same project** used for Gmail OAuth
+3. Go to **APIs & Services > Library**
+4. Search for **YouTube Data API v3** and enable it
+
+#### 2. Add Redirect URIs
+
+In the same OAuth 2.0 Client ID used for Gmail (under **APIs & Services > Credentials**), add these redirect URIs:
+- Production: `https://api.agentweb.pro/api/oauth/youtube/callback`
+- Staging: `https://api-stage.agentweb.pro/api/oauth/youtube/callback`
+- Local: `http://localhost:3001/api/oauth/youtube/callback`
+
+Scopes (`youtube`, `youtube.readonly`, `userinfo.email`, `userinfo.profile`) are requested at runtime in the authorization URL — no console configuration needed.
+
+#### 3. Credentials
+
+No additional secrets needed — YouTube reuses the Gmail credentials from `dev/AgentWeb/Google/Gmail` (or `prod/AgentWeb/Google/Gmail`).
+
 ### CMS Configuration (BaseHub and Webflow)
 
 The blog publishing feature supports publishing to both BaseHub and Webflow CMS. Users can be configured with a CMS Type in the admin dashboard, and the system will automatically route blog posts to the appropriate CMS.

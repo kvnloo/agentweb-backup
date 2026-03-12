@@ -2,147 +2,17 @@ import express from "express";
 import { authenticateToken } from "../middleware/auth";
 import { userDb } from "../services/db";
 import { getSecret } from "../utils/secretsManager";
-import { JWT } from "google-auth-library";
-import { BetaAnalyticsDataClient } from "@google-analytics/data";
 import { calculateFunnelMetrics, DEFAULT_FUNNEL_STAGES, validateFunnelStages } from "../services/funnelService";
+import {
+  getGoogleSearchConsoleAccessToken,
+  getGoogleAnalyticsDataClient,
+  getTechnicalSeoScore,
+} from "../services/seoService";
 
 const router = express.Router();
-const pageSpeedStrategy = "mobile";
 
 // Apply authentication middleware to all routes
 router.use(authenticateToken);
-
-// Helper function to get Google Search Console access token using service account
-async function getGoogleSearchConsoleAccessToken(): Promise<string | null> {
-  try {
-    const secretName = process.env.NODE_ENV === "production" 
-      ? "prod/AgentWeb/Google/SearchConsole"
-      : "dev/AgentWeb/Google/SearchConsole";
-
-    // Service account JSON is stored as plaintext
-    const serviceAccountJson = await getSecret(secretName);
-    const serviceAccount = JSON.parse(serviceAccountJson);
-    
-    if (!serviceAccount.private_key || !serviceAccount.client_email) {
-      console.error("Service account JSON missing required fields (private_key or client_email)");
-      return null;
-    }
-
-    // Create JWT client for service account
-    const client = new JWT({
-      email: serviceAccount.client_email,
-      key: serviceAccount.private_key,
-      scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
-    });
-    
-    const accessToken = await client.getAccessToken();
-    return accessToken.token || null;
-  } catch (error: any) {
-    console.error("Error fetching Google Search Console access token:", error);
-    return null;
-  }
-}
-
-// Helper function to get Google Analytics Data API client
-async function getGoogleAnalyticsDataClient(): Promise<BetaAnalyticsDataClient | null> {
-  try {
-    const secretName = process.env.NODE_ENV === "production" 
-      ? "prod/AgentWeb/Google/SearchConsole"
-      : "dev/AgentWeb/Google/SearchConsole";
-
-    // Use the same service account as Search Console
-    const serviceAccountJson = await getSecret(secretName);
-    const serviceAccount = JSON.parse(serviceAccountJson);
-    
-    if (!serviceAccount.private_key || !serviceAccount.client_email) {
-      console.error("Service account JSON missing required fields (private_key or client_email)");
-      return null;
-    }
-
-    // Create Analytics Data client with service account credentials
-    const client = new BetaAnalyticsDataClient({
-      credentials: {
-        client_email: serviceAccount.client_email,
-        private_key: serviceAccount.private_key,
-      },
-    });
-    
-    return client;
-  } catch (error: any) {
-    console.error("Error creating Google Analytics Data client:", error);
-    return null;
-  }
-}
-
-async function getPageSpeedApiKey(): Promise<string | null> {
-  try {
-    const secretName = process.env.NODE_ENV === "production"
-      ? "prod/AgentWeb/Google/PageSpeed"
-      : "dev/AgentWeb/Google/PageSpeed";
-    const secretString = await getSecret(secretName);
-    const trimmed = secretString.trim();
-    if (!trimmed) {
-      return null;
-    }
-
-    try {
-      const parsed = JSON.parse(trimmed);
-      const apiKey = parsed?.apiKey;
-      return typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : null;
-    } catch (parseError) {
-      return trimmed;
-    }
-  } catch (error) {
-    console.error("Error fetching PageSpeed API key:", error);
-    return null;
-  }
-}
-
-function buildPageSpeedUrl(domain: string): string {
-  if (!domain) {
-    return "";
-  }
-
-  if (domain.startsWith("http://") || domain.startsWith("https://")) {
-    return domain;
-  }
-
-  return `https://${domain}`;
-}
-
-async function getTechnicalSeoScore(domain: string): Promise<number | null> {
-  const pageSpeedApiKey = await getPageSpeedApiKey();
-  if (!pageSpeedApiKey) {
-    return null;
-  }
-
-  const targetUrl = buildPageSpeedUrl(domain);
-  if (!targetUrl) {
-    return null;
-  }
-
-  try {
-    const pageSpeedUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(targetUrl)}&category=seo&strategy=${encodeURIComponent(pageSpeedStrategy)}&key=${encodeURIComponent(pageSpeedApiKey)}`;
-    const response = await fetch(pageSpeedUrl);
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => null);
-      console.error("PageSpeed Insights API error:", errorData || response.statusText);
-      return null;
-    }
-
-    const data = await response.json();
-    const score = data?.lighthouseResult?.categories?.seo?.score;
-    if (typeof score !== "number") {
-      return null;
-    }
-
-    return Math.round(score * 100);
-  } catch (error) {
-    console.error("Error fetching PageSpeed Insights data:", error);
-    return null;
-  }
-}
 
 // Get SEO metrics for user's configured domains
 router.get("/metrics", async (req, res) => {

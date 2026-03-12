@@ -3,6 +3,11 @@
  * Tests cover: listConnectedAccounts, postOnConnectedAccount, loadConnectedAccountPosts, loadConnectedAccountMetrics
  */
 
+// Mock unipile-node-sdk to prevent import errors (may not be installed locally)
+jest.mock('unipile-node-sdk', () => ({
+  UnipileClient: jest.fn().mockImplementation(() => ({})),
+}), { virtual: true });
+
 // Mock dependencies
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
@@ -221,8 +226,8 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should load posts for company page account', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      // Shared service uses getAccountsByUserId, then filters by accountId
+      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([
         { id: 'urn:li:share:post1', commentary: 'First company post', author: 'urn:li:organization:123456' },
         { id: 'urn:li:share:post2', commentary: 'Second company post', author: 'urn:li:organization:123456' },
@@ -241,16 +246,15 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should include metrics when requested for company page', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([
         { id: 'urn:li:share:post1', commentary: 'Company post' }
       ]);
       mockAdapter.getPostMetrics.mockResolvedValue([
-        { 
-          share: 'urn:li:share:post1', 
-          likes: 50, 
-          comments: 10, 
+        {
+          share: 'urn:li:share:post1',
+          likes: 50,
+          comments: 10,
           shares: 5,
           impressions: 1000,
           clicks: 25,
@@ -266,7 +270,8 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(mockAdapter.getPostMetrics).toHaveBeenCalledWith(
         mockLinkedInAccount,
-        ['urn:li:share:post1']
+        ['urn:li:share:post1'],
+        'user-123'
       );
       expect(result.posts[0].metrics).toBeDefined();
       expect(result.posts[0].metrics.likeCount).toBe(50);
@@ -278,8 +283,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle posts without IDs gracefully when fetching metrics', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([
         { commentary: 'Post without ID' }
       ]);
@@ -295,8 +299,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should continue without metrics on metric fetch failure', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([{ id: 'post1' }]);
       mockAdapter.getPostMetrics.mockRejectedValue(new Error('Metrics API error'));
 
@@ -307,11 +310,12 @@ describe('AgentModeService - Social Media Tools', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.posts[0].metrics).toBeUndefined();
+      expect(result.posts[0].metrics).toBeNull();
     });
 
     it('should return error when account not found', async () => {
-      mockGetAccountById.mockResolvedValue(null);
+      // No accounts returned = account not found
+      mockGetAccountsByUserId.mockResolvedValue([]);
 
       const result = await service.loadConnectedAccountPosts(
         'user-123',
@@ -323,9 +327,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should return error when adapter fails due to expired token', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      // The implementation doesn't check isTokenValid - it lets the adapter handle token refresh
-      // So we need to mock the adapter throwing an error when token refresh fails
+      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
 
       const result = await service.loadConnectedAccountPosts(
@@ -338,8 +340,7 @@ describe('AgentModeService - Social Media Tools', () => {
     });
 
     it('should handle empty posts list', async () => {
-      mockGetAccountById.mockResolvedValue(mockLinkedInAccount as any);
-      mockIsTokenValid.mockResolvedValue(true);
+      mockGetAccountsByUserId.mockResolvedValue([mockLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([]);
 
       const result = await service.loadConnectedAccountPosts(

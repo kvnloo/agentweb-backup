@@ -323,10 +323,16 @@ export const googleCallback = async (
         (!user.roles || !user.roles.includes("customer"))
       ) {
         // User was invited but doesn't have customer role yet - add it
-        const updatedRoles = user.roles && user.roles.length > 0 
+        // Also copy stripe_customer_id from waitlist if user doesn't have one
+        const updatedRoles = user.roles && user.roles.length > 0
           ? [...user.roles, "customer"]
           : ["customer"];
-        await userDb.updateUser(user.userId, { roles: updatedRoles });
+        const updatePayload: any = { roles: updatedRoles };
+        if (waitlistEntry.stripe_customer_id && !user.stripe_customer_id) {
+          updatePayload.stripe_customer_id = waitlistEntry.stripe_customer_id;
+          user.stripe_customer_id = waitlistEntry.stripe_customer_id;
+        }
+        await userDb.updateUser(user.userId, updatePayload);
         user.roles = updatedRoles;
         console.log(`Added customer role to existing user ${email} during OAuth login`);
       }
