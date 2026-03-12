@@ -1486,10 +1486,11 @@ export class ChatbotDB {
       TableName: this.tableName,
       IndexName: 'UserIdIndex',
       KeyConditionExpression: 'userId = :userId',
-      FilterExpression: 'pageIdentifier = :pageIdentifier AND (attribute_not_exists(archived) OR archived = :false)',
+      FilterExpression: 'pageIdentifier = :pageIdentifier AND portalType <> :agentType AND (attribute_not_exists(archived) OR archived = :false)',
       ExpressionAttributeValues: {
         ':userId': userId,
         ':pageIdentifier': pageId,
+        ':agentType': 'agent',
         ':false': false,
       },
       ScanIndexForward: false,
@@ -3230,7 +3231,18 @@ export async function generateChatResponse(
     }
 
     // Get messages for OpenAI
+    // Always inject the current system prompt fresh (ignoring the stale stored version)
+    // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
+    const freshSystemPrompt = portalType === "customer" ? await getEmmaSystemContext() : null;
     const messages = [...session.messages];
+    if (freshSystemPrompt) {
+      const firstSystemIdx = messages.findIndex((m) => m.role === "system");
+      if (firstSystemIdx >= 0) {
+        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: freshSystemPrompt };
+      } else {
+        messages.unshift({ role: "system", content: freshSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
+      }
+    }
 
     // Support vision: if screenshot provided, modify last user message for visual analysis
     if (uploadedScreenshotUrl) {
@@ -3353,17 +3365,47 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // KB tools, scheduled chat tools, and other tools available to Emma
+        // Base tools always available to Emma
         const toolsToInclude = [
-          'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source',
-          'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
-          'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables',
+          'read_page_source',
         ];
 
+        // Page-aware tool injection based on the current page URL
+        const urlPath = (currentUrl || '').replace(/^\//, '');
+        const page = urlPath.split('/')[0].split('?')[0];
+        const urlParams = new URLSearchParams(urlPath.includes('?') ? urlPath.split('?')[1] : '');
+        const tab = urlParams.get('tab') || '';
+        const pageKey = tab ? `${page}?tab=${tab}` : page;
+        const pageToolMap: Record<string, string[]> = {
+          'brand-guidelines': ['read_brand_guidelines', 'update_brand_guidelines'],
+          'market-strategy':  ['read_market_strategy', 'update_market_strategy'],
+          'gtm-plan':         ['list_gtm_plans', 'read_gtm_plan', 'create_gtm_plan', 'update_gtm_plan', 'add_gtm_phase', 'add_gtm_work_items', 'update_gtm_work_item', 'update_gtm_phase', 'delete_gtm_items', 'get_gtm_common_items', 'add_gtm_common_items', 'send_gtm_status_report'],
+          'crm':              ['get_lead_lists', 'create_lead_list', 'add_leads_to_list', 'get_leads', 'search_leads', 'get_lead_details', 'update_lead', 'delete_leads', 'update_lead_list', 'delete_lead_list', 'update_lead_status', 'get_lead_list_statuses', 'configure_lead_statuses', 'get_lead_engagements', 'add_lead_engagement', 'send_email_to_lead', 'update_email_draft_for_lead'],
+          'social-posts':     ['list_connected_accounts', 'list_connected_account_posts', 'load_connected_account_metrics', 'post_on_connected_account', 'comment_on_linkedin_post', 'react_to_linkedin_post', 'create_social_media_posts'],
+          'paid-social':      ['list_connected_accounts', 'list_meta_ads_campaigns', 'get_meta_ads_metrics'],
+          'images':           ['generate_image', 'describe_image'],
+          'videos':           ['generate_video', 'describe_video'],
+          'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
+          'email-templates':  ['list_html_templates', 'create_html_from_template', 'update_html_file'],
+          'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
+          'research-reports': ['perform_deep_research', 'search_web'],
+          'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
+          'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file'],
+          'seo':              ['get_seo_metrics', 'get_website_analytics'],
+          'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article'],
+          'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
+        };
+        if (pageToolMap[pageKey]) {
+          toolsToInclude.push(...pageToolMap[pageKey]);
+        }
+
         const { mcpToolRegistry } = await import('../mcp/server/registry');
+        const { emmaToolRegistry } = await import('../emma/registry');
 
         for (const toolName of toolsToInclude) {
-          const toolHandler = mcpToolRegistry.getTool(toolName);
+          // First try emmaToolRegistry (Emma-specific tools), then fall back to mcpToolRegistry
+          const emmaHandler = emmaToolRegistry.getTool(toolName);
+          const toolHandler = emmaHandler || mcpToolRegistry.getTool(toolName);
           if (toolHandler) {
             // Convert MCP definition to OpenAI format
             const mcpDef = toolHandler.definition;
