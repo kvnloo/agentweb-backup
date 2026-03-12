@@ -16534,81 +16534,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
-      const { socialPlatformService } = await import('./socialPlatformService');
+      const { getPostsForUser } = await import('./socialPostsService');
+      const result = await getPostsForUser(userId, {
+        accountId,
+        limit: options.limit || 10,
+        includeMetrics: options.include_metrics !== false,
+      });
 
-      try {
-        console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? {
-          found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
-        } : { found: false });
-
-        if (!account) {
+      if (result.posts.length === 0) {
+        // Check if the account was found at all
+        if (result.accounts.length === 0) {
           return {
             success: false,
             message: 'Account not found or access denied'
           };
         }
-
-        // NOTE: Skipping isTokenValid check here because the adapter should handle 
-        // token refresh internally. However, listPosts doesn't pass userId, so we
-        // need to check if the adapter supports token refresh for this operation.
-        console.log('[AgentMode] Getting adapter for platform:', account.platform);
-        const adapter = socialPlatformService.getAdapter(account.platform);
-        const limit = options.limit || 10;
-        
-        console.log('[AgentMode] Calling adapter.listPosts with limit:', limit);
-        // Fetch posts via adapter
-        let posts = await adapter.listPosts(account, { limit });
-        console.log('[AgentMode] listPosts returned', posts?.length || 0, 'posts');
-        
-        // Fetch metrics merging if requested and supported
-        if (options.include_metrics && posts.length > 0) {
-          try {
-            // Assume posts have an 'id' field as per LinkedIn/generic structure
-            const postIds = posts.map(p => p.id).filter(Boolean);
-            if (postIds.length > 0) {
-              const metrics = await adapter.getPostMetrics(account, postIds, userId);
-              
-              // Merge metrics into posts
-              posts = posts.map(post => {
-                const metric = metrics.find(m => m.share === post.id);
-                return {
-                  ...post,
-                  metrics: metric ? {
-                    likeCount: metric.likes,
-                    commentCount: metric.comments,
-                    shareCount: metric.shares,
-                    impressionCount: metric.impressions,
-                    clickCount: metric.clicks,
-                    engagement: metric.engagement
-                  } : null
-                };
-              });
-            }
-          } catch (metricError) {
-            console.warn('AgentMode: Failed to fetch post metrics:', metricError);
-            // Continue without metrics
-          }
-        }
-        
-        return {
-          success: true,
-          message: `Successfully loaded ${posts.length} posts from ${account.platform}`,
-          posts: posts
-        };
-
-      } catch (error: any) {
-        return {
-          success: false,
-          message: `Failed to load posts: ${error.message}`
-        };
       }
 
+      return {
+        success: true,
+        message: `Successfully loaded ${result.posts.length} posts`,
+        posts: result.posts
+      };
     } catch (error) {
       console.error('AgentMode: Error loading connected account posts:', error);
       return {
