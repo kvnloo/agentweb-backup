@@ -29,6 +29,7 @@ import seoRoutes from "./routes/seo";
 import funnelRoutes from "./routes/funnel";
 import gtmPlanRoutes from "./routes/gtmPlan";
 import crmRoutes from "./routes/crm";
+import crmPublicRoutes from "./routes/crmPublic";
 import subscriptionRoutes from "./routes/subscription";
 import booksRoutes from "./routes/books";
 import linkedinAuthRoutes from "./routes/linkedinAuth";
@@ -37,6 +38,7 @@ import metaAuthRoutes from "./routes/metaAuth";
 import clickupAuthRoutes from "./routes/clickupAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import linkedInOutreachAuthRoutes from "./routes/linkedInOutreachAuth";
+import youtubeAuthRoutes from "./routes/youtubeAuth";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
@@ -44,8 +46,12 @@ import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import leadMagnetAdminRoutes from "./routes/leadMagnetAdmin";
+import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
+import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
+import clientHealthRoutes from "./routes/clientHealth";
+import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -105,6 +111,7 @@ const corsOptions = {
         /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/, // 192.168.x.x with optional port
         /^http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/, // 10.x.x.x with optional port
         /^http:\/\/172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+(:\d+)?$/, // 172.16-31.x.x with optional port
+        /^https?:\/\/\d+\.\d+\.\d+\.\d+(:\d+)?$/, // Any IP address (for cloud test environments)
       ];
 
       const isLocalNetwork = localNetworkPatterns.some((pattern) =>
@@ -129,13 +136,14 @@ const corsOptions = {
 
 // CORS middleware with exception for public subscriber join endpoint
 app.use((req, res, next) => {
-  // Check if this is the public subscriber join endpoint
-  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/)) {
-    // Allow all origins for this endpoint only
+  // Check if this is a public endpoint that needs open CORS
+  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
+      req.path.startsWith('/api/lead-magnet/')) {
+    // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
+
     // Handle preflight requests
     if (req.method === 'OPTIONS') {
       return res.status(200).end();
@@ -146,6 +154,9 @@ app.use((req, res, next) => {
   // Apply CORS middleware for all other routes
   cors(corsOptions)(req, res, next);
 });
+// Stripe webhook needs the raw body (Buffer) for signature verification.
+// This MUST come before express.json() which parses the body.
+app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -171,6 +182,7 @@ app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
+app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);
@@ -185,6 +197,7 @@ app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
 app.use("/api/funnels", funnelRoutes);
 app.use("/api/gtm-plan", gtmPlanRoutes);
+app.use("/api/crm/public", crmPublicRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/subscription", subscriptionRoutes);
 app.use("/api/books", booksRoutes);
@@ -193,18 +206,21 @@ app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
+app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
+app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
+app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.use("/review", reviewRouter);
-
+app.use("/api/lead-magnet", leadMagnetRoutes);
 
 
 // Agent API documentation (public, no auth)

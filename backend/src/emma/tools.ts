@@ -1,6 +1,7 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
+import { getAccountSummary } from '../services/accountSummaryService';
 
 emmaToolRegistry.register({
   name: 'install_skills',
@@ -144,13 +145,27 @@ emmaToolRegistry.register({
   name: 'linkedin_outreach',
   definition: {
     name: 'linkedin_outreach',
-    description: 'Send a LinkedIn connection invite or a direct message via a connected Unipile account. To find the account_id, call list_connected_accounts(platform=\'unipile\') tool.\n\nFor the target person, pass EITHER:\n- profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/) - this tool will resolve it to a provider_id automatically.\n- provider_id: the Unipile provider_id directly if you already have it.\n\nActions:\n- send-invite: Send a connection request (message optional but recommended).\n- send-message: Send a direct message (message required).',
+    description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
+
+Actions:
+- search-people: Search LinkedIn for people by keywords, title, company. Pass keywords for broad search, or use title/company for targeted search. Alternatively pass search_url with a LinkedIn search URL copied from the browser. Returns paginated results with provider_id for each person.
+- get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
+- list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
+- list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended.
+- send-message: Send a direct message. Requires profile_url or provider_id. message required.
+- get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
+- cancel-invitation: Cancel a pending invitation by invitation_id (obtain from list-sent-invitations).
+
+For target person identification (send-invite, send-message, get-profile), pass EITHER:
+- profile_url: a full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/)
+- provider_id: the Unipile provider_id directly if you already have it`,
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['send-invite', 'send-message'],
+          enum: ['search-people', 'get-profile', 'list-connections', 'list-sent-invitations', 'send-invite', 'send-message', 'get-company', 'cancel-invitation'],
           description: 'The outreach action to perform.'
         },
         account_id: {
@@ -159,15 +174,43 @@ emmaToolRegistry.register({
         },
         profile_url: {
           type: 'string',
-          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). Provide this OR provider_id.'
+          description: 'Full LinkedIn profile URL (e.g. https://www.linkedin.com/in/username/). For send-invite, send-message. Provide this OR provider_id.'
         },
         provider_id: {
           type: 'string',
-          description: 'The Unipile provider_id for the target LinkedIn user. Provide this OR profile_url.'
+          description: 'The Unipile provider_id for the target LinkedIn user. For send-invite, send-message, get-profile. Provide this OR profile_url.'
         },
         message: {
           type: 'string',
           description: 'Message content. Required for send-message; recommended for send-invite.'
+        },
+        keywords: {
+          type: 'string',
+          description: 'Free text search keywords for search-people action.'
+        },
+        search_url: {
+          type: 'string',
+          description: 'A LinkedIn search URL copied from the browser for search-people action. Alternative to keyword-based search.'
+        },
+        title: {
+          type: 'string',
+          description: 'Job title filter for search-people (e.g. "CTO").'
+        },
+        company: {
+          type: 'string',
+          description: 'Company name filter for search-people.'
+        },
+        company_id: {
+          type: 'string',
+          description: 'LinkedIn company identifier/slug for get-company action.'
+        },
+        invitation_id: {
+          type: 'string',
+          description: 'Invitation ID for cancel-invitation action. Obtain from list-sent-invitations.'
+        },
+        cursor: {
+          type: 'string',
+          description: 'Pagination cursor for search-people, list-connections, list-sent-invitations.'
         }
       },
       required: ['action', 'account_id']
@@ -177,11 +220,14 @@ emmaToolRegistry.register({
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    if (!args.profile_url && !args.provider_id) {
-      return { success: false, message: 'Either profile_url or provider_id is required.' };
-    }
-    if (args.profile_url && args.provider_id) {
-      return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
+    const targetActions = ['send-invite', 'send-message', 'get-profile'];
+    if (targetActions.includes(args.action)) {
+      if (!args.profile_url && !args.provider_id) {
+        return { success: false, message: 'Either profile_url or provider_id is required.' };
+      }
+      if (args.profile_url && args.provider_id) {
+        return { success: false, message: 'Provide only one of profile_url or provider_id, not both.' };
+      }
     }
     return await agentModeService.linkedinOutreach(context.userId, args);
   }
@@ -2589,7 +2635,7 @@ emmaToolRegistry.register({
       properties: {
         platform: {
           type: 'string',
-          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "facebook", "meta", "twitter", "unipile" (LinkedIn Outreach - use this when the user asks about sending connection requests or direct messages on LinkedIn), or "all" for every platform.',
+          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "facebook", "meta", "twitter", "youtube" (YouTube channels - for uploading videos and viewing channel metrics), "unipile" (LinkedIn Outreach - use this when the user asks about sending connection requests or direct messages on LinkedIn), or "all" for every platform.',
           default: 'all'
         }
       },
@@ -2653,7 +2699,7 @@ emmaToolRegistry.register({
   name: 'post_on_connected_account',
   definition: {
     name: 'post_on_connected_account',
-    description: 'Create a post on a connected social media account. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
+    description: 'Create a post on a connected social media account. Supports LinkedIn, Instagram, and YouTube. For YouTube: this UPLOADS a video — you MUST provide a video URL in media_urls. The content becomes the video title (first 100 chars) and description. CRITICAL: Always review the post content with the user and get explicit approval before publishing to social media. IMPORTANT: The content parameter must contain the COMPLETE, FULL post text exactly as approved by the user. Never truncate, abbreviate, summarize, or use placeholders like "..." in the content.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2662,7 +2708,7 @@ emmaToolRegistry.register({
         media_urls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Optional URLs of images/videos to attach'
+          description: 'Optional URLs of images/videos to attach. REQUIRED for YouTube — must be a direct video file URL (e.g. .mp4). The video will be downloaded and uploaded to YouTube.'
         }
       },
       required: ['account_id', 'content']
@@ -4004,3 +4050,173 @@ emmaToolRegistry.register({
     return { success: true, message: `Memory ${args.memoryId} deleted.` };
   }
 });
+
+// --- Client Health Assessment (admin-only) ---
+
+emmaToolRegistry.register({
+  name: 'assess_client_health',
+  definition: {
+    name: 'assess_client_health',
+    description: `Assess the health of a specific client account across three layers: ads, landing pages, and lead quality. Admin-only tool.
+
+Returns a structured health assessment with:
+- **Ads layer**: Meta ad account connectivity, active campaigns
+- **Lander layer**: Landing page / website presence (productDomain, seoDomains)
+- **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
+- **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
+- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
+
+Use this to quickly diagnose a client's marketing funnel completeness.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    return await agentModeService.assessClientHealth(userId, args.client_name_or_email);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'list_all_clients',
+  definition: {
+    name: 'list_all_clients',
+    description: `List all non-admin client accounts with quick health indicators. Admin-only tool.
+
+Returns for each client:
+- Name, email, roles
+- has_ads: whether they have a Meta ad account connected
+- has_lander: whether they have landing pages (productDomain or seoDomains)
+- has_crm: whether they have CRM integrations (email domain, LinkedIn)
+- last_activity: last login timestamp
+
+Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    return await agentModeService.listAllClients(userId);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'account_summary',
+  definition: {
+    name: 'account_summary',
+    description: 'Get a summary of work done on this account over a time period. Returns sessions, assets (images, videos, reports, social posts), and results (published count, leads added, email delivery/clicks/replies/bounced, social media posts published/impressions/engagements/clicks).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        time_range: {
+          type: 'string',
+          enum: ['1d', '7d', '30d', '90d'],
+          description: 'Time range for the summary. Defaults to 7d.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const timeRange = args.time_range || '7d';
+    return await getAccountSummary(userId, timeRange);
+  }
+});
+
+// --- SEO & Analytics Tools ---
+emmaToolRegistry.register({
+  name: 'get_seo_metrics',
+  definition: {
+    name: 'get_seo_metrics',
+    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). User must have SEO domains configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for metrics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchSearchConsoleMetrics } = await import('../services/seoService');
+    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_website_analytics',
+  definition: {
+    name: 'get_website_analytics',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. User must have a Google Analytics Property ID configured in their account settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeframe: {
+          type: 'string',
+          enum: ['7d', '14d', '30d', '90d'],
+          description: 'Time period for analytics. Default: 30d'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
+    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
+  }
+});
+
+// ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
+// These tools wrap REST endpoints via mcpFetch. Rather than duplicating
+// definitions, we re-register them from the MCP server registry.
+// Ensure apiTools has registered its tools before we try to bridge them.
+import '../mcp/server/apiTools';
+import { mcpToolRegistry } from '../mcp/server/registry';
+
+const scheduledChatToolNames = [
+  'list_scheduled_chats',
+  'manage_scheduled_chat',
+  'test_scheduled_chat',
+  'get_scheduled_chat_test_history',
+  'submit_scheduled_chat_variables',
+];
+
+for (const toolName of scheduledChatToolNames) {
+  const handler = mcpToolRegistry.getTool(toolName);
+  if (handler) {
+    emmaToolRegistry.register({
+      name: handler.name,
+      definition: handler.definition,
+      execute: handler.execute,
+    });
+  } else {
+    console.warn(`[emma/tools] Failed to bridge scheduled chat tool "${toolName}" — not found in mcpToolRegistry`);
+  }
+}

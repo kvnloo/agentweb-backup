@@ -63,6 +63,7 @@
     "date-fns-tz": "^3.2.0",
     "dotenv": "^16.0.3",
     "express": "^4.18.3",
+    "express-rate-limit": "^8.3.1",
     "facebook-nodejs-business-sdk": "^24.0.1",
     "google-auth-library": "^9.15.1",
     "googleapis": "^144.0.0",
@@ -99,7 +100,8 @@
     "typescript": "^5.3.3",
     "ulid": "^3.0.2",
     "unipile-node-sdk": "^1.9.3",
-    "uuid": "^11.1.0"
+    "uuid": "^11.1.0",
+    "v0-sdk": "^0.16.4"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",

@@ -52,15 +52,23 @@ mcpToolRegistry.register({
       properties: {
         session_id: { type: 'string', description: 'The chat session ID' },
         message: { type: 'string', description: 'The message to send' },
-        llm_model: { type: 'string', description: 'LLM model to use (optional)' }
+        llm_model: { type: 'string', description: 'LLM model to use (optional)' },
+        media_urls: { type: 'array', items: { type: 'string' }, description: 'Array of image URLs (S3 paths or public URLs) to attach to the message' }
       },
       required: ['session_id', 'message']
     }
   },
   execute: async (args: any, context: any) => {
+    const body: any = { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model };
+    if (args.media_urls && args.media_urls.length > 0) {
+      body.attachments = args.media_urls.map((url: string) => {
+        const filename = url.split('/').pop()?.split('?')[0] || 'image';
+        return { url, filename };
+      });
+    }
     const data = await mcpFetch({
       method: 'POST', path: '/api/agent-mode/generate', context: ctx(context),
-      body: { sessionId: args.session_id, userMessage: args.message, llmModel: args.llm_model }
+      body
     });
     return jsonResult(data);
   }
@@ -262,6 +270,181 @@ mcpToolRegistry.register({
       default:
         return jsonResult({ error: `Unknown action: ${args.action}` });
     }
+  }
+});
+
+// ─── Scheduled Chats ─────────────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'list_scheduled_chats',
+  definition: {
+    name: 'list_scheduled_chats',
+    description: 'List all scheduled chats for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/scheduled-chats', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'manage_scheduled_chat',
+  definition: {
+    name: 'manage_scheduled_chat',
+    description: 'Create, update, toggle (pause/resume), or delete a scheduled chat. Use action: "create", "update", "toggle", or "delete".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'toggle', 'delete'], description: 'CRUD action' },
+        schedule_id: { type: 'string', description: 'Schedule ID (required for update/toggle/delete)' },
+        schedule_name: { type: 'string', description: 'Schedule name (create/update)' },
+        starting_message: { type: 'string', description: 'The prompt/message to run on each execution (create/update)' },
+        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
+        frequency_interval_days: { type: 'number', description: 'Number of days between runs (required when schedule_frequency is "every_n_days", must be >= 1)' },
+        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
+        description: { type: 'string', description: 'Description (create/update)' },
+        keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
+        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update)' },
+        function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (create/update)' },
+        daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
+        run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
+        variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
+        variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
+        llm_model: { type: 'string', description: 'LLM model to use (create/update)' },
+        session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
+        status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const c = ctx(context);
+    switch (args.action) {
+      case 'create': {
+        const body: any = {
+          scheduleName: args.schedule_name,
+          startingMessage: args.starting_message,
+          scheduleFrequency: args.schedule_frequency,
+        };
+        if (args.description !== undefined) body.description = args.description;
+        if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
+        if (args.keywords !== undefined) body.keywords = args.keywords;
+        if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
+        if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
+        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
+        if (args.run_count !== undefined) body.runCount = args.run_count;
+        if (args.variables !== undefined) body.variables = args.variables;
+        if (args.variable_values !== undefined) body.variableValues = args.variable_values;
+        if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        if (args.session_id !== undefined) body.sessionId = args.session_id;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
+        const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
+        return jsonResult(data);
+      }
+      case 'update': {
+        const body: any = {
+          scheduleName: args.schedule_name,
+          startingMessage: args.starting_message,
+          scheduleFrequency: args.schedule_frequency,
+        };
+        if (args.description !== undefined) body.description = args.description;
+        if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
+        if (args.keywords !== undefined) body.keywords = args.keywords;
+        if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
+        if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
+        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
+        if (args.run_count !== undefined) body.runCount = args.run_count;
+        if (args.variables !== undefined) body.variables = args.variables;
+        if (args.variable_values !== undefined) body.variableValues = args.variable_values;
+        if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
+        return jsonResult(data);
+      }
+      case 'toggle': {
+        const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${args.action}` });
+    }
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'test_scheduled_chat',
+  definition: {
+    name: 'test_scheduled_chat',
+    description: 'Trigger a test run of a scheduled chat. Variables must already be set on the schedule.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: { type: 'string', description: 'The scheduled chat ID to test' },
+        send_notification_email: { type: 'boolean', description: 'Whether to send notification emails with the test results (default false)' }
+      },
+      required: ['schedule_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test`, context: ctx(context),
+      body: { sendNotificationEmail: args.send_notification_email || false }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_scheduled_chat_test_history',
+  definition: {
+    name: 'get_scheduled_chat_test_history',
+    description: 'Get test and run history for a scheduled chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: { type: 'string', description: 'The scheduled chat ID' }
+      },
+      required: ['schedule_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/test-history`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'submit_scheduled_chat_variables',
+  definition: {
+    name: 'submit_scheduled_chat_variables',
+    description: 'Submit variable values for a scheduled chat. Optionally trigger an immediate run after submission.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        schedule_id: { type: 'string', description: 'The scheduled chat ID' },
+        variable_values: { type: 'object', description: 'Object mapping variable names to their values' },
+        trigger_run: { type: 'boolean', description: 'Whether to trigger a run immediately after submitting variables (default false)' }
+      },
+      required: ['schedule_id', 'variable_values']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/variables`, context: ctx(context),
+      body: {
+        variableValues: args.variable_values,
+        triggerRun: args.trigger_run || false,
+      }
+    });
+    return jsonResult(data);
   }
 });
 
@@ -817,6 +1000,127 @@ mcpToolRegistry.register({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
       body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
     });
+    return jsonResult(data);
+  }
+});
+
+// ─── Landing Pages (v0) ─────────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'generate_landing_page',
+  definition: {
+    name: 'generate_landing_page',
+    description: 'Generate a new landing page using v0 + brand guidelines. Returns a page object with an ID to poll, iterate, or deploy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Description of the landing page to generate' },
+        name: { type: 'string', description: 'Optional display name for the page' }
+      },
+      required: ['prompt']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
+      body: { prompt: args.prompt, name: args.name }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'deploy_landing_page',
+  definition: {
+    name: 'deploy_landing_page',
+    description: 'Deploy a generated landing page to Vercel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
+      body: {}
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'iterate_landing_page',
+  definition: {
+    name: 'iterate_landing_page',
+    description: 'Refine a generated landing page with follow-up instructions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' },
+        message: { type: 'string', description: 'Instructions for how to refine the page' }
+      },
+      required: ['page_id', 'message']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
+      body: { message: args.message }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_landing_pages',
+  definition: {
+    name: 'list_landing_pages',
+    description: 'List all generated landing pages for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/landing-pages/v0/generated', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page',
+  definition: {
+    name: 'get_landing_page',
+    description: 'Get details of a specific generated landing page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_landing_page',
+  definition: {
+    name: 'delete_landing_page',
+    description: 'Delete a generated landing page record.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
     return jsonResult(data);
   }
 });

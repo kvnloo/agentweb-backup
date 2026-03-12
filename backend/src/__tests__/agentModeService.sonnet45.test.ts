@@ -120,6 +120,21 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['gemini-3.1-pro-preview'].client).toBeNull();
     });
 
+    it('should include Gemini 3.1 Flash Lite Preview in the supported models', async () => {
+      const models = await agentModeService.getSupportedModels();
+      expect(models).toContain('gemini-3.1-flash-lite-preview');
+    });
+
+    it('should have temperature support enabled for Gemini 3.1 Flash Lite Preview', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-flash-lite-preview'].supportsTemperature).toBe(true);
+    });
+
+    it('should have null client initially for Gemini 3.1 Flash Lite Preview (lazy-loaded)', () => {
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-flash-lite-preview'].client).toBeNull();
+    });
+
     it('should return only anthropic models from getReportsModelOptions', async () => {
       const reportsModels = await agentModeService.getReportsModelOptions();
       expect(reportsModels.length).toBeGreaterThan(0);
@@ -230,6 +245,28 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       // After calling, the client should be cached (no longer null)
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['gemini-3.1-pro-preview'].client).toBe(mockGeminiClient);
+    });
+
+    it('should lazy-load Gemini client for gemini-3.1-flash-lite-preview on first callLLM', async () => {
+      const mockCreate = jest.fn().mockResolvedValue({
+        choices: [{ message: { content: 'test response' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      });
+      const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
+
+      jest.spyOn(agentModeService as any, 'getGeminiClient').mockResolvedValue(mockGeminiClient);
+
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'Hello' },
+      ];
+
+      await (agentModeService as any).callLLM('gemini-3.1-flash-lite-preview', messages);
+
+      expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
+
+      const llmModels = (agentModeService as any).llmModels;
+      expect(llmModels['gemini-3.1-flash-lite-preview'].client).toBe(mockGeminiClient);
     });
   });
 

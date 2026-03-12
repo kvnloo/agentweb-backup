@@ -400,6 +400,40 @@ export class LinkedInService {
 
 
   /**
+   * Get social metadata for an activity URN.
+   * Works with urn:li:activity:... URNs — returns reaction/comment counts.
+   * This is the only LinkedIn API that accepts activity URNs directly.
+   */
+  async getActivityMetadata(accessToken: string, activityUrn: string): Promise<{
+    exists: boolean;
+    likeCount: number;
+    commentCount: number;
+  }> {
+    const encodedUrn = encodeURIComponent(activityUrn);
+    try {
+      const response = await this.client.get(`/rest/socialMetadata/${encodedUrn}`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const data = response.data as any;
+      // Sum all reaction types
+      let likeCount = 0;
+      if (data.reactionSummaries) {
+        for (const key of Object.keys(data.reactionSummaries)) {
+          likeCount += data.reactionSummaries[key]?.count ?? 0;
+        }
+      }
+      const commentCount = data.commentSummary?.count ?? 0;
+      return { exists: true, likeCount, commentCount };
+    } catch (error: any) {
+      if (error.response?.status === 404) {
+        return { exists: false, likeCount: 0, commentCount: 0 };
+      }
+      this.handleError(error);
+      return { exists: false, likeCount: 0, commentCount: 0 };
+    }
+  }
+
+  /**
    * List posts for a specific author (person or organization)
    * Note: LinkedIn Versioned Posts API requires X-RestLi-Method: FINDER header
    * and URL-encoded author URN (colons must be encoded)

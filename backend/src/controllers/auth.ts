@@ -36,15 +36,16 @@ export const register = async (req: Request, res: Response) => {
         ? reqRoles
         : ["customer"];
 
-    // Check waitlist status only for non-free users
+    // Check waitlist status only for non-free users (feature-flagged via SKIP_WAITLIST_CHECK)
+    const skipWaitlist = process.env.SKIP_WAITLIST_CHECK === 'true';
     let waitlistEntry = null;
     let stripe_customer_id = undefined;
     let companyNameFromWaitlist = undefined;
     let useCaseCategoriesFromWaitlist = undefined;
     let displayNameFromWaitlist = undefined;
 
-    if (!finalRoles.includes('free')) {
-      // Only check waitlist for premium users (customer/partner)
+    if (!finalRoles.includes('free') && !skipWaitlist) {
+      // Only check waitlist for premium users (customer/partner) when waitlist is enabled
       waitlistEntry = await waitlistDb.getByEmail(email);
 
       if (!waitlistEntry) {
@@ -69,6 +70,15 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist = waitlistEntry.companyName;
       useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
       displayNameFromWaitlist = waitlistEntry.fullName;
+    } else if (!finalRoles.includes('free') && skipWaitlist) {
+      // Waitlist bypassed — still try to pull details from waitlist if entry exists
+      waitlistEntry = await waitlistDb.getByEmail(email);
+      if (waitlistEntry) {
+        stripe_customer_id = waitlistEntry.stripe_customer_id;
+        companyNameFromWaitlist = waitlistEntry.companyName;
+        useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+        displayNameFromWaitlist = waitlistEntry.fullName;
+      }
     }
 
     // If waitlist entry exists and status is invited
@@ -313,10 +323,16 @@ export const googleCallback = async (
         (!user.roles || !user.roles.includes("customer"))
       ) {
         // User was invited but doesn't have customer role yet - add it
-        const updatedRoles = user.roles && user.roles.length > 0 
+        // Also copy stripe_customer_id from waitlist if user doesn't have one
+        const updatedRoles = user.roles && user.roles.length > 0
           ? [...user.roles, "customer"]
           : ["customer"];
-        await userDb.updateUser(user.userId, { roles: updatedRoles });
+        const updatePayload: any = { roles: updatedRoles };
+        if (waitlistEntry.stripe_customer_id && !user.stripe_customer_id) {
+          updatePayload.stripe_customer_id = waitlistEntry.stripe_customer_id;
+          user.stripe_customer_id = waitlistEntry.stripe_customer_id;
+        }
+        await userDb.updateUser(user.userId, updatePayload);
         user.roles = updatedRoles;
         console.log(`Added customer role to existing user ${email} during OAuth login`);
       }

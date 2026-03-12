@@ -1935,7 +1935,7 @@ async function getExecutionsWithAssets(
   // Define file filter functions for each asset type
   const fileFilters = {
     'images': (file: ResultFile) => {
-      const filename = file.filename.toLowerCase();
+      const filename = (file.filename || '').toLowerCase();
       return filename.endsWith('.jpg') ||
              filename.endsWith('.jpeg') ||
              filename.endsWith('.png') ||
@@ -1944,11 +1944,11 @@ async function getExecutionsWithAssets(
              filename.endsWith('.svg');
     },
     'videos': (file: ResultFile) => {
-      const filename = file.filename.toLowerCase();
+      const filename = (file.filename || '').toLowerCase();
       return filename.endsWith('.mp4');
     },
     'html-reports': (file: ResultFile) => {
-      const filename = file.filename.toLowerCase();
+      const filename = (file.filename || '').toLowerCase();
       return filename.endsWith('.html') ||
              filename.endsWith('.htm') ||
              (file.is_html === true);
