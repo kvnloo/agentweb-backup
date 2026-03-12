@@ -9,6 +9,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-11',
     changes: [
+      'Feature: YouTube Connected Accounts',
+      '- Connect your YouTube channel from Settings → Connected Accounts',
+      '- View your channel\'s videos and performance metrics through Emma',
+      '- Upload videos to YouTube directly via Emma in Agent Mode',
+      '- Reuses existing Google OAuth credentials (same as Gmail)',
+    ],
+  },
+  {
+    date: '2026-03-11',
+    changes: [
       'Feature: LinkedIn Outreach — Search & Discovery in Agent Mode',
       '- Ask Emma to search LinkedIn for people by keyword, job title, or company name',
       '- View detailed LinkedIn profiles including headline, location, and connection degree',
