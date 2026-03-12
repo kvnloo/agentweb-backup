@@ -2629,13 +2629,13 @@ emmaToolRegistry.register({
   name: 'list_connected_accounts',
   definition: {
     name: 'list_connected_accounts',
-    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool).',
+    description: 'Returns list of social media accounts connected by the user. PLATFORM MAPPING: use platform="linkedin" for standard LinkedIn posting accounts; use platform="instagram" for Instagram accounts; use platform="unipile" for LinkedIn Outreach accounts (sending connection invites and direct messages via the linkedin_outreach tool). Do NOT use platform="meta" for Instagram accounts.',
     inputSchema: {
       type: 'object',
       properties: {
         platform: {
           type: 'string',
-          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "facebook", "meta", "twitter", "youtube" (YouTube channels - for uploading videos and viewing channel metrics), "unipile" (LinkedIn Outreach - use this when the user asks about sending connection requests or direct messages on LinkedIn), or "all" for every platform.',
+          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "instagram" (use this for Instagram accounts), "facebook", "meta" (Facebook Ads/Pages), "twitter", "youtube" (YouTube channels), "unipile" (LinkedIn Outreach), or "all" for every platform.',
           default: 'all'
         }
       },
