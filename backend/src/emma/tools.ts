@@ -4092,15 +4092,27 @@ emmaToolRegistry.register({
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
 
-const scheduledChatToolNames = [
+const bridgedToolNames = [
+  // Scheduled Chat tools
   'list_scheduled_chats',
   'manage_scheduled_chat',
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
+  // Landing Page tools (v0 generation + deployment)
+  'generate_landing_page',
+  'deploy_landing_page',
+  'iterate_landing_page',
+  'list_landing_pages',
+  'get_landing_page',
+  'delete_landing_page',
+  'preview_landing_page_html',
+  'enable_lead_list_public_access',
+  'duplicate_landing_page',
+  'edit_landing_page_file',
 ];
 
-for (const toolName of scheduledChatToolNames) {
+for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
     emmaToolRegistry.register({
@@ -4109,6 +4121,6 @@ for (const toolName of scheduledChatToolNames) {
       execute: handler.execute,
     });
   } else {
-    console.warn(`[emma/tools] Failed to bridge scheduled chat tool "${toolName}" — not found in mcpToolRegistry`);
+    console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }

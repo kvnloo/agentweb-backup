@@ -1691,6 +1691,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
           workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
         }
 
+        // Include skill IDs if available (for awareness)
+        if (step.skillIds && step.skillIds.length > 0) {
+          workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        }
+
         workPlanContent += '\n';
       });
 
@@ -15078,7 +15083,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -15099,7 +15104,8 @@ Please:
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
-          requiredFunctionCalls: step.requiredFunctionCalls
+          requiredFunctionCalls: step.requiredFunctionCalls,
+          skillIds: step.skillIds
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
@@ -15124,7 +15130,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -15150,7 +15156,8 @@ Please:
             ...workPlan.steps[existingIndex],
             title: newStep.title,
             description: newStep.description,
-            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls
+            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
+            skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -15161,7 +15168,8 @@ Please:
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
-            requiredFunctionCalls: newStep.requiredFunctionCalls
+            requiredFunctionCalls: newStep.requiredFunctionCalls,
+            skillIds: newStep.skillIds
           });
         }
       }
@@ -15301,6 +15309,26 @@ Please:
         // Update function counts if they were modified
         if (countsModified) {
           await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+        }
+
+        // Auto-install skills for the next pending step
+        const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
+        if (completedStepCounts.length > 0) {
+          const nextPendingStep = workPlan.steps
+            .sort((a: any, b: any) => a.stepCount - b.stepCount)
+            .find((s: any) => s.status === 'pending');
+          if (nextPendingStep?.skillIds?.length) {
+            try {
+              const currentAssociated = session.associatedSkills || [];
+              const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
+              if (newSkillIds.length > 0) {
+                await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
+                console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
+              }
+            } catch (skillErr) {
+              console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
+            }
+          }
         }
       }
 

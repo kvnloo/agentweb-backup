@@ -4098,7 +4098,8 @@ export const agentModeController = {
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
-          requiredFunctionCalls: step.requiredFunctionCalls
+          requiredFunctionCalls: step.requiredFunctionCalls,
+          skillIds: step.skillIds
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
@@ -4113,6 +4114,26 @@ export const agentModeController = {
         requireLogin: predefinedPlan.requireLogin || false
       };
       await chatbotDb.updateSessionWorkPlan(session.sessionId, workPlanWithWelcome);
+
+      // Auto-install ALL skills from ALL work plan steps upfront.
+      // Skills need to be available from the start because tool filtering is computed
+      // at the beginning of each message — installing mid-conversation (on step completion)
+      // doesn't take effect until the next message, causing tools to be unavailable.
+      // The work plan's requiredFunctionCalls still enforce step ordering.
+      const allSkillIds = new Set<string>();
+      for (const step of predefinedPlan.steps) {
+        if (step.skillIds?.length) {
+          step.skillIds.forEach((id: string) => allSkillIds.add(id));
+        }
+      }
+      if (allSkillIds.size > 0) {
+        try {
+          await chatbotDb.addAssociatedSkills(session.sessionId, Array.from(allSkillIds));
+          console.log(`AgentMode: Auto-installed all plan skills for "${predefinedPlan.title}": ${Array.from(allSkillIds).join(', ')}`);
+        } catch (skillErr) {
+          console.error('AgentMode: Error auto-installing plan skills:', skillErr);
+        }
+      }
 
       // Set default model for new sessions
       // Use work plan's default model if specified, otherwise use global default
