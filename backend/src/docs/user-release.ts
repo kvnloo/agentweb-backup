@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-12',
     changes: [
+      'Fix: Emma — Headless Browser Support',
+      '- Emma can now use Playwright browser tools (navigate, screenshot, click) on server environments',
+      '- Automatically configures headless mode and sandbox settings for reliable browser automation',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
       'Improvement: Social Media Posts — Direct Links',
       '- Each post card now includes a link icon to open the original post on LinkedIn',
     ],
