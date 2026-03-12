@@ -784,7 +784,7 @@ export class ChatbotDB {
         KeyConditionExpression: 'sessionId = :sessionId',
         ExpressionAttributeValues: { ':sessionId': sessionId },
         ScanIndexForward: true,
-        Limit: 10,
+        Limit: 20,
       }).promise();
       const firstUser = (result.Items || []).find((item: any) => item.message?.role === 'user');
       return firstUser ? (firstUser.message.content as string) || null : null;
@@ -3114,35 +3114,59 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
   }
 }
 
-function trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+function trimToolMessagesForContext(
+  messages: any[],
+  recentToPreserve: number = 3,
+  maxToolContentLength: number = 8000,
+  maxHistoricalTools: number = 20
+): any[] {
   const toolIndices: number[] = [];
   for (let i = 0; i < messages.length; i++) {
-    if (messages[i].role === 'tool') {
-      toolIndices.push(i);
-    }
+    if (messages[i].role === 'tool') toolIndices.push(i);
   }
   const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
-  return messages.map((msg, idx) => {
-    if (msg.role === 'tool' && !preserveSet.has(idx) && typeof msg.content === 'string' && msg.content.length > maxToolContentLength) {
-      return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
-    }
-    return msg;
-  });
+  const historicalIndices = toolIndices.slice(0, toolIndices.length - recentToPreserve);
+  const dropSet = historicalIndices.length > maxHistoricalTools
+    ? new Set(historicalIndices.slice(0, historicalIndices.length - maxHistoricalTools))
+    : new Set<number>();
+
+  return messages
+    .filter((_, idx) => !dropSet.has(idx))
+    .map((msg) => {
+      if (msg.role === 'tool' && !preserveSet.has(messages.indexOf(msg)) && typeof msg.content === 'string' && msg.content.length > maxToolContentLength) {
+        return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
+      }
+      return msg;
+    });
+}
+
+export interface ChatResponseOptions {
+  currentUrl?: string;
+  pageContent?: string;
+  portalType?: "customer" | "partner";
+  userId?: string;
+  structuredContext?: string;
+  screenshot?: string;
+  model?: string;
+  onToolStart?: (toolName: string) => void;
 }
 
 // Update generateChatResponse to use platform knowledge base when needed
 export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
-  currentUrl?: string,
-  pageContent?: string,
-  portalType: "customer" | "partner" = "partner",
-  userId?: string,
-  structuredContext?: string,
-  screenshot?: string,
-  model?: string,
-  onToolStart?: (toolName: string) => void
+  options: ChatResponseOptions = {}
 ): Promise<string | { content: string; toolCalls?: any[]; invalidations?: string[] }> {
+  const {
+    currentUrl,
+    pageContent,
+    portalType = "partner",
+    userId,
+    structuredContext,
+    screenshot,
+    model,
+    onToolStart,
+  } = options;
   try {
     const timestamp = new Date().toISOString();
 
@@ -3480,90 +3504,23 @@ export async function generateChatResponse(
 
       console.log(`[generateChatResponse] Executing ${responseMessage.tool_calls.length} tool calls`);
 
-      // Map tool calls to an array of promises for parallel execution
-      const toolPromises = responseMessage.tool_calls.map(async (toolCall: any) => {
+      for (const toolCall of responseMessage.tool_calls) {
         let functionArgs: any;
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
-
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
-
-          // Notify caller that a tool is starting (enables real-time SSE streaming)
           onToolStart?.(toolCall.function.name);
-
-          // Execute tool via AgentModeService (reuse existing infrastructure)
-          if (!agentModeService) {
-            throw new Error("AgentModeService not initialized");
-          }
-
-          const result = await agentModeService.executeTool(
-            response.model,
-            toolCall.function.name,
-            functionArgs,
-            userId!,
-            sessionId,
-            false // mockMode
-          );
-
+          if (!agentModeService) throw new Error("AgentModeService not initialized");
+          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
-
-          return { status: 'success' as const, toolCall, functionArgs, result };
+          toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs, result });
+          const toolContent = typeof result === 'string' ? result : JSON.stringify(result);
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, name: toolCall.function.name, content: toolContent, metadata: { timestamp: new Date().toISOString() } });
         } catch (error) {
           console.error(`[generateChatResponse] Tool execution error for ${toolCall.function.name}:`, error);
-          return { status: 'error' as const, toolCall, functionArgs, error };
-        }
-      });
-
-      const toolResults = await Promise.all(toolPromises);
-
-      // Process results in original order — append to messages and toolCalls sequentially
-      for (const toolResult of toolResults) {
-        if (toolResult.status === 'success') {
-          const { toolCall, functionArgs, result } = toolResult;
-          
-          // Track tool call for response
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs,
-            result: result
-          });
-
-          // Format result for tool message
-          const toolContent = typeof result === 'string' ? result : JSON.stringify(result);
-
-          // Add tool result message to messages array (for next iteration)
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: toolContent,
-            metadata: { timestamp: new Date().toISOString() }
-          });
-        } else {
-          const { toolCall, functionArgs, error } = toolResult;
-          
-          // Track failed tool call
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs || toolCall.function.arguments,
-            error: error instanceof Error ? error.message : 'Unknown error'
-          });
-
-          // Add error result as tool message (LLM needs to see the error)
-          const errorContent = JSON.stringify({
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error'
-          });
-
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: errorContent,
-            metadata: { timestamp: new Date().toISOString() }
-          });
+          toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs || toolCall.function.arguments, error: error instanceof Error ? error.message : 'Unknown error' });
+          const errorContent = JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, name: toolCall.function.name, content: errorContent, metadata: { timestamp: new Date().toISOString() } });
         }
       }
 

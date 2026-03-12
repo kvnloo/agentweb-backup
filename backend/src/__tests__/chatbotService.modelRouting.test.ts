@@ -122,8 +122,8 @@ describe('generateChatResponse — model routing', () => {
       mockGeminiClientCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
 
       await generateChatResponse(
-        'sess-1', 'Hello', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'gemini-2.5-flash'
+        'sess-1', 'Hello',
+        { portalType: 'customer', userId: 'user-1', model: 'gemini-2.5-flash' }
       );
 
       expect(mockGetGeminiClient).toHaveBeenCalledTimes(1);
@@ -135,8 +135,8 @@ describe('generateChatResponse — model routing', () => {
       mockGeminiClientCreate.mockResolvedValue(makeCompletion('Gemini says hi'));
 
       const result = await generateChatResponse(
-        'sess-1', 'Hello', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'gemini-2.5-flash'
+        'sess-1', 'Hello',
+        { portalType: 'customer', userId: 'user-1', model: 'gemini-2.5-flash' }
       );
 
       const content = typeof result === 'string' ? result : (result as any).content;
@@ -148,8 +148,8 @@ describe('generateChatResponse — model routing', () => {
       mockGeminiClientCreate.mockResolvedValue(makeCompletion());
 
       await generateChatResponse(
-        'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'gemini-2.5-pro'
+        'sess-1', 'Hi',
+        { portalType: 'customer', userId: 'user-1', model: 'gemini-2.5-pro' }
       );
 
       expect(mockGetBedrockClient).not.toHaveBeenCalled();
@@ -164,8 +164,8 @@ describe('generateChatResponse — model routing', () => {
       mockBedrockClientCreate.mockResolvedValue(makeCompletion('Claude says hi'));
 
       await generateChatResponse(
-        'sess-1', 'Hello', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'anthropic.claude-sonnet-4-6'
+        'sess-1', 'Hello',
+        { portalType: 'customer', userId: 'user-1', model: 'anthropic.claude-sonnet-4-6' }
       );
 
       expect(mockGetBedrockClient).toHaveBeenCalledWith('anthropic.claude-sonnet-4-6');
@@ -177,8 +177,8 @@ describe('generateChatResponse — model routing', () => {
       mockBedrockClientCreate.mockResolvedValue(makeCompletion('Bedrock response'));
 
       const result = await generateChatResponse(
-        'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'anthropic.claude-sonnet-4-6'
+        'sess-1', 'Hi',
+        { portalType: 'customer', userId: 'user-1', model: 'anthropic.claude-sonnet-4-6' }
       );
 
       const content = typeof result === 'string' ? result : (result as any).content;
@@ -190,8 +190,8 @@ describe('generateChatResponse — model routing', () => {
       mockBedrockClientCreate.mockResolvedValue(makeCompletion('ok'));
 
       await generateChatResponse(
-        'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
-        undefined, undefined, 'claude-opus-4'
+        'sess-1', 'Hi',
+        { portalType: 'customer', userId: 'user-1', model: 'claude-opus-4' }
       );
 
       expect(mockGetBedrockClient).toHaveBeenCalledWith('claude-opus-4');
@@ -203,8 +203,8 @@ describe('generateChatResponse — model routing', () => {
       seedSessionMocks();
       try {
         await generateChatResponse(
-          'sess-1', 'Hi', undefined, undefined, 'customer', 'user-1',
-          undefined, undefined, 'sonnet-v2-custom'
+          'sess-1', 'Hi',
+          { portalType: 'customer', userId: 'user-1', model: 'sonnet-v2-custom' }
         );
       } catch {
         // Expected — Azure OpenAI is not configured in tests

@@ -137,8 +137,8 @@ describe('sendMessageStream controller', () => {
       .mockResolvedValueOnce(SESSION_OWNER);
 
     mockGenerateChatResponse.mockImplementationOnce(
-      async (_sid, _msg, _url, _pc, _pt, _uid, _sc, _ss, _model, onToolStart) => {
-        onToolStart?.('update_brand_guidelines');
+      async (_sid, _msg, options) => {
+        options?.onToolStart?.('update_brand_guidelines');
         return 'Done';
       }
     );
@@ -257,14 +257,11 @@ describe('sendMessageStream controller', () => {
     expect(mockGenerateChatResponse).toHaveBeenCalledWith(
       expect.any(String), // sessionId
       expect.any(String), // message
-      undefined,          // currentUrl
-      undefined,          // pageContext
-      'customer',         // portalType
-      expect.any(String), // userId
-      undefined,          // structuredContext
-      undefined,          // screenshot
-      undefined,          // model
-      expect.any(Function) // onToolStart
+      expect.objectContaining({
+        portalType: 'customer',
+        userId: expect.any(String),
+        onToolStart: expect.any(Function),
+      })
     );
   });
 });
