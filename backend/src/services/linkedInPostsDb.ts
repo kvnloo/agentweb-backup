@@ -143,7 +143,10 @@ export async function updatePostMetrics(
         await dynamodb.update({
             TableName: LINKEDIN_POSTS_TABLE,
             Key: { userId, postId },
-            UpdateExpression: 'SET metrics = :m, metricsFetchedAt = :ts',
+            UpdateExpression: 'SET #metrics = :m, metricsFetchedAt = :ts',
+            ExpressionAttributeNames: {
+                '#metrics': 'metrics',
+            },
             ExpressionAttributeValues: {
                 ':m': metrics,
                 ':ts': new Date().toISOString(),

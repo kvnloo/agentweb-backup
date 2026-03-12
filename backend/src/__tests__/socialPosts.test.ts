@@ -3,7 +3,6 @@ import express from 'express';
 import socialPostsRouter from '../routes/socialPosts';
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
 import { socialPlatformService } from '../services/socialPlatformService';
-
 // Mock dependencies
 jest.mock('../services/connectedAccountsDb');
 jest.mock('../services/socialPlatformService');
@@ -349,6 +348,28 @@ describe('Social Posts API', () => {
             expect(typeof post2.content).toBe('string');
         });
 
+        it('normalizes content from text and caption fields', async () => {
+            const account = createMockAccount();
+            mockGetAccountsByUserId.mockResolvedValue([account]);
+
+            const posts = [
+                { id: 'post1', text: 'Text field post', createdAt: '2026-03-10T12:00:00Z' },
+                { id: 'post2', caption: 'Caption field post', createdAt: '2026-03-09T12:00:00Z' },
+            ];
+            const adapter = createMockAdapter(posts, []);
+            (socialPlatformService.getAdapter as jest.Mock).mockReturnValue(adapter);
+
+            const response = await request(app)
+                .get('/api/social-posts?include_metrics=false')
+                .set('Authorization', 'Bearer test-token');
+
+            expect(response.status).toBe(200);
+            const post1 = response.body.posts.find((p: any) => p.id === 'post1');
+            expect(post1.content).toBe('Text field post');
+            const post2 = response.body.posts.find((p: any) => p.id === 'post2');
+            expect(post2.content).toBe('Caption field post');
+        });
+
         it('skips non-social accounts (unipile, gmail, meta)', async () => {
             const linkedInAccount = createMockAccount();
             const unipileAccount = createMockAccount({
@@ -386,3 +407,4 @@ describe('Social Posts API', () => {
         });
     });
 });
+
