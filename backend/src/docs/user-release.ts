@@ -7,6 +7,13 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-12',
+    changes: [
+      'Improvement: Social Media Posts — Direct Links',
+      '- Each post card now includes a link icon to open the original post on LinkedIn',
+    ],
+  },
+  {
     date: '2026-03-11',
     changes: [
       'Feature: Social Media Posts Page',
