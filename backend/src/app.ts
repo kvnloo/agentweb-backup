@@ -45,6 +45,7 @@ import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import landingPagesRoutes from "./routes/landingPages";
+import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
@@ -132,6 +133,7 @@ const corsOptions = {
 app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
+      req.path.match(/^\/api\/crm\/public\/lists\/[^\/]+\/capture$/) ||
       req.path.startsWith('/api/lead-magnet/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -175,6 +177,7 @@ app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
+app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);

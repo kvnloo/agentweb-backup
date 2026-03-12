@@ -96,4 +96,64 @@ router.post('/lists/:listId/leads/:leadId/group-email-resubscribe', async (req: 
   }
 });
 
+// POST /api/crm/public/lists/:listId/capture
+// Public lead capture endpoint for landing page forms
+const captureRateLimitMap = new Map<string, number[]>();
+
+router.post('/lists/:listId/capture', async (req: Request, res: Response) => {
+  try {
+    const { listId } = req.params;
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+
+    // Rate limit: 10 captures per IP per minute
+    const now = Date.now();
+    const timestamps = captureRateLimitMap.get(ip) || [];
+    const recent = timestamps.filter(t => now - t < 60_000);
+    if (recent.length >= 10) {
+      return res.status(429).json({ message: 'Rate limit exceeded. Try again later.' });
+    }
+    recent.push(now);
+    captureRateLimitMap.set(ip, recent);
+
+    // Verify list exists and has public access enabled
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'List not found' });
+    }
+    if (!list.publicAccessEnabled) {
+      return res.status(403).json({ message: 'Public access is not enabled for this list' });
+    }
+
+    const { email, firstName, lastName, company, phone, message } = req.body;
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: 'Invalid email format' });
+    }
+
+    const lead = await crmDb.createLead(listId, {
+      email: email.trim().toLowerCase(),
+      firstName: firstName || '',
+      lastName: lastName || '',
+      company: company || '',
+      phone: phone || '',
+      notes: message || '',
+      status: 'new',
+    });
+
+    return res.status(201).json({ success: true, leadId: lead.leadId });
+  } catch (error: any) {
+    // Handle duplicate email gracefully
+    if (error.message?.includes('already exists')) {
+      return res.status(409).json({ success: true, message: 'Lead already captured' });
+    }
+    console.error('Error capturing lead:', error);
+    return res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
 export default router;
