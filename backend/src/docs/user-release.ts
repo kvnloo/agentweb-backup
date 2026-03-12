@@ -7,6 +7,48 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-11',
+    changes: [
+      'Feature: Social Media Posts Page',
+      '- New "Social Posts" page in the customer portal under Performance Hub',
+      '- View all your social media posts across LinkedIn (personal & company) and Instagram in one place',
+      '- Engagement metrics for each post: impressions, likes, comments, and shares',
+      '- Filter by account and sort by date, impressions, or engagement',
+      '- Summary stats: total posts, impressions, and engagement across all accounts',
+    ],
+  },
+  {
+    date: '2026-03-11',
+    changes: [
+      'Feature: YouTube Connected Accounts',
+      '- Connect your YouTube channel from Settings → Connected Accounts',
+      '- View your channel\'s videos and performance metrics through Emma',
+      '- Upload videos to YouTube directly via Emma in Agent Mode',
+      '- Reuses existing Google OAuth credentials (same as Gmail)',
+    ],
+  },
+  {
+    date: '2026-03-11',
+    changes: [
+      'Feature: LinkedIn Outreach — Search & Discovery in Agent Mode',
+      '- Ask Emma to search LinkedIn for people by keyword, job title, or company name',
+      '- View detailed LinkedIn profiles including headline, location, and connection degree',
+      '- List your existing LinkedIn connections and sent invitations with status tracking',
+      '- Browse company profiles for research before outreach',
+      '- Cancel pending connection invitations',
+      '- Full outreach workflow: search → view profile → send invite → track status',
+    ],
+  },
+  {
+    date: '2026-03-11',
+    changes: [
+      'Feature: Custom Interval Scheduling ("Every N Days")',
+      '- New "Every N days" frequency option for scheduled chats — set any interval from 1 to 365 days',
+      '- Available in the schedule creation/edit form and via Emma\'s manage_scheduled_chat tool',
+      '- Schedule list displays friendly labels like "Every 5 days" with next run time',
+    ],
+  },
+  {
     date: '2026-03-10',
     changes: [
       'Feature: Scheduled Chat Management in Agent Mode',

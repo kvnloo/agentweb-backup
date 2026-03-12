@@ -332,3 +332,62 @@ export async function getGmailCredentials(): Promise<GmailCredentials> {
     throw new Error('Failed to fetch Gmail credentials from Secrets Manager');
   }
 }
+
+/**
+ * Get YouTube OAuth credentials from AWS Secrets Manager.
+ * Reuses the Gmail Google OAuth credentials (same Google Cloud project).
+ *
+ * Secret location: dev/AgentWeb/Google/Gmail (or prod/... for production)
+ *
+ * @returns YouTube OAuth client credentials (same as Gmail)
+ */
+export async function getYouTubeCredentials(): Promise<GmailCredentials> {
+  return getGmailCredentials();
+}
+
+/**
+ * Interface for V0 credentials returned from Secrets Manager
+ */
+export interface V0Credentials {
+  apiKey: string;
+}
+
+/**
+ * Get V0 Platform API key from AWS Secrets Manager.
+ * Falls back to V0_API_KEY environment variable if Secrets Manager is unavailable.
+ *
+ * Secret location: dev/AgentWeb/V0 (or prod/... for production)
+ * Secret format: { "apiKey": "v1:team_..." }
+ *
+ * @returns The V0 API key string
+ */
+export async function getV0ApiKey(): Promise<string> {
+  // Try env var first (useful for local dev and EB environment config)
+  if (process.env.V0_API_KEY) {
+    return process.env.V0_API_KEY;
+  }
+
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/V0'
+      : 'dev/AgentWeb/V0';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('V0 credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as V0Credentials;
+
+    if (!credentials.apiKey) {
+      throw new Error('V0 credentials missing apiKey');
+    }
+
+    return credentials.apiKey;
+  } catch (error) {
+    console.error('Error fetching V0 API key from Secrets Manager:', error);
+    throw new Error('Failed to fetch V0 API key. Set V0_API_KEY env var or store in Secrets Manager.');
+  }
+}

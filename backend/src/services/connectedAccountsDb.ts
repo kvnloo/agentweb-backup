@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -103,7 +103,20 @@ export interface GmailConfig extends BaseOAuthConfig {
   granted_scopes: string[]; // Actual scopes granted (may differ from requested)
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig; // | TwitterConfig
+/**
+ * YouTube OAuth configuration
+ */
+export interface YouTubeConfig extends BaseOAuthConfig {
+  account_type: 'channel';
+  channel_id: string;
+  channel_name: string;
+  picture_url?: string;
+  subscriber_count?: number;
+  video_count?: number;
+  granted_scopes: string[];
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig; // | TwitterConfig
 
 /**
  * Connected Account configuration stored in the User record
