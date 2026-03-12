@@ -104,8 +104,8 @@ AgentWeb is a multi-tenant web automation platform with three main components:
 1. **Backend (Node.js/TypeScript)** - Express API server with Socket.IO for real-time chat
 2. **Agent Engine (Python)** - Browser automation engine using browser-use library and playwright
 3. **Frontend Applications (React/TypeScript)**:
-   - Partner Portal (admin/partner interface) - in this repo at `partner-portal/`
-   - Customer Portal (end-user interface) - in this repo at `customer-portal/`
+   - Partner Portal (admin/partner interface) - in this repo at `partner-portal/` — **admin-only features** (user management, system config, admin dashboards)
+   - Customer Portal (end-user interface) - in this repo at `customer-portal/` — **all user-facing features** (tasks, chat, marketing hub, social posts, settings, etc.). When adding new UI pages for end users, always use customer-portal, NOT partner-portal.
    - Growth Genius Chat - separate repo
 
 ### Data Flow

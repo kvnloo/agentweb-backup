@@ -9,6 +9,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-11',
     changes: [
+      'Feature: Social Media Posts Page',
+      '- New "Social Posts" page in the customer portal under Performance Hub',
+      '- View all your social media posts across LinkedIn (personal & company) and Instagram in one place',
+      '- Engagement metrics for each post: impressions, likes, comments, and shares',
+      '- Filter by account and sort by date, impressions, or engagement',
+      '- Summary stats: total posts, impressions, and engagement across all accounts',
+    ],
+  },
+  {
+    date: '2026-03-11',
+    changes: [
       'Feature: YouTube Connected Accounts',
       '- Connect your YouTube channel from Settings → Connected Accounts',
       '- View your channel\'s videos and performance metrics through Emma',
