@@ -16534,6 +16534,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
+      // Check if the account exists first
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const allAccounts = await getAccountsByUserId(userId);
+      const matchingAccount = allAccounts.find(a => a.account_id === accountId);
+      if (!matchingAccount) {
+        return {
+          success: false,
+          message: 'Account not found or access denied'
+        };
+      }
+
       const { getPostsForUser } = await import('./socialPostsService');
       const result = await getPostsForUser(userId, {
         accountId,
@@ -16541,14 +16552,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         includeMetrics: options.include_metrics !== false,
       });
 
-      if (result.posts.length === 0) {
-        // Check if the account was found at all
-        if (result.accounts.length === 0) {
-          return {
-            success: false,
-            message: 'Account not found or access denied'
-          };
-        }
+      // If the account wasn't processed (adapter threw), treat as failure
+      if (result.accounts.length === 0) {
+        return {
+          success: false,
+          message: 'Failed to load posts',
+        };
       }
 
       return {
