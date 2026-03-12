@@ -1,4 +1,4 @@
-import { getAccountsByUserId, ConnectedAccount } from './connectedAccountsDb';
+import { getAccountsByUserId } from './connectedAccountsDb';
 import { socialPlatformService } from './socialPlatformService';
 
 const SOCIAL_PLATFORMS = ['linkedin', 'instagram'];
@@ -148,3 +148,4 @@ export async function getPostsForUser(
     accounts: accountSummaries,
   };
 }
+
