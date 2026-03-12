@@ -1004,6 +1004,127 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Landing Pages (v0) ─────────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'generate_landing_page',
+  definition: {
+    name: 'generate_landing_page',
+    description: 'Generate a new landing page using v0 + brand guidelines. Returns a page object with an ID to poll, iterate, or deploy.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Description of the landing page to generate' },
+        name: { type: 'string', description: 'Optional display name for the page' }
+      },
+      required: ['prompt']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
+      body: { prompt: args.prompt, name: args.name }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'deploy_landing_page',
+  definition: {
+    name: 'deploy_landing_page',
+    description: 'Deploy a generated landing page to Vercel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
+      body: {}
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'iterate_landing_page',
+  definition: {
+    name: 'iterate_landing_page',
+    description: 'Refine a generated landing page with follow-up instructions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' },
+        message: { type: 'string', description: 'Instructions for how to refine the page' }
+      },
+      required: ['page_id', 'message']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
+      body: { message: args.message }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_landing_pages',
+  definition: {
+    name: 'list_landing_pages',
+    description: 'List all generated landing pages for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/landing-pages/v0/generated', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page',
+  definition: {
+    name: 'get_landing_page',
+    description: 'Get details of a specific generated landing page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_landing_page',
+  definition: {
+    name: 'delete_landing_page',
+    description: 'Delete a generated landing page record.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
 // ─── Internal-only tools (hidden from external MCP clients) ─────────────────
 // These tools are registered with internal: true so Emma can use them in chat,
 // but they are NOT listed to external MCP clients.
