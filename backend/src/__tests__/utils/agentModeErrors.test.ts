@@ -160,5 +160,71 @@ describe('agentModeErrors utils', () => {
     it('should return false for context limit errors (not retryable)', () => {
       expect(isTransientLLMError(new Error('context length exceeded'))).toBe(false);
     });
+
+    it('should detect 500 status code as transient', () => {
+      const error = Object.assign(new Error('Internal error'), { status: 500 });
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should detect 504 status code as transient', () => {
+      const error = Object.assign(new Error('Gateway timeout'), { status: 504 });
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should detect "internal server error" message pattern', () => {
+      expect(isTransientLLMError(new Error('Internal Server Error occurred'))).toBe(true);
+    });
+
+    it('should detect "internal_server_error" message pattern', () => {
+      expect(isTransientLLMError(new Error('internal_server_error'))).toBe(true);
+    });
+
+    it('should detect "500" in message as transient', () => {
+      expect(isTransientLLMError(new Error('HTTP 500 response'))).toBe(true);
+    });
+
+    it('should detect throttling errors', () => {
+      expect(isTransientLLMError(new Error('Request throttled'))).toBe(true);
+    });
+
+    it('should detect too many requests errors', () => {
+      expect(isTransientLLMError(new Error('too many requests'))).toBe(true);
+    });
+
+    it('should detect rate limit errors', () => {
+      expect(isTransientLLMError(new Error('rate limit exceeded'))).toBe(true);
+      expect(isTransientLLMError(new Error('rate_limit reached'))).toBe(true);
+    });
+
+    it('should detect rate exceeded errors', () => {
+      expect(isTransientLLMError(new Error('rate exceeded'))).toBe(true);
+    });
+
+    it('should detect temporarily unavailable errors', () => {
+      expect(isTransientLLMError(new Error('service temporarily unavailable'))).toBe(true);
+    });
+
+    it('should detect ETIMEDOUT errors', () => {
+      expect(isTransientLLMError(new Error('ETIMEDOUT'))).toBe(true);
+    });
+
+    it('should detect "503" in message as transient', () => {
+      expect(isTransientLLMError(new Error('Error 503'))).toBe(true);
+    });
+
+    it('should return false when statusCode is a string (non-number)', () => {
+      const error = { code: 'ENOTFOUND', message: 'some error' };
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should handle error with no status, code, or response properties', () => {
+      const error = { message: 'generic error' };
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should handle string errors for transient patterns', () => {
+      expect(isTransientLLMError('ECONNRESET')).toBe(true);
+      expect(isTransientLLMError('some normal error')).toBe(false);
+    });
   });
 });

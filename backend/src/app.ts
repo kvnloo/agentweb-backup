@@ -38,6 +38,7 @@ import metaAuthRoutes from "./routes/metaAuth";
 import clickupAuthRoutes from "./routes/clickupAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import linkedInOutreachAuthRoutes from "./routes/linkedInOutreachAuth";
+import youtubeAuthRoutes from "./routes/youtubeAuth";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
@@ -46,6 +47,7 @@ import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
 import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
+import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
@@ -106,6 +108,7 @@ const corsOptions = {
         /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/, // 192.168.x.x with optional port
         /^http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/, // 10.x.x.x with optional port
         /^http:\/\/172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+(:\d+)?$/, // 172.16-31.x.x with optional port
+        /^https?:\/\/\d+\.\d+\.\d+\.\d+(:\d+)?$/, // Any IP address (for cloud test environments)
       ];
 
       const isLocalNetwork = localNetworkPatterns.some((pattern) =>
@@ -172,6 +175,7 @@ app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
+app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
 app.use("/api/slack", slackRoutes);
 app.use("/api/meta", metaRoutes);
@@ -195,6 +199,7 @@ app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
+app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
