@@ -4087,6 +4087,34 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
 });
 
 emmaToolRegistry.register({
+  name: 'list_all_clients',
+  definition: {
+    name: 'list_all_clients',
+    description: `List all non-admin client accounts with quick health indicators. Admin-only tool.
+
+Returns for each client:
+- Name, email, roles
+- has_ads: whether they have a Meta ad account connected
+- has_lander: whether they have landing pages (productDomain or seoDomains)
+- has_crm: whether they have CRM integrations (email domain, LinkedIn)
+- last_activity: last login timestamp
+
+Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    return await agentModeService.listAllClients(userId);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
     name: 'account_summary',
@@ -4136,34 +4164,6 @@ emmaToolRegistry.register({
 
     const { fetchSearchConsoleMetrics } = await import('../services/seoService');
     return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'list_all_clients',
-  definition: {
-    name: 'list_all_clients',
-    description: `List all non-admin client accounts with quick health indicators. Admin-only tool.
-
-Returns for each client:
-- Name, email, roles
-- has_ads: whether they have a Meta ad account connected
-- has_lander: whether they have landing pages (productDomain or seoDomains)
-- has_crm: whether they have CRM integrations (email domain, LinkedIn)
-- last_activity: last login timestamp
-
-Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      required: []
-    }
-  },
-  execute: async (_args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    return await agentModeService.listAllClients(userId);
   }
 });
 
