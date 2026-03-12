@@ -150,7 +150,8 @@ export interface User {
   }>;
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
-  subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Basic")
+  stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
   connected_accounts?: Array<{

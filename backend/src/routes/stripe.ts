@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
 import { userDb, User } from "../services/db"; // Added userDb and User
+import * as stripeController from "../controllers/stripeController";
 
 dotenv.config();
 
@@ -397,6 +398,17 @@ router.post(
 );
 
 /**
+ * @route POST /api/stripe/create-checkout-session
+ * @desc Create a Stripe Checkout Session for subscription purchase
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/create-checkout-session",
+  authenticateToken,
+  stripeController.createCheckoutSession
+);
+
+/**
  * @route POST /api/stripe/cancel-subscription
  * @desc Cancel the authenticated user's subscription at the end of the current billing period
  * @access Private (requires authentication)
@@ -553,84 +565,20 @@ router.post(
 
 /**
  * @route POST /api/stripe/webhook
- * @desc Handle Stripe webhook events for subscription lifecycle
- * @access Public (verified via Stripe signature)
+ * @desc Handle Stripe webhook events (signature-verified, raw body)
+ * @access Public (Stripe sends directly — no auth)
  */
-router.post("/webhook", async (req: Request, res: Response) => {
-  if (!stripe) {
-    return res.status(500).json({ error: "Stripe not configured." });
-  }
+router.post(
+  "/webhook",
+  express.raw({ type: "application/json" }),
+  stripeController.handleWebhook
+);
 
-  const sig = req.headers["stripe-signature"] as string;
-  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-  if (!webhookSecret) {
-    console.error("STRIPE_WEBHOOK_SECRET not configured.");
-    return res.status(500).json({ error: "Webhook secret not configured." });
-  }
-
-  let event: any;
-  try {
-    // req.body is a raw Buffer thanks to express.raw() middleware on this path.
-    // This is required for Stripe signature verification to work correctly.
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-  } catch (err: any) {
-    console.error("Webhook signature verification failed:", err.message);
-    return res.status(400).json({ error: "Invalid webhook signature." });
-  }
-
-  try {
-    switch (event.type) {
-      case "customer.subscription.updated":
-      case "customer.subscription.deleted": {
-        const subscription = event.data.object as Stripe.Subscription;
-        const stripeCustomerId =
-          typeof subscription.customer === "string"
-            ? subscription.customer
-            : subscription.customer?.id;
-
-        if (!stripeCustomerId) break;
-
-        const user = await userDb.getUserByStripeCustomerId(stripeCustomerId);
-        if (!user) {
-          console.warn(
-            `Webhook: No user found for Stripe customer ${stripeCustomerId}`
-          );
-          break;
-        }
-
-        // Map Stripe status to our status
-        let status: string = subscription.status; // active, past_due, canceled, trialing, etc.
-        if (
-          subscription.status === "active" &&
-          subscription.cancel_at_period_end
-        ) {
-          status = "canceling";
-        }
-
-        await userDb.updateUser(user.userId, {
-          subscription_status: status,
-          current_period_end: new Date(
-            (subscription as any).current_period_end * 1000
-          ).toISOString(),
-        });
-
-        console.log(
-          `Webhook: Updated user ${user.userId} subscription_status=${status}`
-        );
-        break;
-      }
-
-      default:
-        // Unhandled event type — acknowledge receipt
-        break;
-    }
-
-    res.json({ received: true });
-  } catch (error: any) {
-    console.error("Webhook processing error:", error.message);
-    res.status(500).json({ error: "Webhook processing failed." });
-  }
-});
+/**
+ * @route GET /api/stripe/products
+ * @desc List active Stripe products with prices
+ * @access Public
+ */
+router.get("/products", stripeController.listProducts);
 
 export default router;
