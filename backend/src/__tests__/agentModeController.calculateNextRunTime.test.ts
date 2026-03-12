@@ -67,6 +67,57 @@ describe('calculateNextRunTime Function Logic', () => {
     });
   });
 
+  describe('Every N days frequency', () => {
+    it('should add N days and preserve time', () => {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000); // 3 days from now
+      const result = calculateNextRunTime('every_n_days', fromDate, 3);
+
+      // Should be 6 days from now (fromDate + 3 days)
+      const expectedMin = fromDate.getTime() + 3 * 24 * 60 * 60 * 1000 - 1000;
+      expect(result.getTime()).toBeGreaterThan(expectedMin);
+      expect(result.getUTCHours()).toBe(fromDate.getUTCHours());
+      expect(result.getUTCMinutes()).toBe(fromDate.getUTCMinutes());
+    });
+
+    it('should handle interval of 1 (equivalent to daily)', () => {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 24 * 60 * 60 * 1000); // Tomorrow
+      const result = calculateNextRunTime('every_n_days', fromDate, 1);
+
+      // Should be 2 days from now (fromDate + 1 day)
+      expect(result.getTime()).toBeGreaterThan(fromDate.getTime());
+      expect(result.getUTCHours()).toBe(fromDate.getUTCHours());
+    });
+
+    it('should handle large intervals', () => {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000); // 90 days from now
+      const result = calculateNextRunTime('every_n_days', fromDate, 90);
+
+      // Should be 180 days from now (fromDate + 90 days)
+      expect(result.getTime()).toBeGreaterThan(fromDate.getTime());
+    });
+
+    it('should ensure next run is in the future when past due', () => {
+      const now = new Date();
+      const pastDate = new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000); // 10 days ago
+      const result = calculateNextRunTime('every_n_days', pastDate, 3);
+
+      // Should catch up by adding 3-day intervals until in the future
+      expect(result.getTime()).toBeGreaterThan(now.getTime());
+    });
+
+    it('should default to 1 day when frequencyIntervalDays is undefined', () => {
+      const now = new Date();
+      const fromDate = new Date(now.getTime() + 24 * 60 * 60 * 1000); // Tomorrow
+      const result = calculateNextRunTime('every_n_days', fromDate);
+
+      // Should behave like daily (add 1 day)
+      expect(result.getTime()).toBeGreaterThan(fromDate.getTime());
+    });
+  });
+
   describe('Daily frequency', () => {
     it('should add 1 day and preserve time', () => {
       const now = new Date();
@@ -157,7 +208,7 @@ describe('calculateNextRunTime Function Logic', () => {
 });
 
 // Helper function to test (copied from controller)
-function calculateNextRunTime(frequency: string, fromDate: Date): Date {
+function calculateNextRunTime(frequency: string, fromDate: Date, frequencyIntervalDays?: number): Date {
   const now = new Date();
   let nextRun = new Date(fromDate);
 
@@ -169,6 +220,14 @@ function calculateNextRunTime(frequency: string, fromDate: Date): Date {
         nextRun.setUTCHours(nextRun.getUTCHours() + 1);
       }
       break;
+    case 'every_n_days': {
+      const interval = frequencyIntervalDays && frequencyIntervalDays >= 1 ? frequencyIntervalDays : 1;
+      nextRun.setUTCDate(nextRun.getUTCDate() + interval);
+      while (nextRun <= now) {
+        nextRun.setUTCDate(nextRun.getUTCDate() + interval);
+      }
+      break;
+    }
     case 'daily':
       nextRun.setUTCDate(nextRun.getUTCDate() + 1);
       while (nextRun <= now) {

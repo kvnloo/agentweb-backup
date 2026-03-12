@@ -110,6 +110,11 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     path: '/landing-pages',
     label: 'Landing Pages',
     description: 'Project documentation from the AgentWebPro organization'
+  },
+  {
+    path: '/social-posts',
+    label: 'Social Posts',
+    description: 'View and track social media posts and engagement metrics'
   }
 ];
 

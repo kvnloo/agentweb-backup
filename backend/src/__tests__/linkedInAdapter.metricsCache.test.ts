@@ -155,7 +155,7 @@ describe('LinkedInAdapter metrics cache', () => {
       expect(mockDocumentClientMethods.update).toHaveBeenCalledWith(
         expect.objectContaining({
           Key: { userId: 'user-1', postId: 'urn:li:share:111' },
-          UpdateExpression: 'SET metrics = :m, metricsFetchedAt = :ts',
+          UpdateExpression: 'SET #metrics = :m, metricsFetchedAt = :ts',
         })
       );
     });

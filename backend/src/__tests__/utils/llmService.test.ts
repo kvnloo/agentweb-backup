@@ -159,6 +159,34 @@ describe('llmService', () => {
       expect(service).toBeInstanceOf(LLMService);
     });
 
+    it('should fall back to AWS_DEFAULT_REGION when AWS_REGION is not set', () => {
+      delete process.env.AWS_REGION;
+      process.env.AWS_DEFAULT_REGION = 'eu-west-1';
+      new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
+    it('should fall back to us-west-2 when neither AWS_REGION nor AWS_DEFAULT_REGION is set', () => {
+      delete process.env.AWS_REGION;
+      delete process.env.AWS_DEFAULT_REGION;
+      new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
+    it('should use empty string for AWS_SECRET_ACCESS_KEY when not set', () => {
+      delete process.env.AWS_SECRET_ACCESS_KEY;
+      // AWS_ACCESS_KEY_ID is set but SECRET_ACCESS_KEY is not
+      new LLMService('claude-3-sonnet');
+      expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
+    it('should fall back to gpt-4 when no model specified and AZURE_OPENAI_DEPLOYMENT not set', () => {
+      delete process.env.AZURE_OPENAI_DEPLOYMENT;
+      const service = new LLMService();
+      expect(AzureChatOpenAI).toHaveBeenCalled();
+      expect(service).toBeInstanceOf(LLMService);
+    });
+
     it('should pass maxTokens when provided', () => {
       new LLMService('gpt-4', 0.5, 2000);
       expect(AzureChatOpenAI).toHaveBeenCalled();
