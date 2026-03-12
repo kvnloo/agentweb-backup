@@ -938,6 +938,9 @@ export class AgentModeService {
           });
         }
 
+        // Execute tool calls in parallel for performance
+        // When the LLM returns multiple tool_calls in one response, they are independent
+        // and can run concurrently instead of sequentially.
         const pendingCounterUpdates: Record<string, number> = {};
         const failedCounterUpdates: Record<string, number> = {};
 
@@ -989,14 +992,25 @@ export class AgentModeService {
           }
         }
 
-        // Phase 2: Execute tools sequentially to preserve ordering dependencies
-        // LLMs may emit dependent tool calls in one response (e.g., read then update),
-        // so parallel execution could cause data races.
-        for (const { toolCall, functionArgs } of preparedCalls) {
+        // Phase 2: Execute all prepared tools in parallel
+        const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
           const toolStart = Date.now();
           try {
             const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
             const toolDuration = Date.now() - toolStart;
+            return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
+          } catch (error) {
+            const toolDuration = Date.now() - toolStart;
+            return { status: 'error' as const, toolCall, functionArgs, error, duration: toolDuration };
+          }
+        });
+
+        const toolResults = await Promise.all(toolPromises);
+
+        // Phase 3: Process results in original order — append to messages, toolCalls, counters
+        for (const toolResult of toolResults) {
+          if (toolResult.status === 'success') {
+            const { toolCall, functionArgs, result, duration } = toolResult;
             const minimalResult = this.extractMinimalToolResult(result, toolCall.function.name);
 
             toolCalls.push({
@@ -1004,7 +1018,7 @@ export class AgentModeService {
               name: toolCall.function.name,
               arguments: functionArgs,
               result: minimalResult,
-              duration: toolDuration
+              duration
             });
 
             pendingCounterUpdates[toolCall.function.name] =
@@ -1018,14 +1032,14 @@ export class AgentModeService {
               content: toolContent,
               metadata: { timestamp: new Date().toISOString() }
             });
-          } catch (error) {
-            const toolDuration = Date.now() - toolStart;
+          } else {
+            const { toolCall, functionArgs, error, duration } = toolResult;
             toolCalls.push({
               id: toolCall.id,
               name: toolCall.function.name,
               arguments: functionArgs || toolCall.function.arguments,
               error: error instanceof Error ? error.message : 'Unknown error',
-              duration: toolDuration
+              duration
             });
 
             failedCounterUpdates[toolCall.function.name] =

@@ -228,9 +228,9 @@ describe('AgentModeService - LLM Timing Metadata', () => {
     });
   });
 
-  describe('sequential tool execution', () => {
-    it('should execute multiple tools sequentially to prevent data races', async () => {
-      const executionOrder: string[] = [];
+  describe('parallel tool execution', () => {
+    it('should execute multiple tools concurrently (not sequentially)', async () => {
+      const TOOL_DELAY_MS = 50;
 
       llmCallSpy.mockResolvedValueOnce({
         choices: [{
@@ -254,26 +254,23 @@ describe('AgentModeService - LLM Timing Metadata', () => {
         }]
       });
 
-      // Track execution order to verify sequential behavior
-      jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(async (...args: any[]) => {
-        const toolName = args[1] as string;
-        executionOrder.push(`start:${toolName}`);
-        await new Promise(resolve => setTimeout(resolve, 10));
-        executionOrder.push(`end:${toolName}`);
+      // Each tool takes TOOL_DELAY_MS — if sequential, total >= 3 * TOOL_DELAY_MS
+      // If parallel, total should be close to TOOL_DELAY_MS
+      jest.spyOn(agentModeService as any, 'executeTool').mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, TOOL_DELAY_MS));
         return { success: true };
       });
       jest.spyOn(agentModeService as any, 'extractMinimalToolResult').mockReturnValue({ success: true });
 
+      const start = Date.now();
       await agentModeService.generateMarketingResponse(
         'Test message', [], 'test-user', 'test-model', 'test-session', true
       );
+      const elapsed = Date.now() - start;
 
-      // Sequential execution: each tool starts after the previous one ends
-      expect(executionOrder).toEqual([
-        'start:search_web', 'end:search_web',
-        'start:get_seo_metrics', 'end:get_seo_metrics',
-        'start:get_website_info', 'end:get_website_info'
-      ]);
+      // If tools run in parallel, total should be well under 3 * TOOL_DELAY_MS
+      // Allow generous margin for test overhead but reject clearly sequential execution
+      expect(elapsed).toBeLessThan(3 * TOOL_DELAY_MS);
     });
 
     it('should preserve tool result order matching original tool_calls order', async () => {
