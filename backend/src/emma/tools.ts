@@ -4110,6 +4110,9 @@ const bridgedToolNames = [
   'enable_lead_list_public_access',
   'duplicate_landing_page',
   'edit_landing_page_file',
+  'list_landing_page_files',
+  'read_landing_page_file',
+  'get_deployment_status',
 ];
 
 for (const toolName of bridgedToolNames) {

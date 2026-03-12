@@ -461,9 +461,9 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'manage_lead_list',
+  name: 'create_lead_list',
   definition: {
-    name: 'manage_lead_list',
+    name: 'create_lead_list',
     description: 'Create, update, or delete a lead list. Use action: "create", "get", "update", or "delete".',
     inputSchema: {
       type: 'object',
@@ -1007,14 +1007,14 @@ mcpToolRegistry.register({
   name: 'generate_landing_page',
   definition: {
     name: 'generate_landing_page',
-    description: 'Generate a production landing page using v0 AI and deploy it. PREREQUISITE: Before calling this tool, you MUST have: 1. Called preview_landing_page_html and shown the preview to the user, 2. Received user approval on the preview design, 3. Called manage_lead_list (action: create) to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. Pass the lead_list_id so the generated page includes a working contact form.',
+    description: 'Generate a production landing page using v0 AI. PREREQUISITE: Before calling this tool, you MUST have: 1. Used create_html_from_template to generate an HTML preview and shown it to the user, 2. Received user approval on the preview design, 3. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. IMPORTANT: Pass the approved HTML from create_html_from_template as template_html so v0 faithfully recreates the design. Pass lead_list_id so the generated page includes a working contact form.',
     inputSchema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Description of the landing page to generate' },
         name: { type: 'string', description: 'Optional display name for the page' },
-        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from manage_lead_list)' },
-        template_html: { type: 'string', description: 'Optional HTML template to use as base' }
+        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' },
+        template_html: { type: 'string', description: 'The approved HTML from create_html_from_template. v0 will recreate this design as a production React/Next.js page. ALWAYS pass this when the user approved an HTML preview.' }
       },
       required: ['prompt']
     }
@@ -1208,6 +1208,70 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'PUT', path: `/api/landing-pages/v0/generated/${args.page_id}/github-edit`, context: ctx(context),
       body: { file_path: args.file_path, content: args.content, commit_message: args.commit_message }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_landing_page_files',
+  definition: {
+    name: 'list_landing_page_files',
+    description: 'List all files in a deployed landing page\'s GitHub repository. Use this BEFORE edit_landing_page_file to see what files exist and find the right file to edit.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'read_landing_page_file',
+  definition: {
+    name: 'read_landing_page_file',
+    description: 'Read the contents of a specific file in a deployed landing page\'s GitHub repository. Use this to see the current code before making edits with edit_landing_page_file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' }
+      },
+      required: ['page_id', 'file_path']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_deployment_status',
+  definition: {
+    name: 'get_deployment_status',
+    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. If the build failed, returns the error details so you can fix the code via edit_landing_page_file and the build will automatically retry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/deployment-status`, context: ctx(context)
     });
     return jsonResult(data);
   }

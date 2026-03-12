@@ -371,3 +371,64 @@ export async function getV0ApiKey(): Promise<string> {
     throw new Error('Failed to fetch V0 API key. Set V0_API_KEY env var or store in Secrets Manager.');
   }
 }
+
+interface GitHubOrgCredentials {
+  orgToken: string;
+  org: string;
+}
+
+/**
+ * Get GitHub org-level token for creating repos under AgentWebPro.
+ * Falls back to GITHUB_ORG_TOKEN environment variable.
+ */
+export async function getGitHubOrgToken(): Promise<{ token: string; org: string }> {
+  if (process.env.GITHUB_ORG_TOKEN) {
+    return { token: process.env.GITHUB_ORG_TOKEN, org: process.env.GITHUB_ORG || 'AgentWebPro' };
+  }
+
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/GitHub'
+      : 'dev/AgentWeb/GitHub';
+
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString) as GitHubOrgCredentials;
+    if (!credentials.orgToken) {
+      throw new Error('GitHub credentials missing orgToken');
+    }
+
+    return { token: credentials.orgToken, org: credentials.org || 'AgentWebPro' };
+  } catch (error) {
+    console.error('Error fetching GitHub org token from Secrets Manager:', error);
+    throw new Error('Failed to fetch GitHub org token. Set GITHUB_ORG_TOKEN env var or store in Secrets Manager.');
+  }
+}
+
+/**
+ * Get Vercel API token for creating projects and deployments.
+ * Falls back to VERCEL_TOKEN environment variable.
+ */
+export async function getVercelToken(): Promise<string> {
+  if (process.env.VERCEL_TOKEN) {
+    return process.env.VERCEL_TOKEN;
+  }
+
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Vercel'
+      : 'dev/AgentWeb/Vercel';
+
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString) as { token: string };
+    if (!credentials.token) {
+      throw new Error('Vercel credentials missing token');
+    }
+
+    return credentials.token;
+  } catch (error) {
+    console.error('Error fetching Vercel token from Secrets Manager:', error);
+    throw new Error('Failed to fetch Vercel token. Set VERCEL_TOKEN env var or store in Secrets Manager.');
+  }
+}

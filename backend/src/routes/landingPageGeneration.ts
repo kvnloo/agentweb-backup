@@ -1,4 +1,5 @@
 import { Router, Request, Response, NextFunction } from "express";
+import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb } from "../services/db";
 import {
@@ -9,6 +10,7 @@ import {
   listLandingPages,
   deleteLandingPage,
   BrandContext,
+  getDeploymentStatus,
 } from "../services/v0Service";
 
 const router = Router();
@@ -363,19 +365,143 @@ router.put("/generated/:id/github-edit", async (req, res: Response) => {
       return res.status(400).json({ error: "file_path and content are required" });
     }
 
-    // Return the repo details for the GitHub MCP tool to handle the actual edit
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+
+    // Get the current file SHA (needed for updates)
+    let fileSha: string | undefined;
+    try {
+      const fileRes = await axios.get<any>(
+        `https://api.github.com/repos/${owner}/${repoName}/contents/${file_path}`,
+        { headers: ghHeaders }
+      );
+      fileSha = fileRes.data.sha;
+    } catch (err: any) {
+      if (err.response?.status !== 404) throw err;
+      // 404 means new file — no sha needed
+    }
+
+    // Create or update the file
+    const putBody: any = {
+      message: commit_message || `Update ${file_path} via Emma`,
+      content: Buffer.from(content, "utf-8").toString("base64"),
+    };
+    if (fileSha) putBody.sha = fileSha;
+
+    const commitRes = await axios.put<any>(
+      `https://api.github.com/repos/${owner}/${repoName}/contents/${file_path}`,
+      putBody,
+      { headers: ghHeaders }
+    );
+
     res.json({
-      owner,
-      repo: repo.replace('.git', ''),
+      success: true,
+      commit_url: commitRes.data.commit?.html_url,
       file_path,
-      content,
-      commit_message: commit_message || `Update ${file_path} via Emma`,
       page_id: page.id,
       deployed_url: page.deployedUrl,
+      message: `File "${file_path}" updated. Changes will auto-deploy to ${page.deployedUrl} within ~30 seconds.`,
     });
   } catch (error: any) {
     console.error("[LP GENERATION] Error with github edit:", error);
     res.status(500).json({ error: "Failed to process edit request" });
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/deployment-status
+ * Check the Vercel build/deployment status for a landing page.
+ * Returns build status, errors if any, and deployed URL.
+ */
+router.get("/generated/:id/deployment-status", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const result = await getDeploymentStatus(req.params.id, userId);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error checking deployment status:", error);
+    res.status(500).json({ error: error.message || "Failed to check deployment status" });
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/files
+ * List files in the landing page's GitHub repo (recursive).
+ */
+router.get("/generated/:id/files", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
+
+    const match = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!match) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+
+    const [, owner, repo] = match;
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+
+    const treeRes = await axios.get<any>(
+      `https://api.github.com/repos/${owner}/${repoName}/git/trees/main?recursive=1`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+    );
+
+    const files = treeRes.data.tree
+      .filter((item: any) => item.type === "blob")
+      .map((item: any) => ({ path: item.path, size: item.size }));
+
+    res.json({ files, repo: `${owner}/${repoName}` });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error listing files:", error);
+    res.status(500).json({ error: "Failed to list files" });
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/files/:path(*)
+ * Read a file from the landing page's GitHub repo.
+ */
+router.get("/generated/:id/file-content", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
+
+    const filePath = req.query.path as string;
+    if (!filePath) return res.status(400).json({ error: "path query parameter is required" });
+
+    const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+
+    const [, owner, repo] = repoMatch;
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+
+    const fileRes = await axios.get<any>(
+      `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+    );
+
+    const content = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+    res.json({ path: filePath, content, sha: fileRes.data.sha });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error reading file:", error);
+    res.status(500).json({ error: "Failed to read file" });
   }
 });
 
