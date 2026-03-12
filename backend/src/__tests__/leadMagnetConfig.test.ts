@@ -140,8 +140,8 @@ describe('LeadMagnetConfigDb', () => {
     );
   });
 
-  // SUCCESS test 9: Update config
-  it('should update config and refresh updatedAt', async () => {
+  // SUCCESS test 9: Update config with optimistic concurrency
+  it('should update config with ConditionExpression for optimistic locking', async () => {
     const existing: LeadMagnetConfig = {
       ...validConfig,
       configId: 'cfg-update',
@@ -159,5 +159,41 @@ describe('LeadMagnetConfigDb', () => {
     expect(result.enabled).toBe(false);
     expect(result.configId).toBe('cfg-update');
     expect(result.updatedAt).not.toBe('2026-03-10T00:00:00Z');
+    // Verify optimistic concurrency control
+    expect(mockPut).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        ExpressionAttributeValues: { ':expectedUpdatedAt': '2026-03-10T00:00:00Z' },
+      }),
+    );
+  });
+
+  // SUCCESS test 10: listAll handles DynamoDB pagination
+  it('should paginate through all scan results', async () => {
+    const page1Items = [
+      { ...validConfig, configId: 'c1', createdAt: 'x', updatedAt: 'x' },
+    ];
+    const page2Items = [
+      { ...validConfig, configId: 'c2', createdAt: 'x', updatedAt: 'x', name: 'Second' },
+    ];
+    mockScan
+      .mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({
+          Items: page1Items,
+          LastEvaluatedKey: { configId: 'c1' },
+        }),
+      })
+      .mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({
+          Items: page2Items,
+        }),
+      });
+
+    const result = await db.listAll();
+
+    expect(mockScan).toHaveBeenCalledTimes(2);
+    expect(result).toHaveLength(2);
+    expect(result[0].configId).toBe('c1');
+    expect(result[1].configId).toBe('c2');
   });
 });

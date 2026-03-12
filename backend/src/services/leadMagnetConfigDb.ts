@@ -81,39 +81,46 @@ export class LeadMagnetConfigDb {
     return (result.Item as LeadMagnetConfig) || null;
   }
 
-  async getBySlug(slug: string): Promise<LeadMagnetConfig | null> {
-    const result = await this.docClient
-      .scan({
-        TableName: this.tableName,
-        FilterExpression: 'landingPageSlug = :slug',
-        ExpressionAttributeValues: { ':slug': slug },
-      })
-      .promise();
+  private async scanAll(
+    params: AWS.DynamoDB.DocumentClient.ScanInput,
+  ): Promise<LeadMagnetConfig[]> {
+    const items: LeadMagnetConfig[] = [];
+    let lastKey: AWS.DynamoDB.DocumentClient.Key | undefined;
 
-    const items = result.Items as LeadMagnetConfig[];
-    return items && items.length > 0 ? items[0] : null;
+    do {
+      const result = await this.docClient
+        .scan({ ...params, ExclusiveStartKey: lastKey })
+        .promise();
+
+      if (result.Items) {
+        items.push(...(result.Items as LeadMagnetConfig[]));
+      }
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+
+    return items;
+  }
+
+  async getBySlug(slug: string): Promise<LeadMagnetConfig | null> {
+    const items = await this.scanAll({
+      TableName: this.tableName,
+      FilterExpression: 'landingPageSlug = :slug',
+      ExpressionAttributeValues: { ':slug': slug },
+    });
+
+    return items.length > 0 ? items[0] : null;
   }
 
   async listAll(): Promise<LeadMagnetConfig[]> {
-    const result = await this.docClient
-      .scan({
-        TableName: this.tableName,
-      })
-      .promise();
-
-    return (result.Items as LeadMagnetConfig[]) || [];
+    return this.scanAll({ TableName: this.tableName });
   }
 
   async listEnabled(): Promise<LeadMagnetConfig[]> {
-    const result = await this.docClient
-      .scan({
-        TableName: this.tableName,
-        FilterExpression: 'enabled = :enabled',
-        ExpressionAttributeValues: { ':enabled': true },
-      })
-      .promise();
-
-    return (result.Items as LeadMagnetConfig[]) || [];
+    return this.scanAll({
+      TableName: this.tableName,
+      FilterExpression: 'enabled = :enabled',
+      ExpressionAttributeValues: { ':enabled': true },
+    });
   }
 
   async update(
@@ -139,6 +146,10 @@ export class LeadMagnetConfigDb {
       .put({
         TableName: this.tableName,
         Item: merged,
+        ConditionExpression: 'updatedAt = :expectedUpdatedAt',
+        ExpressionAttributeValues: {
+          ':expectedUpdatedAt': existing.updatedAt,
+        },
       })
       .promise();
 
