@@ -1007,7 +1007,7 @@ mcpToolRegistry.register({
   name: 'generate_landing_page',
   definition: {
     name: 'generate_landing_page',
-    description: 'Generate a production landing page using v0 AI. PREREQUISITE: Before calling this tool, you MUST have: 1. Used create_html_from_template to generate an HTML preview and shown it to the user, 2. Received user approval on the preview design, 3. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. IMPORTANT: Pass the approved HTML from create_html_from_template as template_html so v0 faithfully recreates the design. Pass lead_list_id so the generated page includes a working contact form.',
+    description: 'Generate AND deploy a production landing page in one step. This tool generates code via v0, pushes to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Used create_html_from_template to generate an HTML preview and shown it to the user, 2. Received user approval on the preview design, 3. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. IMPORTANT: Pass the approved HTML as template_html. Pass lead_list_id for the contact form. Do NOT call deploy_landing_page after this — deployment is automatic.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1032,7 +1032,7 @@ mcpToolRegistry.register({
   name: 'deploy_landing_page',
   definition: {
     name: 'deploy_landing_page',
-    description: 'Deploy a generated landing page to Vercel. After deployment, share the live URL with the user. The contact form will capture leads into the connected lead list.',
+    description: 'Retry deploying a landing page that failed during deployment. Only use this if generate_landing_page returned a failed status. Do NOT call this after a successful generate — deployment is already included in generate_landing_page.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -124,6 +124,17 @@ export async function generateLandingPage(
   leadListId?: string,
   templateHtml?: string
 ): Promise<GeneratedLandingPage> {
+  // Dedup: if this user already has a page with a v0ChatId that isn't failed, reuse it.
+  // This prevents burning extra v0 credits on retries or duplicate calls from Emma.
+  const existingPages = await listLandingPages(userId);
+  const reusable = existingPages.find(
+    (p) => p.v0ChatId && ["generating", "draft", "deploying", "deployed"].includes(p.status)
+  );
+  if (reusable) {
+    console.log(`[V0 SERVICE] Reusing existing page ${reusable.id} (status: ${reusable.status}, v0ChatId: ${reusable.v0ChatId}) — skipping new v0 chat`);
+    return reusable;
+  }
+
   const id = uuidv4();
   const now = new Date().toISOString();
   const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, templateHtml);
@@ -170,18 +181,12 @@ export async function generateLandingPage(
     const chatId = chat.id;
 
     // Update record with v0 chat ID and mark as draft
-    const updatedRecord: Partial<GeneratedLandingPage> = {
-      status: "draft",
-      v0ChatId: chatId,
-      updatedAt: new Date().toISOString(),
-    };
-
     let updateExpression =
       "SET #status = :status, v0ChatId = :chatId, updatedAt = :updatedAt";
     const expressionAttributeValues: Record<string, any> = {
       ":status": "draft",
       ":chatId": chatId,
-      ":updatedAt": updatedRecord.updatedAt,
+      ":updatedAt": new Date().toISOString(),
     };
 
     if (leadListId) {
@@ -199,10 +204,10 @@ export async function generateLandingPage(
       })
       .promise();
 
-    return {
-      ...record,
-      ...updatedRecord,
-    } as GeneratedLandingPage;
+    // Auto-deploy: download from v0 → GitHub → Vercel in one shot
+    console.log(`[V0 SERVICE] v0 chat created (${chatId}), auto-deploying...`);
+    const deployed = await deployLandingPage(id, userId);
+    return deployed;
   } catch (error: any) {
     console.error("[V0 SERVICE] Generation failed:", error);
 
@@ -247,7 +252,7 @@ export async function deployLandingPage(
     throw new Error("Landing page has no v0 chat — generate first");
   }
 
-  if (record.status !== "draft") {
+  if (!["draft", "failed", "deploying"].includes(record.status)) {
     throw new Error(`Cannot deploy a landing page with status: ${record.status}`);
   }
 
@@ -282,6 +287,21 @@ export async function deployLandingPage(
       .slice(0, 30);
     const repoName = `lp-${slug}-${id.slice(0, 8)}`;
     const { githubRepoUrl, repoFullName } = await createGitHubRepoAndPush(repoName, zipBuffer, record.name);
+
+    // Save GitHub repo URL immediately so it's not lost if Vercel step fails
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET #status = :status, githubRepoUrl = :repoUrl, updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "deploying",
+          ":repoUrl": githubRepoUrl,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
 
     // Step 4: Create Vercel project linked to the GitHub repo
     console.log(`[V0 SERVICE] Step 4: Creating Vercel project linked to ${repoFullName}`);
@@ -341,6 +361,27 @@ export async function deployLandingPage(
     };
   } catch (error: any) {
     console.error("[V0 SERVICE] Deployment failed:", error);
+
+    // Update DB record to "failed" so user/Emma knows what happened and can retry
+    try {
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression:
+            "SET #status = :status, errorMessage = :error, updatedAt = :updatedAt",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":status": "failed",
+            ":error": error.message || "Unknown deployment error",
+            ":updatedAt": new Date().toISOString(),
+          },
+        })
+        .promise();
+    } catch (dbError) {
+      console.error("[V0 SERVICE] Failed to update DB after deploy error:", dbError);
+    }
+
     throw new Error(`Deployment failed: ${error.message}`);
   }
 }
