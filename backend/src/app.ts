@@ -38,6 +38,7 @@ import metaAuthRoutes from "./routes/metaAuth";
 import clickupAuthRoutes from "./routes/clickupAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import linkedInOutreachAuthRoutes from "./routes/linkedInOutreachAuth";
+import youtubeAuthRoutes from "./routes/youtubeAuth";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
@@ -106,6 +107,7 @@ const corsOptions = {
         /^http:\/\/192\.168\.\d+\.\d+(:\d+)?$/, // 192.168.x.x with optional port
         /^http:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/, // 10.x.x.x with optional port
         /^http:\/\/172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+(:\d+)?$/, // 172.16-31.x.x with optional port
+        /^https?:\/\/\d+\.\d+\.\d+\.\d+(:\d+)?$/, // Any IP address (for cloud test environments)
       ];
 
       const isLocalNetwork = localNetworkPatterns.some((pattern) =>
@@ -196,6 +198,7 @@ app.use("/api/oauth/linkedin-outreach", linkedInOutreachAuthRoutes);
 app.use("/api/oauth/gmail", gmailAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
+app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);

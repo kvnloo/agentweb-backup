@@ -334,6 +334,18 @@ export async function getGmailCredentials(): Promise<GmailCredentials> {
 }
 
 /**
+ * Get YouTube OAuth credentials from AWS Secrets Manager.
+ * Reuses the Gmail Google OAuth credentials (same Google Cloud project).
+ *
+ * Secret location: dev/AgentWeb/Google/Gmail (or prod/... for production)
+ *
+ * @returns YouTube OAuth client credentials (same as Gmail)
+ */
+export async function getYouTubeCredentials(): Promise<GmailCredentials> {
+  return getGmailCredentials();
+}
+
+/**
  * Interface for V0 credentials returned from Secrets Manager
  */
 export interface V0Credentials {
