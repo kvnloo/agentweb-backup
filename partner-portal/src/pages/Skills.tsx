@@ -217,33 +217,23 @@ export default function Skills() {
 
   // Toggle a skill's membership in a subscription type
   const handleToggleSubscription = async (skillId: string, subName: string) => {
+    const sub = subscriptionTypes.find((t) => t.name === subName);
+    if (!sub) return;
+    const hasSkill = sub.allowedSkills.includes(skillId) || sub.allowedSkills.includes("*");
+    const action = hasSkill ? "remove" : "add";
+
     setSavingSubscriptions(true);
     try {
-      const updatedTypes = subscriptionTypes.map((type) => {
-        if (type.name !== subName) return type;
-        const hasSkill = type.allowedSkills.includes(skillId) || type.allowedSkills.includes("*");
-        let newAllowedSkills: string[];
-        if (type.allowedSkills.includes("*")) {
-          // Expand wildcard: include all published skill IDs + __other_skills__ except this one
-          const allSkillIds = skills
-            .filter((s) => s.isPublished)
-            .map((s) => s.skillId)
-            .concat("__other_skills__");
-          newAllowedSkills = allSkillIds.filter((id) => id !== skillId);
-        } else if (hasSkill) {
-          newAllowedSkills = type.allowedSkills.filter((id) => id !== skillId);
-        } else {
-          newAllowedSkills = [...type.allowedSkills, skillId];
-        }
-        return { ...type, allowedSkills: newAllowedSkills };
-      });
-
-      await axios.post(
-        buildApiUrl("/api/admin/subscription-types"),
-        { subscriptionTypes: updatedTypes },
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/subscription-types/${encodeURIComponent(subName)}/skills`),
+        { skillId, action },
         { headers: { Authorization: `Bearer ${token}` } }
       );
-      setSubscriptionTypes(updatedTypes);
+      // Update only the affected subscription type in local state
+      const updated = response.data.subscriptionType as SubscriptionType;
+      setSubscriptionTypes((prev) =>
+        prev.map((t) => (t.name === subName ? updated : t))
+      );
     } catch (err) {
       setError("Failed to update subscription");
       console.error(err);
