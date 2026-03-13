@@ -357,6 +357,11 @@ router.put("/generated/:id/github-edit", async (req, res: Response) => {
       return res.status(400).json({ error: "file_path and content are required" });
     }
 
+    // Prevent path traversal attacks
+    if (file_path.includes('..') || file_path.startsWith('.github/') || file_path.startsWith('.github\\')) {
+      return res.status(400).json({ error: "Invalid file path" });
+    }
+
     const repoName = repo.replace('.git', '');
     const { getGitHubOrgToken } = await import("../utils/secretsManager");
     const { token } = await getGitHubOrgToken();
