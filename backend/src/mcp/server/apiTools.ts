@@ -1007,14 +1007,14 @@ mcpToolRegistry.register({
   name: 'generate_landing_page',
   definition: {
     name: 'generate_landing_page',
-    description: 'Generate AND deploy a production landing page in one step. This tool generates code via v0, pushes to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Used create_html_from_template to generate an HTML preview and shown it to the user, 2. Received user approval on the preview design, 3. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. IMPORTANT: Pass the approved HTML as template_html. Pass lead_list_id for the contact form. Do NOT call deploy_landing_page after this — deployment is automatic.',
+    description: 'Generate AND deploy a production landing page in one step. This tool generates code via v0, pushes to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Used preview_landing_page_html to generate an HTML preview and shown it to the user, 2. Received user approval on the preview design, 3. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. IMPORTANT: Pass the approved HTML as template_html and the lead list ID as lead_list_id for the contact form. Do NOT call deploy_landing_page after this — deployment is automatic.',
     inputSchema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Description of the landing page to generate' },
         name: { type: 'string', description: 'Optional display name for the page' },
         lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' },
-        template_html: { type: 'string', description: 'The approved HTML from create_html_from_template. v0 will recreate this design as a production React/Next.js page. ALWAYS pass this when the user approved an HTML preview.' }
+        template_html: { type: 'string', description: 'The approved HTML from preview_landing_page_html. v0 will recreate this design as a production React/Next.js page. ALWAYS pass this when the user approved an HTML preview.' }
       },
       required: ['prompt']
     }
