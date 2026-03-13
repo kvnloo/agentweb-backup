@@ -16581,81 +16581,37 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
-      const { socialPlatformService } = await import('./socialPlatformService');
-
-      try {
-        console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? {
-          found: true,
-          platform: account.platform,
-          accountType: account.config?.account_type,
-          accountName: account.account_name
-        } : { found: false });
-
-        if (!account) {
-          return {
-            success: false,
-            message: 'Account not found or access denied'
-          };
-        }
-
-        // NOTE: Skipping isTokenValid check here because the adapter should handle 
-        // token refresh internally. However, listPosts doesn't pass userId, so we
-        // need to check if the adapter supports token refresh for this operation.
-        console.log('[AgentMode] Getting adapter for platform:', account.platform);
-        const adapter = socialPlatformService.getAdapter(account.platform);
-        const limit = options.limit || 10;
-        
-        console.log('[AgentMode] Calling adapter.listPosts with limit:', limit);
-        // Fetch posts via adapter
-        let posts = await adapter.listPosts(account, { limit });
-        console.log('[AgentMode] listPosts returned', posts?.length || 0, 'posts');
-        
-        // Fetch metrics merging if requested and supported
-        if (options.include_metrics && posts.length > 0) {
-          try {
-            // Assume posts have an 'id' field as per LinkedIn/generic structure
-            const postIds = posts.map(p => p.id).filter(Boolean);
-            if (postIds.length > 0) {
-              const metrics = await adapter.getPostMetrics(account, postIds, userId);
-              
-              // Merge metrics into posts
-              posts = posts.map(post => {
-                const metric = metrics.find(m => m.share === post.id);
-                return {
-                  ...post,
-                  metrics: metric ? {
-                    likeCount: metric.likes,
-                    commentCount: metric.comments,
-                    shareCount: metric.shares,
-                    impressionCount: metric.impressions,
-                    clickCount: metric.clicks,
-                    engagement: metric.engagement
-                  } : null
-                };
-              });
-            }
-          } catch (metricError) {
-            console.warn('AgentMode: Failed to fetch post metrics:', metricError);
-            // Continue without metrics
-          }
-        }
-        
-        return {
-          success: true,
-          message: `Successfully loaded ${posts.length} posts from ${account.platform}`,
-          posts: posts
-        };
-
-      } catch (error: any) {
+      // Check if the account exists first
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const allAccounts = await getAccountsByUserId(userId);
+      const matchingAccount = allAccounts.find(a => a.account_id === accountId);
+      if (!matchingAccount) {
         return {
           success: false,
-          message: `Failed to load posts: ${error.message}`
+          message: 'Account not found or access denied'
         };
       }
 
+      const { getPostsForUser } = await import('./socialPostsService');
+      const result = await getPostsForUser(userId, {
+        accountId,
+        limit: options.limit || 10,
+        includeMetrics: options.include_metrics !== false,
+      });
+
+      // If the account wasn't processed (adapter threw), treat as failure
+      if (result.accounts.length === 0) {
+        return {
+          success: false,
+          message: 'Failed to load posts',
+        };
+      }
+
+      return {
+        success: true,
+        message: `Successfully loaded ${result.posts.length} posts`,
+        posts: result.posts
+      };
     } catch (error) {
       console.error('AgentMode: Error loading connected account posts:', error);
       return {
@@ -16788,6 +16744,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
     try {
       switch (action) {
+        case 'search-people': {
+          const { keywords, search_url, title, company, cursor } = args;
+          if (!keywords && !search_url && !cursor) throw new Error('Either keywords, search_url, or cursor is required for search-people');
+          const searchResult = await linkedInOutreachService.searchPeople(account_id, {
+            keywords, url: search_url, title, company, cursor
+          });
+          return { success: true, data: searchResult };
+        }
+
+        case 'get-profile': {
+          if (!target) throw new Error('Either profile_url or provider_id is required for get-profile');
+          if (isUrl) {
+            const profileResult = await linkedInOutreachService.getLinkedInProfile(target, account_id);
+            return { success: true, data: profileResult };
+          }
+          const profileResult = await linkedInOutreachService.getProfile(target, account_id);
+          return { success: true, data: profileResult };
+        }
+
+        case 'list-connections': {
+          const connectionsResult = await linkedInOutreachService.listConnections(account_id, args.cursor);
+          return { success: true, data: connectionsResult };
+        }
+
+        case 'list-sent-invitations': {
+          const invitationsResult = await linkedInOutreachService.listSentInvitations(account_id, args.cursor);
+          return { success: true, data: invitationsResult };
+        }
+
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
           const inviteResult = await linkedInOutreachService.sendInvitation(account_id, target, isUrl, message);
@@ -16801,6 +16786,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return { success: true, data: messageResponse };
         }
 
+        case 'get-company': {
+          const companyId = args.company_id;
+          if (!companyId) throw new Error('company_id is required for get-company');
+          const companyResult = await linkedInOutreachService.getCompanyProfile(companyId, account_id);
+          return { success: true, data: companyResult };
+        }
+
+        case 'cancel-invitation': {
+          const invitationId = args.invitation_id;
+          if (!invitationId) throw new Error('invitation_id is required for cancel-invitation');
+          const cancelResult = await linkedInOutreachService.cancelInvitation(invitationId, account_id);
+          return { success: true, data: cancelResult };
+        }
+
         default:
           throw new Error(`Unsupported LinkedIn outreach action: ${action}`);
       }
@@ -16809,7 +16808,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // Errors that went through handleError are already logged by the service; don't double-log.
       // Also suppress user-facing errors like "Cannot send message: not a 1st-degree connection".
       const alreadyLogged = error instanceof Error && !!(error as any).structuredError;
-      const isExpectedUserError = errorMessage.startsWith('Cannot send message:');
+      const isExpectedUserError = errorMessage.startsWith('Cannot send message:') || errorMessage.startsWith('Cannot send invite:');
       if (!alreadyLogged && !isExpectedUserError) {
         console.error('AgentMode: LinkedIn outreach failed:', error);
       }
@@ -16819,6 +16818,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         error: errorMessage
       };
     }
+  }
+
+  // --- Client Health Assessment (admin-only) ---
+
+  async assessClientHealth(callerUserId: string, clientNameOrEmail: string): Promise<any> {
+    const { assessClientHealth } = await import('./clientHealthService');
+    return assessClientHealth(callerUserId, clientNameOrEmail);
+  }
+
+  async listAllClients(callerUserId: string): Promise<any> {
+    const { listAllClients } = await import('./clientHealthService');
+    return listAllClients(callerUserId);
   }
 }
 

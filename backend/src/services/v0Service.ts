@@ -1137,6 +1137,61 @@ export async function getDeploymentStatus(
 }
 
 /**
+ * Refine a landing page with follow-up instructions via v0 chat.
+ */
+export async function iterateLandingPage(
+  id: string,
+  userId: string,
+  message: string
+): Promise<GeneratedLandingPage> {
+  const record = await getLandingPage(id, userId);
+  if (!record) {
+    throw new Error("Landing page not found");
+  }
+
+  if (!record.v0ChatId) {
+    throw new Error("Landing page has no v0 chat — generate first");
+  }
+
+  try {
+    const v0 = await getV0Client();
+
+    await v0.chats.sendMessage({
+      chatId: record.v0ChatId,
+      message,
+    });
+
+    // Reset status to draft (needs re-deploy after iteration)
+    const newStatus = record.status === "deployed" ? "draft" : record.status;
+
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": newStatus,
+          ":iterations": (record.iterations || 0) + 1,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    return {
+      ...record,
+      status: newStatus,
+      iterations: (record.iterations || 0) + 1,
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error: any) {
+    console.error("[V0 SERVICE] Iteration failed:", error);
+    throw new Error(`Iteration failed: ${error.message}`);
+  }
+}
+
+/**
  * Get a single landing page by ID (scoped to user). Excludes archived unless requested.
  */
 export async function getLandingPage(

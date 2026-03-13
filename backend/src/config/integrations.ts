@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getMetaCredentials, getGmailCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getMetaCredentials, getGmailCredentials, getYouTubeCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -75,6 +75,20 @@ export const INTEGRATION_CONFIG = {
     scopes: [
       'https://www.googleapis.com/auth/gmail.readonly',
       'https://www.googleapis.com/auth/gmail.send',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile',
+    ],
+  },
+
+  youtube: {
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/youtube/callback`,
+    authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    profileUrl: 'https://www.googleapis.com/oauth2/v2/userinfo',
+    channelsUrl: 'https://www.googleapis.com/youtube/v3/channels',
+    scopes: [
+      'https://www.googleapis.com/auth/youtube',
+      'https://www.googleapis.com/auth/youtube.readonly',
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ],
@@ -185,6 +199,47 @@ export async function getGmailConfig(): Promise<GmailOAuthConfig> {
   };
   gmailConfigCacheExpiresAt = Date.now() + GMAIL_CONFIG_CACHE_TTL_MS;
   return cachedGmailConfig;
+}
+
+// YouTube configuration interface
+export interface YouTubeOAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  profileUrl: string;
+  channelsUrl: string;
+}
+
+// Module-level cache for YouTube config (reuses Gmail credentials)
+let cachedYouTubeConfig: YouTubeOAuthConfig | null = null;
+let youtubeConfigCacheExpiresAt = 0;
+const YOUTUBE_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Returns YouTube OAuth configuration.
+ * Reuses Gmail Google OAuth credentials from AWS Secrets Manager.
+ * Result is cached for 5 minutes.
+ */
+export async function getYouTubeConfig(): Promise<YouTubeOAuthConfig> {
+  if (cachedYouTubeConfig && Date.now() < youtubeConfigCacheExpiresAt) {
+    return cachedYouTubeConfig;
+  }
+  const credentials = await getYouTubeCredentials();
+  cachedYouTubeConfig = {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.youtube.redirectUri,
+    scopes: INTEGRATION_CONFIG.youtube.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.youtube.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.youtube.tokenUrl,
+    profileUrl: INTEGRATION_CONFIG.youtube.profileUrl,
+    channelsUrl: INTEGRATION_CONFIG.youtube.channelsUrl,
+  };
+  youtubeConfigCacheExpiresAt = Date.now() + YOUTUBE_CONFIG_CACHE_TTL_MS;
+  return cachedYouTubeConfig;
 }
 
 /**

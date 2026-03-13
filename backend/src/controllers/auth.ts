@@ -36,7 +36,8 @@ export const register = async (req: Request, res: Response) => {
         ? reqRoles
         : ["customer"];
 
-    // Check waitlist status only for non-free users
+    // Check waitlist status only for non-free users (feature-flagged via SKIP_WAITLIST_CHECK)
+    const skipWaitlist = process.env.SKIP_WAITLIST_CHECK === 'true';
     let waitlistEntry = null;
     let stripe_customer_id = undefined;
     let companyNameFromWaitlist = undefined;
@@ -44,31 +45,15 @@ export const register = async (req: Request, res: Response) => {
     let displayNameFromWaitlist = undefined;
 
     if (!finalRoles.includes('free')) {
-      // Only check waitlist for premium users (customer/partner)
+      // Look up waitlist entry to copy bonus data if present (no gate)
       waitlistEntry = await waitlistDb.getByEmail(email);
 
-      if (!waitlistEntry) {
-        const landingSiteUrl =
-          process.env.LANDING_SITE_URL || "https://agentweb.pro";
-        return res.status(403).json({
-          message: `Please join our waitlist first at ${landingSiteUrl}`,
-          code: "not_in_waitlist",
-        });
+      if (waitlistEntry) {
+        stripe_customer_id = waitlistEntry.stripe_customer_id;
+        companyNameFromWaitlist = waitlistEntry.companyName;
+        useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+        displayNameFromWaitlist = waitlistEntry.fullName;
       }
-
-      if (waitlistEntry.status !== "invited") {
-        return res.status(403).json({
-          message:
-            "Your account is on our waitlist but hasn't been invited yet. Please look out for an invitation email.",
-          code: "not_invited",
-        });
-      }
-
-      // Extract additional details from waitlist entry for premium users
-      stripe_customer_id = waitlistEntry.stripe_customer_id;
-      companyNameFromWaitlist = waitlistEntry.companyName;
-      useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
-      displayNameFromWaitlist = waitlistEntry.fullName;
     }
 
     // If waitlist entry exists and status is invited
@@ -244,34 +229,17 @@ export const googleCallback = async (
           );
         }
       } else {
-        // For other portals, check waitlist as before
+        // For other portals, look up waitlist for bonus data (no gate)
         const waitlistEntry = await waitlistDb.getByEmail(email);
 
-        if (!waitlistEntry) {
-          const landingSiteUrl =
-            process.env.LANDING_SITE_URL || "https://agentweb.pro";
-          return done(null, false, {
-            message: `Please join our waitlist first at ${landingSiteUrl}`,
-            code: "not_in_waitlist",
-          });
-        }
-
-        if (waitlistEntry.status !== "invited") {
-          return done(null, false, {
-            message: "You are on the waitlist but not yet invited.",
-            code: "not_invited",
-          });
-        }
-
-        // Create user from waitlist entry
         const userId = uuidv4();
         const placeholderPassword = `oauth_placeholder_${uuidv4()}`;
 
-        const stripe_customer_id = waitlistEntry.stripe_customer_id;
-        const companyNameFromWaitlist = waitlistEntry.companyName;
-        const useCaseCategoriesFromWaitlist = waitlistEntry.useCaseCategories;
+        const stripe_customer_id = waitlistEntry?.stripe_customer_id;
+        const companyNameFromWaitlist = waitlistEntry?.companyName;
+        const useCaseCategoriesFromWaitlist = waitlistEntry?.useCaseCategories;
         const finalDisplayName =
-          profile.displayName || waitlistEntry.fullName || email.split("@")[0];
+          profile.displayName || waitlistEntry?.fullName || email.split("@")[0];
 
         const roles: ("partner" | "customer" | "free")[] = ["free"];
 

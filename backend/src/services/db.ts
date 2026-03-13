@@ -150,7 +150,8 @@ export interface User {
   }>;
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
-  subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Basic")
+  stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
   connected_accounts?: Array<{
@@ -1669,7 +1670,8 @@ export const scheduleDb = {
     scheduleId: string;
     taskId: string;
     userId: string;
-    frequency: string; // 'daily', 'weekly', 'monthly', or cron expression
+    frequency: string; // 'daily', 'weekly', 'monthly', 'every_n_days', or cron expression
+    frequencyIntervalDays?: number; // Required when frequency is 'every_n_days' (>= 1)
     nextRunTime: string;
     status: string; // 'active' or 'inactive'
     createdAt: string;
@@ -1749,6 +1751,7 @@ export const scheduleDb = {
           scheduleId: string,
           updates: Partial<{
             frequency: string;
+            frequencyIntervalDays: number;
             nextRunTime: string;
             status: string;
             lastRunTime: string;

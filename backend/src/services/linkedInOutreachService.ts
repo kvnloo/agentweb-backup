@@ -321,6 +321,152 @@ export class LinkedInOutreachService {
     }
   }
 
+  // ─── Search & discovery ─────────────────────────────────────────────────────
+
+  /**
+   * Search LinkedIn for people using the Unipile search endpoint.
+   * Supports keyword-based search or URL-based search (passing a LinkedIn search URL).
+   */
+  async searchPeople(accountId: string, params: {
+    keywords?: string;
+    url?: string;
+    title?: string;
+    company?: string;
+    cursor?: string;
+  }): Promise<any> {
+    try {
+      const { keywords, url, title, company, cursor } = params;
+      this.log(`Searching LinkedIn people`, { accountId, keywords, url });
+      const client = await this.getClient();
+
+      let body: any;
+
+      if (url) {
+        // URL-based search: the URL overrides all other params
+        body = { url };
+      } else if (cursor) {
+        // Pagination: just pass the cursor
+        body = { cursor };
+      } else {
+        // Structured classic search
+        body = {
+          api: 'classic',
+          category: 'people',
+        };
+        if (keywords) body.keywords = keywords;
+        // title and company go into advanced_keywords for free-text matching
+        if (title || company) {
+          body.advanced_keywords = {};
+          if (title) body.advanced_keywords.title = title;
+          if (company) body.advanced_keywords.company = company;
+        }
+      }
+
+      const result = await client.request.send({
+        method: 'POST',
+        path: ['linkedin', 'search'],
+        parameters: { account_id: accountId },
+        headers: { 'Content-Type': 'application/json' },
+        body
+      });
+      this.log(`Search returned results`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'searchPeople');
+    }
+  }
+
+  /**
+   * Get a full LinkedIn profile by provider_id or identifier.
+   * Exposes the internal getLinkedInProfile resolution as a public method
+   * that works with raw provider_id strings (not just URLs).
+   */
+  async getProfile(identifier: string, accountId: string): Promise<any> {
+    try {
+      this.log(`Fetching profile: ${identifier}`, { accountId });
+      const client = await this.getClient();
+      const profile = await client.request.send({
+        method: 'GET',
+        path: ['users', identifier],
+        parameters: { account_id: accountId }
+      });
+      this.log(`Successfully fetched profile: ${identifier}`);
+      return profile;
+    } catch (error: any) {
+      return this.handleError(error, 'getProfile');
+    }
+  }
+
+  /**
+   * List the user's LinkedIn connections (1st-degree relations).
+   */
+  async listConnections(accountId: string, cursor?: string): Promise<any> {
+    try {
+      this.log(`Listing connections`, { accountId, cursor });
+      const client = await this.getClient();
+      const params: any = { account_id: accountId };
+      if (cursor) params.cursor = cursor;
+      const result = await client.users.getAllRelations(params);
+      this.log(`Listed connections successfully`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'listConnections');
+    }
+  }
+
+  /**
+   * List sent connection invitations with their status.
+   */
+  async listSentInvitations(accountId: string, cursor?: string): Promise<any> {
+    try {
+      this.log(`Listing sent invitations`, { accountId, cursor });
+      const client = await this.getClient();
+      const params: any = { account_id: accountId };
+      if (cursor) params.cursor = cursor;
+      const result = await client.users.getAllInvitationsSent(params);
+      this.log(`Listed sent invitations successfully`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'listSentInvitations');
+    }
+  }
+
+  /**
+   * Get a LinkedIn company profile.
+   */
+  async getCompanyProfile(companyId: string, accountId: string): Promise<any> {
+    try {
+      this.log(`Fetching company profile: ${companyId}`, { accountId });
+      const client = await this.getClient();
+      const result = await client.users.getCompanyProfile({
+        account_id: accountId,
+        identifier: companyId
+      });
+      this.log(`Successfully fetched company profile: ${companyId}`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'getCompanyProfile');
+    }
+  }
+
+  /**
+   * Cancel a pending connection invitation.
+   */
+  async cancelInvitation(invitationId: string, accountId: string): Promise<any> {
+    try {
+      this.log(`Cancelling invitation: ${invitationId}`, { accountId });
+      const client = await this.getClient();
+      const result = await client.users.cancelInvitationSent({
+        account_id: accountId,
+        invitation_id: invitationId
+      });
+      this.log(`Successfully cancelled invitation: ${invitationId}`);
+      return result;
+    } catch (error: any) {
+      return this.handleError(error, 'cancelInvitation');
+    }
+  }
+
   /**
    * Send a message to a LinkedIn profile.
    * Uses startNewChat to handle both new and existing conversations.

@@ -5,6 +5,7 @@ import { userDb, crmDb } from "../services/db";
 import {
   generateLandingPage,
   deployLandingPage,
+  iterateLandingPage,
   getLandingPage,
   listLandingPages,
   deleteLandingPage,
@@ -163,6 +164,36 @@ router.post("/generated/:id/deploy", rateLimiter, async (req, res: Response) => 
     console.error("[LP GENERATION] Error deploying:", error);
     const status = error.message?.includes("not found") ? 404 : 500;
     res.status(status).json({ error: error.message || "Failed to deploy" });
+  }
+});
+
+/**
+ * POST /api/landing-pages/v0/generated/:id/iterate
+ * Refine a landing page with follow-up instructions
+ */
+router.post("/generated/:id/iterate", rateLimiter, async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { id } = req.params;
+    const { message } = req.body;
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "message is required and must be a string" });
+    }
+
+    if (message.length > MAX_INPUT_LENGTH) {
+      return res.status(400).json({ error: `message must not exceed ${MAX_INPUT_LENGTH} characters` });
+    }
+
+    const result = await iterateLandingPage(id, userId, message);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error iterating:", error);
+    const status = error.message?.includes("not found") ? 404 : 500;
+    res.status(status).json({ error: error.message || "Failed to iterate" });
   }
 });
 

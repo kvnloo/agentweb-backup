@@ -1052,6 +1052,29 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
+  name: 'iterate_landing_page',
+  definition: {
+    name: 'iterate_landing_page',
+    description: 'Refine a generated landing page with follow-up instructions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' },
+        message: { type: 'string', description: 'Instructions for how to refine the page' }
+      },
+      required: ['page_id', 'message']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
+      body: { message: args.message }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
   name: 'list_landing_pages',
   definition: {
     name: 'list_landing_pages',
