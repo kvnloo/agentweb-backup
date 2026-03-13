@@ -27,6 +27,7 @@ jest.mock('../services/chatbotService', () => ({
 // Mock subscriptionService
 jest.mock('../services/subscriptionService', () => ({
   getAllowedSkills: jest.fn().mockResolvedValue(['*']),
+  getPublicAllowedSkills: jest.fn().mockResolvedValue([]),
   resolveSkillsToToolNames: jest.fn().mockResolvedValue(['*']),
   filterFunctionCalls: jest.fn().mockImplementation((tools) => tools),
 }));
@@ -778,15 +779,32 @@ describe('AgentModeService - Skills', () => {
       expect(result.some(s => s.skillId === 'skill-2')).toBe(false);
     });
 
-    it('should return all skills when no userId provided (wildcard default)', async () => {
+    it('should return no skills when no userId and public default is empty', async () => {
       const publishedSkills = [
         { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
       ];
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      const { getPublicAllowedSkills } = require('../services/subscriptionService');
+      (getPublicAllowedSkills as jest.Mock).mockResolvedValue([]);
+
+      const result = await agentModeService.getSkillsForDisplay([]);
+
+      expect(result).toHaveLength(0);
+    });
+
+    it('should return allowed skills when no userId and public config is set', async () => {
+      const publishedSkills = [
+        { skillId: 'skill-1', name: 'Skill 1', description: 'Desc', toolNames: ['tool1'], isPublished: true },
+        { skillId: 'skill-2', name: 'Skill 2', description: 'Desc', toolNames: ['tool2'], isPublished: true },
+      ];
+      (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
+      const { getPublicAllowedSkills } = require('../services/subscriptionService');
+      (getPublicAllowedSkills as jest.Mock).mockResolvedValue(['skill-1']);
 
       const result = await agentModeService.getSkillsForDisplay([]);
 
       expect(result.some(s => s.skillId === 'skill-1')).toBe(true);
+      expect(result.some(s => s.skillId === 'skill-2')).toBe(false);
     });
 
     it('should include __other_skills__ virtual entry when allowed', async () => {

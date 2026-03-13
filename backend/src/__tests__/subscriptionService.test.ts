@@ -11,6 +11,7 @@ import {
   filterFunctionCalls,
   getAllAvailableSkills,
   getAllowedSkills,
+  getPublicAllowedSkills,
   resolveSkillsToToolNames,
 } from '../services/subscriptionService';
 
@@ -197,6 +198,46 @@ describe('subscriptionService', () => {
 
     const skills2 = await getAllowedSkills('u2');
     expect(skills2).toEqual(['*']);
+  });
+
+  // ---- getAllowedSkills for anonymous users ----
+
+  it('getAllowedSkills routes anon_ users to public allowed skills', async () => {
+    // Set up public skills setting
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'public_allowed_skills',
+      settingValue: JSON.stringify(['skill-1']),
+    } as any);
+
+    const skills = await getAllowedSkills('anon_abc-123');
+    expect(skills).toEqual(['skill-1']);
+    // Should NOT call getUserById for anonymous users
+    expect(mockedUserDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  it('getAllowedSkills returns empty array for anon_ users when no public config', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(null);
+
+    const skills = await getAllowedSkills('anon_xyz-456');
+    expect(skills).toEqual([]);
+    expect(mockedUserDb.getUserById).not.toHaveBeenCalled();
+  });
+
+  // ---- getPublicAllowedSkills tests ----
+
+  it('getPublicAllowedSkills returns empty array when no setting', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce(null);
+    const skills = await getPublicAllowedSkills();
+    expect(skills).toEqual([]);
+  });
+
+  it('getPublicAllowedSkills returns stored skills list', async () => {
+    mockedSettingsService.getSetting.mockResolvedValueOnce({
+      settingName: 'public_allowed_skills',
+      settingValue: JSON.stringify(['skill-1', '__other_skills__']),
+    } as any);
+    const skills = await getPublicAllowedSkills();
+    expect(skills).toEqual(['skill-1', '__other_skills__']);
   });
 
   // ---- resolveSkillsToToolNames tests ----
