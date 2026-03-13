@@ -149,7 +149,7 @@ ${feedback ? `\nUSER FEEDBACK ON PREVIOUS VERSION:\n${feedback}\nApply this feed
 
 Return ONLY the complete HTML document starting with <!DOCTYPE html>. No explanation, no markdown, just the HTML.`;
 
-    const llmModel = 'anthropic.claude-sonnet-4-6';
+    const llmModel = await agentModeService.getDefaultModel();
     const response = await agentModeService.callLLM(llmModel, [
       { role: 'user', content: prompt }
     ], {
