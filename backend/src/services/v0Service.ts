@@ -185,6 +185,8 @@ export function buildBrandEnrichedPrompt(
     '\n\nIMPORTANT: Create a complete, production-ready landing page. Use modern design patterns, responsive layout, and the brand colors/fonts specified above.' +
     '\n\nCRITICAL Next.js Rules:' +
     '\n- Any component that uses onClick, onChange, onSubmit, useState, useEffect, or any other event handler or React hook MUST have "use client" at the very top of the file.' +
+    '\n- Do NOT use <style jsx> anywhere. Use Tailwind CSS classes or CSS modules instead. styled-jsx causes Turbopack build failures in Next.js 15+.' +
+    '\n- For CSS animations (like marquee), define @keyframes in globals.css and reference via Tailwind arbitrary values or className, never via <style jsx>.' +
     '\n- Never pass event handler props (onClick, onChange, etc.) from a Server Component to a Client Component — instead, make the parent a Client Component too, or wrap the interactive part in its own "use client" component.' +
     '\n- The main page.tsx can be a Server Component, but any interactive sections (forms, buttons with handlers, navigation with click handlers) must be extracted into separate Client Components with "use client".' +
     '\n\nCRITICAL Build Rules:' +
@@ -700,6 +702,68 @@ async function unzipBuffer(buffer: Buffer | ArrayBuffer): Promise<Array<{ path: 
 }
 
 /**
+ * Auto-fix common v0-generated code issues that cause Next.js build failures.
+ * Modifies files in-place before they are pushed to GitHub.
+ *
+ * Known issues:
+ * 1. `<style jsx>` in Server Components → add 'use client' directive
+ * 2. Missing 'use client' for files using hooks (useState, useEffect, etc.)
+ * 3. @import "shadcn" in CSS → replace with standard Tailwind imports
+ */
+function autoFixV0Files(files: Array<{ path: string; content: Buffer }>): number {
+  let fixCount = 0;
+
+  for (const file of files) {
+    if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+
+    const content = file.content.toString("utf-8");
+    const hasUseClient = content.trimStart().startsWith("'use client'") || content.trimStart().startsWith('"use client"');
+
+    if (hasUseClient) continue;
+
+    // Check if file needs 'use client'
+    const needsClient =
+      /<style jsx/.test(content) ||
+      /\buseState\b/.test(content) ||
+      /\buseEffect\b/.test(content) ||
+      /\buseRef\b/.test(content) ||
+      /\buseCallback\b/.test(content) ||
+      /\buseMemo\b/.test(content) ||
+      /\bonClick\b/.test(content) ||
+      /\bonChange\b/.test(content) ||
+      /\bonSubmit\b/.test(content);
+
+    if (needsClient) {
+      file.content = Buffer.from("'use client'\n\n" + content);
+      fixCount++;
+      console.log(`[V0 SERVICE] Auto-fix: added 'use client' to ${file.path}`);
+    }
+  }
+
+  // Fix CSS issues
+  for (const file of files) {
+    if (!file.path.endsWith(".css")) continue;
+
+    let content = file.content.toString("utf-8");
+    let changed = false;
+
+    // Replace @import "shadcn" with nothing (it's not a real CSS import)
+    if (content.includes('@import "shadcn"') || content.includes("@import 'shadcn'")) {
+      content = content.replace(/@import\s+['"]shadcn['"];?\s*/g, "");
+      changed = true;
+      console.log(`[V0 SERVICE] Auto-fix: removed @import "shadcn" from ${file.path}`);
+    }
+
+    if (changed) {
+      file.content = Buffer.from(content);
+      fixCount++;
+    }
+  }
+
+  return fixCount;
+}
+
+/**
  * Create a GitHub repo under the AgentWebPro org and push all files via the Contents API.
  */
 async function createGitHubRepoAndPush(
@@ -784,6 +848,12 @@ async function createGitHubRepoAndPush(
   if (scaffoldFiles.length > 0) {
     console.log(`[V0 SERVICE] Adding ${scaffoldFiles.length} scaffold files: ${scaffoldFiles.map(f => f.path).join(", ")}`);
     files.push(...scaffoldFiles);
+  }
+
+  // Auto-fix common v0 build issues before pushing to GitHub
+  const fixCount = autoFixV0Files(files);
+  if (fixCount > 0) {
+    console.log(`[V0 SERVICE] Auto-fixed ${fixCount} files for build compatibility`);
   }
 
   // Push files to the repo using the Git Trees API (single commit for all files)
