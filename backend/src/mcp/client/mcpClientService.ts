@@ -555,7 +555,19 @@ export class McpClientService {
   private createStdioTransport(name: string, config: StdioTransportConfig): Transport {
     const resolvedCommand = resolveEnvPlaceholders(config.command);
     const resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
-    
+
+    // Auto-configure Playwright MCP for headless server environments
+    const isPlaywrightMcp = resolvedArgs.some(arg => arg.includes('@playwright/mcp'));
+    if (isPlaywrightMcp) {
+      if (!resolvedArgs.includes('--headless')) {
+        resolvedArgs.push('--headless');
+      }
+      if (!resolvedArgs.includes('--no-sandbox')) {
+        resolvedArgs.push('--no-sandbox');
+      }
+      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox for ${name}`);
+    }
+
     // Resolve environment variables in the env config
     const resolvedEnv: Record<string, string> = {};
     if (config.env) {

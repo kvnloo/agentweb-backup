@@ -17,7 +17,7 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
-import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
+import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -884,6 +884,16 @@ export class AgentModeService {
         await new Promise(resolve => setImmediate(resolve));
         responseMessage = response.choices[0].message;
 
+        // Ensure content is always a string (Gemini can return undefined/null content
+        // when safety filters or token exhaustion prevent generation)
+        if (responseMessage.content == null) {
+          responseMessage.content = '';
+        }
+        // Ensure tool_calls doesn't persist as null (DynamoDB drops null values)
+        if (!responseMessage.tool_calls) {
+          delete responseMessage.tool_calls;
+        }
+
         // Record per-iteration timing for metadata
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
@@ -1590,6 +1600,17 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Copy all sliced messages as-is
     for (const msg of sliced) {
+      // Skip empty assistant messages (no content and no tool_calls) — these are artifacts
+      // from failed LLM responses where content was lost (e.g. Gemini safety filter)
+      if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
+        continue;
+      }
+      // Skip error messages — they carry no useful context for the LLM and accumulate
+      // when a session enters a crash loop
+      if (msg.role === 'assistant' && (msg as any).metadata?.isErrorMessage) {
+        continue;
+      }
+
       let content = msg.content;
 
       // For user messages with attachments, reconstruct content to include attachment URLs
@@ -1862,7 +1883,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       skillService.getPublishedSkills(),
-      userId ? getAllowedSkills(userId) : Promise.resolve(["*"] as string[])
+      userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
@@ -3157,7 +3178,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
+  public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
@@ -3171,6 +3192,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
         sessionId,
         llmModel,
         service: this,
+        ...extraContext,
       });
 
       // // If result is already MCP-wrapped (from external MCP tools via mcpClientService),

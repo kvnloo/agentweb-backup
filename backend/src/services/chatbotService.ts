@@ -13,9 +13,11 @@ import { EngineServiceClient } from '@google-cloud/discoveryengine';
 import { Storage } from '@google-cloud/storage';
 import { SearchServiceClient, protos } from '@google-cloud/discoveryengine';
 import { taskDb } from '../services/db';
-import { getGCSPPrivateKey } from '../utils/secretsManager';
+import { getGCSPPrivateKey, getSecret } from '../utils/secretsManager';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
+import { isTransientLLMError } from '../utils/agentModeErrors';
+import { uploadFileToS3 } from '../utils/s3Utils';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -451,7 +453,7 @@ export class ChatbotDB {
     const timestamp = new Date().toISOString();
 
     const selectedSystemMessage =
-      portalType === "customer" ? emmaSystemMessage :
+      portalType === "customer" ? await getEmmaSystemContext() :
       portalType === "genius" ? geniusSystemMessage :
       portalType === "agent" ? null : // Agent Mode uses its own system prompt
       partnerSystemMessage;
@@ -772,6 +774,23 @@ export class ChatbotDB {
       }
       console.error("Error getting message count from messages table:", error);
       throw error;
+    }
+  }
+
+  // Get the first user message text for history list preview (lightweight — Limit:10)
+  private async getSessionPreview(sessionId: string): Promise<string | null> {
+    try {
+      const result = await dynamodb.query({
+        TableName: this.messagesTableName,
+        KeyConditionExpression: 'sessionId = :sessionId',
+        ExpressionAttributeValues: { ':sessionId': sessionId },
+        ScanIndexForward: true,
+        Limit: 20,
+      }).promise();
+      const firstUser = (result.Items || []).find((item: any) => item.message?.role === 'user');
+      return firstUser ? (firstUser.message.content as string) || null : null;
+    } catch {
+      return null;
     }
   }
 
@@ -1456,6 +1475,56 @@ export class ChatbotDB {
       console.error("Error getting user chat sessions:", error);
       throw error;
     }
+  }
+
+  /**
+   * Get Emma (customer-portal) sessions for a user.
+   * Filters server-side by pageIdentifier so Agent Mode sessions are excluded.
+   * Returns lean session objects (no full message fetch) suitable for the history panel.
+   */
+  async getEmmaSessions(userId: string, limit: number = 20, pageId: string = 'customer-portal'): Promise<ChatSession[]> {
+    const params: any = {
+      TableName: this.tableName,
+      IndexName: 'UserIdIndex',
+      KeyConditionExpression: 'userId = :userId',
+      FilterExpression: 'pageIdentifier = :pageIdentifier AND portalType <> :agentType AND (attribute_not_exists(archived) OR archived = :false)',
+      ExpressionAttributeValues: {
+        ':userId': userId,
+        ':pageIdentifier': pageId,
+        ':agentType': 'agent',
+        ':false': false,
+      },
+      ScanIndexForward: false,
+    };
+
+    const collected: ChatSession[] = [];
+    let lastEvaluatedKey: any = undefined;
+
+    // Paginate until we have enough results (DynamoDB Limit is scan limit, not result limit)
+    do {
+      if (lastEvaluatedKey) {
+        params.ExclusiveStartKey = lastEvaluatedKey;
+      }
+      const result = await dynamodb.query(params).promise();
+      const items = (result.Items as ChatSession[]) || [];
+      collected.push(...items);
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey && collected.length < limit);
+
+    // Sort by updatedAt descending and take top N
+    const topSessions = collected
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+      .slice(0, limit);
+
+    // Fetch first user message preview for each session in parallel
+    const sessionsWithPreview = await Promise.all(
+      topSessions.map(async (session) => {
+        const previewText = await this.getSessionPreview(session.sessionId);
+        return { ...session, previewText };
+      })
+    );
+
+    return sessionsWithPreview;
   }
 
   /**
@@ -2701,19 +2770,44 @@ Be helpful, concise, and accurate. If you don't know the answer, suggest the use
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
 
-const emmaSystemMessage = `You are Emma, a helpful 24/7 marketing operator assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
+const emmaSystemMessage = `You are Emma Chat, a helpful 24/7 support assistant for AgentWeb's Customer Portal. AgentWeb is a powerful web automation platform.
 
 Your primary functions are to help users with market research, campaign planning and optimization, and tracking performance metrics.
 
-You have access to tools that allow you to manage knowledge bases. Here are the tools and when to use each:
+You have access to tools that allow you to read and update the user's marketing data directly. Key capabilities:
 
-1. **create_knowledge_base**: Create a brand new knowledge base. Use when the user wants to start fresh with new research, documentation, or data collection. Provide a name and initial content.
+**Knowledge Base:**
+1. **create_knowledge_base**: Create a new knowledge base with initial content.
+2. **update_knowledge_base_file**: Update content in an existing knowledge base file.
+3. **attach_knowledge_base_files**: Save multiple pieces of content as separate files in a knowledge base.
+Always use list_knowledge_base_files first to see available knowledge bases and their identifiers before updating.
 
-2. **update_knowledge_base_file**: Update or append content to a specific file in an existing knowledge base. Use list_knowledge_base_files first to get the correct taskId (kb_identifier). Specify fileName "knowledge-base.txt" for the main file, or the name of an attached file.
+**Brand & Strategy:**
+- **read_brand_guidelines** / **update_brand_guidelines**: Read or update brand name, colors, fonts, tone, messaging.
+- **read_market_strategy** / **update_market_strategy**: Read or update ICP, competitors, positioning, value proposition.
+Always call the read tool first before updating to get current values.
 
-3. **attach_knowledge_base_files**: Save multiple pieces of content as separate named files in an existing knowledge base. Use when the user wants to save several distinct items (e.g., research summaries, data files) at once.
+**GTM Plan:**
+- **list_gtm_plans** / **read_gtm_plan** / **create_gtm_plan** / **update_gtm_plan**: Manage GTM plans.
+- **add_gtm_phase** / **add_gtm_work_items** / **update_gtm_work_item**: Manage phases and work items within a plan.
 
-IMPORTANT: Always use list_knowledge_base_files first to see available knowledge bases and their identifiers (taskIds) before using update_knowledge_base_file or attach_knowledge_base_files.
+**CRM:** **get_leads**, **search_leads**, **update_lead**, **create_lead_list**
+
+**Books:** **list_books**, **create_book**, **update_book_content**
+
+**Email Templates:** **list_html_templates**, **create_html_from_template**, **update_html_file**
+
+**Visual Context:**
+- **get_visual_context**: Call this when you need to SEE the page visually (colors, layout, design). A screenshot will be captured and sent in the follow-up message.
+
+**Structured Page Context:**
+With each message you receive structured page context:
+- buttons[]: clickable elements on the page (use exact button text in your guidance)
+- inputs[]: form fields with labels, placeholders, and current values
+- headings[]: page section titles
+- visibleText: visible page text
+
+Use this to give SPECIFIC UI guidance. Example: "Click the 'Save Brand Colors' button" instead of "find the save button".
 
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
@@ -2750,6 +2844,31 @@ Example of good formatting:
 Be helpful, concise, and accurate. If you don't know the answer or the request is outside your marketing operator functions, suggest the user join our Discord community for human support: <a href="${
   process.env.DISCORD_INVITE_URL || "https://discord.gg/kP2u6Wf9KQ"
 }" target="_blank">Discord community</a>`;
+
+// Cache for Emma system context (60s TTL)
+let cachedSystemContext: { value: string; expiry: number } | null = null;
+
+// Exported for testing only — not part of the public API
+export function __resetEmmaSystemContextCache(): void {
+  cachedSystemContext = null;
+}
+
+export async function getEmmaSystemContext(): Promise<string> {
+  if (cachedSystemContext && Date.now() < cachedSystemContext.expiry) {
+    return cachedSystemContext.value;
+  }
+  try {
+    const res = await dynamodb.get({
+      TableName: `${TABLE_PREFIX}AW-Settings`,
+      Key: { settingName: 'emma_system_context' },
+    }).promise();
+    const value = res.Item?.settingValue || emmaSystemMessage;
+    cachedSystemContext = { value, expiry: Date.now() + 60_000 };
+    return value;
+  } catch {
+    return emmaSystemMessage;
+  }
+}
 
 const geniusSystemMessage = `You are Growth Genius, a specialized AI growth marketing assistant for AgentWeb's Growth Genius Chat. You help entrepreneurs, startups, and businesses with growth strategies, marketing tactics, and business development.
 
@@ -2998,20 +3117,100 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
   }
 }
 
+function trimToolMessagesForContext(
+  messages: any[],
+  recentToPreserve: number = 3,
+  maxToolContentLength: number = 8000,
+  maxHistoricalTools: number = 20
+): any[] {
+  const toolIndices: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'tool') toolIndices.push(i);
+  }
+  const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+  const historicalIndices = toolIndices.slice(0, toolIndices.length - recentToPreserve);
+  const dropSet = historicalIndices.length > maxHistoricalTools
+    ? new Set(historicalIndices.slice(0, historicalIndices.length - maxHistoricalTools))
+    : new Set<number>();
+
+  return messages
+    .filter((_, idx) => !dropSet.has(idx))
+    .map((msg) => {
+      if (msg.role === 'tool' && !preserveSet.has(messages.indexOf(msg)) && typeof msg.content === 'string' && msg.content.length > maxToolContentLength) {
+        return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
+      }
+      return msg;
+    });
+}
+
+export interface ChatResponseOptions {
+  currentUrl?: string;
+  pageContent?: string;
+  portalType?: "customer" | "partner";
+  userId?: string;
+  structuredContext?: string;
+  screenshot?: string;
+  model?: string;
+  socketId?: string;
+  onToolStart?: (toolName: string) => void;
+}
+
 // Update generateChatResponse to use platform knowledge base when needed
 export async function generateChatResponse(
   sessionId: string,
   userMessage: string,
-  currentUrl?: string,
-  pageContent?: string,
-  portalType: "customer" | "partner" = "partner",
-  userId?: string
-): Promise<string | { content: string; toolCalls?: any[] }> {
+  options: ChatResponseOptions = {}
+): Promise<string | { content: string; toolCalls?: any[]; invalidations?: string[] }> {
+  const {
+    currentUrl,
+    pageContent,
+    portalType = "partner",
+    userId,
+    structuredContext,
+    screenshot,
+    model,
+    socketId,
+    onToolStart,
+  } = options;
   try {
     const timestamp = new Date().toISOString();
 
+    // Upload screenshot to S3 if provided
+    let uploadedScreenshotUrl = screenshot;
+    let attachments: any[] | undefined;
+    
+    if (screenshot && screenshot.startsWith('data:image')) {
+      try {
+        const base64Data = screenshot.replace(/^data:image\/\w+;base64,/, "");
+        const buffer = Buffer.from(base64Data, 'base64');
+        const uploadResult = await uploadFileToS3(
+          buffer,
+          `screenshot-${Date.now()}.jpg`,
+          userId || 'anonymous',
+          'image/jpeg'
+        );
+        if (uploadResult.success && uploadResult.url) {
+          uploadedScreenshotUrl = uploadResult.url;
+          attachments = [{
+            url: uploadResult.url,
+            filename: 'screenshot.jpg',
+            size: buffer.length,
+            mimetype: 'image/jpeg',
+            uploadedAt: timestamp
+          }];
+        } else {
+          // Upload did not return a URL — don't send raw base64 to the LLM
+          uploadedScreenshotUrl = undefined;
+        }
+      } catch (err) {
+        console.error('Failed to upload screenshot to S3:', err);
+        // Don't send raw base64 to the LLM on upload failure
+        uploadedScreenshotUrl = undefined;
+      }
+    }
+
     // Add user message to session with metadata
-    const userMessageMetadata = {
+    const userMessageMetadata: any = {
       currentUrl,
       pageContentLength: pageContent?.length,
       knowledgeBaseChunks: knowledgeBase.length,
@@ -3019,6 +3218,9 @@ export async function generateChatResponse(
       timestamp,
       portalType,
     };
+    if (attachments) {
+      userMessageMetadata.attachments = attachments;
+    }
 
     await chatbotDb.addMessageToSession(sessionId, {
       role: "user",
@@ -3033,7 +3235,30 @@ export async function generateChatResponse(
     }
 
     // Get messages for OpenAI
+    // Always inject the current system prompt fresh (ignoring the stale stored version)
+    // so that DynamoDB overrides and prompt updates take effect immediately for all sessions.
+    const freshSystemPrompt = portalType === "customer" ? await getEmmaSystemContext() : null;
     const messages = [...session.messages];
+    if (freshSystemPrompt) {
+      const firstSystemIdx = messages.findIndex((m) => m.role === "system");
+      if (firstSystemIdx >= 0) {
+        messages[firstSystemIdx] = { ...messages[firstSystemIdx], content: freshSystemPrompt };
+      } else {
+        messages.unshift({ role: "system", content: freshSystemPrompt, metadata: { timestamp: new Date().toISOString() } });
+      }
+    }
+
+    // Support vision: if screenshot provided, modify last user message for visual analysis
+    if (uploadedScreenshotUrl) {
+      const lastUserIdx = messages.map((m) => m.role).lastIndexOf('user');
+      if (lastUserIdx >= 0) {
+        (messages[lastUserIdx] as any).content = [
+          { type: 'text', text: messages[lastUserIdx].content },
+          { type: 'image_url', image_url: { url: uploadedScreenshotUrl, detail: 'low' } }
+        ];
+      }
+    }
+
     let contextInfo = "";
 
     let activeKnowledgeBase: ContextChunk[];
@@ -3108,6 +3333,13 @@ export async function generateChatResponse(
         .map((m) => m.role)
         .lastIndexOf("user");
 
+      // Append structured page context (buttons, inputs, headings) if provided
+      if (structuredContext) {
+        contextInfo = contextInfo
+          ? `${contextInfo}\n\n--- Current Page UI Elements ---\n${structuredContext}`
+          : `--- Current Page UI Elements ---\n${structuredContext}`;
+      }
+
       // Insert the context right before the user's message if we have any
       if (contextInfo && lastUserMsgIndex > 0) {
         messages.splice(lastUserMsgIndex, 0, {
@@ -3137,17 +3369,49 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // KB tools, scheduled chat tools, and other tools available to Emma
+        // Base tools always available to Emma
         const toolsToInclude = [
-          'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source',
-          'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
-          'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables',
+          'read_page_source',
+          'get_visual_context',
+          'enrich_leads_preview', 'enrich_leads_execute',
         ];
 
+        // Page-aware tool injection based on the current page URL
+        const urlPath = (currentUrl || '').replace(/^\//, '');
+        const page = urlPath.split('/')[0].split('?')[0];
+        const urlParams = new URLSearchParams(urlPath.includes('?') ? urlPath.split('?')[1] : '');
+        const tab = urlParams.get('tab') || '';
+        const pageKey = tab ? `${page}?tab=${tab}` : page;
+        const pageToolMap: Record<string, string[]> = {
+          'brand-guidelines': ['read_brand_guidelines', 'update_brand_guidelines'],
+          'market-strategy':  ['read_market_strategy', 'update_market_strategy'],
+          'gtm-plan':         ['list_gtm_plans', 'read_gtm_plan', 'create_gtm_plan', 'update_gtm_plan', 'add_gtm_phase', 'add_gtm_work_items', 'update_gtm_work_item', 'update_gtm_phase', 'delete_gtm_items', 'get_gtm_common_items', 'add_gtm_common_items', 'send_gtm_status_report'],
+          'crm':              ['get_lead_lists', 'create_lead_list', 'add_leads_to_list', 'get_leads', 'search_leads', 'get_lead_details', 'update_lead', 'delete_leads', 'update_lead_list', 'delete_lead_list', 'update_lead_status', 'get_lead_list_statuses', 'configure_lead_statuses', 'get_lead_engagements', 'add_lead_engagement', 'send_email_to_lead', 'update_email_draft_for_lead'],
+          'social-posts':     ['list_connected_accounts', 'list_connected_account_posts', 'load_connected_account_metrics', 'post_on_connected_account', 'comment_on_linkedin_post', 'react_to_linkedin_post', 'create_social_media_posts'],
+          'paid-social':      ['list_connected_accounts', 'list_meta_ads_campaigns', 'get_meta_ads_metrics'],
+          'images':           ['generate_image', 'describe_image'],
+          'videos':           ['generate_video', 'describe_video'],
+          'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
+          'email-templates':  ['list_html_templates', 'create_html_from_template', 'update_html_file'],
+          'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
+          'research-reports': ['perform_deep_research', 'search_web'],
+          'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
+          'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file'],
+          'seo':              ['get_seo_metrics', 'get_website_analytics'],
+          'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article'],
+          'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
+        };
+        if (pageToolMap[pageKey]) {
+          toolsToInclude.push(...pageToolMap[pageKey]);
+        }
+
         const { mcpToolRegistry } = await import('../mcp/server/registry');
+        const { emmaToolRegistry } = await import('../emma/registry');
 
         for (const toolName of toolsToInclude) {
-          const toolHandler = mcpToolRegistry.getTool(toolName);
+          // First try emmaToolRegistry (Emma-specific tools), then fall back to mcpToolRegistry
+          const emmaHandler = emmaToolRegistry.getTool(toolName);
+          const toolHandler = emmaHandler || mcpToolRegistry.getTool(toolName);
           if (toolHandler) {
             // Convert MCP definition to OpenAI format
             const mcpDef = toolHandler.definition;
@@ -3176,13 +3440,59 @@ export async function generateChatResponse(
     let finalAssistantMessage = '';
     let finalUsageData: any = null;
 
+    const isGeminiModel = model ? model.toLowerCase().includes('gemini') : false;
+    // Match 'claude' or 'anthropic.' prefixed Bedrock IDs (e.g. anthropic.claude-3-5-sonnet-20241022)
+    // Deliberately excludes generic 'sonnet' to avoid false positives on unrelated model names.
+    const isClaudeModel = model ? (model.toLowerCase().includes('claude') || model.startsWith('anthropic.')) : false;
+
+    // Select the active client:
+    // - Claude/Bedrock: use agentModeService.getBedrockClient() which returns an
+    //   OpenAI-compatible wrapper that fully supports tool calling via ChatBedrockConverse.
+    // - Gemini: use agentModeService.getGeminiClient() which returns an
+    //   OpenAI-compatible wrapper that supports tool calling.
+    // - Azure OpenAI (default): use the standard OpenAI SDK client.
+    const activeDeployment = isClaudeModel ? model! : (model || process.env.AZURE_OPENAI_DEPLOYMENT || '');
+    let activeClient: any;
+
+    if (isClaudeModel || isGeminiModel) {
+      if (!agentModeService) {
+        throw new Error('AgentModeService not initialized');
+      }
+    }
+
+    if (isClaudeModel) {
+      activeClient = await agentModeService!.getBedrockClient(model!);
+    } else if (isGeminiModel) {
+      activeClient = await agentModeService!.getGeminiClient();
+    } else {
+      activeClient = model
+        ? new OpenAI({
+            apiKey: process.env.AZURE_OPENAI_API_KEY,
+            baseURL: `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${model}`,
+            defaultQuery: { "api-version": process.env.AZURE_OPENAI_API_VERSION || "2024-08-01-preview" },
+            defaultHeaders: { "api-key": process.env.AZURE_OPENAI_API_KEY },
+          })
+        : openai;
+    }
+
+    // Helper: Sleep function for exponential backoff
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
     while (iteration < MAX_ITERATIONS) {
       console.log(`[generateChatResponse] Iteration ${iteration + 1}`);
 
+      // Trim large old tool results to prevent context window overflow
+      const trimmedMessages = trimToolMessagesForContext(messages);
+
       // Generate response using OpenAI (with tools if available)
-      const response = await openai.chat.completions.create({
-        model: `${process.env.AZURE_OPENAI_DEPLOYMENT}`,
-        messages: messages.map(({ role, content, name, tool_call_id, tool_calls }) => {
+      let response: any;
+      const maxAttempts = 3;
+      const baseDelayMs = 2000;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          response = await activeClient.chat.completions.create({
+            model: activeDeployment,
+            messages: trimmedMessages.map(({ role, content, name, tool_call_id, tool_calls }: any) => {
           const message: any = { role, content };
           if (role === 'tool' && tool_call_id) {
             message.tool_call_id = tool_call_id;
@@ -3197,7 +3507,19 @@ export async function generateChatResponse(
         }),
         // Add tools only for customer portal with tools loaded
         ...(toolDefinitions.length > 0 ? { tools: toolDefinitions, tool_choice: 'auto' } : {})
-      });
+          });
+          break; // Success, break the retry loop
+        } catch (error) {
+          const isLastAttempt = attempt >= maxAttempts;
+          if (!isTransientLLMError(error) || isLastAttempt) {
+            throw error;
+          }
+          const jitterMs = Math.floor(Math.random() * 500);
+          const delayMs = baseDelayMs * Math.pow(2, attempt - 1) + jitterMs;
+          console.warn(`[generateChatResponse] Rate limit/transient error for model "${activeDeployment}", attempt ${attempt}/${maxAttempts}. Waiting ${delayMs}ms before retry...`);
+          await sleep(delayMs);
+        }
+      }
 
       const responseMessage = response.choices[0]?.message;
       if (!responseMessage) {
@@ -3230,74 +3552,23 @@ export async function generateChatResponse(
 
       console.log(`[generateChatResponse] Executing ${responseMessage.tool_calls.length} tool calls`);
 
-      // Execute each tool call
       for (const toolCall of responseMessage.tool_calls) {
         let functionArgs: any;
         try {
           functionArgs = JSON.parse(toolCall.function.arguments);
-
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
-
-          // Execute tool via AgentModeService (reuse existing infrastructure)
-          if (!agentModeService) {
-            throw new Error("AgentModeService not initialized");
-          }
-
-          const result = await agentModeService.executeTool(
-            response.model,
-            toolCall.function.name,
-            functionArgs,
-            userId!,
-            sessionId,
-            false // mockMode
-          );
-
+          onToolStart?.(toolCall.function.name);
+          if (!agentModeService) throw new Error("AgentModeService not initialized");
+          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, socketId ? { socketId } : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
-
-          // Track tool call for response
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs,
-            result: result
-          });
-
-          // Format result for tool message
+          toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs, result });
           const toolContent = typeof result === 'string' ? result : JSON.stringify(result);
-
-          // Add tool result message to messages array (for next iteration)
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: toolContent,
-            metadata: { timestamp: new Date().toISOString() }
-          });
-
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, name: toolCall.function.name, content: toolContent, metadata: { timestamp: new Date().toISOString() } });
         } catch (error) {
           console.error(`[generateChatResponse] Tool execution error for ${toolCall.function.name}:`, error);
-
-          // Track failed tool call
-          toolCalls.push({
-            id: toolCall.id,
-            name: toolCall.function.name,
-            arguments: functionArgs || toolCall.function.arguments,
-            error: error instanceof Error ? error.message : 'Unknown error'
-          });
-
-          // Add error result as tool message (LLM needs to see the error)
-          const errorContent = JSON.stringify({
-            success: false,
-            error: error instanceof Error ? error.message : 'Unknown error'
-          });
-
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: errorContent,
-            metadata: { timestamp: new Date().toISOString() }
-          });
+          toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs || toolCall.function.arguments, error: error instanceof Error ? error.message : 'Unknown error' });
+          const errorContent = JSON.stringify({ success: false, error: error instanceof Error ? error.message : 'Unknown error' });
+          messages.push({ role: 'tool', tool_call_id: toolCall.id, name: toolCall.function.name, content: errorContent, metadata: { timestamp: new Date().toISOString() } });
         }
       }
 
@@ -3330,11 +3601,37 @@ export async function generateChatResponse(
       metadata: assistantMessageMetadata,
     });
 
+    // Compute page invalidations from successful tool calls
+    const PAGE_INVALIDATION_MAP: Record<string, string[]> = {
+      'update_brand_guidelines': ['brand-guidelines'],
+      'update_market_strategy': ['market-strategy'],
+      'update_gtm_plan': ['gtm-plan'],
+      'add_gtm_phase': ['gtm-plan'],
+      'add_gtm_work_items': ['gtm-plan'],
+      'update_gtm_work_item': ['gtm-plan'],
+      'create_gtm_plan': ['gtm-plan'],
+      'update_lead': ['crm'],
+      'create_lead_list': ['crm'],
+      'update_book_content': ['books'],
+      'create_book': ['books'],
+      'create_html_from_template': ['email-templates'],
+      'update_html_file': ['email-templates'],
+      'create_knowledge_base': ['knowledge-base'],
+      'update_knowledge_base_file': ['knowledge-base'],
+    };
+
+    const allInvalidations = [...new Set(
+      toolCalls
+        .filter((tc) => !tc.error)
+        .flatMap((tc) => PAGE_INVALIDATION_MAP[tc.name] || [])
+    )];
+
     // Return response object (like Agent Mode, not just string)
     if (toolCalls.length > 0) {
       return {
         content: finalAssistantMessage,
-        toolCalls: toolCalls
+        toolCalls: toolCalls,
+        ...(allInvalidations.length > 0 ? { invalidations: allInvalidations } : {})
       };
     } else {
       // For backward compatibility with partner portal
