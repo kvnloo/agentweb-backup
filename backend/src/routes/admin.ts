@@ -3581,6 +3581,78 @@ router.post("/subscription-types/:typeName/skills", async (req, res) => {
   }
 });
 
+// Get public (anonymous user) allowed skills
+router.get("/public-skills", async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting("public_allowed_skills");
+    let allowedSkills: string[] = [];
+    if (setting) {
+      try {
+        const parsed = JSON.parse(setting.settingValue);
+        if (Array.isArray(parsed)) {
+          allowedSkills = parsed;
+        }
+      } catch { /* use default */ }
+    }
+    res.json({ allowedSkills });
+  } catch (error: any) {
+    console.error("Error getting public skills:", error);
+    res.status(500).json({ message: error.message || "Error getting public skills" });
+  }
+});
+
+// Toggle a skill for public (anonymous) access
+router.post("/public-skills", async (req, res) => {
+  try {
+    const { skillId, action } = req.body; // action: "add" | "remove"
+
+    if (!skillId || typeof skillId !== "string") {
+      return res.status(400).json({ message: "skillId is required" });
+    }
+    if (action !== "add" && action !== "remove") {
+      return res.status(400).json({ message: "action must be 'add' or 'remove'" });
+    }
+
+    // Load current public skills
+    const setting = await settingsService.getSetting("public_allowed_skills");
+    let allowedSkills: string[] = [];
+    if (setting) {
+      try {
+        allowedSkills = JSON.parse(setting.settingValue);
+      } catch {
+        allowedSkills = [];
+      }
+    }
+
+    // If wildcard, expand to actual skill list first
+    if (allowedSkills.includes("*")) {
+      const subscriptionService = await import('../services/subscriptionService');
+      allowedSkills = await subscriptionService.getAllAvailableSkills();
+    }
+
+    if (action === "add") {
+      if (!allowedSkills.includes(skillId)) {
+        allowedSkills = [...allowedSkills, skillId];
+      }
+    } else {
+      allowedSkills = allowedSkills.filter((id: string) => id !== skillId);
+    }
+
+    const updatedBy = (req as any).user?.email || "unknown";
+    await settingsService.setSetting(
+      "public_allowed_skills",
+      JSON.stringify(allowedSkills),
+      "Skills available to public/anonymous users",
+      updatedBy
+    );
+
+    res.json({ success: true, allowedSkills });
+  } catch (error: any) {
+    console.error("Error updating public skills:", error);
+    res.status(500).json({ message: error.message || "Error updating public skills" });
+  }
+});
+
 // Update user subscription type
 router.put("/users/:userId/subscription-type", async (req, res) => {
   try {
