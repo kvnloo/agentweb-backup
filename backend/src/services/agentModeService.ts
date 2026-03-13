@@ -3152,7 +3152,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false): Promise<any> {
+  public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
     // and are required for the skill-gated tool flow to work during benchmark tests.
@@ -3166,6 +3166,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
         sessionId,
         llmModel,
         service: this,
+        ...extraContext,
       });
 
       // // If result is already MCP-wrapped (from external MCP tools via mcpClientService),

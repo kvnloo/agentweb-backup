@@ -3003,7 +3003,8 @@ export async function generateChatResponse(
   currentUrl?: string,
   pageContent?: string,
   portalType: "customer" | "partner" = "partner",
-  userId?: string
+  userId?: string,
+  socketId?: string
 ): Promise<string | { content: string; toolCalls?: any[] }> {
   try {
     const timestamp = new Date().toISOString();
@@ -3135,17 +3136,19 @@ export async function generateChatResponse(
         agentModeService = new AgentModeService();
         await agentModeService.initialize();
 
-        // KB tools, scheduled chat tools, and other tools available to Emma
+        // KB tools, scheduled chat tools, enrichment tools, and other tools available to Emma
         const toolsToInclude = [
           'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files', 'read_page_source',
           'list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat',
           'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables',
+          'enrich_leads_preview', 'enrich_leads_execute',
         ];
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
+        const { emmaToolRegistry } = await import('../emma/registry');
 
         for (const toolName of toolsToInclude) {
-          const toolHandler = mcpToolRegistry.getTool(toolName);
+          const toolHandler = mcpToolRegistry.getTool(toolName) || emmaToolRegistry.getTool(toolName);
           if (toolHandler) {
             // Convert MCP definition to OpenAI format
             const mcpDef = toolHandler.definition;
@@ -3247,7 +3250,8 @@ export async function generateChatResponse(
             functionArgs,
             userId!,
             sessionId,
-            false // mockMode
+            false, // mockMode
+            socketId ? { socketId } : undefined
           );
 
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);

@@ -4130,6 +4130,146 @@ emmaToolRegistry.register({
   }
 });
 
+// ─── CRM Enrichment tools ────────────────────────────────────────────────────
+
+emmaToolRegistry.register({
+  name: 'enrich_leads_preview',
+  definition: {
+    name: 'enrich_leads_preview',
+    description: `Preview a CRM lead enrichment job. Processes 2 sample leads to show what the enrichment will produce before committing to the full batch.
+
+Returns total lead count, how many would be processed, how many are already enriched, and 2 sample enrichment results so the user can verify quality before proceeding.
+
+After showing the preview, ask the user to confirm before calling enrich_leads_execute.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID to enrich.'
+        },
+        instruction: {
+          type: 'string',
+          description: 'Natural language instruction for what to enrich (e.g. "Determine company size and industry").'
+        },
+        output_fields: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of custom field names to populate (e.g. ["company_size", "industry"]). Use snake_case.'
+        },
+        sources: {
+          type: 'array',
+          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
+          description: 'Data sources to use. web_search: searches the web per lead. linkedin: looks up LinkedIn profiles. existing_data: infers from existing lead fields.'
+        },
+        filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              operator: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'is_empty', 'is_not_empty'] },
+              value: {}
+            },
+            required: ['field', 'operator']
+          },
+          description: 'Optional filters to narrow which leads to enrich.'
+        },
+        force_overwrite: {
+          type: 'boolean',
+          description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        }
+      },
+      required: ['list_id', 'instruction', 'output_fields', 'sources']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    return await service.preview({
+      listId: args.list_id,
+      userId: context.userId,
+      instruction: args.instruction,
+      outputFields: args.output_fields,
+      sources: args.sources,
+      filters: args.filters,
+      forceOverwrite: args.force_overwrite,
+    });
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'enrich_leads_execute',
+  definition: {
+    name: 'enrich_leads_execute',
+    description: `Execute a CRM lead enrichment job. Processes all matching leads in parallel, enriching custom fields using AI and the specified data sources.
+
+Progress updates are sent via Socket.IO in real-time. Returns immediately with a job ID and the count of leads to be processed.
+
+Call enrich_leads_preview first to show the user what will happen before executing.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The CRM lead list ID to enrich.'
+        },
+        instruction: {
+          type: 'string',
+          description: 'Natural language instruction for what to enrich.'
+        },
+        output_fields: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of custom field names to populate. Use snake_case.'
+        },
+        sources: {
+          type: 'array',
+          items: { type: 'string', enum: ['web_search', 'linkedin', 'existing_data'] },
+          description: 'Data sources to use.'
+        },
+        filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              operator: { type: 'string', enum: ['equals', 'not_equals', 'contains', 'is_empty', 'is_not_empty'] },
+              value: {}
+            },
+            required: ['field', 'operator']
+          },
+          description: 'Optional filters to narrow which leads to enrich.'
+        },
+        force_overwrite: {
+          type: 'boolean',
+          description: 'If true, re-enrich leads that already have these fields populated. Default false.'
+        }
+      },
+      required: ['list_id', 'instruction', 'output_fields', 'sources']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+    const service = new CrmEnrichmentService();
+    return await service.execute({
+      listId: args.list_id,
+      userId: context.userId,
+      instruction: args.instruction,
+      outputFields: args.output_fields,
+      sources: args.sources,
+      filters: args.filters,
+      forceOverwrite: args.force_overwrite,
+    }, context.socketId);
+  }
+});
+
 // ─── Scheduled Chat tools (bridged from mcpToolRegistry / apiTools.ts) ───────
 // These tools wrap REST endpoints via mcpFetch. Rather than duplicating
 // definitions, we re-register them from the MCP server registry.
