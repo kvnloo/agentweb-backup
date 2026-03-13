@@ -19,6 +19,9 @@ COPY backend/src ./src
 COPY backend/docs ./docs
 RUN NODE_OPTIONS=--max-old-space-size=4096 npm run build
 
+# Copy non-TS assets to dist (templates, scripts, etc.)
+RUN cp -r src/templates dist/templates 2>/dev/null || true
+
 # Copy user-data script (needed by devEnvService to launch EC2 instances)
 COPY test-env/user-data-dev-auto.sh ./dist/user-data-dev-auto.sh
 
