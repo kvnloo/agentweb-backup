@@ -28,9 +28,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-13',
     changes: [
-      'Fix: Customer Portal — Page Title Now Shows User Email',
-      '- The browser tab title now consistently shows "Customer Portal - <your email>" on every page',
-      '- Previously the title only updated when the Emma chat panel was open',
+      'Fix: Customer Portal — Stable Page Title During Delegated Admin Access',
+      '- When an admin delegates into a customer account, the browser tab title now stays as "Customer Portal - <customer email>"',
+      '- Previously the title changed to "Chat Support - ..." when a chat session was active, making it hard to identify the account',
     ],
   },
   {
