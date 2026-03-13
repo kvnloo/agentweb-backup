@@ -3149,6 +3149,7 @@ export interface ChatResponseOptions {
   structuredContext?: string;
   screenshot?: string;
   model?: string;
+  socketId?: string;
   onToolStart?: (toolName: string) => void;
 }
 
@@ -3166,6 +3167,7 @@ export async function generateChatResponse(
     structuredContext,
     screenshot,
     model,
+    socketId,
     onToolStart,
   } = options;
   try {
@@ -3369,6 +3371,7 @@ export async function generateChatResponse(
         const toolsToInclude = [
           'read_page_source',
           'get_visual_context',
+          'enrich_leads_preview', 'enrich_leads_execute',
         ];
 
         // Page-aware tool injection based on the current page URL
@@ -3554,7 +3557,7 @@ export async function generateChatResponse(
           console.log(`[generateChatResponse] Executing tool: ${toolCall.function.name}`, functionArgs);
           onToolStart?.(toolCall.function.name);
           if (!agentModeService) throw new Error("AgentModeService not initialized");
-          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false);
+          const result = await agentModeService.executeTool(response.model, toolCall.function.name, functionArgs, userId!, sessionId, false, socketId ? { socketId } : undefined);
           console.log(`[generateChatResponse] Tool ${toolCall.function.name} executed successfully`);
           toolCalls.push({ id: toolCall.id, name: toolCall.function.name, arguments: functionArgs, result });
           const toolContent = typeof result === 'string' ? result : JSON.stringify(result);

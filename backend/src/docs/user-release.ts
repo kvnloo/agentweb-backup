@@ -9,6 +9,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-12',
     changes: [
+      'Feature: CRM — Natural Language Enrichment via Emma',
+      '- Ask Emma to enrich your CRM leads with any custom fields (e.g., "Enrich my leads with company size and industry")',
+      '- Supports web search, LinkedIn, and existing data as enrichment sources',
+      '- Preview mode shows sample results before processing the full list',
+      '- Real-time progress bar on the CRM page during enrichment',
+      '- Works across thousands of records with parallel batch processing',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
       'Fix: Agent Mode — Crashed Session Recovery',
       '- Fixed an issue where sessions could become permanently stuck if the AI model returned an empty response',
       '- Sessions with accumulated error messages now recover automatically without manual intervention',
