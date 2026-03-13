@@ -12,6 +12,13 @@
       "env": {
         "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer <YOUR_NOTION_TOKEN>\",\"Notion-Version\":\"2025-09-03\"}"
       }
+    },
+    "okareo": {
+      "command": "uvx",
+      "args": ["okareo-mcp"],
+      "env": {
+        "OKAREO_API_KEY": "<YOUR_OKAREO_API_KEY>"
+      }
     }
   }
 }

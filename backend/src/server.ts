@@ -115,11 +115,7 @@ io.on('connection', (socket: Socket) => {
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        data.currentUrl,
-        data.pageContent,
-        portalType,
-        userId,
-        socket.id
+        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id }
       );
 
       // Send response back to the client

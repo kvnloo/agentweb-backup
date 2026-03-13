@@ -884,6 +884,16 @@ export class AgentModeService {
         await new Promise(resolve => setImmediate(resolve));
         responseMessage = response.choices[0].message;
 
+        // Ensure content is always a string (Gemini can return undefined/null content
+        // when safety filters or token exhaustion prevent generation)
+        if (responseMessage.content == null) {
+          responseMessage.content = '';
+        }
+        // Ensure tool_calls doesn't persist as null (DynamoDB drops null values)
+        if (!responseMessage.tool_calls) {
+          delete responseMessage.tool_calls;
+        }
+
         // Record per-iteration timing for metadata
         const toolNamesList = responseMessage.tool_calls?.map((tc: any) => tc.function.name) || [];
         iterationTimings.push({ iteration, llmDurationMs, toolNames: toolNamesList });
@@ -1590,6 +1600,17 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Copy all sliced messages as-is
     for (const msg of sliced) {
+      // Skip empty assistant messages (no content and no tool_calls) — these are artifacts
+      // from failed LLM responses where content was lost (e.g. Gemini safety filter)
+      if (msg.role === 'assistant' && !msg.content && !(msg as any).tool_calls) {
+        continue;
+      }
+      // Skip error messages — they carry no useful context for the LLM and accumulate
+      // when a session enters a crash loop
+      if (msg.role === 'assistant' && (msg as any).metadata?.isErrorMessage) {
+        continue;
+      }
+
       let content = msg.content;
 
       // For user messages with attachments, reconstruct content to include attachment URLs

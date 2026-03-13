@@ -54,7 +54,8 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
-    const result = await chatbotDb.getUserSessions(userId);
+    const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
+    const result = await chatbotDb.getUserSessions(userId, undefined, limitParam);
     
     // Remove page content from response to reduce payload size
     const sanitizedSessions = result.sessions.map(session => {
@@ -66,6 +67,25 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
   } catch (error) {
     console.error('Error listing chat sessions:', error);
     res.status(500).json({ error: 'Failed to list chat sessions' });
+  }
+};
+
+// List Emma (customer-portal) sessions only — filtered server-side
+export const listEmmaSessions = async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ error: 'User not authenticated' });
+    }
+    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+    const pageId = (req.query.pageIdentifier as string) || 'customer-portal';
+    const sessions = await chatbotDb.getEmmaSessions(userId, limit, pageId);
+    // Strip heavy fields not needed for the history list
+    const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => rest);
+    res.status(200).json(sanitized);
+  } catch (error) {
+    console.error('Error listing Emma sessions:', error);
+    res.status(500).json({ error: 'Failed to list Emma sessions' });
   }
 };
 
@@ -99,7 +119,7 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
 export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const sessionId = req.params.sessionId;
-    const { message, currentUrl, pageContext } = req.body;
+    const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
     const portal = req.query.portal as string | undefined;
 
     let portalType: 'customer' | 'partner' = 'partner'; // Default to partner
@@ -130,7 +150,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, currentUrl, pageContext, portalType, userId, undefined);
+      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model });
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -163,6 +183,93 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
   } catch (error) {
     console.error('Error sending message:', error);
     res.status(500).json({ error: 'Failed to process message' });
+  }
+};
+
+// Send a message with SSE streaming for real-time tool call visibility
+export const sendMessageStream = async (req: AuthenticatedRequest, res: Response) => {
+  const sessionId = req.params.sessionId;
+  const { message, currentUrl, pageContext, structuredContext, screenshot, model } = req.body;
+  const portal = req.query.portal as string | undefined;
+
+  const portalType: 'customer' | 'partner' = portal === 'customer' ? 'customer' : 'partner';
+
+  // Auth guard — must be before any DB access so unauthenticated requests get 401, not 403
+  const userId = req.user?.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'User not authenticated' });
+    return;
+  }
+
+  if (!message) {
+    res.status(400).json({ error: 'Message is required' });
+    return;
+  }
+
+  let session;
+  try {
+    session = await chatbotDb.getChatSession(sessionId);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to retrieve chat session' });
+    return;
+  }
+
+  if (!session) {
+    res.status(404).json({ error: 'Chat session not found' });
+    return;
+  }
+
+  if (session.userId !== userId) {
+    res.status(403).json({ error: 'Unauthorized access to chat session' });
+    return;
+  }
+
+  // Set up SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (data: object) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    // Flush immediately so the client receives events without buffering
+    if (typeof (res as any).flush === 'function') {
+      (res as any).flush();
+    }
+  };
+
+  try {
+    const response = await generateChatResponse(
+      sessionId, message,
+      {
+        currentUrl, pageContent: pageContext, portalType, userId,
+        structuredContext, screenshot, model,
+        onToolStart: (toolName: string) => sendEvent({ type: 'tool_start', name: toolName })
+      }
+    );
+
+    const updatedSession = await chatbotDb.getChatSession(sessionId);
+    const formattedResponse = typeof response === 'string' ? { content: response } : response;
+
+    sendEvent({ type: 'complete', ...formattedResponse, session: updatedSession });
+  } catch (error) {
+    console.error('Error in chatbot stream:', error);
+    // getChatSession can itself throw (e.g. DB down). Wrap to avoid unhandled rejection
+    // after SSE headers are already flushed.
+    let currentSession = null;
+    try {
+      currentSession = await chatbotDb.getChatSession(sessionId);
+    } catch {
+      // Ignore — we still need to send the error event
+    }
+    sendEvent({
+      type: 'complete',
+      content: "I'm sorry, I encountered an error processing your request. Please try again.",
+      session: currentSession,
+      error: true
+    });
+  } finally {
+    res.end();
   }
 };
 
