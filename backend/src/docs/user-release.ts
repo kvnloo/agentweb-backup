@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-12',
     changes: [
+      'Fix: Emma — Visual Context Tool',
+      '- Emma can now capture and analyze page screenshots when asked about visual aspects',
+      '- The get_visual_context tool is available on all pages for visual layout and design analysis',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
       'Fix: Emma — Headless Browser Support',
       '- Emma can now use Playwright browser tools (navigate, screenshot, click) on server environments',
       '- Automatically configures headless mode and sandbox settings for reliable browser automation',
