@@ -13980,7 +13980,7 @@ Format the response as JSON with this structure:
   }
 
   // Find a template by name, searching user templates first then public
-  private async findTemplateByName(templateName: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+  public async findTemplateByName(templateName: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
     const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
     const userMatch = userTemplates.find((t: any) => t.template_name === templateName);

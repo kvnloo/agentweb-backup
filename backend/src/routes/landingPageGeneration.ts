@@ -75,6 +75,18 @@ router.post("/preview", async (req, res: Response) => {
 
     const { agentModeService } = await import("../services/agentModeService");
 
+    // Load the landing page template as design inspiration
+    let templateHtml = '';
+    try {
+      const { template } = await agentModeService.findTemplateByName('landing-page-v2', userId);
+      if (template?.html_content) {
+        templateHtml = template.html_content;
+        console.log(`[LP GENERATION] Loaded template 'landing-page-v2' (${templateHtml.length} chars) as design inspiration`);
+      }
+    } catch (err) {
+      console.warn('[LP GENERATION] Could not load template, proceeding without inspiration:', err);
+    }
+
     // Build a rich brand context string
     const brandParts: string[] = [];
     if (brandData.brandName) brandParts.push(`Company: ${brandData.brandName}`);
@@ -95,32 +107,31 @@ router.post("/preview", async (req, res: Response) => {
       ? brandParts.join('\n')
       : 'No brand guidelines available. Create a modern, professional landing page.';
 
+    const templateInspirationBlock = templateHtml
+      ? `
+DESIGN INSPIRATION TEMPLATE:
+Below is an HTML template to use as INSPIRATION for your design. Study its layout, section order, visual style, spacing, animations, and overall feel. Then create your OWN version that captures the spirit and quality of this template but is fully customized to the brand above. Do NOT do simple variable substitution — reimagine the content. You can change the structure, add/remove sections, and make it your own. The template is a starting point for quality and style, not a rigid scaffold.
+
+<template_inspiration>
+${templateHtml}
+</template_inspiration>
+`
+      : '';
+
     const prompt = `You are a world-class web designer. Generate a complete, beautiful, single-file HTML landing page.
 
 BRAND CONTEXT:
 ${brandContext}
-
+${templateInspirationBlock}
 DESIGN REQUIREMENTS:
 - Create a visually stunning, modern landing page that feels premium and high-converting
-- Use the brand colors, fonts, and tone provided — but apply them creatively
-- The design should feel custom-crafted, NOT like a template with blanks filled in
+- Use the brand colors, fonts, and tone provided — apply them creatively
+${templateHtml ? '- Draw inspiration from the template above for layout patterns, CSS techniques, animations, and visual polish — but make it your own' : '- The design should feel custom-crafted and polished'}
 - Use CSS custom properties for colors so they're easy to adjust
 - Include Google Fonts via CDN (pick one that matches the brand tone if none specified)
 - Mobile responsive with clean breakpoints
-- Smooth, subtle CSS animations (fade-ins, hover effects)
+- Smooth, subtle CSS animations (fade-ins, hover effects, scroll-triggered reveals)
 - Professional spacing, typography hierarchy, and visual rhythm
-
-SECTIONS TO INCLUDE:
-1. Navigation bar with logo/company name and CTA button
-2. Hero section with compelling headline, subtext, and primary CTA
-3. Pain points or problem statement (why the audience needs this)
-4. Features/benefits grid (3-6 items with icons or emojis)
-5. How it works (3 simple steps)
-6. Social proof / testimonials (can be placeholder names)
-7. Pricing or value proposition
-8. FAQ section (4-6 questions)
-9. Contact/lead capture form (name, email, company, message fields)
-10. Footer
 
 COPY GUIDELINES:
 - Write real, compelling marketing copy based on the brand context — not lorem ipsum
