@@ -1007,14 +1007,13 @@ mcpToolRegistry.register({
   name: 'generate_landing_page',
   definition: {
     name: 'generate_landing_page',
-    description: 'Generate AND deploy a production landing page in one step. This tool generates code via v0, pushes to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Used preview_landing_page_html to generate an HTML preview and shown it to the user, 2. Received user approval on the preview design, 3. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 4. Called enable_lead_list_public_access to enable public form capture. IMPORTANT: Pass the approved HTML as template_html and the lead list ID as lead_list_id for the contact form. Do NOT call deploy_landing_page after this — deployment is automatic.',
+    description: 'Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic.',
     inputSchema: {
       type: 'object',
       properties: {
-        prompt: { type: 'string', description: 'Description of the landing page to generate' },
+        prompt: { type: 'string', description: 'Detailed description of the landing page including brand colors, fonts, tone, sections, copy guidance, and any specific requirements. The more detail, the better v0 output.' },
         name: { type: 'string', description: 'Optional display name for the page' },
-        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' },
-        template_html: { type: 'string', description: 'The approved HTML from preview_landing_page_html. v0 will recreate this design as a production React/Next.js page. ALWAYS pass this when the user approved an HTML preview.' }
+        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' }
       },
       required: ['prompt']
     }
@@ -1022,7 +1021,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
-      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_html: args.template_html },
+      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id },
       timeoutMs: 15 * 60 * 1000, // 15 minutes — v0 generation + GitHub + Vercel deploy
     });
     return jsonResult(data);
@@ -1103,26 +1102,7 @@ mcpToolRegistry.register({
   }
 });
 
-// ─── Landing Page Preview + Lead List Tools ─────────────────────────────────
-
-mcpToolRegistry.register({
-  name: 'preview_landing_page_html',
-  definition: {
-    name: 'preview_landing_page_html',
-    description: 'Generate a beautiful HTML landing page preview using the user\'s brand guidelines. The LLM creates a fully custom design — not a rigid template fill. Returns the HTML and an S3 preview URL to share with the user. Call this first when a user asks to build a landing page. For revisions, pass feedback describing what to change.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        feedback: { type: 'string', description: 'Optional feedback on a previous preview to incorporate (e.g., "make the hero section bigger", "change CTA to blue")' }
-      },
-      required: []
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/preview', context: ctx(context), body: { feedback: args.feedback }, timeoutMs: 10 * 60 * 1000 });
-    return jsonResult(data);
-  }
-});
+// ─── Landing Page Lead List + Editing Tools ─────────────────────────────────
 
 mcpToolRegistry.register({
   name: 'enable_lead_list_public_access',

@@ -4105,7 +4105,6 @@ const bridgedToolNames = [
   'list_landing_pages',
   'get_landing_page',
   'delete_landing_page',
-  'preview_landing_page_html',
   'enable_lead_list_public_access',
   'duplicate_landing_page',
   'edit_landing_page_file',

@@ -2,6 +2,8 @@ import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import axios from "axios";
 import { Agent, setGlobalDispatcher } from "undici";
+import * as fs from "fs";
+import * as path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
 
 // v0 code generation can take several minutes — extend Node's default fetch timeouts.
@@ -48,6 +50,8 @@ export interface GeneratedLandingPage {
 export interface BrandContext {
   brandName?: string;
   primaryColor?: string;
+  primaryColorEnd?: string;
+  isGradient?: boolean;
   secondaryColor?: string;
   fontFamily?: string;
   tagline?: string;
@@ -55,7 +59,13 @@ export interface BrandContext {
   logoUrl?: string;
   brandPersonality?: string;
   keyMessages?: string[];
+  brandValues?: string[];
   targetAudience?: string;
+  founders?: Array<{ name: string; jobTitle: string; styleTone: string }>;
+  // Market strategy fields
+  businessOverview?: string;
+  icp?: Array<{ title: string; description: string; valueProposition: string; buyerPersonas: string[] }>;
+  competitors?: Array<{ name: string; description: string }>;
 }
 
 /**
@@ -73,7 +83,11 @@ export function buildBrandEnrichedPrompt(
 
   const brandParts: string[] = [];
   if (brand.brandName) brandParts.push(`Brand: ${brand.brandName}`);
-  if (brand.primaryColor) brandParts.push(`Primary color: ${brand.primaryColor}`);
+  if (brand.primaryColor && brand.isGradient && brand.primaryColorEnd) {
+    brandParts.push(`Primary color: gradient from ${brand.primaryColor} to ${brand.primaryColorEnd}`);
+  } else if (brand.primaryColor) {
+    brandParts.push(`Primary color: ${brand.primaryColor}`);
+  }
   if (brand.secondaryColor) brandParts.push(`Secondary color: ${brand.secondaryColor}`);
   if (brand.fontFamily) brandParts.push(`Font: ${brand.fontFamily}`);
   if (brand.tagline) brandParts.push(`Tagline: "${brand.tagline}"`);
@@ -82,10 +96,34 @@ export function buildBrandEnrichedPrompt(
   if (brand.brandPersonality) brandParts.push(`Brand personality: ${brand.brandPersonality}`);
   if (brand.keyMessages && brand.keyMessages.length > 0)
     brandParts.push(`Key messages: ${brand.keyMessages.join(", ")}`);
+  if (brand.brandValues && brand.brandValues.length > 0)
+    brandParts.push(`Brand values: ${brand.brandValues.join(", ")}`);
   if (brand.targetAudience) brandParts.push(`Target audience: ${brand.targetAudience}`);
+  if (brand.founders && brand.founders.length > 0) {
+    const founderLines = brand.founders.map(f => `  - ${f.name}, ${f.jobTitle}`).join("\n");
+    brandParts.push(`Founders:\n${founderLines}`);
+  }
 
   if (brandParts.length > 0) {
     parts.push("\n\nBrand Guidelines:\n" + brandParts.join("\n"));
+  }
+
+  // Market strategy — gives v0 real business context for landing page copy
+  const marketParts: string[] = [];
+  if (brand.businessOverview) marketParts.push(`Business overview: ${brand.businessOverview}`);
+  if (brand.icp && brand.icp.length > 0) {
+    const icpLines = brand.icp.map(p =>
+      `  - ${p.title}: ${p.description}${p.valueProposition ? ` | Value prop: ${p.valueProposition}` : ""}`
+    ).join("\n");
+    marketParts.push(`Ideal Customer Profiles:\n${icpLines}`);
+  }
+  if (brand.competitors && brand.competitors.length > 0) {
+    const compLines = brand.competitors.map(c => `  - ${c.name}: ${c.description}`).join("\n");
+    marketParts.push(`Competitors (differentiate from these):\n${compLines}`);
+  }
+
+  if (marketParts.length > 0) {
+    parts.push("\n\nMarket Context:\n" + marketParts.join("\n"));
   }
 
   if (leadListId) {
@@ -96,7 +134,7 @@ export function buildBrandEnrichedPrompt(
 
   if (templateHtml) {
     parts.push(
-      '\n\nREFERENCE HTML TEMPLATE:\nThe following HTML template represents the approved design. Recreate this design faithfully as a production React/Next.js page. Match the layout, sections, colors, typography, and content as closely as possible. Convert inline styles to Tailwind CSS classes.\n\n```html\n' +
+      '\n\nDESIGN INSPIRATION:\nThe following HTML template is provided as design inspiration. Use it as a reference for layout structure, section ordering, and content patterns — but feel free to improve the visual design, use modern components, and adapt it to look polished and professional. Do NOT copy the HTML verbatim; instead, build a superior React/Next.js version inspired by its structure.\n\n```html\n' +
       templateHtml +
       '\n```'
     );
@@ -180,7 +218,20 @@ async function generateFirstPage(
 ): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
-  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, templateHtml);
+
+  // Auto-load the HTML template as design inspiration for v0
+  let effectiveTemplate = templateHtml;
+  if (!effectiveTemplate) {
+    try {
+      const templatePath = path.join(__dirname, "../templates/landing-page-v2.html");
+      effectiveTemplate = fs.readFileSync(templatePath, "utf-8");
+      console.log(`[V0 SERVICE] Loaded landing page template (${effectiveTemplate.length} chars) as design inspiration`);
+    } catch (err) {
+      console.warn("[V0 SERVICE] Could not load landing page template, continuing without:", err);
+    }
+  }
+
+  const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, effectiveTemplate);
 
   const record: GeneratedLandingPage = {
     id,

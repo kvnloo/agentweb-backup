@@ -58,125 +58,6 @@ function rateLimiter(req: Request, res: Response, next: NextFunction): void {
 router.use(authenticateToken);
 
 /**
- * POST /api/landing-pages/v0/preview
- * Generate an HTML preview using the landing page template + brand guidelines
- */
-router.post("/preview", async (req, res: Response) => {
-  try {
-    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    // Fetch brand guidelines
-    const user = await userDb.getUserById(userId);
-    const brandData = (user as any)?.brandGuidelines?.brandData || {};
-    const { feedback } = req.body || {};
-
-    const { agentModeService } = await import("../services/agentModeService");
-
-    // Load the landing page template as design inspiration
-    let templateHtml = '';
-    try {
-      const { template } = await agentModeService.findTemplateByName('landing-page-v2', userId);
-      if (template?.html_content) {
-        templateHtml = template.html_content;
-        console.log(`[LP GENERATION] Loaded template 'landing-page-v2' (${templateHtml.length} chars) as design inspiration`);
-      }
-    } catch (err) {
-      console.warn('[LP GENERATION] Could not load template, proceeding without inspiration:', err);
-    }
-
-    // Build a rich brand context string
-    const brandParts: string[] = [];
-    if (brandData.brandName) brandParts.push(`Company: ${brandData.brandName}`);
-    if (brandData.tagline) brandParts.push(`Tagline: ${brandData.tagline}`);
-    if (brandData.description) brandParts.push(`Description: ${brandData.description}`);
-    if (brandData.primaryColor) brandParts.push(`Primary Color: ${brandData.primaryColor}`);
-    if (brandData.secondaryColor) brandParts.push(`Secondary Color: ${brandData.secondaryColor}`);
-    if (brandData.accentColor) brandParts.push(`Accent Color: ${brandData.accentColor}`);
-    if (brandData.fontFamily) brandParts.push(`Font: ${brandData.fontFamily}`);
-    if (brandData.logoUrl) brandParts.push(`Logo URL: ${brandData.logoUrl}`);
-    if (brandData.targetAudience) brandParts.push(`Target Audience: ${brandData.targetAudience}`);
-    if (brandData.toneOfVoice) brandParts.push(`Tone: ${brandData.toneOfVoice}`);
-    if (brandData.keyMessages?.length) brandParts.push(`Key Messages:\n${brandData.keyMessages.map((m: string) => `  - ${m}`).join('\n')}`);
-    if (brandData.competitors?.length) brandParts.push(`Competitors: ${brandData.competitors.join(', ')}`);
-    if (brandData.uniqueSellingPoints?.length) brandParts.push(`USPs:\n${brandData.uniqueSellingPoints.map((u: string) => `  - ${u}`).join('\n')}`);
-
-    const brandContext = brandParts.length > 0
-      ? brandParts.join('\n')
-      : 'No brand guidelines available. Create a modern, professional landing page.';
-
-    const templateInspirationBlock = templateHtml
-      ? `
-DESIGN INSPIRATION TEMPLATE:
-Below is an HTML template to use as INSPIRATION for your design. Study its layout, section order, visual style, spacing, animations, and overall feel. Then create your OWN version that captures the spirit and quality of this template but is fully customized to the brand above. Do NOT do simple variable substitution — reimagine the content. You can change the structure, add/remove sections, and make it your own. The template is a starting point for quality and style, not a rigid scaffold.
-
-<template_inspiration>
-${templateHtml}
-</template_inspiration>
-`
-      : '';
-
-    const prompt = `You are a world-class web designer. Generate a complete, beautiful, single-file HTML landing page.
-
-BRAND CONTEXT:
-${brandContext}
-${templateInspirationBlock}
-DESIGN REQUIREMENTS:
-- Create a visually stunning, modern landing page that feels premium and high-converting
-- Use the brand colors, fonts, and tone provided — apply them creatively
-${templateHtml ? '- Draw inspiration from the template above for layout patterns, CSS techniques, animations, and visual polish — but make it your own' : '- The design should feel custom-crafted and polished'}
-- Use CSS custom properties for colors so they're easy to adjust
-- Include Google Fonts via CDN (pick one that matches the brand tone if none specified)
-- Mobile responsive with clean breakpoints
-- Smooth, subtle CSS animations (fade-ins, hover effects, scroll-triggered reveals)
-- Professional spacing, typography hierarchy, and visual rhythm
-
-COPY GUIDELINES:
-- Write real, compelling marketing copy based on the brand context — not lorem ipsum
-- Headlines should be punchy and benefit-driven
-- Use the brand's tone of voice throughout
-- CTAs should be action-oriented and specific
-
-TECHNICAL REQUIREMENTS:
-- Single self-contained HTML file with inline <style> and <script>
-- No external dependencies except Google Fonts
-- The contact form should have client-side validation
-- Use semantic HTML5 elements
-- Ensure accessibility basics (alt text, ARIA labels, contrast)
-${feedback ? `\nUSER FEEDBACK ON PREVIOUS VERSION:\n${feedback}\nApply this feedback to improve the design.` : ''}
-
-Return ONLY the complete HTML document starting with <!DOCTYPE html>. No explanation, no markdown, just the HTML.`;
-
-    const llmModel = await agentModeService.getDefaultModel();
-    const response = await agentModeService.callLLM(llmModel, [
-      { role: 'user', content: prompt }
-    ], {
-      temperature: 0.7,
-      max_completion_tokens: 65536
-    });
-
-    let html = response.choices[0]?.message?.content || '';
-
-    // Strip markdown code fences if present
-    const codeBlockMatch = html.match(/```(?:html)?\s*\n?([\s\S]*?)\n?\s*```/);
-    if (codeBlockMatch) {
-      html = codeBlockMatch[1].trim();
-    }
-
-    if (!html.includes('<!DOCTYPE') && !html.includes('<html')) {
-      return res.status(500).json({ error: "LLM did not return valid HTML" });
-    }
-
-    res.json({ html, brandContext: brandParts });
-  } catch (error: any) {
-    console.error("[LP GENERATION] Error generating preview:", error);
-    res.status(500).json({ error: "Failed to generate preview" });
-  }
-});
-
-/**
  * POST /api/landing-pages/v0/generate
  * Generate a new landing page using v0 Platform API + brand guidelines
  */
@@ -198,7 +79,7 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
 
     const pageName = name || prompt.slice(0, 60);
 
-    // Fetch brand guidelines for context enrichment
+    // Fetch brand guidelines + market strategy for maximum context
     let brandContext: BrandContext = {};
     try {
       const user = await userDb.getUserById(userId);
@@ -208,13 +89,17 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
         brandContext = {
           brandName: bd.brandName,
           primaryColor: bd.primaryColor,
+          primaryColorEnd: bd.primaryColorEnd,
+          isGradient: bd.isGradient,
           secondaryColor: bd.secondaryColor,
           fontFamily: bd.fontFamily,
           tagline: bd.tagline,
           toneOfVoice: bd.toneOfVoice,
           brandPersonality: bd.brandPersonality,
           keyMessages: bd.keyMessages,
+          brandValues: bd.brandValues,
           targetAudience: bd.targetAudience,
+          founders: bd.founders,
         };
 
         // Get logo URL from attachments
@@ -226,6 +111,14 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
             brandContext.logoUrl = logo.url;
           }
         }
+      }
+
+      // Pull market strategy for richer landing page copy
+      if (user?.marketStrategy) {
+        const ms = user.marketStrategy;
+        brandContext.businessOverview = ms.businessOverview;
+        brandContext.icp = ms.icp;
+        brandContext.competitors = ms.competitors;
       }
     } catch (error) {
       console.error("[LP GENERATION] Failed to fetch brand guidelines, continuing without:", error);
@@ -343,23 +236,37 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
     const { name } = req.body;
     const newName = name || `${original.name} (copy)`;
 
-    // Re-generate using the original prompt + brand context
+    // Re-generate using the original prompt + full brand context
     let brandContext: BrandContext = {};
     try {
       const user = await userDb.getUserById(userId);
       if (user?.brandGuidelines) {
-        const bd = (user.brandGuidelines as any).brandData || {};
+        const bg = user.brandGuidelines;
+        const bd = (bg as any).brandData || {};
         brandContext = {
           brandName: bd.brandName,
           primaryColor: bd.primaryColor,
+          primaryColorEnd: bd.primaryColorEnd,
+          isGradient: bd.isGradient,
           secondaryColor: bd.secondaryColor,
           fontFamily: bd.fontFamily,
           tagline: bd.tagline,
           toneOfVoice: bd.toneOfVoice,
           brandPersonality: bd.brandPersonality,
           keyMessages: bd.keyMessages,
+          brandValues: bd.brandValues,
           targetAudience: bd.targetAudience,
+          founders: bd.founders,
         };
+        if ((bg as any).attachments && Array.isArray((bg as any).attachments)) {
+          const logo = (bg as any).attachments.find((a: any) => a.type === "logo" && a.url);
+          if (logo) brandContext.logoUrl = logo.url;
+        }
+      }
+      if (user?.marketStrategy) {
+        brandContext.businessOverview = user.marketStrategy.businessOverview;
+        brandContext.icp = user.marketStrategy.icp;
+        brandContext.competitors = user.marketStrategy.competitors;
       }
     } catch {}
 
