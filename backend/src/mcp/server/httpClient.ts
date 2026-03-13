@@ -4,6 +4,16 @@
  */
 
 import jwt from 'jsonwebtoken';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+// Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
+// is too short for MCP tools that call slow endpoints (e.g. preview_landing_page_html
+// calls Azure OpenAI which can take 2-5 min with large prompts).
+setGlobalDispatcher(new Agent({
+  headersTimeout: 15 * 60 * 1000,  // 15 minutes
+  bodyTimeout: 15 * 60 * 1000,     // 15 minutes
+  connectTimeout: 30 * 1000,       // 30 seconds
+}));
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
