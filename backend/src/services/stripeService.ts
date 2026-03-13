@@ -184,15 +184,18 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
 
 /**
  * Find a user by their stripe_customer_id.
- * Uses getAllUsers scan since there's no GSI on stripe_customer_id.
- * In production, consider adding a DynamoDB GSI for better performance.
+ * Uses a filtered DynamoDB scan (server-side filter, no GSI required).
+ * Consider adding a GSI on stripe_customer_id if user count grows past ~1000.
  */
 async function findUserByStripeCustomerId(stripeCustomerId: string): Promise<any | null> {
   if (!stripeCustomerId) return null;
 
   try {
-    const allUsers = await userDb.getAllUsers();
-    return allUsers.find((u: any) => u.stripe_customer_id === stripeCustomerId) || null;
+    const result = await userDb.scanWithFilter(
+      'stripe_customer_id = :cid',
+      { ':cid': stripeCustomerId },
+    );
+    return result[0] || null;
   } catch (error) {
     console.error('Error finding user by stripe_customer_id:', error);
     return null;

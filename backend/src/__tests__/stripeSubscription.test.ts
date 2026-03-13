@@ -21,12 +21,15 @@ const mockGetUserById = jest.fn();
 const mockUpdateUser = jest.fn();
 const mockGetAllUsers = jest.fn();
 
+const mockScanWithFilter = jest.fn();
+
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: mockGetUserById,
     getUserByEmail: jest.fn(),
     updateUser: mockUpdateUser,
     getAllUsers: mockGetAllUsers,
+    scanWithFilter: mockScanWithFilter,
   },
   User: {},
 }));
@@ -209,8 +212,8 @@ describe('Stripe subscription management', () => {
         },
       };
       mockStripe.webhooks.constructEvent.mockReturnValue(event);
-      // findUserByStripeCustomerId uses getAllUsers scan to find user by stripe_customer_id
-      mockGetAllUsers.mockResolvedValue([
+      // findUserByStripeCustomerId uses scanWithFilter to find user by stripe_customer_id
+      mockScanWithFilter.mockResolvedValue([
         { userId: 'user-123', stripe_customer_id: 'cus_abc123' },
       ]);
       mockUpdateUser.mockResolvedValue({});

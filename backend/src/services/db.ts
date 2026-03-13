@@ -458,6 +458,23 @@ class UserDB {
     }
   }
 
+  /**
+   * Scan with a server-side filter expression. Returns raw items (no counts).
+   */
+  async scanWithFilter(
+    filterExpression: string,
+    expressionAttributeValues: Record<string, any>,
+  ): Promise<any[]> {
+    const result = await this.docClient
+      .scan({
+        TableName: this.tableName,
+        FilterExpression: filterExpression,
+        ExpressionAttributeValues: expressionAttributeValues,
+      })
+      .promise();
+    return result.Items || [];
+  }
+
   async getUserAnalytics(startDate: string, endDate: string) {
     try {
       const params = {
