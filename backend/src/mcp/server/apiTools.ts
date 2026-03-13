@@ -1051,29 +1051,6 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'iterate_landing_page',
-  definition: {
-    name: 'iterate_landing_page',
-    description: 'Refine a generated landing page with follow-up instructions.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        page_id: { type: 'string', description: 'The generated landing page ID' },
-        message: { type: 'string', description: 'Instructions for how to refine the page' }
-      },
-      required: ['page_id', 'message']
-    }
-  },
-  execute: async (args: any, context: any) => {
-    const data = await mcpFetch({
-      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
-      body: { message: args.message }
-    });
-    return jsonResult(data);
-  }
-});
-
-mcpToolRegistry.register({
   name: 'list_landing_pages',
   definition: {
     name: 'list_landing_pages',
@@ -1192,7 +1169,7 @@ mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
-    description: 'Edit a specific file in a deployed landing page\'s GitHub repository. Use this when the user wants to change copy, styling, or functionality after deployment. Changes auto-deploy via Vercel. For major redesigns, use iterate_landing_page instead.',
+    description: 'Edit a specific file in a deployed landing page\'s GitHub repository. Use this when the user wants to change copy, styling, or functionality after deployment. Changes auto-deploy via Vercel within ~30 seconds.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -4099,10 +4099,9 @@ const bridgedToolNames = [
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
-  // Landing Page tools (v0 generation + deployment)
+  // Landing Page tools (v0 generation + GitHub editing)
   'generate_landing_page',
   'deploy_landing_page',
-  'iterate_landing_page',
   'list_landing_pages',
   'get_landing_page',
   'delete_landing_page',

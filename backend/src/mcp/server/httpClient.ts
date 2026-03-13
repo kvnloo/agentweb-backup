@@ -50,7 +50,7 @@ async function lookupUser(userId: string): Promise<UserRecord> {
 
 // ─── JWT generation ─────────────────────────────────────────────────────────
 
-const SELF_CALL_TOKEN_TTL = 60; // seconds
+const SELF_CALL_TOKEN_TTL = 600; // seconds — must outlast slow operations like v0 generation
 
 export function generateSelfCallToken(user: UserRecord): string {
   const secret = process.env.JWT_SECRET || 'your-secret-key';
@@ -97,12 +97,21 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
     'Content-Type': 'application/json',
   };
 
-  const fetchOptions: RequestInit = { method, headers };
+  const controller = new AbortController();
+  const timeoutMs = 5 * 60 * 1000; // 5 minutes — v0 generation + deploy can take several minutes
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const fetchOptions: RequestInit = { method, headers, signal: controller.signal };
   if (body && method !== 'GET') {
     fetchOptions.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, fetchOptions);
+  let response: Response;
+  try {
+    response = await fetch(url, fetchOptions);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   // Parse response
   const contentType = response.headers.get('content-type') || '';

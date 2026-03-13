@@ -1,7 +1,17 @@
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import axios from "axios";
+import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
+
+// v0 code generation can take several minutes — extend Node's default fetch timeouts.
+// Node 20's built-in undici has headersTimeout=300s which is too short for v0.
+setGlobalDispatcher(new Agent({
+  headersTimeout: 10 * 60 * 1000,  // 10 minutes
+  bodyTimeout: 10 * 60 * 1000,     // 10 minutes
+  connectTimeout: 30 * 1000,       // 30 seconds for initial connection
+}));
+console.log("[V0 SERVICE] Extended fetch timeouts to 10 minutes for v0 API calls");
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -16,7 +26,7 @@ export interface GeneratedLandingPage {
   userId: string;
   name: string;
   prompt: string;
-  status: "generating" | "draft" | "deployed" | "failed";
+  status: "generating" | "draft" | "deploying" | "deployed" | "failed";
   v0ProjectId?: string;
   v0ChatId?: string;
   vercelProjectId?: string;
@@ -27,6 +37,10 @@ export interface GeneratedLandingPage {
   errorMessage?: string;
   leadListId?: string;
   templateHtml?: string;
+  isRootPage?: boolean;
+  slug?: string;
+  archived?: boolean;
+  archivedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -114,7 +128,13 @@ async function getV0Client() {
 }
 
 /**
- * Generate a landing page using v0 Platform API
+ * Generate a landing page.
+ *
+ * Strategy:
+ * - If user has NO deployed landing page with a GitHub repo → call v0 (the only v0 call),
+ *   create a GitHub repo, deploy to Vercel. This is the "first page" path.
+ * - If user ALREADY has a deployed landing page → add a new page route to the EXISTING
+ *   GitHub repo via the GitHub Contents API. No v0 call, no new repo. Vercel auto-redeploys.
  */
 export async function generateLandingPage(
   userId: string,
@@ -124,22 +144,44 @@ export async function generateLandingPage(
   leadListId?: string,
   templateHtml?: string
 ): Promise<GeneratedLandingPage> {
-  // Dedup: if this user already has a page with a v0ChatId that isn't failed, reuse it.
-  // This prevents burning extra v0 credits on retries or duplicate calls from Emma.
+  // Check if user already has a site (GitHub repo) — includes archived records.
+  // This is the core guard: v0 is only called if NO site exists at all.
+  const siteRecord = await findUserSiteRecord(userId);
+
+  if (siteRecord) {
+    // ── Add new page route to existing repo (no v0 call) ──
+    return addPageToExistingRepo(siteRecord, userId, prompt, name, brandContext, leadListId, templateHtml);
+  }
+
+  // Dedup: if this user already has a page in-progress with a v0ChatId, reuse it.
   const existingPages = await listLandingPages(userId);
   const reusable = existingPages.find(
-    (p) => p.v0ChatId && ["generating", "draft", "deploying", "deployed"].includes(p.status)
+    (p) => p.v0ChatId && ["generating", "draft", "deploying"].includes(p.status)
   );
   if (reusable) {
     console.log(`[V0 SERVICE] Reusing existing page ${reusable.id} (status: ${reusable.status}, v0ChatId: ${reusable.v0ChatId}) — skipping new v0 chat`);
     return reusable;
   }
 
+  // ── First page: call v0 → create repo → deploy ──
+  return generateFirstPage(userId, prompt, name, brandContext, leadListId, templateHtml);
+}
+
+/**
+ * First-ever landing page for this user. Calls v0 once, creates GitHub repo, deploys to Vercel.
+ */
+async function generateFirstPage(
+  userId: string,
+  prompt: string,
+  name: string,
+  brandContext: BrandContext,
+  leadListId?: string,
+  templateHtml?: string
+): Promise<GeneratedLandingPage> {
   const id = uuidv4();
   const now = new Date().toISOString();
   const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, templateHtml);
 
-  // Create the record first in "generating" status
   const record: GeneratedLandingPage = {
     id,
     userId,
@@ -147,40 +189,26 @@ export async function generateLandingPage(
     prompt,
     status: "generating",
     iterations: 0,
+    isRootPage: true,
     createdAt: now,
     updatedAt: now,
   };
 
-  if (leadListId) {
-    record.leadListId = leadListId;
-  }
-  if (templateHtml) {
-    record.templateHtml = templateHtml;
-  }
+  if (leadListId) record.leadListId = leadListId;
+  if (templateHtml) record.templateHtml = templateHtml;
 
-  await dynamodb
-    .put({
-      TableName: TABLE_NAME,
-      Item: record,
-    })
-    .promise();
+  await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
   try {
     const v0 = await getV0Client();
 
-    // Generate the landing page via a standalone chat (no v0 project needed — we deploy via GitHub/Vercel)
-    const chatResponse = await v0.chats.create({
-      message: enrichedPrompt,
-    });
+    const chatResponse = await v0.chats.create({ message: enrichedPrompt });
 
-    // Narrow the union type — streaming responses don't have 'id'
     if (!("id" in chatResponse) || !chatResponse.id) {
       throw new Error("v0 chat creation did not return a ChatDetail with an id");
     }
-    const chat = chatResponse;
-    const chatId = chat.id;
+    const chatId = chatResponse.id;
 
-    // Update record with v0 chat ID and mark as draft
     let updateExpression =
       "SET #status = :status, v0ChatId = :chatId, updatedAt = :updatedAt";
     const expressionAttributeValues: Record<string, any> = {
@@ -204,14 +232,12 @@ export async function generateLandingPage(
       })
       .promise();
 
-    // Auto-deploy: download from v0 → GitHub → Vercel in one shot
     console.log(`[V0 SERVICE] v0 chat created (${chatId}), auto-deploying...`);
     const deployed = await deployLandingPage(id, userId);
     return deployed;
   } catch (error: any) {
     console.error("[V0 SERVICE] Generation failed:", error);
 
-    // Update record to failed status
     await dynamodb
       .update({
         TableName: TABLE_NAME,
@@ -233,6 +259,179 @@ export async function generateLandingPage(
       errorMessage: error.message || "Unknown error during generation",
     };
   }
+}
+
+/**
+ * Add a new page route to an existing deployed landing page's GitHub repo.
+ * Creates app/<slug>/page.tsx via the GitHub Contents API. Vercel auto-redeploys.
+ * No v0 call — the new page content is generated from the prompt + template HTML.
+ */
+async function addPageToExistingRepo(
+  existingPage: GeneratedLandingPage,
+  userId: string,
+  prompt: string,
+  name: string,
+  brandContext: BrandContext,
+  leadListId?: string,
+  templateHtml?: string
+): Promise<GeneratedLandingPage> {
+  const id = uuidv4();
+  const now = new Date().toISOString();
+
+  // Create a slug for the new page route
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 30);
+
+  const match = existingPage.githubRepoUrl!.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!match) throw new Error("Invalid GitHub repo URL on existing page");
+  const [, owner, repo] = match;
+  const repoName = repo.replace(".git", "");
+
+  console.log(`[GITHUB] Adding new page /${slug} to existing repo ${owner}/${repoName}`);
+
+  // Build the page content — a simple React component from the template/prompt
+  const pageContent = buildNewPageContent(name, prompt, brandContext, leadListId, templateHtml);
+
+  // Derive the base URL from the Vercel project name in the GitHub repo URL
+  const repoSlug = repoName; // e.g. "lp-taskflow-landing-9262210a"
+  const baseUrl = `https://${repoSlug}.vercel.app`;
+
+  const record: GeneratedLandingPage = {
+    id,
+    userId,
+    name,
+    prompt,
+    status: "deploying",
+    iterations: 0,
+    slug,
+    githubRepoUrl: existingPage.githubRepoUrl,
+    vercelProjectId: existingPage.vercelProjectId,
+    deployedUrl: baseUrl ? `${baseUrl}/${slug}` : undefined,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  if (leadListId) record.leadListId = leadListId;
+  if (templateHtml) record.templateHtml = templateHtml;
+
+  await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
+
+  try {
+    const { token: ghToken } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${ghToken}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+
+    // Create the new page file: app/<slug>/page.tsx
+    const filePath = `app/${slug}/page.tsx`;
+    const encoded = Buffer.from(pageContent, "utf-8").toString("base64");
+
+    await axios.put(
+      `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+      {
+        message: `Add new page: ${name} (/${slug})`,
+        content: encoded,
+      },
+      { headers: ghHeaders }
+    );
+
+    console.log(`[GITHUB] Created ${filePath} in ${owner}/${repoName} — Vercel will auto-redeploy`);
+
+    // Update record to deployed
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "deployed",
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    return {
+      ...record,
+      status: "deployed",
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error: any) {
+    console.error("[GITHUB] Failed to add page to repo:", error);
+
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression:
+          "SET #status = :status, errorMessage = :error, updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "failed",
+          ":error": error.message || "Failed to add page to repo",
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    return {
+      ...record,
+      status: "failed",
+      errorMessage: error.message || "Failed to add page to repo",
+    };
+  }
+}
+
+/**
+ * Build a simple React page component from prompt + brand context.
+ * Used when adding new pages to an existing repo (no v0 needed).
+ */
+function buildNewPageContent(
+  name: string,
+  prompt: string,
+  brandContext: BrandContext,
+  leadListId?: string,
+  templateHtml?: string
+): string {
+  // If template HTML is provided, wrap it in a React component with dangerouslySetInnerHTML
+  if (templateHtml) {
+    // Escape backticks in the HTML for the template literal
+    const escapedHtml = templateHtml.replace(/`/g, "\\`").replace(/\$/g, "\\$");
+    return `export default function ${name.replace(/[^a-zA-Z0-9]/g, "")}Page() {
+  return (
+    <div dangerouslySetInnerHTML={{ __html: \`${escapedHtml}\` }} />
+  );
+}
+`;
+  }
+
+  // Otherwise, generate a minimal page from the prompt context
+  const brandName = brandContext.brandName || name;
+  const primaryColor = brandContext.primaryColor || "#007AFF";
+  const tagline = brandContext.tagline || prompt.slice(0, 100);
+
+  return `export default function ${name.replace(/[^a-zA-Z0-9]/g, "")}Page() {
+  return (
+    <main className="min-h-screen bg-white">
+      <section className="max-w-4xl mx-auto px-6 py-20 text-center">
+        <h1 className="text-4xl font-bold mb-4" style={{ color: "${primaryColor}" }}>
+          ${brandName}
+        </h1>
+        <p className="text-xl text-gray-600 mb-8">
+          ${tagline}
+        </p>
+        <p className="text-gray-500">
+          ${prompt.replace(/'/g, "\\'")}
+        </p>
+      </section>
+    </main>
+  );
+}
+`;
 }
 
 /**
@@ -440,6 +639,58 @@ async function createGitHubRepoAndPush(
   const files = await unzipBuffer(zipData);
   console.log(`[V0 SERVICE] Extracted ${files.length} files from v0 zip`);
 
+  // v0 downloads only contain modified files — add standard Next.js scaffolding
+  // that's required for the build but not included in the zip
+  const scaffoldFiles: Array<{ path: string; content: Buffer }> = [];
+
+  const hasFile = (name: string) => files.some((f) => f.path === name || f.path.endsWith(`/${name}`));
+
+  if (!hasFile("tsconfig.json")) {
+    scaffoldFiles.push({
+      path: "tsconfig.json",
+      content: Buffer.from(JSON.stringify({
+        compilerOptions: {
+          target: "ES2017",
+          lib: ["dom", "dom.iterable", "esnext"],
+          allowJs: true,
+          skipLibCheck: true,
+          strict: true,
+          noEmit: true,
+          esModuleInterop: true,
+          module: "esnext",
+          moduleResolution: "bundler",
+          resolveJsonModule: true,
+          isolatedModules: true,
+          jsx: "preserve",
+          incremental: true,
+          plugins: [{ name: "next" }],
+          paths: { "@/*": ["./*"] },
+        },
+        include: ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+        exclude: ["node_modules"],
+      }, null, 2)),
+    });
+  }
+
+  if (!hasFile("next.config.ts") && !hasFile("next.config.js") && !hasFile("next.config.mjs")) {
+    scaffoldFiles.push({
+      path: "next.config.ts",
+      content: Buffer.from('import type { NextConfig } from "next";\nconst nextConfig: NextConfig = {};\nexport default nextConfig;\n'),
+    });
+  }
+
+  if (!hasFile("lib/utils.ts")) {
+    scaffoldFiles.push({
+      path: "lib/utils.ts",
+      content: Buffer.from('import { type ClassValue, clsx } from "clsx"\nimport { twMerge } from "tailwind-merge"\n\nexport function cn(...inputs: ClassValue[]) {\n  return twMerge(clsx(inputs))\n}\n'),
+    });
+  }
+
+  if (scaffoldFiles.length > 0) {
+    console.log(`[V0 SERVICE] Adding ${scaffoldFiles.length} scaffold files: ${scaffoldFiles.map(f => f.path).join(", ")}`);
+    files.push(...scaffoldFiles);
+  }
+
   // Push files to the repo using the Git Trees API (single commit for all files)
   // Step A: Get the default branch SHA
   const refRes = await axios.get<any>(
@@ -520,6 +771,8 @@ async function createVercelProject(
     {
       name: projectName,
       framework: "nextjs",
+      installCommand: "npm install",  // v0 generates package.json for npm, not pnpm
+      buildCommand: "npm run build",  // Prevent Vercel from defaulting to pnpm
       gitRepository: {
         type: "github",
         repo: repoFullName,
@@ -533,7 +786,30 @@ async function createVercelProject(
 
   console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl}`);
 
-  // Poll for initial deployment status (Vercel auto-triggers a build when linking GitHub)
+  // Manually trigger a deployment — Vercel doesn't always auto-deploy when linking to an existing repo
+  const { token: ghToken } = await getGitHubOrgToken();
+  const repoInfoRes = await axios.get<any>(`https://api.github.com/repos/${repoFullName}`, {
+    headers: { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" },
+  });
+  const repoId = repoInfoRes.data.id;
+
+  try {
+    await axios.post<any>(
+      "https://api.vercel.com/v13/deployments",
+      {
+        name: projectName,
+        project: vercelProjectId,
+        gitSource: { type: "github", repo: repoFullName, ref: "main", repoId },
+      },
+      { headers }
+    );
+    console.log(`[V0 SERVICE] Triggered manual deployment for ${projectName}`);
+  } catch (deployErr: any) {
+    // Non-fatal — Vercel may have already auto-triggered
+    console.warn(`[V0 SERVICE] Manual deploy trigger failed (may already be deploying): ${deployErr.message}`);
+  }
+
+  // Poll for deployment status
   const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken);
 
   return { deployedUrl, vercelProjectId, ...deploymentResult };
@@ -661,66 +937,12 @@ export async function getDeploymentStatus(
 }
 
 /**
- * Send a follow-up message to iterate on a landing page
- */
-export async function iterateLandingPage(
-  id: string,
-  userId: string,
-  message: string
-): Promise<GeneratedLandingPage> {
-  const record = await getLandingPage(id, userId);
-  if (!record) {
-    throw new Error("Landing page not found");
-  }
-
-  if (!record.v0ChatId) {
-    throw new Error("Landing page has no v0 chat — generate first");
-  }
-
-  try {
-    const v0 = await getV0Client();
-
-    await v0.chats.sendMessage({
-      chatId: record.v0ChatId,
-      message,
-    });
-
-    // Reset status to draft (needs re-deploy after iteration)
-    const newStatus = record.status === "deployed" ? "draft" : record.status;
-
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id },
-        UpdateExpression:
-          "SET #status = :status, iterations = :iterations, updatedAt = :updatedAt",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":status": newStatus,
-          ":iterations": (record.iterations || 0) + 1,
-          ":updatedAt": new Date().toISOString(),
-        },
-      })
-      .promise();
-
-    return {
-      ...record,
-      status: newStatus,
-      iterations: (record.iterations || 0) + 1,
-      updatedAt: new Date().toISOString(),
-    };
-  } catch (error: any) {
-    console.error("[V0 SERVICE] Iteration failed:", error);
-    throw new Error(`Iteration failed: ${error.message}`);
-  }
-}
-
-/**
- * Get a single landing page by ID (scoped to user)
+ * Get a single landing page by ID (scoped to user). Excludes archived unless requested.
  */
 export async function getLandingPage(
   id: string,
-  userId: string
+  userId: string,
+  includeArchived = false
 ): Promise<GeneratedLandingPage | null> {
   const result = await dynamodb
     .get({
@@ -733,12 +955,15 @@ export async function getLandingPage(
   if (!item || item.userId !== userId) {
     return null;
   }
+  if (item.archived && !includeArchived) {
+    return null;
+  }
 
   return item;
 }
 
 /**
- * List all generated landing pages for a user
+ * List all generated landing pages for a user (excludes archived).
  */
 export async function listLandingPages(
   userId: string
@@ -748,8 +973,10 @@ export async function listLandingPages(
       TableName: TABLE_NAME,
       IndexName: "UserIdIndex",
       KeyConditionExpression: "userId = :userId",
+      FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
       ExpressionAttributeValues: {
         ":userId": userId,
+        ":archivedFalse": false,
       },
       ScanIndexForward: false, // newest first
     })
@@ -759,22 +986,117 @@ export async function listLandingPages(
 }
 
 /**
- * Delete a landing page record
+ * Find the user's landing site (GitHub repo + Vercel project).
+ * Searches ALL records including archived — the site survives page deletion.
+ * Also auto-marks the site record as isRootPage if not already set.
+ */
+async function findUserSiteRecord(userId: string): Promise<GeneratedLandingPage | null> {
+  const result = await dynamodb
+    .query({
+      TableName: TABLE_NAME,
+      IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :userId",
+      ExpressionAttributeValues: { ":userId": userId },
+    })
+    .promise();
+
+  const pages = (result.Items || []) as GeneratedLandingPage[];
+
+  // Prefer: 1) explicit root page, 2) page with v0ChatId (original v0 page), 3) any with githubRepoUrl
+  const siteRecord =
+    pages.find((p) => p.isRootPage && p.githubRepoUrl) ||
+    pages.find((p) => p.v0ChatId && p.githubRepoUrl) ||
+    pages.find((p) => !!p.githubRepoUrl);
+
+  if (siteRecord && !siteRecord.isRootPage) {
+    // Backfill: mark this as the root page
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id: siteRecord.id },
+        UpdateExpression: "SET isRootPage = :val",
+        ExpressionAttributeValues: { ":val": true },
+      })
+      .promise();
+    siteRecord.isRootPage = true;
+  }
+
+  return siteRecord || null;
+}
+
+/**
+ * Remove a page route file from the GitHub repo.
+ */
+async function removePageFromGitHub(githubRepoUrl: string, slug: string): Promise<void> {
+  const match = githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!match) return;
+  const [, owner, repo] = match;
+  const repoName = repo.replace(".git", "");
+  const filePath = `app/${slug}/page.tsx`;
+
+  const { token: ghToken } = await getGitHubOrgToken();
+  const ghHeaders = {
+    Authorization: `Bearer ${ghToken}`,
+    Accept: "application/vnd.github.v3+json",
+  };
+
+  // Get the file SHA (required for deletion)
+  const fileRes = await axios.get<any>(
+    `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+    { headers: ghHeaders }
+  );
+
+  await axios({
+    method: "DELETE",
+    url: `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+    headers: ghHeaders,
+    data: {
+      message: `Remove page /${slug}`,
+      sha: fileRes.data.sha,
+    },
+  });
+
+  console.log(`[GITHUB] Removed ${filePath} from ${owner}/${repoName}`);
+}
+
+/**
+ * Delete a landing page. Root page cannot be deleted.
+ * Sub-pages are soft-deleted (archived) and their route file is removed from GitHub.
  */
 export async function deleteLandingPage(
   id: string,
   userId: string
 ): Promise<void> {
-  // Verify ownership first
   const record = await getLandingPage(id, userId);
   if (!record) {
     throw new Error("Landing page not found");
   }
 
+  if (record.isRootPage) {
+    throw new Error("Cannot delete the root landing page. Use Emma to edit it instead.");
+  }
+
+  // Remove route file from GitHub
+  if (record.githubRepoUrl && record.slug) {
+    try {
+      await removePageFromGitHub(record.githubRepoUrl, record.slug);
+    } catch (err: any) {
+      console.error("[V0 SERVICE] Failed to remove route from GitHub:", err.message);
+      // Continue with soft-delete even if GitHub cleanup fails
+    }
+  }
+
+  // Soft-delete (archive)
   await dynamodb
-    .delete({
+    .update({
       TableName: TABLE_NAME,
       Key: { id },
+      UpdateExpression: "SET archived = :archived, archivedAt = :archivedAt, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":archived": true,
+        ":archivedAt": new Date().toISOString(),
+        ":updatedAt": new Date().toISOString(),
+      },
     })
     .promise();
 }

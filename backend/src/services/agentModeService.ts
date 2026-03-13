@@ -14621,42 +14621,61 @@ You must return a valid JSON object with exactly these two fields:
 
 IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
-      const substitutionResponse = await this.callLLM(llmModel, [
-        {
-          role: 'user',
-          content: substitutionPrompt
+      // Try with increasing token limits — large HTML templates need room for the full output
+      const tokenLimits = [32768, 65536];
+      let substitutionData: any = null;
+
+      for (const maxTokens of tokenLimits) {
+        const substitutionResponse = await this.callLLM(llmModel, [
+          {
+            role: 'user',
+            content: substitutionPrompt
+          }
+        ], {
+          temperature: 0.1,
+          response_format: { type: 'json_object' },
+          max_completion_tokens: maxTokens
+        });
+
+        const finishReason = substitutionResponse.choices[0].finish_reason;
+        const substitutionResult = substitutionResponse.choices[0].message.content;
+
+        if (!substitutionResult) {
+          throw new Error('LLM did not return substitution result');
         }
-      ], {
-        temperature: 0.1,
-        response_format: { type: 'json_object' },
-        max_completion_tokens: 16384
-      });
 
-      const substitutionResult = substitutionResponse.choices[0].message.content;
-      if (!substitutionResult) {
-        throw new Error('LLM did not return substitution result');
-      }
+        // If the response was truncated (length = hit token limit), retry with more tokens
+        if (finishReason === 'length') {
+          console.warn(`createHtmlFromTemplate: Response truncated at ${maxTokens} tokens, retrying with more...`);
+          continue;
+        }
 
-      let substitutionData;
-      try {
-        substitutionData = JSON.parse(substitutionResult);
-      } catch (parseError) {
-        // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
-        const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-        if (codeBlockMatch) {
-          try {
-            substitutionData = JSON.parse(codeBlockMatch[1].trim());
-          } catch (innerParseError) {
-            console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+        try {
+          substitutionData = JSON.parse(substitutionResult);
+        } catch (parseError) {
+          // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
+          const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+          if (codeBlockMatch) {
+            try {
+              substitutionData = JSON.parse(codeBlockMatch[1].trim());
+            } catch (innerParseError) {
+              console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+              // If we have more token limits to try, continue; otherwise throw
+              if (maxTokens < tokenLimits[tokenLimits.length - 1]) continue;
+              throw new Error('LLM returned invalid JSON for variable substitution');
+            }
+          } else {
+            console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+            if (maxTokens < tokenLimits[tokenLimits.length - 1]) continue;
             throw new Error('LLM returned invalid JSON for variable substitution');
           }
-        } else {
-          console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
-          throw new Error('LLM returned invalid JSON for variable substitution');
         }
+
+        // Successfully parsed — break out of retry loop
+        if (substitutionData) break;
       }
 
-      if (!substitutionData.final_html || !substitutionData.final_subject) {
+      if (!substitutionData || !substitutionData.final_html || !substitutionData.final_subject) {
         throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
