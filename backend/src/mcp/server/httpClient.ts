@@ -19,6 +19,8 @@ interface McpFetchOptions {
   context: { userId?: string; agentUserId?: string };
   body?: Record<string, unknown>;
   queryParams?: Record<string, string>;
+  /** Override the default 5-minute timeout (in ms). Use for long-running calls like v0 generation. */
+  timeoutMs?: number;
 }
 
 // ─── User cache (per-process, cleared on restart) ───────────────────────────
@@ -98,8 +100,8 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
   };
 
   const controller = new AbortController();
-  const timeoutMs = 5 * 60 * 1000; // 5 minutes — v0 generation + deploy can take several minutes
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const effectiveTimeout = options.timeoutMs ?? 5 * 60 * 1000; // default 5 minutes
+  const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
 
   const fetchOptions: RequestInit = { method, headers, signal: controller.signal };
   if (body && method !== 'GET') {

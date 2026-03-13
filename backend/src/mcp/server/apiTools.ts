@@ -1022,7 +1022,8 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
-      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_html: args.template_html }
+      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id, template_html: args.template_html },
+      timeoutMs: 15 * 60 * 1000, // 15 minutes — v0 generation + GitHub + Vercel deploy
     });
     return jsonResult(data);
   }
@@ -1044,7 +1045,8 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
-      body: {}
+      body: {},
+      timeoutMs: 15 * 60 * 1000, // 15 minutes — GitHub + Vercel deploy
     });
     return jsonResult(data);
   }
@@ -1117,7 +1119,7 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
-    const data = await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/preview', context: ctx(context), body: { feedback: args.feedback } });
+    const data = await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/preview', context: ctx(context), body: { feedback: args.feedback }, timeoutMs: 10 * 60 * 1000 });
     return jsonResult(data);
   }
 });
