@@ -169,23 +169,7 @@ Return ONLY the complete HTML document starting with <!DOCTYPE html>. No explana
       return res.status(500).json({ error: "LLM did not return valid HTML" });
     }
 
-    // Upload to S3 for preview
-    const s3Key = `users/${userId}/files/${Date.now()}/landing-page-preview.html`;
-    const AWS = require('aws-sdk');
-    const s3 = new AWS.S3({ region: process.env.AWS_REGION || 'us-west-2' });
-    const bucket = process.env.USER_FILES_BUCKET || 'agentweb-user-files';
-
-    await s3.putObject({
-      Bucket: bucket,
-      Key: s3Key,
-      Body: html,
-      ContentType: 'text/html',
-      ACL: 'public-read',
-    }).promise();
-
-    const previewUrl = `https://${bucket}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${s3Key}`;
-
-    res.json({ html, previewUrl, brandContext: brandParts });
+    res.json({ html, brandContext: brandParts });
   } catch (error: any) {
     console.error("[LP GENERATION] Error generating preview:", error);
     res.status(500).json({ error: "Failed to generate preview" });
