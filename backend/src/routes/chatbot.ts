@@ -3,8 +3,10 @@ import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import {
   createChatSession,
   listUserSessions,
+  listEmmaSessions,
   getChatSession,
   sendMessage,
+  sendMessageStream,
   deleteChatSession
 } from '../controllers/chatbot';
 
@@ -19,11 +21,17 @@ router.post('/sessions', (req: Request, res: Response) => createChatSession(req 
 // List all chat sessions for the current user
 router.get('/sessions', (req: Request, res: Response) => listUserSessions(req as AuthenticatedRequest, res));
 
+// List Emma (customer-portal) sessions only
+router.get('/sessions/emma', (req: Request, res: Response) => listEmmaSessions(req as AuthenticatedRequest, res));
+
 // Get a specific chat session
 router.get('/sessions/:sessionId', (req: Request, res: Response) => getChatSession(req as AuthenticatedRequest, res));
 
 // Send a message and get a response
 router.post('/sessions/:sessionId/messages', (req: Request, res: Response) => sendMessage(req as AuthenticatedRequest, res));
+
+// Send a message with SSE streaming for real-time tool call visibility
+router.post('/sessions/:sessionId/messages/stream', (req: Request, res: Response) => sendMessageStream(req as AuthenticatedRequest, res));
 
 // Delete a chat session
 router.delete('/sessions/:sessionId', (req: Request, res: Response) => deleteChatSession(req as AuthenticatedRequest, res));

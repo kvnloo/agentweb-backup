@@ -783,7 +783,7 @@ describe('CRM Routes', () => {
       }));
     });
 
-    it('should set "Company information not found" when search has no results', async () => {
+    it('should delegate to CrmEnrichmentService.enrichWebCompat for enrich mode', async () => {
       const mockList = {
         listId: 'list1',
         name: 'Test List',
@@ -791,91 +791,32 @@ describe('CRM Routes', () => {
       };
 
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [
-          {
-            leadId: 'lead1',
-            company: 'Unknown Co',
-            customFields: {},
-          },
-        ],
-        lastEvaluatedKey: null,
-      });
-      (agentModeService.searchWeb as jest.Mock).mockResolvedValue({
-        success: false,
-        error: 'No search results found',
-      });
 
-      mockRequest.params = { listId: 'list1' };
-      mockRequest.query = { mode: 'enrich' };
-      mockRequest.body = {};
-
-      const handler = findEnrichWebPostHandler();
-      if (handler && handler.route) {
-        await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
-      }
-
-      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', {
-        customFields: {
-          web_company_info: 'Company information not found',
+      // Mock the dynamic import of CrmEnrichmentService
+      jest.mock('../services/crmEnrichmentService', () => ({
+        CrmEnrichmentService: {
+          enrichWebCompat: jest.fn().mockResolvedValue({
+            processedCount: 3,
+            failedCount: 1,
+            totalToProcess: 4,
+            failureBreakdown: { searchWebFailed: 1, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },
+          }),
         },
-      });
-      expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
-        success: true,
-        processedCount: 1,
-        failedCount: 0,
       }));
-    });
-
-    it('should retry with stricter JSON instructions when first JSON parse fails', async () => {
-      const mockList = {
-        listId: 'list1',
-        name: 'Test List',
-        userId: 'test-user-id',
-      };
-
-      (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [
-          {
-            leadId: 'lead-json-retry',
-            company: 'Acme',
-            customFields: {},
-          },
-        ],
-        lastEvaluatedKey: null,
-      });
-      (agentModeService.searchWeb as jest.Mock).mockResolvedValue({
-        success: true,
-        results: [{ title: 'Acme', url: 'https://acme.test', snippet: 'Acme overview' }],
-      });
-
-      const mockLlmService = {
-        generateJSONContent: jest.fn().mockRejectedValue(new SyntaxError('Bad JSON')),
-        generateContent: jest.fn().mockResolvedValue('{"web_company_info":"Acme builds B2B software."}'),
-      };
-      (createLLMService as jest.Mock).mockReturnValue(mockLlmService);
 
       mockRequest.params = { listId: 'list1' };
       mockRequest.query = { mode: 'enrich' };
-      mockRequest.body = {};
+      mockRequest.body = { socketId: 'sock-1', forceEnrich: true };
 
       const handler = findEnrichWebPostHandler();
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
 
-      expect(mockLlmService.generateJSONContent).toHaveBeenCalled();
-      expect(mockLlmService.generateContent).toHaveBeenCalled();
-      expect(crmDb.updateLead).toHaveBeenCalledWith('list1', 'lead-json-retry', {
-        customFields: {
-          web_company_info: 'Acme builds B2B software.',
-        },
-      });
       expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
         success: true,
-        processedCount: 1,
-        failedCount: 0,
+        processedCount: 3,
+        failedCount: 1,
       }));
     });
   });

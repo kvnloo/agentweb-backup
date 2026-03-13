@@ -7,6 +7,64 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-13',
+    changes: [
+      'Fix: Customer Portal — Page Title Now Shows User Email',
+      '- The browser tab title now consistently shows "Customer Portal - <your email>" on every page',
+      '- Previously the title only updated when the Emma chat panel was open',
+    ],
+  },
+  {
+    date: '2026-03-13',
+    changes: [
+      'Feature: Admin — Add Skills to Subscriptions from Skills Page',
+      '- Admins can now toggle which subscription types include a skill directly from the Skills page',
+      '- No need to navigate to the Subscription Types tab for simple skill assignments',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
+      'Feature: CRM — Natural Language Enrichment via Emma',
+      '- Ask Emma to enrich your CRM leads with any custom fields (e.g., "Enrich my leads with company size and industry")',
+      '- Supports web search, LinkedIn, and existing data as enrichment sources',
+      '- Preview mode shows sample results before processing the full list',
+      '- Real-time progress bar on the CRM page during enrichment',
+      '- Works across thousands of records with parallel batch processing',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
+      'Fix: Agent Mode — Crashed Session Recovery',
+      '- Fixed an issue where sessions could become permanently stuck if the AI model returned an empty response',
+      '- Sessions with accumulated error messages now recover automatically without manual intervention',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
+      'Fix: Emma — Visual Context Tool',
+      '- Emma can now capture and analyze page screenshots when asked about visual aspects',
+      '- The get_visual_context tool is available on all pages for visual layout and design analysis',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
+      'Fix: Emma — Headless Browser Support',
+      '- Emma can now use Playwright browser tools (navigate, screenshot, click) on server environments',
+      '- Automatically configures headless mode and sandbox settings for reliable browser automation',
+    ],
+  },
+  {
+    date: '2026-03-12',
+    changes: [
+      'Improvement: Social Media Posts — Direct Links',
+      '- Each post card now includes a link icon to open the original post on LinkedIn',
+    ],
+  },
+  {
     date: '2026-03-11',
     changes: [
       'Feature: Social Media Posts Page',

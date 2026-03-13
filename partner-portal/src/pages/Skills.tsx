@@ -27,12 +27,12 @@ import {
   Stack,
   Autocomplete,
   Divider,
+  Checkbox,
 } from "@mui/material";
 import {
   Edit as EditIcon,
   Add as AddIcon,
   AdminPanelSettings as AdminIcon,
-
   Close as CloseIcon,
   Delete as DeleteIcon,
   CheckBoxOutlineBlank as CheckBoxOutlineBlankIcon,
@@ -44,6 +44,12 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
 import skillService, { Skill } from "../services/skillService";
+
+interface SubscriptionType {
+  name: string;
+  allowedPages: string[];
+  allowedSkills: string[];
+}
 
 interface ToolParameter {
   type: string;
@@ -79,6 +85,8 @@ export default function Skills() {
   const [saving, setSaving] = useState(false);
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
+  const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
+  const [savingSubscriptionKey, setSavingSubscriptionKey] = useState<string | null>(null);
 
   const { token } = useAuth();
 
@@ -92,6 +100,17 @@ export default function Skills() {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  }, [token]);
+
+  const fetchSubscriptionTypes = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl("/api/admin/subscription-types"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSubscriptionTypes(response.data || []);
+    } catch (err) {
+      console.error("Failed to fetch subscription types", err);
     }
   }, [token]);
 
@@ -111,8 +130,9 @@ export default function Skills() {
     if (token) {
       fetchSkills();
       fetchTools();
+      fetchSubscriptionTypes();
     }
-  }, [token, fetchSkills, fetchTools]);
+  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes]);
 
   const handleOpenEditDialog = (skill: Skill | null = null) => {
     if (skill) {
@@ -194,6 +214,34 @@ export default function Skills() {
   };
 
 
+
+  // Toggle a skill's membership in a subscription type
+  const handleToggleSubscription = async (skillId: string, subName: string) => {
+    const sub = subscriptionTypes.find((t) => t.name === subName);
+    if (!sub) return;
+    const hasSkill = sub.allowedSkills.includes(skillId) || sub.allowedSkills.includes("*");
+    const action = hasSkill ? "remove" : "add";
+
+    const key = `${skillId}:${subName}`;
+    setSavingSubscriptionKey(key);
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/subscription-types/${encodeURIComponent(subName)}/skills`),
+        { skillId, action },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      // Update only the affected subscription type in local state
+      const updated = response.data.subscriptionType as SubscriptionType;
+      setSubscriptionTypes((prev) =>
+        prev.map((t) => (t.name === subName ? updated : t))
+      );
+    } catch (err) {
+      setError("Failed to update subscription");
+      console.error(err);
+    } finally {
+      setSavingSubscriptionKey(null);
+    }
+  };
 
   // Paste tools helpers
   const parsePasteText = (text: string) => {
@@ -295,6 +343,9 @@ export default function Skills() {
                   <TableCell>Name</TableCell>
                   <TableCell>Description</TableCell>
                   <TableCell>Status</TableCell>
+                  {subscriptionTypes.length > 0 && (
+                    <TableCell>Subscriptions</TableCell>
+                  )}
                   <TableCell>Tools</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -302,7 +353,7 @@ export default function Skills() {
               <TableBody>
                 {filteredSkills.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={5} align="center" sx={{ py: 3 }}>
+                    <TableCell colSpan={subscriptionTypes.length > 0 ? 6 : 5} align="center" sx={{ py: 3 }}>
                       <Typography variant="body1" color="text.secondary">
                         {searchText ? `No skills matching "${searchText}"` : "No Skills Defined"}
                       </Typography>
@@ -339,6 +390,32 @@ export default function Skills() {
                           size="small"
                         />
                       </TableCell>
+                      {subscriptionTypes.length > 0 && (
+                        <TableCell>
+                          <Stack direction="column" spacing={0}>
+                            {subscriptionTypes.map((sub) => {
+                              const isIncluded = sub.allowedSkills.includes(skill.skillId) || sub.allowedSkills.includes("*");
+                              const isSaving = savingSubscriptionKey === `${skill.skillId}:${sub.name}`;
+                              return (
+                                <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                                  <FormControlLabel
+                                    control={
+                                      <Checkbox
+                                        size="small"
+                                        checked={isIncluded}
+                                        disabled={isSaving || !skill.isPublished}
+                                        onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
+                                      />
+                                    }
+                                    label={<Typography variant="caption">{sub.name}</Typography>}
+                                    sx={{ m: 0 }}
+                                  />
+                                </Tooltip>
+                              );
+                            })}
+                          </Stack>
+                        </TableCell>
+                      )}
                       <TableCell>
                         {skill.toolNames?.map((tool: string) => (
                           <Chip key={tool} label={tool} size="small" sx={{ mr: 0.5, mb: 0.5 }} />
@@ -361,29 +438,64 @@ export default function Skills() {
                     </TableRow>
                   ))
                 )}
+                {/* Virtual __other_skills__ row */}
+                {!loading && unusedTools.length > 0 && (
+                  <TableRow sx={{ backgroundColor: 'action.hover' }}>
+                    <TableCell sx={{ fontWeight: "bold" }}>
+                      Other Skills
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        (virtual)
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 300 }}>
+                      <Typography variant="body2">
+                        {unusedTools.length} tool(s) not assigned to any named skill
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label="Auto" color="warning" size="small" />
+                    </TableCell>
+                    {subscriptionTypes.length > 0 && (
+                      <TableCell>
+                        <Stack direction="column" spacing={0}>
+                          {subscriptionTypes.map((sub) => {
+                            const isIncluded = sub.allowedSkills.includes("__other_skills__") || sub.allowedSkills.includes("*");
+                            const isSaving = savingSubscriptionKey === `__other_skills__:${sub.name}`;
+                            return (
+                              <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                                <FormControlLabel
+                                  control={
+                                    <Checkbox
+                                      size="small"
+                                      checked={isIncluded}
+                                      disabled={isSaving}
+                                      onChange={() => handleToggleSubscription("__other_skills__", sub.name)}
+                                    />
+                                  }
+                                  label={<Typography variant="caption">{sub.name}</Typography>}
+                                  sx={{ m: 0 }}
+                                />
+                              </Tooltip>
+                            );
+                          })}
+                        </Stack>
+                      </TableCell>
+                    )}
+                    <TableCell>
+                      {unusedTools.map(tool => (
+                        <Tooltip key={tool.name} title={tool.description} arrow>
+                          <Chip label={tool.name} size="small" color="warning" variant="outlined" sx={{ mr: 0.5, mb: 0.5 }} />
+                        </Tooltip>
+                      ))}
+                    </TableCell>
+                    <TableCell />
+                  </TableRow>
+                )}
               </TableBody>
             </Table>
           </TableContainer>
         )}
       </Paper>
-
-      {!loading && unusedTools.length > 0 && (
-        <Alert severity="warning" sx={{ mt: 3, mb: 4 }}>
-          <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 'bold' }}>
-            {unusedTools.length} tool(s) not assigned to any skill:
-          </Typography>
-          <Typography variant="body2" sx={{ mb: 1.5 }}>
-            These tools are automatically grouped into a virtual "other_skills" skill, making them available to Emma even without an explicit skill assignment.
-          </Typography>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-            {unusedTools.map(tool => (
-              <Tooltip key={tool.name} title={tool.description} arrow>
-                <Chip label={tool.name} size="small" color="warning" variant="outlined" />
-              </Tooltip>
-            ))}
-          </Box>
-        </Alert>
-      )}
 
       {/* Create/Edit Skill Dialog */}
       <Dialog open={openEditDialog} onClose={handleCloseEditDialog} maxWidth="md" fullWidth>

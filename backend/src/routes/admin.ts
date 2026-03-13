@@ -3522,6 +3522,69 @@ router.post("/subscription-types", async (req, res) => {
   }
 });
 
+// Add or remove a single skill from a subscription type
+router.post("/subscription-types/:typeName/skills", async (req, res) => {
+  try {
+    const { typeName } = req.params;
+    const { skillId, action } = req.body; // action: "add" | "remove"
+
+    if (!skillId || typeof skillId !== "string") {
+      return res.status(400).json({ message: "skillId is required" });
+    }
+    if (action !== "add" && action !== "remove") {
+      return res.status(400).json({ message: "action must be 'add' or 'remove'" });
+    }
+
+    // Load current subscription types
+    const setting = await settingsService.getSetting("subscription_types");
+    let subscriptionTypes: any[] = [];
+    if (setting) {
+      try {
+        subscriptionTypes = JSON.parse(setting.settingValue);
+      } catch {
+        subscriptionTypes = [];
+      }
+    }
+
+    const typeIndex = subscriptionTypes.findIndex((t: any) => t.name === typeName);
+    if (typeIndex < 0) {
+      return res.status(404).json({ message: `Subscription type "${typeName}" not found` });
+    }
+
+    const subType = subscriptionTypes[typeIndex];
+    let allowedSkills: string[] = subType.allowedSkills || [];
+
+    // If wildcard, expand to actual skill list first
+    if (allowedSkills.includes("*")) {
+      const subscriptionService = await import('../services/subscriptionService');
+      allowedSkills = await subscriptionService.getAllAvailableSkills();
+    }
+
+    if (action === "add") {
+      if (!allowedSkills.includes(skillId)) {
+        allowedSkills = [...allowedSkills, skillId];
+      }
+    } else {
+      allowedSkills = allowedSkills.filter((id: string) => id !== skillId);
+    }
+
+    subscriptionTypes[typeIndex] = { ...subType, allowedSkills };
+
+    const updatedBy = (req as any).user?.email || "unknown";
+    await settingsService.setSetting(
+      "subscription_types",
+      JSON.stringify(subscriptionTypes),
+      "Customer portal subscription types configuration",
+      updatedBy
+    );
+
+    res.json({ success: true, subscriptionType: subscriptionTypes[typeIndex] });
+  } catch (error: any) {
+    console.error("Error updating subscription type skill:", error);
+    res.status(500).json({ message: error.message || "Error updating subscription type skill" });
+  }
+});
+
 // Update user subscription type
 router.put("/users/:userId/subscription-type", async (req, res) => {
   try {

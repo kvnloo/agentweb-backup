@@ -194,6 +194,115 @@ describe('Admin subscription types routes', () => {
     expect(pro.allowedSkills).not.toContain('*');
   });
 
+  describe('POST /api/admin/subscription-types/:typeName/skills', () => {
+    const storedTypes = [
+      { name: 'Basic', allowedPages: ['/'], allowedSkills: ['skill-1'] },
+      { name: 'Pro', allowedPages: ['/'], allowedSkills: ['skill-1', 'skill-2'] },
+    ];
+
+    beforeEach(() => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify(storedTypes),
+        description: 'Subscription types',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'system',
+      } as any);
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+    });
+
+    it('should return 400 when skillId is missing', async () => {
+      await request(app)
+        .post('/api/admin/subscription-types/Basic/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ action: 'add' })
+        .expect(400);
+    });
+
+    it('should return 400 when action is invalid', async () => {
+      await request(app)
+        .post('/api/admin/subscription-types/Basic/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-2', action: 'toggle' })
+        .expect(400);
+    });
+
+    it('should return 404 when subscription type does not exist', async () => {
+      await request(app)
+        .post('/api/admin/subscription-types/NonExistent/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-2', action: 'add' })
+        .expect(404);
+    });
+
+    it('should add a skill to a subscription type', async () => {
+      const res = await request(app)
+        .post('/api/admin/subscription-types/Basic/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-2', action: 'add' })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.subscriptionType.allowedSkills).toContain('skill-2');
+      expect(res.body.subscriptionType.allowedSkills).toContain('skill-1');
+
+      // Verify setSetting was called with updated data
+      const savedTypes = JSON.parse(mockedSettingsService.setSetting.mock.calls[0][1] as string);
+      const basic = savedTypes.find((t: any) => t.name === 'Basic');
+      expect(basic.allowedSkills).toEqual(['skill-1', 'skill-2']);
+      // Pro should be untouched
+      const pro = savedTypes.find((t: any) => t.name === 'Pro');
+      expect(pro.allowedSkills).toEqual(['skill-1', 'skill-2']);
+    });
+
+    it('should remove a skill from a subscription type', async () => {
+      const res = await request(app)
+        .post('/api/admin/subscription-types/Pro/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-2', action: 'remove' })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.subscriptionType.allowedSkills).not.toContain('skill-2');
+      expect(res.body.subscriptionType.allowedSkills).toContain('skill-1');
+    });
+
+    it('should not duplicate a skill when adding one that already exists', async () => {
+      const res = await request(app)
+        .post('/api/admin/subscription-types/Basic/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-1', action: 'add' })
+        .expect(200);
+
+      expect(res.body.subscriptionType.allowedSkills.filter((s: string) => s === 'skill-1')).toHaveLength(1);
+    });
+
+    it('should expand wildcard "*" before removing a skill', async () => {
+      const wildcardTypes = [
+        { name: 'AllAccess', allowedPages: ['/'], allowedSkills: ['*'] },
+      ];
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'subscription_types',
+        settingValue: JSON.stringify(wildcardTypes),
+        description: 'Subscription types',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'system',
+      } as any);
+
+      const res = await request(app)
+        .post('/api/admin/subscription-types/AllAccess/skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-1', action: 'remove' })
+        .expect(200);
+
+      expect(res.body.subscriptionType.allowedSkills).not.toContain('skill-1');
+      expect(res.body.subscriptionType.allowedSkills).not.toContain('*');
+      // Should still have the other skills from the expanded list
+      expect(res.body.subscriptionType.allowedSkills).toContain('skill-2');
+      expect(res.body.subscriptionType.allowedSkills).toContain('__other_skills__');
+    });
+  });
+
   it('GET /api/admin/available-skills returns published skills plus __other_skills__', async () => {
     const res = await request(app)
       .get('/api/admin/available-skills')

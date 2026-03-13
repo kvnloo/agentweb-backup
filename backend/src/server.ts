@@ -72,6 +72,19 @@ io.use((socket, next) => {
 io.on('connection', (socket: Socket) => {
   console.log('Client connected:', socket.id);
 
+  // Auto-join user-specific room for targeted broadcasts
+  try {
+    const token = socket.handshake.auth.token;
+    if (token) {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      if (decoded.userId) {
+        socket.join(`user:${decoded.userId}`);
+      }
+    }
+  } catch {
+    // Ignore auth errors for room join — socket still works for other purposes
+  }
+
   socket.on('error', (error: Error) => {
     console.error('Socket error:', error);
   });
@@ -102,10 +115,7 @@ io.on('connection', (socket: Socket) => {
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        data.currentUrl,
-        data.pageContent,
-        portalType,
-        userId
+        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id }
       );
 
       // Send response back to the client

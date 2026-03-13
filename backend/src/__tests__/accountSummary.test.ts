@@ -288,6 +288,10 @@ describe('getAccountSummary', () => {
   // --- RESULTS: Leads ---
 
   test('counts leads added within time range across lead lists', async () => {
+    // Use relative dates so the test doesn't become flaky over time
+    const now = new Date();
+    const daysAgo = (n: number) => new Date(now.getTime() - n * 24 * 60 * 60 * 1000).toISOString();
+
     mockGetSessions.mockResolvedValue([]);
     mockGetLeadLists.mockResolvedValue([
       { listId: 'list-1', userId: 'user-1' },
@@ -296,16 +300,16 @@ describe('getAccountSummary', () => {
     mockGetLeads
       .mockResolvedValueOnce({
         items: [
-          { leadId: 'lead-1', createdAt: '2026-03-08T10:00:00.000Z' },
-          { leadId: 'lead-2', createdAt: '2026-03-07T10:00:00.000Z' },
-          { leadId: 'lead-3', createdAt: '2026-01-01T10:00:00.000Z' }, // outside range
+          { leadId: 'lead-1', createdAt: daysAgo(1) },
+          { leadId: 'lead-2', createdAt: daysAgo(3) },
+          { leadId: 'lead-3', createdAt: daysAgo(30) }, // outside 7d range
         ],
         lastEvaluatedKey: null,
         hasMore: false,
       })
       .mockResolvedValueOnce({
         items: [
-          { leadId: 'lead-4', createdAt: '2026-03-06T10:00:00.000Z' },
+          { leadId: 'lead-4', createdAt: daysAgo(5) },
         ],
         lastEvaluatedKey: null,
         hasMore: false,
