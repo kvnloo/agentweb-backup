@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
-import { userDb } from "../services/db";
+import { userDb, crmDb } from "../services/db";
 import {
   generateLandingPage,
   deployLandingPage,
@@ -122,6 +122,19 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
       }
     } catch (error) {
       console.error("[LP GENERATION] Failed to fetch brand guidelines, continuing without:", error);
+    }
+
+    // Auto-enable public access on the lead list so the landing page form works
+    if (lead_list_id) {
+      try {
+        const list = await crmDb.getLeadListById(lead_list_id);
+        if (list && !list.publicAccessEnabled) {
+          await crmDb.updateLeadList(lead_list_id, { publicAccessEnabled: true });
+          console.log(`[LP GENERATION] Auto-enabled public access on lead list ${lead_list_id}`);
+        }
+      } catch (err) {
+        console.warn(`[LP GENERATION] Could not auto-enable public access on lead list:`, err);
+      }
     }
 
     const result = await generateLandingPage(userId, prompt, pageName, brandContext, lead_list_id, template_html);

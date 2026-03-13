@@ -168,8 +168,11 @@ export function buildBrandEnrichedPrompt(
   }
 
   if (leadListId) {
+    const apiBase = process.env.BACKEND_URL || 'https://api.agentweb.pro';
     parts.push(
-      `\n\nInclude a contact/lead capture form that POSTs JSON to: ${process.env.BACKEND_URL || 'https://api.agentweb.pro'}/api/crm/public/lists/${leadListId}/capture with fields: email (required), firstName, lastName, company, phone, message. The form should use fetch() with mode 'cors' and Content-Type 'application/json'.`
+      `\n\nInclude a contact/lead capture form that POSTs JSON to: ${apiBase}/api/webhooks/forward-lead\n` +
+      `The request body MUST include: listId: '${leadListId}' (required), email (required), firstName, lastName, company, phone, source: 'landing-page'.\n` +
+      `The form should use fetch() with mode 'cors' and Content-Type 'application/json'. Show a success message after submission.`
     );
   }
 

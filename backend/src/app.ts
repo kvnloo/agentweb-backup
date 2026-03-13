@@ -133,7 +133,6 @@ const corsOptions = {
 app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
-      req.path.match(/^\/api\/crm\/public\/lists\/[^\/]+\/capture$/) ||
       req.path.startsWith('/api/lead-magnet/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
