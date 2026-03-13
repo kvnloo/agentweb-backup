@@ -438,29 +438,64 @@ export default function Skills() {
                     </TableRow>
                   ))
                 )}
+                {/* Virtual __other_skills__ row */}
+                {!loading && unusedTools.length > 0 && (
+                  <TableRow sx={{ backgroundColor: 'action.hover' }}>
+                    <TableCell sx={{ fontWeight: "bold" }}>
+                      Other Skills
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        (virtual)
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 300 }}>
+                      <Typography variant="body2">
+                        {unusedTools.length} tool(s) not assigned to any named skill
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label="Auto" color="warning" size="small" />
+                    </TableCell>
+                    {subscriptionTypes.length > 0 && (
+                      <TableCell>
+                        <Stack direction="column" spacing={0}>
+                          {subscriptionTypes.map((sub) => {
+                            const isIncluded = sub.allowedSkills.includes("__other_skills__") || sub.allowedSkills.includes("*");
+                            const isSaving = savingSubscriptionKey === `__other_skills__:${sub.name}`;
+                            return (
+                              <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                                <FormControlLabel
+                                  control={
+                                    <Checkbox
+                                      size="small"
+                                      checked={isIncluded}
+                                      disabled={isSaving}
+                                      onChange={() => handleToggleSubscription("__other_skills__", sub.name)}
+                                    />
+                                  }
+                                  label={<Typography variant="caption">{sub.name}</Typography>}
+                                  sx={{ m: 0 }}
+                                />
+                              </Tooltip>
+                            );
+                          })}
+                        </Stack>
+                      </TableCell>
+                    )}
+                    <TableCell>
+                      {unusedTools.map(tool => (
+                        <Tooltip key={tool.name} title={tool.description} arrow>
+                          <Chip label={tool.name} size="small" color="warning" variant="outlined" sx={{ mr: 0.5, mb: 0.5 }} />
+                        </Tooltip>
+                      ))}
+                    </TableCell>
+                    <TableCell />
+                  </TableRow>
+                )}
               </TableBody>
             </Table>
           </TableContainer>
         )}
       </Paper>
-
-      {!loading && unusedTools.length > 0 && (
-        <Alert severity="warning" sx={{ mt: 3, mb: 4 }}>
-          <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 'bold' }}>
-            {unusedTools.length} tool(s) not assigned to any skill:
-          </Typography>
-          <Typography variant="body2" sx={{ mb: 1.5 }}>
-            These tools are automatically grouped into a virtual "other_skills" skill, making them available to Emma even without an explicit skill assignment.
-          </Typography>
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
-            {unusedTools.map(tool => (
-              <Tooltip key={tool.name} title={tool.description} arrow>
-                <Chip label={tool.name} size="small" color="warning" variant="outlined" />
-              </Tooltip>
-            ))}
-          </Box>
-        </Alert>
-      )}
 
       {/* Create/Edit Skill Dialog */}
       <Dialog open={openEditDialog} onClose={handleCloseEditDialog} maxWidth="md" fullWidth>
