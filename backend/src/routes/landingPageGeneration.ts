@@ -71,35 +71,110 @@ router.post("/preview", async (req, res: Response) => {
     // Fetch brand guidelines
     const user = await userDb.getUserById(userId);
     const brandData = (user as any)?.brandGuidelines?.brandData || {};
+    const { feedback } = req.body || {};
 
-    // Load the landing page template
     const { agentModeService } = await import("../services/agentModeService");
 
-    // Map brand data to template variables for the LLM
-    const variableValues: Record<string, string> = {};
-    if (brandData.brandName) variableValues.company_name = brandData.brandName;
-    if (brandData.tagline) variableValues.hero_headline = brandData.tagline;
-    if (brandData.primaryColor) variableValues.color_primary = brandData.primaryColor;
-    if (brandData.secondaryColor) variableValues.color_secondary = brandData.secondaryColor;
-    if (brandData.fontFamily) variableValues.font_family = brandData.fontFamily;
-    if (brandData.targetAudience) variableValues.target_audience = brandData.targetAudience;
-    if (brandData.keyMessages?.length) variableValues.key_messages = brandData.keyMessages.join(', ');
-    if (brandData.toneOfVoice) variableValues.tone_of_voice = brandData.toneOfVoice;
+    // Build a rich brand context string
+    const brandParts: string[] = [];
+    if (brandData.brandName) brandParts.push(`Company: ${brandData.brandName}`);
+    if (brandData.tagline) brandParts.push(`Tagline: ${brandData.tagline}`);
+    if (brandData.description) brandParts.push(`Description: ${brandData.description}`);
+    if (brandData.primaryColor) brandParts.push(`Primary Color: ${brandData.primaryColor}`);
+    if (brandData.secondaryColor) brandParts.push(`Secondary Color: ${brandData.secondaryColor}`);
+    if (brandData.accentColor) brandParts.push(`Accent Color: ${brandData.accentColor}`);
+    if (brandData.fontFamily) brandParts.push(`Font: ${brandData.fontFamily}`);
+    if (brandData.logoUrl) brandParts.push(`Logo URL: ${brandData.logoUrl}`);
+    if (brandData.targetAudience) brandParts.push(`Target Audience: ${brandData.targetAudience}`);
+    if (brandData.toneOfVoice) brandParts.push(`Tone: ${brandData.toneOfVoice}`);
+    if (brandData.keyMessages?.length) brandParts.push(`Key Messages:\n${brandData.keyMessages.map((m: string) => `  - ${m}`).join('\n')}`);
+    if (brandData.competitors?.length) brandParts.push(`Competitors: ${brandData.competitors.join(', ')}`);
+    if (brandData.uniqueSellingPoints?.length) brandParts.push(`USPs:\n${brandData.uniqueSellingPoints.map((u: string) => `  - ${u}`).join('\n')}`);
 
-    const result = await agentModeService.createHtmlFromTemplate(
-      'gpt-4o',
-      'landing-page-v2',
-      variableValues,
-      undefined,
-      userId,
-      'preview-session'
-    );
+    const brandContext = brandParts.length > 0
+      ? brandParts.join('\n')
+      : 'No brand guidelines available. Create a modern, professional landing page.';
 
-    if (result?.error) {
-      return res.status(400).json({ error: result.error });
+    const prompt = `You are a world-class web designer. Generate a complete, beautiful, single-file HTML landing page.
+
+BRAND CONTEXT:
+${brandContext}
+
+DESIGN REQUIREMENTS:
+- Create a visually stunning, modern landing page that feels premium and high-converting
+- Use the brand colors, fonts, and tone provided — but apply them creatively
+- The design should feel custom-crafted, NOT like a template with blanks filled in
+- Use CSS custom properties for colors so they're easy to adjust
+- Include Google Fonts via CDN (pick one that matches the brand tone if none specified)
+- Mobile responsive with clean breakpoints
+- Smooth, subtle CSS animations (fade-ins, hover effects)
+- Professional spacing, typography hierarchy, and visual rhythm
+
+SECTIONS TO INCLUDE:
+1. Navigation bar with logo/company name and CTA button
+2. Hero section with compelling headline, subtext, and primary CTA
+3. Pain points or problem statement (why the audience needs this)
+4. Features/benefits grid (3-6 items with icons or emojis)
+5. How it works (3 simple steps)
+6. Social proof / testimonials (can be placeholder names)
+7. Pricing or value proposition
+8. FAQ section (4-6 questions)
+9. Contact/lead capture form (name, email, company, message fields)
+10. Footer
+
+COPY GUIDELINES:
+- Write real, compelling marketing copy based on the brand context — not lorem ipsum
+- Headlines should be punchy and benefit-driven
+- Use the brand's tone of voice throughout
+- CTAs should be action-oriented and specific
+
+TECHNICAL REQUIREMENTS:
+- Single self-contained HTML file with inline <style> and <script>
+- No external dependencies except Google Fonts
+- The contact form should have client-side validation
+- Use semantic HTML5 elements
+- Ensure accessibility basics (alt text, ARIA labels, contrast)
+${feedback ? `\nUSER FEEDBACK ON PREVIOUS VERSION:\n${feedback}\nApply this feedback to improve the design.` : ''}
+
+Return ONLY the complete HTML document starting with <!DOCTYPE html>. No explanation, no markdown, just the HTML.`;
+
+    const llmModel = 'gpt-4o';
+    const response = await agentModeService.callLLM(llmModel, [
+      { role: 'user', content: prompt }
+    ], {
+      temperature: 0.7,
+      max_completion_tokens: 65536
+    });
+
+    let html = response.choices[0]?.message?.content || '';
+
+    // Strip markdown code fences if present
+    const codeBlockMatch = html.match(/```(?:html)?\s*\n?([\s\S]*?)\n?\s*```/);
+    if (codeBlockMatch) {
+      html = codeBlockMatch[1].trim();
     }
 
-    res.json({ html: result?.html || result?.content || '', variables: variableValues });
+    if (!html.includes('<!DOCTYPE') && !html.includes('<html')) {
+      return res.status(500).json({ error: "LLM did not return valid HTML" });
+    }
+
+    // Upload to S3 for preview
+    const s3Key = `users/${userId}/files/${Date.now()}/landing-page-preview.html`;
+    const AWS = require('aws-sdk');
+    const s3 = new AWS.S3({ region: process.env.AWS_REGION || 'us-west-2' });
+    const bucket = process.env.USER_FILES_BUCKET || 'agentweb-user-files';
+
+    await s3.putObject({
+      Bucket: bucket,
+      Key: s3Key,
+      Body: html,
+      ContentType: 'text/html',
+      ACL: 'public-read',
+    }).promise();
+
+    const previewUrl = `https://${bucket}.s3.${process.env.AWS_REGION || 'us-west-2'}.amazonaws.com/${s3Key}`;
+
+    res.json({ html, previewUrl, brandContext: brandParts });
   } catch (error: any) {
     console.error("[LP GENERATION] Error generating preview:", error);
     res.status(500).json({ error: "Failed to generate preview" });

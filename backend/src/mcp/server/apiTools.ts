@@ -1107,15 +1107,17 @@ mcpToolRegistry.register({
   name: 'preview_landing_page_html',
   definition: {
     name: 'preview_landing_page_html',
-    description: 'Generate an HTML preview of a landing page using the user\'s brand guidelines and the standard template. Shows the user what their page will look like before building it with v0. ALWAYS call this first when a user asks to build a landing page. The returned HTML can be displayed directly in the chat.',
+    description: 'Generate a beautiful HTML landing page preview using the user\'s brand guidelines. The LLM creates a fully custom design — not a rigid template fill. Returns the HTML and an S3 preview URL to share with the user. Call this first when a user asks to build a landing page. For revisions, pass feedback describing what to change.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        feedback: { type: 'string', description: 'Optional feedback on a previous preview to incorporate (e.g., "make the hero section bigger", "change CTA to blue")' }
+      },
       required: []
     }
   },
-  execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/preview', context: ctx(context), body: {} });
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'POST', path: '/api/landing-pages/v0/preview', context: ctx(context), body: { feedback: args.feedback } });
     return jsonResult(data);
   }
 });
