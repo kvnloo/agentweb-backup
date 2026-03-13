@@ -126,11 +126,17 @@ export async function getAllAvailableSkills(): Promise<string[]> {
 }
 
 /**
- * Get allowed skill IDs for a user based on their subscription type
- * Returns the actual list of skill IDs or ["*"] for all
+ * Get allowed skill IDs for a user based on their subscription type.
+ * Anonymous users (anon_*) use the public allowed skills config.
+ * Returns the actual list of skill IDs or ["*"] for all.
  */
 export async function getAllowedSkills(userId: string): Promise<string[]> {
   try {
+    // Anonymous/public users use the public skills config
+    if (userId.startsWith("anon_")) {
+      return getPublicAllowedSkills();
+    }
+
     const subscriptionTypeName = await getUserSubscriptionType(userId);
     const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
 
@@ -187,6 +193,28 @@ export async function resolveSkillsToToolNames(skillIds: string[]): Promise<stri
   } catch (error) {
     console.error("Error resolving skills to tool names:", error);
     return ["*"];
+  }
+}
+
+/**
+ * Get allowed skill IDs for public/anonymous users.
+ * Reads from the "public_allowed_skills" setting.
+ * Returns ["*"] (all skills) if no setting exists.
+ */
+export async function getPublicAllowedSkills(): Promise<string[]> {
+  try {
+    const setting = await settingsService.getSetting("public_allowed_skills");
+    if (setting) {
+      const skills = JSON.parse(setting.settingValue);
+      if (Array.isArray(skills)) {
+        return skills;
+      }
+    }
+    // Default: no skills available to public
+    return [];
+  } catch (error) {
+    console.error("Error getting public allowed skills:", error);
+    return [];
   }
 }
 

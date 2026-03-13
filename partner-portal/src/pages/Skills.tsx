@@ -86,6 +86,7 @@ export default function Skills() {
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
+  const [publicAllowedSkills, setPublicAllowedSkills] = useState<string[]>([]);
   const [savingSubscriptionKey, setSavingSubscriptionKey] = useState<string | null>(null);
 
   const { token } = useAuth();
@@ -114,6 +115,17 @@ export default function Skills() {
     }
   }, [token]);
 
+  const fetchPublicSkills = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl("/api/admin/public-skills"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setPublicAllowedSkills(response.data.allowedSkills || []);
+    } catch (err) {
+      console.error("Failed to fetch public skills", err);
+    }
+  }, [token]);
+
   const fetchTools = useCallback(async () => {
     try {
       const response = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
@@ -131,8 +143,9 @@ export default function Skills() {
       fetchSkills();
       fetchTools();
       fetchSubscriptionTypes();
+      fetchPublicSkills();
     }
-  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes]);
+  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills]);
 
   const handleOpenEditDialog = (skill: Skill | null = null) => {
     if (skill) {
@@ -243,6 +256,28 @@ export default function Skills() {
     }
   };
 
+  // Toggle a skill's availability for public/anonymous users
+  const handleTogglePublicSkill = async (skillId: string) => {
+    const hasSkill = publicAllowedSkills.includes(skillId) || publicAllowedSkills.includes("*");
+    const action = hasSkill ? "remove" : "add";
+
+    const key = `${skillId}:Public`;
+    setSavingSubscriptionKey(key);
+    try {
+      const response = await axios.post(
+        buildApiUrl("/api/admin/public-skills"),
+        { skillId, action },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setPublicAllowedSkills(response.data.allowedSkills || []);
+    } catch (err) {
+      setError("Failed to update public skills");
+      console.error(err);
+    } finally {
+      setSavingSubscriptionKey(null);
+    }
+  };
+
   // Paste tools helpers
   const parsePasteText = (text: string) => {
     const names = text
@@ -343,9 +378,7 @@ export default function Skills() {
                   <TableCell>Name</TableCell>
                   <TableCell>Description</TableCell>
                   <TableCell>Status</TableCell>
-                  {subscriptionTypes.length > 0 && (
-                    <TableCell>Subscriptions</TableCell>
-                  )}
+                  <TableCell>Subscriptions</TableCell>
                   <TableCell>Tools</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -353,7 +386,7 @@ export default function Skills() {
               <TableBody>
                 {filteredSkills.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={subscriptionTypes.length > 0 ? 6 : 5} align="center" sx={{ py: 3 }}>
+                    <TableCell colSpan={6} align="center" sx={{ py: 3 }}>
                       <Typography variant="body1" color="text.secondary">
                         {searchText ? `No skills matching "${searchText}"` : "No Skills Defined"}
                       </Typography>
@@ -390,32 +423,50 @@ export default function Skills() {
                           size="small"
                         />
                       </TableCell>
-                      {subscriptionTypes.length > 0 && (
-                        <TableCell>
-                          <Stack direction="column" spacing={0}>
-                            {subscriptionTypes.map((sub) => {
-                              const isIncluded = sub.allowedSkills.includes(skill.skillId) || sub.allowedSkills.includes("*");
-                              const isSaving = savingSubscriptionKey === `${skill.skillId}:${sub.name}`;
-                              return (
-                                <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
-                                  <FormControlLabel
-                                    control={
-                                      <Checkbox
-                                        size="small"
-                                        checked={isIncluded}
-                                        disabled={isSaving || !skill.isPublished}
-                                        onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
-                                      />
-                                    }
-                                    label={<Typography variant="caption">{sub.name}</Typography>}
-                                    sx={{ m: 0 }}
-                                  />
-                                </Tooltip>
-                              );
-                            })}
-                          </Stack>
-                        </TableCell>
-                      )}
+                      <TableCell>
+                        <Stack direction="column" spacing={0}>
+                          {subscriptionTypes.map((sub) => {
+                            const isIncluded = sub.allowedSkills.includes(skill.skillId) || sub.allowedSkills.includes("*");
+                            const isSaving = savingSubscriptionKey === `${skill.skillId}:${sub.name}`;
+                            return (
+                              <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                                <FormControlLabel
+                                  control={
+                                    <Checkbox
+                                      size="small"
+                                      checked={isIncluded}
+                                      disabled={isSaving || !skill.isPublished}
+                                      onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
+                                    />
+                                  }
+                                  label={<Typography variant="caption">{sub.name}</Typography>}
+                                  sx={{ m: 0 }}
+                                />
+                              </Tooltip>
+                            );
+                          })}
+                          {(() => {
+                            const isPublicIncluded = publicAllowedSkills.includes(skill.skillId) || publicAllowedSkills.includes("*");
+                            const isPublicSaving = savingSubscriptionKey === `${skill.skillId}:Public`;
+                            return (
+                              <Tooltip title={isPublicIncluded ? "Remove from Public" : "Add to Public"}>
+                                <FormControlLabel
+                                  control={
+                                    <Checkbox
+                                      size="small"
+                                      checked={isPublicIncluded}
+                                      disabled={isPublicSaving || !skill.isPublished}
+                                      onChange={() => handleTogglePublicSkill(skill.skillId)}
+                                    />
+                                  }
+                                  label={<Typography variant="caption" sx={{ fontStyle: "italic" }}>Public</Typography>}
+                                  sx={{ m: 0 }}
+                                />
+                              </Tooltip>
+                            );
+                          })()}
+                        </Stack>
+                      </TableCell>
                       <TableCell>
                         {skill.toolNames?.map((tool: string) => (
                           <Chip key={tool} label={tool} size="small" sx={{ mr: 0.5, mb: 0.5 }} />
@@ -455,32 +506,50 @@ export default function Skills() {
                     <TableCell>
                       <Chip label="Auto" color="warning" size="small" />
                     </TableCell>
-                    {subscriptionTypes.length > 0 && (
-                      <TableCell>
-                        <Stack direction="column" spacing={0}>
-                          {subscriptionTypes.map((sub) => {
-                            const isIncluded = sub.allowedSkills.includes("__other_skills__") || sub.allowedSkills.includes("*");
-                            const isSaving = savingSubscriptionKey === `__other_skills__:${sub.name}`;
-                            return (
-                              <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
-                                <FormControlLabel
-                                  control={
-                                    <Checkbox
-                                      size="small"
-                                      checked={isIncluded}
-                                      disabled={isSaving}
-                                      onChange={() => handleToggleSubscription("__other_skills__", sub.name)}
-                                    />
-                                  }
-                                  label={<Typography variant="caption">{sub.name}</Typography>}
-                                  sx={{ m: 0 }}
-                                />
-                              </Tooltip>
-                            );
-                          })}
-                        </Stack>
-                      </TableCell>
-                    )}
+                    <TableCell>
+                      <Stack direction="column" spacing={0}>
+                        {subscriptionTypes.map((sub) => {
+                          const isIncluded = sub.allowedSkills.includes("__other_skills__") || sub.allowedSkills.includes("*");
+                          const isSaving = savingSubscriptionKey === `__other_skills__:${sub.name}`;
+                          return (
+                            <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={isIncluded}
+                                    disabled={isSaving}
+                                    onChange={() => handleToggleSubscription("__other_skills__", sub.name)}
+                                  />
+                                }
+                                label={<Typography variant="caption">{sub.name}</Typography>}
+                                sx={{ m: 0 }}
+                              />
+                            </Tooltip>
+                          );
+                        })}
+                        {(() => {
+                          const isPublicIncluded = publicAllowedSkills.includes("__other_skills__") || publicAllowedSkills.includes("*");
+                          const isPublicSaving = savingSubscriptionKey === `__other_skills__:Public`;
+                          return (
+                            <Tooltip title={isPublicIncluded ? "Remove from Public" : "Add to Public"}>
+                              <FormControlLabel
+                                control={
+                                  <Checkbox
+                                    size="small"
+                                    checked={isPublicIncluded}
+                                    disabled={isPublicSaving}
+                                    onChange={() => handleTogglePublicSkill("__other_skills__")}
+                                  />
+                                }
+                                label={<Typography variant="caption" sx={{ fontStyle: "italic" }}>Public</Typography>}
+                                sx={{ m: 0 }}
+                              />
+                            </Tooltip>
+                          );
+                        })()}
+                      </Stack>
+                    </TableCell>
                     <TableCell>
                       {unusedTools.map(tool => (
                         <Tooltip key={tool.name} title={tool.description} arrow>

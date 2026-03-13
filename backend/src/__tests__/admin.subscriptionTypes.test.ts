@@ -26,6 +26,7 @@ jest.mock('../services/settingsService', () => ({
 jest.mock('../services/subscriptionService', () => ({
   getAllAvailablePages: jest.fn(() => ['/', '/agent-mode', '/settings', '/guide', '/tasks']),
   getAllAvailableSkills: jest.fn(async () => ['skill-1', 'skill-2', '__other_skills__']),
+  getPublicAllowedSkills: jest.fn(async () => []),
   // Keep getAllAvailableFunctionCalls for backward compat if referenced elsewhere
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
 }));
@@ -300,6 +301,133 @@ describe('Admin subscription types routes', () => {
       // Should still have the other skills from the expanded list
       expect(res.body.subscriptionType.allowedSkills).toContain('skill-2');
       expect(res.body.subscriptionType.allowedSkills).toContain('__other_skills__');
+    });
+  });
+
+  // --- Public skills routes ---
+
+  describe('GET /api/admin/public-skills', () => {
+    it('should return empty array when no setting exists', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+
+      const res = await request(app)
+        .get('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .expect(200);
+
+      expect(res.body.allowedSkills).toEqual([]);
+    });
+
+    it('should return stored public skills list', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'public_allowed_skills',
+        settingValue: JSON.stringify(['skill-1', '__other_skills__']),
+        description: 'Skills available to public/anonymous users',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      } as any);
+
+      const res = await request(app)
+        .get('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .expect(200);
+
+      expect(res.body.allowedSkills).toEqual(['skill-1', '__other_skills__']);
+    });
+  });
+
+  describe('POST /api/admin/public-skills', () => {
+    it('should return 400 when skillId is missing', async () => {
+      await request(app)
+        .post('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ action: 'add' })
+        .expect(400);
+    });
+
+    it('should return 400 when action is invalid', async () => {
+      await request(app)
+        .post('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-1', action: 'toggle' })
+        .expect(400);
+    });
+
+    it('should add a skill to public access', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'public_allowed_skills',
+        settingValue: JSON.stringify(['skill-1']),
+        description: 'Skills available to public/anonymous users',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      } as any);
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+      const res = await request(app)
+        .post('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-2', action: 'add' })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.allowedSkills).toContain('skill-1');
+      expect(res.body.allowedSkills).toContain('skill-2');
+    });
+
+    it('should remove a skill from public access', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'public_allowed_skills',
+        settingValue: JSON.stringify(['skill-1', 'skill-2']),
+        description: 'Skills available to public/anonymous users',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      } as any);
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+      const res = await request(app)
+        .post('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-1', action: 'remove' })
+        .expect(200);
+
+      expect(res.body.success).toBe(true);
+      expect(res.body.allowedSkills).not.toContain('skill-1');
+      expect(res.body.allowedSkills).toContain('skill-2');
+    });
+
+    it('should expand wildcard before removing a skill', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue({
+        settingName: 'public_allowed_skills',
+        settingValue: JSON.stringify(['*']),
+        description: 'Skills available to public/anonymous users',
+        updatedAt: new Date().toISOString(),
+        updatedBy: 'admin',
+      } as any);
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+      const res = await request(app)
+        .post('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-1', action: 'remove' })
+        .expect(200);
+
+      expect(res.body.allowedSkills).not.toContain('skill-1');
+      expect(res.body.allowedSkills).not.toContain('*');
+      expect(res.body.allowedSkills).toContain('skill-2');
+      expect(res.body.allowedSkills).toContain('__other_skills__');
+    });
+
+    it('should add skill to empty list when no setting exists', async () => {
+      mockedSettingsService.getSetting.mockResolvedValue(null);
+      mockedSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+      const res = await request(app)
+        .post('/api/admin/public-skills')
+        .set('Authorization', 'Bearer test-token')
+        .send({ skillId: 'skill-1', action: 'add' })
+        .expect(200);
+
+      expect(res.body.allowedSkills).toEqual(['skill-1']);
     });
   });
 
