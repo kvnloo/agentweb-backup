@@ -7,6 +7,22 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-13',
+    changes: [
+      'Fix: Customer Portal — Page Title Now Shows User Email',
+      '- The browser tab title now consistently shows "Customer Portal - <your email>" on every page',
+      '- Previously the title only updated when the Emma chat panel was open',
+    ],
+  },
+  {
+    date: '2026-03-13',
+    changes: [
+      'Feature: Admin — Add Skills to Subscriptions from Skills Page',
+      '- Admins can now toggle which subscription types include a skill directly from the Skills page',
+      '- No need to navigate to the Subscription Types tab for simple skill assignments',
+    ],
+  },
+  {
     date: '2026-03-12',
     changes: [
       'Feature: CRM — Natural Language Enrichment via Emma',
