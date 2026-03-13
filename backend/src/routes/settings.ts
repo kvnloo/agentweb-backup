@@ -513,10 +513,11 @@ router.post('/agent-mode-predefined-workplans', authenticateToken, requireAdmin,
           stepCount: index + 1,
           title: step.title.trim(),
           description: step.description?.trim() || undefined,
-          requiredFunctionCalls: step.requiredFunctionCalls?.filter((f: string) => f.trim().length > 0) || undefined
+          requiredFunctionCalls: step.requiredFunctionCalls?.filter((f: string) => f.trim().length > 0) || undefined,
+          skillIds: step.skillIds?.filter((id: string) => id.trim().length > 0) || undefined
         }))
     };
-    
+
     if (validatedWorkPlan.title.length === 0 || validatedWorkPlan.steps.length === 0) {
       return res.status(400).json({ error: 'Work plan must have a title and at least one step' });
     }
@@ -631,10 +632,11 @@ router.put('/agent-mode-predefined-workplans/:planId', authenticateToken, requir
           stepCount: index + 1,
           title: step.title.trim(),
           description: step.description?.trim() || undefined,
-          requiredFunctionCalls: step.requiredFunctionCalls?.filter((f: string) => f.trim().length > 0) || undefined
+          requiredFunctionCalls: step.requiredFunctionCalls?.filter((f: string) => f.trim().length > 0) || undefined,
+          skillIds: step.skillIds?.filter((id: string) => id.trim().length > 0) || undefined
         }))
     };
-    
+
     if (validatedWorkPlan.title.length === 0 || validatedWorkPlan.steps.length === 0) {
       return res.status(400).json({ error: 'Work plan must have a title and at least one step' });
     }

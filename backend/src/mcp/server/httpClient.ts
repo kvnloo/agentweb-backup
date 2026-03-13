@@ -4,6 +4,16 @@
  */
 
 import jwt from 'jsonwebtoken';
+import { Agent, setGlobalDispatcher } from 'undici';
+
+// Extend Node's built-in fetch timeouts. The default undici headersTimeout (300s)
+// is too short for MCP tools that call slow endpoints (e.g. generate_landing_page
+// calls v0 API which can take 2-5 min).
+setGlobalDispatcher(new Agent({
+  headersTimeout: 15 * 60 * 1000,  // 15 minutes
+  bodyTimeout: 15 * 60 * 1000,     // 15 minutes
+  connectTimeout: 30 * 1000,       // 30 seconds
+}));
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -19,6 +29,8 @@ interface McpFetchOptions {
   context: { userId?: string; agentUserId?: string };
   body?: Record<string, unknown>;
   queryParams?: Record<string, string>;
+  /** Override the default 5-minute timeout (in ms). Use for long-running calls like v0 generation. */
+  timeoutMs?: number;
 }
 
 // ─── User cache (per-process, cleared on restart) ───────────────────────────
@@ -50,7 +62,7 @@ async function lookupUser(userId: string): Promise<UserRecord> {
 
 // ─── JWT generation ─────────────────────────────────────────────────────────
 
-const SELF_CALL_TOKEN_TTL = 60; // seconds
+const SELF_CALL_TOKEN_TTL = 600; // seconds — must outlast slow operations like v0 generation
 
 export function generateSelfCallToken(user: UserRecord): string {
   const secret = process.env.JWT_SECRET || 'your-secret-key';
@@ -97,12 +109,21 @@ export async function mcpFetch(options: McpFetchOptions): Promise<any> {
     'Content-Type': 'application/json',
   };
 
-  const fetchOptions: RequestInit = { method, headers };
+  const controller = new AbortController();
+  const effectiveTimeout = options.timeoutMs ?? 5 * 60 * 1000; // default 5 minutes
+  const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
+
+  const fetchOptions: RequestInit = { method, headers, signal: controller.signal };
   if (body && method !== 'GET') {
     fetchOptions.body = JSON.stringify(body);
   }
 
-  const response = await fetch(url, fetchOptions);
+  let response: Response;
+  try {
+    response = await fetch(url, fetchOptions);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   // Parse response
   const contentType = response.headers.get('content-type') || '';

@@ -156,6 +156,7 @@ export interface ChatSession {
       completedAt?: string;
       notes?: string;
       requiredFunctionCalls?: string[]; // Required function names that must be called before marking complete
+      skillIds?: string[]; // Skill IDs to auto-install when this step becomes active
     }>;
     createdAt: string;
     updatedAt: string;
@@ -2003,6 +2004,7 @@ export class ChatbotDB {
         completedAt?: string;
         notes?: string;
         requiredFunctionCalls?: string[];
+        skillIds?: string[];
       }>;
       createdAt: string;
       updatedAt: string;
