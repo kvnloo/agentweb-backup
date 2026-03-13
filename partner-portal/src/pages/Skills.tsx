@@ -86,7 +86,7 @@ export default function Skills() {
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
-  const [savingSubscriptions, setSavingSubscriptions] = useState(false);
+  const [savingSubscriptionKey, setSavingSubscriptionKey] = useState<string | null>(null);
 
   const { token } = useAuth();
 
@@ -222,7 +222,8 @@ export default function Skills() {
     const hasSkill = sub.allowedSkills.includes(skillId) || sub.allowedSkills.includes("*");
     const action = hasSkill ? "remove" : "add";
 
-    setSavingSubscriptions(true);
+    const key = `${skillId}:${subName}`;
+    setSavingSubscriptionKey(key);
     try {
       const response = await axios.post(
         buildApiUrl(`/api/admin/subscription-types/${encodeURIComponent(subName)}/skills`),
@@ -238,7 +239,7 @@ export default function Skills() {
       setError("Failed to update subscription");
       console.error(err);
     } finally {
-      setSavingSubscriptions(false);
+      setSavingSubscriptionKey(null);
     }
   };
 
@@ -394,6 +395,7 @@ export default function Skills() {
                           <Stack direction="column" spacing={0}>
                             {subscriptionTypes.map((sub) => {
                               const isIncluded = sub.allowedSkills.includes(skill.skillId) || sub.allowedSkills.includes("*");
+                              const isSaving = savingSubscriptionKey === `${skill.skillId}:${sub.name}`;
                               return (
                                 <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
                                   <FormControlLabel
@@ -401,7 +403,7 @@ export default function Skills() {
                                       <Checkbox
                                         size="small"
                                         checked={isIncluded}
-                                        disabled={savingSubscriptions || !skill.isPublished}
+                                        disabled={isSaving || !skill.isPublished}
                                         onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
                                       />
                                     }
