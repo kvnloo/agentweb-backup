@@ -445,30 +445,46 @@ describe('Security Tests', () => {
       expect(res.json).toHaveBeenCalledWith({ message: 'User already exists' });
     });
 
-    it('FAIL: non-free user not on waitlist → 403', async () => {
+    it('SUCCESS: non-free user not on waitlist → registers without gate', async () => {
       const req: any = { body: { email: 'new@example.com', password: 'pass123', roles: ['customer'] } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
       mockWaitlistDb.getByEmail.mockResolvedValue(undefined as any);
+      mockUserDb.createUser.mockResolvedValue({
+        userId: 'user-new',
+        email: 'new@example.com',
+        roles: ['customer'],
+        isAdmin: false,
+        isOAuthUser: false,
+        createdAt: new Date().toISOString(),
+      } as any);
 
       await register(req, res);
 
-      expect(res.status).toHaveBeenCalledWith(403);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'not_in_waitlist' }));
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ token: 'mock-jwt-token' }));
     });
 
-    it('FAIL: on waitlist but not invited → 403', async () => {
+    it('SUCCESS: on waitlist but not invited → registers without gate', async () => {
       const req: any = { body: { email: 'waiting@example.com', password: 'pass123', roles: ['customer'] } };
       const res = createRes();
 
       mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
       mockWaitlistDb.getByEmail.mockResolvedValue({ email: 'waiting@example.com', status: 'pending' } as any);
+      mockUserDb.createUser.mockResolvedValue({
+        userId: 'user-new',
+        email: 'waiting@example.com',
+        roles: ['customer'],
+        isAdmin: false,
+        isOAuthUser: false,
+        createdAt: new Date().toISOString(),
+      } as any);
 
       await register(req, res);
 
-      expect(res.status).toHaveBeenCalledWith(403);
-      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'not_invited' }));
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ token: 'mock-jwt-token' }));
     });
 
     it('SUCCESS: free user registers without waitlist check', async () => {

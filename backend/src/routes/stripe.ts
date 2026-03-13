@@ -346,6 +346,88 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
 });
 
 /**
+ * @route POST /api/stripe/create-checkout-session
+ * @desc Create a Stripe Checkout session (embedded mode) for a newly registered user
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/create-checkout-session",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    const userEmail = authenticatedReq.user?.email;
+
+    if (!userId || !userEmail) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    const { plan } = req.body;
+    if (!plan) {
+      return res.status(400).json({ error: "Plan is required." });
+    }
+
+    // Map plan names to Stripe price IDs
+    const planPriceMap: Record<string, string> = {
+      starter: process.env.STRIPE_STARTER_PRICE_ID || "",
+      complete: process.env.STRIPE_COMPLETE_PRICE_ID || "",
+    };
+
+    const priceId = planPriceMap[plan.toLowerCase()];
+    if (!priceId) {
+      return res.status(400).json({ error: `Unknown plan: ${plan}` });
+    }
+
+    try {
+      // Find or create Stripe customer
+      const user = await userDb.getUserById(userId);
+      let customerId = user?.stripe_customer_id;
+
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: userEmail,
+          metadata: { userId },
+        });
+        customerId = customer.id;
+        await userDb.updateUser(userId, { stripe_customer_id: customerId });
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        ui_mode: "embedded",
+        customer: customerId,
+        line_items: [{ price: priceId, quantity: 1 }],
+        mode: "subscription",
+        return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      });
+
+      res.json({ clientSecret: session.client_secret });
+    } catch (error: any) {
+      console.error("Error creating checkout session:", error.message);
+      res.status(500).json({ error: "Failed to create checkout session." });
+    }
+  }
+);
+
+/**
+ * @route GET /api/stripe/config
+ * @desc Return Stripe publishable key to frontend
+ * @access Public
+ */
+router.get("/config", (_req: Request, res: Response) => {
+  const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
+  if (!publishableKey) {
+    return res.status(500).json({ error: "Stripe publishable key not configured." });
+  }
+  res.json({ publishableKey });
+});
+
+/**
  * @route POST /api/stripe/create-customer-portal-session
  * @desc Create a Stripe Customer Portal session for the authenticated user
  * @access Private (requires authentication)
@@ -395,17 +477,6 @@ router.post(
       });
     }
   }
-);
-
-/**
- * @route POST /api/stripe/create-checkout-session
- * @desc Create a Stripe Checkout Session for subscription purchase
- * @access Private (requires authentication)
- */
-router.post(
-  "/create-checkout-session",
-  authenticateToken,
-  stripeController.createCheckoutSession
 );
 
 /**
