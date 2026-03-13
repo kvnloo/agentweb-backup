@@ -19,12 +19,14 @@ jest.mock('stripe', () => {
 
 const mockGetUserById = jest.fn();
 const mockUpdateUser = jest.fn();
+const mockGetAllUsers = jest.fn();
 
 jest.mock('../services/db', () => ({
   userDb: {
     getUserById: mockGetUserById,
     getUserByEmail: jest.fn(),
     updateUser: mockUpdateUser,
+    getAllUsers: mockGetAllUsers,
   },
   User: {},
 }));
@@ -207,13 +209,10 @@ describe('Stripe subscription management', () => {
         },
       };
       mockStripe.webhooks.constructEvent.mockReturnValue(event);
-      mockGetUserById.mockResolvedValue(null); // getUserById won't be called for webhook
-      // Need to mock getUserByStripeCustomerId — we'll search by scanning
-      const { userDb } = require('../services/db');
-      userDb.getUserByStripeCustomerId = jest.fn().mockResolvedValue({
-        userId: 'user-123',
-        stripe_customer_id: 'cus_abc123',
-      });
+      // findUserByStripeCustomerId uses getAllUsers scan to find user by stripe_customer_id
+      mockGetAllUsers.mockResolvedValue([
+        { userId: 'user-123', stripe_customer_id: 'cus_abc123' },
+      ]);
       mockUpdateUser.mockResolvedValue({});
 
       const app = createApp();

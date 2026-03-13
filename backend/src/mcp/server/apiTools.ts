@@ -300,7 +300,8 @@ mcpToolRegistry.register({
         schedule_id: { type: 'string', description: 'Schedule ID (required for update/toggle/delete)' },
         schedule_name: { type: 'string', description: 'Schedule name (create/update)' },
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (create/update)' },
-        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly (create/update)' },
+        schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
+        frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
         next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
@@ -328,6 +329,7 @@ mcpToolRegistry.register({
           scheduleFrequency: args.schedule_frequency,
         };
         if (args.description !== undefined) body.description = args.description;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
@@ -349,6 +351,7 @@ mcpToolRegistry.register({
           scheduleFrequency: args.schedule_frequency,
         };
         if (args.description !== undefined) body.description = args.description;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
