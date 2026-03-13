@@ -27,12 +27,12 @@ import {
   Stack,
   Autocomplete,
   Divider,
+  Checkbox,
 } from "@mui/material";
 import {
   Edit as EditIcon,
   Add as AddIcon,
   AdminPanelSettings as AdminIcon,
-
   Close as CloseIcon,
   Delete as DeleteIcon,
   CheckBoxOutlineBlank as CheckBoxOutlineBlankIcon,
@@ -44,6 +44,12 @@ import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
 import skillService, { Skill } from "../services/skillService";
+
+interface SubscriptionType {
+  name: string;
+  allowedPages: string[];
+  allowedSkills: string[];
+}
 
 interface ToolParameter {
   type: string;
@@ -79,6 +85,8 @@ export default function Skills() {
   const [saving, setSaving] = useState(false);
   const [pasteDialogOpen, setPasteDialogOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
+  const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
+  const [savingSubscriptions, setSavingSubscriptions] = useState(false);
 
   const { token } = useAuth();
 
@@ -92,6 +100,17 @@ export default function Skills() {
       console.error(err);
     } finally {
       setLoading(false);
+    }
+  }, [token]);
+
+  const fetchSubscriptionTypes = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl("/api/admin/subscription-types"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setSubscriptionTypes(response.data || []);
+    } catch (err) {
+      console.error("Failed to fetch subscription types", err);
     }
   }, [token]);
 
@@ -111,8 +130,9 @@ export default function Skills() {
     if (token) {
       fetchSkills();
       fetchTools();
+      fetchSubscriptionTypes();
     }
-  }, [token, fetchSkills, fetchTools]);
+  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes]);
 
   const handleOpenEditDialog = (skill: Skill | null = null) => {
     if (skill) {
@@ -194,6 +214,43 @@ export default function Skills() {
   };
 
 
+
+  // Toggle a skill's membership in a subscription type
+  const handleToggleSubscription = async (skillId: string, subName: string) => {
+    setSavingSubscriptions(true);
+    try {
+      const updatedTypes = subscriptionTypes.map((type) => {
+        if (type.name !== subName) return type;
+        const hasSkill = type.allowedSkills.includes(skillId) || type.allowedSkills.includes("*");
+        let newAllowedSkills: string[];
+        if (type.allowedSkills.includes("*")) {
+          // Expand wildcard: include all published skill IDs + __other_skills__ except this one
+          const allSkillIds = skills
+            .filter((s) => s.isPublished)
+            .map((s) => s.skillId)
+            .concat("__other_skills__");
+          newAllowedSkills = allSkillIds.filter((id) => id !== skillId);
+        } else if (hasSkill) {
+          newAllowedSkills = type.allowedSkills.filter((id) => id !== skillId);
+        } else {
+          newAllowedSkills = [...type.allowedSkills, skillId];
+        }
+        return { ...type, allowedSkills: newAllowedSkills };
+      });
+
+      await axios.post(
+        buildApiUrl("/api/admin/subscription-types"),
+        { subscriptionTypes: updatedTypes },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setSubscriptionTypes(updatedTypes);
+    } catch (err) {
+      setError("Failed to update subscription");
+      console.error(err);
+    } finally {
+      setSavingSubscriptions(false);
+    }
+  };
 
   // Paste tools helpers
   const parsePasteText = (text: string) => {
@@ -295,6 +352,9 @@ export default function Skills() {
                   <TableCell>Name</TableCell>
                   <TableCell>Description</TableCell>
                   <TableCell>Status</TableCell>
+                  {subscriptionTypes.length > 0 && (
+                    <TableCell>Subscriptions</TableCell>
+                  )}
                   <TableCell>Tools</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -302,7 +362,7 @@ export default function Skills() {
               <TableBody>
                 {filteredSkills.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={5} align="center" sx={{ py: 3 }}>
+                    <TableCell colSpan={subscriptionTypes.length > 0 ? 6 : 5} align="center" sx={{ py: 3 }}>
                       <Typography variant="body1" color="text.secondary">
                         {searchText ? `No skills matching "${searchText}"` : "No Skills Defined"}
                       </Typography>
@@ -339,6 +399,31 @@ export default function Skills() {
                           size="small"
                         />
                       </TableCell>
+                      {subscriptionTypes.length > 0 && (
+                        <TableCell>
+                          <Stack direction="column" spacing={0}>
+                            {subscriptionTypes.map((sub) => {
+                              const isIncluded = sub.allowedSkills.includes(skill.skillId) || sub.allowedSkills.includes("*");
+                              return (
+                                <Tooltip key={sub.name} title={isIncluded ? `Remove from ${sub.name}` : `Add to ${sub.name}`}>
+                                  <FormControlLabel
+                                    control={
+                                      <Checkbox
+                                        size="small"
+                                        checked={isIncluded}
+                                        disabled={savingSubscriptions || !skill.isPublished}
+                                        onChange={() => handleToggleSubscription(skill.skillId, sub.name)}
+                                      />
+                                    }
+                                    label={<Typography variant="caption">{sub.name}</Typography>}
+                                    sx={{ m: 0 }}
+                                  />
+                                </Tooltip>
+                              );
+                            })}
+                          </Stack>
+                        </TableCell>
+                      )}
                       <TableCell>
                         {skill.toolNames?.map((tool: string) => (
                           <Chip key={tool} label={tool} size="small" sx={{ mr: 0.5, mb: 0.5 }} />
