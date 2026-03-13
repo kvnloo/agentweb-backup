@@ -3368,6 +3368,7 @@ export async function generateChatResponse(
         // Base tools always available to Emma
         const toolsToInclude = [
           'read_page_source',
+          'get_visual_context',
         ];
 
         // Page-aware tool injection based on the current page URL
