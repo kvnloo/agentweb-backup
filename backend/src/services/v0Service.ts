@@ -69,6 +69,47 @@ export interface BrandContext {
 }
 
 /**
+ * Extract a condensed outline from the full HTML template (~55KB → ~3KB).
+ * Sends section structure, CSS variables, and key patterns to v0 as inspiration
+ * without overwhelming its prompt limits.
+ */
+function extractTemplateOutline(fullHtml: string): string {
+  const sections: string[] = [];
+
+  // Extract CSS variables block (design tokens)
+  const cssVarMatch = fullHtml.match(/:root\s*\{([^}]+)\}/);
+  if (cssVarMatch) {
+    sections.push('/* CSS Design Tokens */\n:root {' + cssVarMatch[1] + '}');
+  }
+
+  // Extract section hierarchy from comments
+  const hierarchyMatch = fullHtml.match(/SECTION HIERARCHY:[\s\S]*?={3,}/);
+  if (hierarchyMatch) {
+    sections.push('/* ' + hierarchyMatch[0]);
+  }
+
+  // Extract body section structure (class names and IDs give v0 the layout)
+  const sectionHeaders = fullHtml.match(/<section[^>]*(?:id|class)="[^"]*"[^>]*>/g) || [];
+  if (sectionHeaders.length > 0) {
+    sections.push('<!-- Section structure -->\n' + sectionHeaders.join('\n'));
+  }
+
+  // Extract key template variables used (gives v0 an idea of what content to generate)
+  const variables = new Set<string>();
+  const varRegex = /\{\{([^}]+)\}\}/g;
+  let match;
+  while ((match = varRegex.exec(fullHtml)) !== null) {
+    variables.add(match[1].trim());
+  }
+  if (variables.size > 0) {
+    sections.push('<!-- Template variables (content structure) -->\n' +
+      Array.from(variables).map(v => `{{${v}}}`).join(', '));
+  }
+
+  return sections.join('\n\n');
+}
+
+/**
  * Build an enriched prompt that includes brand guidelines context
  */
 export function buildBrandEnrichedPrompt(
@@ -219,13 +260,16 @@ async function generateFirstPage(
   const id = uuidv4();
   const now = new Date().toISOString();
 
-  // Auto-load the HTML template as design inspiration for v0
+  // Auto-load the HTML template structure as design inspiration for v0.
+  // We send a condensed outline (not the full 55KB HTML) to avoid exceeding v0 prompt limits.
   let effectiveTemplate = templateHtml;
   if (!effectiveTemplate) {
     try {
       const templatePath = path.join(__dirname, "../templates/landing-page-v2.html");
-      effectiveTemplate = fs.readFileSync(templatePath, "utf-8");
-      console.log(`[V0 SERVICE] Loaded landing page template (${effectiveTemplate.length} chars) as design inspiration`);
+      const fullTemplate = fs.readFileSync(templatePath, "utf-8");
+      // Extract a condensed version: section structure + key CSS variables + first body section
+      effectiveTemplate = extractTemplateOutline(fullTemplate);
+      console.log(`[V0 SERVICE] Loaded landing page template outline (${effectiveTemplate.length} chars) as design inspiration`);
     } catch (err) {
       console.warn("[V0 SERVICE] Could not load landing page template, continuing without:", err);
     }
