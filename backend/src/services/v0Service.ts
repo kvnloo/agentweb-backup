@@ -170,9 +170,14 @@ export function buildBrandEnrichedPrompt(
   if (leadListId) {
     const apiBase = process.env.BACKEND_URL || 'https://api.agentweb.pro';
     parts.push(
-      `\n\nInclude a contact/lead capture form that POSTs JSON to: ${apiBase}/api/webhooks/forward-lead\n` +
-      `The request body MUST include: listId: '${leadListId}' (required), email (required), firstName, lastName, company, phone, source: 'landing-page'.\n` +
-      `The form should use fetch() with mode 'cors' and Content-Type 'application/json'. Show a success message after submission.`
+      `\n\nLEAD CAPTURE FORM — IMPORTANT ARCHITECTURE:\n` +
+      `1. Create a Next.js API route at app/api/capture/route.ts that proxies form submissions to the backend.\n` +
+      `   The proxy route should POST to: ${apiBase}/api/webhooks/forward-lead\n` +
+      `   The proxy route must add listId: '${leadListId}' and source: 'landing-page' to the body before forwarding.\n` +
+      `2. The frontend form component MUST fetch('/api/capture', ...) using the RELATIVE path — never hardcode any backend URL in client-side code.\n` +
+      `   The form should collect: email (required), firstName, lastName, company, phone.\n` +
+      `   Show a success message after submission. Show an error message on failure.\n` +
+      `3. NEVER put absolute backend URLs (like ${apiBase}) in any client-side .tsx file. Only the server-side API route should know the backend URL.`
     );
   }
 
