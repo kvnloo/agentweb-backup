@@ -1712,6 +1712,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
           workPlanContent += `   Required Functions: ${step.requiredFunctionCalls.join(', ')}\n`;
         }
 
+        // Include skill IDs if available (for awareness)
+        if (step.skillIds && step.skillIds.length > 0) {
+          workPlanContent += `   Skills (auto-installed when this step becomes active): ${step.skillIds.join(', ')}\n`;
+        }
+
         workPlanContent += '\n';
       });
 
@@ -13997,7 +14002,7 @@ Format the response as JSON with this structure:
   }
 
   // Find a template by name, searching user templates first then public
-  private async findTemplateByName(templateName: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
+  public async findTemplateByName(templateName: string, userId: string): Promise<{ template: any | null, isPublic: boolean }> {
     const { userTemplates, publicTemplates } = await this.getTemplatesForUser(userId);
 
     const userMatch = userTemplates.find((t: any) => t.template_name === templateName);
@@ -14638,42 +14643,61 @@ You must return a valid JSON object with exactly these two fields:
 
 IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
-      const substitutionResponse = await this.callLLM(llmModel, [
-        {
-          role: 'user',
-          content: substitutionPrompt
+      // Try with increasing token limits — large HTML templates need room for the full output
+      const tokenLimits = [32768, 65536];
+      let substitutionData: any = null;
+
+      for (const maxTokens of tokenLimits) {
+        const substitutionResponse = await this.callLLM(llmModel, [
+          {
+            role: 'user',
+            content: substitutionPrompt
+          }
+        ], {
+          temperature: 0.1,
+          response_format: { type: 'json_object' },
+          max_completion_tokens: maxTokens
+        });
+
+        const finishReason = substitutionResponse.choices[0].finish_reason;
+        const substitutionResult = substitutionResponse.choices[0].message.content;
+
+        if (!substitutionResult) {
+          throw new Error('LLM did not return substitution result');
         }
-      ], {
-        temperature: 0.1,
-        response_format: { type: 'json_object' },
-        max_completion_tokens: 16384
-      });
 
-      const substitutionResult = substitutionResponse.choices[0].message.content;
-      if (!substitutionResult) {
-        throw new Error('LLM did not return substitution result');
-      }
+        // If the response was truncated (length = hit token limit), retry with more tokens
+        if (finishReason === 'length') {
+          console.warn(`createHtmlFromTemplate: Response truncated at ${maxTokens} tokens, retrying with more...`);
+          continue;
+        }
 
-      let substitutionData;
-      try {
-        substitutionData = JSON.parse(substitutionResult);
-      } catch (parseError) {
-        // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
-        const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-        if (codeBlockMatch) {
-          try {
-            substitutionData = JSON.parse(codeBlockMatch[1].trim());
-          } catch (innerParseError) {
-            console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+        try {
+          substitutionData = JSON.parse(substitutionResult);
+        } catch (parseError) {
+          // Some models (e.g. Gemini) wrap JSON in markdown code blocks — strip and retry
+          const codeBlockMatch = substitutionResult.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+          if (codeBlockMatch) {
+            try {
+              substitutionData = JSON.parse(codeBlockMatch[1].trim());
+            } catch (innerParseError) {
+              console.error('createHtmlFromTemplate: Failed to parse JSON even after stripping code block wrapper. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+              // If we have more token limits to try, continue; otherwise throw
+              if (maxTokens < tokenLimits[tokenLimits.length - 1]) continue;
+              throw new Error('LLM returned invalid JSON for variable substitution');
+            }
+          } else {
+            console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
+            if (maxTokens < tokenLimits[tokenLimits.length - 1]) continue;
             throw new Error('LLM returned invalid JSON for variable substitution');
           }
-        } else {
-          console.error('createHtmlFromTemplate: Failed to parse LLM response as JSON. Raw response (first 500 chars):', substitutionResult.substring(0, 500));
-          throw new Error('LLM returned invalid JSON for variable substitution');
         }
+
+        // Successfully parsed — break out of retry loop
+        if (substitutionData) break;
       }
 
-      if (!substitutionData.final_html || !substitutionData.final_subject) {
+      if (!substitutionData || !substitutionData.final_html || !substitutionData.final_subject) {
         throw new Error('LLM substitution result missing final_html or final_subject fields');
       }
 
@@ -15100,7 +15124,7 @@ Please:
 
   // Work Plan Management Methods
 
-  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, sessionId: string): Promise<any> {
+  public async createWorkPlan(title: string, steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -15121,7 +15145,8 @@ Please:
           status: 'pending' as const,
           completedAt: undefined,
           notes: undefined,
-          requiredFunctionCalls: step.requiredFunctionCalls
+          requiredFunctionCalls: step.requiredFunctionCalls,
+          skillIds: step.skillIds
         })),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
@@ -15146,7 +15171,7 @@ Please:
     }
   }
 
-  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
+  public async modifyWorkPlan(steps: Array<{ stepCount: number; title: string; description?: string; requiredFunctionCalls?: string[]; skillIds?: string[] }>, removeStepCounts: number[], sessionId: string): Promise<any> {
     try {
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session || !session.workPlan) {
@@ -15172,7 +15197,8 @@ Please:
             ...workPlan.steps[existingIndex],
             title: newStep.title,
             description: newStep.description,
-            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls
+            requiredFunctionCalls: newStep.requiredFunctionCalls !== undefined ? newStep.requiredFunctionCalls : workPlan.steps[existingIndex].requiredFunctionCalls,
+            skillIds: newStep.skillIds !== undefined ? newStep.skillIds : workPlan.steps[existingIndex].skillIds
           };
         } else {
           // Add new step (stepCount will be fixed by updateSessionWorkPlan)
@@ -15183,7 +15209,8 @@ Please:
             status: 'pending',
             completedAt: undefined,
             notes: undefined,
-            requiredFunctionCalls: newStep.requiredFunctionCalls
+            requiredFunctionCalls: newStep.requiredFunctionCalls,
+            skillIds: newStep.skillIds
           });
         }
       }
@@ -15323,6 +15350,26 @@ Please:
         // Update function counts if they were modified
         if (countsModified) {
           await chatbotDb.updateCalledFunctions(sessionId, calledFunctionCounts);
+        }
+
+        // Auto-install skills for the next pending step
+        const completedStepCounts = updatedSteps.filter(s => s.status === 'completed').map(s => s.stepCount);
+        if (completedStepCounts.length > 0) {
+          const nextPendingStep = workPlan.steps
+            .sort((a: any, b: any) => a.stepCount - b.stepCount)
+            .find((s: any) => s.status === 'pending');
+          if (nextPendingStep?.skillIds?.length) {
+            try {
+              const currentAssociated = session.associatedSkills || [];
+              const newSkillIds = nextPendingStep.skillIds.filter((id: string) => !currentAssociated.includes(id));
+              if (newSkillIds.length > 0) {
+                await chatbotDb.addAssociatedSkills(sessionId, newSkillIds);
+                console.log(`AgentMode: Auto-installed skills for step ${nextPendingStep.stepCount}: ${newSkillIds.join(', ')}`);
+              }
+            } catch (skillErr) {
+              console.error('AgentMode: Error auto-installing skills for next step:', skillErr);
+            }
+          }
         }
       }
 
