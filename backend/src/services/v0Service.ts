@@ -947,9 +947,13 @@ async function createVercelProject(
   );
 
   const vercelProjectId = createRes.data.id;
-  const deployedUrl = `https://${projectName}.vercel.app`;
+  // Use the actual alias/domain from Vercel API — Vercel truncates long project names
+  const vercelAlias = createRes.data.alias?.[0]?.domain
+    || createRes.data.targets?.production?.alias?.[0]
+    || `${createRes.data.name || projectName}.vercel.app`;
+  const deployedUrl = vercelAlias.startsWith("https://") ? vercelAlias : `https://${vercelAlias}`;
 
-  console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl}`);
+  console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl} (requested name: ${projectName})`);
 
   // Manually trigger a deployment — Vercel doesn't always auto-deploy when linking to an existing repo
   const { token: ghToken } = await getGitHubOrgToken();
@@ -977,7 +981,34 @@ async function createVercelProject(
   // Poll for deployment status
   const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken);
 
-  return { deployedUrl, vercelProjectId, ...deploymentResult };
+  // After deployment, fetch the project to get the real production alias
+  // (Vercel truncates long project names, so our constructed URL may be wrong)
+  let finalUrl = deployedUrl;
+  try {
+    const projectRes = await axios.get<any>(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      { headers }
+    );
+    const aliases = projectRes.data?.alias || projectRes.data?.targets?.production?.alias || [];
+    const productionAlias = aliases.find((a: any) =>
+      typeof a === "string" ? a.endsWith(".vercel.app") : a?.domain?.endsWith(".vercel.app")
+    );
+    if (productionAlias) {
+      const domain = typeof productionAlias === "string" ? productionAlias : productionAlias.domain;
+      finalUrl = `https://${domain}`;
+    } else if (projectRes.data?.name) {
+      // Fallback: use the actual project name from Vercel (which may be truncated)
+      finalUrl = `https://${projectRes.data.name}.vercel.app`;
+    }
+  } catch (aliasErr: any) {
+    console.warn(`[V0 SERVICE] Could not fetch project aliases, using constructed URL: ${aliasErr.message}`);
+  }
+
+  if (finalUrl !== deployedUrl) {
+    console.log(`[V0 SERVICE] URL corrected: ${deployedUrl} → ${finalUrl}`);
+  }
+
+  return { deployedUrl: finalUrl, vercelProjectId, ...deploymentResult };
 }
 
 /**
@@ -987,7 +1018,7 @@ async function createVercelProject(
 async function pollVercelDeployment(
   projectId: string,
   vercelToken: string
-): Promise<{ buildStatus: string; buildError?: string }> {
+): Promise<{ buildStatus: string; buildError?: string; actualUrl?: string }> {
   const headers = { Authorization: `Bearer ${vercelToken}` };
   const maxAttempts = 30; // 30 * 10s = 5 minutes
   const pollInterval = 10000;
@@ -1011,7 +1042,13 @@ async function pollVercelDeployment(
       console.log(`[V0 SERVICE] Deployment ${deployment.uid}: state=${state} (attempt ${attempt + 1})`);
 
       if (state === "READY") {
-        return { buildStatus: "success" };
+        // Extract the actual production URL from the deployment
+        const actualUrl = deployment.url
+          ? `https://${deployment.url}`
+          : deployment.alias?.[0]
+            ? `https://${deployment.alias[0]}`
+            : undefined;
+        return { buildStatus: "success", actualUrl };
       }
 
       if (state === "ERROR" || state === "CANCELED") {
