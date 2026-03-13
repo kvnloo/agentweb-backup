@@ -17,7 +17,7 @@ import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
 import { skillService } from './skillService';
-import { getAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
+import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -1878,7 +1878,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       skillService.getPublishedSkills(),
-      userId ? getAllowedSkills(userId) : Promise.resolve(["*"] as string[])
+      userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");

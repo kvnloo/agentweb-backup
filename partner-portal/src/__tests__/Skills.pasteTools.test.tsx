@@ -74,9 +74,16 @@ describe('Skills - Paste Tools Feature', () => {
     };
     (axios.create as jest.Mock).mockReturnValue(mockAxiosInstance);
 
-    // Mock the direct axios.get call for fetching tools
-    mockedAxios.get.mockResolvedValue({
-      data: { functionCalls: mockAvailableTools },
+    // Mock the direct axios.get calls
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes('subscription-types')) {
+        return Promise.resolve({ data: [] });
+      }
+      if (url.includes('public-skills')) {
+        return Promise.resolve({ data: { allowedSkills: [] } });
+      }
+      // Default: function-calls endpoint
+      return Promise.resolve({ data: { functionCalls: mockAvailableTools } });
     });
   });
 

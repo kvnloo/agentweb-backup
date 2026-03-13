@@ -20,6 +20,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Feature: Admin — Add Skills to Subscriptions from Skills Page',
       '- Admins can now toggle which subscription types include a skill directly from the Skills page',
       '- No need to navigate to the Subscription Types tab for simple skill assignments',
+      '- New "Public" toggle controls which skills are available to anonymous/public users',
+      '- Anonymous sessions now respect public skill restrictions instead of defaulting to all skills',
     ],
   },
   {
