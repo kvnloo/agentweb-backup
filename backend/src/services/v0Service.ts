@@ -981,24 +981,20 @@ async function createVercelProject(
   // Poll for deployment status
   const deploymentResult = await pollVercelDeployment(vercelProjectId, vercelToken);
 
-  // After deployment, fetch the project to get the real production alias
-  // (Vercel truncates long project names, so our constructed URL may be wrong)
+  // After deployment, fetch the project to get the real production alias.
+  // Vercel truncates long project names in domains (e.g. our requested name
+  // "lp-foo--abc123" may become "lp-foo-ab" in the domain), so we read the
+  // actual domain from targets.production.alias[0] which is authoritative.
   let finalUrl = deployedUrl;
   try {
     const projectRes = await axios.get<any>(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
       { headers }
     );
-    const aliases = projectRes.data?.alias || projectRes.data?.targets?.production?.alias || [];
-    const productionAlias = aliases.find((a: any) =>
-      typeof a === "string" ? a.endsWith(".vercel.app") : a?.domain?.endsWith(".vercel.app")
-    );
-    if (productionAlias) {
-      const domain = typeof productionAlias === "string" ? productionAlias : productionAlias.domain;
-      finalUrl = `https://${domain}`;
-    } else if (projectRes.data?.name) {
-      // Fallback: use the actual project name from Vercel (which may be truncated)
-      finalUrl = `https://${projectRes.data.name}.vercel.app`;
+    const productionAliases: string[] = projectRes.data?.targets?.production?.alias || [];
+    const vercelDomain = productionAliases.find((a: string) => a.endsWith(".vercel.app"));
+    if (vercelDomain) {
+      finalUrl = `https://${vercelDomain}`;
     }
   } catch (aliasErr: any) {
     console.warn(`[V0 SERVICE] Could not fetch project aliases, using constructed URL: ${aliasErr.message}`);
@@ -1018,7 +1014,7 @@ async function createVercelProject(
 async function pollVercelDeployment(
   projectId: string,
   vercelToken: string
-): Promise<{ buildStatus: string; buildError?: string; actualUrl?: string }> {
+): Promise<{ buildStatus: string; buildError?: string }> {
   const headers = { Authorization: `Bearer ${vercelToken}` };
   const maxAttempts = 30; // 30 * 10s = 5 minutes
   const pollInterval = 10000;
@@ -1042,13 +1038,7 @@ async function pollVercelDeployment(
       console.log(`[V0 SERVICE] Deployment ${deployment.uid}: state=${state} (attempt ${attempt + 1})`);
 
       if (state === "READY") {
-        // Extract the actual production URL from the deployment
-        const actualUrl = deployment.url
-          ? `https://${deployment.url}`
-          : deployment.alias?.[0]
-            ? `https://${deployment.alias[0]}`
-            : undefined;
-        return { buildStatus: "success", actualUrl };
+        return { buildStatus: "success" };
       }
 
       if (state === "ERROR" || state === "CANCELED") {
