@@ -1,8 +1,10 @@
 import axios from 'axios';
-import { getAccessToken, getWorkspaces, listDocs, readDocContent, listTasks, readTaskContent } from '../services/clickupService';
+import { getAccessToken, getWorkspaces, listDocs, readDocContent, listTasks, readTaskContent, createDoc, editPage } from '../services/clickupService';
 
 jest.mock('axios');
 const mockAxiosGet = axios.get as jest.Mock;
+const mockAxiosPost = axios.post as jest.Mock;
+const mockAxiosPut = axios.put as jest.Mock;
 
 const mockGetUserById = jest.fn();
 jest.mock('../services/db', () => ({
@@ -597,6 +599,58 @@ describe('clickupService', () => {
       const content = await readTaskContent('ck_token', 'task-1');
       expect(content).toContain('# Minimal');
       // Should not throw
+    });
+  });
+
+  describe('createDoc', () => {
+    it('should create a doc and return id and name', async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { id: 'doc-new-1', name: 'My New Doc' },
+      });
+
+      const result = await createDoc('ck_token', 'ws-1', 'My New Doc', '# Hello\n\nWorld');
+      expect(result).toEqual({ id: 'doc-new-1', name: 'My New Doc' });
+      expect(mockAxiosPost).toHaveBeenCalledWith(
+        'https://api.clickup.com/api/v3/workspaces/ws-1/docs',
+        { name: 'My New Doc', content: '# Hello\n\nWorld' },
+        { headers: { Authorization: 'ck_token', 'Content-Type': 'application/json' } }
+      );
+    });
+
+    it('should propagate API errors', async () => {
+      mockAxiosPost.mockRejectedValueOnce(new Error('Forbidden'));
+
+      await expect(createDoc('ck_token', 'ws-1', 'Doc', 'content'))
+        .rejects.toThrow('Forbidden');
+    });
+
+    it('should handle empty content', async () => {
+      mockAxiosPost.mockResolvedValueOnce({
+        data: { id: 'doc-empty', name: 'Empty Doc' },
+      });
+
+      const result = await createDoc('ck_token', 'ws-1', 'Empty Doc', '');
+      expect(result).toEqual({ id: 'doc-empty', name: 'Empty Doc' });
+    });
+  });
+
+  describe('editPage', () => {
+    it('should update a page successfully', async () => {
+      mockAxiosPut.mockResolvedValueOnce({ data: {} });
+
+      await editPage('ck_token', 'ws-1', 'doc-1', 'page-1', 'Updated content');
+      expect(mockAxiosPut).toHaveBeenCalledWith(
+        'https://api.clickup.com/api/v3/workspaces/ws-1/docs/doc-1/pages/page-1',
+        { content: 'Updated content' },
+        { headers: { Authorization: 'ck_token', 'Content-Type': 'application/json' } }
+      );
+    });
+
+    it('should propagate API errors', async () => {
+      mockAxiosPut.mockRejectedValueOnce(new Error('Not Found'));
+
+      await expect(editPage('ck_token', 'ws-1', 'doc-1', 'page-1', 'content'))
+        .rejects.toThrow('Not Found');
     });
   });
 });
