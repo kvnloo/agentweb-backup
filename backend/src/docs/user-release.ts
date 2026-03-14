@@ -7,6 +7,23 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-14',
+    changes: [
+      'Feature: Agent Mode — Write Documents to ClickUp',
+      '- Emma can now create new documents directly in your connected ClickUp workspace',
+      '- Use the "write_clickup_doc" tool (via the Knowledge Base skill) to save research, reports, or documentation to ClickUp',
+      '- Documents are created at the workspace root for maximum compatibility',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
+      'Fix: Partner Portal — Edit Skill Shows All Selected Tools',
+      '- The Edit Skill popup now displays all tools assigned to a skill, including tools that may have been removed from the codebase',
+      '- Previously, removed tools were silently hidden, making them impossible to deselect',
+    ],
+  },
+  {
     date: '2026-03-13',
     changes: [
       'Feature: Admin — Skill Sync Between Prod and Dev Environments',
