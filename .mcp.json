@@ -5,6 +5,14 @@
       "command": "npx",
       "args": ["-y", "@playwright/mcp@latest", "--output-dir", "/tmp/playwright-screenshots"]
     },
+    "notion": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@notionhq/notion-mcp-server"],
+      "env": {
+        "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer ntn_b24541781292QM42dt5JIipWlMH0gNSNNoCE19O4ZG893T\",\"Notion-Version\":\"2025-09-03\"}"
+      }
+    },
     "okareo": {
       "command": "uvx",
       "args": ["okareo-mcp"],

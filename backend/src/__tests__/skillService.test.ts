@@ -2,6 +2,7 @@ import { Skill } from '../services/skillService';
 
 describe('SkillService', () => {
   let skillService: any;
+  let SkillService: any;
   let mockPut: jest.Mock;
   let mockGet: jest.Mock;
   let mockScan: jest.Mock;
@@ -43,6 +44,7 @@ describe('SkillService', () => {
     // Import the module after mocking
     const module = require('../services/skillService');
     skillService = module.skillService;
+    SkillService = module.SkillService;
   });
 
   beforeEach(() => {
@@ -261,6 +263,169 @@ describe('SkillService', () => {
     it('should delete skill by skillId', async () => {
       await skillService.deleteSkill('skill-1');
       expect(mockDelete).toHaveBeenCalled();
+    });
+  });
+
+  describe('syncSkill', () => {
+    const mockSkill = {
+      skillId: 'skill-1',
+      name: 'Test Skill',
+      description: 'Description',
+      toolNames: ['tool1', 'tool2'],
+      isPublished: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+
+    it('should read from prod table and write to dev table for prod-to-dev', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: mockSkill }) // get from source
+        .mockResolvedValueOnce({}); // put to target
+
+      const result = await skillService.syncSkill('skill-1', 'prod-to-dev');
+
+      expect(result).toEqual(expect.objectContaining({ skillId: 'skill-1', name: 'Test Skill' }));
+      // Should read from AW-Skills (prod) and write to Dev-AW-Skills (dev)
+      expect(mockGet).toHaveBeenCalledWith(expect.objectContaining({
+        TableName: 'AW-Skills',
+        Key: { skillId: 'skill-1' },
+      }));
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        TableName: 'Dev-AW-Skills',
+      }));
+    });
+
+    it('should read from dev table and write to prod table for dev-to-prod', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Item: mockSkill }) // get from source
+        .mockResolvedValueOnce({}); // put to target
+
+      const result = await skillService.syncSkill('skill-1', 'dev-to-prod');
+
+      expect(result).toEqual(expect.objectContaining({ skillId: 'skill-1' }));
+      expect(mockGet).toHaveBeenCalledWith(expect.objectContaining({
+        TableName: 'Dev-AW-Skills',
+      }));
+      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
+        TableName: 'AW-Skills',
+      }));
+    });
+
+    it('should return null if skill not found in source table', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: undefined });
+
+      const result = await skillService.syncSkill('non-existent', 'prod-to-dev');
+      expect(result).toBeNull();
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('should convert DynamoDB Set toolNames when writing to target', async () => {
+      const skillWithSet = {
+        ...mockSkill,
+        toolNames: { values: ['tool1', 'tool2'] },
+      };
+      mockPromise
+        .mockResolvedValueOnce({ Item: skillWithSet })
+        .mockResolvedValueOnce({});
+
+      const result = await skillService.syncSkill('skill-1', 'prod-to-dev');
+
+      expect(result?.toolNames).toEqual(['tool1', 'tool2']);
+      expect(mockCreateSet).toHaveBeenCalledWith(['tool1', 'tool2']);
+    });
+  });
+
+  describe('getSyncStatus', () => {
+    const skill1 = {
+      skillId: 'skill-1',
+      name: 'Skill One',
+      description: 'Desc',
+      toolNames: ['tool1'],
+      isPublished: true,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+
+    it('should return inSync=true when prod and dev skills match on content fields', async () => {
+      const devSkill = { ...skill1, updatedAt: '2026-02-01T00:00:00.000Z', createdAt: '2026-02-01T00:00:00.000Z' };
+      // First scan = prod table, second scan = dev table
+      mockPromise
+        .mockResolvedValueOnce({ Items: [skill1] })
+        .mockResolvedValueOnce({ Items: [devSkill] });
+
+      const result = await skillService.getSyncStatus();
+
+      expect(result['skill-1']).toEqual({
+        inSync: true,
+        existsInProd: true,
+        existsInDev: true,
+        changedFields: [],
+      });
+    });
+
+    it('should return inSync=false with changedFields when content fields differ', async () => {
+      const devSkill = { ...skill1, name: 'Different Name' };
+      mockPromise
+        .mockResolvedValueOnce({ Items: [skill1] })
+        .mockResolvedValueOnce({ Items: [devSkill] });
+
+      const result = await skillService.getSyncStatus();
+
+      expect(result['skill-1'].inSync).toBe(false);
+      expect(result['skill-1'].changedFields).toEqual(['name']);
+      expect(result['skill-1'].existsInProd).toBe(true);
+      expect(result['skill-1'].existsInDev).toBe(true);
+    });
+
+    it('should report multiple changed fields', async () => {
+      const devSkill = { ...skill1, name: 'Different', description: 'New desc', isPublished: false };
+      mockPromise
+        .mockResolvedValueOnce({ Items: [skill1] })
+        .mockResolvedValueOnce({ Items: [devSkill] });
+
+      const result = await skillService.getSyncStatus();
+
+      expect(result['skill-1'].changedFields).toEqual(['name', 'description', 'isPublished']);
+    });
+
+    it('should return existsInDev=false when skill only in prod', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Items: [skill1] })
+        .mockResolvedValueOnce({ Items: [] });
+
+      const result = await skillService.getSyncStatus();
+
+      expect(result['skill-1']).toEqual({
+        inSync: false,
+        existsInProd: true,
+        existsInDev: false,
+        changedFields: [],
+      });
+    });
+
+    it('should return existsInProd=false when skill only in dev', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Items: [] })
+        .mockResolvedValueOnce({ Items: [skill1] });
+
+      const result = await skillService.getSyncStatus();
+
+      expect(result['skill-1']).toEqual({
+        inSync: false,
+        existsInProd: false,
+        existsInDev: true,
+        changedFields: [],
+      });
+    });
+
+    it('should handle empty tables', async () => {
+      mockPromise
+        .mockResolvedValueOnce({ Items: [] })
+        .mockResolvedValueOnce({ Items: [] });
+
+      const result = await skillService.getSyncStatus();
+
+      expect(result).toEqual({});
     });
   });
 });

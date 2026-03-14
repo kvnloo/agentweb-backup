@@ -9,6 +9,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-13',
     changes: [
+      'Feature: Admin — Skill Sync Between Prod and Dev Environments',
+      '- Sync button on the Skills page lets admins copy skills between production and dev DynamoDB tables',
+      '- Direction is auto-determined by environment: prod pushes to dev, dev pushes to prod',
+      '- On page load, shows sync status for each skill — disabled when already in sync',
+      '- Displays which fields differ (name, description, systemPrompt, etc.) before syncing',
+    ],
+  },
+  {
+    date: '2026-03-13',
+    changes: [
       'Feature: Agent Mode — Admin Work Plan Management',
       '- Admins can now create, update, and delete predefined work plans directly through Emma in Agent Mode',
       '- Two new admin-only tools: list_predefined_work_plans and manage_predefined_work_plan',

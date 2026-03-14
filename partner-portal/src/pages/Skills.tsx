@@ -39,11 +39,12 @@ import {
   CheckBox as CheckBoxIcon,
   Search as SearchIcon,
   ContentPaste as ContentPasteIcon,
+  SyncAlt as SyncAltIcon,
 } from "@mui/icons-material";
 import axios from "axios";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl } from "../config";
-import skillService, { Skill } from "../services/skillService";
+import skillService, { Skill, SkillSyncInfo } from "../services/skillService";
 
 interface SubscriptionType {
   name: string;
@@ -88,6 +89,12 @@ export default function Skills() {
   const [subscriptionTypes, setSubscriptionTypes] = useState<SubscriptionType[]>([]);
   const [publicAllowedSkills, setPublicAllowedSkills] = useState<string[]>([]);
   const [savingSubscriptionKey, setSavingSubscriptionKey] = useState<string | null>(null);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [skillToSync, setSkillToSync] = useState<Skill | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [successMessage, setSuccessMessage] = useState("");
+  const [syncStatus, setSyncStatus] = useState<Record<string, SkillSyncInfo>>({});
+  const [backendEnv, setBackendEnv] = useState<'development' | 'production'>('production');
 
   const { token } = useAuth();
 
@@ -126,6 +133,16 @@ export default function Skills() {
     }
   }, [token]);
 
+  const fetchSyncStatus = useCallback(async () => {
+    try {
+      const data = await skillService.getSyncStatus(token!);
+      setSyncStatus(data.skills);
+      setBackendEnv(data.environment);
+    } catch (err) {
+      console.error("Failed to fetch sync status", err);
+    }
+  }, [token]);
+
   const fetchTools = useCallback(async () => {
     try {
       const response = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
@@ -144,8 +161,9 @@ export default function Skills() {
       fetchTools();
       fetchSubscriptionTypes();
       fetchPublicSkills();
+      fetchSyncStatus();
     }
-  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills]);
+  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills, fetchSyncStatus]);
 
   const handleOpenEditDialog = (skill: Skill | null = null) => {
     if (skill) {
@@ -227,6 +245,32 @@ export default function Skills() {
   };
 
 
+
+  const handleOpenSyncDialog = (skill: Skill) => {
+    setSkillToSync(skill);
+    setSyncDialogOpen(true);
+  };
+
+  const syncDirection = backendEnv === 'development' ? 'dev-to-prod' : 'prod-to-dev';
+  const syncLabel = backendEnv === 'development' ? 'Dev → Prod' : 'Prod → Dev';
+
+  const handleSync = async () => {
+    if (!skillToSync) return;
+    setSyncing(true);
+    try {
+      await skillService.syncSkill(skillToSync.skillId, syncDirection, token!);
+      setSuccessMessage(`Skill "${skillToSync.name}" synced ${syncLabel}`);
+      fetchSkills();
+      fetchSyncStatus();
+      setSyncDialogOpen(false);
+      setSkillToSync(null);
+    } catch (err) {
+      setError("Failed to sync skill");
+      console.error(err);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   // Toggle a skill's membership in a subscription type
   const handleToggleSubscription = async (skillId: string, subName: string) => {
@@ -340,6 +384,7 @@ export default function Skills() {
         </Box>
 
         {error && <Alert severity="error" sx={{ mb: 3 }} onClose={() => setError("")}>{error}</Alert>}
+        {successMessage && <Alert severity="success" sx={{ mb: 3 }} onClose={() => setSuccessMessage("")}>{successMessage}</Alert>}
 
         <Box sx={{ mb: 3, display: 'flex', justifyContent: 'flex-start' }}>
           <TextField
@@ -380,7 +425,7 @@ export default function Skills() {
                   <TableCell>Status</TableCell>
                   <TableCell>Subscriptions</TableCell>
                   <TableCell>Tools</TableCell>
-                  <TableCell>Actions</TableCell>
+                  <TableCell sx={{ whiteSpace: "nowrap" }}>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -396,10 +441,10 @@ export default function Skills() {
                   filteredSkills.map((skill: Skill) => (
                     <TableRow key={skill.skillId}>
                       <TableCell sx={{ fontWeight: "bold" }}>{skill.name}</TableCell>
-                      <TableCell sx={{ maxWidth: 300 }}>
-                        <Tooltip 
-                          title={skill.description} 
-                          arrow 
+                      <TableCell sx={{ maxWidth: 200 }}>
+                        <Tooltip
+                          title={skill.description}
+                          arrow
                           placement="top-start"
                           slotProps={{
                             tooltip: {
@@ -478,6 +523,27 @@ export default function Skills() {
                             <IconButton onClick={() => handleOpenEditDialog(skill)}>
                               <EditIcon />
                             </IconButton>
+                          </Tooltip>
+                          <Tooltip title={
+                            syncStatus[skill.skillId]?.inSync
+                              ? "Prod & Dev in sync"
+                              : syncStatus[skill.skillId]?.changedFields?.length
+                                ? `Out of sync: ${syncStatus[skill.skillId].changedFields.join(", ")}`
+                                : !syncStatus[skill.skillId]?.existsInProd
+                                  ? "Missing in Prod"
+                                  : !syncStatus[skill.skillId]?.existsInDev
+                                    ? "Missing in Dev"
+                                    : "Sync Skill (Prod/Dev)"
+                          }>
+                            <span>
+                              <IconButton
+                                onClick={() => handleOpenSyncDialog(skill)}
+                                color="info"
+                                disabled={syncStatus[skill.skillId]?.inSync}
+                              >
+                                <SyncAltIcon />
+                              </IconButton>
+                            </span>
                           </Tooltip>
                           <Tooltip title="Delete Skill">
                             <IconButton onClick={() => handleOpenDeleteDialog(skill)} color="error">
@@ -784,6 +850,46 @@ export default function Skills() {
           <Button onClick={handleCloseDeleteDialog} color="inherit">Cancel</Button>
           <Button onClick={handleDelete} variant="contained" color="error">
             Delete Skill
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Sync Skill Dialog */}
+      <Dialog open={syncDialogOpen} onClose={() => { setSyncDialogOpen(false); setSkillToSync(null); }}>
+        <DialogTitle>Sync Skill ({syncLabel})</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ mb: 2 }}>
+            Sync <strong>{skillToSync?.name}</strong> {syncLabel}:
+          </Typography>
+          {skillToSync && syncStatus[skillToSync.skillId] && (() => {
+            const info = syncStatus[skillToSync.skillId];
+            if (!info.existsInProd) {
+              return <Alert severity="info" sx={{ mb: 2 }}>This skill only exists in Dev. It will be created in Prod.</Alert>;
+            }
+            if (!info.existsInDev) {
+              return <Alert severity="info" sx={{ mb: 2 }}>This skill only exists in Prod. It will be created in Dev.</Alert>;
+            }
+            if (info.changedFields.length > 0) {
+              return (
+                <Alert severity="info" sx={{ mb: 2 }}>
+                  <strong>Fields that will change:</strong> {info.changedFields.join(", ")}
+                </Alert>
+              );
+            }
+            return null;
+          })()}
+          {backendEnv === 'development' && (
+            <Alert severity="warning" sx={{ mt: 1 }}>
+              This will overwrite the production version of this skill.
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setSyncDialogOpen(false); setSkillToSync(null); }} color="inherit">
+            Cancel
+          </Button>
+          <Button onClick={handleSync} variant="contained" color="primary" disabled={syncing}>
+            {syncing ? <CircularProgress size={20} color="inherit" /> : `Sync ${syncLabel}`}
           </Button>
         </DialogActions>
       </Dialog>
