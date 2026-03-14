@@ -696,6 +696,9 @@ export default function AdminDashboard() {
   const [editingAdAccountUserId, setEditingAdAccountUserId] = useState<string | null>(null);
   const [currentAdAccountText, setCurrentAdAccountText] = useState("");
   const [adAccountEditLoading, setAdAccountEditLoading] = useState(false);
+  const [editingStripeCustomerIdUserId, setEditingStripeCustomerIdUserId] = useState<string | null>(null);
+  const [currentStripeCustomerIdText, setCurrentStripeCustomerIdText] = useState("");
+  const [stripeCustomerIdEditLoading, setStripeCustomerIdEditLoading] = useState(false);
   const [emailSenderDialogOpen, setEmailSenderDialogOpen] = useState(false);
   const [editingEmailSenderUserId, setEditingEmailSenderUserId] = useState<string | null>(null);
   const [emailDomain, setEmailDomain] = useState("");
@@ -1887,6 +1890,43 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSaveStripeCustomerId = async (userId: string) => {
+    try {
+      setStripeCustomerIdEditLoading(true);
+
+      const stripeId = currentStripeCustomerIdText.trim();
+      if (stripeId && !stripeId.startsWith("cus_")) {
+        setError("Stripe Customer ID must start with 'cus_'");
+        return;
+      }
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/users/${userId}/stripe-customer-id`),
+        { stripeCustomerId: stripeId },
+        {
+          headers: { Authorization: `Bearer ${token}` }
+        }
+      );
+
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === userId
+              ? { ...user, stripe_customer_id: response.data.stripe_customer_id }
+              : user
+          )
+        );
+        setSuccess("Stripe Customer ID updated successfully!");
+        setEditingStripeCustomerIdUserId(null);
+        setCurrentStripeCustomerIdText("");
+      }
+    } catch (error: any) {
+      console.error("Error updating Stripe Customer ID:", error);
+      setError(error.response?.data?.message || "Failed to update Stripe Customer ID");
+    } finally {
+      setStripeCustomerIdEditLoading(false);
+    }
+  };
 
   const handleSaveEmailSender = async () => {
     if (!editingEmailSenderUserId) return;
@@ -3266,7 +3306,55 @@ export default function AdminDashboard() {
                       <TableRow key={user.userId}>
                         <TableCell>{user.email}</TableCell>
                         <TableCell>{user.userId}</TableCell>
-                        <TableCell>{user.stripe_customer_id || "-"}</TableCell>
+                        <TableCell>
+                          {editingStripeCustomerIdUserId === user.userId ? (
+                            <>
+                              <TextField
+                                size="small"
+                                value={currentStripeCustomerIdText}
+                                onChange={(e) => setCurrentStripeCustomerIdText(e.target.value)}
+                                placeholder="cus_..."
+                                sx={{ minWidth: 200 }}
+                                disabled={stripeCustomerIdEditLoading}
+                                helperText="Stripe Customer ID (starts with cus_)"
+                              />
+                              <IconButton
+                                size="small"
+                                onClick={() => handleSaveStripeCustomerId(user.userId)}
+                                disabled={stripeCustomerIdEditLoading}
+                                color="primary"
+                              >
+                                <CheckIcon />
+                              </IconButton>
+                              <IconButton
+                                size="small"
+                                onClick={() => {
+                                  setEditingStripeCustomerIdUserId(null);
+                                  setCurrentStripeCustomerIdText("");
+                                }}
+                                disabled={stripeCustomerIdEditLoading}
+                              >
+                                <CloseIcon />
+                              </IconButton>
+                            </>
+                          ) : (
+                            <>
+                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
+                                {user.stripe_customer_id || "-"}
+                              </Typography>
+                              <IconButton
+                                size="small"
+                                onClick={() => {
+                                  setEditingStripeCustomerIdUserId(user.userId);
+                                  setCurrentStripeCustomerIdText(user.stripe_customer_id || "");
+                                }}
+                                disabled={stripeCustomerIdEditLoading}
+                              >
+                                <EditIcon />
+                              </IconButton>
+                            </>
+                          )}
+                        </TableCell>
                         <TableCell>
                           {editingAdAccountUserId === user.userId ? (
                             <>
