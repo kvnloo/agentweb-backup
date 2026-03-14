@@ -3441,6 +3441,9 @@ export async function generateChatResponse(
     }
 
     // Iterative tool execution loop (follows Agent Mode pattern)
+    const startMemory = process.memoryUsage();
+    const startTime = Date.now();
+    const iterationTimings: { iteration: number; llmDurationMs: number; toolNames: string[] }[] = [];
     let iteration = 0;
     const MAX_ITERATIONS = 10;
     const toolCalls: any[] = []; // Track tool calls for response
@@ -3492,6 +3495,7 @@ export async function generateChatResponse(
       const trimmedMessages = trimToolMessagesForContext(messages);
 
       // Generate response using OpenAI (with tools if available)
+      const llmStartMs = Date.now();
       let response: any;
       const maxAttempts = 3;
       const baseDelayMs = 2000;
@@ -3528,6 +3532,7 @@ export async function generateChatResponse(
         }
       }
 
+      const llmDurationMs = Date.now() - llmStartMs;
       const responseMessage = response.choices[0]?.message;
       if (!responseMessage) {
         throw new Error("No response from LLM");
@@ -3552,6 +3557,7 @@ export async function generateChatResponse(
       // Check if LLM wants to call tools
       if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
         // No tool calls - we're done
+        iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: [] });
         finalAssistantMessage = responseMessage.content || "I apologize, but I was unable to generate a response.";
         finalUsageData = logTokenUsage(response, "Final response");
         break;
@@ -3579,6 +3585,8 @@ export async function generateChatResponse(
         }
       }
 
+      const toolNamesList = responseMessage.tool_calls.map((tc: any) => tc.function.name);
+      iterationTimings.push({ iteration: iteration + 1, llmDurationMs, toolNames: toolNamesList });
       iteration++;
     }
 
@@ -3587,6 +3595,19 @@ export async function generateChatResponse(
       finalAssistantMessage = "I apologize, but I reached the maximum number of iterations. Please try again with a simpler request.";
       console.warn(`[generateChatResponse] Hit MAX_ITERATIONS (${MAX_ITERATIONS})`);
     }
+
+    // Calculate memory usage delta and current state
+    const endMemory = process.memoryUsage();
+    const endTime = Date.now();
+    const memoryUsage = {
+      heapUsedDeltaMB: Number(((endMemory.heapUsed - startMemory.heapUsed) / 1024 / 1024).toFixed(2)),
+      heapTotalDeltaMB: Number(((endMemory.heapTotal - startMemory.heapTotal) / 1024 / 1024).toFixed(2)),
+      rssDeltaMB: Number(((endMemory.rss - startMemory.rss) / 1024 / 1024).toFixed(2)),
+      currentHeapUsedMB: Number((endMemory.heapUsed / 1024 / 1024).toFixed(2)),
+      currentHeapTotalMB: Number((endMemory.heapTotal / 1024 / 1024).toFixed(2)),
+      currentRssMB: Number((endMemory.rss / 1024 / 1024).toFixed(2)),
+      durationMs: endTime - startTime
+    };
 
     // Save all new messages to session
     const assistantMessageMetadata = {
@@ -3597,6 +3618,8 @@ export async function generateChatResponse(
       relevantChunks: relevantChunksInfo,
       timestamp,
       portalType,
+      iterationTimings,
+      memoryUsage,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined // Include tool calls if any
     };
 
