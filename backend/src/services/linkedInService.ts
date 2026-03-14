@@ -721,21 +721,29 @@ export class LinkedInService {
     accessToken: string,
     postUrn: string,
     actorUrn: string,
-    commentText: string
+    commentText: string,
+    parentCommentUrn?: string
   ): Promise<string> {
     return this.safeRequest(async () => {
       // URL-encode the post URN for the path
       const encodedPostUrn = encodeURIComponent(postUrn);
 
+      const payload: any = {
+        actor: actorUrn,
+        object: postUrn,
+        message: {
+          text: commentText
+        }
+      };
+
+      // Add parentComment for nested replies
+      if (parentCommentUrn) {
+        payload.parentComment = parentCommentUrn;
+      }
+
       const response = await this.client.post(
         `/rest/socialActions/${encodedPostUrn}/comments`,
-        {
-          actor: actorUrn,
-          object: postUrn,
-          message: {
-            text: commentText
-          }
-        },
+        payload,
         {
           headers: { Authorization: `Bearer ${accessToken}` }
         }
@@ -745,6 +753,36 @@ export class LinkedInService {
       const commentUrn = response.headers['x-restli-id'] || (response.data as any).commentUrn;
       console.log(`[LinkedIn] Comment created successfully: ${commentUrn}`);
       return commentUrn;
+    });
+  }
+
+  /**
+   * Get comments on a LinkedIn post
+   * @param accessToken - OAuth access token
+   * @param postUrn - URN of the post (e.g., "urn:li:ugcPost:123" or "urn:li:share:456")
+   * @returns Array of comments with URN, actor, text, and timestamp
+   */
+  async getComments(
+    accessToken: string,
+    postUrn: string
+  ): Promise<Array<{ commentUrn: string; actorUrn: string; text: string; createdAt: number }>> {
+    return this.safeRequest(async () => {
+      const encodedPostUrn = encodeURIComponent(postUrn);
+
+      const response = await this.client.get(
+        `/rest/socialActions/${encodedPostUrn}/comments`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        }
+      );
+
+      const elements = (response.data as any)?.elements || [];
+      return elements.map((el: any) => ({
+        commentUrn: el.$URN || el.id || '',
+        actorUrn: el.actor || '',
+        text: el.message?.text || '',
+        createdAt: el.created?.time || 0
+      }));
     });
   }
 

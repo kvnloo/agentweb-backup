@@ -144,7 +144,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string): Promise<PostResult> {
+  async createComment(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const actorUrn = account.account_id; // The account creating the comment
 
@@ -153,7 +153,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       const { token } = await this.getValidToken(account, userId);
 
       // Create comment
-      const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText);
+      const commentUrn = await linkedInService.createComment(token, postUrn, actorUrn, commentText, parentCommentUrn);
 
       return {
         success: true,
@@ -171,6 +171,18 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
       if (error.response?.status === 403) {
         throw new Error('Permission denied. Make sure your account has permission to comment on this post.');
+      }
+      throw error;
+    }
+  }
+
+  async getComments(account: ConnectedAccount, postUrn: string, userId?: string): Promise<Array<{ commentUrn: string; actorUrn: string; text: string; createdAt: number }>> {
+    try {
+      const { token } = await this.getValidToken(account, userId);
+      return await linkedInService.getComments(token, postUrn);
+    } catch (error: any) {
+      if (error.response?.status === 401) {
+        throw new Error('LinkedIn access token expired. Please reconnect your account.');
       }
       throw error;
     }
