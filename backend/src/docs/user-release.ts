@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-14',
     changes: [
+      'Feature: Agent Mode — LinkedIn Comment Replies & Listing',
+      '- Reply to specific LinkedIn comments as nested replies using the comment_on_linkedin_post tool with parent_comment_urn',
+      '- New list_linkedin_comments tool shows all comments on a post with URNs, authors, text, and timestamps',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
       'Improvement: Admin — Chat History Cleanup',
       '- Empty sessions (no user messages) are now hidden from the Chat History tab',
       '- Emma chatbot sessions now show Longest Wait and Max Heap metrics, matching Agent Mode sessions',
