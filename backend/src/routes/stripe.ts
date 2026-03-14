@@ -403,6 +403,9 @@ router.post(
         customer: customerId,
         line_items: [{ price: priceId, quantity: 1 }],
         mode: "subscription",
+        subscription_data: {
+          trial_period_days: 14,
+        },
         return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       });
 
