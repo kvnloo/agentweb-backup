@@ -5,6 +5,8 @@ import {
   getSkill,
   updateSkill,
   deleteSkill,
+  syncSkill,
+  getSyncStatus,
 } from '../controllers/skillController';
 import { skillService } from '../services/skillService';
 
@@ -16,6 +18,8 @@ jest.mock('../services/skillService', () => ({
     getSkill: jest.fn(),
     updateSkill: jest.fn(),
     deleteSkill: jest.fn(),
+    syncSkill: jest.fn(),
+    getSyncStatus: jest.fn(),
   },
 }));
 
@@ -379,6 +383,173 @@ describe('SkillController', () => {
       expect(mockStatus).toHaveBeenCalledWith(500);
       expect(mockJson).toHaveBeenCalledWith({
         message: 'Failed to delete skill',
+      });
+    });
+  });
+
+  describe('POST /api/skills/sync (syncSkill)', () => {
+    // Default NODE_ENV is undefined (treated as production), so allowed direction is prod-to-dev
+    const originalEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      process.env.NODE_ENV = originalEnv;
+    });
+
+    it('should return 400 if skillId is missing', async () => {
+      mockRequest.body = { direction: 'prod-to-dev' };
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'skillId and direction are required',
+      });
+      expect(skillService.syncSkill).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 if direction is missing', async () => {
+      mockRequest.body = { skillId: 'skill-123' };
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'skillId and direction are required',
+      });
+    });
+
+    it('should return 400 for invalid direction', async () => {
+      mockRequest.body = { skillId: 'skill-123', direction: 'invalid' };
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'direction must be "prod-to-dev" or "dev-to-prod"',
+      });
+    });
+
+    it('should return 400 when direction does not match environment (prod env, dev-to-prod)', async () => {
+      process.env.NODE_ENV = 'production';
+      mockRequest.body = { skillId: 'skill-123', direction: 'dev-to-prod' };
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'In prod environment, only "prod-to-dev" sync is allowed',
+      });
+      expect(skillService.syncSkill).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 when direction does not match environment (dev env, prod-to-dev)', async () => {
+      process.env.NODE_ENV = 'development';
+      mockRequest.body = { skillId: 'skill-123', direction: 'prod-to-dev' };
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'In dev environment, only "dev-to-prod" sync is allowed',
+      });
+      expect(skillService.syncSkill).not.toHaveBeenCalled();
+    });
+
+    it('should return 404 if skill not found in source', async () => {
+      mockRequest.body = { skillId: 'non-existent', direction: 'prod-to-dev' };
+      (skillService.syncSkill as jest.Mock).mockResolvedValue(null);
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(404);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'Skill not found in source table',
+      });
+    });
+
+    it('should sync skill prod-to-dev successfully in prod environment', async () => {
+      process.env.NODE_ENV = 'production';
+      const mockSkill = {
+        skillId: 'skill-123',
+        name: 'Test Skill',
+        description: 'Desc',
+        toolNames: ['tool1'],
+        isPublished: true,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      };
+
+      mockRequest.body = { skillId: 'skill-123', direction: 'prod-to-dev' };
+      (skillService.syncSkill as jest.Mock).mockResolvedValue(mockSkill);
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(skillService.syncSkill).toHaveBeenCalledWith('skill-123', 'prod-to-dev');
+      expect(mockStatus).toHaveBeenCalledWith(200);
+      expect(mockJson).toHaveBeenCalledWith(mockSkill);
+    });
+
+    it('should sync skill dev-to-prod successfully in dev environment', async () => {
+      process.env.NODE_ENV = 'development';
+      const mockSkill = {
+        skillId: 'skill-123',
+        name: 'Test Skill',
+        description: 'Desc',
+        toolNames: [],
+        isPublished: false,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      };
+
+      mockRequest.body = { skillId: 'skill-123', direction: 'dev-to-prod' };
+      (skillService.syncSkill as jest.Mock).mockResolvedValue(mockSkill);
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(skillService.syncSkill).toHaveBeenCalledWith('skill-123', 'dev-to-prod');
+      expect(mockStatus).toHaveBeenCalledWith(200);
+      expect(mockJson).toHaveBeenCalledWith(mockSkill);
+    });
+
+    it('should return 500 on service error', async () => {
+      mockRequest.body = { skillId: 'skill-123', direction: 'prod-to-dev' };
+      (skillService.syncSkill as jest.Mock).mockRejectedValue(new Error('DB Error'));
+
+      await syncSkill(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(500);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'Failed to sync skill',
+      });
+    });
+  });
+
+  describe('GET /api/skills/sync-status (getSyncStatus)', () => {
+    it('should return sync status with environment info', async () => {
+      const syncStatusResult = {
+        'skill-1': { inSync: true, existsInProd: true, existsInDev: true, changedFields: [] },
+        'skill-2': { inSync: false, existsInProd: true, existsInDev: false, changedFields: [] },
+      };
+      (skillService.getSyncStatus as jest.Mock).mockResolvedValue(syncStatusResult);
+
+      await getSyncStatus(mockRequest as Request, mockResponse as Response);
+
+      expect(skillService.getSyncStatus).toHaveBeenCalled();
+      expect(mockStatus).toHaveBeenCalledWith(200);
+      expect(mockJson).toHaveBeenCalledWith({
+        skills: syncStatusResult,
+        environment: expect.stringMatching(/^(development|production)$/),
+      });
+    });
+
+    it('should return 500 on service error', async () => {
+      (skillService.getSyncStatus as jest.Mock).mockRejectedValue(new Error('DB Error'));
+
+      await getSyncStatus(mockRequest as Request, mockResponse as Response);
+
+      expect(mockStatus).toHaveBeenCalledWith(500);
+      expect(mockJson).toHaveBeenCalledWith({
+        message: 'Failed to get sync status',
       });
     });
   });
