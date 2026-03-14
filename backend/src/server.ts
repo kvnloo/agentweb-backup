@@ -108,14 +108,15 @@ io.on('connection', (socket: Socket) => {
         throw new Error('No authentication token provided');
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string; isAdmin?: boolean };
       const userId = decoded.userId;
+      const isAdmin = decoded.isAdmin === true;
 
       const portalType = data.portal || 'partner';
       const response = await generateChatResponse(
         data.sessionId,
         data.message,
-        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, socketId: socket.id }
+        { currentUrl: data.currentUrl, pageContent: data.pageContent, portalType, userId, isAdmin, socketId: socket.id }
       );
 
       // Send response back to the client

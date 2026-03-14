@@ -133,6 +133,24 @@ emmaToolRegistry.register({
       });
     }
 
+    // Add __admin_tools__ virtual skill for admin users only
+    try {
+      const { userDb } = await import('../services/db');
+      const currentUser = await userDb.getUserById(userId);
+      if (currentUser?.isAdmin === true) {
+        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan'];
+        availableSkills.push({
+          skillId: '__admin_tools__',
+          name: 'Admin Tools',
+          description: 'Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
+          toolNames: adminToolNames,
+          toolCount: adminToolNames.length
+        });
+      }
+    } catch {
+      // Skip admin tools if user lookup fails
+    }
+
     return {
       skills: availableSkills,
       totalSkills: availableSkills.length,
@@ -4393,6 +4411,12 @@ const bridgedToolNames = [
   'get_deployment_status',
 ];
 
+// ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
+const adminToolNames = [
+  'list_predefined_work_plans',
+  'manage_predefined_work_plan',
+];
+
 for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
@@ -4403,5 +4427,18 @@ for (const toolName of bridgedToolNames) {
     });
   } else {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
+  }
+}
+
+for (const toolName of adminToolNames) {
+  const handler = mcpToolRegistry.getTool(toolName);
+  if (handler) {
+    emmaToolRegistry.register({
+      name: handler.name,
+      definition: handler.definition,
+      execute: handler.execute,
+    });
+  } else {
+    console.warn(`[emma/tools] Failed to bridge admin tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }

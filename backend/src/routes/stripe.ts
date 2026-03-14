@@ -377,6 +377,7 @@ router.post(
     const planPriceMap: Record<string, string> = {
       starter: process.env.STRIPE_STARTER_PRICE_ID || "",
       complete: process.env.STRIPE_COMPLETE_PRICE_ID || "",
+      pro: process.env.STRIPE_COMPLETE_PRICE_ID || "",
     };
 
     const priceId = planPriceMap[plan.toLowerCase()];

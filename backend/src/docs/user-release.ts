@@ -9,6 +9,25 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-13',
     changes: [
+      'Feature: Agent Mode — Admin Work Plan Management',
+      '- Admins can now create, update, and delete predefined work plans directly through Emma in Agent Mode',
+      '- Two new admin-only tools: list_predefined_work_plans and manage_predefined_work_plan',
+      '- Admin tools are security-gated and only visible to admin users across all skill listing paths',
+    ],
+  },
+  {
+    date: '2026-03-13',
+    changes: [
+      'Improvement: Admin Dashboard — Collapsible Work Plan Cards',
+      '- Predefined work plans are now collapsible for easier navigation when managing multiple plans',
+      '- Status chips show visibility, login requirement, step count, and model at a glance',
+      '- Steps can be reordered with up/down arrows',
+      '- Duplicate button to quickly copy existing work plans',
+    ],
+  },
+  {
+    date: '2026-03-13',
+    changes: [
       'Fix: Customer Portal — Stable Page Title During Delegated Admin Access',
       '- When an admin delegates into a customer account, the browser tab title now stays as "Customer Portal - <customer email>"',
       '- Previously the title changed to "Chat Support - ..." when a chat session was active, making it hard to identify the account',
