@@ -2290,7 +2290,13 @@ router.get("/chat-sessions", async (req, res) => {
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
       : null;
 
-    res.json({ sessions: sessionsWithMessages, nextCursor });
+    // Filter out sessions that have no user messages (not real sessions)
+    const nonEmptySessions = sessionsWithMessages.filter((session: any) =>
+      Array.isArray(session.messages) &&
+      session.messages.some((msg: any) => msg.role === "user")
+    );
+
+    res.json({ sessions: nonEmptySessions, nextCursor });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });
