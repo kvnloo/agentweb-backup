@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -1348,6 +1348,7 @@ export class AgentModeService {
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
 - **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
@@ -11338,6 +11339,42 @@ Format the response as JSON with this structure:
       return {
         success: false,
         message: `Failed to read ClickUp task "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Helper: create a new document in a ClickUp workspace
+  public async writeClickUpDoc(
+    workspaceId: string,
+    name: string,
+    content: string,
+    userId: string
+  ): Promise<{ success: boolean; message: string; docId?: string }> {
+    try {
+      const clickUpToken = await getClickUpAccessToken(userId);
+      if (!clickUpToken) {
+        return { success: false, message: 'ClickUp not connected' };
+      }
+
+      // Verify user has access to this workspace
+      const workspaces = await getClickUpWorkspaces(clickUpToken);
+      const workspace = workspaces.find(w => w.id === workspaceId);
+      if (!workspace) {
+        return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      }
+
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+
+      return {
+        success: true,
+        message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
+        docId: doc.id,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating ClickUp doc:', error);
+      return {
+        success: false,
+        message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }
