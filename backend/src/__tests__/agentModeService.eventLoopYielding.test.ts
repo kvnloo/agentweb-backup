@@ -321,7 +321,8 @@ describe('AgentModeService - generateMarketingResponse', () => {
         { query: 'test query' },
         'test-user',
         'test-session',
-        false
+        false,
+        undefined
       );
 
       // Verify final response includes tool results

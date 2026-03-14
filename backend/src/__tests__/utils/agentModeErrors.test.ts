@@ -226,5 +226,13 @@ describe('agentModeErrors utils', () => {
       expect(isTransientLLMError('ECONNRESET')).toBe(true);
       expect(isTransientLLMError('some normal error')).toBe(false);
     });
+
+    it('should detect AbortSignal timeout errors', () => {
+      expect(isTransientLLMError(new Error('The operation was aborted due to timeout'))).toBe(true);
+    });
+
+    it('should detect TimeoutError by name in message', () => {
+      expect(isTransientLLMError(new Error('TimeoutError: signal timed out'))).toBe(true);
+    });
   });
 });
