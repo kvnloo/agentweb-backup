@@ -477,7 +477,6 @@ router.post(
       );
       res.status(500).json({
         error: "Failed to create Stripe Customer Portal session.",
-        details: error.message,
       });
     }
   }
@@ -645,7 +644,6 @@ router.post(
  */
 router.post(
   "/webhook",
-  express.raw({ type: "application/json" }),
   stripeController.handleWebhook
 );
 

@@ -123,10 +123,13 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     return;
   }
 
+  // Derive subscription tier from the price ID in the checkout session
+  const subscriptionType = deriveSubscriptionType(session);
+
   await userDb.updateUser(user.userId, {
     stripe_customer_id: stripeCustomerId,
     stripe_subscription_id: stripeSubscriptionId,
-    subscriptionType: 'pro',
+    subscriptionType,
     subscription_status: 'active',
   });
 
@@ -181,6 +184,26 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Derive the subscription type from the checkout session's line items price ID.
+ * Falls back to 'pro' if the price cannot be determined.
+ */
+function deriveSubscriptionType(session: any): string {
+  const priceId = session.line_items?.data?.[0]?.price?.id
+    || session.display_items?.[0]?.price?.id;
+
+  if (priceId) {
+    if (priceId === process.env.STRIPE_STARTER_PRICE_ID) {
+      return 'starter';
+    }
+    if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) {
+      return 'pro';
+    }
+  }
+
+  return 'pro';
+}
 
 /**
  * Find a user by their stripe_customer_id.

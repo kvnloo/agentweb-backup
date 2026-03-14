@@ -328,7 +328,7 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
  * The actual GitHub operations are handled by the GitHub MCP server.
  * This route validates ownership and returns repo info for the MCP tool to use.
  */
-router.put("/generated/:id/github-edit", async (req, res: Response) => {
+router.put("/generated/:id/github-edit", rateLimiter, async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {
@@ -480,6 +480,11 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
 
     const filePath = req.query.path as string;
     if (!filePath) return res.status(400).json({ error: "path query parameter is required" });
+
+    // Prevent path traversal attacks
+    if (filePath.includes('..') || filePath.startsWith('.github/') || filePath.startsWith('.github\\')) {
+      return res.status(400).json({ error: "Invalid file path" });
+    }
 
     const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
     if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
