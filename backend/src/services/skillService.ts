@@ -17,6 +17,13 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
   },
 });
 
+export interface SkillSyncInfo {
+  inSync: boolean;
+  existsInProd: boolean;
+  existsInDev: boolean;
+  changedFields: string[];
+}
+
 export interface Skill {
   skillId: string;
   name: string;
@@ -193,6 +200,90 @@ export class SkillService {
       await dynamodb.put(params).promise();
     } catch (error) {
       console.error(`Error updating skill ${skill.skillId}:`, error);
+      throw error;
+    }
+  }
+
+  async syncSkill(skillId: string, direction: 'prod-to-dev' | 'dev-to-prod'): Promise<Skill | null> {
+    const sourceTable = direction === 'prod-to-dev' ? 'AW-Skills' : 'Dev-AW-Skills';
+    const targetTable = direction === 'prod-to-dev' ? 'Dev-AW-Skills' : 'AW-Skills';
+
+    try {
+      // Read from source table
+      const result = await dynamodb.get({
+        TableName: sourceTable,
+        Key: { skillId },
+      }).promise();
+
+      if (!result.Item) {
+        return null;
+      }
+
+      const skill = this.normalizeSkill(result.Item);
+
+      // Write to target table, converting toolNames back to DynamoDB Set
+      const skillItem: any = { ...skill };
+      if (skill.toolNames && skill.toolNames.length > 0) {
+        skillItem.toolNames = dynamodb.createSet(skill.toolNames);
+      } else {
+        delete skillItem.toolNames;
+      }
+
+      await dynamodb.put({
+        TableName: targetTable,
+        Item: skillItem,
+      }).promise();
+
+      return skill;
+    } catch (error) {
+      console.error(`Error syncing skill ${skillId} (${direction}):`, error);
+      throw error;
+    }
+  }
+
+  private getChangedFields(a: Skill, b: Skill): string[] {
+    const changed: string[] = [];
+    if (a.name !== b.name) changed.push('name');
+    if (a.description !== b.description) changed.push('description');
+    if (a.isPublished !== b.isPublished) changed.push('isPublished');
+    if ((a.systemPrompt || '') !== (b.systemPrompt || '')) changed.push('systemPrompt');
+    const sortedA = [...(a.toolNames || [])].sort();
+    const sortedB = [...(b.toolNames || [])].sort();
+    if (JSON.stringify(sortedA) !== JSON.stringify(sortedB)) changed.push('toolNames');
+    return changed;
+  }
+
+  async getSyncStatus(): Promise<Record<string, SkillSyncInfo>> {
+    try {
+      const [prodResult, devResult] = await Promise.all([
+        dynamodb.scan({ TableName: 'AW-Skills' }).promise(),
+        dynamodb.scan({ TableName: 'Dev-AW-Skills' }).promise(),
+      ]);
+
+      const prodSkills = (prodResult.Items || []).map(item => this.normalizeSkill(item));
+      const devSkills = (devResult.Items || []).map(item => this.normalizeSkill(item));
+
+      const prodMap = new Map(prodSkills.map(s => [s.skillId, s]));
+      const devMap = new Map(devSkills.map(s => [s.skillId, s]));
+
+      const allIds = new Set([...prodMap.keys(), ...devMap.keys()]);
+      const result: Record<string, SkillSyncInfo> = {};
+
+      for (const id of allIds) {
+        const prod = prodMap.get(id);
+        const dev = devMap.get(id);
+        const changedFields = (prod && dev) ? this.getChangedFields(prod, dev) : [];
+        result[id] = {
+          inSync: !!(prod && dev && changedFields.length === 0),
+          existsInProd: !!prod,
+          existsInDev: !!dev,
+          changedFields,
+        };
+      }
+
+      return result;
+    } catch (error) {
+      console.error("Error getting sync status:", error);
       throw error;
     }
   }
