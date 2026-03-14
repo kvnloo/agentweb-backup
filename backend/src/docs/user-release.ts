@@ -9,6 +9,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-13',
     changes: [
+      'Feature: Admin — Skill Sync Between Prod and Dev Environments',
+      '- Sync button on the Skills page lets admins copy skills between production and dev DynamoDB tables',
+      '- Direction is auto-determined by environment: prod pushes to dev, dev pushes to prod',
+      '- On page load, shows sync status for each skill — disabled when already in sync',
+      '- Displays which fields differ (name, description, systemPrompt, etc.) before syncing',
+    ],
+  },
+  {
+    date: '2026-03-13',
+    changes: [
       'Fix: Customer Portal — Page Title Now Shows User Email',
       '- The browser tab title now consistently shows "Customer Portal - <your email>" on every page',
       '- Previously the title only updated when the Emma chat panel was open',
