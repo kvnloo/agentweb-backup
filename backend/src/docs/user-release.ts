@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-14',
+    changes: [
+      'Improvement: Admin — Chat History Cleanup',
+      '- Empty sessions (no user messages) are now hidden from the Chat History tab',
+      '- Emma chatbot sessions now show Longest Wait and Max Heap metrics, matching Agent Mode sessions',
+    ],
+  },
+  {
     date: '2026-03-13',
     changes: [
       'Feature: Admin — Skill Sync Between Prod and Dev Environments',
