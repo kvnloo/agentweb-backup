@@ -429,8 +429,8 @@ describe('MCP Server Security', () => {
       expect(decoded.userId).toBe('user-123');
       expect(decoded.email).toBe('user@example.com');
       expect(decoded.isAdmin).toBe(false);
-      // Token should expire in 60 seconds
-      expect(decoded.exp - decoded.iat).toBe(60);
+      // Token should expire in 600 seconds (extended for slow v0 operations)
+      expect(decoded.exp - decoded.iat).toBe(600);
     });
 
     it('self-call JWT does not grant admin when user is not admin', () => {

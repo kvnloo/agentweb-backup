@@ -41,6 +41,7 @@ jest.mock('../services/db', () => ({
     getUserByEmail: jest.fn(),
     updateUser: jest.fn(),
     getAllUsers: jest.fn(),
+    scanWithFilter: jest.fn(),
   },
 }));
 
@@ -294,7 +295,7 @@ describe('Stripe Backend Integration', () => {
         stripe_customer_id: 'cus_123',
       };
 
-      (userDb.getAllUsers as jest.Mock).mockResolvedValue([mockUser]);
+      (userDb as any).scanWithFilter.mockResolvedValue([mockUser]);
       (userDb.updateUser as jest.Mock).mockResolvedValue({
         ...mockUser,
         subscription_status: 'past_due',
@@ -325,7 +326,7 @@ describe('Stripe Backend Integration', () => {
         subscription_status: 'active',
       };
 
-      (userDb.getAllUsers as jest.Mock).mockResolvedValue([mockUser]);
+      (userDb as any).scanWithFilter.mockResolvedValue([mockUser]);
       (userDb.updateUser as jest.Mock).mockResolvedValue({
         ...mockUser,
         subscription_status: 'canceled',
