@@ -70,6 +70,9 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn().mockResolvedValue([]),
 }));
 
+// Helper: generate ISO dates relative to now so tests don't break on date boundaries
+const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+
 const mockGetSessions = chatbotDb.getSessionsWithoutMessages as jest.Mock;
 const mockGetUserById = userDb.getUserById as jest.Mock;
 const mockGetLeadLists = crmDb.getLeadListsByUserId as jest.Mock;
@@ -82,8 +85,8 @@ function makeSession(overrides: Record<string, any> = {}) {
   return {
     sessionId: `session-${Math.random().toString(36).slice(2, 8)}`,
     userId: 'user-1',
-    createdAt: '2026-03-05T10:00:00.000Z',
-    updatedAt: '2026-03-05T10:30:00.000Z',
+    createdAt: daysAgo(5),
+    updatedAt: daysAgo(5),
     portalType: 'customer',
     ...overrides,
   };
@@ -120,8 +123,8 @@ describe('getAccountSummary', () => {
 
   test('filters out sessions outside the time range', async () => {
     mockGetSessions.mockResolvedValue([
-      makeSession({ createdAt: '2026-03-08T10:00:00.000Z' }), // within 7d of Mar 9
-      makeSession({ createdAt: '2026-02-01T10:00:00.000Z' }), // outside 7d
+      makeSession({ createdAt: daysAgo(2) }), // within 7d
+      makeSession({ createdAt: daysAgo(30) }), // outside 7d
     ]);
 
     const result = await getAccountSummary('user-1', '7d');
@@ -131,7 +134,7 @@ describe('getAccountSummary', () => {
 
   test('handles invalid time_range by defaulting to 7d', async () => {
     mockGetSessions.mockResolvedValue([
-      makeSession({ createdAt: '2026-03-08T10:00:00.000Z' }),
+      makeSession({ createdAt: daysAgo(2) }),
     ]);
 
     const result = await getAccountSummary('user-1', 'invalid' as any);
@@ -145,25 +148,25 @@ describe('getAccountSummary', () => {
   test('counts assets from assetCache across sessions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({
-        createdAt: '2026-03-08T10:00:00.000Z',
+        createdAt: daysAgo(2),
         assetCache: {
           images: [
-            { url: 'https://s3/img1.png', filename: 'img1.png', generatedAt: '2026-03-08T10:00:00Z' },
-            { url: 'https://s3/img2.png', filename: 'img2.png', generatedAt: '2026-03-08T11:00:00Z' },
+            { url: 'https://s3/img1.png', filename: 'img1.png', generatedAt: daysAgo(2) },
+            { url: 'https://s3/img2.png', filename: 'img2.png', generatedAt: daysAgo(2) },
           ],
           videos: [
-            { url: 'https://s3/vid1.mp4', filename: 'vid1.mp4', generatedAt: '2026-03-08T12:00:00Z' },
+            { url: 'https://s3/vid1.mp4', filename: 'vid1.mp4', generatedAt: daysAgo(2) },
           ],
           htmlReports: [
-            { url: 'https://s3/report1.html', filename: 'report.html', generatedAt: '2026-03-08T13:00:00Z' },
+            { url: 'https://s3/report1.html', filename: 'report.html', generatedAt: daysAgo(2) },
           ],
         },
       }),
       makeSession({
-        createdAt: '2026-03-07T10:00:00.000Z',
+        createdAt: daysAgo(3),
         assetCache: {
           images: [
-            { url: 'https://s3/img3.png', filename: 'img3.png', generatedAt: '2026-03-07T10:00:00Z' },
+            { url: 'https://s3/img3.png', filename: 'img3.png', generatedAt: daysAgo(3) },
           ],
           videos: [],
           htmlReports: [],
@@ -182,7 +185,7 @@ describe('getAccountSummary', () => {
   test('counts social media posts from calledFunctions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({
-        createdAt: '2026-03-08T10:00:00.000Z',
+        createdAt: daysAgo(2),
         calledFunctions: {
           'create_social_media_posts': 3,
           'post_on_connected_account': 2,
@@ -200,12 +203,12 @@ describe('getAccountSummary', () => {
   test('counts blog articles and deep research as reports via calledFunctions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({
-        createdAt: '2026-03-08T10:00:00.000Z',
+        createdAt: daysAgo(2),
         assetCache: {
           images: [],
           videos: [],
           htmlReports: [
-            { url: 'https://s3/report1.html', filename: 'report.html', generatedAt: '2026-03-08T10:00:00Z' },
+            { url: 'https://s3/report1.html', filename: 'report.html', generatedAt: daysAgo(2) },
           ],
         },
         calledFunctions: {
@@ -224,7 +227,7 @@ describe('getAccountSummary', () => {
   test('counts published from both publishStatuses and calledFunctions', async () => {
     mockGetSessions.mockResolvedValue([
       makeSession({
-        createdAt: '2026-03-08T10:00:00.000Z',
+        createdAt: daysAgo(2),
         publishStatuses: {
           'https://s3/img1.png': 'published',
           'https://s3/img2.png': 'draft',
@@ -236,7 +239,7 @@ describe('getAccountSummary', () => {
         },
       }),
       makeSession({
-        createdAt: '2026-03-07T10:00:00.000Z',
+        createdAt: daysAgo(3),
         publishStatuses: {
           'https://s3/vid1.mp4': 'published',
         },
@@ -272,7 +275,7 @@ describe('getAccountSummary', () => {
 
   test('sessions with no assetCache or calledFunctions are counted but contribute zero assets', async () => {
     mockGetSessions.mockResolvedValue([
-      makeSession({ createdAt: '2026-03-08T10:00:00.000Z' }),
+      makeSession({ createdAt: daysAgo(2) }),
     ]);
 
     const result = await getAccountSummary('user-1', '7d');
@@ -325,12 +328,12 @@ describe('getAccountSummary', () => {
     mockGetLeadLists.mockResolvedValue([{ listId: 'list-1', userId: 'user-1' }]);
     mockGetLeads
       .mockResolvedValueOnce({
-        items: [{ leadId: 'lead-1', createdAt: '2026-03-08T10:00:00.000Z' }],
+        items: [{ leadId: 'lead-1', createdAt: daysAgo(2) }],
         lastEvaluatedKey: { listId: 'list-1', leadId: 'lead-1' },
         hasMore: true,
       })
       .mockResolvedValueOnce({
-        items: [{ leadId: 'lead-2', createdAt: '2026-03-07T10:00:00.000Z' }],
+        items: [{ leadId: 'lead-2', createdAt: daysAgo(3) }],
         lastEvaluatedKey: null,
         hasMore: false,
       });
@@ -346,12 +349,12 @@ describe('getAccountSummary', () => {
     mockGetSessions.mockResolvedValue([]);
     mockGetUserById.mockResolvedValue({ userId: 'user-1', emailDomain: 'mycompany.com' });
     mockGetEmailEvents.mockResolvedValue([
-      { eventType: 'email.delivered', createdAt: '2026-03-08T10:00:00.000Z' },
-      { eventType: 'email.delivered', createdAt: '2026-03-07T10:00:00.000Z' },
-      { eventType: 'email.clicked', createdAt: '2026-03-08T12:00:00.000Z' },
-      { eventType: 'email.received', createdAt: '2026-03-08T13:00:00.000Z' }, // reply
-      { eventType: 'email.bounced', createdAt: '2026-03-08T14:00:00.000Z' },
-      { eventType: 'email.delivered', createdAt: '2026-01-01T10:00:00.000Z' }, // outside range
+      { eventType: 'email.delivered', createdAt: daysAgo(2) },
+      { eventType: 'email.delivered', createdAt: daysAgo(3) },
+      { eventType: 'email.clicked', createdAt: daysAgo(2) },
+      { eventType: 'email.received', createdAt: daysAgo(2) }, // reply
+      { eventType: 'email.bounced', createdAt: daysAgo(2) },
+      { eventType: 'email.delivered', createdAt: daysAgo(90) }, // outside range
     ]);
 
     const result = await getAccountSummary('user-1', '7d');
@@ -384,15 +387,15 @@ describe('getAccountSummary', () => {
       .mockResolvedValueOnce({
         success: true,
         posts: [
-          { id: 'p1', created: { time: new Date('2026-03-08T10:00:00.000Z').getTime() }, metrics: null },
-          { id: 'p2', created: { time: new Date('2026-01-01T10:00:00.000Z').getTime() }, metrics: null }, // outside range
+          { id: 'p1', created: { time: new Date(daysAgo(2)).getTime() }, metrics: null },
+          { id: 'p2', created: { time: new Date(daysAgo(90)).getTime() }, metrics: null }, // outside range
         ],
       })
       .mockResolvedValueOnce({
         success: true,
         posts: [
-          { id: 'o1', createdAt: '2026-03-08T10:00:00.000Z', metrics: null },
-          { id: 'o2', createdAt: '2026-03-07T10:00:00.000Z', metrics: null },
+          { id: 'o1', createdAt: daysAgo(2), metrics: null },
+          { id: 'o2', createdAt: daysAgo(3), metrics: null },
         ],
       });
 
@@ -412,17 +415,17 @@ describe('getAccountSummary', () => {
       posts: [
         {
           id: 'post-1',
-          createdAt: '2026-03-08T10:00:00.000Z',
+          createdAt: daysAgo(2),
           metrics: { impressionCount: 1200, likeCount: 45, commentCount: 12, shareCount: 8, clickCount: 89 },
         },
         {
           id: 'post-2',
-          createdAt: '2026-03-07T10:00:00.000Z',
+          createdAt: daysAgo(3),
           metrics: { impressionCount: 800, likeCount: 20, commentCount: 5, shareCount: 3, clickCount: 40 },
         },
         {
           id: 'post-3',
-          createdAt: '2026-01-01T10:00:00.000Z', // outside range
+          createdAt: daysAgo(90), // outside range
           metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 10 },
         },
       ],
@@ -446,12 +449,12 @@ describe('getAccountSummary', () => {
       posts: [
         {
           id: 'post-1',
-          created: { time: new Date('2026-03-08T10:00:00.000Z').getTime() },
+          created: { time: new Date(daysAgo(2)).getTime() },
           metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 5 },
         },
         {
           id: 'post-2',
-          created: { time: new Date('2026-01-01T10:00:00.000Z').getTime() }, // outside range
+          created: { time: new Date(daysAgo(90)).getTime() }, // outside range
           metrics: { impressionCount: 300, likeCount: 5, commentCount: 1, shareCount: 0, clickCount: 2 },
         },
       ],
@@ -501,7 +504,7 @@ describe('getAccountSummary', () => {
       posts: [
         {
           id: 'post-1',
-          createdAt: '2026-03-08T10:00:00.000Z',
+          createdAt: daysAgo(2),
           metrics: { impressionCount: 500, likeCount: 10, commentCount: 2, shareCount: 1, clickCount: 5 },
         },
       ],
