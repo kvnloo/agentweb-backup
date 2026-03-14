@@ -113,14 +113,13 @@ export class CrmEnrichmentService {
     return unipileAccount?.account_id || null;
   }
 
+  private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
+
   private async enrichLead(
     lead: any,
     spec: EnrichmentJobSpec,
-    llmService: any,
     linkedInAccountId?: string | null,
   ): Promise<{ fields: Record<string, string> }> {
-    const escapeBraces = (str: string) => str.replace(/{/g, '{{').replace(/}/g, '}}');
-
     let webContext = '';
     let linkedinContext = '';
 
@@ -219,15 +218,23 @@ ${webContext ? `\nWeb search results:${webContext}` : ''}${linkedinContext ? `\n
 
 Extract the requested fields now.`;
 
+    // Call Gemini via the shared OpenAI-compatible client
+    const geminiClient = await agentModeService.getGeminiClient();
     let response: Record<string, string> | null = null;
     try {
-      response = await llmService.generateJSONContent(
-        escapeBraces(systemPrompt),
-        escapeBraces(userPrompt),
-        'json'
-      );
+      const completion = await geminiClient.chat.completions.create({
+        model: CrmEnrichmentService.ENRICH_MODEL,
+        temperature: 1,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+      });
+      const raw = completion.choices?.[0]?.message?.content || '';
+      response = JSON.parse(raw);
     } catch {
-      // Retry with stricter instructions
+      // Retry with stricter instructions, no JSON mode
       const strictRetryPrompt = `${userPrompt}
 
 CRITICAL RETRY INSTRUCTIONS:
@@ -236,11 +243,15 @@ No markdown, no backticks, no comments, no trailing commas.
 Valid example:
 {${spec.outputFields.map(f => `"${f}":"value"`).join(',')}}`;
 
-      const rawRetry = await llmService.generateContent(
-        escapeBraces(systemPrompt),
-        escapeBraces(strictRetryPrompt),
-        'text'
-      );
+      const retry = await geminiClient.chat.completions.create({
+        model: CrmEnrichmentService.ENRICH_MODEL,
+        temperature: 1,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: strictRetryPrompt },
+        ],
+      });
+      const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
         .trim()
@@ -279,9 +290,6 @@ Valid example:
     const sampleLeads = leadsToProcess.slice(0, 2);
 
     if (sampleLeads.length > 0) {
-      const { createLLMService } = await import('../utils/llmService');
-      const llmService = createLLMService('gemini-3.1-flash-lite-preview', 1);
-
       // Resolve LinkedIn account if needed
       let linkedInAccountId: string | null = null;
       if (spec.sources.includes('linkedin')) {
@@ -290,7 +298,7 @@ Valid example:
 
       for (const lead of sampleLeads) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, llmService, linkedInAccountId);
+          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
           samples.push({ leadId: lead.leadId, lead, enrichedFields: fields });
         } catch (err) {
           samples.push({ leadId: lead.leadId, lead, enrichedFields: { _error: String(err) } });
@@ -357,8 +365,6 @@ Valid example:
       emit(userRoom, progressEvent, payload);
     };
 
-    const { createLLMService } = await import('../utils/llmService');
-
     const parallelism = hasLinkedin && linkedInAccountId ? 5 : 20;
     const chunkSize = Math.max(1, Math.ceil(leadsToProcess.length / parallelism));
     const chunks: any[][] = [];
@@ -378,11 +384,9 @@ Valid example:
     emitProgress('Starting enrichment...', 0, 0, 0);
 
     const chunkProcessors = chunks.map(async (chunk) => {
-      const llmService = createLLMService('gemini-3.1-flash-lite-preview', 1);
-
       for (const lead of chunk) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, llmService, linkedInAccountId);
+          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
 
           await crmDb.updateLead(spec.listId, lead.leadId, {
             customFields: {
