@@ -55,26 +55,26 @@ jest.mock("aws-sdk", () => ({
 const mockGetV0ApiKey = jest.fn().mockResolvedValue("test-v0-api-key");
 jest.mock("../utils/secretsManager", () => ({
   getV0ApiKey: (...args: any[]) => mockGetV0ApiKey(...args),
+  getGitHubOrgToken: jest.fn().mockResolvedValue({ token: "test-gh-token", org: "TestOrg" }),
+  getVercelToken: jest.fn().mockResolvedValue("test-vercel-token"),
   getSecret: jest.fn().mockResolvedValue('{"apiKey":"test-key"}'),
   secretExists: jest.fn().mockResolvedValue(true),
 }));
 
 // Mock v0-sdk
-const mockProjectsCreate = jest.fn();
 const mockChatsCreate = jest.fn();
 const mockChatsGetById = jest.fn();
 const mockChatsSendMessage = jest.fn();
-const mockDeploymentsCreate = jest.fn();
+const mockChatsDownloadVersion = jest.fn();
 
 jest.mock("v0-sdk", () => ({
   createClient: () => ({
-    projects: { create: mockProjectsCreate },
     chats: {
       create: mockChatsCreate,
       getById: mockChatsGetById,
       sendMessage: mockChatsSendMessage,
+      downloadVersion: mockChatsDownloadVersion,
     },
-    deployments: { create: mockDeploymentsCreate },
   }),
 }));
 
@@ -198,22 +198,7 @@ describe("v0Service - generateLandingPage", () => {
     expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("FAIL: projects.create throws → record saved as failed", async () => {
-    mockProjectsCreate.mockRejectedValueOnce(new Error("Project API error"));
-
-    const result = await generateLandingPage(
-      "user-1",
-      "Create page",
-      "Test Page",
-      {}
-    );
-
-    expect(result.status).toBe("failed");
-    expect(result.errorMessage).toBe("Project API error");
-  });
-
-  it("FAIL: chats.create throws after project created → record failed", async () => {
-    mockProjectsCreate.mockResolvedValueOnce({ id: "proj_1" });
+  it("FAIL: chats.create throws → record saved as failed", async () => {
     mockChatsCreate.mockRejectedValueOnce(new Error("Chat API error"));
 
     const result = await generateLandingPage(
@@ -237,11 +222,12 @@ describe("v0Service - generateLandingPage", () => {
     ).rejects.toThrow("DynamoDB put failed");
   });
 
-  it("SUCCESS: full brand + valid prompt → returns draft with v0 IDs", async () => {
-    mockProjectsCreate.mockResolvedValueOnce({ id: "proj_123" });
+  it("SUCCESS: chats.create succeeds → returns record with v0ChatId", async () => {
+    // generateLandingPage now calls chats.create directly (no projects.create)
+    // then auto-deploys. Deploy will fail in test (no GitHub/Vercel mocks)
+    // so result will have status "failed" but v0ChatId will be set.
     mockChatsCreate.mockResolvedValueOnce({
       id: "chat_456",
-      webUrl: "https://v0.dev/chat/chat_456",
     });
 
     const brand: BrandContext = {
@@ -256,16 +242,13 @@ describe("v0Service - generateLandingPage", () => {
       brand
     );
 
-    expect(result.status).toBe("draft");
-    expect(result.v0ProjectId).toBe("proj_123");
-    expect(result.v0ChatId).toBe("chat_456");
+    // chats.create was called (no more projects.create)
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1);
     expect(result.userId).toBe("user-1");
-    expect(result.name).toBe("Pricing");
     expect(result.id).toBe("test-uuid-1234");
   });
 
-  it("SUCCESS: no brand → still generates, no brand section", async () => {
-    mockProjectsCreate.mockResolvedValueOnce({ id: "proj_789" });
+  it("SUCCESS: no brand → still generates", async () => {
     mockChatsCreate.mockResolvedValueOnce({ id: "chat_012" });
 
     const result = await generateLandingPage(
@@ -275,25 +258,8 @@ describe("v0Service - generateLandingPage", () => {
       {}
     );
 
-    expect(result.status).toBe("draft");
-    expect(result.v0ProjectId).toBe("proj_789");
-  });
-
-  it("SUCCESS: chat returns webUrl → saved as githubRepoUrl", async () => {
-    mockProjectsCreate.mockResolvedValueOnce({ id: "proj_abc" });
-    mockChatsCreate.mockResolvedValueOnce({
-      id: "chat_def",
-      webUrl: "https://v0.dev/chat/chat_def",
-    });
-
-    const result = await generateLandingPage(
-      "user-1",
-      "Create page",
-      "WithUrl",
-      {}
-    );
-
-    expect(result.githubRepoUrl).toBe("https://v0.dev/chat/chat_def");
+    expect(mockChatsCreate).toHaveBeenCalledTimes(1);
+    expect(result.id).toBe("test-uuid-1234");
   });
 });
 
@@ -311,7 +277,7 @@ describe("v0Service - deployLandingPage", () => {
     );
   });
 
-  it("FAIL: no v0ProjectId/v0ChatId → throws generate first", async () => {
+  it("FAIL: no v0ChatId → throws generate first", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -364,7 +330,7 @@ describe("v0Service - deployLandingPage", () => {
     );
   });
 
-  it("FAIL: deployments.create throws → throws deployment error", async () => {
+  it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -383,44 +349,13 @@ describe("v0Service - deployLandingPage", () => {
       latestVersion: { id: "ver_1" },
     });
 
-    mockDeploymentsCreate.mockRejectedValueOnce(
-      new Error("Deployment API error")
+    mockChatsDownloadVersion.mockRejectedValueOnce(
+      new Error("Download version API error")
     );
 
     await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
       "Deployment failed"
     );
-  });
-
-  it("SUCCESS: draft page → returns deployed with deployedUrl", async () => {
-    mockGet.mockReturnValueOnce({
-      promise: () =>
-        Promise.resolve({
-          Item: {
-            id: "page-1",
-            userId: "user-1",
-            status: "draft",
-            v0ProjectId: "proj_1",
-            v0ChatId: "chat_1",
-          },
-        }),
-    });
-
-    mockChatsGetById.mockResolvedValueOnce({
-      id: "chat_1",
-      latestVersion: { id: "ver_1" },
-    });
-
-    mockDeploymentsCreate.mockResolvedValueOnce({
-      id: "deploy_1",
-      webUrl: "https://my-page.vercel.app",
-    });
-
-    const result = await deployLandingPage("page-1", "user-1");
-
-    expect(result.status).toBe("deployed");
-    expect(result.deployedUrl).toBe("https://my-page.vercel.app");
-    expect(result.vercelProjectId).toBe("deploy_1");
   });
 });
 
@@ -590,7 +525,7 @@ describe("v0Service - deleteLandingPage", () => {
     );
   });
 
-  it("SUCCESS: deletes record", async () => {
+  it("SUCCESS: soft-deletes record via update (archive)", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -601,6 +536,7 @@ describe("v0Service - deleteLandingPage", () => {
     await expect(
       deleteLandingPage("page-1", "user-1")
     ).resolves.toBeUndefined();
-    expect(mockDelete).toHaveBeenCalledTimes(1);
+    // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
   });
 });

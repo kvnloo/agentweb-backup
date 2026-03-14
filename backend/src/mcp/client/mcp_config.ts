@@ -7,5 +7,13 @@ export const internalMcpServers: Record<string, McpServerConfig> = {
     url: `http://localhost:${process.env.PORT || 3001}/mcp`,
     accessToken: process.env.MCP_ACCESS_TOKEN,
     isInternal: true
-  }
+  },
+  "github": {
+    transport: "stdio",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-github"],
+    env: {
+      GITHUB_PERSONAL_ACCESS_TOKEN: "{{github_access_token}}"
+    }
+  } as any
 };

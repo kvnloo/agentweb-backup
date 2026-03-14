@@ -132,7 +132,7 @@ describe('SkillService', () => {
 
       const result = await skillService.getSkill('skill-1');
 
-      expect(result).toEqual(mockSkill);
+      expect(result).toEqual({ ...mockSkill, triggerMode: 'install_only' });
       expect(mockGet).toHaveBeenCalledWith({
         TableName: expect.stringContaining('AW-Skills'),
         Key: { skillId: 'skill-1' },

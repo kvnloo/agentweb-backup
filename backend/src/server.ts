@@ -232,6 +232,15 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 // Create test account before starting the server
 createTestAccount().then(async () => {
 
+  // Load Stripe credentials from Secrets Manager if env vars are not set
+  try {
+    const { getStripeCredentials } = await import('./utils/secretsManager');
+    await getStripeCredentials();
+    console.log('Stripe credentials loaded');
+  } catch (error) {
+    console.warn('Stripe credentials not available — billing features will be disabled:', (error as Error).message);
+  }
+
   server.listen(port, async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);

@@ -36,15 +36,15 @@ describe('httpClient', () => {
   // ─── FAIL tests ───────────────────────────────────────────────────────
 
   describe('generateSelfCallToken - error cases', () => {
-    it('should generate a JWT that expires in 60 seconds', () => {
+    it('should generate a JWT that expires in 600 seconds', () => {
       const token = generateSelfCallToken(testUser);
       const decoded = jwt.verify(token, 'test-secret') as any;
 
       expect(decoded.userId).toBe('user-123');
       expect(decoded.email).toBe('test@example.com');
       expect(decoded.isAdmin).toBe(false);
-      // Token should expire within ~60s
-      expect(decoded.exp - decoded.iat).toBeLessThanOrEqual(60);
+      // Token should expire within ~600s (must outlast slow operations like v0 generation)
+      expect(decoded.exp - decoded.iat).toBeLessThanOrEqual(600);
     });
 
     it('should include isAdmin flag in token', () => {

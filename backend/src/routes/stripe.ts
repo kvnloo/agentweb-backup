@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import waitlistDb and WaitlistEntry
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth"; // Added AuthenticatedRequest and authenticateToken
 import { userDb, User } from "../services/db"; // Added userDb and User
+import * as stripeController from "../controllers/stripeController";
 
 dotenv.config();
 
@@ -345,6 +346,92 @@ router.get("/session/:sessionId", async (req: Request, res: Response) => {
 });
 
 /**
+ * @route POST /api/stripe/create-checkout-session
+ * @desc Create a Stripe Checkout session (embedded mode) for a newly registered user
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/create-checkout-session",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    const userEmail = authenticatedReq.user?.email;
+
+    if (!userId || !userEmail) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    const { plan } = req.body;
+    if (!plan) {
+      return res.status(400).json({ error: "Plan is required." });
+    }
+
+    // Map plan names to Stripe price IDs
+    const planPriceMap: Record<string, string> = {
+      starter: process.env.STRIPE_STARTER_PRICE_ID || "",
+      complete: process.env.STRIPE_COMPLETE_PRICE_ID || "",
+      pro: process.env.STRIPE_COMPLETE_PRICE_ID || "",
+    };
+
+    const priceId = planPriceMap[plan.toLowerCase()];
+    if (!priceId) {
+      return res.status(400).json({ error: `Unknown plan: ${plan}` });
+    }
+
+    try {
+      // Find or create Stripe customer
+      const user = await userDb.getUserById(userId);
+      let customerId = user?.stripe_customer_id;
+
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          email: userEmail,
+          metadata: { userId },
+        });
+        customerId = customer.id;
+        await userDb.updateUser(userId, { stripe_customer_id: customerId });
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        ui_mode: "embedded",
+        customer: customerId,
+        line_items: [{ price: priceId, quantity: 1 }],
+        mode: "subscription",
+        subscription_data: {
+          trial_period_days: 14,
+        },
+        return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      });
+
+      res.json({ clientSecret: session.client_secret });
+    } catch (error: any) {
+      console.error("Error creating checkout session:", error.message);
+      res.status(500).json({ error: "Failed to create checkout session." });
+    }
+  }
+);
+
+/**
+ * @route GET /api/stripe/config
+ * @desc Return Stripe publishable key to frontend
+ * @access Public
+ */
+router.get("/config", (_req: Request, res: Response) => {
+  const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY;
+  if (!publishableKey) {
+    return res.status(500).json({ error: "Stripe publishable key not configured." });
+  }
+  res.json({ publishableKey });
+});
+
+/**
  * @route POST /api/stripe/create-customer-portal-session
  * @desc Create a Stripe Customer Portal session for the authenticated user
  * @access Private (requires authentication)
@@ -390,10 +477,181 @@ router.post(
       );
       res.status(500).json({
         error: "Failed to create Stripe Customer Portal session.",
-        details: error.message,
       });
     }
   }
 );
+
+/**
+ * @route POST /api/stripe/cancel-subscription
+ * @desc Cancel the authenticated user's subscription at the end of the current billing period
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/cancel-subscription",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    try {
+      const user = await userDb.getUserById(userId);
+      if (!user || !user.stripe_customer_id) {
+        return res
+          .status(400)
+          .json({ error: "No subscription found for this account." });
+      }
+
+      // Find the user's active subscription
+      const subscriptions = await stripe.subscriptions.list({
+        customer: user.stripe_customer_id,
+        status: "active",
+        limit: 1,
+      });
+
+      if (subscriptions.data.length === 0) {
+        // Also check for trialing subscriptions
+        const trialingSubscriptions = await stripe.subscriptions.list({
+          customer: user.stripe_customer_id,
+          status: "trialing",
+          limit: 1,
+        });
+
+        if (trialingSubscriptions.data.length === 0) {
+          return res
+            .status(404)
+            .json({ error: "No active subscription found." });
+        }
+
+        subscriptions.data = trialingSubscriptions.data;
+      }
+
+      const subscription = subscriptions.data[0];
+
+      // Cancel at period end (graceful cancellation)
+      const updated: Stripe.Subscription = await stripe.subscriptions.update(subscription.id, {
+        cancel_at_period_end: true,
+      });
+
+      // Update user record
+      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
+      await userDb.updateUser(userId, {
+        subscription_status: "canceling",
+        current_period_end: periodEnd,
+      });
+
+      res.json({
+        message: "Subscription will be canceled at the end of the billing period.",
+        cancel_at_period_end: updated.cancel_at_period_end,
+        current_period_end: periodEnd,
+      });
+    } catch (error: any) {
+      console.error("Error canceling subscription:", error.message);
+      res.status(500).json({ error: "Failed to cancel subscription." });
+    }
+  }
+);
+
+/**
+ * @route POST /api/stripe/reactivate-subscription
+ * @desc Reactivate a subscription that was canceled but hasn't expired yet
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/reactivate-subscription",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    try {
+      const user = await userDb.getUserById(userId);
+      if (!user || !user.stripe_customer_id) {
+        return res
+          .status(400)
+          .json({ error: "No subscription found for this account." });
+      }
+
+      // Find the user's subscription (could be active with cancel_at_period_end=true)
+      const subscriptions = await stripe.subscriptions.list({
+        customer: user.stripe_customer_id,
+        status: "active",
+        limit: 1,
+      });
+
+      if (subscriptions.data.length === 0) {
+        return res
+          .status(404)
+          .json({ error: "No active subscription found to reactivate." });
+      }
+
+      const subscription = subscriptions.data[0];
+
+      if (!subscription.cancel_at_period_end) {
+        return res
+          .status(400)
+          .json({ error: "Subscription is not canceled. No reactivation needed." });
+      }
+
+      // Reactivate by removing the cancel_at_period_end flag
+      const updated: Stripe.Subscription = await stripe.subscriptions.update(subscription.id, {
+        cancel_at_period_end: false,
+      });
+
+      // Update user record
+      const periodEnd = new Date((updated as any).current_period_end * 1000).toISOString();
+      await userDb.updateUser(userId, {
+        subscription_status: "active",
+        current_period_end: periodEnd,
+      });
+
+      res.json({
+        message: "Subscription reactivated successfully.",
+        cancel_at_period_end: updated.cancel_at_period_end,
+        current_period_end: periodEnd,
+      });
+    } catch (error: any) {
+      console.error("Error reactivating subscription:", error.message);
+      res.status(500).json({ error: "Failed to reactivate subscription." });
+    }
+  }
+);
+
+/**
+ * @route POST /api/stripe/webhook
+ * @desc Handle Stripe webhook events (signature-verified, raw body)
+ * @access Public (Stripe sends directly — no auth)
+ */
+router.post(
+  "/webhook",
+  stripeController.handleWebhook
+);
+
+/**
+ * @route GET /api/stripe/products
+ * @desc List active Stripe products with prices
+ * @access Public
+ */
+router.get("/products", stripeController.listProducts);
 
 export default router;

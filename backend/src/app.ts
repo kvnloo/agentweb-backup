@@ -45,10 +45,13 @@ import supportRoutes from "./routes/support";
 import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
 import memoryRoutes from "./routes/memory";
+import leadMagnetAdminRoutes from "./routes/leadMagnetAdmin";
 import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
 import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
+import clientHealthRoutes from "./routes/clientHealth";
+import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -133,13 +136,14 @@ const corsOptions = {
 
 // CORS middleware with exception for public subscriber join endpoint
 app.use((req, res, next) => {
-  // Check if this is the public subscriber join endpoint
-  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/)) {
-    // Allow all origins for this endpoint only
+  // Check if this is a public endpoint that needs open CORS
+  if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
+      req.path.startsWith('/api/lead-magnet/')) {
+    // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
+
     // Handle preflight requests
     if (req.method === 'OPTIONS') {
       return res.status(200).end();
@@ -150,6 +154,9 @@ app.use((req, res, next) => {
   // Apply CORS middleware for all other routes
   cors(corsOptions)(req, res, next);
 });
+// Stripe webhook needs the raw body (Buffer) for signature verification.
+// This MUST come before express.json() which parses the body.
+app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -174,6 +181,7 @@ app.use("/api/docs", docsRoutes);
 app.use("/api/files", fileRoutes);
 app.use("/api/stripe", stripeRoutes);
 app.use("/api/brand", brandRoutes);
+app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/landing-pages", landingPagesRoutes);
 app.use("/api/landing-pages/v0", landingPageGenerationRoutes);
 app.use("/api/market-strategy", marketStrategyRoutes);
@@ -203,6 +211,8 @@ app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
+app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
+app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
@@ -211,7 +221,7 @@ app.use("/api/memory", memoryRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.use("/review", reviewRouter);
-
+app.use("/api/lead-magnet", leadMagnetRoutes);
 
 
 // Agent API documentation (public, no auth)

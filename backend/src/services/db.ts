@@ -150,7 +150,10 @@ export interface User {
   }>;
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
-  subscriptionType?: string; // Subscription type for customer-portal users (defaults to "Basic")
+  subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Basic")
+  stripe_subscription_id?: string; // Stripe subscription ID
+  subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
+  current_period_end?: string; // ISO date of current billing period end
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook' 
     | 'meta' | 'twitter' | 'instagram';
@@ -369,6 +372,28 @@ class UserDB {
     }
   }
 
+  async getUserByStripeCustomerId(stripeCustomerId: string): Promise<User | null> {
+    try {
+      const params = {
+        TableName: this.tableName,
+        FilterExpression: "stripe_customer_id = :scid",
+        ExpressionAttributeValues: {
+          ":scid": stripeCustomerId,
+        },
+      };
+
+      // Note: This is a full table scan — consider adding a GSI on stripe_customer_id at scale
+      const result = await this.docClient.scan(params).promise();
+      if (result.Items && result.Items.length > 1) {
+        console.warn(`getUserByStripeCustomerId: found ${result.Items.length} users with stripe_customer_id=${stripeCustomerId} — expected 1. Using first match.`);
+      }
+      return (result.Items?.[0] as User) || null;
+    } catch (error) {
+      console.error("Error in getUserByStripeCustomerId:", error);
+      throw error;
+    }
+  }
+
   async getUsersByEmailDomain(emailDomain: string): Promise<User[]> {
     try {
       const normalizedDomain = emailDomain.trim().toLowerCase();
@@ -431,6 +456,23 @@ class UserDB {
       console.error("Error in getAllUsers:", error);
       throw error;
     }
+  }
+
+  /**
+   * Scan with a server-side filter expression. Returns raw items (no counts).
+   */
+  async scanWithFilter(
+    filterExpression: string,
+    expressionAttributeValues: Record<string, any>,
+  ): Promise<any[]> {
+    const result = await this.docClient
+      .scan({
+        TableName: this.tableName,
+        FilterExpression: filterExpression,
+        ExpressionAttributeValues: expressionAttributeValues,
+      })
+      .promise();
+    return result.Items || [];
   }
 
   async getUserAnalytics(startDate: string, endDate: string) {

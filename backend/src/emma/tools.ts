@@ -4097,6 +4097,69 @@ emmaToolRegistry.register({
   }
 });
 
+// --- Client Health Assessment (admin-only) ---
+
+emmaToolRegistry.register({
+  name: 'assess_client_health',
+  definition: {
+    name: 'assess_client_health',
+    description: `Assess the health of a specific client account across three layers: ads, landing pages, and lead quality. Admin-only tool.
+
+Returns a structured health assessment with:
+- **Ads layer**: Meta ad account connectivity, active campaigns
+- **Lander layer**: Landing page / website presence (productDomain, seoDomains)
+- **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
+- **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
+- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
+
+Use this to quickly diagnose a client's marketing funnel completeness.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    return await agentModeService.assessClientHealth(userId, args.client_name_or_email);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'list_all_clients',
+  definition: {
+    name: 'list_all_clients',
+    description: `List all non-admin client accounts with quick health indicators. Admin-only tool.
+
+Returns for each client:
+- Name, email, roles
+- has_ads: whether they have a Meta ad account connected
+- has_lander: whether they have landing pages (productDomain or seoDomains)
+- has_crm: whether they have CRM integrations (email domain, LinkedIn)
+- last_activity: last login timestamp
+
+Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    return await agentModeService.listAllClients(userId);
+  }
+});
+
 emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
@@ -4327,12 +4390,25 @@ import { mcpToolRegistry } from '../mcp/server/registry';
 // for mcpToolRegistry to be available).
 mcpToolRegistry.register(visualContextTool);
 
-const scheduledChatToolNames = [
+const bridgedToolNames = [
+  // Scheduled Chat tools
   'list_scheduled_chats',
   'manage_scheduled_chat',
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
+  // Landing Page tools (v0 generation + GitHub editing)
+  'generate_landing_page',
+  'deploy_landing_page',
+  'list_landing_pages',
+  'get_landing_page',
+  'delete_landing_page',
+  'enable_lead_list_public_access',
+  'duplicate_landing_page',
+  'edit_landing_page_file',
+  'list_landing_page_files',
+  'read_landing_page_file',
+  'get_deployment_status',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -4341,7 +4417,7 @@ const adminToolNames = [
   'manage_predefined_work_plan',
 ];
 
-for (const toolName of scheduledChatToolNames) {
+for (const toolName of bridgedToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {
     emmaToolRegistry.register({
@@ -4350,7 +4426,7 @@ for (const toolName of scheduledChatToolNames) {
       execute: handler.execute,
     });
   } else {
-    console.warn(`[emma/tools] Failed to bridge scheduled chat tool "${toolName}" — not found in mcpToolRegistry`);
+    console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }
 

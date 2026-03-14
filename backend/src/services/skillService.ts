@@ -17,6 +17,17 @@ const dynamodb = new AWS.DynamoDB.DocumentClient({
   },
 });
 
+export type SkillCategory = 'tool_bundle' | 'digest' | 'analysis' | 'report' | 'action';
+export type SkillTriggerMode = 'install_only' | 'on_demand' | 'scheduled' | 'both';
+export type SkillVisibility = 'system' | 'private' | 'public' | 'pending_review';
+
+export interface SkillSchedule {
+  frequency: 'daily' | 'weekly' | 'monthly' | 'custom';
+  preferredTime?: string;
+  deliveryChannels?: string[];
+  cronExpression?: string;
+}
+
 export interface SkillSyncInfo {
   inSync: boolean;
   existsInProd: boolean;
@@ -33,6 +44,16 @@ export interface Skill {
   isPublished: boolean;
   createdAt: string;
   updatedAt: string;
+  // Extended fields (Phase 1) — all optional for backward compatibility
+  category?: SkillCategory;
+  triggerMode?: SkillTriggerMode;
+  schedule?: SkillSchedule;
+  welcomeMessage?: string;
+  llmModel?: string;
+  maxIterations?: number;
+  isBuiltIn?: boolean;
+  ownerId?: string;
+  visibility?: SkillVisibility;
 }
 
 export class SkillService {
@@ -45,14 +66,19 @@ export class SkillService {
   private normalizeSkill(item: any): Skill {
     if (!item) return item;
     const skill = { ...item };
-    
+
     // Convert DynamoDB Set to Array if necessary
     if (skill.toolNames && typeof skill.toolNames === 'object' && !Array.isArray(skill.toolNames) && 'values' in skill.toolNames) {
       skill.toolNames = skill.toolNames.values;
     } else if (!skill.toolNames) {
       skill.toolNames = [];
     }
-    
+
+    // Default triggerMode for legacy skills without the field
+    if (!skill.triggerMode) {
+      skill.triggerMode = 'install_only';
+    }
+
     return skill as Skill;
   }
 

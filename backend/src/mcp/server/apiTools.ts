@@ -301,7 +301,7 @@ mcpToolRegistry.register({
         schedule_name: { type: 'string', description: 'Schedule name (create/update)' },
         starting_message: { type: 'string', description: 'The prompt/message to run on each execution (create/update)' },
         schedule_frequency: { type: 'string', description: 'Frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
-        frequency_interval_days: { type: 'number', description: 'Number of days between runs (required when schedule_frequency is "every_n_days", must be >= 1)' },
+        frequency_interval_days: { type: 'number', description: 'Number of days between runs when schedule_frequency is every_n_days (create/update)' },
         next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first/next run (create/update)' },
         description: { type: 'string', description: 'Description (create/update)' },
         keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to look for in results (create/update)' },
@@ -329,6 +329,7 @@ mcpToolRegistry.register({
           scheduleFrequency: args.schedule_frequency,
         };
         if (args.description !== undefined) body.description = args.description;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
@@ -340,7 +341,6 @@ mcpToolRegistry.register({
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         if (args.session_id !== undefined) body.sessionId = args.session_id;
-        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/scheduled-chats', context: c, body });
         return jsonResult(data);
       }
@@ -351,6 +351,7 @@ mcpToolRegistry.register({
           scheduleFrequency: args.schedule_frequency,
         };
         if (args.description !== undefined) body.description = args.description;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
         if (args.keywords !== undefined) body.keywords = args.keywords;
         if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
@@ -361,7 +362,6 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
-        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
         return jsonResult(data);
       }
@@ -464,9 +464,9 @@ mcpToolRegistry.register({
 });
 
 mcpToolRegistry.register({
-  name: 'manage_lead_list',
+  name: 'create_lead_list',
   definition: {
-    name: 'manage_lead_list',
+    name: 'create_lead_list',
     description: 'Create, update, or delete a lead list. Use action: "create", "get", "update", or "delete".',
     inputSchema: {
       type: 'object',
@@ -999,6 +999,266 @@ mcpToolRegistry.register({
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
       body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
+    });
+    return jsonResult(data);
+  }
+});
+
+// ─── Landing Pages (v0) ─────────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'generate_landing_page',
+  definition: {
+    name: 'generate_landing_page',
+    description: 'Generate AND deploy a production landing page in one step. This tool sends brand guidelines + prompt to v0, which generates a polished React/Next.js site, pushes it to a private GitHub repo, and deploys to Vercel automatically. Returns the live URL when done. PREREQUISITE: Before calling this tool, you MUST have: 1. Called read_brand_guidelines to get brand data, 2. Called create_lead_list to create a lead list named "LP Leads - {page name}" for the contact form, 3. Called enable_lead_list_public_access to enable public form capture. Pass the lead list ID as lead_list_id. Include all brand details in the prompt for best results. Do NOT call deploy_landing_page after this — deployment is automatic.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Detailed description of the landing page including brand colors, fonts, tone, sections, copy guidance, and any specific requirements. The more detail, the better v0 output.' },
+        name: { type: 'string', description: 'Optional display name for the page' },
+        lead_list_id: { type: 'string', description: 'ID of the CRM lead list for the contact form (from create_lead_list)' }
+      },
+      required: ['prompt']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: '/api/landing-pages/v0/generate', context: ctx(context),
+      body: { prompt: args.prompt, name: args.name, lead_list_id: args.lead_list_id },
+      timeoutMs: 15 * 60 * 1000, // 15 minutes — v0 generation + GitHub + Vercel deploy
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'deploy_landing_page',
+  definition: {
+    name: 'deploy_landing_page',
+    description: 'Retry deploying a landing page that failed during deployment. Only use this if generate_landing_page returned a failed status. Do NOT call this after a successful generate — deployment is already included in generate_landing_page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/deploy`, context: ctx(context),
+      body: {},
+      timeoutMs: 15 * 60 * 1000, // 15 minutes — GitHub + Vercel deploy
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'iterate_landing_page',
+  definition: {
+    name: 'iterate_landing_page',
+    description: 'Refine a generated landing page with follow-up instructions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' },
+        message: { type: 'string', description: 'Instructions for how to refine the page' }
+      },
+      required: ['page_id', 'message']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/iterate`, context: ctx(context),
+      body: { message: args.message }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_landing_pages',
+  definition: {
+    name: 'list_landing_pages',
+    description: 'List all generated landing pages for the authenticated user.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/landing-pages/v0/generated', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page',
+  definition: {
+    name: 'get_landing_page',
+    description: 'Get details of a specific generated landing page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'delete_landing_page',
+  definition: {
+    name: 'delete_landing_page',
+    description: 'Delete a generated landing page record.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The generated landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'DELETE', path: `/api/landing-pages/v0/generated/${args.page_id}`, context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+// ─── Landing Page Lead List + Editing Tools ─────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'enable_lead_list_public_access',
+  definition: {
+    name: 'enable_lead_list_public_access',
+    description: 'Enable public access on a CRM lead list so landing page forms can submit leads without authentication. Call this after creating a lead list for a landing page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: { type: 'string', description: 'The lead list ID to enable public access on' }
+      },
+      required: ['list_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'PUT', path: `/api/crm/lists/${args.list_id}`, context: ctx(context),
+      body: { publicAccessEnabled: true }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'duplicate_landing_page',
+  definition: {
+    name: 'duplicate_landing_page',
+    description: 'Create a copy of an existing landing page for independent editing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID to duplicate' },
+        name: { type: 'string', description: 'Name for the duplicated page (optional)' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST', path: `/api/landing-pages/v0/generated/${args.page_id}/duplicate`, context: ctx(context),
+      body: { name: args.name }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'edit_landing_page_file',
+  definition: {
+    name: 'edit_landing_page_file',
+    description: 'Edit a specific file in a deployed landing page\'s GitHub repository. Use this when the user wants to change copy, styling, or functionality after deployment. Changes auto-deploy via Vercel within ~30 seconds.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
+        content: { type: 'string', description: 'The new file content' },
+        commit_message: { type: 'string', description: 'Git commit message (optional)' }
+      },
+      required: ['page_id', 'file_path', 'content']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'PUT', path: `/api/landing-pages/v0/generated/${args.page_id}/github-edit`, context: ctx(context),
+      body: { file_path: args.file_path, content: args.content, commit_message: args.commit_message }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'list_landing_page_files',
+  definition: {
+    name: 'list_landing_page_files',
+    description: 'List all files in a deployed landing page\'s GitHub repository. Use this BEFORE edit_landing_page_file to see what files exist and find the right file to edit.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/files`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'read_landing_page_file',
+  definition: {
+    name: 'read_landing_page_file',
+    description: 'Read the contents of a specific file in a deployed landing page\'s GitHub repository. Use this to see the current code before making edits with edit_landing_page_file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' }
+      },
+      required: ['page_id', 'file_path']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/file-content?path=${encodeURIComponent(args.file_path)}`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_deployment_status',
+  definition: {
+    name: 'get_deployment_status',
+    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. If the build failed, returns the error details so you can fix the code via edit_landing_page_file and the build will automatically retry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' }
+      },
+      required: ['page_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/deployment-status`, context: ctx(context)
     });
     return jsonResult(data);
   }
