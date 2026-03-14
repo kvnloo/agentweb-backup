@@ -3490,6 +3490,43 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'write_clickup_doc',
+  definition: {
+    name: 'write_clickup_doc',
+    description: 'Create a new document in the user\'s ClickUp workspace. Use this when the user wants to save content (research, reports, documentation) directly to ClickUp. The workspace_id can be obtained from list_knowledge_base_files (ClickUp entries have identifiers like "clickup:WORKSPACE_ID").',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspace_id: {
+          type: 'string',
+          description: 'ClickUp workspace ID (get from list_knowledge_base_files, e.g., the part after "clickup:" in the identifier)'
+        },
+        name: {
+          type: 'string',
+          description: 'Document title'
+        },
+        content: {
+          type: 'string',
+          description: 'Document content (markdown)'
+        }
+      },
+      required: ['workspace_id', 'name', 'content']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.writeClickUpDoc(
+      args.workspace_id,
+      args.name,
+      args.content,
+      context.userId
+    );
+  }
+});
+
+emmaToolRegistry.register({
   name: "read_file_content",
   definition: {
     name: "read_file_content",
