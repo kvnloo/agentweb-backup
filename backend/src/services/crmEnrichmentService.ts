@@ -1,7 +1,29 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
-import { io } from '../server';
 import { v4 as uuidv4 } from 'uuid';
+
+// Callback type for emitting Socket.IO events.
+// In the main process this uses the real `io` instance directly;
+// in the worker process the callback forwards events over IPC to the parent.
+export type SocketEmitFn = (room: string, event: string, payload: any) => void;
+
+// Lazy-load Socket.IO to avoid importing server.ts in worker processes
+// (server.ts binds to a port at module level, causing EADDRINUSE in workers)
+function getIO(): import('socket.io').Server | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { io } = require('../server');
+    return io;
+  } catch {
+    return null;
+  }
+}
+
+function defaultSocketEmit(): SocketEmitFn | null {
+  const ioInstance = getIO();
+  if (!ioInstance) return null;
+  return (room, event, payload) => ioInstance.to(room).emit(event, payload);
+}
 
 export interface EnrichmentJobSpec {
   listId: string;
@@ -91,14 +113,13 @@ export class CrmEnrichmentService {
     return unipileAccount?.account_id || null;
   }
 
+  private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
+
   private async enrichLead(
     lead: any,
     spec: EnrichmentJobSpec,
-    llmService: any,
     linkedInAccountId?: string | null,
   ): Promise<{ fields: Record<string, string> }> {
-    const escapeBraces = (str: string) => str.replace(/{/g, '{{').replace(/}/g, '}}');
-
     let webContext = '';
     let linkedinContext = '';
 
@@ -197,15 +218,23 @@ ${webContext ? `\nWeb search results:${webContext}` : ''}${linkedinContext ? `\n
 
 Extract the requested fields now.`;
 
+    // Call Gemini via the shared OpenAI-compatible client
+    const geminiClient = await agentModeService.getGeminiClient();
     let response: Record<string, string> | null = null;
     try {
-      response = await llmService.generateJSONContent(
-        escapeBraces(systemPrompt),
-        escapeBraces(userPrompt),
-        'json'
-      );
+      const completion = await geminiClient.chat.completions.create({
+        model: CrmEnrichmentService.ENRICH_MODEL,
+        temperature: 1,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+      });
+      const raw = completion.choices?.[0]?.message?.content || '';
+      response = JSON.parse(raw);
     } catch {
-      // Retry with stricter instructions
+      // Retry with stricter instructions, no JSON mode
       const strictRetryPrompt = `${userPrompt}
 
 CRITICAL RETRY INSTRUCTIONS:
@@ -214,11 +243,15 @@ No markdown, no backticks, no comments, no trailing commas.
 Valid example:
 {${spec.outputFields.map(f => `"${f}":"value"`).join(',')}}`;
 
-      const rawRetry = await llmService.generateContent(
-        escapeBraces(systemPrompt),
-        escapeBraces(strictRetryPrompt),
-        'text'
-      );
+      const retry = await geminiClient.chat.completions.create({
+        model: CrmEnrichmentService.ENRICH_MODEL,
+        temperature: 1,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: strictRetryPrompt },
+        ],
+      });
+      const rawRetry = retry.choices?.[0]?.message?.content || '';
 
       const cleaned = rawRetry
         .trim()
@@ -257,9 +290,6 @@ Valid example:
     const sampleLeads = leadsToProcess.slice(0, 2);
 
     if (sampleLeads.length > 0) {
-      const { createLLMService } = await import('../utils/llmService');
-      const llmService = createLLMService('gpt-5.2-chat', 1);
-
       // Resolve LinkedIn account if needed
       let linkedInAccountId: string | null = null;
       if (spec.sources.includes('linkedin')) {
@@ -268,7 +298,7 @@ Valid example:
 
       for (const lead of sampleLeads) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, llmService, linkedInAccountId);
+          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
           samples.push({ leadId: lead.leadId, lead, enrichedFields: fields });
         } catch (err) {
           samples.push({ leadId: lead.leadId, lead, enrichedFields: { _error: String(err) } });
@@ -284,7 +314,7 @@ Valid example:
     };
   }
 
-  async execute(spec: EnrichmentJobSpec, socketId?: string, options?: { progressEvent?: string; completeEvent?: string }): Promise<EnrichmentExecuteResult> {
+  async execute(spec: EnrichmentJobSpec, socketId?: string, options?: { progressEvent?: string; completeEvent?: string; socketEmit?: SocketEmitFn }): Promise<EnrichmentExecuteResult> {
     const progressEvent = options?.progressEvent || 'crm-enrichment-progress';
     const completeEvent = options?.completeEvent || 'crm-enrichment-complete';
     const jobId = uuidv4();
@@ -317,7 +347,9 @@ Valid example:
     }
 
     const userRoom = `user:${spec.userId}`;
+    const emit = options?.socketEmit || defaultSocketEmit();
     const emitProgress = (message: string, progress: number, processedCount: number, failedCount: number) => {
+      if (!emit) return;
       const payload = {
         jobId,
         message,
@@ -327,13 +359,11 @@ Valid example:
         totalToProcess: leadsToProcess.length,
       };
       if (socketId) {
-        io.to(socketId).emit(progressEvent, payload);
+        emit(socketId, progressEvent, payload);
       }
       // Always emit to user room so CRM page receives updates
-      io.to(userRoom).emit(progressEvent, payload);
+      emit(userRoom, progressEvent, payload);
     };
-
-    const { createLLMService } = await import('../utils/llmService');
 
     const parallelism = hasLinkedin && linkedInAccountId ? 5 : 20;
     const chunkSize = Math.max(1, Math.ceil(leadsToProcess.length / parallelism));
@@ -354,11 +384,9 @@ Valid example:
     emitProgress('Starting enrichment...', 0, 0, 0);
 
     const chunkProcessors = chunks.map(async (chunk) => {
-      const llmService = createLLMService('gpt-5.2-chat', 1);
-
       for (const lead of chunk) {
         try {
-          const { fields } = await this.enrichLead(lead, spec, llmService, linkedInAccountId);
+          const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
 
           await crmDb.updateLead(spec.listId, lead.leadId, {
             customFields: {
@@ -413,10 +441,12 @@ Valid example:
       outputFields: spec.outputFields,
       failureBreakdown,
     };
-    if (socketId) {
-      io.to(socketId).emit(completeEvent, completionPayload);
+    if (emit) {
+      if (socketId) {
+        emit(socketId, completeEvent, completionPayload);
+      }
+      emit(userRoom, completeEvent, completionPayload);
     }
-    io.to(userRoom).emit(completeEvent, completionPayload);
 
     return {
       jobId,

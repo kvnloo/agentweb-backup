@@ -17,6 +17,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-14',
     changes: [
+      'Fix: Agent Mode — Resolved CRM Session Crash and Enrichment Reliability',
+      '- Fixed a timeout issue where long-running AI model calls could hang indefinitely, causing agent sessions to crash',
+      '- Fixed enrichment progress updates not reaching the CRM page when running in background',
+      '- Switched CRM web enrichment to use Gemini Flash Lite for faster and more reliable lead enrichment',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
       'Improvement: Admin — Chat History Cleanup',
       '- Empty sessions (no user messages) are now hidden from the Chat History tab',
       '- Emma chatbot sessions now show Longest Wait and Max Heap metrics, matching Agent Mode sessions',

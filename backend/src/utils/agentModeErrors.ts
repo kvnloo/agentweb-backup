@@ -41,6 +41,8 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /econnreset/i,
   /etimedout/i,
   /socket hang up/i,
+  /aborted.*timeout/i,
+  /TimeoutError/i,
   /500/,
   /502/,
   /503/,

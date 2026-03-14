@@ -441,12 +441,17 @@ export class AgentModeService {
     const { HumanMessage, AIMessage, SystemMessage, ToolMessage } = await import('@langchain/core/messages');
 
     const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
+    const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
     const bedrockClient = new BedrockRuntimeClient({
       region,
       credentials: process.env.AWS_ACCESS_KEY_ID ? {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
       } : undefined,
+      requestHandler: {
+        connectionTimeout: 10_000, // 10s to establish connection
+        requestTimeout: BEDROCK_REQUEST_TIMEOUT_MS,
+      } as any,
     });
 
     // Map certain model IDs to their corresponding inference profile ARNs
@@ -516,8 +521,11 @@ export class AgentModeService {
               }
             }
 
-            // Invoke the model
-            const response: any = await modelToInvoke.invoke(messages);
+            // Invoke the model with a timeout to prevent indefinite hangs
+            // (Bedrock can stall on throttling or infra issues with no socket-level timeout)
+            const response: any = await modelToInvoke.invoke(messages, {
+              signal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+            });
 
             // Extract tool calls if present
             let toolCalls = null;
@@ -705,7 +713,8 @@ export class AgentModeService {
     llmModel: string,
     sessionId: string,
     mockMode: boolean = false,
-    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void
+    onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
+    socketEmit?: (room: string, event: string, payload: any) => void
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
       // Track memory usage for optimization
@@ -1012,7 +1021,7 @@ export class AgentModeService {
         const toolPromises = preparedCalls.map(async ({ toolCall, functionArgs }) => {
           const toolStart = Date.now();
           try {
-            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode);
+            const result = await this.executeTool(llmModel, toolCall.function.name, functionArgs, userId, sessionId, mockMode, socketEmit ? { socketEmit } : undefined);
             const toolDuration = Date.now() - toolStart;
             return { status: 'success' as const, toolCall, functionArgs, result, duration: toolDuration };
           } catch (error) {

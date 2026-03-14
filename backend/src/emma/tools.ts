@@ -4404,7 +4404,7 @@ Call enrich_leads_preview first to show the user what will happen before executi
       sources: args.sources,
       filters: args.filters,
       forceOverwrite: args.force_overwrite,
-    }, context.socketId);
+    }, context.socketId, context.socketEmit ? { socketEmit: context.socketEmit } : undefined);
   }
 });
 

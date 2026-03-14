@@ -110,7 +110,8 @@ describe('Emma CRM Enrichment Tools', () => {
         listId: 'list-abc',
         userId: 'user1',
       }),
-      'sock-123'
+      'sock-123',
+      undefined
     );
   });
 
