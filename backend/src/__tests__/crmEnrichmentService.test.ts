@@ -19,15 +19,19 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockGeminiCreate = jest.fn();
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     searchWeb: jest.fn(),
     linkedinOutreach: jest.fn(),
+    getGeminiClient: jest.fn().mockResolvedValue({
+      chat: {
+        completions: {
+          create: mockGeminiCreate,
+        },
+      },
+    }),
   },
-}));
-
-jest.mock('../utils/llmService', () => ({
-  createLLMService: jest.fn(),
 }));
 
 jest.mock('../services/connectedAccountsDb', () => ({
@@ -36,22 +40,19 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
-import { createLLMService } from '../utils/llmService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
-const mockCreateLLMService = createLLMService as jest.MockedFunction<typeof createLLMService>;
 const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
 const mockIo = io as any;
 
-// Helper to create a mock LLM service
-function createMockLLMService() {
+// Helper: mock a successful Gemini completion response
+function geminiResponse(content: Record<string, string>) {
   return {
-    generateJSONContent: jest.fn(),
-    generateContent: jest.fn(),
+    choices: [{ message: { content: JSON.stringify(content) } }],
   };
 }
 
@@ -123,14 +124,12 @@ describe('CrmEnrichmentService', () => {
         lastEvaluatedKey: null, hasMore: false,
       });
 
-      const mockLLM = createMockLLMService();
-      // First lead: LLM fails
-      mockLLM.generateJSONContent
+      // First lead: JSON mode fails, retry also returns garbage
+      mockGeminiCreate
         .mockRejectedValueOnce(new Error('Invalid JSON'))
-        .mockResolvedValueOnce({ company_size: '500+' });
-      // Retry also fails for first lead
-      mockLLM.generateContent.mockResolvedValueOnce('not json at all');
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+        .mockResolvedValueOnce({ choices: [{ message: { content: 'not json at all' } }] })
+        // Second lead succeeds
+        .mockResolvedValueOnce(geminiResponse({ company_size: '500+' }));
 
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'A company' }] });
@@ -162,9 +161,7 @@ describe('CrmEnrichmentService', () => {
         .mockResolvedValueOnce({ success: false, error: 'Rate limited' })
         .mockResolvedValueOnce({ success: true, results: [{ title: 'Acme', snippet: 'A company' }] });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ company_size: '500+' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -191,10 +188,7 @@ describe('CrmEnrichmentService', () => {
 
       mockGetAccountsByUserId.mockResolvedValue([]);
 
-      // With existing_data, we still process via LLM
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ industry: 'Tech' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -229,9 +223,7 @@ describe('CrmEnrichmentService', () => {
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'A company' }] });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ company_size: '500+', industry: 'Technology' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+', industry: 'Technology' }));
 
       const spec: EnrichmentJobSpec = {
         listId: 'list1',
@@ -258,9 +250,7 @@ describe('CrmEnrichmentService', () => {
       ];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ industry: 'Technology' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Technology' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -281,7 +271,7 @@ describe('CrmEnrichmentService', () => {
       }));
     });
 
-    it('should call searchWeb + LLM per lead with web_search source', async () => {
+    it('should call searchWeb + Gemini per lead with web_search source', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       const leads = [createLead({ leadId: 'lead1' })];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
@@ -289,9 +279,7 @@ describe('CrmEnrichmentService', () => {
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Tech company' }] });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ company_size: '500+' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -307,7 +295,7 @@ describe('CrmEnrichmentService', () => {
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
       expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 5);
-      expect(mockLLM.generateJSONContent).toHaveBeenCalled();
+      expect(mockGeminiCreate).toHaveBeenCalled();
     });
 
     it('should call searchPeople/getProfile per lead with linkedin source', async () => {
@@ -320,9 +308,7 @@ describe('CrmEnrichmentService', () => {
       mockAgentModeService.linkedinOutreach
         .mockResolvedValue({ success: true, data: { headline: 'CTO at Acme', summary: 'Tech leader' } });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ seniority: 'C-level' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ seniority: 'C-level' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -343,7 +329,7 @@ describe('CrmEnrichmentService', () => {
       );
     });
 
-    it('should feed both web_search and linkedin data to LLM with combined sources', async () => {
+    it('should feed both web_search and linkedin data to Gemini with combined sources', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
       const leads = [createLead({ leadId: 'lead1' })];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
@@ -357,9 +343,7 @@ describe('CrmEnrichmentService', () => {
         .mockResolvedValueOnce({ success: true, data: { items: [{ provider_id: 'prov1' }] } })
         .mockResolvedValueOnce({ success: true, data: { headline: 'CTO', summary: 'Leader' } });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ company_size: '500+', seniority: 'C-level' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+', seniority: 'C-level' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -376,10 +360,11 @@ describe('CrmEnrichmentService', () => {
       expect(result.processedCount).toBe(1);
       expect(mockAgentModeService.searchWeb).toHaveBeenCalled();
       expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalled();
-      // Both data sources fed into the same LLM call
-      const llmCall = mockLLM.generateJSONContent.mock.calls[0];
-      expect(llmCall[1]).toContain('Web search');
-      expect(llmCall[1]).toContain('LinkedIn');
+      // Both data sources fed into the same Gemini call
+      const geminiCall = mockGeminiCreate.mock.calls[0][0];
+      const userMsg = geminiCall.messages.find((m: any) => m.role === 'user')?.content || '';
+      expect(userMsg).toContain('Web search');
+      expect(userMsg).toContain('LinkedIn');
     });
 
     it('should re-process already-enriched leads when forceOverwrite=true', async () => {
@@ -389,9 +374,7 @@ describe('CrmEnrichmentService', () => {
       ];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ company_size: '500+' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '500+' }));
 
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Big company' }] });
@@ -420,9 +403,7 @@ describe('CrmEnrichmentService', () => {
       ];
       mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ industry: 'Tech' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
 
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
@@ -451,9 +432,7 @@ describe('CrmEnrichmentService', () => {
         lastEvaluatedKey: null, hasMore: false,
       });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ company_size: '100' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ company_size: '100' }));
 
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
@@ -482,9 +461,7 @@ describe('CrmEnrichmentService', () => {
       mockAgentModeService.linkedinOutreach
         .mockResolvedValue({ success: true, data: { headline: 'CTO' } });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ seniority: 'C-level' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ seniority: 'C-level' }));
 
       mockCrmDb.updateLead.mockResolvedValue({} as any);
       mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
@@ -497,10 +474,11 @@ describe('CrmEnrichmentService', () => {
         sources: ['linkedin'],
       };
 
-      await service.execute(spec);
-      // With 20 leads and parallelism 5, we expect 5 chunks (4 leads each)
-      // Verify by checking that createLLMService was called 5 times (once per chunk)
-      expect(mockCreateLLMService).toHaveBeenCalledTimes(5);
+      const result = await service.execute(spec);
+      // All 20 leads should be processed
+      expect(result.processedCount).toBe(20);
+      // Gemini called once per lead
+      expect(mockGeminiCreate).toHaveBeenCalledTimes(20);
     });
   });
 
@@ -527,9 +505,7 @@ describe('CrmEnrichmentService', () => {
         lastEvaluatedKey: null, hasMore: false,
       });
 
-      const mockLLM = createMockLLMService();
-      mockLLM.generateJSONContent.mockResolvedValue({ industry: 'Tech' });
-      mockCreateLLMService.mockReturnValue(mockLLM as any);
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
 
       mockAgentModeService.searchWeb
         .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
