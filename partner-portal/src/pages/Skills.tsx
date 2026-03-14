@@ -732,9 +732,15 @@ export default function Skills() {
             <Autocomplete
               multiple
               disableCloseOnSelect
-              options={availableTools}
+              options={[
+                ...availableTools,
+                ...toolNames
+                  .filter(name => !availableTools.some(t => t.name === name))
+                  .map(name => ({ name, description: '(tool no longer available)' })),
+              ]}
               getOptionLabel={(option) => option.name}
-              value={availableTools.filter(t => toolNames.includes(t.name))}
+              isOptionEqualToValue={(option, value) => option.name === value.name}
+              value={toolNames.map(name => availableTools.find(t => t.name === name) || { name, description: '(tool no longer available)' })}
               inputValue={toolSearchText}
               onInputChange={(_, newInputValue, reason) => {
                 if (reason === 'input') {

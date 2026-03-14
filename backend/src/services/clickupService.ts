@@ -231,6 +231,40 @@ export async function listTasks(accessToken: string, teamId: string): Promise<Cl
 }
 
 /**
+ * Create a new doc in a workspace (at the workspace root).
+ */
+export async function createDoc(
+  accessToken: string,
+  workspaceId: string,
+  name: string,
+  content: string
+): Promise<{ id: string; name: string }> {
+  const response = await axios.post<{ id: string; name: string }>(
+    `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs`,
+    { name, content },
+    { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
+  );
+  return { id: response.data.id, name: response.data.name };
+}
+
+/**
+ * Update (edit) an existing page in a doc.
+ */
+export async function editPage(
+  accessToken: string,
+  workspaceId: string,
+  docId: string,
+  pageId: string,
+  content: string
+): Promise<void> {
+  await axios.put(
+    `${CLICKUP_API_V3}/workspaces/${workspaceId}/docs/${docId}/pages/${pageId}`,
+    { content },
+    { headers: { Authorization: accessToken, 'Content-Type': 'application/json' } }
+  );
+}
+
+/**
  * Read a single task and format it as markdown.
  */
 export async function readTaskContent(accessToken: string, taskId: string): Promise<string> {
