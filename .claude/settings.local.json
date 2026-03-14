@@ -167,7 +167,9 @@
       "Bash(kill 94456:*)",
       "Bash(kill 26539:*)",
       "Bash(kill 63608:*)",
-      "mcp__playwright__browser_handle_dialog"
+      "mcp__playwright__browser_handle_dialog",
+      "mcp__notion__API-patch-page",
+      "mcp__playwright__browser_resize"
     ]
   },
   "enableAllProjectMcpServers": true,
