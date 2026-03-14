@@ -2769,7 +2769,7 @@ emmaToolRegistry.register({
   name: 'comment_on_linkedin_post',
   definition: {
     name: 'comment_on_linkedin_post',
-    description: 'Create a comment on a LinkedIn post using a connected LinkedIn account. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
+    description: 'Create a comment on a LinkedIn post, or reply to an existing comment, using a connected LinkedIn account. To reply to a specific comment (nested reply), provide the parent_comment_urn. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2784,13 +2784,42 @@ emmaToolRegistry.register({
         comment_text: {
           type: 'string',
           description: 'The comment text content. Should be concise and relevant to the post.'
+        },
+        parent_comment_urn: {
+          type: 'string',
+          description: 'Optional. The URN of a parent comment to reply to (e.g., "urn:li:comment:(urn:li:ugcPost:123,456)"). When provided, the comment is posted as a nested reply under this comment instead of as a top-level comment.'
         }
       },
       required: ['account_id', 'post_urn', 'comment_text']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text);
+    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text, args.parent_comment_urn);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'list_linkedin_comments',
+  definition: {
+    name: 'list_linkedin_comments',
+    description: 'List comments on a LinkedIn post. Returns each comment\'s URN, author URN, text, and timestamp. Use this to find the comment_urn needed for replying to a specific comment via comment_on_linkedin_post with parent_comment_urn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The connected LinkedIn account ID to use for fetching comments'
+        },
+        post_urn: {
+          type: 'string',
+          description: 'The LinkedIn post URN to list comments for (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
+        }
+      },
+      required: ['account_id', 'post_urn']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listLinkedInComments(context?.userId, args.account_id, args.post_urn);
   }
 });
 

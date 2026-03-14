@@ -889,7 +889,8 @@ describe('LinkedInAdapter', () => {
         'test-access-token',
         'urn:li:share:123',
         'urn:li:person:abc123',
-        'Great post!'
+        'Great post!',
+        undefined
       );
       expect(result).toEqual({
         success: true,
@@ -908,7 +909,8 @@ describe('LinkedInAdapter', () => {
         'test-org-token',
         'urn:li:ugcPost:789',
         'urn:li:organization:123456',
-        'Insightful!'
+        'Insightful!',
+        undefined
       );
       expect(result.success).toBe(true);
       expect(result.postId).toBe('urn:li:comment:(urn:li:ugcPost:789,101)');
@@ -971,7 +973,8 @@ describe('LinkedInAdapter', () => {
         'new-token',
         'urn:li:share:123',
         'urn:li:person:abc123',
-        'Test'
+        'Test',
+        undefined
       );
       expect(result.success).toBe(true);
     });

@@ -68,7 +68,7 @@ export interface SocialPlatformAdapter {
    * @param commentText - The comment text
    * @param userId - Optional user ID for token refresh capability
    */
-  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string): Promise<PostResult>;
+  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult>;
 
   /**
    * React to a post (like, praise, etc.)

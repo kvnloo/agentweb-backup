@@ -9,6 +9,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-14',
     changes: [
+      'Feature: Agent Mode — LinkedIn Comment Replies & Listing',
+      '- Reply to specific LinkedIn comments as nested replies using the comment_on_linkedin_post tool with parent_comment_urn',
+      '- New list_linkedin_comments tool shows all comments on a post with URNs, authors, text, and timestamps',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
       'Feature: Agent Mode — Write Documents to ClickUp',
       '- Emma can now create new documents directly in your connected ClickUp workspace',
       '- Use the "write_clickup_doc" tool (via the Knowledge Base skill) to save research, reports, or documentation to ClickUp',

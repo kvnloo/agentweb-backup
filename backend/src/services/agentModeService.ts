@@ -16542,7 +16542,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string): Promise<any> {
+  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
       accountId,
@@ -16592,7 +16592,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(account, postUrn, commentText, userId);
+        const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
 
         return {
           success: true,
@@ -16619,6 +16619,51 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         success: false,
         message: 'Failed to create comment',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  async listLinkedInComments(userId: string, accountId: string, postUrn: string): Promise<any> {
+    console.log('[AgentMode] listLinkedInComments called:', { userId, accountId, postUrn });
+
+    try {
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      const account = await getAccountById(accountId, userId);
+      if (!account) {
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      if (account.platform !== 'linkedin') {
+        return { success: false, message: 'Listing comments is currently only supported for LinkedIn accounts' };
+      }
+
+      const adapter = socialPlatformService.getAdapter(account.platform) as any;
+      if (!adapter.getComments) {
+        return { success: false, message: 'Listing comments is not supported for this platform' };
+      }
+
+      const comments = await adapter.getComments(account, postUrn, userId);
+
+      return {
+        success: true,
+        message: `Found ${comments.length} comment(s) on this post`,
+        comments: comments.map((c: any) => ({
+          comment_urn: c.commentUrn,
+          actor_urn: c.actorUrn,
+          text: c.text,
+          created_at: c.createdAt ? new Date(c.createdAt).toISOString() : null
+        }))
+      };
+    } catch (error: any) {
+      let message = error.message;
+      if (message.includes('access token expired')) {
+        message = 'Account token expired. Please reconnect the account in Settings.';
+      }
+      return {
+        success: false,
+        message: `Failed to list comments: ${message}`
       };
     }
   }
