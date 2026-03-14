@@ -1,7 +1,29 @@
 import { crmDb } from './db';
 import { agentModeService } from './agentModeService';
-import { io } from '../server';
 import { v4 as uuidv4 } from 'uuid';
+
+// Callback type for emitting Socket.IO events.
+// In the main process this uses the real `io` instance directly;
+// in the worker process the callback forwards events over IPC to the parent.
+export type SocketEmitFn = (room: string, event: string, payload: any) => void;
+
+// Lazy-load Socket.IO to avoid importing server.ts in worker processes
+// (server.ts binds to a port at module level, causing EADDRINUSE in workers)
+function getIO(): import('socket.io').Server | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { io } = require('../server');
+    return io;
+  } catch {
+    return null;
+  }
+}
+
+function defaultSocketEmit(): SocketEmitFn | null {
+  const ioInstance = getIO();
+  if (!ioInstance) return null;
+  return (room, event, payload) => ioInstance.to(room).emit(event, payload);
+}
 
 export interface EnrichmentJobSpec {
   listId: string;
@@ -258,7 +280,7 @@ Valid example:
 
     if (sampleLeads.length > 0) {
       const { createLLMService } = await import('../utils/llmService');
-      const llmService = createLLMService('gpt-5.2-chat', 1);
+      const llmService = createLLMService('gemini-3.1-flash-lite-preview', 1);
 
       // Resolve LinkedIn account if needed
       let linkedInAccountId: string | null = null;
@@ -284,7 +306,7 @@ Valid example:
     };
   }
 
-  async execute(spec: EnrichmentJobSpec, socketId?: string, options?: { progressEvent?: string; completeEvent?: string }): Promise<EnrichmentExecuteResult> {
+  async execute(spec: EnrichmentJobSpec, socketId?: string, options?: { progressEvent?: string; completeEvent?: string; socketEmit?: SocketEmitFn }): Promise<EnrichmentExecuteResult> {
     const progressEvent = options?.progressEvent || 'crm-enrichment-progress';
     const completeEvent = options?.completeEvent || 'crm-enrichment-complete';
     const jobId = uuidv4();
@@ -317,7 +339,9 @@ Valid example:
     }
 
     const userRoom = `user:${spec.userId}`;
+    const emit = options?.socketEmit || defaultSocketEmit();
     const emitProgress = (message: string, progress: number, processedCount: number, failedCount: number) => {
+      if (!emit) return;
       const payload = {
         jobId,
         message,
@@ -327,10 +351,10 @@ Valid example:
         totalToProcess: leadsToProcess.length,
       };
       if (socketId) {
-        io.to(socketId).emit(progressEvent, payload);
+        emit(socketId, progressEvent, payload);
       }
       // Always emit to user room so CRM page receives updates
-      io.to(userRoom).emit(progressEvent, payload);
+      emit(userRoom, progressEvent, payload);
     };
 
     const { createLLMService } = await import('../utils/llmService');
@@ -354,7 +378,7 @@ Valid example:
     emitProgress('Starting enrichment...', 0, 0, 0);
 
     const chunkProcessors = chunks.map(async (chunk) => {
-      const llmService = createLLMService('gpt-5.2-chat', 1);
+      const llmService = createLLMService('gemini-3.1-flash-lite-preview', 1);
 
       for (const lead of chunk) {
         try {
@@ -413,10 +437,12 @@ Valid example:
       outputFields: spec.outputFields,
       failureBreakdown,
     };
-    if (socketId) {
-      io.to(socketId).emit(completeEvent, completionPayload);
+    if (emit) {
+      if (socketId) {
+        emit(socketId, completeEvent, completionPayload);
+      }
+      emit(userRoom, completeEvent, completionPayload);
     }
-    io.to(userRoom).emit(completeEvent, completionPayload);
 
     return {
       jobId,

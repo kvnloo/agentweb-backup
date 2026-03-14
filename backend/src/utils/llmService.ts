@@ -1,20 +1,36 @@
-import { AzureChatOpenAI } from '@langchain/openai';
+import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { ChatBedrockConverse } from '@langchain/aws';
 import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import { getSecret } from './secretsManager';
 
 export type OutputFormat = 'json' | 'xml';
 
 export class LLMService {
-  private chatModel: AzureChatOpenAI | ChatBedrockConverse;
+  private chatModel: AzureChatOpenAI | ChatBedrockConverse | ChatOpenAI;
+  private chatModelPromise: Promise<void> | null = null;
 
   constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
+    const isGemini = model.toLowerCase().includes('gemini');
     const isClaude = model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.');
     
-    if (isClaude) {
+    if (isGemini) {
+      // Gemini uses OpenAI-compatible API via Google's endpoint.
+      // API key may need async fetch from Secrets Manager, so we set a placeholder
+      // and lazily resolve the real key before the first call.
+      this.chatModel = new ChatOpenAI({
+        modelName: model,
+        openAIApiKey: 'placeholder',
+        configuration: { baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+        temperature,
+        ...(maxTokens && { maxTokens }),
+      });
+      // Schedule async key resolution
+      this.chatModelPromise = this.initGeminiKey(model, temperature, maxTokens);
+    } else if (isClaude) {
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
       const bedrockClient = new BedrockRuntimeClient({
         region,
@@ -23,7 +39,7 @@ export class LLMService {
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
         } : undefined,
       });
-      
+
       // Map model IDs to inference profile ARNs for cross-region access
       let modelId = model;
       if (model === 'anthropic.claude-sonnet-4-5-20250929-v1:0') {
@@ -33,7 +49,7 @@ export class LLMService {
       } else if (model === 'anthropic.claude-opus-4-6-v1') {
         modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1';
       }
-      
+
       this.chatModel = new ChatBedrockConverse({
         model: modelId,
         region,
@@ -59,6 +75,31 @@ export class LLMService {
     }
   }
 
+  private async initGeminiKey(model: string, temperature: number, maxTokens?: number): Promise<void> {
+    let apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      const env = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+      apiKey = await getSecret(`${env}/AgentWeb/GeminiAPIKey`);
+    }
+    if (!apiKey?.trim()) {
+      throw new Error('Gemini API key not found in env or Secrets Manager');
+    }
+    this.chatModel = new ChatOpenAI({
+      modelName: model,
+      openAIApiKey: apiKey.trim(),
+      configuration: { baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+      temperature,
+      ...(maxTokens && { maxTokens }),
+    });
+  }
+
+  private async ensureReady(): Promise<void> {
+    if (this.chatModelPromise) {
+      await this.chatModelPromise;
+      this.chatModelPromise = null;
+    }
+  }
+
   /**
    * Generate content with system and user prompts
    * @param systemPrompt System prompt for the LLM
@@ -71,6 +112,7 @@ export class LLMService {
     userPrompt: string,
     responseFormat?: 'json' | 'text'
   ): Promise<string> {
+    await this.ensureReady();
     try {
       const prompt = ChatPromptTemplate.fromMessages([
         ['system', systemPrompt],
@@ -127,6 +169,7 @@ export class LLMService {
     userPrompt: string,
     format: OutputFormat = 'json'
   ): Promise<T> {
+    await this.ensureReady();
     try {
       const prompt = ChatPromptTemplate.fromMessages([
         ['system', systemPrompt],

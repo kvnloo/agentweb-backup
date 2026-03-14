@@ -64,6 +64,12 @@ process.on('message', async (message: any) => {
         });
       };
 
+      // Socket.IO emit callback — forwards events to parent process over IPC,
+      // which then emits on the real io instance (worker has no Socket.IO server)
+      const socketEmit = (room: string, event: string, payload: any) => {
+        process.send!({ type: 'socketEmit', room, event, payload });
+      };
+
       const result = await agentModeService.generateMarketingResponse(
         messageContent,
         sessionHistory,
@@ -71,7 +77,8 @@ process.on('message', async (message: any) => {
         llmModel,
         sessionId,
         mockMode,
-        onProgress
+        onProgress,
+        socketEmit
       );
 
       // Send result back to parent process

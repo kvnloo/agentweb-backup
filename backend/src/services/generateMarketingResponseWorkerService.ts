@@ -121,6 +121,17 @@ export class GenerateMarketingResponseWorkerService {
         return;
       }
 
+      // Forward Socket.IO events from the worker to the real io instance
+      if (message.type === 'socketEmit') {
+        try {
+          const { io } = require('../server');
+          io.to(message.room).emit(message.event, message.payload);
+        } catch {
+          // Socket.IO not available (shouldn't happen in main process)
+        }
+        return;
+      }
+
       if (!message.requestId) return;
 
       const pending = this.pendingRequests.get(message.requestId);
