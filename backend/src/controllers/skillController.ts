@@ -78,6 +78,48 @@ export const updateSkill = async (req: Request, res: Response) => {
   }
 };
 
+export const getSyncStatus = async (req: Request, res: Response) => {
+  try {
+    const status = await skillService.getSyncStatus();
+    const environment = process.env.NODE_ENV === "development" ? "development" : "production";
+    res.status(200).json({ skills: status, environment });
+  } catch (error) {
+    console.error("Error getting sync status:", error);
+    res.status(500).json({ message: "Failed to get sync status" });
+  }
+};
+
+export const syncSkill = async (req: Request, res: Response) => {
+  try {
+    const { skillId, direction } = req.body;
+
+    if (!skillId || !direction) {
+      return res.status(400).json({ message: "skillId and direction are required" });
+    }
+
+    if (direction !== 'prod-to-dev' && direction !== 'dev-to-prod') {
+      return res.status(400).json({ message: 'direction must be "prod-to-dev" or "dev-to-prod"' });
+    }
+
+    const isDev = process.env.NODE_ENV === "development";
+    const allowedDirection = isDev ? "dev-to-prod" : "prod-to-dev";
+    if (direction !== allowedDirection) {
+      return res.status(400).json({ message: `In ${isDev ? "dev" : "prod"} environment, only "${allowedDirection}" sync is allowed` });
+    }
+
+    const skill = await skillService.syncSkill(skillId, direction);
+
+    if (!skill) {
+      return res.status(404).json({ message: "Skill not found in source table" });
+    }
+
+    res.status(200).json(skill);
+  } catch (error) {
+    console.error("Error syncing skill:", error);
+    res.status(500).json({ message: "Failed to sync skill" });
+  }
+};
+
 export const deleteSkill = async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;

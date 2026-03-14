@@ -78,10 +78,50 @@ export const deleteSkill = async (skillId: string, token: string): Promise<void>
   }
 };
 
+export type SyncDirection = 'prod-to-dev' | 'dev-to-prod';
+
+export interface SkillSyncInfo {
+  inSync: boolean;
+  existsInProd: boolean;
+  existsInDev: boolean;
+  changedFields: string[];
+}
+
+export interface SyncStatusResponse {
+  skills: Record<string, SkillSyncInfo>;
+  environment: 'development' | 'production';
+}
+
+export const getSyncStatus = async (token: string): Promise<SyncStatusResponse> => {
+  try {
+    const response = await api.get('/api/skills/sync-status', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching sync status:', error);
+    return { skills: {}, environment: 'production' };
+  }
+};
+
+export const syncSkill = async (skillId: string, direction: SyncDirection, token: string): Promise<Skill> => {
+  try {
+    const response = await api.post('/api/skills/sync', { skillId, direction }, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return response.data;
+  } catch (error) {
+    console.error(`Error syncing skill ${skillId}:`, error);
+    throw error;
+  }
+};
+
 export default {
   getAllSkills,
   getSkill,
   createSkill,
   updateSkill,
   deleteSkill,
+  syncSkill,
+  getSyncStatus,
 };
