@@ -80,6 +80,11 @@ import {
   ThumbDown as ThumbDownIcon,
   Sync as SyncIcon,
   Replay as ReplayIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+  ContentCopy as ContentCopyIcon,
+  ArrowUpward as ArrowUpwardIcon,
+  ArrowDownward as ArrowDownwardIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -6532,6 +6537,7 @@ const AgentModeSettings = () => {
   const [success, setSuccess] = useState('');
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
   const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
+  const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
@@ -7405,8 +7411,9 @@ const AgentModeSettings = () => {
       newWorkPlan
     ]);
     
-    // Set the newly added plan ID to trigger scroll
+    // Set the newly added plan ID to trigger scroll and expand
     setNewlyAddedPlanId(newWorkPlan.id || null);
+    setExpandedPlanId(newWorkPlan.id || null);
   };
 
   const removeWorkPlan = async (index: number) => {
@@ -7466,6 +7473,33 @@ const AgentModeSettings = () => {
       .filter((_, i) => i !== stepIndex)
       .map((step, i) => ({ ...step, stepCount: i + 1 }));
     setPredefinedWorkPlans(updated);
+  };
+
+  const moveStepInWorkPlan = (workPlanIndex: number, stepIndex: number, direction: 'up' | 'down') => {
+    const updated = [...predefinedWorkPlans];
+    const steps = [...updated[workPlanIndex].steps];
+    const targetIndex = direction === 'up' ? stepIndex - 1 : stepIndex + 1;
+    if (targetIndex < 0 || targetIndex >= steps.length) return;
+    [steps[stepIndex], steps[targetIndex]] = [steps[targetIndex], steps[stepIndex]];
+    updated[workPlanIndex] = { ...updated[workPlanIndex], steps: steps.map((s, i) => ({ ...s, stepCount: i + 1 })) };
+    setPredefinedWorkPlans(updated);
+  };
+
+  const duplicateWorkPlan = (index: number) => {
+    const original = predefinedWorkPlans[index];
+    const copy: PredefinedWorkPlan = {
+      ...JSON.parse(JSON.stringify(original)),
+      id: undefined,
+      title: `${original.title} (Copy)`,
+    };
+    const tempId = `new-${Date.now()}`;
+    setPredefinedWorkPlans([...predefinedWorkPlans, copy]);
+    setExpandedPlanId(tempId);
+    setNewlyAddedPlanId(tempId);
+  };
+
+  const togglePlanExpanded = (planId: string) => {
+    setExpandedPlanId(prev => prev === planId ? null : planId);
   };
 
   const updateStepInWorkPlan = (workPlanIndex: number, stepIndex: number, step: WorkPlanStep) => {
@@ -8079,13 +8113,16 @@ const AgentModeSettings = () => {
             </Box>
           ) : (
             <Box>
-              {predefinedWorkPlans.map((workPlan, workPlanIndex) => (
-                <Card 
-                  key={workPlan.id || workPlanIndex} 
+              {predefinedWorkPlans.map((workPlan, workPlanIndex) => {
+                const planKey = workPlan.id || `index-${workPlanIndex}`;
+                const isExpanded = expandedPlanId === planKey;
+                return (
+                <Card
+                  key={workPlan.id || workPlanIndex}
                   id={`work-plan-${workPlan.id || workPlanIndex}`}
                   sx={{ mb: 2, border: '1px solid', borderColor: 'divider' }}
                 >
-                  <CardContent>
+                  <CardContent sx={{ pb: isExpanded ? undefined : '16px !important' }}>
                     {workPlanErrors[workPlan.id || ''] && (
                       <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
                         setWorkPlanErrors(prev => {
@@ -8097,28 +8134,38 @@ const AgentModeSettings = () => {
                         {workPlanErrors[workPlan.id || '']}
                       </Alert>
                     )}
-                    <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-                      <TextField
-                        label="Work Plan Title"
-                        value={workPlan.title}
-                        onChange={(e) => {
-                          updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value });
-                          // Clear error when user starts typing
-                          if (workPlanErrors[workPlan.id || '']) {
-                            setWorkPlanErrors(prev => {
-                              const updated = { ...prev };
-                              delete updated[workPlan.id || ''];
-                              return updated;
-                            });
-                          }
-                        }}
-                        placeholder="Enter work plan title..."
-                        variant="outlined"
-                        fullWidth
-                        sx={{ mr: 2 }}
-                        error={!!workPlanErrors[workPlan.id || ''] && workPlanErrors[workPlan.id || ''].includes('title')}
-                      />
-                      <Box display="flex" gap={1}>
+                    {/* Collapsed header row */}
+                    <Box display="flex" justifyContent="space-between" alignItems="center">
+                      <Box
+                        display="flex"
+                        alignItems="center"
+                        sx={{ cursor: 'pointer', flex: 1, mr: 2, minWidth: 0 }}
+                        onClick={() => togglePlanExpanded(planKey)}
+                      >
+                        <IconButton size="small" sx={{ mr: 1 }}>
+                          {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                        </IconButton>
+                        <Typography variant="subtitle1" fontWeight="medium" noWrap sx={{ mr: 2 }}>
+                          {workPlan.title || 'Untitled Plan'}
+                        </Typography>
+                        <Box display="flex" gap={0.5} flexWrap="wrap">
+                          <Chip label={`${workPlan.steps.length} step${workPlan.steps.length !== 1 ? 's' : ''}`} size="small" variant="outlined" />
+                          {workPlan.showInAgentMode && <Chip label="Visible" size="small" color="success" />}
+                          {workPlan.requireLogin && <Chip label="Login Required" size="small" color="warning" variant="outlined" />}
+                          {workPlan.autocomplete && <Chip label="Autocomplete" size="small" color="info" variant="outlined" />}
+                          {workPlan.defaultModel && <Chip label={workPlan.defaultModel} size="small" variant="outlined" />}
+                        </Box>
+                      </Box>
+                      <Box display="flex" gap={0.5} flexShrink={0}>
+                        <Tooltip title="Duplicate plan">
+                          <IconButton
+                            size="small"
+                            onClick={() => duplicateWorkPlan(workPlanIndex)}
+                            disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
+                          >
+                            <ContentCopyIcon fontSize="small" />
+                          </IconButton>
+                        </Tooltip>
                         <Button
                           variant="contained"
                           onClick={() => saveIndividualWorkPlan(workPlanIndex)}
@@ -8131,11 +8178,34 @@ const AgentModeSettings = () => {
                           color="error"
                           onClick={() => removeWorkPlan(workPlanIndex)}
                           disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
+                          size="small"
                         >
-                          <DeleteIcon />
+                          <DeleteIcon fontSize="small" />
                         </IconButton>
                       </Box>
                     </Box>
+
+                    <Collapse in={isExpanded}>
+                    <Box sx={{ mt: 2 }}>
+                    <TextField
+                      label="Work Plan Title"
+                      value={workPlan.title}
+                      onChange={(e) => {
+                        updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value });
+                        if (workPlanErrors[workPlan.id || '']) {
+                          setWorkPlanErrors(prev => {
+                            const updated = { ...prev };
+                            delete updated[workPlan.id || ''];
+                            return updated;
+                          });
+                        }
+                      }}
+                      placeholder="Enter work plan title..."
+                      variant="outlined"
+                      fullWidth
+                      sx={{ mb: 2 }}
+                      error={!!workPlanErrors[workPlan.id || ''] && workPlanErrors[workPlan.id || ''].includes('title')}
+                    />
 
                     <TextField
                       label="Description (Optional)"
@@ -8272,14 +8342,38 @@ const AgentModeSettings = () => {
                           <Typography variant="body2" color="text.secondary" sx={{ minWidth: 60 }}>
                             Step {step.stepCount}:
                           </Typography>
-                          <IconButton
-                            size="small"
-                            color="error"
-                            onClick={() => removeStepFromWorkPlan(workPlanIndex, stepIndex)}
-                            disabled={false}
-                          >
-                            <DeleteIcon fontSize="small" />
-                          </IconButton>
+                          <Box display="flex" gap={0.25}>
+                            <Tooltip title="Move up">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => moveStepInWorkPlan(workPlanIndex, stepIndex, 'up')}
+                                  disabled={stepIndex === 0}
+                                >
+                                  <ArrowUpwardIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                            <Tooltip title="Move down">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => moveStepInWorkPlan(workPlanIndex, stepIndex, 'down')}
+                                  disabled={stepIndex === workPlan.steps.length - 1}
+                                >
+                                  <ArrowDownwardIcon fontSize="small" />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
+                            <IconButton
+                              size="small"
+                              color="error"
+                              onClick={() => removeStepFromWorkPlan(workPlanIndex, stepIndex)}
+                              disabled={false}
+                            >
+                              <DeleteIcon fontSize="small" />
+                            </IconButton>
+                          </Box>
                         </Box>
                         <TextField
                           label="Step Title"
@@ -8396,9 +8490,12 @@ const AgentModeSettings = () => {
                     >
                       Add Step
                     </Button>
+                    </Box>
+                    </Collapse>
                   </CardContent>
                 </Card>
-              ))}
+                );
+              })}
             </Box>
           )}
 

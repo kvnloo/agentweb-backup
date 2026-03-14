@@ -1158,6 +1158,97 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Predefined Work Plans (admin-only) ─────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'list_predefined_work_plans',
+  definition: {
+    name: 'list_predefined_work_plans',
+    description: 'List all predefined work plans. Returns the full list of plans with their IDs, titles, steps, and settings. CAUTION: Admin-only tool — changes to work plans affect the production environment.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/settings/agent-mode-predefined-workplans', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'manage_predefined_work_plan',
+  definition: {
+    name: 'manage_predefined_work_plan',
+    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'delete', 'get'], description: 'CRUD action' },
+        plan_id: { type: 'string', description: 'Plan ID (required for update/delete/get)' },
+        title: { type: 'string', description: 'Plan title (create/update)' },
+        description: { type: 'string', description: 'Plan description (create/update)' },
+        welcome_message: { type: 'string', description: 'Welcome message shown to users (create/update)' },
+        autocomplete: { type: 'boolean', description: 'Whether the plan auto-completes (create/update)' },
+        require_login: { type: 'boolean', description: 'Whether login is required (create/update)' },
+        show_in_agent_mode: { type: 'boolean', description: 'Whether to show in agent mode (create/update)' },
+        show_login_signup: { type: 'string', enum: ['after_plan_completed', 'always'], description: 'When to show login/signup (create/update)' },
+        default_model: { type: 'string', description: 'Default LLM model (create/update)' },
+        steps: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              description: { type: 'string' },
+              required_function_calls: { type: 'array', items: { type: 'string' } }
+            },
+            required: ['title']
+          },
+          description: 'Work plan steps (create/update)'
+        }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const c = ctx(context);
+    switch (args.action) {
+      case 'create': {
+        const body: any = { title: args.title, steps: args.steps };
+        if (args.description !== undefined) body.description = args.description;
+        if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
+        if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
+        if (args.require_login !== undefined) body.requireLogin = args.require_login;
+        if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
+        if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
+        if (args.default_model !== undefined) body.defaultModel = args.default_model;
+        const data = await mcpFetch({ method: 'POST', path: '/api/settings/agent-mode-predefined-workplans', context: c, body });
+        return jsonResult(data);
+      }
+      case 'update': {
+        const body: any = { title: args.title, steps: args.steps };
+        if (args.description !== undefined) body.description = args.description;
+        if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
+        if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
+        if (args.require_login !== undefined) body.requireLogin = args.require_login;
+        if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
+        if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
+        if (args.default_model !== undefined) body.defaultModel = args.default_model;
+        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c, body });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c });
+        return jsonResult(data);
+      }
+      case 'get': {
+        const data = await mcpFetch({ method: 'GET', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${args.action}` });
+    }
+  }
+});
+
 mcpToolRegistry.register({
   name: 'save_file',
   internal: true,

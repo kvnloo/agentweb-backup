@@ -66,6 +66,20 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
   - **Also:** `customer-portal/src/App.tsx` (route), `customer-portal/src/utils/pageTitles.ts` (title)
   - **Date:** 2026-03-11
 
+### Agent Mode vs Emma Chatbot
+- **Lesson:** Agent Mode (`agentModeService.ts`) is the PRIMARY agent; Emma chatbot (`chatbotService.ts`) is secondary (customer support widget)
+  - **Why:** Wired admin work plan tools into chatbotService instead of agentModeService — tools weren't available in agent-mode sessions where they're actually needed
+  - **Fix:** Always wire new tools into agent mode first. Agent mode uses `emmaToolRegistry` (bridged from `mcpToolRegistry` in `emma/tools.ts`). The chatbot uses a separate `toolsToInclude` approach in `chatbotService.ts`.
+  - **Architecture:** `apiTools.ts` → `mcpToolRegistry` → bridge in `emma/tools.ts` → `emmaToolRegistry` → `agentModeService.toolRegistry`
+  - **Date:** 2026-03-13
+
+### Admin-Only Features Must Check isAdmin at Every Entry Point
+- **Lesson:** When adding admin-only features, verify authorization at EVERY code path that exposes or grants access — not just one
+  - **Why:** Added admin tools to `list_available_skills` in `emma/tools.ts` without an `isAdmin` check, allowing non-admin users to see admin tools in the skill list. The install path was gated, but listing wasn't.
+  - **Fix:** Always check `user?.isAdmin === true` before exposing admin-only data. Check ALL entry points: listing, installation, execution. Never assume one gate covers all paths.
+  - **Pattern:** Use `userDb.getUserById(userId)` to verify admin status; don't trust context fields that may not exist.
+  - **Date:** 2026-03-13
+
 ## Code Patterns
 
 ### DynamoDB Queries

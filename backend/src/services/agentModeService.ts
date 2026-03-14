@@ -21,6 +21,8 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
+const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -711,17 +713,21 @@ export class AgentModeService {
       const startTime = Date.now();
 
       // 1. Initial Data Fetching (Pre-Loop) - Parallel fetch for performance
+      const { userDb: userDbForAdmin } = await import('./db');
       let [
         currentSession,
         userAllowedSkillIds,
         publishedSkills,
-        baseSystemPrompt
+        baseSystemPrompt,
+        currentUser
       ] = await Promise.all([
         chatbotDb.getChatSession(sessionId),
         getAllowedSkills(userId),
         skillService.getPublishedSkills(),
-        this.getMarketingSystemPrompt()
+        this.getMarketingSystemPrompt(),
+        userDbForAdmin.getUserById(userId).catch(() => null)
       ]);
+      const isAdmin = currentUser?.isAdmin === true;
 
       const workPlan = currentSession?.workPlan;
       const currentTaskStatuses = this.getCurrentTaskStatusesInSession(sessionHistory);
@@ -744,7 +750,7 @@ export class AgentModeService {
       const marketingMessages = this.buildMarketingContext(messageContent, sessionHistory, currentTaskStatuses, workPlan);
 
       // Build the "Available Skills" message (excluding already-associated skills, filtered by subscription)
-      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds);
+      let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, isAdmin);
 
       const today = new Date().toISOString().split('T')[0];
       const messages: any[] = [
@@ -813,7 +819,7 @@ export class AgentModeService {
                 installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
                 // Rebuild available skills (excluding newly associated ones, filtered by subscription)
-                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds);
+                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, isAdmin);
 
                 // Update messages using helper — track length change to keep initialMessageCount accurate
                 const preUpdateLen = messages.length;
@@ -1739,6 +1745,25 @@ When a user requests client onboarding or says "onboard new client" or similar:
       
       const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
 
+      // Add admin skill for admin users (if not already installed)
+      if (!associatedSkillIds.has(ADMIN_SKILL_VIRTUAL_ID)) {
+        try {
+          const { userDb } = await import('./db');
+          const user = await userDb.getUserById(userId);
+          if (user?.isAdmin) {
+            availableSkills.push({
+              skillId: ADMIN_SKILL_VIRTUAL_ID,
+              name: 'Admin Tools',
+              description: 'Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
+              toolNames: ADMIN_SKILL_TOOL_NAMES,
+              isPublished: true,
+            } as any);
+          }
+        } catch (e) {
+          console.warn('[listSkills] Error checking admin status:', (e as Error).message);
+        }
+      }
+
       if (!availableSkills.length)
         return { message: "All available skills are already installed." };
 
@@ -1843,7 +1868,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
    * Build the "Available Skills" context message, excluding skills already associated with the session.
    * Only shows skills the user's subscription allows.
    */
-  private buildAvailableSkillsMessage(publishedSkills: any[], associatedSkillIds: string[], userAllowedSkillIds: string[] = ["*"]): string {
+  private buildAvailableSkillsMessage(publishedSkills: any[], associatedSkillIds: string[], userAllowedSkillIds: string[] = ["*"], isAdmin: boolean = false): string {
     const associatedSet = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
@@ -1866,6 +1891,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
           .join(', ');
         skillEntries.push(`${OTHER_SKILLS_VIRTUAL_ID}- other_skills: ${otherToolsDescription}`);
       }
+    }
+
+    // Add virtual admin skill for admin users (if not already installed)
+    if (isAdmin && !associatedSet.has(ADMIN_SKILL_VIRTUAL_ID)) {
+      skillEntries.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools: Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
     }
 
     if (skillEntries.length === 0) return '';
@@ -1908,6 +1938,25 @@ When a user requests client onboarding or says "onboard new client" or similar:
       }
     }
 
+    // Add virtual admin_tools entry for admin users only
+    if (userId) {
+      try {
+        const { userDb } = await import('./db');
+        const user = await userDb.getUserById(userId);
+        if (user?.isAdmin === true) {
+          skills.push({
+            skillId: ADMIN_SKILL_VIRTUAL_ID,
+            name: 'Admin Tools',
+            description: 'Manage predefined work plans (list, create, update, delete). WARNING: modifies production configuration.',
+            installed: installedIds.has(ADMIN_SKILL_VIRTUAL_ID),
+            toolNames: ADMIN_SKILL_TOOL_NAMES
+          });
+        }
+      } catch {
+        // Skip if user lookup fails
+      }
+    }
+
     return skills;
   }
 
@@ -1921,11 +1970,23 @@ When a user requests client onboarding or says "onboard new client" or similar:
         const isWildcard = userAllowedSkillIds.includes("*");
         const allowedSkillSet = new Set(userAllowedSkillIds);
 
-        // Filter valid IDs: exists in published skills OR is the virtual other_skills ID
-        // AND is allowed by user's subscription
+        // Check admin status for admin skill gating
+        let isAdmin = false;
+        if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
+          try {
+            const { userDb } = await import('./db');
+            const user = await userDb.getUserById(userId);
+            isAdmin = user?.isAdmin === true;
+          } catch (e) {
+            console.warn('[installSkills] Error checking admin status:', (e as Error).message);
+          }
+        }
+
+        // Filter valid IDs: exists in published skills OR is a virtual skill ID
+        // AND is allowed by user's subscription (or admin for admin skill)
         const validSkillIds = skillIds.filter(id =>
-          (id === OTHER_SKILLS_VIRTUAL_ID || publishedSkills.some(s => s.skillId === id)) &&
-          (isWildcard || allowedSkillSet.has(id))
+          (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || publishedSkills.some(s => s.skillId === id)) &&
+          (id === ADMIN_SKILL_VIRTUAL_ID || isWildcard || allowedSkillSet.has(id))
         );
 
         const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -1939,6 +2000,8 @@ When a user requests client onboarding or says "onboard new client" or similar:
           validSkillIds.forEach(id => {
             if (id === OTHER_SKILLS_VIRTUAL_ID) {
               installedNames.push('other_skills');
+            } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
+              installedNames.push('Admin Tools');
             } else {
               const skill = publishedSkills.find(s => s.skillId === id);
               if (skill) installedNames.push(skill.name);
@@ -1998,6 +2061,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     if (sessionAssociatedSkillIds.includes(OTHER_SKILLS_VIRTUAL_ID) && (isWildcard || allowedSkillSet.has(OTHER_SKILLS_VIRTUAL_ID))) {
       const unassociatedTools = this.getUnassociatedTools(publishedSkills);
       unassociatedTools.forEach(t => allowedToolNames.add(t.name));
+    }
+
+    // Handle virtual admin_tools skill
+    if (sessionAssociatedSkillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
+      ADMIN_SKILL_TOOL_NAMES.forEach(t => allowedToolNames.add(t));
     }
 
     let installedSkillContextMsg = '';
