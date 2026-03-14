@@ -444,3 +444,52 @@ export async function getVercelToken(): Promise<string> {
     throw new Error('Failed to fetch Vercel token. Set VERCEL_TOKEN env var or store in Secrets Manager.');
   }
 }
+
+export interface StripeCredentials {
+  secretKey: string;
+  publishableKey: string;
+  webhookSecret: string;
+  starterPriceId: string;
+  completePriceId: string;
+}
+
+/**
+ * Get Stripe credentials from env vars (primary) or Secrets Manager (fallback).
+ */
+export async function getStripeCredentials(): Promise<StripeCredentials> {
+  // If all env vars are set, use them directly
+  if (process.env.STRIPE_SECRET_KEY && process.env.STRIPE_PUBLISHABLE_KEY && process.env.STRIPE_WEBHOOK_SECRET) {
+    return {
+      secretKey: process.env.STRIPE_SECRET_KEY,
+      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+      webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+      starterPriceId: process.env.STRIPE_STARTER_PRICE_ID || '',
+      completePriceId: process.env.STRIPE_COMPLETE_PRICE_ID || '',
+    };
+  }
+
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Stripe'
+      : 'dev/AgentWeb/Stripe';
+
+    const secretString = await getSecret(secretName);
+    const credentials = JSON.parse(secretString) as StripeCredentials;
+    if (!credentials.secretKey) {
+      throw new Error('Stripe credentials missing secretKey');
+    }
+
+    // Populate env vars so the rest of the app can use them
+    process.env.STRIPE_SECRET_KEY = credentials.secretKey;
+    process.env.STRIPE_PUBLISHABLE_KEY = credentials.publishableKey;
+    process.env.STRIPE_WEBHOOK_SECRET = credentials.webhookSecret;
+    process.env.STRIPE_STARTER_PRICE_ID = credentials.starterPriceId;
+    process.env.STRIPE_COMPLETE_PRICE_ID = credentials.completePriceId;
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Stripe credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Stripe credentials. Set STRIPE_* env vars or store in Secrets Manager.');
+  }
+}
