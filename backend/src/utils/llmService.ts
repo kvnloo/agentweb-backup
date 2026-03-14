@@ -13,7 +13,7 @@ export class LLMService {
   constructor(modelName?: string, temperature: number = 0.8, maxTokens?: number) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
     const isClaude = model.toLowerCase().includes('claude') || model.toLowerCase().includes('sonnet') || model.startsWith('anthropic.');
-    
+
     if (isClaude) {
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
       const bedrockClient = new BedrockRuntimeClient({
@@ -23,7 +23,7 @@ export class LLMService {
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
         } : undefined,
       });
-      
+
       // Map model IDs to inference profile ARNs for cross-region access
       let modelId = model;
       if (model === 'anthropic.claude-sonnet-4-5-20250929-v1:0') {
@@ -33,7 +33,7 @@ export class LLMService {
       } else if (model === 'anthropic.claude-opus-4-6-v1') {
         modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1';
       }
-      
+
       this.chatModel = new ChatBedrockConverse({
         model: modelId,
         region,
