@@ -454,20 +454,10 @@ export interface StripeCredentials {
 }
 
 /**
- * Get Stripe credentials from env vars (primary) or Secrets Manager (fallback).
+ * Get Stripe credentials from AWS Secrets Manager.
+ * Populates process.env so the rest of the app can read STRIPE_* vars.
  */
 export async function getStripeCredentials(): Promise<StripeCredentials> {
-  // If all env vars are set, use them directly
-  if (process.env.STRIPE_SECRET_KEY && process.env.STRIPE_PUBLISHABLE_KEY && process.env.STRIPE_WEBHOOK_SECRET) {
-    return {
-      secretKey: process.env.STRIPE_SECRET_KEY,
-      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
-      webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
-      starterPriceId: process.env.STRIPE_STARTER_PRICE_ID || '',
-      completePriceId: process.env.STRIPE_COMPLETE_PRICE_ID || '',
-    };
-  }
-
   try {
     const environment = process.env.NODE_ENV || 'development';
     const secretName = environment === 'production'
@@ -490,6 +480,6 @@ export async function getStripeCredentials(): Promise<StripeCredentials> {
     return credentials;
   } catch (error) {
     console.error('Error fetching Stripe credentials from Secrets Manager:', error);
-    throw new Error('Failed to fetch Stripe credentials. Set STRIPE_* env vars or store in Secrets Manager.');
+    throw new Error('Failed to fetch Stripe credentials. Store in Secrets Manager at dev/AgentWeb/Stripe or prod/AgentWeb/Stripe.');
   }
 }
