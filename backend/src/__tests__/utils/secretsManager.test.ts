@@ -17,7 +17,11 @@ import {
   getGoogleDriveServiceAccountEmail,
   getUnipileCredentials,
   getGmailCredentials,
+  getYouTubeCredentials,
   getV0ApiKey,
+  getGitHubOrgToken,
+  getVercelToken,
+  getStripeCredentials,
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -782,6 +786,42 @@ describe('secretsManager utils', () => {
     });
   });
 
+  describe('getYouTubeCredentials', () => {
+    it('should delegate to getGmailCredentials and return same result', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'yt-client', clientSecret: 'yt-secret' })
+        })
+      });
+
+      const result = await getYouTubeCredentials();
+      expect(result.clientId).toBe('yt-client');
+      expect(result.clientSecret).toBe('yt-secret');
+    });
+
+    it('should use dev Gmail secret name', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getYouTubeCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({ SecretId: 'dev/AgentWeb/Google/Gmail' });
+    });
+
+    it('should propagate errors from getGmailCredentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getYouTubeCredentials()).rejects.toThrow(
+        'Failed to fetch Gmail credentials from Secrets Manager'
+      );
+    });
+  });
+
   describe('getGoogleDriveServiceAccountEmail', () => {
     it('should return service account email', async () => {
       mockGetSecretValue.mockReturnValue({
@@ -859,6 +899,345 @@ describe('secretsManager utils', () => {
       expect(mockGetSecretValue).toHaveBeenCalledWith({
         SecretId: 'dev/AgentWeb/Google/Share'
       });
+    });
+  });
+
+  describe('getGitHubOrgToken', () => {
+    afterEach(() => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      delete process.env.GITHUB_ORG;
+    });
+
+    it('should return token from env var when set', async () => {
+      process.env.GITHUB_ORG_TOKEN = 'ghp_envtoken123';
+
+      const result = await getGitHubOrgToken();
+      expect(result).toEqual({ token: 'ghp_envtoken123', org: 'AgentWebPro' });
+      expect(mockGetSecretValue).not.toHaveBeenCalled();
+    });
+
+    it('should return custom org from env var when set', async () => {
+      process.env.GITHUB_ORG_TOKEN = 'ghp_envtoken123';
+      process.env.GITHUB_ORG = 'CustomOrg';
+
+      const result = await getGitHubOrgToken();
+      expect(result).toEqual({ token: 'ghp_envtoken123', org: 'CustomOrg' });
+    });
+
+    it('should return token from Secrets Manager when env var not set', async () => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ orgToken: 'ghp_smtoken', org: 'SMOrg' })
+        })
+      });
+
+      const result = await getGitHubOrgToken();
+      expect(result).toEqual({ token: 'ghp_smtoken', org: 'SMOrg' });
+    });
+
+    it('should default org to AgentWebPro when not in secret', async () => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ orgToken: 'ghp_smtoken' })
+        })
+      });
+
+      const result = await getGitHubOrgToken();
+      expect(result).toEqual({ token: 'ghp_smtoken', org: 'AgentWebPro' });
+    });
+
+    it('should throw error when orgToken is missing from secret', async () => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ org: 'SomeOrg' })
+        })
+      });
+
+      await expect(getGitHubOrgToken()).rejects.toThrow(
+        'Failed to fetch GitHub org token'
+      );
+    });
+
+    it('should throw error when Secrets Manager fails', async () => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getGitHubOrgToken()).rejects.toThrow(
+        'Failed to fetch GitHub org token'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ orgToken: 'token', org: 'Org' })
+        })
+      });
+
+      await getGitHubOrgToken();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/GitHub'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      delete process.env.GITHUB_ORG_TOKEN;
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ orgToken: 'token', org: 'Org' })
+        })
+      });
+
+      await getGitHubOrgToken();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/GitHub'
+      });
+    });
+  });
+
+  describe('getVercelToken', () => {
+    afterEach(() => {
+      delete process.env.VERCEL_TOKEN;
+    });
+
+    it('should return token from env var when set', async () => {
+      process.env.VERCEL_TOKEN = 'vercel-env-token';
+
+      const result = await getVercelToken();
+      expect(result).toBe('vercel-env-token');
+      expect(mockGetSecretValue).not.toHaveBeenCalled();
+    });
+
+    it('should return token from Secrets Manager when env var not set', async () => {
+      delete process.env.VERCEL_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ token: 'vercel-sm-token' })
+        })
+      });
+
+      const result = await getVercelToken();
+      expect(result).toBe('vercel-sm-token');
+    });
+
+    it('should throw error when token is missing from secret', async () => {
+      delete process.env.VERCEL_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ notToken: 'something' })
+        })
+      });
+
+      await expect(getVercelToken()).rejects.toThrow(
+        'Failed to fetch Vercel token'
+      );
+    });
+
+    it('should throw error when Secrets Manager fails', async () => {
+      delete process.env.VERCEL_TOKEN;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getVercelToken()).rejects.toThrow(
+        'Failed to fetch Vercel token'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      delete process.env.VERCEL_TOKEN;
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ token: 'token' })
+        })
+      });
+
+      await getVercelToken();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/Vercel'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      delete process.env.VERCEL_TOKEN;
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ token: 'token' })
+        })
+      });
+
+      await getVercelToken();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Vercel'
+      });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.VERCEL_TOKEN;
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ token: 'token' })
+        })
+      });
+
+      await getVercelToken();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Vercel'
+      });
+    });
+  });
+
+  describe('getStripeCredentials', () => {
+    const validStripeSecret = JSON.stringify({
+      secretKey: 'sk_test_abc123',
+      publishableKey: 'pk_test_xyz789',
+      webhookSecret: 'whsec_test_456',
+      starterPriceId: 'price_starter_123',
+      completePriceId: 'price_complete_456',
+    });
+
+    afterEach(() => {
+      delete process.env.STRIPE_SECRET_KEY;
+      delete process.env.STRIPE_PUBLISHABLE_KEY;
+      delete process.env.STRIPE_WEBHOOK_SECRET;
+      delete process.env.STRIPE_STARTER_PRICE_ID;
+      delete process.env.STRIPE_COMPLETE_PRICE_ID;
+    });
+
+    it('should return Stripe credentials on success', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: validStripeSecret })
+      });
+
+      const result = await getStripeCredentials();
+      expect(result).toEqual({
+        secretKey: 'sk_test_abc123',
+        publishableKey: 'pk_test_xyz789',
+        webhookSecret: 'whsec_test_456',
+        starterPriceId: 'price_starter_123',
+        completePriceId: 'price_complete_456',
+      });
+    });
+
+    it('should populate process.env with Stripe credentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: validStripeSecret })
+      });
+
+      await getStripeCredentials();
+      expect(process.env.STRIPE_SECRET_KEY).toBe('sk_test_abc123');
+      expect(process.env.STRIPE_PUBLISHABLE_KEY).toBe('pk_test_xyz789');
+      expect(process.env.STRIPE_WEBHOOK_SECRET).toBe('whsec_test_456');
+      expect(process.env.STRIPE_STARTER_PRICE_ID).toBe('price_starter_123');
+      expect(process.env.STRIPE_COMPLETE_PRICE_ID).toBe('price_complete_456');
+    });
+
+    it('should throw error when secretKey is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            publishableKey: 'pk_test_xyz789',
+            webhookSecret: 'whsec_test_456',
+          })
+        })
+      });
+
+      await expect(getStripeCredentials()).rejects.toThrow(
+        'Failed to fetch Stripe credentials'
+      );
+    });
+
+    it('should throw error when Secrets Manager fails', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getStripeCredentials()).rejects.toThrow(
+        'Failed to fetch Stripe credentials'
+      );
+    });
+
+    it('should throw error when secret string is null', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: undefined })
+      });
+
+      await expect(getStripeCredentials()).rejects.toThrow(
+        'Failed to fetch Stripe credentials'
+      );
+    });
+
+    it('should throw error when secret is invalid JSON', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: 'not-json' })
+      });
+
+      await expect(getStripeCredentials()).rejects.toThrow(
+        'Failed to fetch Stripe credentials'
+      );
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: validStripeSecret })
+      });
+
+      await getStripeCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Stripe'
+      });
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: validStripeSecret })
+      });
+
+      await getStripeCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/Stripe'
+      });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: validStripeSecret })
+      });
+
+      await getStripeCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Stripe'
+      });
+    });
+
+    it('should populate env vars even when optional fields are undefined', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            secretKey: 'sk_test_minimal',
+          })
+        })
+      });
+
+      const result = await getStripeCredentials();
+      expect(result.secretKey).toBe('sk_test_minimal');
+      expect(process.env.STRIPE_SECRET_KEY).toBe('sk_test_minimal');
+      // undefined fields still get set (as "undefined" string or undefined)
+      expect(result.publishableKey).toBeUndefined();
     });
   });
 });
