@@ -67,7 +67,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
           agentModeService.default_model,
           'test-session'
         )
-      ).rejects.toThrow('I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.');
+      ).rejects.toThrow('I apologize, but I encountered an error processing your request. Please try again.');
     });
 
     it('should throw user-friendly error for ResponsibleAIPolicyViolation', async () => {
@@ -106,7 +106,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
           agentModeService.default_model,
           'test-session'
         )
-      ).rejects.toThrow('I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.');
+      ).rejects.toThrow('I apologize, but I encountered an error processing your request. Please try again.');
     });
 
     it('should throw user-friendly error for general 400 errors', async () => {
@@ -142,7 +142,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
           agentModeService.default_model,
           'test-session'
         )
-      ).rejects.toThrow('I encountered an issue processing your request. Please try rephrasing your question.');
+      ).rejects.toThrow('I apologize, but I encountered an error processing your request. Please try again.');
     });
 
     it('should throw user-friendly error for rate limiting', async () => {
@@ -178,7 +178,7 @@ describe('AgentModeService - Content Filtering Error Handling', () => {
           agentModeService.default_model,
           'test-session'
         )
-      ).rejects.toThrow('I\'m currently experiencing high demand. Please wait a moment and try again.');
+      ).rejects.toThrow('I apologize, but I encountered an error processing your request. Please try again.');
     });
 
     it('should throw generic error for other errors', async () => {

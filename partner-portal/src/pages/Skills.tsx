@@ -555,6 +555,36 @@ export default function Skills() {
                     </TableRow>
                   ))
                 )}
+                {/* Virtual __admin_tools__ row */}
+                {!loading && (
+                  <TableRow sx={{ backgroundColor: 'action.hover' }}>
+                    <TableCell sx={{ fontWeight: "bold" }}>
+                      Admin Tools
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        (virtual — admin only)
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 300 }}>
+                      <Typography variant="body2">
+                        Manage predefined work plans. Only visible to admin users in agent mode.
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label="Auto" color="warning" size="small" />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="caption" color="text.secondary">
+                        Admin-only (no subscription gating)
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      {["list_predefined_work_plans", "manage_predefined_work_plan"].map(tool => (
+                        <Chip key={tool} label={tool} size="small" color="warning" variant="outlined" sx={{ mr: 0.5, mb: 0.5 }} />
+                      ))}
+                    </TableCell>
+                    <TableCell />
+                  </TableRow>
+                )}
                 {/* Virtual __other_skills__ row */}
                 {!loading && unusedTools.length > 0 && (
                   <TableRow sx={{ backgroundColor: 'action.hover' }}>

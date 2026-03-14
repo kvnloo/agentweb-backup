@@ -23,11 +23,14 @@ interface WorkPlanStep {
 }
 
 interface PredefinedWorkPlan {
+  id?: string;
   title: string;
   steps: WorkPlanStep[];
+  autocomplete?: boolean;
   requireLogin?: boolean;
   showLoginSignup?: 'after_plan_completed' | 'always';
   showInAgentMode?: boolean;
+  defaultModel?: string;
 }
 
 // Helper function to get default onboarding plan
@@ -684,6 +687,187 @@ describe('AdminDashboard Predefined Work Plans', () => {
       expect(updated.steps[1].title).toBe('Updated Step 2');
       expect(updated.steps[1].description).toBe('New description');
       expect(updated.steps[1].requiredFunctionCalls).toEqual(['test_function']);
+    });
+  });
+
+  describe('Duplicate Work Plan', () => {
+    const duplicateWorkPlan = (workPlans: PredefinedWorkPlan[], index: number): PredefinedWorkPlan[] => {
+      const original = workPlans[index];
+      const copy: PredefinedWorkPlan = {
+        ...JSON.parse(JSON.stringify(original)),
+        id: undefined,
+        title: `${original.title} (Copy)`,
+      };
+      return [...workPlans, copy];
+    };
+
+    it('should create a copy with "(Copy)" appended to the title', () => {
+      const workPlans: PredefinedWorkPlan[] = [
+        { id: 'plan-1', title: 'My Plan', steps: [{ stepCount: 1, title: 'Step 1' }] }
+      ];
+
+      const updated = duplicateWorkPlan(workPlans, 0);
+
+      expect(updated).toHaveLength(2);
+      expect(updated[1].title).toBe('My Plan (Copy)');
+    });
+
+    it('should clear the id on the duplicated plan', () => {
+      const workPlans: PredefinedWorkPlan[] = [
+        { id: 'plan-1', title: 'My Plan', steps: [{ stepCount: 1, title: 'Step 1' }] }
+      ];
+
+      const updated = duplicateWorkPlan(workPlans, 0);
+
+      expect(updated[1].id).toBeUndefined();
+      expect(updated[0].id).toBe('plan-1');
+    });
+
+    it('should preserve all steps in the duplicated plan', () => {
+      const workPlans: PredefinedWorkPlan[] = [
+        {
+          id: 'plan-1',
+          title: 'My Plan',
+          autocomplete: true,
+          requireLogin: true,
+          showInAgentMode: true,
+          defaultModel: 'gpt-4',
+          steps: [
+            { stepCount: 1, title: 'Step 1', description: 'Desc 1', requiredFunctionCalls: ['func_a'] },
+            { stepCount: 2, title: 'Step 2', description: 'Desc 2' },
+          ]
+        }
+      ];
+
+      const updated = duplicateWorkPlan(workPlans, 0);
+      const copy = updated[1];
+
+      expect(copy.steps).toHaveLength(2);
+      expect(copy.steps[0].title).toBe('Step 1');
+      expect(copy.steps[0].requiredFunctionCalls).toEqual(['func_a']);
+      expect(copy.steps[1].title).toBe('Step 2');
+      expect(copy.autocomplete).toBe(true);
+      expect(copy.requireLogin).toBe(true);
+      expect(copy.showInAgentMode).toBe(true);
+      expect(copy.defaultModel).toBe('gpt-4');
+    });
+
+    it('should deep copy steps so mutations do not affect original', () => {
+      const workPlans: PredefinedWorkPlan[] = [
+        { id: 'plan-1', title: 'My Plan', steps: [{ stepCount: 1, title: 'Step 1', requiredFunctionCalls: ['func_a'] }] }
+      ];
+
+      const updated = duplicateWorkPlan(workPlans, 0);
+      updated[1].steps[0].title = 'Modified';
+      updated[1].steps[0].requiredFunctionCalls!.push('func_b');
+
+      expect(updated[0].steps[0].title).toBe('Step 1');
+      expect(updated[0].steps[0].requiredFunctionCalls).toEqual(['func_a']);
+    });
+  });
+
+  describe('Move Step in Work Plan', () => {
+    const moveStepInWorkPlan = (
+      workPlan: PredefinedWorkPlan,
+      stepIndex: number,
+      direction: 'up' | 'down'
+    ): PredefinedWorkPlan => {
+      const steps = [...workPlan.steps];
+      const targetIndex = direction === 'up' ? stepIndex - 1 : stepIndex + 1;
+      if (targetIndex < 0 || targetIndex >= steps.length) return workPlan;
+      [steps[stepIndex], steps[targetIndex]] = [steps[targetIndex], steps[stepIndex]];
+      return { ...workPlan, steps: steps.map((s, i) => ({ ...s, stepCount: i + 1 })) };
+    };
+
+    it('should move a step up', () => {
+      const workPlan: PredefinedWorkPlan = {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step A' },
+          { stepCount: 2, title: 'Step B' },
+          { stepCount: 3, title: 'Step C' },
+        ]
+      };
+
+      const updated = moveStepInWorkPlan(workPlan, 2, 'up');
+
+      expect(updated.steps[0].title).toBe('Step A');
+      expect(updated.steps[1].title).toBe('Step C');
+      expect(updated.steps[2].title).toBe('Step B');
+      expect(updated.steps[0].stepCount).toBe(1);
+      expect(updated.steps[1].stepCount).toBe(2);
+      expect(updated.steps[2].stepCount).toBe(3);
+    });
+
+    it('should move a step down', () => {
+      const workPlan: PredefinedWorkPlan = {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step A' },
+          { stepCount: 2, title: 'Step B' },
+          { stepCount: 3, title: 'Step C' },
+        ]
+      };
+
+      const updated = moveStepInWorkPlan(workPlan, 0, 'down');
+
+      expect(updated.steps[0].title).toBe('Step B');
+      expect(updated.steps[1].title).toBe('Step A');
+      expect(updated.steps[2].title).toBe('Step C');
+      expect(updated.steps[0].stepCount).toBe(1);
+      expect(updated.steps[1].stepCount).toBe(2);
+      expect(updated.steps[2].stepCount).toBe(3);
+    });
+
+    it('should not move the first step up (boundary)', () => {
+      const workPlan: PredefinedWorkPlan = {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step A' },
+          { stepCount: 2, title: 'Step B' },
+        ]
+      };
+
+      const updated = moveStepInWorkPlan(workPlan, 0, 'up');
+
+      expect(updated).toBe(workPlan); // Same reference — no change
+      expect(updated.steps[0].title).toBe('Step A');
+      expect(updated.steps[1].title).toBe('Step B');
+    });
+
+    it('should not move the last step down (boundary)', () => {
+      const workPlan: PredefinedWorkPlan = {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step A' },
+          { stepCount: 2, title: 'Step B' },
+        ]
+      };
+
+      const updated = moveStepInWorkPlan(workPlan, 1, 'down');
+
+      expect(updated).toBe(workPlan);
+      expect(updated.steps[0].title).toBe('Step A');
+      expect(updated.steps[1].title).toBe('Step B');
+    });
+
+    it('should renumber stepCount after moving', () => {
+      const workPlan: PredefinedWorkPlan = {
+        title: 'Test Plan',
+        steps: [
+          { stepCount: 1, title: 'Step A' },
+          { stepCount: 2, title: 'Step B' },
+          { stepCount: 3, title: 'Step C' },
+        ]
+      };
+
+      const updated = moveStepInWorkPlan(workPlan, 1, 'up');
+
+      updated.steps.forEach((step, index) => {
+        expect(step.stepCount).toBe(index + 1);
+      });
+      expect(updated.steps[0].title).toBe('Step B');
+      expect(updated.steps[1].title).toBe('Step A');
     });
   });
 });
