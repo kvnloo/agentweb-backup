@@ -77,13 +77,70 @@ describe("Admin chat sessions endpoint", () => {
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("session-1");
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("session-2");
 
-    expect(res.body.sessions).toHaveLength(2);
+    // session-1 has only assistant messages, so it should be filtered out
+    expect(res.body.sessions).toHaveLength(1);
     expect(res.body.nextCursor).toBeNull();
     expect(res.body.sessions[0].sessionId).toBe("session-2");
     expect(res.body.sessions[0].messages).toHaveLength(2);
     expect(res.body.sessions[0].messages[0].content).toBe("hello");
-    expect(res.body.sessions[1].sessionId).toBe("session-1");
-    expect(res.body.sessions[1].messages[0].content).toBe("from-messages-table");
+  });
+
+  it("filters out sessions with no user messages", async () => {
+    const baseSessions = [
+      {
+        sessionId: "empty-session",
+        userId: "user-1",
+        createdAt: "2024-01-01T00:00:00Z",
+        updatedAt: "2024-01-01T00:00:00Z",
+        messages: [],
+      },
+      {
+        sessionId: "assistant-only",
+        userId: "user-2",
+        createdAt: "2024-01-02T00:00:00Z",
+        updatedAt: "2024-01-02T00:00:00Z",
+        messages: [],
+      },
+      {
+        sessionId: "real-session",
+        userId: "user-3",
+        createdAt: "2024-01-03T00:00:00Z",
+        updatedAt: "2024-01-03T00:00:00Z",
+        messages: [],
+      },
+    ];
+
+    mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+      sessions: baseSessions as any,
+      lastEvaluatedKey: undefined,
+    });
+    mockChatbotDb.getChatSession.mockImplementation(async (sessionId: string) => {
+      if (sessionId === "empty-session") {
+        return { ...baseSessions[0], messages: [] } as any;
+      }
+      if (sessionId === "assistant-only") {
+        return {
+          ...baseSessions[1],
+          messages: [{ role: "assistant", content: "auto greeting" }],
+        } as any;
+      }
+      if (sessionId === "real-session") {
+        return {
+          ...baseSessions[2],
+          messages: [
+            { role: "assistant", content: "hello" },
+            { role: "user", content: "hi there" },
+          ],
+        } as any;
+      }
+      return null;
+    });
+
+    const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+    // Only the session with a user message should be returned
+    expect(res.body.sessions).toHaveLength(1);
+    expect(res.body.sessions[0].sessionId).toBe("real-session");
   });
 
   it("passes the decoded cursor to pagination queries", async () => {
