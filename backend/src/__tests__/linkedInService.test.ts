@@ -1158,6 +1158,127 @@ describe('LinkedInService', () => {
     });
   });
 
+  describe('createComment - reply to comment (parentComment)', () => {
+    it('should include parentComment in payload when parentCommentUrn is provided', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { commentUrn: 'urn:li:comment:(urn:li:share:123,789)' },
+        headers: { 'x-restli-id': 'urn:li:comment:(urn:li:share:123,789)' },
+      });
+
+      const result = await service.createComment(
+        'token',
+        'urn:li:share:123',
+        'urn:li:person:abc',
+        'Thanks for the kind words!',
+        'urn:li:comment:(urn:li:share:123,456)'
+      );
+
+      expect(mockClient.post).toHaveBeenCalledWith(
+        `/rest/socialActions/${encodeURIComponent('urn:li:share:123')}/comments`,
+        {
+          actor: 'urn:li:person:abc',
+          object: 'urn:li:share:123',
+          message: {
+            text: 'Thanks for the kind words!'
+          },
+          parentComment: 'urn:li:comment:(urn:li:share:123,456)'
+        },
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toBe('urn:li:comment:(urn:li:share:123,789)');
+    });
+
+    it('should NOT include parentComment when parentCommentUrn is undefined', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { commentUrn: 'urn:li:comment:(urn:li:share:123,456)' },
+        headers: { 'x-restli-id': 'urn:li:comment:(urn:li:share:123,456)' },
+      });
+
+      await service.createComment('token', 'urn:li:share:123', 'urn:li:person:abc', 'Top-level comment');
+
+      const payload = mockClient.post.mock.calls[0][1];
+      expect(payload).not.toHaveProperty('parentComment');
+    });
+
+    it('should reply to comment on behalf of organization', async () => {
+      mockClient.post.mockResolvedValue({
+        data: { commentUrn: 'urn:li:comment:(urn:li:ugcPost:789,999)' },
+        headers: { 'x-restli-id': 'urn:li:comment:(urn:li:ugcPost:789,999)' },
+      });
+
+      const result = await service.createComment(
+        'token',
+        'urn:li:ugcPost:789',
+        'urn:li:organization:123',
+        'Thank you!',
+        'urn:li:comment:(urn:li:ugcPost:789,500)'
+      );
+
+      const payload = mockClient.post.mock.calls[0][1];
+      expect(payload.parentComment).toBe('urn:li:comment:(urn:li:ugcPost:789,500)');
+      expect(payload.actor).toBe('urn:li:organization:123');
+      expect(result).toBe('urn:li:comment:(urn:li:ugcPost:789,999)');
+    });
+  });
+
+  describe('getComments', () => {
+    it('should fetch comments for a post and return parsed results', async () => {
+      mockClient.get.mockResolvedValue({
+        data: {
+          elements: [
+            {
+              $URN: 'urn:li:comment:(urn:li:share:123,456)',
+              actor: 'urn:li:person:commenter1',
+              message: { text: 'Great post!' },
+              created: { time: 1710000000000 }
+            },
+            {
+              $URN: 'urn:li:comment:(urn:li:share:123,789)',
+              actor: 'urn:li:person:commenter2',
+              message: { text: 'Thanks for sharing' },
+              created: { time: 1710001000000 }
+            }
+          ],
+          paging: { count: 10, start: 0, total: 2 }
+        }
+      });
+
+      const result = await service.getComments('token', 'urn:li:share:123');
+
+      expect(mockClient.get).toHaveBeenCalledWith(
+        `/rest/socialActions/${encodeURIComponent('urn:li:share:123')}/comments`,
+        { headers: { Authorization: 'Bearer token' } }
+      );
+      expect(result).toHaveLength(2);
+      expect(result[0].commentUrn).toBe('urn:li:comment:(urn:li:share:123,456)');
+      expect(result[0].text).toBe('Great post!');
+      expect(result[0].actorUrn).toBe('urn:li:person:commenter1');
+    });
+
+    it('should return empty array when no comments exist', async () => {
+      mockClient.get.mockResolvedValue({
+        data: { elements: [], paging: { count: 10, start: 0, total: 0 } }
+      });
+
+      const result = await service.getComments('token', 'urn:li:share:999');
+      expect(result).toEqual([]);
+    });
+
+    it('should handle 401 error for expired token', async () => {
+      const axiosError = {
+        response: { status: 401, data: { message: 'Unauthorized' } },
+        isAxiosError: true,
+        message: 'Request failed',
+      };
+      mockClient.get.mockRejectedValue(axiosError);
+      ((axios as any).isAxiosError as jest.Mock).mockReturnValue(true);
+
+      await expect(
+        service.getComments('expired-token', 'urn:li:share:123')
+      ).rejects.toThrow('LinkedIn access token expired or invalid');
+    });
+  });
+
   describe('createReaction', () => {
     it('should create a LIKE reaction on a post', async () => {
       mockClient.post.mockResolvedValue({
