@@ -150,7 +150,7 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
     
     try {
       // Generate response
-      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, isAdmin: req.user?.isAdmin === true, structuredContext, screenshot, model });
+      const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model });
       
       // Get updated session with the new messages
       const updatedSession = await chatbotDb.getChatSession(sessionId);
@@ -242,7 +242,7 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     const response = await generateChatResponse(
       sessionId, message,
       {
-        currentUrl, pageContent: pageContext, portalType, userId, isAdmin: req.user?.isAdmin === true,
+        currentUrl, pageContent: pageContext, portalType, userId,
         structuredContext, screenshot, model,
         onToolStart: (toolName: string) => sendEvent({ type: 'tool_start', name: toolName })
       }

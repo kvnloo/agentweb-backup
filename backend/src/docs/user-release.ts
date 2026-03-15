@@ -9,6 +9,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-15',
     changes: [
+      'Feature: Agent Mode — Skill Management Admin Tools',
+      '- Emma can now list, create, update, and delete skill definitions via new admin-only tools (list_skills, manage_skill)',
+      '- Admin tools are only available in Agent Mode for admin users — they are no longer incorrectly loaded in the customer support sidebar chat',
+      '- The Skills page now dynamically loads admin tool names from the backend instead of hardcoding them',
+    ],
+  },
+  {
+    date: '2026-03-15',
+    changes: [
       'Feature: Share Links — Rich Social Media Previews',
       '- Shared conversation links now show rich previews on Slack, LinkedIn, iMessage, and other platforms',
       '- Previews include the conversation title and a snippet of the first message',

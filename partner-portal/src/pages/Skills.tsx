@@ -97,6 +97,7 @@ export default function Skills() {
   const [backendEnv, setBackendEnv] = useState<'development' | 'production'>('production');
   const [foundationTools, setFoundationTools] = useState<string[]>([]);
   const [foundationDefaults, setFoundationDefaults] = useState<string[]>([]);
+  const [adminToolNames, setAdminToolNames] = useState<string[]>([]);
   const [foundationDialogOpen, setFoundationDialogOpen] = useState(false);
   const [foundationEditTools, setFoundationEditTools] = useState<string[]>([]);
   const [foundationSearchText, setFoundationSearchText] = useState("");
@@ -156,6 +157,7 @@ export default function Skills() {
       });
       setFoundationTools(response.data.toolNames || []);
       setFoundationDefaults(response.data.defaults || []);
+      setAdminToolNames(response.data.adminToolNames || []);
     } catch (err) {
       console.error("Failed to fetch foundation tools", err);
     }
@@ -405,14 +407,14 @@ export default function Skills() {
   );
 
   // Compute unused tools (tools not assigned to any skill, excluding foundation and admin tools)
-  const ADMIN_TOOL_NAMES = new Set(["list_predefined_work_plans", "manage_predefined_work_plan"]);
+  const adminToolSet = new Set(adminToolNames);
   const usedToolNames = new Set<string>();
   skills.forEach(skill => {
     skill.toolNames?.forEach(t => usedToolNames.add(t));
   });
   const foundationSet = new Set(foundationTools);
   const unusedTools = availableTools.filter(t =>
-    !usedToolNames.has(t.name) && !foundationSet.has(t.name) && !ADMIN_TOOL_NAMES.has(t.name)
+    !usedToolNames.has(t.name) && !foundationSet.has(t.name) && !adminToolSet.has(t.name)
   );
 
   return (
@@ -654,7 +656,7 @@ export default function Skills() {
                     </TableCell>
                     <TableCell sx={{ maxWidth: 300 }}>
                       <Typography variant="body2">
-                        Manage predefined work plans. Only visible to admin users in agent mode.
+                        Manage predefined work plans and skill definitions. Only visible to admin users in agent mode.
                       </Typography>
                     </TableCell>
                     <TableCell>
@@ -666,7 +668,7 @@ export default function Skills() {
                       </Typography>
                     </TableCell>
                     <TableCell>
-                      {["list_predefined_work_plans", "manage_predefined_work_plan"].map(tool => (
+                      {adminToolNames.map(tool => (
                         <Chip key={tool} label={tool} size="small" color="warning" variant="outlined" sx={{ mr: 0.5, mb: 0.5 }} />
                       ))}
                     </TableCell>

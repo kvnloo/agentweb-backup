@@ -138,11 +138,11 @@ emmaToolRegistry.register({
       const { userDb } = await import('../services/db');
       const currentUser = await userDb.getUserById(userId);
       if (currentUser?.isAdmin === true) {
-        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan'];
+        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
         availableSkills.push({
           skillId: '__admin_tools__',
           name: 'Admin Tools',
-          description: 'Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
+          description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
           toolNames: adminToolNames,
           toolCount: adminToolNames.length
         });
@@ -4481,6 +4481,8 @@ const bridgedToolNames = [
 const adminToolNames = [
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
+  'list_skills',
+  'manage_skill',
 ];
 
 for (const toolName of bridgedToolNames) {

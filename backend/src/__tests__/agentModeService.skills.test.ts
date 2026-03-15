@@ -384,6 +384,8 @@ describe('AgentModeService - Skills', () => {
         { name: 'regular_tool', definition: { function: { description: 'regular' } } },
         { name: 'list_predefined_work_plans', definition: { function: { description: 'admin tool' } } },
         { name: 'manage_predefined_work_plan', definition: { function: { description: 'admin tool 2' } } },
+        { name: 'list_skills', definition: { function: { description: 'admin tool 3' } } },
+        { name: 'manage_skill', definition: { function: { description: 'admin tool 4' } } },
       ];
       jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
 
