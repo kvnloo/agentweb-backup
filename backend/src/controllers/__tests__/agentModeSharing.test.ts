@@ -287,12 +287,13 @@ describe('AgentMode Sharing Controller', () => {
       await agentModeController.createConversableShare(req as Request, res as Response);
 
       expect(chatbotDb.getChatSession).toHaveBeenCalledWith(sessionId);
-      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId, 7);
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith({
         shareId: sessionId,
         conversableToken: expect.any(String),
-        conversableUrl: expect.stringContaining(`/ishare/${sessionId}?conversable=`)
+        conversableUrl: expect.stringContaining(`/ishare/${sessionId}?conversable=`),
+        expiresAt: expect.any(String)
       });
     });
 
@@ -333,7 +334,7 @@ describe('AgentMode Sharing Controller', () => {
       await agentModeController.createConversableShare(req as Request, res as Response);
 
       // Verify that createOrReuseInteractiveShare is called
-      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId, 7);
       expect(res.status).toHaveBeenCalledWith(200);
     });
   });
