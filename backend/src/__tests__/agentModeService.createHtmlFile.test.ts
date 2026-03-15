@@ -153,7 +153,7 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(createLLMService).toHaveBeenCalledWith(
         'anthropic.claude-sonnet-4-5-20250929-v1:0',
         0.8,
-        16384
+        64000
       );
     });
 
