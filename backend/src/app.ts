@@ -52,6 +52,7 @@ import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
+import agencyRoutes, { agencyTeamRoutes } from "./routes/agencies";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -220,6 +221,8 @@ app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
 app.use("/review", reviewRouter);
 app.use("/api/lead-magnet", leadMagnetRoutes);
+app.use("/api/agencies", authenticateToken, agencyRoutes);
+app.use("/api/teams", authenticateToken, agencyTeamRoutes);
 
 
 // Agent API documentation (public, no auth)
