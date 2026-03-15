@@ -456,6 +456,29 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
             }
           }
 
+          // LinkedIn auto-connection trigger
+          if (leadList.linkedInAutoConnectEnabled === true && lead.linkedin) {
+            // Dedup: only queue if this lead hasn't already had a connection queued
+            const existingCf = existingLead?.customFields || {};
+            if (!existingCf.linkedInConnectionQueued) {
+              try {
+                const liResult = await agentModeService.queueLinkedInConnectionForLead(
+                  leadList.userId,
+                  lead.linkedin,
+                  { company: lead.company, title: lead.title }
+                );
+                if (liResult.success) {
+                  // Mark lead so we don't send duplicate connection requests
+                  await crmDb.updateLead(leadList.listId, lead.leadId, {
+                    customFields: { ...(lead.customFields || {}), linkedInConnectionQueued: true },
+                  });
+                }
+              } catch (liError) {
+                console.error('LinkedIn auto-connection failed:', liError);
+              }
+            }
+          }
+
           // Send alert with accurate draft/send status
           const alertEventType = isUpdated ? 'api.lead_updated' : 'api.lead_added';
           await leadListAlertService.notifyLeadListOwnerIfConfigured(
