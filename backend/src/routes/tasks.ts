@@ -1,7 +1,7 @@
 import express, { Request, RequestHandler, Response } from 'express';
 import cors from 'cors';
 import { createTask, getTasks, getTask, updateTask, deleteTask, executeTask, getTaskExecutions, updateTaskExecution, respondToInteraction, getTaskExecution, getExecutionLog, generateShareToken, getExecutionWithToken, sendExecutionEmail, uploadFileToExecution, getPlacidEditorToken, generateFromTemplateToExecution, listPlacidTemplates, createRevisionExecution, updateReport, getTaskExecutionPublic } from '../controllers/tasks';
-import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { authenticateToken, AuthenticatedRequest, getEffectiveOwnerId } from '../middleware/auth';
 import { taskDb, subscriberDb } from '../services/db';
 import multer from 'multer';
 import { RequestHandler as ExpressRequestHandler } from 'express-serve-static-core';
@@ -24,12 +24,24 @@ interface AuthRequest extends Request {
 }
 
 const router = express.Router();
-const upload = multer({ 
+const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: MAX_FILE_SIZE, // 100MB limit to support larger video uploads
   },
 });
+
+/**
+ * Check if the current user has access to a task.
+ * Uses getEffectiveOwnerId() so team members can access each other's tasks.
+ * Admin users always have access.
+ */
+function hasTaskAccess(req: Request, task: { userId: string }): boolean {
+  const authReq = req as AuthenticatedRequest;
+  if (authReq.user?.isAdmin) return true;
+  const ownerId = getEffectiveOwnerId(req);
+  return task.userId === ownerId;
+}
 
 // Initialize GCS with service account credentials
 import { getGCSPPrivateKey } from '../utils/secretsManager';
@@ -262,7 +274,7 @@ router.post('/:taskId/subscribers/:email/resubscribe', authenticateToken, async 
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -313,7 +325,7 @@ router.put('/:id/email-sender', authenticateToken, async (req: AuthRequest, res:
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -343,7 +355,7 @@ router.get('/:id/email-domain-status', authenticateToken, async (req: AuthReques
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -403,7 +415,7 @@ router.put('/:taskId/executions/:executionId/kill', authenticateToken, async (re
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this execution' });
     }
 
@@ -458,7 +470,7 @@ router.get('/:taskId/subscribers/all', authenticateToken, async (req, res) => {
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -498,7 +510,7 @@ router.post('/:taskId/subscribers/:email/email-history', authenticateToken, asyn
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -554,7 +566,7 @@ router.put('/:taskId/subscribers/:email/email-history/:emailId', authenticateTok
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -595,7 +607,7 @@ router.put('/:taskId/subscribers/:email', authenticateToken, async (req, res) =>
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -644,7 +656,7 @@ router.post('/:taskId/subscribers/batch', authenticateToken, async (req, res) =>
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -684,7 +696,7 @@ router.get('/:taskId/subscribers/:email/email-events', authenticateToken, async 
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -787,7 +799,7 @@ router.post('/:taskId/subscribers', authenticateToken, async (req, res) => {
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -830,7 +842,7 @@ router.post('/:taskId/attachments', upload.single('file'), (async (req, res) => 
     if (!task) {
       return res.status(404).json({ error: 'Task not found' });
     }
-    if (task.userId !== (req as AuthenticatedRequest).user.userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ error: 'Not authorized to modify this task' });
     }
 
@@ -852,7 +864,7 @@ router.delete('/:taskId/attachments/:key', authenticateToken, (async (req: Authe
     if (!task) {
       return res.status(404).json({ error: 'Task not found' });
     }
-    if (task.userId !== req.user.userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ error: 'Not authorized to modify this task' });
     }
 
@@ -958,7 +970,7 @@ router.put('/:taskId/executions/:executionId/archive', authenticateToken, async 
     }
 
     // Check if user is owner or admin
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -988,7 +1000,7 @@ router.put('/:taskId/executions/:executionId/unarchive', authenticateToken, asyn
     }
 
     // Check if user is owner or admin
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1024,8 +1036,11 @@ router.get('/knowledge-base/all', authenticateToken, async (req: Request, res: R
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
+    // Use effectiveOwnerId so team members share knowledge bases
+    const ownerId = getEffectiveOwnerId(req) || userId;
+
     // Use the common function to get tasks with knowledge base
-    const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(userId);
+    const knowledgeBaseTasks = await taskDb.getTasksWithKnowledgeBase(ownerId);
 
     // Map to return only necessary fields for the API response
     const response = knowledgeBaseTasks.map((task: any) => ({
@@ -1058,7 +1073,7 @@ router.get('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to access this task' });
     }
 
@@ -1148,7 +1163,7 @@ router.put('/:taskId/knowledge-base', authenticateToken, async (req: Request, re
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1217,7 +1232,7 @@ router.post('/:taskId/executions/:executionId/update-knowledge-base', authentica
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1347,7 +1362,7 @@ router.post('/:taskId/knowledge-base/files', authenticateToken, upload.array('fi
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1507,7 +1522,7 @@ router.delete('/:taskId/knowledge-base/files/:fileKey', authenticateToken, async
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1583,7 +1598,7 @@ router.delete('/:taskId/knowledge-base', authenticateToken, async (req: Request,
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1640,7 +1655,7 @@ router.put('/:id/knowledge-base-type', authenticateToken, async (req: Request, r
     }
 
     // Check if user owns the task
-    if (task.userId !== userId && !(req as AuthenticatedRequest).user?.isAdmin) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Not authorized to modify this task' });
     }
 
@@ -1795,7 +1810,7 @@ router.get("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1842,7 +1857,7 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
       return res.status(401).json({ message: 'User not found' });
     }
 
-    if (!user.isAdmin && task.userId !== userId) {
+    if (!hasTaskAccess(req, task)) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2398,7 +2413,8 @@ router.get('/executions/with-images', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'images', 'Error getting executions with images');
+    const ownerId = getEffectiveOwnerId(req) || userId;
+    const result = await getExecutionsWithAssets(ownerId, 'images', 'Error getting executions with images');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with images:', error);
@@ -2415,7 +2431,8 @@ router.get('/executions/with-videos', authenticateToken, async (req: Request, re
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'videos', 'Error getting executions with videos');
+    const ownerId = getEffectiveOwnerId(req) || userId;
+    const result = await getExecutionsWithAssets(ownerId, 'videos', 'Error getting executions with videos');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with videos:', error);
@@ -2432,7 +2449,8 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
+    const ownerId = getEffectiveOwnerId(req) || userId;
+    const result = await getExecutionsWithAssets(ownerId, 'html-reports', 'Error getting executions with HTML reports');
     res.json(result);
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);
