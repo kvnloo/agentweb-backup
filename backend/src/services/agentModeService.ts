@@ -991,6 +991,19 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
+            // Block non-admin users from invoking admin-only tools
+            if (!isAdmin && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
+              const errorMsg = `Tool "${toolCall.function.name}" is restricted to admin users only.`;
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: errorMsg }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
@@ -1856,7 +1869,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   /**
    * Get tools that are not associated with any published skill.
-   * Excludes foundation tools (always available without a skill).
+   * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
     // Collect all tool names used by any published skill
@@ -1865,11 +1878,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
+    // Build exclusion set: foundation tools + admin-only tools
+    const excludedTools = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
+    ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
+
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
 
     return allTools
-      .filter(tool => !associatedToolNames.has(tool.name) && !AgentModeService.FOUNDATION_TOOLS.has(tool.name))
+      .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
         name: tool.name,
         description: tool.definition?.function?.description || ''
