@@ -55,8 +55,6 @@ import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
-const { version } = require('../package.json');
-
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
 import { setupMcpOAuth } from "./mcp/oauth/oauthRoutes";
@@ -256,7 +254,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy", version });
+  res.status(200).json({ status: "healthy" });
 });
 
 export default app;
