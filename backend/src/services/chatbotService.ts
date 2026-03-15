@@ -3148,7 +3148,6 @@ export interface ChatResponseOptions {
   pageContent?: string;
   portalType?: "customer" | "partner";
   userId?: string;
-  isAdmin?: boolean;
   structuredContext?: string;
   screenshot?: string;
   model?: string;
@@ -3167,7 +3166,6 @@ export async function generateChatResponse(
     pageContent,
     portalType = "partner",
     userId,
-    isAdmin,
     structuredContext,
     screenshot,
     model,
@@ -3405,11 +3403,6 @@ export async function generateChatResponse(
         };
         if (pageToolMap[pageKey]) {
           toolsToInclude.push(...pageToolMap[pageKey]);
-        }
-
-        // Admin-only tools — loaded regardless of page when user is admin
-        if (isAdmin) {
-          toolsToInclude.push('list_predefined_work_plans', 'manage_predefined_work_plan');
         }
 
         const { mcpToolRegistry } = await import('../mcp/server/registry');
