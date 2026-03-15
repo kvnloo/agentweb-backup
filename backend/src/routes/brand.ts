@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import { authenticateToken, AuthenticatedRequest, getEffectiveOwnerId } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
@@ -66,13 +66,16 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
+    // Use effectiveOwnerId so team members share brand guidelines
+    const ownerId = getEffectiveOwnerId(req) || userId;
+
     const result = await dynamodb
       .query({
         TableName: `${TABLE_PREFIX}AW-Users`,
         IndexName: "UserIdIndex",
         KeyConditionExpression: "userId = :userId",
         ExpressionAttributeValues: {
-          ":userId": userId,
+          ":userId": ownerId,
         },
       })
       .promise();
@@ -124,6 +127,9 @@ router.post(
         return res.status(401).json({ error: "User ID not provided" });
       }
 
+      // Use effectiveOwnerId so team members share brand guidelines
+      const ownerId = getEffectiveOwnerId(req) || userId;
+
       const {
         primaryColor,
         primaryColorEnd,
@@ -160,7 +166,7 @@ router.post(
       if (files.logo && files.logo[0]) {
         const { url, key } = await uploadBrandFile(
           files.logo[0],
-          userId,
+          ownerId,
           "logo"
         );
         attachments.push({
@@ -174,7 +180,7 @@ router.post(
       if (files.secondaryLogo && files.secondaryLogo[0]) {
         const { url, key } = await uploadBrandFile(
           files.secondaryLogo[0],
-          userId,
+          ownerId,
           "logo"
         );
         attachments.push({
@@ -188,7 +194,7 @@ router.post(
       if (files.brandGuide && files.brandGuide[0]) {
         const { url, key } = await uploadBrandFile(
           files.brandGuide[0],
-          userId,
+          ownerId,
           "documents"
         );
         attachments.push({
@@ -201,7 +207,7 @@ router.post(
 
       if (files.additionalAssets) {
         for (const file of files.additionalAssets) {
-          const { url, key } = await uploadBrandFile(file, userId, "assets");
+          const { url, key } = await uploadBrandFile(file, ownerId, "assets");
           attachments.push({
             type: "asset",
             url,
@@ -226,7 +232,7 @@ router.post(
           IndexName: "UserIdIndex",
           KeyConditionExpression: "userId = :userId",
           ExpressionAttributeValues: {
-            ":userId": userId,
+            ":userId": ownerId,
           },
         })
         .promise();
@@ -378,6 +384,9 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
+    // Use effectiveOwnerId so team members share brand guidelines
+    const ownerId = getEffectiveOwnerId(req) || userId;
+
     // Get current user and brand guidelines
     const result = await dynamodb
       .query({
@@ -385,7 +394,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         IndexName: "UserIdIndex",
         KeyConditionExpression: "userId = :userId",
         ExpressionAttributeValues: {
-          ":userId": userId,
+          ":userId": ownerId,
         },
       })
       .promise();

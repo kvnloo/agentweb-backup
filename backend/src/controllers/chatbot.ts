@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { AuthenticatedRequest } from '../middleware/auth';
+import { AuthenticatedRequest, getEffectiveOwnerId } from '../middleware/auth';
 import { chatbotDb, generateChatResponse } from '../services/chatbotService';
 
 // Create a new chat session
@@ -9,6 +9,9 @@ export const createChatSession = async (req: AuthenticatedRequest, res: Response
     if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
+
+    // Use effectiveOwnerId so team members share sessions
+    const ownerId = getEffectiveOwnerId(req) || userId;
 
     const { pageContext, pageIdentifier } = req.body; // Extract pageIdentifier from body
     const portalQuery = req.query.portal as string | undefined;
@@ -28,9 +31,9 @@ export const createChatSession = async (req: AuthenticatedRequest, res: Response
     }
 
     const session = await chatbotDb.createChatSession(
-      userId, 
-      pageContext, 
-      portalType, 
+      ownerId,
+      pageContext,
+      portalType,
       pageIdentifier,
       undefined, // selectedStartupId
       undefined, // workflowId
@@ -54,8 +57,11 @@ export const listUserSessions = async (req: AuthenticatedRequest, res: Response)
       return res.status(401).json({ error: 'User not authenticated' });
     }
 
+    // Use effectiveOwnerId so team members see shared sessions
+    const ownerId = getEffectiveOwnerId(req) || userId;
+
     const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
-    const result = await chatbotDb.getUserSessions(userId, undefined, limitParam);
+    const result = await chatbotDb.getUserSessions(ownerId, undefined, limitParam);
     
     // Remove page content from response to reduce payload size
     const sanitizedSessions = result.sessions.map(session => {
@@ -77,9 +83,13 @@ export const listEmmaSessions = async (req: AuthenticatedRequest, res: Response)
     if (!userId) {
       return res.status(401).json({ error: 'User not authenticated' });
     }
+
+    // Use effectiveOwnerId so team members see shared sessions
+    const ownerId = getEffectiveOwnerId(req) || userId;
+
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
     const pageId = (req.query.pageIdentifier as string) || 'customer-portal';
-    const sessions = await chatbotDb.getEmmaSessions(userId, limit, pageId);
+    const sessions = await chatbotDb.getEmmaSessions(ownerId, limit, pageId);
     // Strip heavy fields not needed for the history list
     const sanitized = sessions.map(({ pageContent, contextChunks, ...rest }: any) => rest);
     res.status(200).json(sanitized);
@@ -99,12 +109,12 @@ export const getChatSession = async (req: AuthenticatedRequest, res: Response) =
       return res.status(404).json({ error: 'Chat session not found' });
     }
     
-    // Verify user has access to this session
-    const userId = req.user?.userId;
-    if (session.userId !== userId) {
+    // Verify user has access to this session — use effectiveOwnerId for team scoping
+    const ownerId = getEffectiveOwnerId(req);
+    if (session.userId !== ownerId) {
       return res.status(403).json({ error: 'Unauthorized access to chat session' });
     }
-    
+
     // Remove chunked context from response to reduce payload size
     const { contextChunks, ...sanitizedSession } = session;
     
@@ -142,12 +152,13 @@ export const sendMessage = async (req: AuthenticatedRequest, res: Response) => {
       return res.status(404).json({ error: 'Chat session not found' });
     }
     
-    // Verify user has access to this session
+    // Verify user has access to this session — use effectiveOwnerId for team scoping
     const userId = req.user?.userId;
-    if (session.userId !== userId) {
+    const ownerId = getEffectiveOwnerId(req);
+    if (session.userId !== ownerId) {
       return res.status(403).json({ error: 'Unauthorized access to chat session' });
     }
-    
+
     try {
       // Generate response
       const response = await generateChatResponse(sessionId, message, { currentUrl, pageContent: pageContext, portalType, userId, structuredContext, screenshot, model });
@@ -219,7 +230,8 @@ export const sendMessageStream = async (req: AuthenticatedRequest, res: Response
     return;
   }
 
-  if (session.userId !== userId) {
+  const streamOwnerId = getEffectiveOwnerId(req);
+  if (session.userId !== streamOwnerId) {
     res.status(403).json({ error: 'Unauthorized access to chat session' });
     return;
   }
@@ -284,12 +296,12 @@ export const deleteChatSession = async (req: AuthenticatedRequest, res: Response
       return res.status(404).json({ error: 'Chat session not found' });
     }
     
-    // Verify user has access to this session
-    const userId = req.user?.userId;
-    if (session.userId !== userId) {
+    // Verify user has access to this session — use effectiveOwnerId for team scoping
+    const ownerId = getEffectiveOwnerId(req);
+    if (session.userId !== ownerId) {
       return res.status(403).json({ error: 'Unauthorized access to chat session' });
     }
-    
+
     await chatbotDb.deleteSession(sessionId);
     res.status(204).send();
   } catch (error) {
