@@ -32,6 +32,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token-123',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 
@@ -106,6 +107,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token-456',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 
@@ -170,6 +172,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'correct-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 
@@ -193,6 +196,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 
@@ -216,6 +220,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 
@@ -278,6 +283,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 
@@ -307,6 +313,7 @@ describe('Agent Mode iShare Feedback', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       };
 

@@ -107,6 +107,7 @@ describe('filterMessagesForClient - Tool Calls Preservation', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
         createdAt: '2026-01-25T00:00:00Z',
         updatedAt: '2026-01-25T00:00:00Z',
@@ -168,6 +169,7 @@ describe('filterMessagesForClient - Tool Calls Preservation', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
         createdAt: '2026-01-25T00:00:00Z',
         updatedAt: '2026-01-25T00:00:00Z',
@@ -218,6 +220,7 @@ describe('filterMessagesForClient - Tool Calls Preservation', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'valid-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
         createdAt: '2026-01-25T00:00:00Z',
         updatedAt: '2026-01-25T00:00:00Z',

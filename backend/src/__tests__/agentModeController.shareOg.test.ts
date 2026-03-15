@@ -157,7 +157,7 @@ describe('Agent Mode Controller - getShareOgMetadata', () => {
         { role: 'user', content: 'Interactive chat content' },
       ],
       shareMetadata: { isShared: false },
-      interactiveShareMetadata: { isActive: true },
+      interactiveShareMetadata: { isActive: true, sharedAt: '2024-01-01T00:00:00Z', expiresAt: '2099-01-01T00:00:00Z' },
     });
     const req = mockRequest('session-1');
     const res = mockResponse();
