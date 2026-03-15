@@ -7,6 +7,25 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-15',
+    changes: [
+      'Feature: Share Links — Rich Social Media Previews',
+      '- Shared conversation links now show rich previews on Slack, LinkedIn, iMessage, and other platforms',
+      '- Previews include the conversation title and a snippet of the first message',
+      '- Powered by server-side OG meta tag injection for instant crawler support',
+    ],
+  },
+  {
+    date: '2026-03-15',
+    changes: [
+      'Feature: Interactive Share — Expiration & Internal-Only Warning',
+      '- Interactive share links now expire after a configurable number of days (default 7, max 365)',
+      '- New "Internal Use Only" warning in the share dialog explains the security implications of interactive sharing',
+      '- Expiration date is displayed on active interactive shares',
+      '- Expired links are automatically deactivated and return a clear "link has expired" message',
+    ],
+  },
+  {
     date: '2026-03-14',
     changes: [
       'Feature: Agent Mode — LinkedIn Comment Replies & Listing',
