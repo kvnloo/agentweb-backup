@@ -4552,7 +4552,8 @@ export const agentModeController = {
     try {
       const toolNames = [...agentModeService.getFoundationToolNames()];
       const defaults = [...AgentModeService.DEFAULT_FOUNDATION_TOOLS];
-      res.json({ toolNames, defaults });
+      const adminToolNames = agentModeService.getAdminToolNames();
+      res.json({ toolNames, defaults, adminToolNames });
     } catch (error) {
       console.error('AgentMode: Get foundation tools error:', error);
       res.status(500).json({ error: 'Failed to get foundation tools' });

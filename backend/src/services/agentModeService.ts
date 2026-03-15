@@ -1908,6 +1908,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
     return AgentModeService.FOUNDATION_TOOLS;
   }
 
+  public getAdminToolNames(): string[] {
+    return [...ADMIN_SKILL_TOOL_NAMES];
+  }
+
   /**
    * Load foundation tools from DB (AW-Settings). Falls back to DEFAULT_FOUNDATION_TOOLS.
    */
