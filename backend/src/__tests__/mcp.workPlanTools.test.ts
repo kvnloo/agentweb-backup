@@ -206,16 +206,10 @@ describe('Predefined Work Plan MCP Tools', () => {
   });
 });
 
-describe('Admin-only tool loading in chatbotService', () => {
-  // These tests verify that the admin-only tools are conditionally included
-  // by checking the toolsToInclude logic in generateChatResponse.
-  // We test this indirectly through the ChatResponseOptions interface.
-
-  it('should include work plan tools in ChatResponseOptions isAdmin type', async () => {
-    // Verify the interface accepts isAdmin
-    const { ChatResponseOptions } = await import('../services/chatbotService') as any;
-    // The import itself validates the type exists. We test the runtime behavior
-    // by checking that the tools are registered and available.
+describe('Admin tools are NOT in chatbotService', () => {
+  it('should not have isAdmin in ChatResponseOptions interface', async () => {
+    // Admin tools belong in Agent Mode only, not the Emma chatbot.
+    // Verify the tools are registered in mcpToolRegistry (for Agent Mode use).
     const names = mcpToolRegistry.getToolNames();
     expect(names).toContain('list_predefined_work_plans');
     expect(names).toContain('manage_predefined_work_plan');
