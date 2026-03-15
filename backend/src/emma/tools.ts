@@ -1,6 +1,6 @@
 import { agentModeService } from '../services/agentModeService';
 import { emmaToolRegistry } from './registry';
-import { accountMemoryDb } from '../services/db';
+import { accountMemoryDb, crmDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
 
 emmaToolRegistry.register({
@@ -248,6 +248,132 @@ For target person identification (send-invite, send-message, get-profile), pass 
       }
     }
     return await agentModeService.linkedinOutreach(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'linkedin_outreach_batch',
+  definition: {
+    name: 'linkedin_outreach_batch',
+    description: `Batch LinkedIn outreach: resolve leads from a lead list, personalize a message template with lead data, and send connection invites or messages in bulk.
+
+Template variables: {{firstName}}, {{lastName}}, {{company}}, {{title}} — replaced with each lead's data. Unknown variables produce a warning but are left as-is.
+
+Only leads with a non-empty 'linkedin' field are processed; others are skipped.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The Unipile account ID for the LinkedIn connection. Obtain via list_connected_accounts(platform=\'unipile\').'
+        },
+        action: {
+          type: 'string',
+          enum: ['send-invite', 'send-message'],
+          description: 'The outreach action: send-invite (connection request) or send-message (direct message).'
+        },
+        lead_list_id: {
+          type: 'string',
+          description: 'ID of the lead list to pull leads from.'
+        },
+        template: {
+          type: 'string',
+          description: 'Message template with {{firstName}}, {{lastName}}, {{company}}, {{title}} variables for personalization.'
+        },
+        max_leads: {
+          type: 'number',
+          description: 'Maximum number of leads to process. Defaults to all leads with LinkedIn URLs.'
+        }
+      },
+      required: ['account_id', 'action', 'lead_list_id', 'template']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    if (!context?.userId) {
+      throw new Error('Missing user context');
+    }
+
+    const { account_id, action, lead_list_id, template, max_leads } = args;
+
+    if (!lead_list_id) {
+      return { success: false, message: 'lead_list_id is required.' };
+    }
+
+    // Resolve lead list and verify ownership
+    const list = await crmDb.getLeadListById(lead_list_id);
+    if (!list || list.userId !== context.userId) {
+      return { success: false, message: 'Lead list not found or unauthorized.' };
+    }
+
+    // Fetch all leads from the list
+    const leadsResult = await crmDb.getLeadsByListId(lead_list_id);
+    const allLeads = leadsResult.items || [];
+
+    // Filter to leads with LinkedIn URLs
+    const linkedInLeads = allLeads.filter((lead: any) => {
+      const url = lead.data?.linkedin;
+      return url && typeof url === 'string' && url.trim().length > 0;
+    });
+
+    const skipped = allLeads.length - linkedInLeads.length;
+
+    // Apply max_leads limit
+    const leadsToProcess = max_leads && max_leads > 0
+      ? linkedInLeads.slice(0, max_leads)
+      : linkedInLeads;
+
+    // Detect unknown template variables
+    const knownVars = new Set(['firstName', 'lastName', 'company', 'title']);
+    const templateVarPattern = /\{\{(\w+)\}\}/g;
+    const warnings: string[] = [];
+    let match;
+    while ((match = templateVarPattern.exec(template)) !== null) {
+      if (!knownVars.has(match[1])) {
+        warnings.push(`Unknown template variable: {{${match[1]}}}`);
+      }
+    }
+
+    // Process each lead
+    let sent = 0;
+    let failed = 0;
+    const results: any[] = [];
+
+    for (const lead of leadsToProcess) {
+      const data = lead.data || {};
+      // Substitute template variables
+      const personalizedMessage = template
+        .replace(/\{\{firstName\}\}/g, data.firstName || '')
+        .replace(/\{\{lastName\}\}/g, data.lastName || '')
+        .replace(/\{\{company\}\}/g, data.company || '')
+        .replace(/\{\{title\}\}/g, data.title || '');
+
+      try {
+        const outreachResult = await agentModeService.linkedinOutreach(context.userId, {
+          action,
+          account_id,
+          profile_url: data.linkedin,
+          message: personalizedMessage,
+        });
+
+        if (outreachResult.success) {
+          sent++;
+          results.push({ leadId: lead.leadId, status: 'sent' });
+        } else {
+          failed++;
+          results.push({ leadId: lead.leadId, status: 'failed', error: outreachResult.message });
+        }
+      } catch (err) {
+        failed++;
+        results.push({ leadId: lead.leadId, status: 'failed', error: err instanceof Error ? err.message : 'Unknown error' });
+      }
+    }
+
+    return {
+      success: true,
+      summary: { sent, failed, skipped, total: allLeads.length },
+      results,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
 });
 
