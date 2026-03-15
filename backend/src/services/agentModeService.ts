@@ -14877,8 +14877,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      // Use 16K tokens for HTML generation to avoid truncation
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
+      // Use 64K tokens for HTML generation — reports like GTM audits can be 60KB+
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 65536);
 
       // Build system prompt for HTML generation
       const systemPrompt = `You are an expert web developer and HTML designer. Your task is to create a well-formatted, professional HTML document from the provided title and content draft.
