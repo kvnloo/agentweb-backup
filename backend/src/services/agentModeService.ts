@@ -600,7 +600,13 @@ export class AgentModeService {
   };
 
   async getSupportedModels() {
-    return Object.keys(this.llmModels);
+    const models = Object.keys(this.llmModels);
+    const defaultModel = await this.getDefaultModel();
+    // Put the default model first so frontends that use [0] pick the right one
+    if (defaultModel && models.includes(defaultModel)) {
+      return [defaultModel, ...models.filter(m => m !== defaultModel)];
+    }
+    return models;
   }
 
   async getReportsModelOptions(): Promise<string[]> {
