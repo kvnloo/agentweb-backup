@@ -377,6 +377,21 @@ describe('AgentModeService - Skills', () => {
       expect(result[0].name).toBe('tool_no_desc');
       expect(result[0].description).toBe('');
     });
+
+    it('should exclude admin-only tools from unassociated tools', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'regular_tool', definition: { function: { description: 'regular' } } },
+        { name: 'list_predefined_work_plans', definition: { function: { description: 'admin tool' } } },
+        { name: 'manage_predefined_work_plan', definition: { function: { description: 'admin tool 2' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('regular_tool');
+    });
   });
 
   describe('buildAvailableSkillsMessage', () => {
