@@ -22,7 +22,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -1789,7 +1789,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
             availableSkills.push({
               skillId: ADMIN_SKILL_VIRTUAL_ID,
               name: 'Admin Tools',
-              description: 'Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
+              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
               toolNames: ADMIN_SKILL_TOOL_NAMES,
               isPublished: true,
             } as any);
@@ -1975,7 +1975,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Add virtual admin skill for admin users (if not already installed)
     if (isAdmin && !associatedSet.has(ADMIN_SKILL_VIRTUAL_ID)) {
-      skillEntries.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools: Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
+      skillEntries.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools: Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
     }
 
     if (skillEntries.length === 0) return '';
@@ -2027,7 +2027,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           skills.push({
             skillId: ADMIN_SKILL_VIRTUAL_ID,
             name: 'Admin Tools',
-            description: 'Manage predefined work plans (list, create, update, delete). WARNING: modifies production configuration.',
+            description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: modifies production configuration.',
             installed: installedIds.has(ADMIN_SKILL_VIRTUAL_ID),
             toolNames: ADMIN_SKILL_TOOL_NAMES
           });
