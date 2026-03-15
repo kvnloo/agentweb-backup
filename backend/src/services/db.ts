@@ -31,6 +31,11 @@ AWS.config.update({
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 const CHAT_SESSIONS_TABLE = `${TABLE_PREFIX}AW-ChatSessions`;
 
+// Team tables
+export const TEAMS_TABLE = `${TABLE_PREFIX}AW-Teams`;
+export const TEAM_MEMBERS_TABLE = `${TABLE_PREFIX}AW-TeamMembers`;
+export const TEAM_INVITES_TABLE = `${TABLE_PREFIX}AW-TeamInvites`;
+
 // Initialize S3 client
 const s3 = new S3();
 
