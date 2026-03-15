@@ -7,6 +7,7 @@ import { waitlistDb } from "../services/waitlistDb";
 import { v4 as uuidv4 } from "uuid";
 import { emailService } from "../services/emailService";
 import crypto from "crypto";
+import { teamService } from "../services/teamService";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -145,12 +146,27 @@ export const login = async (req: Request, res: Response) => {
       // Don't fail login if lastLoginTime update fails
     }
 
-    const jwtPayload = {
+    // Look up team membership for JWT
+    let teamId: string | undefined;
+    try {
+      const memberships = await teamService.getTeamsForUser(user.userId);
+      const activeMembership = memberships.find((m) => m.status === "active");
+      if (activeMembership) {
+        teamId = activeMembership.teamId;
+      }
+    } catch {
+      // Team lookup failure should not break login
+    }
+
+    const jwtPayload: Record<string, any> = {
       userId: user.userId,
       email: user.email,
       roles: user.roles || [],
       isAdmin: user.isAdmin || false,
     };
+    if (teamId) {
+      jwtPayload.teamId = teamId;
+    }
     const token = jwt.sign(
       jwtPayload,
       process.env.JWT_SECRET || "your-secret-key",
