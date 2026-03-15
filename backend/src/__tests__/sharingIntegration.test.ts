@@ -135,7 +135,7 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body.conversableUrl).toContain(`/ishare/${sessionId}?conversable=`);
 
       // Verify createOrReuseInteractiveShare was called
-      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId, 7);
 
       // Step 3: Test view-only access
       const sessionWithBothShares = {
@@ -267,7 +267,7 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body).toHaveProperty('conversableUrl');
 
       // Verify createOrReuseInteractiveShare was called
-      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId, 7);
 
       // Verify shareMetadata was not touched
       expect(chatbotDb.updateSessionShareMetadata).not.toHaveBeenCalled();
