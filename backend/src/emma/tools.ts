@@ -138,11 +138,11 @@ emmaToolRegistry.register({
       const { userDb } = await import('../services/db');
       const currentUser = await userDb.getUserById(userId);
       if (currentUser?.isAdmin === true) {
-        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan'];
+        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
         availableSkills.push({
           skillId: '__admin_tools__',
           name: 'Admin Tools',
-          description: 'Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
+          description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
           toolNames: adminToolNames,
           toolCount: adminToolNames.length
         });
@@ -2769,7 +2769,7 @@ emmaToolRegistry.register({
   name: 'comment_on_linkedin_post',
   definition: {
     name: 'comment_on_linkedin_post',
-    description: 'Create a comment on a LinkedIn post using a connected LinkedIn account. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
+    description: 'Create a comment on a LinkedIn post, or reply to an existing comment, using a connected LinkedIn account. To reply to a specific comment (nested reply), provide the parent_comment_urn. CRITICAL: Always review the comment content with the user and get explicit approval before posting comments on LinkedIn.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2784,13 +2784,42 @@ emmaToolRegistry.register({
         comment_text: {
           type: 'string',
           description: 'The comment text content. Should be concise and relevant to the post.'
+        },
+        parent_comment_urn: {
+          type: 'string',
+          description: 'Optional. The URN of a parent comment to reply to (e.g., "urn:li:comment:(urn:li:ugcPost:123,456)"). When provided, the comment is posted as a nested reply under this comment instead of as a top-level comment.'
         }
       },
       required: ['account_id', 'post_urn', 'comment_text']
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text);
+    return await agentModeService.commentOnLinkedInPost(context?.userId, args.account_id, args.post_urn, args.comment_text, args.parent_comment_urn);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'list_linkedin_comments',
+  definition: {
+    name: 'list_linkedin_comments',
+    description: 'List comments on a LinkedIn post. Returns each comment\'s URN, author URN, text, and timestamp. Use this to find the comment_urn needed for replying to a specific comment via comment_on_linkedin_post with parent_comment_urn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'The connected LinkedIn account ID to use for fetching comments'
+        },
+        post_urn: {
+          type: 'string',
+          description: 'The LinkedIn post URN to list comments for (e.g., "urn:li:ugcPost:123456789" or "urn:li:share:987654321" or "urn:li:activity:123456789")'
+        }
+      },
+      required: ['account_id', 'post_urn']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.listLinkedInComments(context?.userId, args.account_id, args.post_urn);
   }
 });
 
@@ -3485,6 +3514,43 @@ emmaToolRegistry.register({
       args.files,
       context.userId,
       context.sessionId
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'write_clickup_doc',
+  definition: {
+    name: 'write_clickup_doc',
+    description: 'Create a new document in the user\'s ClickUp workspace. Use this when the user wants to save content (research, reports, documentation) directly to ClickUp. The workspace_id can be obtained from list_knowledge_base_files (ClickUp entries have identifiers like "clickup:WORKSPACE_ID").',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspace_id: {
+          type: 'string',
+          description: 'ClickUp workspace ID (get from list_knowledge_base_files, e.g., the part after "clickup:" in the identifier)'
+        },
+        name: {
+          type: 'string',
+          description: 'Document title'
+        },
+        content: {
+          type: 'string',
+          description: 'Document content (markdown)'
+        }
+      },
+      required: ['workspace_id', 'name', 'content']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    if (!context?.userId) {
+      throw new Error("Missing user context");
+    }
+    return await agentModeService.writeClickUpDoc(
+      args.workspace_id,
+      args.name,
+      args.content,
+      context.userId
     );
   }
 });
@@ -4415,6 +4481,8 @@ const bridgedToolNames = [
 const adminToolNames = [
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
+  'list_skills',
+  'manage_skill',
 ];
 
 for (const toolName of bridgedToolNames) {

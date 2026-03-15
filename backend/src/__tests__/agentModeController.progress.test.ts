@@ -79,7 +79,8 @@ describe('AgentMode Progress SSE Endpoints', () => {
     interactiveShareMetadata: {
       isActive: true,
       token: 'test-conversable-token',
-      sharedAt: '2024-01-01T00:00:00Z'
+      sharedAt: '2024-01-01T00:00:00Z',
+      expiresAt: '2099-01-01T00:00:00Z'
     }
   };
 

@@ -377,6 +377,23 @@ describe('AgentModeService - Skills', () => {
       expect(result[0].name).toBe('tool_no_desc');
       expect(result[0].description).toBe('');
     });
+
+    it('should exclude admin-only tools from unassociated tools', () => {
+      const publishedSkills: any[] = [];
+      const mockTools = [
+        { name: 'regular_tool', definition: { function: { description: 'regular' } } },
+        { name: 'list_predefined_work_plans', definition: { function: { description: 'admin tool' } } },
+        { name: 'manage_predefined_work_plan', definition: { function: { description: 'admin tool 2' } } },
+        { name: 'list_skills', definition: { function: { description: 'admin tool 3' } } },
+        { name: 'manage_skill', definition: { function: { description: 'admin tool 4' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+
+      const result = (agentModeService as any).getUnassociatedTools(publishedSkills);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].name).toBe('regular_tool');
+    });
   });
 
   describe('buildAvailableSkillsMessage', () => {
@@ -719,7 +736,12 @@ describe('AgentModeService - Skills', () => {
   });
 
   describe('getFoundationToolNames', () => {
-    it('should return a Set containing foundation tool names', () => {
+    beforeEach(() => {
+      // Reset to defaults before each test
+      (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+    });
+
+    it('should return a Set containing default foundation tool names', () => {
       const foundationTools = agentModeService.getFoundationToolNames();
 
       expect(foundationTools).toBeInstanceOf(Set);
@@ -743,6 +765,98 @@ describe('AgentModeService - Skills', () => {
       expect(foundationTools.has('generate_image')).toBe(false);
       expect(foundationTools.has('create_blog_article')).toBe(false);
       expect(foundationTools.has('create_social_media_posts')).toBe(false);
+    });
+  });
+
+  describe('loadFoundationTools', () => {
+    beforeEach(() => {
+      (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+    });
+
+    it('should load foundation tools from DB when setting exists', async () => {
+      const { settingsService } = require('../services/settingsService');
+      settingsService.getSetting = jest.fn().mockResolvedValue({
+        settingName: 'foundation_tools',
+        settingValue: JSON.stringify(['tool_a', 'tool_b', 'tool_c']),
+      });
+
+      await agentModeService.loadFoundationTools();
+
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.size).toBe(3);
+      expect(tools.has('tool_a')).toBe(true);
+      expect(tools.has('tool_b')).toBe(true);
+      expect(tools.has('tool_c')).toBe(true);
+      expect(tools.has('install_skills')).toBe(false);
+    });
+
+    it('should fall back to defaults when no DB setting exists', async () => {
+      const { settingsService } = require('../services/settingsService');
+      settingsService.getSetting = jest.fn().mockResolvedValue(null);
+
+      await agentModeService.loadFoundationTools();
+
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.has('install_skills')).toBe(true);
+      expect(tools.size).toBe(AgentModeService.DEFAULT_FOUNDATION_TOOLS.length);
+    });
+
+    it('should fall back to defaults when DB returns invalid JSON', async () => {
+      const { settingsService } = require('../services/settingsService');
+      settingsService.getSetting = jest.fn().mockResolvedValue({
+        settingName: 'foundation_tools',
+        settingValue: 'not-valid-json',
+      });
+
+      await agentModeService.loadFoundationTools();
+
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.has('install_skills')).toBe(true);
+      expect(tools.size).toBe(AgentModeService.DEFAULT_FOUNDATION_TOOLS.length);
+    });
+
+    it('should fall back to defaults when DB throws an error', async () => {
+      const { settingsService } = require('../services/settingsService');
+      settingsService.getSetting = jest.fn().mockRejectedValue(new Error('DynamoDB error'));
+
+      await agentModeService.loadFoundationTools();
+
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.has('install_skills')).toBe(true);
+    });
+  });
+
+  describe('updateFoundationTools', () => {
+    beforeEach(() => {
+      (AgentModeService as any).FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+    });
+
+    it('should update foundation tools in DB and in-memory', async () => {
+      const { settingsService } = require('../services/settingsService');
+      settingsService.setSetting = jest.fn().mockResolvedValue(undefined);
+
+      const result = await agentModeService.updateFoundationTools(['tool_x', 'tool_y'], 'admin@test.com');
+
+      expect(result).toEqual(['tool_x', 'tool_y']);
+      expect(settingsService.setSetting).toHaveBeenCalledWith(
+        'foundation_tools',
+        JSON.stringify(['tool_x', 'tool_y']),
+        expect.any(String),
+        'admin@test.com'
+      );
+      const tools = agentModeService.getFoundationToolNames();
+      expect(tools.size).toBe(2);
+      expect(tools.has('tool_x')).toBe(true);
+      expect(tools.has('tool_y')).toBe(true);
+    });
+
+    it('should deduplicate tool names', async () => {
+      const { settingsService } = require('../services/settingsService');
+      settingsService.setSetting = jest.fn().mockResolvedValue(undefined);
+
+      const result = await agentModeService.updateFoundationTools(['tool_a', 'tool_a', 'tool_b'], 'admin@test.com');
+
+      expect(result).toEqual(['tool_a', 'tool_b']);
     });
   });
 

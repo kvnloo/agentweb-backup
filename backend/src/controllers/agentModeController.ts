@@ -17,6 +17,20 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+/** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
+const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+
+/**
+ * Returns the effective expiration date for an interactive share.
+ * If expiresAt is set, use it. Otherwise, default to sharedAt + 7 days.
+ * If neither is set, returns a date in the past (treat as expired).
+ */
+function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: string }): Date {
+  if (share.expiresAt) return new Date(share.expiresAt);
+  if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
+  return new Date(0); // No dates at all — treat as expired
+}
+
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -1811,7 +1825,7 @@ export const agentModeController = {
   async createConversableShare(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId } = req.body;
+      const { sessionId, expirationDays: rawExpirationDays } = req.body;
 
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
@@ -1819,17 +1833,26 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Validate expirationDays (default 7, max 365)
+      const expirationDays = rawExpirationDays != null ? Number(rawExpirationDays) : 7;
+      if (!Number.isFinite(expirationDays) || expirationDays < 1 || expirationDays > 365) {
+        return res.status(400).json({ error: 'Expiration must be between 1 and 365 days' });
+      }
+
       // Use the common function to create or reuse interactive share
-      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
+      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays);
 
       // Extract the token from the URL for backward compatibility
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
 
+      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
+
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
-        conversableUrl: conversableUrl
+        conversableUrl: conversableUrl,
+        expiresAt: expiresAt
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
@@ -1898,6 +1921,16 @@ export const agentModeController = {
         // Remove share metadata if expired
         await chatbotDb.updateSessionShareMetadata(shareId, { isShared: false });
         return res.status(410).json({ error: 'Share link has expired' });
+      }
+
+      // Check if interactive share expired (including legacy shares without expiresAt)
+      if (conversable && hasInteractiveShare && session.interactiveShareMetadata &&
+          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, {
+          ...session.interactiveShareMetadata,
+          isActive: false
+        });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
       // If conversable token is provided, validate it
@@ -1976,6 +2009,16 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      // Check if interactive share has expired (including legacy shares without expiresAt)
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, {
+          ...interactiveShare,
+          isActive: false
+        });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -2370,6 +2413,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -2503,6 +2552,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -4274,6 +4329,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -4497,6 +4558,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -4544,6 +4611,87 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Update session title error:', error);
       res.status(500).json({ error: 'Failed to update session title' });
+    }
+  },
+
+  async getShareOgMetadata(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+
+      // Must have view-only or interactive sharing enabled
+      const hasViewOnlyShare = session.shareMetadata?.isShared;
+      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
+      if (!hasViewOnlyShare && !hasInteractiveShare) {
+        return res.status(404).json({ error: 'This conversation is not shared' });
+      }
+
+      // Check if view-only share expired
+      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+        return res.status(410).json({ error: 'Share link has expired' });
+      }
+
+      // Check if interactive share expired
+      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata &&
+          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
+      const title = session.title || 'AgentWeb Conversation';
+
+      // Extract first user message for description
+      let description = 'View this conversation on AgentWeb';
+      if (Array.isArray(session.messages)) {
+        const firstUserMessage = session.messages.find(
+          (m: any) => m && m.role === 'user' && typeof m.content === 'string'
+        );
+        if (firstUserMessage) {
+          const content = firstUserMessage.content.trim();
+          description = content.length > 160 ? content.substring(0, 157) + '...' : content;
+        }
+      }
+
+      res.json({ title, description });
+    } catch (error) {
+      console.error('AgentMode: Get share OG metadata error:', error);
+      res.status(500).json({ error: 'Failed to get share metadata' });
+    }
+  },
+
+  // GET /api/agent-mode/foundation-tools
+  getFoundationTools: async (req: Request, res: Response) => {
+    try {
+      const toolNames = [...agentModeService.getFoundationToolNames()];
+      const defaults = [...AgentModeService.DEFAULT_FOUNDATION_TOOLS];
+      const adminToolNames = agentModeService.getAdminToolNames();
+      res.json({ toolNames, defaults, adminToolNames });
+    } catch (error) {
+      console.error('AgentMode: Get foundation tools error:', error);
+      res.status(500).json({ error: 'Failed to get foundation tools' });
+    }
+  },
+
+  // PUT /api/agent-mode/foundation-tools
+  updateFoundationTools: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { toolNames } = req.body;
+      if (!Array.isArray(toolNames)) {
+        return res.status(400).json({ error: 'toolNames must be an array of strings' });
+      }
+      if (!toolNames.every((t: unknown) => typeof t === 'string' && t.length > 0)) {
+        return res.status(400).json({ error: 'Each tool name must be a non-empty string' });
+      }
+
+      const updatedBy = req.user?.email || 'admin';
+      const updated = await agentModeService.updateFoundationTools(toolNames, updatedBy);
+      res.json({ toolNames: updated });
+    } catch (error) {
+      console.error('AgentMode: Update foundation tools error:', error);
+      res.status(500).json({ error: 'Failed to update foundation tools' });
     }
   },
 };

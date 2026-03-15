@@ -1509,6 +1509,77 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Skill Management (admin-only) ──────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'list_skills',
+  definition: {
+    name: 'list_skills',
+    description: 'List all skill definitions. Returns each skill\'s ID, name, description, toolNames, systemPrompt, isPublished status, and extended fields. Admin-only.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/skills', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'manage_skill',
+  definition: {
+    name: 'manage_skill',
+    description: 'Create, update, delete, or get a skill definition. Admin only. CAUTION: These operations modify production skill configuration — changes affect which tools are available to users. Always confirm with the user before making changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'delete', 'get'], description: 'CRUD action' },
+        skill_id: { type: 'string', description: 'Skill ID (required for update/delete/get)' },
+        name: { type: 'string', description: 'Skill name (create/update)' },
+        description: { type: 'string', description: 'Skill description (create/update)' },
+        tool_names: { type: 'array', items: { type: 'string' }, description: 'Tool names included in this skill (create/update)' },
+        system_prompt: { type: 'string', description: 'System prompt injected when skill is installed (create/update)' },
+        is_published: { type: 'boolean', description: 'Whether the skill is visible to users (create/update)' }
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const c = ctx(context);
+    switch (args.action) {
+      case 'create': {
+        const body: any = { name: args.name, description: args.description, toolNames: args.tool_names || [] };
+        if (args.system_prompt !== undefined) body.systemPrompt = args.system_prompt;
+        if (args.is_published !== undefined) body.isPublished = args.is_published;
+        const data = await mcpFetch({ method: 'POST', path: '/api/skills', context: c, body });
+        return jsonResult(data);
+      }
+      case 'update': {
+        if (!args.skill_id) return jsonResult({ error: 'skill_id is required for update' });
+        const body: any = {};
+        if (args.name !== undefined) body.name = args.name;
+        if (args.description !== undefined) body.description = args.description;
+        if (args.tool_names !== undefined) body.toolNames = args.tool_names;
+        if (args.system_prompt !== undefined) body.systemPrompt = args.system_prompt;
+        if (args.is_published !== undefined) body.isPublished = args.is_published;
+        const data = await mcpFetch({ method: 'PUT', path: `/api/skills/${args.skill_id}`, context: c, body });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        if (!args.skill_id) return jsonResult({ error: 'skill_id is required for delete' });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/skills/${args.skill_id}`, context: c });
+        return jsonResult(data);
+      }
+      case 'get': {
+        if (!args.skill_id) return jsonResult({ error: 'skill_id is required for get' });
+        const data = await mcpFetch({ method: 'GET', path: `/api/skills/${args.skill_id}`, context: c });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${args.action}` });
+    }
+  }
+});
+
 mcpToolRegistry.register({
   name: 'save_file',
   internal: true,

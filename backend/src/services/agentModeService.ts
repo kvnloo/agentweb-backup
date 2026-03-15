@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
-import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent } from './clickupService';
+import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -22,7 +22,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -105,6 +105,7 @@ export class AgentModeService {
   }
 
   public async initialize() {
+    await this.loadFoundationTools();
     await this.registerTools();
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
@@ -600,7 +601,13 @@ export class AgentModeService {
   };
 
   async getSupportedModels() {
-    return Object.keys(this.llmModels);
+    const models = Object.keys(this.llmModels);
+    const defaultModel = await this.getDefaultModel();
+    // Put the default model first so frontends that use [0] pick the right one
+    if (defaultModel && models.includes(defaultModel)) {
+      return [defaultModel, ...models.filter(m => m !== defaultModel)];
+    }
+    return models;
   }
 
   async getReportsModelOptions(): Promise<string[]> {
@@ -984,6 +991,19 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
+            // Block non-admin users from invoking admin-only tools
+            if (!isAdmin && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
+              const errorMsg = `Tool "${toolCall.function.name}" is restricted to admin users only.`;
+              (messages as any[]).push({
+                tool_call_id: toolCall.id,
+                role: 'tool',
+                name: toolCall.function.name,
+                content: JSON.stringify({ error: errorMsg }),
+                metadata: { timestamp: new Date().toISOString() }
+              });
+              continue;
+            }
+
             if (publishedSkills.length > 0 && sessionAssociatedSkillIds.length > 0 && !allowedToolNames.has(toolCall.function.name)) {
               const errorMsg = `Tool "${toolCall.function.name}" is not available. You must install the required skill first using install_skills.`;
               (messages as any[]).push({
@@ -1348,6 +1368,7 @@ export class AgentModeService {
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
 - **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
 
@@ -1768,7 +1789,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
             availableSkills.push({
               skillId: ADMIN_SKILL_VIRTUAL_ID,
               name: 'Admin Tools',
-              description: 'Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
+              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
               toolNames: ADMIN_SKILL_TOOL_NAMES,
               isPublished: true,
             } as any);
@@ -1795,10 +1816,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  // Tools that are always available without installing a skill.
-  // These are Emma's core GTM infrastructure - context and discovery tools
-  // Made public for use in MCP server skill gating
-  public static readonly FOUNDATION_TOOLS = new Set([
+  // Default foundation tools — used as fallback when no DB override exists.
+  // These are Emma's core GTM infrastructure - context and discovery tools.
+  public static readonly DEFAULT_FOUNDATION_TOOLS: ReadonlyArray<string> = [
     // Discovery
     'install_skills',
     'list_available_skills',
@@ -1835,7 +1855,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
     'submit_scheduled_chat_variables'
-  ]);
+  ];
+
+  // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
+  // Made public for use in MCP server skill gating.
+  public static FOUNDATION_TOOLS: Set<string> = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+
+  private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
@@ -1843,7 +1869,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   /**
    * Get tools that are not associated with any published skill.
-   * Excludes foundation tools (always available without a skill).
+   * Excludes foundation tools and admin-only tools.
    */
   private getUnassociatedTools(publishedSkills: any[]): { name: string; description: string }[] {
     // Collect all tool names used by any published skill
@@ -1852,11 +1878,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
       skill.toolNames?.forEach((t: string) => associatedToolNames.add(t));
     });
 
+    // Build exclusion set: foundation tools + admin-only tools
+    const excludedTools = new Set<string>(AgentModeService.FOUNDATION_TOOLS);
+    ADMIN_SKILL_TOOL_NAMES.forEach(t => excludedTools.add(t));
+
     // Get all registered tools and find those not in any skill
     const allTools = this.toolRegistry.getAllTools();
 
     return allTools
-      .filter(tool => !associatedToolNames.has(tool.name) && !AgentModeService.FOUNDATION_TOOLS.has(tool.name))
+      .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
         name: tool.name,
         description: tool.definition?.function?.description || ''
@@ -1876,6 +1906,46 @@ When a user requests client onboarding or says "onboard new client" or similar:
    */
   public getFoundationToolNames(): Set<string> {
     return AgentModeService.FOUNDATION_TOOLS;
+  }
+
+  public getAdminToolNames(): string[] {
+    return [...ADMIN_SKILL_TOOL_NAMES];
+  }
+
+  /**
+   * Load foundation tools from DB (AW-Settings). Falls back to DEFAULT_FOUNDATION_TOOLS.
+   */
+  public async loadFoundationTools(): Promise<void> {
+    try {
+      const setting = await settingsService.getSetting(AgentModeService.FOUNDATION_TOOLS_SETTING);
+      if (setting?.settingValue) {
+        const toolNames: string[] = JSON.parse(setting.settingValue);
+        if (Array.isArray(toolNames) && toolNames.length > 0) {
+          AgentModeService.FOUNDATION_TOOLS = new Set(toolNames);
+          console.log(`AgentMode: Loaded ${toolNames.length} foundation tools from DB`);
+          return;
+        }
+      }
+    } catch (error) {
+      console.error('AgentMode: Error loading foundation tools from DB, using defaults:', error);
+    }
+    AgentModeService.FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+  }
+
+  /**
+   * Update foundation tools in DB and refresh the in-memory set.
+   */
+  public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
+    const unique = [...new Set(toolNames)];
+    await settingsService.setSetting(
+      AgentModeService.FOUNDATION_TOOLS_SETTING,
+      JSON.stringify(unique),
+      'Foundation tools - always available without installing a skill',
+      updatedBy
+    );
+    AgentModeService.FOUNDATION_TOOLS = new Set(unique);
+    console.log(`AgentMode: Updated foundation tools (${unique.length} tools) by ${updatedBy}`);
+    return unique;
   }
 
   /**
@@ -1909,7 +1979,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Add virtual admin skill for admin users (if not already installed)
     if (isAdmin && !associatedSet.has(ADMIN_SKILL_VIRTUAL_ID)) {
-      skillEntries.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools: Manage predefined work plans (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
+      skillEntries.push(`${ADMIN_SKILL_VIRTUAL_ID}- Admin Tools: Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care. Tools: ${ADMIN_SKILL_TOOL_NAMES.join(', ')}`);
     }
 
     if (skillEntries.length === 0) return '';
@@ -1961,7 +2031,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
           skills.push({
             skillId: ADMIN_SKILL_VIRTUAL_ID,
             name: 'Admin Tools',
-            description: 'Manage predefined work plans (list, create, update, delete). WARNING: modifies production configuration.',
+            description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: modifies production configuration.',
             installed: installedIds.has(ADMIN_SKILL_VIRTUAL_ID),
             toolNames: ADMIN_SKILL_TOOL_NAMES
           });
@@ -11342,6 +11412,42 @@ Format the response as JSON with this structure:
     }
   }
 
+  // Helper: create a new document in a ClickUp workspace
+  public async writeClickUpDoc(
+    workspaceId: string,
+    name: string,
+    content: string,
+    userId: string
+  ): Promise<{ success: boolean; message: string; docId?: string }> {
+    try {
+      const clickUpToken = await getClickUpAccessToken(userId);
+      if (!clickUpToken) {
+        return { success: false, message: 'ClickUp not connected' };
+      }
+
+      // Verify user has access to this workspace
+      const workspaces = await getClickUpWorkspaces(clickUpToken);
+      const workspace = workspaces.find(w => w.id === workspaceId);
+      if (!workspace) {
+        return { success: false, message: 'Not authorized to access this ClickUp workspace' };
+      }
+
+      const doc = await createClickUpDoc(clickUpToken, workspaceId, name, content);
+
+      return {
+        success: true,
+        message: `Successfully created ClickUp document "${name}" in workspace "${workspace.name}"`,
+        docId: doc.id,
+      };
+    } catch (error) {
+      console.error('AgentMode: Error creating ClickUp doc:', error);
+      return {
+        success: false,
+        message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
   // Web search functionality
   public async searchWeb(query: string, maxResults: number = 10): Promise<any> {
     try {
@@ -16505,7 +16611,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string): Promise<any> {
+  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
       accountId,
@@ -16555,7 +16661,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
 
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(account, postUrn, commentText, userId);
+        const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
 
         return {
           success: true,
@@ -16582,6 +16688,51 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         success: false,
         message: 'Failed to create comment',
         error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  async listLinkedInComments(userId: string, accountId: string, postUrn: string): Promise<any> {
+    console.log('[AgentMode] listLinkedInComments called:', { userId, accountId, postUrn });
+
+    try {
+      const { getAccountById } = await import('./connectedAccountsDb');
+      const { socialPlatformService } = await import('./socialPlatformService');
+
+      const account = await getAccountById(accountId, userId);
+      if (!account) {
+        return { success: false, message: 'Account not found or access denied' };
+      }
+
+      if (account.platform !== 'linkedin') {
+        return { success: false, message: 'Listing comments is currently only supported for LinkedIn accounts' };
+      }
+
+      const adapter = socialPlatformService.getAdapter(account.platform) as any;
+      if (!adapter.getComments) {
+        return { success: false, message: 'Listing comments is not supported for this platform' };
+      }
+
+      const comments = await adapter.getComments(account, postUrn, userId);
+
+      return {
+        success: true,
+        message: `Found ${comments.length} comment(s) on this post`,
+        comments: comments.map((c: any) => ({
+          comment_urn: c.commentUrn,
+          actor_urn: c.actorUrn,
+          text: c.text,
+          created_at: c.createdAt ? new Date(c.createdAt).toISOString() : null
+        }))
+      };
+    } catch (error: any) {
+      let message = error.message;
+      if (message.includes('access token expired')) {
+        message = 'Account token expired. Please reconnect the account in Settings.';
+      }
+      return {
+        success: false,
+        message: `Failed to list comments: ${message}`
       };
     }
   }

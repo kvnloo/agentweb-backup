@@ -27,6 +27,10 @@ const asyncHandlerAuth = (fn: (req: AuthenticatedRequest, res: Response) => Prom
 
 
 // Public routes (no authentication required)
+// GET /api/agent-mode/share/:shareId/og
+// Get OG metadata for shared conversation (public, lightweight)
+router.get('/share/:shareId/og', asyncHandler(agentModeController.getShareOgMetadata));
+
 // GET /api/agent-mode/share/:shareId
 // Get shared conversation (public)
 router.get('/share/:shareId', asyncHandler(agentModeController.getSharedConversation));
@@ -245,5 +249,13 @@ router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeCo
 // POST /api/agent-mode/scheduled-chats/:scheduleId/test-history/:runId/send-email
 // Send test notification email for a specific test history record
 router.post('/scheduled-chats/:scheduleId/test-history/:runId/send-email', asyncHandler(agentModeController.sendScheduledChatTestEmail));
+
+// GET /api/agent-mode/foundation-tools
+// Get foundation tools list (admin only)
+router.get('/foundation-tools', requireAdmin, asyncHandler(agentModeController.getFoundationTools));
+
+// PUT /api/agent-mode/foundation-tools
+// Update foundation tools list (admin only)
+router.put('/foundation-tools', requireAdmin, asyncHandlerAuth(agentModeController.updateFoundationTools));
 
 export default router;

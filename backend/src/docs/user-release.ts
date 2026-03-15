@@ -7,6 +7,70 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-15',
+    changes: [
+      'Feature: Agent Mode — Skill Management Admin Tools',
+      '- Emma can now list, create, update, and delete skill definitions via new admin-only tools (list_skills, manage_skill)',
+      '- Admin tools are only available in Agent Mode for admin users — they are no longer incorrectly loaded in the customer support sidebar chat',
+      '- The Skills page now dynamically loads admin tool names from the backend instead of hardcoding them',
+    ],
+  },
+  {
+    date: '2026-03-15',
+    changes: [
+      'Feature: Share Links — Rich Social Media Previews',
+      '- Shared conversation links now show rich previews on Slack, LinkedIn, iMessage, and other platforms',
+      '- Previews include the conversation title and a snippet of the first message',
+      '- Powered by server-side OG meta tag injection for instant crawler support',
+    ],
+  },
+  {
+    date: '2026-03-15',
+    changes: [
+      'Feature: Interactive Share — Expiration & Internal-Only Warning',
+      '- Interactive share links now expire after a configurable number of days (default 7, max 365)',
+      '- New "Internal Use Only" warning in the share dialog explains the security implications of interactive sharing',
+      '- Expiration date is displayed on active interactive shares',
+      '- Expired links are automatically deactivated and return a clear "link has expired" message',
+      '- Legacy interactive shares (created before this release) now expire 7 days after creation',
+      '- Expired share pages show login and sign-up buttons instead of redirecting',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
+      'Feature: Admin — Foundation Tools Management',
+      '- Foundation tools (always available without installing a skill) can now be managed from the Skills page',
+      '- New "Foundation Tools" row with edit button lets admins add/remove tools and reset to defaults',
+      '- Changes persist to DB and take effect immediately — no redeployment needed',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
+      'Feature: Agent Mode — LinkedIn Comment Replies & Listing',
+      '- Reply to specific LinkedIn comments as nested replies using the comment_on_linkedin_post tool with parent_comment_urn',
+      '- New list_linkedin_comments tool shows all comments on a post with URNs, authors, text, and timestamps',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
+      'Feature: Agent Mode — Write Documents to ClickUp',
+      '- Emma can now create new documents directly in your connected ClickUp workspace',
+      '- Use the "write_clickup_doc" tool (via the Knowledge Base skill) to save research, reports, or documentation to ClickUp',
+      '- Documents are created at the workspace root for maximum compatibility',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
+      'Fix: Partner Portal — Edit Skill Shows All Selected Tools',
+      '- The Edit Skill popup now displays all tools assigned to a skill, including tools that may have been removed from the codebase',
+      '- Previously, removed tools were silently hidden, making them impossible to deselect',
+    ],
+  },
+  {
     date: '2026-03-14',
     changes: [
       'Fix: Agent Mode — Resolved CRM Session Crash and Enrichment Reliability',

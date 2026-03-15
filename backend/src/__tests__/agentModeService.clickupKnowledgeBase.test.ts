@@ -18,6 +18,7 @@ const mockListDocs = jest.fn();
 const mockReadDocContent = jest.fn();
 const mockListTasks = jest.fn();
 const mockReadTaskContent = jest.fn();
+const mockCreateDoc = jest.fn();
 jest.mock('../services/clickupService', () => ({
   getAccessToken: (...args: any[]) => mockGetAccessToken(...args),
   getWorkspaces: (...args: any[]) => mockGetWorkspaces(...args),
@@ -25,6 +26,7 @@ jest.mock('../services/clickupService', () => ({
   readDocContent: (...args: any[]) => mockReadDocContent(...args),
   listTasks: (...args: any[]) => mockListTasks(...args),
   readTaskContent: (...args: any[]) => mockReadTaskContent(...args),
+  createDoc: (...args: any[]) => mockCreateDoc(...args),
 }));
 
 // Mock userDb (needed by getUserGoogleDriveFolders in listKnowledgeBaseFiles)
@@ -453,5 +455,49 @@ describe('AgentModeService - ClickUp Knowledge Base', () => {
       const result = await (agentModeService as any).searchKnowledgeBase('test', 5, 'user-123');
       expect(result.success).toBe(true);
     });
+  });
+
+  // ============================================
+  // writeClickUpDoc tests
+  // ============================================
+
+  describe('writeClickUpDoc', () => {
+    it('should return error when ClickUp is not connected', async () => {
+      mockGetAccessToken.mockResolvedValue(null);
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', '# Content', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('ClickUp not connected');
+    });
+
+    it('should return error when workspace is not accessible', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-other', name: 'Other' }]);
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', '# Content', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toBe('Not authorized to access this ClickUp workspace');
+    });
+
+    it('should successfully create a ClickUp doc', async () => {
+      mockGetAccessToken.mockResolvedValue('ck_token');
+      mockGetWorkspaces.mockResolvedValue([{ id: 'ws-1', name: 'Test Workspace' }]);
+      mockCreateDoc.mockResolvedValue({ id: 'doc-new-1', name: 'New Doc' });
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', '# Hello\n\nWorld', 'user-123');
+      expect(result.success).toBe(true);
+      expect(result.docId).toBe('doc-new-1');
+      expect(result.message).toContain('New Doc');
+      expect(mockCreateDoc).toHaveBeenCalledWith('ck_token', 'ws-1', 'New Doc', '# Hello\n\nWorld');
+    });
+
+    it('should handle API errors gracefully', async () => {
+      mockGetAccessToken.mockRejectedValue(new Error('API Error'));
+
+      const result = await (agentModeService as any).writeClickUpDoc('ws-1', 'New Doc', 'content', 'user-123');
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Failed to create ClickUp document');
+    });
+
   });
 });

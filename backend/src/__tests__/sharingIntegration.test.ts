@@ -135,16 +135,17 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body.conversableUrl).toContain(`/ishare/${sessionId}?conversable=`);
 
       // Verify createOrReuseInteractiveShare was called
-      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId, 7);
 
       // Step 3: Test view-only access
       const sessionWithBothShares = {
         ...mockSession,
         shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: 'test-token', 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -222,10 +223,11 @@ describe('Sharing Integration Tests', () => {
       const lastCall = (chatbotDb.updateSessionInteractiveShareMetadata as jest.Mock).mock.calls.slice(-1)[0];
       expect(lastCall).toEqual([
         sessionId,
-        { 
+        {
           isActive: false,
           sharedAt: "2024-01-01T00:00:00Z",
-          token: "test-token"
+          token: "test-token",
+          expiresAt: "2099-01-01T00:00:00Z"
         }
       ]);
 
@@ -267,7 +269,7 @@ describe('Sharing Integration Tests', () => {
       expect(interactiveResponse.body).toHaveProperty('conversableUrl');
 
       // Verify createOrReuseInteractiveShare was called
-      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId);
+      expect(chatbotDb.createOrReuseInteractiveShare).toHaveBeenCalledWith(sessionId, 7);
 
       // Verify shareMetadata was not touched
       expect(chatbotDb.updateSessionShareMetadata).not.toHaveBeenCalled();
@@ -285,10 +287,11 @@ describe('Sharing Integration Tests', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: 'test-token', 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -302,10 +305,11 @@ describe('Sharing Integration Tests', () => {
       // Verify only interactiveShareMetadata was updated
       expect(chatbotDb.updateSessionInteractiveShareMetadata).toHaveBeenCalledWith(
         sessionId,
-        { 
+        {
           isActive: false,
           sharedAt: "2024-01-01T00:00:00Z",
-          token: "test-token"
+          token: "test-token",
+          expiresAt: "2099-01-01T00:00:00Z"
         }
       );
 
@@ -345,10 +349,11 @@ describe('Sharing Integration Tests', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: false },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: 'valid-token', 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'valid-token',
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -388,10 +393,11 @@ describe('Sharing Integration Tests', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: 'test-token', 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'test-token',
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -489,7 +495,8 @@ describe('Sharing Integration Tests', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'test-token',
-          sharedAt: '2024-01-01T00:00:00Z'
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         },
         workPlan: mockWorkPlan
       };
@@ -534,7 +541,8 @@ describe('Sharing Integration Tests', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'test-token',
-          sharedAt: '2024-01-01T00:00:00Z'
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 

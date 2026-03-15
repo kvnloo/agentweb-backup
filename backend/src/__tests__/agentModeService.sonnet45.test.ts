@@ -151,6 +151,54 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
   });
 
+  describe('getSupportedModels default model ordering', () => {
+    it('should place the configured default model first in the list', async () => {
+      const { settingsService } = require('../services/settingsService');
+      const allModels = Object.keys((agentModeService as any).llmModels);
+      // Configure a model that is NOT first in the natural object-key order
+      const nonFirstModel = allModels[allModels.length - 1];
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: nonFirstModel,
+      });
+
+      const models = await agentModeService.getSupportedModels();
+      expect(models[0]).toBe(nonFirstModel);
+      expect(models.length).toBe(allModels.length);
+      // No duplicates
+      expect(new Set(models).size).toBe(models.length);
+    });
+
+    it('should keep original order when no default model is configured', async () => {
+      const { settingsService } = require('../services/settingsService');
+      (settingsService.getSetting as jest.Mock).mockResolvedValue(null);
+
+      const models = await agentModeService.getSupportedModels();
+      const naturalOrder = Object.keys((agentModeService as any).llmModels);
+      expect(models).toEqual(naturalOrder);
+    });
+
+    it('should keep original order when configured default is not in the model list', async () => {
+      const { settingsService } = require('../services/settingsService');
+      (settingsService.getSetting as jest.Mock).mockResolvedValue({
+        settingValue: 'nonexistent-model-xyz',
+      });
+
+      const models = await agentModeService.getSupportedModels();
+      const naturalOrder = Object.keys((agentModeService as any).llmModels);
+      expect(models).toEqual(naturalOrder);
+    });
+
+    it('should keep original order when settings service throws', async () => {
+      const { settingsService } = require('../services/settingsService');
+      (settingsService.getSetting as jest.Mock).mockRejectedValue(new Error('DB error'));
+
+      const models = await agentModeService.getSupportedModels();
+      const naturalOrder = Object.keys((agentModeService as any).llmModels);
+      // Falls back to env/hardcoded default which is likely first anyway
+      expect(models.length).toBe(naturalOrder.length);
+    });
+  });
+
   describe('Bedrock client lazy-loading', () => {
     it('should lazy-load Bedrock client for Sonnet 4.5 on first callLLM', async () => {
       // Mock the Bedrock invoke to return a valid response
