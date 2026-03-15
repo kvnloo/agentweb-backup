@@ -105,6 +105,7 @@ export class AgentModeService {
   }
 
   public async initialize() {
+    await this.loadFoundationTools();
     await this.registerTools();
     if (process.env.IS_MCP_SERVER !== 'true') {
       await this.initializeMcp();
@@ -1802,10 +1803,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
-  // Tools that are always available without installing a skill.
-  // These are Emma's core GTM infrastructure - context and discovery tools
-  // Made public for use in MCP server skill gating
-  public static readonly FOUNDATION_TOOLS = new Set([
+  // Default foundation tools — used as fallback when no DB override exists.
+  // These are Emma's core GTM infrastructure - context and discovery tools.
+  public static readonly DEFAULT_FOUNDATION_TOOLS: ReadonlyArray<string> = [
     // Discovery
     'install_skills',
     'list_available_skills',
@@ -1842,7 +1842,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
     'submit_scheduled_chat_variables'
-  ]);
+  ];
+
+  // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
+  // Made public for use in MCP server skill gating.
+  public static FOUNDATION_TOOLS: Set<string> = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+
+  private static readonly FOUNDATION_TOOLS_SETTING = 'foundation_tools';
 
   // Subset of foundation tools that must execute for real in mock/benchmark mode
   // because they modify session state (no external side effects).
@@ -1883,6 +1889,42 @@ When a user requests client onboarding or says "onboard new client" or similar:
    */
   public getFoundationToolNames(): Set<string> {
     return AgentModeService.FOUNDATION_TOOLS;
+  }
+
+  /**
+   * Load foundation tools from DB (AW-Settings). Falls back to DEFAULT_FOUNDATION_TOOLS.
+   */
+  public async loadFoundationTools(): Promise<void> {
+    try {
+      const setting = await settingsService.getSetting(AgentModeService.FOUNDATION_TOOLS_SETTING);
+      if (setting?.settingValue) {
+        const toolNames: string[] = JSON.parse(setting.settingValue);
+        if (Array.isArray(toolNames) && toolNames.length > 0) {
+          AgentModeService.FOUNDATION_TOOLS = new Set(toolNames);
+          console.log(`AgentMode: Loaded ${toolNames.length} foundation tools from DB`);
+          return;
+        }
+      }
+    } catch (error) {
+      console.error('AgentMode: Error loading foundation tools from DB, using defaults:', error);
+    }
+    AgentModeService.FOUNDATION_TOOLS = new Set(AgentModeService.DEFAULT_FOUNDATION_TOOLS);
+  }
+
+  /**
+   * Update foundation tools in DB and refresh the in-memory set.
+   */
+  public async updateFoundationTools(toolNames: string[], updatedBy: string): Promise<string[]> {
+    const unique = [...new Set(toolNames)];
+    await settingsService.setSetting(
+      AgentModeService.FOUNDATION_TOOLS_SETTING,
+      JSON.stringify(unique),
+      'Foundation tools - always available without installing a skill',
+      updatedBy
+    );
+    AgentModeService.FOUNDATION_TOOLS = new Set(unique);
+    console.log(`AgentMode: Updated foundation tools (${unique.length} tools) by ${updatedBy}`);
+    return unique;
   }
 
   /**

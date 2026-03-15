@@ -4546,4 +4546,36 @@ export const agentModeController = {
       res.status(500).json({ error: 'Failed to update session title' });
     }
   },
+
+  // GET /api/agent-mode/foundation-tools
+  getFoundationTools: async (req: Request, res: Response) => {
+    try {
+      const toolNames = [...agentModeService.getFoundationToolNames()];
+      const defaults = [...AgentModeService.DEFAULT_FOUNDATION_TOOLS];
+      res.json({ toolNames, defaults });
+    } catch (error) {
+      console.error('AgentMode: Get foundation tools error:', error);
+      res.status(500).json({ error: 'Failed to get foundation tools' });
+    }
+  },
+
+  // PUT /api/agent-mode/foundation-tools
+  updateFoundationTools: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { toolNames } = req.body;
+      if (!Array.isArray(toolNames)) {
+        return res.status(400).json({ error: 'toolNames must be an array of strings' });
+      }
+      if (!toolNames.every((t: unknown) => typeof t === 'string' && t.length > 0)) {
+        return res.status(400).json({ error: 'Each tool name must be a non-empty string' });
+      }
+
+      const updatedBy = req.user?.email || 'admin';
+      const updated = await agentModeService.updateFoundationTools(toolNames, updatedBy);
+      res.json({ toolNames: updated });
+    } catch (error) {
+      console.error('AgentMode: Update foundation tools error:', error);
+      res.status(500).json({ error: 'Failed to update foundation tools' });
+    }
+  },
 };
