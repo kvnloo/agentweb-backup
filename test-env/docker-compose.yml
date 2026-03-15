@@ -38,6 +38,8 @@ services:
         VITE_DEBUG: "true"
     ports:
       - "5174:5174"
+    environment:
+      - API_URL=http://backend:3001
     depends_on:
       - backend
     restart: unless-stopped
