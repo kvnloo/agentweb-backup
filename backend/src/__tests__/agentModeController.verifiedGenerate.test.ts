@@ -10,7 +10,13 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
     createOrReuseInteractiveShare: jest.fn(),
+    updateGenerationStatus: jest.fn().mockResolvedValue({}),
+    getActiveGenerations: jest.fn().mockResolvedValue({ count: 0, sessionIds: [] }),
   },
+}));
+
+jest.mock('../services/concurrencyGate', () => ({
+  checkConcurrencyGate: jest.fn().mockResolvedValue({ allowed: true, activeCount: 0, limit: 3, activeSessionIds: [] }),
 }));
 
 jest.mock('../services/agentModeService', () => ({
