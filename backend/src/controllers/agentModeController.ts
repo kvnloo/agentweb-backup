@@ -17,6 +17,20 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+/** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
+const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
+
+/**
+ * Returns the effective expiration date for an interactive share.
+ * If expiresAt is set, use it. Otherwise, default to sharedAt + 7 days.
+ * If neither is set, returns a date in the past (treat as expired).
+ */
+function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: string }): Date {
+  if (share.expiresAt) return new Date(share.expiresAt);
+  if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
+  return new Date(0); // No dates at all — treat as expired
+}
+
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
 async function syncEmailCampaignExecution(
   userId: string,
@@ -1909,9 +1923,9 @@ export const agentModeController = {
         return res.status(410).json({ error: 'Share link has expired' });
       }
 
-      // Check if interactive share expired
-      if (conversable && hasInteractiveShare && session.interactiveShareMetadata?.expiresAt &&
-          new Date() > new Date(session.interactiveShareMetadata.expiresAt)) {
+      // Check if interactive share expired (including legacy shares without expiresAt)
+      if (conversable && hasInteractiveShare && session.interactiveShareMetadata &&
+          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
         await chatbotDb.updateSessionInteractiveShareMetadata(shareId, {
           ...session.interactiveShareMetadata,
           isActive: false
@@ -1996,8 +2010,8 @@ export const agentModeController = {
 
       const interactiveShare = session.interactiveShareMetadata;
 
-      // Check if interactive share has expired
-      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+      // Check if interactive share has expired (including legacy shares without expiresAt)
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
         await chatbotDb.updateSessionInteractiveShareMetadata(shareId, {
           ...interactiveShare,
           isActive: false
@@ -2400,7 +2414,7 @@ export const agentModeController = {
 
       const interactiveShare = session.interactiveShareMetadata;
 
-      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
         await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
         return res.status(410).json({ error: 'Interactive share link has expired' });
       }
@@ -2539,7 +2553,7 @@ export const agentModeController = {
 
       const interactiveShare = session.interactiveShareMetadata;
 
-      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
         await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
         return res.status(410).json({ error: 'Interactive share link has expired' });
       }
@@ -4316,7 +4330,7 @@ export const agentModeController = {
 
       const interactiveShare = session.interactiveShareMetadata;
 
-      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
         await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
         return res.status(410).json({ error: 'Interactive share link has expired' });
       }
@@ -4545,7 +4559,7 @@ export const agentModeController = {
 
       const interactiveShare = session.interactiveShareMetadata;
 
-      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
         await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
         return res.status(410).json({ error: 'Interactive share link has expired' });
       }
@@ -4622,8 +4636,8 @@ export const agentModeController = {
       }
 
       // Check if interactive share expired
-      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata?.expiresAt &&
-          new Date() > new Date(session.interactiveShareMetadata.expiresAt)) {
+      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata &&
+          new Date() > getInteractiveShareExpiresAt(session.interactiveShareMetadata)) {
         return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
