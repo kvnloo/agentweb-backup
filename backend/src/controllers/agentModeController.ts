@@ -4546,4 +4546,46 @@ export const agentModeController = {
       res.status(500).json({ error: 'Failed to update session title' });
     }
   },
+
+  async getShareOgMetadata(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+
+      // Must have view-only or interactive sharing enabled
+      const hasViewOnlyShare = session.shareMetadata?.isShared;
+      const hasInteractiveShare = session.interactiveShareMetadata?.isActive;
+      if (!hasViewOnlyShare && !hasInteractiveShare) {
+        return res.status(404).json({ error: 'This conversation is not shared' });
+      }
+
+      // Check if view-only share expired
+      if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
+        return res.status(410).json({ error: 'Share link has expired' });
+      }
+
+      const title = session.title || 'AgentWeb Conversation';
+
+      // Extract first user message for description
+      let description = 'View this conversation on AgentWeb';
+      if (Array.isArray(session.messages)) {
+        const firstUserMessage = session.messages.find(
+          (m: any) => m && m.role === 'user' && typeof m.content === 'string'
+        );
+        if (firstUserMessage) {
+          const content = firstUserMessage.content.trim();
+          description = content.length > 160 ? content.substring(0, 157) + '...' : content;
+        }
+      }
+
+      res.json({ title, description });
+    } catch (error) {
+      console.error('AgentMode: Get share OG metadata error:', error);
+      res.status(500).json({ error: 'Failed to get share metadata' });
+    }
+  },
 };

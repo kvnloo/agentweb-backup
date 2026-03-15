@@ -27,6 +27,10 @@ const asyncHandlerAuth = (fn: (req: AuthenticatedRequest, res: Response) => Prom
 
 
 // Public routes (no authentication required)
+// GET /api/agent-mode/share/:shareId/og
+// Get OG metadata for shared conversation (public, lightweight)
+router.get('/share/:shareId/og', asyncHandler(agentModeController.getShareOgMetadata));
+
 // GET /api/agent-mode/share/:shareId
 // Get shared conversation (public)
 router.get('/share/:shareId', asyncHandler(agentModeController.getSharedConversation));
