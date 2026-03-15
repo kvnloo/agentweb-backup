@@ -1811,7 +1811,7 @@ export const agentModeController = {
   async createConversableShare(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId } = req.body;
+      const { sessionId, expirationDays: rawExpirationDays } = req.body;
 
       // Verify the session belongs to the user
       const session = await chatbotDb.getChatSession(sessionId);
@@ -1819,17 +1819,26 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Validate expirationDays (default 7, max 365)
+      const expirationDays = rawExpirationDays != null ? Number(rawExpirationDays) : 7;
+      if (!Number.isFinite(expirationDays) || expirationDays < 1 || expirationDays > 365) {
+        return res.status(400).json({ error: 'Expiration must be between 1 and 365 days' });
+      }
+
       // Use the common function to create or reuse interactive share
-      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId);
+      const conversableUrl = await chatbotDb.createOrReuseInteractiveShare(sessionId, expirationDays);
 
       // Extract the token from the URL for backward compatibility
       const urlParams = new URL(conversableUrl).searchParams;
       const conversableToken = urlParams.get('conversable') || '';
 
+      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
+
       res.status(200).json({
         shareId: sessionId,
         conversableToken: conversableToken,
-        conversableUrl: conversableUrl
+        conversableUrl: conversableUrl,
+        expiresAt: expiresAt
       });
     } catch (error) {
       console.error('AgentMode: Create conversable share error:', error);
@@ -1898,6 +1907,16 @@ export const agentModeController = {
         // Remove share metadata if expired
         await chatbotDb.updateSessionShareMetadata(shareId, { isShared: false });
         return res.status(410).json({ error: 'Share link has expired' });
+      }
+
+      // Check if interactive share expired
+      if (conversable && hasInteractiveShare && session.interactiveShareMetadata?.expiresAt &&
+          new Date() > new Date(session.interactiveShareMetadata.expiresAt)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, {
+          ...session.interactiveShareMetadata,
+          isActive: false
+        });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
       // If conversable token is provided, validate it
@@ -1976,6 +1995,16 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      // Check if interactive share has expired
+      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, {
+          ...interactiveShare,
+          isActive: false
+        });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -2370,6 +2399,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -2503,6 +2538,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -4274,6 +4315,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -4497,6 +4544,12 @@ export const agentModeController = {
       }
 
       const interactiveShare = session.interactiveShareMetadata;
+
+      if (interactiveShare?.expiresAt && new Date() > new Date(interactiveShare.expiresAt)) {
+        await chatbotDb.updateSessionInteractiveShareMetadata(shareId, { ...interactiveShare, isActive: false });
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
       if (!interactiveShare?.isActive || interactiveShare.token !== conversable) {
         return res.status(401).json({ error: 'Invalid or expired conversable token' });
       }
@@ -4566,6 +4619,12 @@ export const agentModeController = {
       // Check if view-only share expired
       if (hasViewOnlyShare && session.shareMetadata?.expiresAt && new Date() > new Date(session.shareMetadata.expiresAt)) {
         return res.status(410).json({ error: 'Share link has expired' });
+      }
+
+      // Check if interactive share expired
+      if (!hasViewOnlyShare && hasInteractiveShare && session.interactiveShareMetadata?.expiresAt &&
+          new Date() > new Date(session.interactiveShareMetadata.expiresAt)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
       }
 
       const title = session.title || 'AgentWeb Conversation';

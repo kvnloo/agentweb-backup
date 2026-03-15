@@ -147,6 +147,7 @@ export interface ChatSession {
     isActive: boolean;
     token?: string;
     sharedAt?: string;
+    expiresAt?: string;
   };
   workPlan?: {
     title: string;
@@ -1988,7 +1989,7 @@ export class ChatbotDB {
 
   async updateSessionInteractiveShareMetadata(
     sessionId: string,
-    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string }
+    interactiveShareMetadata: { isActive: boolean; token?: string; sharedAt?: string; expiresAt?: string }
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
 
@@ -2401,7 +2402,7 @@ export class ChatbotDB {
   }
 
   // Common function to create or reuse interactive share for a session
-  async createOrReuseInteractiveShare(sessionId: string): Promise<string> {
+  async createOrReuseInteractiveShare(sessionId: string, expirationDays: number = 7): Promise<string> {
     try {
       // First, get the current session to check if it already has an interactive share
       const session = await this.getChatSession(sessionId);
@@ -2419,10 +2420,12 @@ export class ChatbotDB {
       const crypto = require('crypto');
       const conversableToken = crypto.randomBytes(32).toString('hex');
       
+      const expiresAt = new Date(Date.now() + expirationDays * 86400000).toISOString();
       const interactiveShareMetadata = {
         isActive: true,
         token: conversableToken,
-        sharedAt: new Date().toISOString()
+        sharedAt: new Date().toISOString(),
+        expiresAt
       };
       
       await this.updateSessionInteractiveShareMetadata(sessionId, interactiveShareMetadata);
