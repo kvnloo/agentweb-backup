@@ -436,6 +436,7 @@ describe('AgentModeController - Error Handling', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'test-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       } as any);
 
@@ -477,6 +478,7 @@ describe('AgentModeController - Error Handling', () => {
         interactiveShareMetadata: {
           isActive: true,
           token: 'test-token',
+          expiresAt: '2099-01-01T00:00:00Z',
         },
       } as any);
 

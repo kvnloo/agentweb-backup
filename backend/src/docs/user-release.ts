@@ -32,6 +32,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- New "Internal Use Only" warning in the share dialog explains the security implications of interactive sharing',
       '- Expiration date is displayed on active interactive shares',
       '- Expired links are automatically deactivated and return a clear "link has expired" message',
+      '- Legacy interactive shares (created before this release) now expire 7 days after creation',
+      '- Expired share pages show login and sign-up buttons instead of redirecting',
     ],
   },
   {

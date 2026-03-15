@@ -489,10 +489,11 @@ describe('AgentMode Sharing Controller', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: conversableToken, 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: conversableToken,
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -519,10 +520,11 @@ describe('AgentMode Sharing Controller', () => {
           createdAt: '2024-01-01T00:00:00Z',
           updatedAt: '2024-01-01T00:00:00Z',
           shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-          interactiveShareMetadata: { 
-            isActive: true, 
-            token: conversableToken, 
-            sharedAt: '2024-01-01T00:00:00Z' 
+          interactiveShareMetadata: {
+            isActive: true,
+            token: conversableToken,
+            sharedAt: '2024-01-01T00:00:00Z',
+            expiresAt: '2099-01-01T00:00:00Z'
           },
           isConversable: true,
           llmModel: 'gpt-5-chat-2'
@@ -586,10 +588,11 @@ describe('AgentMode Sharing Controller', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: false },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: 'valid-token', 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'valid-token',
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -698,10 +701,11 @@ describe('AgentMode Sharing Controller', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: true, sharedAt: '2024-01-01T00:00:00Z' },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: conversableToken, 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: conversableToken,
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 
@@ -770,10 +774,11 @@ describe('AgentMode Sharing Controller', () => {
         portalType: 'agent',
         pageIdentifier: 'agent-mode',
         shareMetadata: { isShared: false },
-        interactiveShareMetadata: { 
-          isActive: true, 
-          token: 'valid-token', 
-          sharedAt: '2024-01-01T00:00:00Z' 
+        interactiveShareMetadata: {
+          isActive: true,
+          token: 'valid-token',
+          sharedAt: '2024-01-01T00:00:00Z',
+          expiresAt: '2099-01-01T00:00:00Z'
         }
       };
 

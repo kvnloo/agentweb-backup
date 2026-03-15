@@ -282,7 +282,7 @@ describe('Interactive Share Public Endpoint Tests', () => {
           }
         ],
         shareMetadata: { isShared: false },
-        interactiveShareMetadata: { isActive: true }
+        interactiveShareMetadata: { isActive: true, expiresAt: '2099-01-01T00:00:00Z' }
       };
       const mockExecution = {
         executionId,
