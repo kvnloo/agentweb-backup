@@ -618,6 +618,10 @@ These checks prevent CI failures and ensure code quality. The `npx tsc` command 
 
 For example, a PR that fixes a bug and adds a feature should have at minimum: one commit for the bug fix, one for the feature, one for tests, one for release notes, and one for any dev.md investigation notes — not a single commit bundling everything together.
 
+## Merging Pull Requests
+
+**NEVER use `--delete-branch` when merging PRs.** Always keep remote branches after merge. Use `gh pr merge <number> --merge` without the `--delete-branch` flag.
+
 ## Testing Strategy
 
 ### Backend Tests

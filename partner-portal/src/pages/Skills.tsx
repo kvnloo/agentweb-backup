@@ -95,6 +95,12 @@ export default function Skills() {
   const [successMessage, setSuccessMessage] = useState("");
   const [syncStatus, setSyncStatus] = useState<Record<string, SkillSyncInfo>>({});
   const [backendEnv, setBackendEnv] = useState<'development' | 'production'>('production');
+  const [foundationTools, setFoundationTools] = useState<string[]>([]);
+  const [foundationDefaults, setFoundationDefaults] = useState<string[]>([]);
+  const [foundationDialogOpen, setFoundationDialogOpen] = useState(false);
+  const [foundationEditTools, setFoundationEditTools] = useState<string[]>([]);
+  const [foundationSearchText, setFoundationSearchText] = useState("");
+  const [savingFoundation, setSavingFoundation] = useState(false);
 
   const { token } = useAuth();
 
@@ -143,6 +149,18 @@ export default function Skills() {
     }
   }, [token]);
 
+  const fetchFoundationTools = useCallback(async () => {
+    try {
+      const response = await axios.get(buildApiUrl("/api/agent-mode/foundation-tools"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setFoundationTools(response.data.toolNames || []);
+      setFoundationDefaults(response.data.defaults || []);
+    } catch (err) {
+      console.error("Failed to fetch foundation tools", err);
+    }
+  }, [token]);
+
   const fetchTools = useCallback(async () => {
     try {
       const response = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
@@ -162,8 +180,9 @@ export default function Skills() {
       fetchSubscriptionTypes();
       fetchPublicSkills();
       fetchSyncStatus();
+      fetchFoundationTools();
     }
-  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills, fetchSyncStatus]);
+  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills, fetchSyncStatus, fetchFoundationTools]);
 
   const handleOpenEditDialog = (skill: Skill | null = null) => {
     if (skill) {
@@ -350,18 +369,51 @@ export default function Skills() {
     setPasteText("");
   };
 
+  const handleOpenFoundationDialog = () => {
+    setFoundationEditTools([...foundationTools]);
+    setFoundationSearchText("");
+    setFoundationDialogOpen(true);
+  };
+
+  const handleSaveFoundationTools = async () => {
+    setSavingFoundation(true);
+    try {
+      const response = await axios.put(
+        buildApiUrl("/api/agent-mode/foundation-tools"),
+        { toolNames: foundationEditTools },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setFoundationTools(response.data.toolNames || []);
+      setFoundationDialogOpen(false);
+      setSuccessMessage("Foundation tools updated successfully");
+    } catch (err) {
+      setError("Failed to update foundation tools");
+      console.error(err);
+    } finally {
+      setSavingFoundation(false);
+    }
+  };
+
+  const handleResetFoundationTools = () => {
+    setFoundationEditTools([...foundationDefaults]);
+  };
+
   const filteredSkills = skills.filter(skill =>
     skill.name.toLowerCase().includes(searchText.toLowerCase()) || 
     skill.description.toLowerCase().includes(searchText.toLowerCase()) ||
     (skill.toolNames && skill.toolNames.some(tool => tool.toLowerCase().includes(searchText.toLowerCase())))
   );
 
-  // Compute unused tools (tools not assigned to any skill)
+  // Compute unused tools (tools not assigned to any skill, excluding foundation and admin tools)
+  const ADMIN_TOOL_NAMES = new Set(["list_predefined_work_plans", "manage_predefined_work_plan"]);
   const usedToolNames = new Set<string>();
   skills.forEach(skill => {
     skill.toolNames?.forEach(t => usedToolNames.add(t));
   });
-  const unusedTools = availableTools.filter(t => !usedToolNames.has(t.name));
+  const foundationSet = new Set(foundationTools);
+  const unusedTools = availableTools.filter(t =>
+    !usedToolNames.has(t.name) && !foundationSet.has(t.name) && !ADMIN_TOOL_NAMES.has(t.name)
+  );
 
   return (
     <Container maxWidth="lg">
@@ -554,6 +606,42 @@ export default function Skills() {
                       </TableCell>
                     </TableRow>
                   ))
+                )}
+                {/* Virtual Foundation Tools row */}
+                {!loading && (
+                  <TableRow sx={{ backgroundColor: '#e8f5e9' }}>
+                    <TableCell sx={{ fontWeight: "bold" }}>
+                      Foundation Tools
+                      <Typography variant="caption" color="text.secondary" display="block">
+                        (always available)
+                      </Typography>
+                    </TableCell>
+                    <TableCell sx={{ maxWidth: 300 }}>
+                      <Typography variant="body2">
+                        {foundationTools.length} tool(s) always available without installing a skill
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label="Core" color="success" size="small" />
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="caption" color="text.secondary">
+                        Always available (bypasses subscription)
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      {foundationTools.map(tool => (
+                        <Chip key={tool} label={tool} size="small" color="success" variant="outlined" sx={{ mr: 0.5, mb: 0.5 }} />
+                      ))}
+                    </TableCell>
+                    <TableCell>
+                      <Tooltip title="Edit Foundation Tools">
+                        <IconButton onClick={handleOpenFoundationDialog}>
+                          <EditIcon />
+                        </IconButton>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
                 )}
                 {/* Virtual __admin_tools__ row */}
                 {!loading && (
@@ -951,6 +1039,89 @@ export default function Skills() {
             disabled={!pasteText.trim() || parsePasteText(pasteText).matched.length === 0}
           >
             Add {pasteText.trim() ? parsePasteText(pasteText).matched.length : 0} Tool(s)
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Foundation Tools Edit Dialog */}
+      <Dialog open={foundationDialogOpen} onClose={() => setFoundationDialogOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ m: 0, p: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          Edit Foundation Tools
+          <IconButton onClick={() => setFoundationDialogOpen(false)} sx={{ color: (theme) => theme.palette.grey[500] }}>
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent sx={{ pt: 1 }}>
+          <Alert severity="info" sx={{ mb: 2 }}>
+            Foundation tools are always available to Emma without installing a skill. Changes take effect immediately for all users.
+          </Alert>
+          <Box sx={{ mb: 2 }}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
+              <Typography variant="subtitle2" color="text.secondary">
+                Select Foundation Tools
+              </Typography>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Typography variant="caption" color="text.secondary" sx={{ fontWeight: 'bold' }}>
+                  {foundationEditTools.length} of {availableTools.length} tools selected
+                </Typography>
+                <Button size="small" variant="outlined" onClick={handleResetFoundationTools} sx={{ textTransform: 'none', fontSize: '0.75rem' }}>
+                  Reset to Defaults
+                </Button>
+              </Stack>
+            </Stack>
+            <Autocomplete
+              multiple
+              disableCloseOnSelect
+              options={availableTools}
+              getOptionLabel={(option) => option.name}
+              value={availableTools.filter(t => foundationEditTools.includes(t.name))}
+              inputValue={foundationSearchText}
+              onInputChange={(_, newInputValue, reason) => {
+                if (reason === 'input') setFoundationSearchText(newInputValue);
+              }}
+              onChange={(_, newValue) => setFoundationEditTools(newValue.map(v => v.name))}
+              onClose={() => setFoundationSearchText("")}
+              slotProps={{
+                paper: {
+                  sx: {
+                    mt: 1,
+                    backgroundColor: '#f5f7ff',
+                    boxShadow: '0px 10px 30px rgba(0,0,0,0.2)',
+                    border: '1px solid rgba(144, 156, 255, 0.2)',
+                    '& .MuiAutocomplete-listbox': { maxHeight: '400px' }
+                  }
+                }
+              }}
+              renderInput={(params) => (
+                <TextField {...params} label="Select Tools" placeholder="Search tools..." />
+              )}
+              renderOption={(props, option, { selected }) => (
+                <li {...props}>
+                  <Box component="span" sx={{ display: 'flex', alignItems: 'center', width: '100%', py: 0.5 }}>
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ width: '100%' }}>
+                      <Box sx={{ display: 'flex', alignItems: 'center', mr: 1 }}>
+                        {selected ? <CheckBoxIcon color="primary" fontSize="small" /> : <CheckBoxOutlineBlankIcon fontSize="small" color="action" />}
+                      </Box>
+                      <Box sx={{ flexGrow: 1 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: selected ? 'bold' : 'normal' }}>{option.name}</Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>{option.description}</Typography>
+                      </Box>
+                    </Stack>
+                  </Box>
+                </li>
+              )}
+              renderTags={(tagValue, getTagProps) =>
+                tagValue.map((option, index) => (
+                  <Chip label={option.name} {...getTagProps({ index })} color="success" variant="outlined" size="small" />
+                ))
+              }
+            />
+          </Box>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setFoundationDialogOpen(false)} color="inherit">Cancel</Button>
+          <Button onClick={handleSaveFoundationTools} variant="contained" color="primary" sx={{ minWidth: 120 }} disabled={savingFoundation}>
+            {savingFoundation ? <CircularProgress size={20} color="inherit" /> : "Save Changes"}
           </Button>
         </DialogActions>
       </Dialog>

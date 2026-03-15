@@ -28,6 +28,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-14',
     changes: [
+      'Feature: Admin — Foundation Tools Management',
+      '- Foundation tools (always available without installing a skill) can now be managed from the Skills page',
+      '- New "Foundation Tools" row with edit button lets admins add/remove tools and reset to defaults',
+      '- Changes persist to DB and take effect immediately — no redeployment needed',
+    ],
+  },
+  {
+    date: '2026-03-14',
+    changes: [
       'Feature: Agent Mode — LinkedIn Comment Replies & Listing',
       '- Reply to specific LinkedIn comments as nested replies using the comment_on_linkedin_post tool with parent_comment_urn',
       '- New list_linkedin_comments tool shows all comments on a post with URNs, authors, text, and timestamps',
