@@ -170,8 +170,7 @@
       "mcp__playwright__browser_handle_dialog",
       "mcp__notion__API-patch-page",
       "mcp__playwright__browser_resize",
-      "mcp__notion__API-get-block-children",
-      "WebFetch(domain:prod-files-secure.s3.us-west-2.amazonaws.com)"
+      "mcp__notion__API-get-block-children"
     ]
   },
   "enableAllProjectMcpServers": true,
