@@ -17070,6 +17070,52 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  // --- LinkedIn Auto-Connection for Leads ---
+
+  /**
+   * Queue a LinkedIn connection request for a newly created lead.
+   * Resolves the user's first LinkedIn (Unipile) account and sends an invitation
+   * with a personalized message based on lead context.
+   *
+   * @param userId - The lead list owner's user ID
+   * @param linkedInUrl - The lead's LinkedIn profile URL
+   * @param leadContext - Object with company and title for personalized message
+   * @returns { success, message } or { success: false, error }
+   */
+  async queueLinkedInConnectionForLead(
+    userId: string,
+    linkedInUrl: string,
+    leadContext: { company?: string; title?: string }
+  ): Promise<{ success: boolean; message?: string; error?: string }> {
+    try {
+      // 1. Get user's LinkedIn account
+      const accountsResult = await linkedInOutreachService.listAccounts(userId);
+      if (!accountsResult?.items?.length) {
+        console.log(`[LinkedInAutoConnect] No LinkedIn account connected for user ${userId}, skipping`);
+        return { success: false, error: 'No LinkedIn account connected' };
+      }
+      const accountId = accountsResult.items[0].id;
+
+      // 2. Build personalized connection message
+      const parts: string[] = [];
+      if (leadContext.title) parts.push(leadContext.title);
+      if (leadContext.company) parts.push(`at ${leadContext.company}`);
+      const contextLine = parts.length > 0 ? ` I see you're ${parts.join(' ')} — ` : ' ';
+      const message = `Hi!${contextLine}I'd love to connect and explore how we might collaborate.`;
+
+      // 3. Send the invitation (the service handles already-connected checks internally)
+      console.log(`[LinkedInAutoConnect] Sending connection request for user ${userId} to ${linkedInUrl}`);
+      await linkedInOutreachService.sendInvitation(accountId, linkedInUrl, true, message);
+      console.log(`[LinkedInAutoConnect] Connection request sent successfully`);
+
+      return { success: true, message: 'Connection request queued' };
+    } catch (error: any) {
+      // Non-fatal — log and return error, don't throw
+      console.error(`[LinkedInAutoConnect] Failed to queue connection:`, error?.message || error);
+      return { success: false, error: error?.message || 'Unknown error' };
+    }
+  }
+
   // --- Client Health Assessment (admin-only) ---
 
   async assessClientHealth(callerUserId: string, clientNameOrEmail: string): Promise<any> {
