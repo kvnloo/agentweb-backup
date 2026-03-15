@@ -404,12 +404,16 @@ export default function Skills() {
     (skill.toolNames && skill.toolNames.some(tool => tool.toLowerCase().includes(searchText.toLowerCase())))
   );
 
-  // Compute unused tools (tools not assigned to any skill)
+  // Compute unused tools (tools not assigned to any skill, excluding foundation and admin tools)
+  const ADMIN_TOOL_NAMES = new Set(["list_predefined_work_plans", "manage_predefined_work_plan"]);
   const usedToolNames = new Set<string>();
   skills.forEach(skill => {
     skill.toolNames?.forEach(t => usedToolNames.add(t));
   });
-  const unusedTools = availableTools.filter(t => !usedToolNames.has(t.name));
+  const foundationSet = new Set(foundationTools);
+  const unusedTools = availableTools.filter(t =>
+    !usedToolNames.has(t.name) && !foundationSet.has(t.name) && !ADMIN_TOOL_NAMES.has(t.name)
+  );
 
   return (
     <Container maxWidth="lg">
