@@ -107,8 +107,8 @@ mkdir -p "$APP_DIR"
 git clone "https://${GITHUB_PAT}@github.com/AgentWebPro/agentweb.git" "$APP_DIR"
 git clone "https://${GITHUB_PAT}@github.com/AgentWebPro/agentweb-customer-portal.git" "$APP_DIR/customer-portal"
 
-chown -R ec2-user:ec2-user "$APP_DIR"
 mkdir -p "$LOG_DIR"
+chown -R ec2-user:ec2-user "$APP_DIR"
 
 # Set up git config for ec2-user
 sudo -u ec2-user git config --global user.name "ec2-user"
@@ -326,27 +326,32 @@ NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
 NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
   if [[ $EXIT_CODE -ne 0 ]]; then
-    OUTPUT="Claude Code exited with code $EXIT_CODE:\n$OUTPUT"
+    OUTPUT="Claude Code exited with code $EXIT_CODE:
+$OUTPUT"
   fi
-  # Truncate to ~9900 chars (Notion rich_text limit is 2000 per element, max ~5 chunks)
-  TRUNCATED="${OUTPUT:0:9900}"
-  if [[ ${#OUTPUT} -gt 9900 ]]; then
-    TRUNCATED="$TRUNCATED\n\n...(truncated)"
-  fi
-  # Escape for JSON
-  JSON_TEXT=$(printf '%s' "$TRUNCATED" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-  # Split into 2000-char rich_text chunks via python
-  RICH_TEXT=$(python3 -c "
+  # Write output to temp file to avoid shell interpolation issues
+  printf '%s' "$OUTPUT" > /tmp/.claude-output.txt
+  # Build Notion comment JSON via Python (reads from file, avoids shell escaping)
+  BODY=$(python3 -c "
 import json, sys
-text = json.loads($JSON_TEXT)
-chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
-print(json.dumps([{'text': {'content': c}} for c in chunks]))
-")
-  curl -s -X POST "https://api.notion.com/v1/comments" \
-    -H "Authorization: Bearer $NOTION_TOKEN" \
-    -H "Notion-Version: 2022-06-28" \
-    -H "Content-Type: application/json" \
-    -d "{\"parent\":{\"page_id\":\"$NOTION_PAGE_ID\"},\"rich_text\":$RICH_TEXT}"
+with open('/tmp/.claude-output.txt', 'r', errors='replace') as f:
+    text = f.read()
+# Truncate to ~9900 chars
+if len(text) > 9900:
+    text = text[:9900] + '\n\n...(truncated)'
+chunks = [{'text': {'content': text[i:i+2000]}} for i in range(0, len(text), 2000)]
+if not chunks:
+    chunks = [{'text': {'content': '(no output)'}}]
+print(json.dumps({'parent': {'page_id': sys.argv[1]}, 'rich_text': chunks}))
+" "$NOTION_PAGE_ID")
+  if [[ -n "$BODY" ]]; then
+    curl -s -X POST "https://api.notion.com/v1/comments" \
+      -H "Authorization: Bearer $NOTION_TOKEN" \
+      -H "Notion-Version: 2022-06-28" \
+      -H "Content-Type: application/json" \
+      -d "$BODY"
+  fi
+  rm -f /tmp/.claude-output.txt
 fi
 exec bash
 RUNEOF
