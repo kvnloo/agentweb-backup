@@ -416,7 +416,7 @@ export async function launchEnvironment(
     console.log(`[devEnv] VPC: ${vpcId}`);
 
     // 3. Create security group (port 5175 open to 0.0.0.0/0 only)
-    const sgName = `agentweb-test-env-notion-${notionPageId.slice(0, 8)}`;
+    const sgName = `agentweb-test-env-notion-${notionPageId.replace(/-/g, "").slice(0, 20)}`;
     const sgRes = await ec2
       .createSecurityGroup({
         GroupName: sgName,

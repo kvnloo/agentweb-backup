@@ -2154,6 +2154,40 @@ export class ChatbotDB {
     }
   }
 
+  async updateSessionError(
+    sessionId: string,
+    error: string,
+    errorStack?: string
+  ): Promise<void> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET #error = :error, #errorStack = :errorStack, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeNames: {
+        "#error": "error",
+        "#errorStack": "errorStack",
+      },
+      ExpressionAttributeValues: {
+        ":error": error,
+        ":errorStack": errorStack || null,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+    };
+
+    try {
+      await dynamodb.update(params).promise();
+    } catch (updateError) {
+      console.error("Error updating session error:", updateError);
+      // Don't throw - we don't want error logging to fail the entire operation
+    }
+  }
+
   async updateSessionFeedbacks(
     sessionId: string,
     feedbacks: Record<string, MessageFeedback>
