@@ -2,9 +2,8 @@ import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import axios from "axios";
 import { Agent, setGlobalDispatcher } from "undici";
-import * as fs from "fs";
-import * as path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
+import { settingsService } from "./settingsService";
 
 // v0 code generation can take several minutes — extend Node's default fetch timeouts.
 // Node 20's built-in undici has headersTimeout=300s which is too short for v0.
@@ -275,11 +274,19 @@ async function generateFirstPage(
   let effectiveTemplate = templateHtml;
   if (!effectiveTemplate) {
     try {
-      const templatePath = path.join(__dirname, "../templates/landing-page-v2.html");
-      const fullTemplate = fs.readFileSync(templatePath, "utf-8");
-      // Extract a condensed version: section structure + key CSS variables + first body section
-      effectiveTemplate = extractTemplateOutline(fullTemplate);
-      console.log(`[V0 SERVICE] Loaded landing page template outline (${effectiveTemplate.length} chars) as design inspiration`);
+      const publicSetting = await settingsService.getSetting("email_templates_public");
+      if (publicSetting) {
+        const templates = JSON.parse(publicSetting.settingValue);
+        const match = templates.find((t: any) => t.template_name === "landing-page-v2");
+        if (match && match.html_content) {
+          effectiveTemplate = extractTemplateOutline(match.html_content);
+          console.log(`[V0 SERVICE] Loaded landing page template outline from DynamoDB (${effectiveTemplate.length} chars) as design inspiration`);
+        } else {
+          console.warn("[V0 SERVICE] landing-page-v2 template not found in email_templates_public, continuing without");
+        }
+      } else {
+        console.warn("[V0 SERVICE] email_templates_public setting not found, continuing without template");
+      }
     } catch (err) {
       console.warn("[V0 SERVICE] Could not load landing page template, continuing without:", err);
     }
