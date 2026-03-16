@@ -86,7 +86,7 @@ emmaToolRegistry.register({
         headers: { 'X-Api-Key': apiKey },
       });
 
-      const meetings = (response.data || []).map((m: any) => ({
+      const meetings = ((response.data as any) || []).map((m: any) => ({
         id: m.id,
         recording_id: m.recording_id,
         title: m.title,
@@ -159,7 +159,7 @@ emmaToolRegistry.register({
         headers: { 'X-Api-Key': apiKey },
       });
 
-      const data = response.data;
+      const data = response.data as any;
       const turns = (data?.transcript || []).map((t: any) => ({
         speaker: t.speaker,
         text: t.text,
