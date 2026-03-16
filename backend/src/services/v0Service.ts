@@ -36,7 +36,8 @@ export async function withRetry<T>(
         err.message?.includes("fetch failed") ||
         err.message?.includes("ECONNREFUSED") ||
         err.message?.includes("ENOTFOUND") ||
-        err.message?.includes("network") ||
+        err.message?.includes("network error") ||
+        err.message?.includes("NetworkError") ||
         err.message?.includes("ETIMEDOUT") ||
         err.message?.includes("socket hang up") ||
         err.code === "ECONNRESET" ||
@@ -47,7 +48,8 @@ export async function withRetry<T>(
         throw err;
       }
 
-      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      const jitter = Math.random() * 500;
+      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       console.warn(
         `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${err.message}), retrying in ${delay}ms...`
       );
@@ -1221,10 +1223,13 @@ export async function iterateLandingPage(
   try {
     const v0 = await getV0Client();
 
-    await v0.chats.sendMessage({
-      chatId: record.v0ChatId,
-      message,
-    });
+    await withRetry(
+      () => v0.chats.sendMessage({
+        chatId: record.v0ChatId!,
+        message,
+      }),
+      "v0 chat iterate"
+    );
 
     // Reset status to draft (needs re-deploy after iteration)
     const newStatus = record.status === "deployed" ? "draft" : record.status;
