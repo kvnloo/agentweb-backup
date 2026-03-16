@@ -445,6 +445,37 @@ export async function getVercelToken(): Promise<string> {
   }
 }
 
+export interface FathomCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+export async function getFathomCredentials(): Promise<FathomCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Fathom'
+      : 'dev/AgentWeb/Fathom';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Fathom credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as FathomCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Fathom credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Fathom credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Fathom credentials from Secrets Manager');
+  }
+}
+
 export interface StripeCredentials {
   secretKey: string;
   publishableKey: string;
