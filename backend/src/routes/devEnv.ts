@@ -68,6 +68,13 @@ router.post(
           return res.status(200).json({ action: "none", reason: "no_instance" });
         }
 
+        // Only relay if this environment launched the instance
+        const currentEnv = process.env.NODE_ENV || "development";
+        if (page.launchedBy && page.launchedBy !== currentEnv) {
+          console.log(`[devEnv] Instance launched by "${page.launchedBy}", current env is "${currentEnv}", skipping`);
+          return res.status(200).json({ action: "none", reason: "wrong_environment" });
+        }
+
         // Fetch comment text
         const commentText = await getNotionCommentText(pageId, commentId);
         if (!commentText) {
