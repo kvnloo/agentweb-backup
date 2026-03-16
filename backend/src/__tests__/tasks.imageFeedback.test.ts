@@ -22,7 +22,6 @@ jest.mock('../middleware/auth', () => ({
     req.user = { userId: 'user123', isAdmin: false };
     next();
   },
-  getEffectiveOwnerId: (req: any) => req.user?.userId,
 }));
 
 const router = require('../routes/tasks').default;
