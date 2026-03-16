@@ -2052,11 +2052,15 @@ export default function AdminDashboard() {
           .map(d => d.trim())
           .filter(d => d.length > 0);
         
-        // Validate each domain format
+        // Validate each domain format (allow both domain and URL-prefix formats)
+        // Domain property: example.com
+        // URL-prefix property: https://example.com or https://example.com/
         const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+        const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
+
         for (const domain of domains) {
-          if (!domainRegex.test(domain)) {
-            setError(`Invalid domain format: ${domain}. Please use format like example.com`);
+          if (!domainRegex.test(domain) && !urlPrefixRegex.test(domain)) {
+            setError(`Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`);
             return;
           }
         }

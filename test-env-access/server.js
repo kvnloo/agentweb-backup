@@ -2,7 +2,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 import { Resend } from "resend";
 import {
   EC2Client,
@@ -354,6 +354,11 @@ const promptQueue = [];
 let processing = false;
 const recentlyPostedComments = new Set(); // track to prevent loops
 
+// Heartbeat state
+let currentActivity = "idle"; // "idle" | "processing: <prompt snippet>" | "waiting_retry: <seconds>s"
+let lastPromptTime = null;
+let lastResponseTime = null;
+
 async function processQueue() {
   if (processing || promptQueue.length === 0) return;
   processing = true;
@@ -361,17 +366,42 @@ async function processQueue() {
   while (promptQueue.length > 0) {
     const { prompt, notionPageId } = promptQueue.shift();
     console.log(`[relay] Processing prompt for page ${notionPageId}: "${prompt.slice(0, 100)}..."`);
+    currentActivity = `processing: ${prompt.slice(0, 80)}`;
+    lastPromptTime = new Date();
 
     try {
       const output = await runClaude(prompt);
+      lastResponseTime = new Date();
+
+      // Check for retry directive: [RELAY_RETRY_AFTER:<seconds>]
+      const retryMatch = output.match(/\[RELAY_RETRY_AFTER:(\d+)\]/);
+      const cleanedOutput = output.replace(/\[RELAY_RETRY_AFTER:\d+\]/g, "").trim();
 
       // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
-      const truncated = output.length > 10000
-        ? output.slice(0, 9950) + "\n\n...(truncated)"
-        : output;
+      const truncated = cleanedOutput.length > 10000
+        ? cleanedOutput.slice(0, 9950) + "\n\n...(truncated)"
+        : cleanedOutput;
 
-      await postNotionComment(notionPageId, truncated);
-      recentlyPostedComments.add(truncated.slice(0, 200));
+      if (truncated && truncated !== "(no output)") {
+        await postNotionComment(notionPageId, truncated);
+        recentlyPostedComments.add(truncated.slice(0, 200));
+      } else if (!retryMatch) {
+        // No output and no retry — let the user know Claude ran but produced nothing
+        await postNotionComment(notionPageId, "(Claude produced no output for this prompt. You may need to re-prompt or check the instance.)");
+      }
+
+      // If Claude requested a retry, re-queue after the specified delay
+      if (retryMatch) {
+        const delaySec = Math.min(parseInt(retryMatch[1], 10), 600); // cap at 10 minutes
+        console.log(`[relay] Claude requested retry in ${delaySec}s for page ${notionPageId}`);
+        currentActivity = `waiting_retry: ${delaySec}s`;
+        setTimeout(() => {
+          promptQueue.push({ prompt: "Continue where you left off. Check the status of what you were waiting for.", notionPageId });
+          processQueue().catch((err) =>
+            console.error("[relay] Queue processor error after retry:", err)
+          );
+        }, delaySec * 1000);
+      }
 
       // If this was a deploy prompt, set status to Done to trigger teardown
       if (prompt === "Prep for deploy") {
@@ -392,6 +422,23 @@ async function processQueue() {
   }
 
   processing = false;
+  currentActivity = "idle";
+}
+
+function stripAnsiAndControlCodes(text) {
+  return text
+    // Strip ANSI escape sequences (CSI, OSC, etc.)
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b[()][0-9A-B]/g, "")
+    .replace(/\x1b\[[\?]?[0-9;]*[hlmsu]/g, "")
+    // Strip remaining escape chars and control codes (except newline/tab)
+    .replace(/\x1b[^\n]*/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+    // Strip script(1) artifacts like [<u or ]9;4;0;
+    .replace(/\[\<u/g, "")
+    .replace(/\][0-9;]+/g, "")
+    .trim();
 }
 
 function runClaude(prompt) {
@@ -416,8 +463,10 @@ function runClaude(prompt) {
     child.stderr.on("data", (data) => { stderr += data.toString(); });
 
     child.on("close", (code) => {
+      // Strip terminal escape codes from script(1) PTY wrapper
+      const cleaned = stripAnsiAndControlCodes(stdout);
       if (code === 0) {
-        resolve(stdout || "(no output)");
+        resolve(cleaned || "(no output)");
       } else {
         reject(new Error(`Claude exited with code ${code}: ${stderr.slice(0, 500)}`));
       }
@@ -461,6 +510,122 @@ app.post("/api/claude-prompt", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Heartbeat — update "Cloud Dev Status" Notion property every minute
+// ---------------------------------------------------------------------------
+
+const NOTION_PAGE_ID = process.env.NOTION_PAGE_ID || "";
+const HEARTBEAT_INTERVAL_MS = 60 * 1000;
+
+async function updateNotionCloudEnvStatus(text) {
+  if (!NOTION_PAGE_ID) return;
+  try {
+    const token = await getNotionToken();
+    const res = await fetch(`${NOTION_API}/pages/${NOTION_PAGE_ID}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        properties: {
+          "Cloud Dev Status": {
+            rich_text: [{ text: { content: text.slice(0, 2000) } }],
+          },
+        },
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[heartbeat] Failed to update Notion property: ${res.status} ${body}`);
+    }
+  } catch (err) {
+    console.error(`[heartbeat] Error:`, err.message || err);
+  }
+}
+
+function getHeartbeatStatus() {
+  const parts = [];
+  const now = new Date();
+
+  // 1. Claude activity
+  parts.push(`Claude: ${currentActivity}`);
+
+  // 2. Queue depth
+  if (promptQueue.length > 0) {
+    parts.push(`Queue: ${promptQueue.length} pending`);
+  }
+
+  // 3. Time since last prompt/response
+  if (lastPromptTime) {
+    const agoMin = Math.round((now - lastPromptTime) / 60000);
+    parts.push(`Last prompt: ${agoMin}m ago`);
+  }
+  if (lastResponseTime) {
+    const agoMin = Math.round((now - lastResponseTime) / 60000);
+    parts.push(`Last response: ${agoMin}m ago`);
+  }
+
+  // 4. Services status (quick check via tmux)
+  try {
+    const tmuxOut = execSync("tmux ls 2>/dev/null || true", { encoding: "utf-8", timeout: 5000 });
+    const services = ["backend", "partner-portal", "customer-portal"];
+    const down = services.filter((s) => !tmuxOut.includes(s));
+    if (down.length > 0) {
+      parts.push(`DOWN: ${down.join(", ")}`);
+    } else {
+      parts.push("Services: all up");
+    }
+  } catch {
+    parts.push("Services: unknown");
+  }
+
+  // 5. Claude process check
+  try {
+    const psOut = execSync("pgrep -f 'claude.*-p' 2>/dev/null || true", { encoding: "utf-8", timeout: 5000 });
+    if (psOut.trim()) {
+      parts.push("Claude process: running");
+    }
+  } catch {
+    // ignore
+  }
+
+  // 6. Conversation file size
+  try {
+    const convDir = "/home/ec2-user/.claude/projects/-home-ec2-user-agentweb";
+    const files = execSync(`ls -S ${convDir}/*.jsonl 2>/dev/null | head -1`, { encoding: "utf-8", timeout: 5000 }).trim();
+    if (files) {
+      const stat = fs.statSync(files);
+      const sizeMB = (stat.size / (1024 * 1024)).toFixed(1);
+      parts.push(`Conversation: ${sizeMB}MB`);
+      if (stat.size > 10 * 1024 * 1024) {
+        parts.push("⚠️ conversation file large");
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 7. Timestamp
+  parts.push(`Updated: ${now.toISOString().slice(11, 19)}Z`);
+
+  return parts.join(" | ");
+}
+
+if (NOTION_PAGE_ID) {
+  setInterval(async () => {
+    const status = getHeartbeatStatus();
+    await updateNotionCloudEnvStatus(status);
+  }, HEARTBEAT_INTERVAL_MS);
+
+  // Post initial status on startup
+  setTimeout(async () => {
+    await updateNotionCloudEnvStatus(getHeartbeatStatus());
+    console.log("[heartbeat] Initial status posted to Notion");
+  }, 5000);
+}
 
 app.listen(PORT, () => {
   console.log(`IP allowlist service running on http://localhost:${PORT}`);
