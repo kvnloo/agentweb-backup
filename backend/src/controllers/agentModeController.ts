@@ -796,6 +796,7 @@ async function runScheduledChat(
   createdAt: string;
 }> {
   const now = new Date();
+  let sessionId: string = '';
 
   try {
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -894,7 +895,7 @@ async function runScheduledChat(
       schedule.emailCampaignTaskId,
       'scheduled' // sessionType
     );
-    const sessionId = testSession.sessionId;
+    sessionId = testSession.sessionId;
 
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
@@ -1007,7 +1008,51 @@ async function runScheduledChat(
       stack: error instanceof Error ? error.stack : undefined,
       name: error instanceof Error ? error.name : 'Unknown'
     });
-    throw error;
+
+    // Save error to session record if session was created
+    if (sessionId) {
+      try {
+        await chatbotDb.updateSessionError(
+          sessionId,
+          error instanceof Error ? error.message : String(error),
+          error instanceof Error ? error.stack : undefined
+        );
+      } catch (saveError) {
+        console.error('Failed to save error to session:', saveError);
+      }
+    }
+
+    // Build error result
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorResult = {
+      scheduleId: schedule.scheduleId,
+      runId: require('uuid').v4(),
+      status: 'failure' as const,
+      passed: false,
+      actualResponse: `Error during execution: ${errorMessage}`,
+      actualFunctionCalls: [],
+      keywordMatches: [],
+      keywordMisses: schedule.keywords || [],
+      functionCallMatches: [],
+      functionCallMisses: schedule.requiredFunctionCalls || [],
+      executionTime: Date.now() - now.getTime(),
+      sessionId: sessionId || '',
+      attempt: 0,
+      createdAt: new Date().toISOString()
+    };
+
+    // Save the error result to database (without actualResponse to save space)
+    const resultToStore = { ...errorResult };
+    delete (resultToStore as any).actualResponse;
+    try {
+      await scheduleDb.addRunResult(schedule.scheduleId, resultToStore);
+    } catch (saveError) {
+      console.error('Error saving error run result:', saveError);
+      // Continue even if saving fails - we still want to return the result
+    }
+
+    // Return error result for error reporting
+    return errorResult;
   }
 }
 
