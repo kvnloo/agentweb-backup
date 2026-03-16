@@ -1,6 +1,6 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, deleteAccount, deleteAccountById } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, deleteAccount, deleteAccountById, createAccount, getAccountByPlatform, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 
@@ -51,6 +51,96 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   } catch (error) {
     console.error('List Accounts Error:', error);
     res.status(500).json({ error: 'Failed to list connected accounts' });
+  }
+});
+
+// ============================================
+// Fathom — API Key connection (not OAuth)
+// ============================================
+
+// Connect Fathom account via API key
+router.post('/connected-accounts/fathom', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { api_key } = req.body;
+
+  if (!api_key || typeof api_key !== 'string') {
+    return res.status(400).json({ error: 'api_key is required' });
+  }
+
+  // Validate the API key against Fathom's API
+  try {
+    const validationResponse = await fetch('https://api.fathom.ai/external/v1/teams', {
+      method: 'GET',
+      headers: {
+        'X-Api-Key': api_key,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!validationResponse.ok) {
+      if (validationResponse.status === 401 || validationResponse.status === 403) {
+        return res.status(401).json({ error: 'Invalid Fathom API key' });
+      }
+      return res.status(502).json({ error: `Fathom API returned status ${validationResponse.status}` });
+    }
+  } catch (fetchErr: any) {
+    console.error('[Fathom] API validation failed:', fetchErr?.message);
+    return res.status(502).json({ error: 'Unable to reach Fathom API to validate key' });
+  }
+
+  try {
+    const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+    const fathomConfig: FathomConfig = {
+      account_type: 'api_key',
+      api_key,
+      access_token: api_key, // For BaseOAuthConfig compat
+      token_expires_at: Date.now() + TEN_YEARS_MS,
+    };
+
+    const account = await createAccount(userId, 'fathom', {
+      account_id: `fathom-${userId}`,
+      account_name: 'Fathom',
+      config: fathomConfig,
+    });
+
+    res.json({ success: true, account });
+  } catch (error) {
+    console.error('[Fathom] Connect error:', error);
+    res.status(500).json({ error: 'Failed to connect Fathom account' });
+  }
+});
+
+// Disconnect Fathom — with webhook cleanup
+router.delete('/connected-accounts/fathom', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+
+  try {
+    // Check for existing webhook to clean up
+    const existingAccount = await getAccountByPlatform(userId, 'fathom');
+    if (existingAccount) {
+      const config = existingAccount.config as FathomConfig;
+      if (config.webhook_id && config.api_key) {
+        try {
+          await fetch(`https://api.fathom.ai/external/v1/webhooks/${config.webhook_id}`, {
+            method: 'DELETE',
+            headers: {
+              'X-Api-Key': config.api_key,
+              'Content-Type': 'application/json',
+            },
+          });
+          console.log(`[Fathom] Deleted webhook ${config.webhook_id} for user ${userId}`);
+        } catch (webhookErr: any) {
+          // Non-fatal: log and continue with DB deletion
+          console.warn(`[Fathom] Failed to delete webhook ${config.webhook_id}:`, webhookErr?.message);
+        }
+      }
+    }
+
+    await deleteAccount(userId, 'fathom');
+    res.json({ success: true, message: 'Fathom account disconnected' });
+  } catch (error) {
+    console.error('[Fathom] Disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Fathom account' });
   }
 });
 
