@@ -2,7 +2,6 @@ import { settingsService } from "./settingsService";
 import { userDb } from "./db";
 import { CUSTOMER_PORTAL_PAGES } from "./customerPortalPages";
 import { skillService } from "./skillService";
-import { DEFAULT_MAX_CONCURRENT_SESSIONS, CONCURRENT_SESSIONS_BY_TIER } from "../config";
 
 export interface SubscriptionType {
   name: string;
@@ -281,21 +280,6 @@ export async function getAllowedPages(userId: string): Promise<string[]> {
     console.error("Error getting allowed pages:", error);
     // Default to allowing all pages on error
     return getAllAvailablePages();
-  }
-}
-
-/**
- * Get the maximum number of concurrent agent sessions allowed for a user
- * based on their subscription tier. Returns DEFAULT_MAX_CONCURRENT_SESSIONS
- * for unknown tiers or on error.
- */
-export async function getMaxConcurrentSessions(userId: string): Promise<number> {
-  try {
-    const subscriptionTypeName = await getUserSubscriptionType(userId);
-    return CONCURRENT_SESSIONS_BY_TIER[subscriptionTypeName] ?? DEFAULT_MAX_CONCURRENT_SESSIONS;
-  } catch (error) {
-    console.error("Error getting max concurrent sessions:", error);
-    return DEFAULT_MAX_CONCURRENT_SESSIONS;
   }
 }
 

@@ -19,12 +19,3 @@ export const RESEND_SYSTEM_NAME = 'AgentWeb';
 // Used for inbound/outbound Emma chatbot emails
 export const EMMA_EMAIL_ADDRESS = 'emma@updates.agentweb.pro';
 export const EMMA_EMAIL_FROM = 'Emma at AgentWeb <emma@updates.agentweb.pro>';
-
-// Multi-task Concurrency Limits
-// Maximum concurrent agent sessions allowed per subscription tier
-export const DEFAULT_MAX_CONCURRENT_SESSIONS = 1;
-export const CONCURRENT_SESSIONS_BY_TIER: Record<string, number> = {
-  'Basic': 1,
-  'Pro': 3,
-  'Super Premium': 5,
-};
