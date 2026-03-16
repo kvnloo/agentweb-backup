@@ -365,13 +365,31 @@ async function processQueue() {
     try {
       const output = await runClaude(prompt);
 
-      // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
-      const truncated = output.length > 10000
-        ? output.slice(0, 9950) + "\n\n...(truncated)"
-        : output;
+      // Check for retry directive: [RELAY_RETRY_AFTER:<seconds>]
+      const retryMatch = output.match(/\[RELAY_RETRY_AFTER:(\d+)\]/);
+      const cleanedOutput = output.replace(/\[RELAY_RETRY_AFTER:\d+\]/g, "").trim();
 
-      await postNotionComment(notionPageId, truncated);
-      recentlyPostedComments.add(truncated.slice(0, 200));
+      // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
+      const truncated = cleanedOutput.length > 10000
+        ? cleanedOutput.slice(0, 9950) + "\n\n...(truncated)"
+        : cleanedOutput;
+
+      if (truncated && truncated !== "(no output)") {
+        await postNotionComment(notionPageId, truncated);
+        recentlyPostedComments.add(truncated.slice(0, 200));
+      }
+
+      // If Claude requested a retry, re-queue after the specified delay
+      if (retryMatch) {
+        const delaySec = Math.min(parseInt(retryMatch[1], 10), 600); // cap at 10 minutes
+        console.log(`[relay] Claude requested retry in ${delaySec}s for page ${notionPageId}`);
+        setTimeout(() => {
+          promptQueue.push({ prompt: "Continue where you left off. Check the status of what you were waiting for.", notionPageId });
+          processQueue().catch((err) =>
+            console.error("[relay] Queue processor error after retry:", err)
+          );
+        }, delaySec * 1000);
+      }
 
       // If this was a deploy prompt, set status to Done to trigger teardown
       if (prompt === "Prep for deploy") {
@@ -392,6 +410,22 @@ async function processQueue() {
   }
 
   processing = false;
+}
+
+function stripAnsiAndControlCodes(text) {
+  return text
+    // Strip ANSI escape sequences (CSI, OSC, etc.)
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b[()][0-9A-B]/g, "")
+    .replace(/\x1b\[[\?]?[0-9;]*[hlmsu]/g, "")
+    // Strip remaining escape chars and control codes (except newline/tab)
+    .replace(/\x1b[^\n]*/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+    // Strip script(1) artifacts like [<u or ]9;4;0;
+    .replace(/\[\<u/g, "")
+    .replace(/\][0-9;]+/g, "")
+    .trim();
 }
 
 function runClaude(prompt) {
@@ -416,8 +450,10 @@ function runClaude(prompt) {
     child.stderr.on("data", (data) => { stderr += data.toString(); });
 
     child.on("close", (code) => {
+      // Strip terminal escape codes from script(1) PTY wrapper
+      const cleaned = stripAnsiAndControlCodes(stdout);
       if (code === 0) {
-        resolve(stdout || "(no output)");
+        resolve(cleaned || "(no output)");
       } else {
         reject(new Error(`Claude exited with code ${code}: ${stderr.slice(0, 500)}`));
       }
