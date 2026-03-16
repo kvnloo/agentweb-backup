@@ -2,7 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import tasksRouter from '../routes/tasks';
 import { taskDb } from '../services/db';
-import { authenticateToken } from '../middleware/auth';
+import { authenticateToken, getEffectiveOwnerId } from '../middleware/auth';
 import { Storage } from '@google-cloud/storage';
 
 // Mock the database service
@@ -12,6 +12,7 @@ const mockedTaskDb = taskDb as jest.Mocked<typeof taskDb>;
 // Mock the auth middleware
 jest.mock('../middleware/auth');
 const mockedAuthenticateToken = authenticateToken as jest.MockedFunction<typeof authenticateToken>;
+const mockedGetEffectiveOwnerId = getEffectiveOwnerId as jest.MockedFunction<typeof getEffectiveOwnerId>;
 
 // Mock Google Cloud Storage
 jest.mock('@google-cloud/storage');
@@ -44,6 +45,9 @@ describe('Knowledge Base Update Endpoint - PUT /api/tasks/:taskId/knowledge-base
       next();
       return undefined;
     });
+
+    // Mock getEffectiveOwnerId to return the user's ID
+    mockedGetEffectiveOwnerId.mockImplementation((req: any) => req.user?.userId);
     
     // Setup GCS mocks
     mockFile = {

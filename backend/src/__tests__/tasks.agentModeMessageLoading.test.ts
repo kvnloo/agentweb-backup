@@ -42,7 +42,8 @@ jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, res: any, next: any) => {
     req.user = { userId: 'user123', isAdmin: false };
     next();
-  }
+  },
+  getEffectiveOwnerId: (req: any) => req.user?.userId,
 }));
 
 // Import the router after mocking
