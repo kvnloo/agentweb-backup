@@ -95,7 +95,7 @@ export const INTEGRATION_CONFIG = {
   },
 
   fathom: {
-    redirectUri: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/oauth/fathom/callback`,
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/callback/fathom`,
     authorizationUrl: 'https://fathom.video/external/v1/oauth2/authorize',
     tokenUrl: 'https://api.fathom.ai/external/v1/oauth2/token',
     scopes: ['public_api'],
