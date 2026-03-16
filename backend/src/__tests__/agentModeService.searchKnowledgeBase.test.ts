@@ -81,12 +81,12 @@ describe('AgentModeService - search_knowledge_base', () => {
         {
           id: 'kb-1',
           content: 'Test content 1',
-          metadata: { source: 'public-knowledge-base' }
+          metadata: { source: 'public-knowledge-base', fileName: 'guide.txt' }
         },
         {
           id: 'kb-2',
           content: 'Test content 2',
-          metadata: { source: 'private-knowledge-base' }
+          metadata: { source: 'private-knowledge-base', fileName: 'knowledge-base.txt' }
         }
       ];
 
@@ -106,11 +106,13 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.results).toHaveLength(2);
       expect(result.results[0]).toEqual({
         content: 'Test content 1',
-        source: 'public-knowledge-base'
+        source: 'public-knowledge-base',
+        fileName: 'guide.txt'
       });
       expect(result.results[1]).toEqual({
         content: 'Test content 2',
-        source: 'private-knowledge-base'
+        source: 'private-knowledge-base',
+        fileName: 'knowledge-base.txt'
       });
     });
 
@@ -160,12 +162,12 @@ describe('AgentModeService - search_knowledge_base', () => {
         {
           id: 'kb-1',
           content: 'Public knowledge content',
-          metadata: { source: 'public-knowledge-base' }
+          metadata: { source: 'public-knowledge-base', fileName: 'public-guide.txt' }
         },
         {
           id: 'kb-2',
           content: 'Private knowledge content',
-          metadata: { source: 'private-knowledge-base' }
+          metadata: { source: 'private-knowledge-base', fileName: 'private-doc.txt' }
         }
       ];
 
@@ -184,8 +186,10 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.totalResults).toBe(2);
       expect(result.results[0].content).toBe('Public knowledge content');
       expect(result.results[0].source).toBe('public-knowledge-base');
+      expect(result.results[0].fileName).toBe('public-guide.txt');
       expect(result.results[1].content).toBe('Private knowledge content');
       expect(result.results[1].source).toBe('private-knowledge-base');
+      expect(result.results[1].fileName).toBe('private-doc.txt');
     });
 
     it('should return success with empty results when no content found', async () => {
@@ -224,7 +228,7 @@ describe('AgentModeService - search_knowledge_base', () => {
         {
           id: 'kb-1',
           content: 'Test content',
-          metadata: { source: 'public-knowledge-base', taskId: 'task-123' }
+          metadata: { source: 'public-knowledge-base', taskId: 'task-123', fileName: 'test.txt' }
         }
       ];
 
@@ -239,7 +243,8 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.results[0]).not.toHaveProperty('taskId');
       expect(result.results[0]).toEqual({
         content: 'Test content',
-        source: 'public-knowledge-base'
+        source: 'public-knowledge-base',
+        fileName: 'test.txt'
       });
     });
 
@@ -321,11 +326,13 @@ describe('AgentModeService - search_knowledge_base', () => {
         results: [
           {
             content: 'This is a mock knowledge base result for "test query". It contains information that was previously stored from a task execution.',
-            source: 'public-knowledge-base'
+            source: 'public-knowledge-base',
+            fileName: 'platform-guide.txt'
           },
           {
             content: 'Another mock knowledge base result for "test query". This information comes from a private knowledge base entry.',
-            source: 'private-knowledge-base'
+            source: 'private-knowledge-base',
+            fileName: 'knowledge-base.txt'
           }
         ],
         totalResults: 2
@@ -339,6 +346,17 @@ describe('AgentModeService - search_knowledge_base', () => {
 
       expect(mockResponse.results[0]).not.toHaveProperty('taskId');
       expect(mockResponse.results[1]).not.toHaveProperty('taskId');
+    });
+
+    it('should include fileName in mock results', () => {
+      const mockResponse = (agentModeService as any).getMockToolResult('search_knowledge_base', {
+        query: 'test query'
+      });
+
+      expect(mockResponse.results[0]).toHaveProperty('fileName');
+      expect(mockResponse.results[0].fileName).toBe('platform-guide.txt');
+      expect(mockResponse.results[1]).toHaveProperty('fileName');
+      expect(mockResponse.results[1].fileName).toBe('knowledge-base.txt');
     });
   });
 

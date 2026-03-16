@@ -229,6 +229,7 @@ export interface ContextChunk {
   metadata: {
     source: string;
     taskId?: string;
+    fileName?: string;
   };
 }
 
@@ -3051,6 +3052,10 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         continue;
       }
 
+      // Extract fileName from the link if available
+      const link = structData.fields?.link?.stringValue;
+      const fileName = link ? link.split('/').pop() : undefined;
+
       for (const segment of structData.fields.extractive_segments.listValue.values) {
         if (!segment.structValue?.fields?.content?.stringValue) {
           continue;
@@ -3061,7 +3066,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
           id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           content: content,
           metadata: {
-            source: 'public-knowledge-base'
+            source: 'public-knowledge-base',
+            ...(fileName && { fileName })
           }
         });
       }
@@ -3074,7 +3080,7 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         continue;
       }
 
-      // Extract taskId from the link
+      // Extract taskId and fileName from the link
       const link = structData.fields?.link?.stringValue;
       if (!link) continue;
 
@@ -3083,6 +3089,7 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
       if (!taskIdMatch) continue;
 
       const taskId = taskIdMatch[1];
+      const fileName = link.split('/').pop();
       
       // Check if task belongs to current user
       try {
@@ -3107,7 +3114,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
           content: content,
           metadata: {
             source: 'private-knowledge-base',
-            taskId: taskId
+            taskId: taskId,
+            ...(fileName && { fileName })
           }
         });
       }
