@@ -66,7 +66,7 @@ async function notionRequest(
  */
 export async function getNotionPage(
   pageId: string
-): Promise<{ title: string; status: string; instanceId: string; sgId: string; databaseId: string }> {
+): Promise<{ title: string; status: string; instanceId: string; sgId: string; publicIp: string; databaseId: string }> {
   const res = await notionRequest("get", `/pages/${pageId}`);
   const props = res.data.properties;
 
@@ -103,10 +103,18 @@ export async function getNotionPage(
       .join("");
   }
 
+  // Extract Public IP (rich_text property — may not exist yet)
+  let publicIp = "";
+  if (props["Public IP"]?.rich_text?.length > 0) {
+    publicIp = props["Public IP"].rich_text
+      .map((t: any) => t.plain_text)
+      .join("");
+  }
+
   // Extract database ID from parent
   const databaseId = res.data.parent?.database_id || "";
 
-  return { title, status, instanceId, sgId, databaseId };
+  return { title, status, instanceId, sgId, publicIp, databaseId };
 }
 
 /**
@@ -303,6 +311,64 @@ export async function addNotionComment(
     parent: { page_id: pageId },
     rich_text: [{ text: { content: text } }],
   });
+}
+
+// ---------------------------------------------------------------------------
+// Comment relay helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the text of a specific Notion comment by listing comments on a page.
+ * Notion doesn't have GET /comments/{id}, so we list and find.
+ */
+export async function getNotionCommentText(
+  pageId: string,
+  commentId: string
+): Promise<string> {
+  const res = await notionRequest("get", `/comments?block_id=${pageId}`);
+  const comment = res.data.results?.find((c: any) => c.id === commentId);
+  if (!comment) return "";
+  return comment.rich_text?.map((t: any) => t.plain_text).join("") || "";
+}
+
+/**
+ * Get the Notion integration's own bot user ID (for filtering out self-comments).
+ */
+let cachedBotUserId: string | null = null;
+
+export async function getNotionBotUserId(): Promise<string> {
+  if (cachedBotUserId) return cachedBotUserId;
+  const res = await notionRequest("get", "/users/me");
+  cachedBotUserId = res.data.id;
+  return cachedBotUserId!;
+}
+
+/**
+ * Relay a prompt to an EC2 test-env-access instance for Claude Code execution.
+ * Uses a shared secret from Secrets Manager for authentication.
+ */
+export async function relayPromptToEC2(
+  publicIp: string,
+  prompt: string,
+  notionPageId: string
+): Promise<void> {
+  try {
+    const notionToken = await getNotionToken();
+    await axios.post(
+      `http://${publicIp}:5175/api/claude-prompt`,
+      { prompt, notionPageId },
+      {
+        headers: { "X-Relay-Secret": notionToken },
+        timeout: 10000,
+      }
+    );
+    console.log(`[devEnv] Relayed prompt to ${publicIp} for page ${notionPageId}`);
+  } catch (err: any) {
+    console.error(
+      `[devEnv] Failed to relay prompt to ${publicIp}:`,
+      err.message || err
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

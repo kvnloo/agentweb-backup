@@ -183,10 +183,13 @@ SG_ID=$(get_instance_tag "sg-id")
 TEA_ENV=$(get_secret "agentweb/test-env/test-env-access-env")
 RESEND_KEY=$(echo "$TEA_ENV" | grep '^RESEND_API_KEY=' | cut -d= -f2-)
 
+NOTION_PAGE_ID=$(get_instance_tag "notion-page-id")
+
 cat > "$APP_DIR/test-env-access/.env" <<ENVEOF
 RESEND_API_KEY=${RESEND_KEY}
 SG_ID=${SG_ID}
 AWS_REGION=${REGION}
+NOTION_PAGE_ID=${NOTION_PAGE_ID}
 ENVEOF
 
 ###############################################################################
@@ -216,7 +219,7 @@ fi
 ###############################################################################
 # 12. Launch Claude Code with Notion task context
 ###############################################################################
-NOTION_PAGE_ID=$(get_instance_tag "notion-page-id")
+# NOTION_PAGE_ID already set in step 9
 NOTION_TOKEN=$(get_secret "agentweb/test-env/notion-token")
 
 # Fetch page title from Notion API

@@ -2,11 +2,16 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { spawn } from "child_process";
 import { Resend } from "resend";
 import {
   EC2Client,
   AuthorizeSecurityGroupIngressCommand,
 } from "@aws-sdk/client-ec2";
+import {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+} from "@aws-sdk/client-secrets-manager";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -270,6 +275,191 @@ app.post("/api/verify", async (req, res) => {
 app.get("/api/allowlist", (_req, res) => {
   const allowlist = readAllowlist();
   res.json(allowlist);
+});
+
+// ---------------------------------------------------------------------------
+// Claude Code prompt relay
+// ---------------------------------------------------------------------------
+
+const smClient = new SecretsManagerClient({ region: AWS_REGION });
+const secretCache = new Map();
+
+async function getCachedSecret(name) {
+  if (secretCache.has(name)) return secretCache.get(name);
+  const res = await smClient.send(
+    new GetSecretValueCommand({ SecretId: name })
+  );
+  const value = res.SecretString || "";
+  secretCache.set(name, value);
+  return value;
+}
+
+async function getNotionToken() {
+  return getCachedSecret("agentweb/test-env/notion-token");
+}
+
+async function getRelaySecret() {
+  return getNotionToken(); // reuse Notion token as shared secret
+}
+
+const NOTION_API = "https://api.notion.com/v1";
+const NOTION_VERSION = "2022-06-28";
+
+async function postNotionComment(pageId, text) {
+  const token = await getNotionToken();
+  // Notion rich_text has a 2000-char limit per element — split if needed
+  const chunks = [];
+  for (let i = 0; i < text.length; i += 2000) {
+    chunks.push({ text: { content: text.slice(i, i + 2000) } });
+  }
+  const res = await fetch(`${NOTION_API}/comments`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      parent: { page_id: pageId },
+      rich_text: chunks,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`[relay] Failed to post Notion comment: ${res.status} ${body}`);
+  }
+}
+
+async function updateNotionStatus(pageId, status) {
+  const token = await getNotionToken();
+  const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Notion-Version": NOTION_VERSION,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      properties: { Status: { status: { name: status } } },
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error(`[relay] Failed to update Notion status: ${res.status} ${body}`);
+  }
+}
+
+// Serial prompt queue
+const promptQueue = [];
+let processing = false;
+const recentlyPostedComments = new Set(); // track to prevent loops
+
+async function processQueue() {
+  if (processing || promptQueue.length === 0) return;
+  processing = true;
+
+  while (promptQueue.length > 0) {
+    const { prompt, notionPageId } = promptQueue.shift();
+    console.log(`[relay] Processing prompt for page ${notionPageId}: "${prompt.slice(0, 100)}..."`);
+
+    try {
+      const output = await runClaude(prompt);
+
+      // Truncate to ~10000 chars for Notion (5 rich_text chunks of 2000)
+      const truncated = output.length > 10000
+        ? output.slice(0, 9950) + "\n\n...(truncated)"
+        : output;
+
+      await postNotionComment(notionPageId, truncated);
+      recentlyPostedComments.add(truncated.slice(0, 200));
+
+      // If this was a deploy prompt, set status to Done to trigger teardown
+      if (prompt === "Prep for deploy") {
+        const isProduction = (process.env.NODE_ENV || "") === "production";
+        await updateNotionStatus(notionPageId, isProduction ? "Done" : "Done_Test");
+      }
+    } catch (err) {
+      console.error(`[relay] Error processing prompt:`, err);
+      try {
+        await postNotionComment(
+          notionPageId,
+          `Claude Code error: ${err.message || err}`
+        );
+      } catch (commentErr) {
+        console.error(`[relay] Failed to post error comment:`, commentErr);
+      }
+    }
+  }
+
+  processing = false;
+}
+
+function runClaude(prompt) {
+  return new Promise((resolve, reject) => {
+    // Escape single quotes in prompt for shell
+    const escaped = prompt.replace(/'/g, "'\\''");
+    const child = spawn(
+      "bash",
+      ["-c", `source ~/.bashrc && cd /home/ec2-user/agentweb && claude -p '${escaped}'`],
+      {
+        uid: 1000, // ec2-user UID
+        gid: 1000,
+        env: { ...process.env, HOME: "/home/ec2-user" },
+        timeout: 30 * 60 * 1000, // 30 minutes
+      }
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (data) => { stdout += data.toString(); });
+    child.stderr.on("data", (data) => { stderr += data.toString(); });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout || "(no output)");
+      } else {
+        reject(new Error(`Claude exited with code ${code}: ${stderr.slice(0, 500)}`));
+      }
+    });
+
+    child.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
+
+app.post("/api/claude-prompt", async (req, res) => {
+  try {
+    // Verify relay secret
+    const expectedSecret = await getRelaySecret();
+    const providedSecret = req.headers["x-relay-secret"];
+
+    if (!expectedSecret || providedSecret !== expectedSecret) {
+      return res.status(403).json({ error: "Invalid relay secret" });
+    }
+
+    const { prompt, notionPageId } = req.body;
+
+    if (!prompt || !notionPageId) {
+      return res.status(400).json({ error: "Missing prompt or notionPageId" });
+    }
+
+    // Add to queue and process
+    const position = promptQueue.length + 1;
+    promptQueue.push({ prompt, notionPageId });
+    console.log(`[relay] Queued prompt for page ${notionPageId} (position ${position})`);
+
+    // Kick the queue processor (async, don't await)
+    processQueue().catch((err) =>
+      console.error("[relay] Queue processor error:", err)
+    );
+
+    res.json({ ok: true, position });
+  } catch (err) {
+    console.error("[relay] /api/claude-prompt error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 app.listen(PORT, () => {
