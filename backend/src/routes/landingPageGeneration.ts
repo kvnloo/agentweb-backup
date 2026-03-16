@@ -72,8 +72,33 @@ function createRateLimiter(
       return;
     }
 
-    recent.push(now);
-    map.set(userId, recent);
+    // Only count the request against the limit AFTER the response succeeds.
+    // Failed requests (5xx) should not consume rate limit quota — this prevents
+    // a death spiral where transient errors eat up the user's limit on retries.
+    const originalEnd = res.end;
+    const originalJson = res.json;
+    let counted = false;
+
+    const countIfSuccess = () => {
+      if (!counted) {
+        counted = true;
+        if (res.statusCode < 500) {
+          recent.push(now);
+          map.set(userId, recent);
+        }
+      }
+    };
+
+    res.end = function (...args: any[]) {
+      countIfSuccess();
+      return originalEnd.apply(this, args);
+    } as any;
+
+    res.json = function (body: any) {
+      countIfSuccess();
+      return originalJson.call(this, body);
+    } as any;
+
     next();
   };
 }
