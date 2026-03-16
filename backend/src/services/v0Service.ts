@@ -276,7 +276,13 @@ async function generateFirstPage(
     try {
       const publicSetting = await settingsService.getSetting("email_templates_public");
       if (publicSetting) {
-        const templates = JSON.parse(publicSetting.settingValue);
+        let templates: any[];
+        try {
+          templates = JSON.parse(publicSetting.settingValue);
+        } catch (parseErr) {
+          console.warn("[V0 SERVICE] email_templates_public settingValue is not valid JSON, continuing without template");
+          templates = [];
+        }
         const match = templates.find((t: any) => t.template_name === "landing-page-v2");
         if (match && match.html_content) {
           effectiveTemplate = extractTemplateOutline(match.html_content);
