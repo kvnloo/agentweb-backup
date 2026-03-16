@@ -2573,11 +2573,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
           results: [
             {
               content: `This is a mock knowledge base result for "${args.query}". It contains information that was previously stored from a task execution.`,
-              source: 'public-knowledge-base'
+              source: 'public-knowledge-base',
+              fileName: 'platform-guide.txt'
             },
             {
               content: `Another mock knowledge base result for "${args.query}". This information comes from a private knowledge base entry.`,
-              source: 'private-knowledge-base'
+              source: 'private-knowledge-base',
+              fileName: 'knowledge-base.txt'
             }
           ],
           totalResults: 2
@@ -10691,9 +10693,10 @@ Format the response as JSON with this structure:
       // Search platform knowledge base (both public and private)
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
-      const results: Array<{ content: string; source: string }> = (searchResults || []).map(result => ({
+      const results: Array<{ content: string; source: string; fileName?: string }> = (searchResults || []).map(result => ({
         content: result.content,
-        source: result.metadata?.source || 'unknown'
+        source: result.metadata?.source || 'unknown',
+        ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
       }));
 
       // Search Google Drive shared folders
