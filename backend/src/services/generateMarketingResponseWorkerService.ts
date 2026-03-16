@@ -13,6 +13,7 @@ interface GenerateMarketingResponseParams {
   llmModel: string;
   sessionId: string;
   mockMode?: boolean;
+  isInteractiveShare?: boolean;
 }
 
 interface GenerateMarketingResponseResult {

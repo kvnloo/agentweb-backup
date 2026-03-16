@@ -721,7 +721,8 @@ export class AgentModeService {
     sessionId: string,
     mockMode: boolean = false,
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
-    socketEmit?: (room: string, event: string, payload: any) => void
+    socketEmit?: (room: string, event: string, payload: any) => void,
+    isInteractiveShare: boolean = false
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
     try {
       // Track memory usage for optimization
@@ -991,9 +992,11 @@ export class AgentModeService {
             //   2. The session was created with the skills system (has associatedSkills).
             // Sessions created before the skills implementation have no associatedSkills
             // and should retain access to all tools for backward compatibility.
-            // Block non-admin users from invoking admin-only tools
-            if (!isAdmin && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
-              const errorMsg = `Tool "${toolCall.function.name}" is restricted to admin users only.`;
+            // Block non-admin users OR interactive share sessions from invoking admin-only tools
+            if ((!isAdmin || isInteractiveShare) && ADMIN_SKILL_TOOL_NAMES.includes(toolCall.function.name)) {
+              const errorMsg = isInteractiveShare
+                ? `Tool "${toolCall.function.name}" is not available in shared sessions.`
+                : `Tool "${toolCall.function.name}" is restricted to admin users only.`;
               (messages as any[]).push({
                 tool_call_id: toolCall.id,
                 role: 'tool',

@@ -1088,7 +1088,8 @@ export async function generateSessionResponse(
   userMessage: string,
   userId: string,
   llmModel: string,
-  attachments?: any[]
+  attachments?: any[],
+  isInteractiveShare?: boolean
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -1193,7 +1194,8 @@ export async function generateSessionResponse(
       userId,
       llmModel,
       sessionId,
-      mockMode: false
+      mockMode: false,
+      isInteractiveShare: isInteractiveShare || false
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -2037,7 +2039,8 @@ export const agentModeController = {
         userMessage,
         session.userId,
         modelToUse,
-        attachments
+        attachments,
+        true // isInteractiveShare - block admin tools for security
       );
 
       // Clear progress store after completion (keep connections open for future messages)
