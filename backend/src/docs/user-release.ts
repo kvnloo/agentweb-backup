@@ -7,6 +7,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-16',
+    changes: [
+      'Security: Interactive Share — Admin Tools Blocked',
+      '- Admin management tools (skill and work plan management) are now blocked in interactive share sessions for security',
+      '- This prevents potential privilege escalation even when sharing sessions from admin accounts',
+    ],
+  },
+  {
     date: '2026-03-15',
     changes: [
       'Feature: Agent Mode — Skill Management Admin Tools',
