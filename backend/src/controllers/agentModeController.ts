@@ -4771,6 +4771,10 @@ export const agentModeController = {
               session.satisfactionScore = score;
             } else {
               scoringResults.push({ sessionId: session.sessionId, status: 'skipped' });
+              // Copy existing score from fullSession if present
+              if (fullSession.satisfactionScore) {
+                session.satisfactionScore = fullSession.satisfactionScore;
+              }
             }
           } catch (error) {
             console.error(`[getAdminChatHistory] Error scoring session ${session.sessionId}:`, error);

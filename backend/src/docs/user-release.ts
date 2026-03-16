@@ -25,6 +25,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Added Gemini-specific error logging with retry status, model info, and context details',
       '- Worker process errors now include session ID and model context for better troubleshooting',
       '- Failed scheduled chats return structured error results instead of throwing, allowing proper database logging',
+      'Fix: Admin Tools — get_chat_history Satisfaction Scores',
+      '- Fixed bug where get_chat_history with sync=true would not return satisfaction scores for sessions that were already scored',
+      '- Now correctly preserves existing satisfaction scores when scoreSessionIfNeeded returns null (skipped)',
     ],
   },
   {
