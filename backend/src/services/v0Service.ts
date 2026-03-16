@@ -14,6 +14,49 @@ setGlobalDispatcher(new Agent({
 }));
 console.log("[V0 SERVICE] Extended fetch timeouts to 10 minutes for v0 API calls");
 
+// ---------------------------------------------------------------------------
+// Retry helper — exponential backoff for transient network failures
+// ---------------------------------------------------------------------------
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 2_000; // 2s, 4s, 8s
+
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxRetries = MAX_RETRIES,
+  baseDelayMs = BASE_DELAY_MS
+): Promise<T> {
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const isRetryable =
+        err.message?.includes("fetch failed") ||
+        err.message?.includes("ECONNREFUSED") ||
+        err.message?.includes("ENOTFOUND") ||
+        err.message?.includes("network") ||
+        err.message?.includes("ETIMEDOUT") ||
+        err.message?.includes("socket hang up") ||
+        err.code === "ECONNRESET" ||
+        err.code === "UND_ERR_HEADERS_TIMEOUT";
+
+      if (!isRetryable || attempt === maxRetries) {
+        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, err.message);
+        throw err;
+      }
+
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      console.warn(
+        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${err.message}), retrying in ${delay}ms...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
+
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
 });
@@ -320,7 +363,10 @@ async function generateFirstPage(
   try {
     const v0 = await getV0Client();
 
-    const chatResponse = await v0.chats.create({ message: enrichedPrompt });
+    const chatResponse = await withRetry(
+      () => v0.chats.create({ message: enrichedPrompt }),
+      "v0 chat creation"
+    );
 
     if (!("id" in chatResponse) || !chatResponse.id) {
       throw new Error("v0 chat creation did not return a ChatDetail with an id");
@@ -576,24 +622,30 @@ export async function deployLandingPage(
   try {
     const v0 = await getV0Client();
 
-    // Step 1: Get the latest version from v0 chat
+    // Step 1: Get the latest version from v0 chat (with retry)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    const chat = await v0.chats.getById({ chatId: record.v0ChatId });
+    const chat = await withRetry(
+      () => v0.chats.getById({ chatId: record.v0ChatId! }),
+      "v0 chat fetch"
+    );
     const versionId = chat.latestVersion?.id;
 
     if (!versionId) {
       throw new Error("No version found in v0 chat — generation may still be in progress");
     }
 
-    // Step 2: Download project files from v0
+    // Step 2: Download project files from v0 (with retry)
     console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId})`);
-    const zipBuffer = await v0.chats.downloadVersion({
-      chatId: record.v0ChatId,
-      versionId,
-      // @ts-ignore — SDK types may not include these yet
-      format: "zip",
-      includeDefaultFiles: true,
-    });
+    const zipBuffer = await withRetry(
+      () => v0.chats.downloadVersion({
+        chatId: record.v0ChatId!,
+        versionId,
+        // @ts-ignore — SDK types may not include these yet
+        format: "zip",
+        includeDefaultFiles: true,
+      }),
+      "v0 zip download"
+    );
 
     // Step 3: Create GitHub repo and push files
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
