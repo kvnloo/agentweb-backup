@@ -2,7 +2,6 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
 import { agencyService } from '../services/agencyService';
-import { teamService } from '../services/teamService';
 
 export interface AgencyAccessInfo {
   agencyTeamId: string;
@@ -16,7 +15,6 @@ export interface AuthenticatedRequest extends Request {
     email: string;
     isAdmin: boolean;
     roles?: ('partner' | 'customer' | 'free')[];
-    teamId?: string;
   };
   delegateInfo?: {
     adminUserId: string;
@@ -31,7 +29,6 @@ export interface UserPayload {
   email: string;
   isAdmin: boolean;
   roles?: ('partner' | 'customer' | 'free')[];
-  teamId?: string;
   // Delegation fields
   delegateAccess?: {
     adminUserId: string;
@@ -50,7 +47,7 @@ export interface UserPayload {
 // Common function to extract user from request token (returns null if no token or invalid)
 // Also returns the decoded payload for delegate info and agency access if needed
 export async function getUserFromToken(req: Request): Promise<{
-  user: { userId: string; email: string; isAdmin: boolean; roles?: ('partner' | 'customer' | 'free')[]; teamId?: string } | null;
+  user: { userId: string; email: string; isAdmin: boolean; roles?: ('partner' | 'customer' | 'free')[] } | null;
   decoded?: UserPayload;
   adminUser?: { userId: string; email: string };
   agencyAccess?: AgencyAccessInfo;
@@ -124,23 +121,9 @@ export async function getUserFromToken(req: Request): Promise<{
     } else {
       // Normal token - get the user data
       const user = await userDb.getUserById(decoded.userId);
-
+      
       if (!user) {
         return { user: null };
-      }
-
-      // Resolve teamId: prefer JWT claim, fallback to DB lookup
-      let teamId = decoded.teamId;
-      if (!teamId) {
-        try {
-          const memberships = await teamService.getTeamsForUser(decoded.userId);
-          const activeMembership = memberships.find((m) => m.status === 'active');
-          if (activeMembership) {
-            teamId = activeMembership.teamId;
-          }
-        } catch {
-          // Silently ignore — team lookup failure should not break auth
-        }
       }
 
       return {
@@ -148,8 +131,7 @@ export async function getUserFromToken(req: Request): Promise<{
           userId: user.userId,
           email: user.email,
           isAdmin: user.isAdmin || false,
-          roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer' | 'free')[],
-          teamId,
+          roles: (user.roles && user.roles.length > 0 ? user.roles : ['partner']) as ('partner' | 'customer' | 'free')[]
         },
         decoded
       };
@@ -209,18 +191,13 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
 
 /**
  * Returns the effective owner ID for data access.
- * Priority: agency-switch mode → teamId → userId.
  * When in agency-switch mode, returns the clientTeamId so the agency user
- * sees the client's data. When user belongs to a team, returns teamId so
- * all team members share the same data scope. Otherwise returns userId.
+ * sees the client's data. Otherwise returns the user's own userId.
  */
 export function getEffectiveOwnerId(req: Request): string | undefined {
   const authReq = req as AuthenticatedRequest;
   if (authReq.agencyAccess) {
     return authReq.agencyAccess.clientTeamId;
-  }
-  if (authReq.user?.teamId) {
-    return authReq.user.teamId;
   }
   return authReq.user?.userId;
 }
