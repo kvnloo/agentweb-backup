@@ -17,6 +17,19 @@ jest.mock('../../services/connectedAccountsDb', () => ({
   deleteAccountById: jest.fn(),
   getAccountsByUserId: jest.fn(),
   getAccountByPlatform: jest.fn(),
+  updateAccountConfig: jest.fn(),
+}));
+
+// Mock fathomApiService
+const mockRegisterWebhook = jest.fn();
+const mockDeleteWebhook = jest.fn();
+const mockValidateApiKey = jest.fn();
+jest.mock('../../services/fathomApiService', () => ({
+  FathomApiService: jest.fn().mockImplementation(() => ({
+    registerWebhook: mockRegisterWebhook,
+    deleteWebhook: mockDeleteWebhook,
+    validateApiKey: mockValidateApiKey,
+  })),
 }));
 
 jest.mock('../../services/linkedInOutreachService', () => ({
@@ -43,7 +56,7 @@ describe('Connected Accounts - Fathom', () => {
   });
 
   describe('POST /api/oauth/connected-accounts/fathom', () => {
-    it('should connect Fathom with a valid API key', async () => {
+    it('should connect Fathom with a valid API key and register webhook', async () => {
       // Mock successful Fathom API validation
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -52,6 +65,9 @@ describe('Connected Accounts - Fathom', () => {
           teams: [{ id: 'team-1', name: 'My Team' }],
         }),
       });
+
+      // Mock successful webhook registration
+      mockRegisterWebhook.mockResolvedValueOnce({ id: 'wh-new-123' });
 
       (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
         platform: 'fathom',
@@ -63,6 +79,8 @@ describe('Connected Accounts - Fathom', () => {
         created_at: '2026-03-16T00:00:00.000Z',
         updated_at: '2026-03-16T00:00:00.000Z',
       });
+
+      (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
 
       const response = await request(app)
         .post('/api/oauth/connected-accounts/fathom')
@@ -95,6 +113,59 @@ describe('Connected Accounts - Fathom', () => {
           }),
         })
       );
+
+      // Should have registered webhook
+      expect(mockRegisterWebhook).toHaveBeenCalledWith(
+        expect.stringContaining('/api/webhooks/fathom')
+      );
+
+      // Should have stored webhook_id in DB
+      expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+        'user-123',
+        'fathom',
+        'fathom-user-123',
+        expect.objectContaining({
+          webhook_id: 'wh-new-123',
+          webhook_url: expect.stringContaining('/api/webhooks/fathom'),
+        })
+      );
+    });
+
+    it('should still succeed if webhook registration fails (graceful degradation)', async () => {
+      // Mock successful Fathom API validation
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          teams: [{ id: 'team-1', name: 'My Team' }],
+        }),
+      });
+
+      // Mock webhook registration failure
+      mockRegisterWebhook.mockRejectedValueOnce(new Error('Webhook registration failed'));
+
+      (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
+        platform: 'fathom',
+        account_id: 'fathom-user-123',
+        account_name: 'Fathom',
+        config: {
+          api_key: 'fv2_valid_key_here',
+        },
+        created_at: '2026-03-16T00:00:00.000Z',
+        updated_at: '2026-03-16T00:00:00.000Z',
+      });
+
+      const response = await request(app)
+        .post('/api/oauth/connected-accounts/fathom')
+        .send({ api_key: 'fv2_valid_key_here' });
+
+      // Should still succeed — webhook registration is best-effort
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.account).toBeDefined();
+
+      // Should NOT have tried to store webhook_id
+      expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
     });
 
     it('should reject an invalid API key (401 from Fathom)', async () => {
@@ -138,7 +209,7 @@ describe('Connected Accounts - Fathom', () => {
   });
 
   describe('DELETE /api/oauth/connected-accounts/fathom', () => {
-    it('should disconnect Fathom and clean up webhook if present', async () => {
+    it('should disconnect Fathom and clean up webhook via FathomApiService', async () => {
       (connectedAccountsDb.getAccountByPlatform as jest.Mock).mockResolvedValue({
         platform: 'fathom',
         account_id: 'fathom-user-123',
@@ -151,11 +222,8 @@ describe('Connected Accounts - Fathom', () => {
         updated_at: '2026-03-16T00:00:00.000Z',
       });
 
-      // Mock webhook deletion
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-      });
+      // Mock webhook deletion success
+      mockDeleteWebhook.mockResolvedValueOnce(undefined);
 
       (connectedAccountsDb.deleteAccount as jest.Mock).mockResolvedValue(undefined);
 
@@ -165,16 +233,8 @@ describe('Connected Accounts - Fathom', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
 
-      // Should have called Fathom to delete webhook
-      expect(mockFetch).toHaveBeenCalledWith(
-        'https://api.fathom.ai/external/v1/webhooks/wh-123',
-        expect.objectContaining({
-          method: 'DELETE',
-          headers: expect.objectContaining({
-            'X-Api-Key': 'fv2_valid_key',
-          }),
-        })
-      );
+      // Should have called FathomApiService to delete webhook
+      expect(mockDeleteWebhook).toHaveBeenCalledWith('wh-123');
 
       expect(connectedAccountsDb.deleteAccount).toHaveBeenCalledWith('user-123', 'fathom');
     });
@@ -200,13 +260,13 @@ describe('Connected Accounts - Fathom', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
 
-      // Should NOT have called Fathom API
-      expect(mockFetch).not.toHaveBeenCalled();
+      // Should NOT have tried to delete webhook
+      expect(mockDeleteWebhook).not.toHaveBeenCalled();
 
       expect(connectedAccountsDb.deleteAccount).toHaveBeenCalledWith('user-123', 'fathom');
     });
 
-    it('should still delete from DB if webhook cleanup fails', async () => {
+    it('should still delete from DB if webhook cleanup fails (graceful degradation)', async () => {
       (connectedAccountsDb.getAccountByPlatform as jest.Mock).mockResolvedValue({
         platform: 'fathom',
         account_id: 'fathom-user-123',
@@ -220,7 +280,7 @@ describe('Connected Accounts - Fathom', () => {
       });
 
       // Mock webhook deletion failure
-      mockFetch.mockRejectedValueOnce(new Error('Fathom API down'));
+      mockDeleteWebhook.mockRejectedValueOnce(new Error('Fathom API down'));
 
       (connectedAccountsDb.deleteAccount as jest.Mock).mockResolvedValue(undefined);
 
@@ -230,7 +290,7 @@ describe('Connected Accounts - Fathom', () => {
       expect(response.status).toBe(200);
       expect(response.body.success).toBe(true);
 
-      // Should still delete from DB
+      // Should still delete from DB even though webhook cleanup failed
       expect(connectedAccountsDb.deleteAccount).toHaveBeenCalledWith('user-123', 'fathom');
     });
   });
