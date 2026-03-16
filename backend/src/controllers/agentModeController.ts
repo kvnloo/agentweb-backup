@@ -17,7 +17,6 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
-import { checkConcurrencyGate } from '../services/concurrencyGate';
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 
@@ -1513,25 +1512,12 @@ export const agentModeController = {
 
   // Generate AI response for marketing conversation
   async generateResponse(req: Request, res: Response) {
-    const sessionId = req.body?.sessionId;
     try {
       const user = req.user as User;
-      const { userMessage, llmModel, attachments } = req.body;
+      const { sessionId, userMessage, llmModel, attachments } = req.body;
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });
-      }
-
-      // --- Concurrency gate: check if user can start a new generation ---
-      const gate = await checkConcurrencyGate(user.userId);
-      if (!gate.allowed) {
-        return res.status(429).json({
-          error: 'Concurrent generation limit reached',
-          message: `You have ${gate.activeCount} active generation(s) and your plan allows ${gate.limit}. Please wait for a running session to finish or switch to it.`,
-          code: 'CONCURRENCY_LIMIT_REACHED',
-          activeSessionIds: gate.activeSessionIds,
-          limit: gate.limit,
-        });
       }
 
       // Get session
@@ -1539,9 +1525,6 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
-
-      // Mark session as generating
-      await chatbotDb.updateGenerationStatus(sessionId, 'generating', new Date().toISOString());
 
       // Clear old progress store (but keep active connections)
       // Don't call cleanupProgress here as it removes active SSE connections
@@ -1559,11 +1542,6 @@ export const agentModeController = {
         attachments
       );
 
-      // Mark session as completed
-      await chatbotDb.updateGenerationStatus(sessionId, 'completed').catch(err => {
-        console.error('AgentMode: Failed to update generation status to completed:', err);
-      });
-
       // Clear progress store after completion (keep connections open for future messages)
       progressStore.delete(sessionId);
 
@@ -1578,14 +1556,8 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
 
-      // Clean up generation status on error
-      if (sessionId) {
-        await chatbotDb.updateGenerationStatus(sessionId, 'error').catch(err => {
-          console.error('AgentMode: Failed to update generation status to error:', err);
-        });
-      }
-
       // Clean up progress store on error so session doesn't appear stuck in generating state
+      const sessionId = req.body?.sessionId;
       if (sessionId) {
         emitProgress(sessionId, { iteration: 0, status: 'complete' });
         progressStore.delete(sessionId);
@@ -4460,11 +4432,10 @@ export const agentModeController = {
 
   // Verified generate - ensures required functions are called minimum number of times
   async verifiedGenerate(req: Request, res: Response) {
-    const sessionId = req.body?.sessionId;
     try {
       const user = req.user as User;
-      const { startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
-
+      const { sessionId, startingMessage, requiredFunctions, keywords, attachments, maxAttempts: maxAttemptsParam } = req.body;
+      
       // Log attachments for debugging
       console.log('AgentMode verifiedGenerate: Received attachments:', attachments?.length || 0, attachments);
 
@@ -4493,18 +4464,6 @@ export const agentModeController = {
         }
       }
 
-      // --- Concurrency gate: check if user can start a new generation ---
-      const gate = await checkConcurrencyGate(user.userId);
-      if (!gate.allowed) {
-        return res.status(429).json({
-          error: 'Concurrent generation limit reached',
-          message: `You have ${gate.activeCount} active generation(s) and your plan allows ${gate.limit}. Please wait for a running session to finish or switch to it.`,
-          code: 'CONCURRENCY_LIMIT_REACHED',
-          activeSessionIds: gate.activeSessionIds,
-          limit: gate.limit,
-        });
-      }
-
       // Get session and verify ownership
       const session = await chatbotDb.getChatSession(sessionId);
       if (!session) {
@@ -4514,9 +4473,6 @@ export const agentModeController = {
       if (session.userId !== user.userId) {
         return res.status(403).json({ error: 'Access denied to this session' });
       }
-
-      // Mark session as generating
-      await chatbotDb.updateGenerationStatus(sessionId, 'generating', new Date().toISOString());
 
       // Track if client disconnected (user navigated away)
       let clientDisconnected = false;
@@ -4537,11 +4493,6 @@ export const agentModeController = {
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
         attachments: attachmentsArray
-      });
-
-      // Mark session as completed
-      await chatbotDb.updateGenerationStatus(sessionId, 'completed').catch(err => {
-        console.error('AgentMode: Failed to update generation status to completed:', err);
       });
 
       // If client disconnected, don't try to send response
@@ -4569,14 +4520,7 @@ export const agentModeController = {
       });
     } catch (error: any) {
       console.error('AgentMode: Verified generate error:', error);
-
-      // Clean up generation status on error
-      if (sessionId) {
-        await chatbotDb.updateGenerationStatus(sessionId, 'error').catch(err => {
-          console.error('AgentMode: Failed to update generation status to error:', err);
-        });
-      }
-
+      const sessionId = req.body?.sessionId;
       const user = req.user as User;
       const isSessionLimit = isSessionLimitError(error);
 

@@ -15,14 +15,8 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     addMessageToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
-    incrementCalledFunctions: jest.fn(),
-    updateGenerationStatus: jest.fn().mockResolvedValue({}),
-    getActiveGenerations: jest.fn().mockResolvedValue({ count: 0, sessionIds: [] }),
+    incrementCalledFunctions: jest.fn()
   }
-}));
-
-jest.mock('../services/concurrencyGate', () => ({
-  checkConcurrencyGate: jest.fn().mockResolvedValue({ allowed: true, activeCount: 0, limit: 3, activeSessionIds: [] }),
 }));
 
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({

@@ -7,7 +7,6 @@ import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { generateChatResponse } from './services/chatbotService';
-import { runOrphanRecoveryOnStartup } from './services/orphanRecovery';
 
 dotenv.config();
 
@@ -245,11 +244,6 @@ createTestAccount().then(async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
-
-    // Run orphan recovery to reset any sessions stuck in 'generating' state
-    runOrphanRecoveryOnStartup().catch(err => {
-      console.error('Orphan recovery failed on startup:', err);
-    });
 
     // Initialize Agent Mode tools in background - don't block server startup
     // This prevents health check timeouts during deployment (e.g. Elastic Beanstalk)
