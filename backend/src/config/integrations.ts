@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getMetaCredentials, getGmailCredentials, getYouTubeCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -92,13 +92,6 @@ export const INTEGRATION_CONFIG = {
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ],
-  },
-
-  fathom: {
-    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/callback/fathom`,
-    authorizationUrl: 'https://fathom.video/external/v1/oauth2/authorize',
-    tokenUrl: 'https://api.fathom.ai/external/v1/oauth2/token',
-    scopes: ['public_api'],
   }
 };
 
@@ -268,39 +261,3 @@ export async function getMetaConfig(flow?: MetaFlowType): Promise<MetaConfig> {
   };
 }
 
-// Fathom configuration interface
-export interface FathomOAuthConfig {
-  clientId: string;
-  clientSecret: string;
-  redirectUri: string;
-  scopes: string[];
-  authorizationUrl: string;
-  tokenUrl: string;
-}
-
-// Module-level cache for Fathom config
-let cachedFathomConfig: FathomOAuthConfig | null = null;
-let fathomConfigCacheExpiresAt = 0;
-const FATHOM_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-/**
- * Returns Fathom OAuth configuration.
- * Credentials are fetched from AWS Secrets Manager (dev/AgentWeb/Fathom or prod/...).
- * Result is cached for 5 minutes to avoid per-request Secrets Manager calls.
- */
-export async function getFathomConfig(): Promise<FathomOAuthConfig> {
-  if (cachedFathomConfig && Date.now() < fathomConfigCacheExpiresAt) {
-    return cachedFathomConfig;
-  }
-  const credentials = await getFathomCredentials();
-  cachedFathomConfig = {
-    clientId: credentials.clientId,
-    clientSecret: credentials.clientSecret,
-    redirectUri: INTEGRATION_CONFIG.fathom.redirectUri,
-    scopes: INTEGRATION_CONFIG.fathom.scopes,
-    authorizationUrl: INTEGRATION_CONFIG.fathom.authorizationUrl,
-    tokenUrl: INTEGRATION_CONFIG.fathom.tokenUrl,
-  };
-  fathomConfigCacheExpiresAt = Date.now() + FATHOM_CONFIG_CACHE_TTL_MS;
-  return cachedFathomConfig;
-}

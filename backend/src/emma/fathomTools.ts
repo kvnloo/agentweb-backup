@@ -11,56 +11,19 @@
 
 import axios from 'axios';
 import { emmaToolRegistry } from './registry';
-import { getAccountsByUserId, updateAccountConfig } from '../services/connectedAccountsDb';
-import { getFathomConfig } from '../config/integrations';
+import { getAccountsByUserId } from '../services/connectedAccountsDb';
 
 const FATHOM_API_BASE = 'https://api.fathom.ai/external/v1';
 
 /**
- * Retrieve the Fathom access token from the user's connected accounts.
- * For OAuth accounts, automatically refreshes the token if expired.
+ * Retrieve the Fathom API key from the user's connected accounts.
  * Returns null if no Fathom account is connected.
  */
-async function getFathomAccessToken(userId: string): Promise<string | null> {
+async function getFathomApiKey(userId: string): Promise<string | null> {
   const accounts = await getAccountsByUserId(userId);
   const fathomAccount = accounts.find(acc => acc.platform === 'fathom');
   if (!fathomAccount) return null;
-
-  const config = fathomAccount.config as any;
-
-  // Check if token needs refresh (OAuth accounts only)
-  if (config.refresh_token && config.token_expires_at && Date.now() > config.token_expires_at - 60000) {
-    try {
-      const fathomConfig = await getFathomConfig();
-      const response = await axios.post(fathomConfig.tokenUrl, new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: config.refresh_token,
-        client_id: fathomConfig.clientId,
-        client_secret: fathomConfig.clientSecret,
-      }).toString(), {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      });
-
-      const { access_token, refresh_token, expires_in } = response.data as {
-        access_token: string;
-        refresh_token?: string;
-        expires_in: number;
-      };
-
-      await updateAccountConfig(userId, 'fathom', fathomAccount.account_id, {
-        access_token,
-        ...(refresh_token && { refresh_token }),
-        token_expires_at: Date.now() + (expires_in * 1000),
-      });
-
-      return access_token;
-    } catch (err: any) {
-      console.error('[Fathom] Token refresh failed:', err?.message);
-      // Fall through to use existing token
-    }
-  }
-
-  return config.access_token || null;
+  return fathomAccount.config.access_token || null;
 }
 
 // ── fathom_get_meetings ──────────────────────────────────────────────────────
@@ -99,8 +62,8 @@ emmaToolRegistry.register({
       return { success: false, message: 'Authentication required: no user context.' };
     }
 
-    const accessToken = await getFathomAccessToken(userId);
-    if (!accessToken) {
+    const apiKey = await getFathomApiKey(userId);
+    if (!apiKey) {
       return {
         success: false,
         message:
@@ -120,7 +83,7 @@ emmaToolRegistry.register({
 
       const url = `${FATHOM_API_BASE}/meetings?${params.toString()}`;
       const response = await axios.get(url, {
-        headers: { 'Authorization': `Bearer ${accessToken}` },
+        headers: { 'X-Api-Key': apiKey },
       });
 
       const meetings = ((response.data as any) || []).map((m: any) => ({
@@ -181,8 +144,8 @@ emmaToolRegistry.register({
       return { success: false, message: 'recording_id is required. Use fathom_get_meetings to find recording IDs.' };
     }
 
-    const accessToken = await getFathomAccessToken(userId);
-    if (!accessToken) {
+    const apiKey = await getFathomApiKey(userId);
+    if (!apiKey) {
       return {
         success: false,
         message:
@@ -193,7 +156,7 @@ emmaToolRegistry.register({
     try {
       const url = `${FATHOM_API_BASE}/recordings/${args.recording_id}/transcript`;
       const response = await axios.get(url, {
-        headers: { 'Authorization': `Bearer ${accessToken}` },
+        headers: { 'X-Api-Key': apiKey },
       });
 
       const data = response.data as any;

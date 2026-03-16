@@ -20,7 +20,7 @@ export class FathomApiService {
     const response = await fetch(`${FATHOM_API_BASE}/webhooks`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
+        'X-Api-Key': this.apiKey,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -49,7 +49,7 @@ export class FathomApiService {
     const response = await fetch(`${FATHOM_API_BASE}/webhooks/${webhookId}`, {
       method: 'DELETE',
       headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
+        'X-Api-Key': this.apiKey,
         'Content-Type': 'application/json',
       },
     });
@@ -69,7 +69,7 @@ export class FathomApiService {
       const response = await fetch(`${FATHOM_API_BASE}/teams`, {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
+          'X-Api-Key': this.apiKey,
           'Content-Type': 'application/json',
         },
       });

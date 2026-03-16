@@ -30,7 +30,7 @@ describe('FathomApiService', () => {
         expect.objectContaining({
           method: 'POST',
           headers: expect.objectContaining({
-            'Authorization': `Bearer ${testApiKey}`,
+            'X-Api-Key': testApiKey,
             'Content-Type': 'application/json',
           }),
         })
@@ -82,7 +82,7 @@ describe('FathomApiService', () => {
         expect.objectContaining({
           method: 'DELETE',
           headers: expect.objectContaining({
-            'Authorization': `Bearer ${testApiKey}`,
+            'X-Api-Key': testApiKey,
           }),
         })
       );
@@ -123,7 +123,7 @@ describe('FathomApiService', () => {
         expect.objectContaining({
           method: 'GET',
           headers: expect.objectContaining({
-            'Authorization': `Bearer ${testApiKey}`,
+            'X-Api-Key': testApiKey,
           }),
         })
       );

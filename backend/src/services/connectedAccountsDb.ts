@@ -120,10 +120,11 @@ export interface YouTubeConfig extends BaseOAuthConfig {
  * Fathom API key configuration (not OAuth — direct API key)
  */
 export interface FathomConfig {
-  account_type: 'oauth' | 'api_key';
-  api_key?: string; // backward compat for old API key accounts
+  account_type: 'api_key';
+  api_key: string;
   webhook_id?: string;  // Stored after webhook registration
   webhook_url?: string; // Our endpoint URL
+  // Required by BaseOAuthConfig consumers — set to far-future for API key accounts
   access_token: string;
   refresh_token?: string;
   token_expires_at: number;
