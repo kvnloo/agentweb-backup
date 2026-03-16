@@ -209,13 +209,13 @@ export const leadListAlertService = {
       createdAt,
     });
 
-    // Send Slack notification if webhook URL is configured
-    if (typeof list.slackWebhookUrl === 'string' && list.slackWebhookUrl.length > 0) {
+    // Send Slack notification if the user has a slackChannel configured
+    if (user.slackChannel) {
       try {
         const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
         const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
 
-        await sendLeadNotification(list.slackWebhookUrl, {
+        await sendLeadNotification(user.slackChannel, {
           firstName: lead.firstName,
           lastName: lead.lastName,
           email: lead.email,
