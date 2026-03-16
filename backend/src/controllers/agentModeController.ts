@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
-import { chatbotDb, updateTaskExecutionStatus, ChatMessage } from '../services/chatbotService';
+import { chatbotDb, updateTaskExecutionStatus, ChatMessage, dynamodb } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
@@ -17,6 +17,7 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+import AWS from 'aws-sdk';
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 
@@ -4707,6 +4708,104 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get share OG metadata error:', error);
       res.status(500).json({ error: 'Failed to get share metadata' });
+    }
+  },
+
+  // GET /api/agent-mode/admin/chat-history
+  // Admin-only endpoint to retrieve chat history with satisfaction scores
+  getAdminChatHistory: async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { startTime, endTime, limit, sync } = req.query;
+
+      if (!startTime || !endTime) {
+        return res.status(400).json({ error: 'startTime and endTime are required' });
+      }
+
+      const limitNum = limit ? parseInt(limit as string, 10) : 100;
+      if (isNaN(limitNum) || limitNum < 1 || limitNum > 1000) {
+        return res.status(400).json({ error: 'limit must be between 1 and 1000' });
+      }
+
+      const syncMode = sync === 'true' || sync === '1';
+
+      // Calculate table name based on NODE_ENV
+      const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+      const tableName = `${TABLE_PREFIX}AW-ChatSessions`;
+
+      // Query chat sessions by time range using AdminUpdatedAtIndex
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: tableName,
+        IndexName: 'AdminUpdatedAtIndex',
+        KeyConditionExpression: 'adminListPartition = :partition AND updatedAt BETWEEN :start AND :end',
+        ExpressionAttributeValues: {
+          ':partition': 'all',
+          ':start': startTime,
+          ':end': endTime,
+        },
+        Limit: limitNum,
+        ScanIndexForward: false, // Most recent first
+      };
+
+      const result = await dynamodb.query(params).promise();
+      let sessions = (result.Items || []) as any[];
+
+      // Sync mode: generate satisfaction scores for sessions that don't have them
+      if (syncMode) {
+        const { scoreSessionIfNeeded } = await import('../services/sessionScoringService');
+        const scoringResults: { sessionId: string; status: 'scored' | 'skipped' | 'error'; error?: string }[] = [];
+
+        for (const session of sessions) {
+          try {
+            // Load full session with messages if needed for scoring
+            const fullSession = await chatbotDb.getChatSession(session.sessionId);
+            if (!fullSession) {
+              scoringResults.push({ sessionId: session.sessionId, status: 'error', error: 'Session not found' });
+              continue;
+            }
+
+            // Attempt to score
+            const score = await scoreSessionIfNeeded(fullSession);
+            if (score) {
+              scoringResults.push({ sessionId: session.sessionId, status: 'scored' });
+              // Update session object with new score
+              session.satisfactionScore = score;
+            } else {
+              scoringResults.push({ sessionId: session.sessionId, status: 'skipped' });
+            }
+          } catch (error) {
+            console.error(`[getAdminChatHistory] Error scoring session ${session.sessionId}:`, error);
+            scoringResults.push({
+              sessionId: session.sessionId,
+              status: 'error',
+              error: (error as Error).message
+            });
+          }
+        }
+
+        console.log('[getAdminChatHistory] Sync mode scoring results:', scoringResults);
+      }
+
+      // Format response with satisfaction scores
+      const formattedSessions = sessions.map(session => ({
+        sessionId: session.sessionId,
+        userId: session.userId,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        sessionType: session.sessionType,
+        messageCount: session.messages?.length || 0,
+        satisfactionScore: session.satisfactionScore,
+      }));
+
+      res.json({
+        sessions: formattedSessions,
+        count: formattedSessions.length,
+        timeRange: { startTime, endTime },
+        syncMode,
+      });
+    } catch (error) {
+      console.error('AgentMode: Get admin chat history error:', error);
+      res.status(500).json({ error: 'Failed to get chat history' });
     }
   },
 

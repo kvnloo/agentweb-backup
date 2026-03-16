@@ -31,7 +31,7 @@ const REPAIRABLE_TOOL_CALLS = [
 ];
 
 // Make sure we have a DynamoDB instance
-const dynamodb = new AWS.DynamoDB.DocumentClient({
+export const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",

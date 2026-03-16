@@ -4483,6 +4483,7 @@ const adminToolNames = [
   'manage_predefined_work_plan',
   'list_skills',
   'manage_skill',
+  'get_chat_history',
 ];
 
 for (const toolName of bridgedToolNames) {
