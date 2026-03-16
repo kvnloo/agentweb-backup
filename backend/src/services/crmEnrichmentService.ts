@@ -459,6 +459,47 @@ Valid example:
     };
   }
 
+  static async suggestEnrichment(goal: string): Promise<{ instruction: string; outputFields: string[] }> {
+    const systemPrompt = `You are a data enrichment specialist for a B2B CRM system.
+
+Given a user's enrichment goal or instruction, produce:
+
+1. An improved extraction instruction. Apply these rules:
+   - SHORT / VAGUE input (under ~80 words, no specific criteria or definitions): rewrite it into a precise 2-4 sentence extraction instruction.
+   - DETAILED input (contains specific criteria, named categories, thresholds, persona definitions, or examples): preserve the FULL content verbatim — do NOT summarize, shorten, or remove any criteria. You may lightly fix grammar or formatting, but every specific rule, definition, and threshold must remain in the output instruction exactly as given. NEVER replace specific definitions with vague phrases like "based on the provided criteria" — that loses the actual criteria.
+
+2. A list of output field names in snake_case — one field per distinct data point. Rules:
+   - Numeric values (employee count, revenue, dates, amounts) → always its own separate field
+   - Categorical / label values (funding stage, ICP category, industry, tier) → always its own separate field
+   - Prose summaries (profile, description, overview) → one field
+   - Never merge different data types — "a profile including industry and employee count" → THREE fields: company_profile + industry + employee_count
+   - Capture every distinct data point mentioned, including ones embedded inside a prose request (e.g. "last funding date" inside a funding description → last_funding_date field)
+
+Return ONLY valid JSON: { "instruction": "...", "outputFields": ["field1", "field2", ...] }
+No markdown, no backticks, no extra text.`;
+
+    const geminiClient = await agentModeService.getGeminiClient();
+    const completion = await geminiClient.chat.completions.create({
+      model: CrmEnrichmentService.ENRICH_MODEL,
+      temperature: 1,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Enrichment goal or instruction:\n${goal}` },
+      ],
+      response_format: { type: 'json_object' },
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || '';
+    const parsed = JSON.parse(raw);
+
+    return {
+      instruction: typeof parsed.instruction === 'string' ? parsed.instruction.trim() : goal,
+      outputFields: Array.isArray(parsed.outputFields)
+        ? parsed.outputFields.filter((f: any) => typeof f === 'string' && f.trim())
+        : [],
+    };
+  }
+
   static async enrichWebCompat(listId: string, userId: string, socketId?: string, forceEnrich = false): Promise<EnrichmentExecuteResult> {
     const service = new CrmEnrichmentService();
     return service.execute({
