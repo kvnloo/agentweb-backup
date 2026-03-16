@@ -35,6 +35,23 @@ You are running inside an EC2 cloud dev environment. These instructions OVERRIDE
 - Verify services are running: `~/agentweb/test-env/dev-services.sh status`
 - **After any code change that could cause a crash**, check the backend log and restart if needed. Do not wait for the user to tell you.
 
+## Async Operations (CI, Merging, etc.)
+
+When you need to wait for something (e.g. CI to finish, a deployment to complete), you can request a delayed follow-up by including this directive anywhere in your response:
+
+```
+[RELAY_RETRY_AFTER:300]
+```
+
+The relay system will re-invoke you after the specified number of seconds (300 = 5 minutes, max 600). Your follow-up prompt will be: "Continue where you left off. Check the status of what you were waiting for."
+
+**Example workflow for "wait for CI and merge":**
+1. Push your changes, create/update the PR
+2. In your response, include `[RELAY_RETRY_AFTER:300]` and explain what you're waiting for
+3. When re-invoked, check CI status with `gh pr checks <number>` or `gh run list`
+4. If CI passed, merge. If still running, include `[RELAY_RETRY_AFTER:180]` again
+5. If CI failed, investigate and fix
+
 ## Browser Testing
 
 Use the Playwright MCP tools (`mcp__playwright__browser_*`) to test against the running services:
