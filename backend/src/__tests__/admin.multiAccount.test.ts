@@ -99,6 +99,41 @@ describe('Admin Routes - Multiple Account Configuration', () => {
       expect(tooLongLabel.length).toBeGreaterThan(100);
     });
 
+    it('should validate both domain and URL-prefix formats for seoDomains', () => {
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
+
+      // Valid domain property formats
+      expect(domainRegex.test('example.com')).toBe(true);
+      expect(domainRegex.test('subdomain.example.com')).toBe(true);
+      expect(domainRegex.test('multi.level.subdomain.example.com')).toBe(true);
+
+      // Valid URL-prefix property formats
+      expect(urlPrefixRegex.test('https://example.com')).toBe(true);
+      expect(urlPrefixRegex.test('https://example.com/')).toBe(true);
+      expect(urlPrefixRegex.test('http://example.com/')).toBe(true);
+      expect(urlPrefixRegex.test('https://subdomain.example.com/')).toBe(true);
+
+      // Invalid formats
+      expect(domainRegex.test('https://example.com')).toBe(false);
+      expect(urlPrefixRegex.test('example.com')).toBe(false);
+      expect(domainRegex.test('invalid')).toBe(false);
+      expect(urlPrefixRegex.test('ftp://example.com')).toBe(false);
+
+      // Combined validation (should accept either format)
+      const testDomains = [
+        'example.com',
+        'https://example.com/',
+        'subdomain.example.com',
+        'https://subdomain.example.com'
+      ];
+
+      testDomains.forEach(domain => {
+        const isValid = domainRegex.test(domain) || urlPrefixRegex.test(domain);
+        expect(isValid).toBe(true);
+      });
+    });
+
     it('should filter out empty entries', () => {
       const properties = [
         { propertyId: '123456789', label: 'Main Site' },

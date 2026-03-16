@@ -668,12 +668,17 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
         return res.status(400).json({ message: "seoDomains must be an array" });
       }
 
-      // Validate each domain format
+      // Validate each domain format (allow both domain and URL-prefix formats)
+      // Domain property: example.com
+      // URL-prefix property: https://example.com or https://example.com/
       const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
+
       for (const domain of seoDomains) {
-        if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
+        const trimmedDomain = domain.trim();
+        if (typeof domain !== 'string' || (!domainRegex.test(trimmedDomain) && !urlPrefixRegex.test(trimmedDomain))) {
           return res.status(400).json({
-            message: `Invalid domain format: ${domain}. Please use format like example.com`
+            message: `Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`
           });
         }
       }
