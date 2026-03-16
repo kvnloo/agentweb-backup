@@ -89,9 +89,9 @@ function createRateLimiter(
       }
     };
 
-    res.end = function (this: any, ...args: [any?, BufferEncoding?, (() => void)?]) {
+    res.end = function (this: any, ...args: any[]) {
       countIfSuccess();
-      return originalEnd.apply(this, args);
+      return (originalEnd as Function).apply(this, args);
     } as any;
 
     res.json = function (this: any, body: any) {
