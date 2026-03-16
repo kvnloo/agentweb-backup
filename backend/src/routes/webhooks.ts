@@ -11,59 +11,6 @@ import { emmaEmailService } from '../services/emmaEmailService';
 
 const router = express.Router();
 
-/**
- * Detect and normalize Warmly webhook payloads into the standard forward-lead schema.
- * Warmly sends fields like `visitor_email`, `visitor_first_name`, `warmly_visitor_id`, etc.
- * This function maps them to our standard Lead fields and stores enrichment data in customFields.
- * Non-Warmly payloads pass through unchanged.
- */
-function normalizeWarmlyPayload(body: Record<string, any>): Record<string, any> {
-  const isWarmly = body.source === 'warmly' || typeof body.warmly_visitor_id === 'string';
-  if (!isWarmly) return body;
-
-  // Map Warmly visitor_* fields to standard Lead fields
-  const normalized: Record<string, any> = {
-    ...body,
-    email: body.email || body.visitor_email,
-    firstName: body.firstName || body.visitor_first_name || '',
-    lastName: body.lastName || body.visitor_last_name || '',
-    phone: body.phone || body.visitor_phone || '',
-    company: body.company || body.visitor_company || '',
-    title: body.title || body.visitor_title || '',
-    linkedin: body.linkedin || body.visitor_linkedin_url || '',
-    source: 'warmly',
-  };
-
-  // Collect Warmly enrichment fields into customFields
-  const warmlyEnrichmentFields = [
-    'warmly_visitor_id',
-    'pages_viewed',
-    'time_on_site',
-    'visitor_location',
-    'referrer',
-    'visit_source',
-    'visitor_industry',
-    'visitor_employee_count',
-    'visitor_revenue',
-    'visitor_technologies',
-  ] as const;
-
-  const enrichmentCustomFields: Record<string, any> = {};
-  for (const field of warmlyEnrichmentFields) {
-    if (body[field] !== undefined) {
-      enrichmentCustomFields[field] = body[field];
-    }
-  }
-
-  // Merge enrichment fields into existing customFields
-  normalized.customFields = {
-    ...(body.customFields && typeof body.customFields === 'object' ? body.customFields : {}),
-    ...enrichmentCustomFields,
-  };
-
-  return normalized;
-}
-
 // Resend webhook endpoint
 router.post('/resend', async (req: express.Request, res: express.Response) => {
   try {
@@ -223,10 +170,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
 
   try {
 
-    // Normalize Warmly payloads before extracting fields
-    const normalizedBody = normalizeWarmlyPayload(req.body);
-
-    // Extract lead data from (possibly normalized) body
+    // Extract lead data from request body
     const {
       email,
       firstName,
@@ -238,7 +182,7 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       linkedin,
       source,
       customFields
-    } = normalizedBody;
+    } = req.body;
 
     // Validate required field (email)
     if (!email || typeof email !== 'string' || !email.trim()) {
