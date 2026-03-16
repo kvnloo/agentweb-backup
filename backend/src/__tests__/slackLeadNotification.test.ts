@@ -1,8 +1,8 @@
 /**
  * Tests for Slack lead notification feature:
  * - formatLeadNotificationPayload: message formatting
- * - sendLeadNotification: webhook HTTP call
- * - leadListAlertService: integration with Slack when slackWebhookUrl is set
+ * - sendLeadNotification: bot-based channel posting via slackClient
+ * - leadListAlertService: integration with Slack when user has slackChannel
  */
 
 // Mock server before any imports
@@ -13,9 +13,18 @@ jest.mock('../server', () => ({
 
 jest.mock('../controllers/templates', () => ({}));
 
-// Mock fetch globally
-const mockFetch = jest.fn();
-(global as any).fetch = mockFetch;
+// Mock the @slack/web-api WebClient
+const mockPostMessage = jest.fn();
+jest.mock('@slack/web-api', () => ({
+  WebClient: jest.fn().mockImplementation(() => ({
+    chat: { postMessage: mockPostMessage },
+    conversations: { info: jest.fn(), list: jest.fn() },
+    views: { open: jest.fn() },
+  })),
+}));
+
+// Set env var before slackService is imported so the client initializes
+process.env.SLACK_BOT_TOKEN = 'xoxb-test-token';
 
 import {
   formatLeadNotificationPayload,
@@ -107,7 +116,7 @@ describe('formatLeadNotificationPayload', () => {
 
 describe('sendLeadNotification', () => {
   beforeEach(() => {
-    mockFetch.mockReset();
+    mockPostMessage.mockReset();
   });
 
   const lead: LeadNotificationPayload = {
@@ -118,39 +127,32 @@ describe('sendLeadNotification', () => {
     listId: 'list_demo',
   };
 
-  it('sends POST to webhook URL with JSON payload', async () => {
-    mockFetch.mockResolvedValueOnce({ ok: true, status: 200 });
+  it('posts to the specified channel using slackClient.chat.postMessage', async () => {
+    mockPostMessage.mockResolvedValueOnce({ ok: true, ts: '1234.5678' });
 
-    await sendLeadNotification('https://hooks.slack.com/test', lead);
+    await sendLeadNotification('C0AL81T5FAM', lead);
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const [url, options] = mockFetch.mock.calls[0];
-    expect(url).toBe('https://hooks.slack.com/test');
-    expect(options.method).toBe('POST');
-    expect(options.headers['Content-Type']).toBe('application/json');
-
-    const body = JSON.parse(options.body);
-    expect(body.text).toContain('Test User');
-    expect(body.blocks).toBeDefined();
+    expect(mockPostMessage).toHaveBeenCalledTimes(1);
+    const call = mockPostMessage.mock.calls[0][0];
+    expect(call.channel).toBe('C0AL81T5FAM');
+    expect(call.text).toContain('Test User');
+    expect(call.blocks).toBeDefined();
+    expect(call.blocks.length).toBeGreaterThan(0);
   });
 
-  it('throws on non-OK response', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 403,
-      text: jest.fn().mockResolvedValue('invalid_token'),
-    });
+  it('throws when Slack API returns not ok', async () => {
+    mockPostMessage.mockResolvedValueOnce({ ok: false, error: 'channel_not_found' });
 
     await expect(
-      sendLeadNotification('https://hooks.slack.com/bad', lead)
-    ).rejects.toThrow('Slack webhook request failed (403)');
+      sendLeadNotification('C_INVALID', lead)
+    ).rejects.toThrow('Slack API error: channel_not_found');
   });
 
-  it('throws on network error', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('Network error'));
+  it('throws when slackClient rejects', async () => {
+    mockPostMessage.mockRejectedValueOnce(new Error('Network error'));
 
     await expect(
-      sendLeadNotification('https://hooks.slack.com/fail', lead)
+      sendLeadNotification('C0AL81T5FAM', lead)
     ).rejects.toThrow('Network error');
   });
 });
@@ -179,9 +181,9 @@ describe('leadListAlertService — Slack integration', () => {
   }));
 
   // We need to spy on sendLeadNotification
-  const mockSendLeadNotification = jest.fn().mockResolvedValue(undefined);
+  const mockSendLeadNotificationFn = jest.fn().mockResolvedValue(undefined);
   jest.mock('../services/slackService', () => ({
-    sendLeadNotification: mockSendLeadNotification,
+    sendLeadNotification: mockSendLeadNotificationFn,
   }));
 
   // Import after mocks
@@ -189,11 +191,10 @@ describe('leadListAlertService — Slack integration', () => {
 
   beforeEach(() => {
     mockSendEmail.mockClear();
-    mockSendLeadNotification.mockClear();
+    mockSendLeadNotificationFn.mockClear();
     mockGetUserById.mockClear();
   });
 
-  const user = { userId: 'user_1', email: 'owner@example.com' };
   const lead = {
     leadId: 'lead_1',
     firstName: 'John',
@@ -202,7 +203,8 @@ describe('leadListAlertService — Slack integration', () => {
     company: 'TestCo',
   };
 
-  it('sends Slack notification when slackWebhookUrl is configured', async () => {
+  it('sends Slack notification when user has slackChannel configured', async () => {
+    const user = { userId: 'user_1', email: 'owner@example.com', slackChannel: 'C0AL81T5FAM' };
     mockGetUserById.mockResolvedValueOnce(user);
 
     const list = {
@@ -210,7 +212,6 @@ describe('leadListAlertService — Slack integration', () => {
       userId: 'user_1',
       name: 'My Leads',
       alertEvents: ['api.lead_added'],
-      slackWebhookUrl: 'https://hooks.slack.com/services/test',
     };
 
     await leadListAlertService.notifyLeadListOwnerIfConfigured(
@@ -224,10 +225,10 @@ describe('leadListAlertService — Slack integration', () => {
     // Email should have been sent
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
 
-    // Slack should also have been called
-    expect(mockSendLeadNotification).toHaveBeenCalledTimes(1);
-    expect(mockSendLeadNotification).toHaveBeenCalledWith(
-      'https://hooks.slack.com/services/test',
+    // Slack should also have been called with the user's channel ID
+    expect(mockSendLeadNotificationFn).toHaveBeenCalledTimes(1);
+    expect(mockSendLeadNotificationFn).toHaveBeenCalledWith(
+      'C0AL81T5FAM',
       expect.objectContaining({
         firstName: 'John',
         lastName: 'Smith',
@@ -239,13 +240,14 @@ describe('leadListAlertService — Slack integration', () => {
     );
   });
 
-  it('does NOT send Slack notification when slackWebhookUrl is not set', async () => {
+  it('does NOT send Slack notification when user has no slackChannel', async () => {
+    const user = { userId: 'user_1', email: 'owner@example.com' };
     mockGetUserById.mockResolvedValueOnce(user);
 
     const list = {
       listId: 'list_2',
       userId: 'user_1',
-      name: 'No Webhook',
+      name: 'No Slack Channel',
       alertEvents: ['api.lead_added'],
     };
 
@@ -258,19 +260,19 @@ describe('leadListAlertService — Slack integration', () => {
     );
 
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
-    expect(mockSendLeadNotification).not.toHaveBeenCalled();
+    expect(mockSendLeadNotificationFn).not.toHaveBeenCalled();
   });
 
-  it('still sends email even if Slack webhook fails', async () => {
+  it('still sends email even if Slack bot call fails', async () => {
+    const user = { userId: 'user_1', email: 'owner@example.com', slackChannel: 'C_BROKEN' };
     mockGetUserById.mockResolvedValueOnce(user);
-    mockSendLeadNotification.mockRejectedValueOnce(new Error('webhook down'));
+    mockSendLeadNotificationFn.mockRejectedValueOnce(new Error('channel_not_found'));
 
     const list = {
       listId: 'list_3',
       userId: 'user_1',
-      name: 'Broken Webhook',
+      name: 'Broken Channel',
       alertEvents: ['api.lead_added'],
-      slackWebhookUrl: 'https://hooks.slack.com/services/broken',
     };
 
     // Should not throw
@@ -285,7 +287,7 @@ describe('leadListAlertService — Slack integration', () => {
     // Email still sent
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     // Slack was attempted
-    expect(mockSendLeadNotification).toHaveBeenCalledTimes(1);
+    expect(mockSendLeadNotificationFn).toHaveBeenCalledTimes(1);
   });
 
   it('skips notification when event type is not in alertEvents', async () => {
@@ -294,7 +296,6 @@ describe('leadListAlertService — Slack integration', () => {
       userId: 'user_1',
       name: 'Filtered',
       alertEvents: ['email.received'],
-      slackWebhookUrl: 'https://hooks.slack.com/services/test',
     };
 
     await leadListAlertService.notifyLeadListOwnerIfConfigured(
@@ -306,6 +307,6 @@ describe('leadListAlertService — Slack integration', () => {
     );
 
     expect(mockSendEmail).not.toHaveBeenCalled();
-    expect(mockSendLeadNotification).not.toHaveBeenCalled();
+    expect(mockSendLeadNotificationFn).not.toHaveBeenCalled();
   });
 });

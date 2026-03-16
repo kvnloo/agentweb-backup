@@ -687,7 +687,7 @@ export async function sendApprovalRequestWithTracking(
 }
 
 /**
- * Lead notification payload for Slack webhook
+ * Lead notification payload for Slack bot messages
  */
 export interface LeadNotificationPayload {
   firstName?: string;
@@ -704,8 +704,7 @@ export interface LeadNotificationPayload {
 }
 
 /**
- * Format a Slack message payload for a new lead notification.
- * This builds a Slack Block Kit message suitable for incoming webhooks.
+ * Format a Slack Block Kit message for a new lead notification.
  * Exported separately so it can be unit-tested without HTTP calls.
  */
 export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
@@ -782,27 +781,28 @@ export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
 }
 
 /**
- * Send a lead notification to an external Slack webhook URL.
- * This does NOT use the internal SLACK_BOT_TOKEN — it posts directly
- * to the client's own webhook so they receive notifications in their workspace.
+ * Send a lead notification to a Slack channel using the internal bot token.
+ * Uses the same slackClient (WebClient) as the approval flow.
+ * The channelId comes from the user's slackChannel field in DynamoDB.
  */
 export async function sendLeadNotification(
-  webhookUrl: string,
+  channelId: string,
   lead: LeadNotificationPayload
 ): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
   const payload = formatLeadNotificationPayload(lead);
 
-  const response = await fetch(webhookUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+  const result = await slackClient.chat.postMessage({
+    channel: channelId,
+    text: payload.text,
+    blocks: payload.blocks,
   });
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new Error(
-      `Slack webhook request failed (${response.status}): ${body}`
-    );
+  if (!result.ok) {
+    throw new Error(`Slack API error: ${result.error}`);
   }
 }
 
