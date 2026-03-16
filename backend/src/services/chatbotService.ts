@@ -220,8 +220,6 @@ export interface ChatSession {
     evaluatedMessageIndex: number; // messageIndex up to which we evaluated
     adminOverride?: boolean;    // When true, auto-scoring skips this session
   };
-  generationStatus?: 'idle' | 'generating' | 'completed' | 'error'; // Multi-task concurrency control
-  generationStartedAt?: string; // ISO timestamp for orphan detection
 }
 
 // Interface for context chunks
@@ -2276,61 +2274,6 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session email metadata:", error);
-      throw error;
-    }
-  }
-
-  async updateGenerationStatus(
-    sessionId: string,
-    status: 'idle' | 'generating' | 'completed' | 'error',
-    startedAt?: string
-  ): Promise<ChatSession> {
-    const timestamp = new Date().toISOString();
-
-    let updateExpression = "SET generationStatus = :status, updatedAt = :updatedAt";
-    const expressionAttributeValues: Record<string, any> = {
-      ":status": status,
-      ":updatedAt": timestamp,
-    };
-
-    if (startedAt) {
-      updateExpression += ", generationStartedAt = :startedAt";
-      expressionAttributeValues[":startedAt"] = startedAt;
-    }
-
-    const params = {
-      TableName: this.tableName,
-      Key: {
-        sessionId,
-      },
-      UpdateExpression: updateExpression,
-      ExpressionAttributeValues: expressionAttributeValues,
-      ReturnValues: "ALL_NEW",
-    };
-
-    try {
-      const result = await dynamodb.update(params).promise();
-      return result.Attributes as ChatSession;
-    } catch (error) {
-      console.error("Error updating generation status:", error);
-      throw error;
-    }
-  }
-
-  async getActiveGenerations(
-    userId: string
-  ): Promise<{ count: number; sessionIds: string[] }> {
-    try {
-      const { sessions } = await this.getUserSessions(userId);
-      const activeSessions = sessions.filter(
-        (session) => session.generationStatus === 'generating'
-      );
-      return {
-        count: activeSessions.length,
-        sessionIds: activeSessions.map((s) => s.sessionId),
-      };
-    } catch (error) {
-      console.error("Error getting active generations:", error);
       throw error;
     }
   }
