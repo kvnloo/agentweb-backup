@@ -5945,7 +5945,7 @@ export default function AdminDashboard() {
                 value={seoDomainsText}
                 onChange={(e) => setSeoDomainsText(e.target.value)}
                 placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
-                helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
+                helperText="Enter one domain per line. For Domain properties: example.com (without https://). For URL-prefix properties: https://example.com (include https://)"
                 disabled={seoDomainsEditLoading}
               />
             </Grid>
