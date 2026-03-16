@@ -533,31 +533,28 @@ export async function launchEnvironment(
       status: "In Progress",
     });
 
-    // 9. Add Notion comment with dev instructions
-    const comment = [
-      `Dev environment launched!`,
-      ``,
-      `Register your IP: http://${publicIp}:5175`,
-      ``,
-      `SSH (install sshpass first: brew install sshpass):`,
-      `  export SSHPASS=<password from 1Password under "SSH for Cloud Dev">`,
-      `  sshpass -e ssh ec2-user@${publicIp}`,
-      ``,
-      `Services (after IP registration):`,
-      `  Backend:          http://${publicIp}:3001`,
-      `  Partner Portal:   http://${publicIp}:5173`,
-      `  Customer Portal:  http://${publicIp}:5174`,
-      ``,
-      `Claude Code auto-ran "prep branch for ${title}".`,
-      `To continue development:`,
-      `  sshpass -e ssh ec2-user@${publicIp}`,
-      `  cd ~/agentweb && claude`,
-      `  /resume to pick up where it left off`,
-      ``,
-      `Set status to "Done" when finished to tear down.`,
-    ].join("\n");
+    // 9. Add Notion comment with dev instructions (links are clickable)
+    const ipUrl = (port: number) => `http://${publicIp}:${port}`;
+    const link = (text: string, url: string) => ({
+      text: { content: text, link: { url } },
+    });
+    const plain = (text: string) => ({ text: { content: text } });
 
-    await addNotionComment(notionPageId, comment);
+    await notionRequest("post", "/comments", {
+      parent: { page_id: notionPageId },
+      rich_text: [
+        plain("Dev environment launched!\n\nRegister your IP: "),
+        link(ipUrl(5175), ipUrl(5175)),
+        plain("\n\nSSH (install sshpass first: brew install sshpass):\n  export SSHPASS=<password from 1Password under \"SSH for Cloud Dev\">\n  sshpass -e ssh ec2-user@" + publicIp),
+        plain("\n\nServices (after IP registration):\n  Backend:          "),
+        link(ipUrl(3001), ipUrl(3001)),
+        plain("\n  Partner Portal:   "),
+        link(ipUrl(5173), ipUrl(5173)),
+        plain("\n  Customer Portal:  "),
+        link(ipUrl(5174), ipUrl(5174)),
+        plain(`\n\nClaude Code auto-ran "prep branch for ${title}".\nClaude will post its output as a comment when done.\nYou can then continue development by posting comments.\n\nSet status to "Done" when finished to tear down.`),
+      ],
+    });
     console.log(`[devEnv] Launch complete for ${instanceId} (${publicIp})`);
   } catch (error: any) {
     console.error(`[devEnv] Launch failed for page ${notionPageId}:`, error);
