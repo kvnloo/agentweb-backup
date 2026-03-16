@@ -20,7 +20,7 @@ start_service() {
   case "$svc" in
     backend)
       dir="$APP_DIR/backend"
-      cmd="npx ts-node-dev --respawn --exit-child --transpile-only src/server.ts"
+      cmd="while true; do echo \"[backend] Starting ts-node-dev at \$(date)\"; npx ts-node-dev --respawn --exit-child --transpile-only src/server.ts; echo \"[backend] Process exited (\$?) at \$(date). Restarting in 3s...\"; sleep 3; done"
       ;;
     partner-portal)
       dir="$APP_DIR/partner-portal"
