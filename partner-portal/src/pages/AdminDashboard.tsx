@@ -714,8 +714,10 @@ export default function AdminDashboard() {
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
+  const [googleAnalyticsProperties, setGoogleAnalyticsProperties] = useState<Array<{ propertyId: string; label: string }>>([]);
   const [gaFilteredDomainsText, setGaFilteredDomainsText] = useState("");
   const [clarityProjectId, setClarityProjectId] = useState("");
+  const [clarityProjects, setClarityProjects] = useState<Array<{ projectId: string; label: string }>>([]);
   const [productDomain, setProductDomain] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
@@ -2068,10 +2070,66 @@ export default function AdminDashboard() {
         return;
       }
 
+      // Validate Google Analytics Properties array
+      const validatedGaProperties = googleAnalyticsProperties
+        .filter(p => p.propertyId.trim() || p.label.trim()) // Filter out empty entries
+        .map(p => ({ propertyId: p.propertyId.trim(), label: p.label.trim() }));
+
+      const gaIdRegex = /^\d+$/;
+      const seenPropertyIds = new Set<string>();
+
+      for (const property of validatedGaProperties) {
+        if (!property.propertyId || !property.label) {
+          setError('Each GA4 property must have both Property ID and Label');
+          return;
+        }
+        if (!gaIdRegex.test(property.propertyId)) {
+          setError(`Invalid Google Analytics Property ID format: ${property.propertyId}. Please enter the numeric Property ID (e.g., 123456789).`);
+          return;
+        }
+        if (property.label.length > 100) {
+          setError(`GA4 property label too long: ${property.label}. Maximum 100 characters.`);
+          return;
+        }
+        if (seenPropertyIds.has(property.propertyId)) {
+          setError(`Duplicate Google Analytics Property ID: ${property.propertyId}`);
+          return;
+        }
+        seenPropertyIds.add(property.propertyId);
+      }
+
       const clarityId = clarityProjectId.trim();
       if (clarityId && !/^[a-zA-Z0-9_-]{6,32}$/.test(clarityId)) {
         setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
         return;
+      }
+
+      // Validate Clarity Projects array
+      const validatedClarityProjects = clarityProjects
+        .filter(p => p.projectId.trim() || p.label.trim()) // Filter out empty entries
+        .map(p => ({ projectId: p.projectId.trim(), label: p.label.trim() }));
+
+      const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
+      const seenProjectIds = new Set<string>();
+
+      for (const project of validatedClarityProjects) {
+        if (!project.projectId || !project.label) {
+          setError('Each Clarity project must have both Project ID and Label');
+          return;
+        }
+        if (!clarityIdRegex.test(project.projectId)) {
+          setError(`Invalid Microsoft Clarity Project ID format: ${project.projectId}. Please enter the project ID (e.g., ul13e4f7fe).`);
+          return;
+        }
+        if (project.label.length > 100) {
+          setError(`Clarity project label too long: ${project.label}. Maximum 100 characters.`);
+          return;
+        }
+        if (seenProjectIds.has(project.projectId)) {
+          setError(`Duplicate Microsoft Clarity Project ID: ${project.projectId}`);
+          return;
+        }
+        seenProjectIds.add(project.projectId);
       }
 
       // Validate product domain format if provided
@@ -2114,8 +2172,10 @@ export default function AdminDashboard() {
         {
           seoDomains: domains,
           googleAnalyticsPropertyId: gaId || null,
+          googleAnalyticsProperties: validatedGaProperties.length > 0 ? validatedGaProperties : undefined,
           gaFilteredDomains: filteredDomains,
           clarityProjectId: clarityId || null,
+          clarityProjects: validatedClarityProjects.length > 0 ? validatedClarityProjects : undefined,
           productDomain: prodDomain || null
         },
         {
@@ -2132,8 +2192,10 @@ export default function AdminDashboard() {
                   ...user,
                   seoDomains: response.data.seoDomains || [],
                   googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined,
+                  googleAnalyticsProperties: response.data.googleAnalyticsProperties || undefined,
                   gaFilteredDomains: response.data.gaFilteredDomains || [],
                   clarityProjectId: response.data.clarityProjectId || undefined,
+                  clarityProjects: response.data.clarityProjects || undefined,
                   productDomain: response.data.productDomain || undefined
                 }
               : user
@@ -2144,8 +2206,10 @@ export default function AdminDashboard() {
         setEditingSeoDomainsUserId(null);
         setSeoDomainsText("");
         setGoogleAnalyticsPropertyId("");
+        setGoogleAnalyticsProperties([]);
         setGaFilteredDomainsText("");
         setClarityProjectId("");
+        setClarityProjects([]);
         setProductDomain("");
       }
     } catch (error: any) {
@@ -3419,7 +3483,11 @@ export default function AdminDashboard() {
                                   No domains
                                 </Typography>
                               )}
-                              {user.googleAnalyticsPropertyId ? (
+                              {((user as any).googleAnalyticsProperties && (user as any).googleAnalyticsProperties.length > 0) ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  GA: {(user as any).googleAnalyticsProperties.map((p: any) => `${p.label} (${p.propertyId})`).join(', ')}
+                                </Typography>
+                              ) : user.googleAnalyticsPropertyId ? (
                                 <Typography variant="body2" color="text.secondary">
                                   GA: {user.googleAnalyticsPropertyId}
                                 </Typography>
@@ -3428,7 +3496,11 @@ export default function AdminDashboard() {
                                   No GA ID
                                 </Typography>
                               )}
-                              {user.clarityProjectId ? (
+                              {((user as any).clarityProjects && (user as any).clarityProjects.length > 0) ? (
+                                <Typography variant="body2" color="text.secondary">
+                                  Clarity: {(user as any).clarityProjects.map((p: any) => `${p.label} (${p.projectId})`).join(', ')}
+                                </Typography>
+                              ) : user.clarityProjectId ? (
                                 <Typography variant="body2" color="text.secondary">
                                   Clarity: {user.clarityProjectId}
                                 </Typography>
@@ -3453,8 +3525,30 @@ export default function AdminDashboard() {
                                 setEditingSeoDomainsUserId(user.userId);
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
                                 setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
+
+                                // Migrate from old single value to new array format if needed
+                                const gaProps = (user as any).googleAnalyticsProperties;
+                                if (gaProps && Array.isArray(gaProps) && gaProps.length > 0) {
+                                  setGoogleAnalyticsProperties(gaProps);
+                                } else if (user.googleAnalyticsPropertyId) {
+                                  setGoogleAnalyticsProperties([{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }]);
+                                } else {
+                                  setGoogleAnalyticsProperties([]);
+                                }
+
                                 setGaFilteredDomainsText(user.gaFilteredDomains?.join("\n") || "");
                                 setClarityProjectId(user.clarityProjectId || "");
+
+                                // Migrate from old single value to new array format if needed
+                                const clarityProjs = (user as any).clarityProjects;
+                                if (clarityProjs && Array.isArray(clarityProjs) && clarityProjs.length > 0) {
+                                  setClarityProjects(clarityProjs);
+                                } else if (user.clarityProjectId) {
+                                  setClarityProjects([{ projectId: user.clarityProjectId, label: "Main Project" }]);
+                                } else {
+                                  setClarityProjects([]);
+                                }
+
                                 setProductDomain(user.productDomain || "");
                                 setSeoDomainsDialogOpen(true);
                               }}
@@ -5806,11 +5900,13 @@ export default function AdminDashboard() {
           setEditingSeoDomainsUserId(null);
           setSeoDomainsText("");
           setGoogleAnalyticsPropertyId("");
+          setGoogleAnalyticsProperties([]);
           setGaFilteredDomainsText("");
           setClarityProjectId("");
+          setClarityProjects([]);
           setProductDomain("");
         }}
-        maxWidth="sm"
+        maxWidth="md"
         fullWidth
       >
         <DialogTitle>
@@ -5822,8 +5918,10 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setGoogleAnalyticsProperties([]);
               setGaFilteredDomainsText("");
               setClarityProjectId("");
+              setClarityProjects([]);
               setProductDomain("");
             }}
             sx={{
@@ -5852,15 +5950,65 @@ export default function AdminDashboard() {
               />
             </Grid>
             <Grid item xs={12}>
-              <TextField
-                fullWidth
-                label="Google Analytics Property ID"
-                value={googleAnalyticsPropertyId}
-                onChange={(e) => setGoogleAnalyticsPropertyId(e.target.value)}
-                placeholder="123456789"
-                helperText="Enter your Google Analytics 4 Property ID (numeric, e.g., 123456789). You can find this in GA4 Admin > Property Settings. This will enable Google Analytics metrics on the SEO/AEO page."
-                disabled={seoDomainsEditLoading}
-              />
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Google Analytics 4 Properties
+                </Typography>
+                {googleAnalyticsProperties.map((property, index) => (
+                  <Box key={index} sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                    <TextField
+                      size="small"
+                      label="Label"
+                      value={property.label}
+                      onChange={(e) => {
+                        const newProps = [...googleAnalyticsProperties];
+                        newProps[index].label = e.target.value;
+                        setGoogleAnalyticsProperties(newProps);
+                      }}
+                      placeholder="Main Website"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <TextField
+                      size="small"
+                      label="Property ID"
+                      value={property.propertyId}
+                      onChange={(e) => {
+                        const newProps = [...googleAnalyticsProperties];
+                        newProps[index].propertyId = e.target.value;
+                        setGoogleAnalyticsProperties(newProps);
+                      }}
+                      placeholder="123456789"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        const newProps = googleAnalyticsProperties.filter((_, i) => i !== index);
+                        setGoogleAnalyticsProperties(newProps);
+                      }}
+                      disabled={seoDomainsEditLoading}
+                      color="error"
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  </Box>
+                ))}
+                <Button
+                  startIcon={<AddIcon />}
+                  onClick={() => {
+                    setGoogleAnalyticsProperties([...googleAnalyticsProperties, { propertyId: '', label: '' }]);
+                  }}
+                  disabled={seoDomainsEditLoading}
+                  size="small"
+                >
+                  Add GA4 Property
+                </Button>
+                <Typography variant="caption" display="block" sx={{ mt: 1, color: 'text.secondary' }}>
+                  Enter your Google Analytics 4 Property IDs (numeric, e.g., 123456789). You can find this in GA4 Admin &gt; Property Settings.
+                </Typography>
+              </Box>
             </Grid>
             <Grid item xs={12}>
               <TextField
@@ -5876,15 +6024,65 @@ export default function AdminDashboard() {
               />
             </Grid>
             <Grid item xs={12}>
-              <TextField
-                fullWidth
-                label="Microsoft Clarity Project ID"
-                value={clarityProjectId}
-                onChange={(e) => setClarityProjectId(e.target.value)}
-                placeholder="ul13e4f7fe"
-                helperText="Enter your Microsoft Clarity Project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings."
-                disabled={seoDomainsEditLoading}
-              />
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Microsoft Clarity Projects
+                </Typography>
+                {clarityProjects.map((project, index) => (
+                  <Box key={index} sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                    <TextField
+                      size="small"
+                      label="Label"
+                      value={project.label}
+                      onChange={(e) => {
+                        const newProjects = [...clarityProjects];
+                        newProjects[index].label = e.target.value;
+                        setClarityProjects(newProjects);
+                      }}
+                      placeholder="Main Site"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <TextField
+                      size="small"
+                      label="Project ID"
+                      value={project.projectId}
+                      onChange={(e) => {
+                        const newProjects = [...clarityProjects];
+                        newProjects[index].projectId = e.target.value;
+                        setClarityProjects(newProjects);
+                      }}
+                      placeholder="ul13e4f7fe"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        const newProjects = clarityProjects.filter((_, i) => i !== index);
+                        setClarityProjects(newProjects);
+                      }}
+                      disabled={seoDomainsEditLoading}
+                      color="error"
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  </Box>
+                ))}
+                <Button
+                  startIcon={<AddIcon />}
+                  onClick={() => {
+                    setClarityProjects([...clarityProjects, { projectId: '', label: '' }]);
+                  }}
+                  disabled={seoDomainsEditLoading}
+                  size="small"
+                >
+                  Add Clarity Project
+                </Button>
+                <Typography variant="caption" display="block" sx={{ mt: 1, color: 'text.secondary' }}>
+                  Enter your Microsoft Clarity Project IDs (e.g., ul13e4f7fe). You can find this in Clarity project settings.
+                </Typography>
+              </Box>
             </Grid>
             <Grid item xs={12}>
               <TextField
@@ -5906,8 +6104,10 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setGoogleAnalyticsProperties([]);
               setGaFilteredDomainsText("");
               setClarityProjectId("");
+              setClarityProjects([]);
               setProductDomain("");
             }}
             disabled={seoDomainsEditLoading}
