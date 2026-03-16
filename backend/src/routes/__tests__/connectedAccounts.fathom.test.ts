@@ -41,10 +41,6 @@ jest.mock('../../utils/tokenUtils', () => ({
   formatExpiryMessage: jest.fn().mockReturnValue('Connected'),
 }));
 
-// Mock global fetch for Fathom API validation
-const mockFetch = jest.fn();
-global.fetch = mockFetch;
-
 describe('Connected Accounts - Fathom', () => {
   let app: express.Application;
 
@@ -55,156 +51,14 @@ describe('Connected Accounts - Fathom', () => {
     app.use('/api/oauth', connectedAccountsRouter);
   });
 
-  describe('POST /api/oauth/connected-accounts/fathom', () => {
-    it('should connect Fathom with a valid API key and register webhook', async () => {
-      // Mock successful Fathom API validation
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          teams: [{ id: 'team-1', name: 'My Team' }],
-        }),
-      });
-
-      // Mock successful webhook registration
-      mockRegisterWebhook.mockResolvedValueOnce({ id: 'wh-new-123' });
-
-      (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
-        platform: 'fathom',
-        account_id: 'fathom-user-123',
-        account_name: 'Fathom',
-        config: {
-          api_key: 'fv2_valid_key_here',
-        },
-        created_at: '2026-03-16T00:00:00.000Z',
-        updated_at: '2026-03-16T00:00:00.000Z',
-      });
-
-      (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
-
+  describe('POST /api/oauth/connected-accounts/fathom — removed (now OAuth)', () => {
+    it('should return 404 since POST route was removed in favor of OAuth flow', async () => {
       const response = await request(app)
         .post('/api/oauth/connected-accounts/fathom')
         .send({ api_key: 'fv2_valid_key_here' });
 
-      expect(response.status).toBe(200);
-      expect(response.body.success).toBe(true);
-      expect(response.body.account).toBeDefined();
-      expect(response.body.account.platform).toBe('fathom');
-
-      // Should have validated against Fathom API
-      expect(mockFetch).toHaveBeenCalledWith(
-        'https://api.fathom.ai/external/v1/teams',
-        expect.objectContaining({
-          headers: expect.objectContaining({
-            'X-Api-Key': 'fv2_valid_key_here',
-          }),
-        })
-      );
-
-      // Should have stored in DB
-      expect(connectedAccountsDb.createAccount).toHaveBeenCalledWith(
-        'user-123',
-        'fathom',
-        expect.objectContaining({
-          account_id: expect.any(String),
-          account_name: 'Fathom',
-          config: expect.objectContaining({
-            api_key: 'fv2_valid_key_here',
-          }),
-        })
-      );
-
-      // Should have registered webhook
-      expect(mockRegisterWebhook).toHaveBeenCalledWith(
-        expect.stringContaining('/api/webhooks/fathom')
-      );
-
-      // Should have stored webhook_id in DB
-      expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
-        'user-123',
-        'fathom',
-        'fathom-user-123',
-        expect.objectContaining({
-          webhook_id: 'wh-new-123',
-          webhook_url: expect.stringContaining('/api/webhooks/fathom'),
-        })
-      );
-    });
-
-    it('should still succeed if webhook registration fails (graceful degradation)', async () => {
-      // Mock successful Fathom API validation
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          teams: [{ id: 'team-1', name: 'My Team' }],
-        }),
-      });
-
-      // Mock webhook registration failure
-      mockRegisterWebhook.mockRejectedValueOnce(new Error('Webhook registration failed'));
-
-      (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
-        platform: 'fathom',
-        account_id: 'fathom-user-123',
-        account_name: 'Fathom',
-        config: {
-          api_key: 'fv2_valid_key_here',
-        },
-        created_at: '2026-03-16T00:00:00.000Z',
-        updated_at: '2026-03-16T00:00:00.000Z',
-      });
-
-      const response = await request(app)
-        .post('/api/oauth/connected-accounts/fathom')
-        .send({ api_key: 'fv2_valid_key_here' });
-
-      // Should still succeed — webhook registration is best-effort
-      expect(response.status).toBe(200);
-      expect(response.body.success).toBe(true);
-      expect(response.body.account).toBeDefined();
-
-      // Should NOT have tried to store webhook_id
-      expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
-    });
-
-    it('should reject an invalid API key (401 from Fathom)', async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: false,
-        status: 401,
-        json: async () => ({ error: 'Unauthorized' }),
-      });
-
-      const response = await request(app)
-        .post('/api/oauth/connected-accounts/fathom')
-        .send({ api_key: 'invalid_key' });
-
-      expect(response.status).toBe(401);
-      expect(response.body.error).toBeDefined();
-      expect(connectedAccountsDb.createAccount).not.toHaveBeenCalled();
-    });
-
-    it('should reject when api_key is missing from request body', async () => {
-      const response = await request(app)
-        .post('/api/oauth/connected-accounts/fathom')
-        .send({});
-
-      expect(response.status).toBe(400);
-      expect(response.body.error).toBeDefined();
-      expect(mockFetch).not.toHaveBeenCalled();
-      expect(connectedAccountsDb.createAccount).not.toHaveBeenCalled();
-    });
-
-    it('should handle Fathom API being unreachable', async () => {
-      mockFetch.mockRejectedValueOnce(new Error('Network error'));
-
-      const response = await request(app)
-        .post('/api/oauth/connected-accounts/fathom')
-        .send({ api_key: 'some_key' });
-
-      expect(response.status).toBe(502);
-      expect(response.body.error).toBeDefined();
-      expect(connectedAccountsDb.createAccount).not.toHaveBeenCalled();
+      // Route no longer exists — Express returns 404
+      expect(response.status).toBe(404);
     });
   });
 
@@ -215,7 +69,8 @@ describe('Connected Accounts - Fathom', () => {
         account_id: 'fathom-user-123',
         account_name: 'Fathom',
         config: {
-          api_key: 'fv2_valid_key',
+          account_type: 'oauth',
+          access_token: 'oauth-access-token',
           webhook_id: 'wh-123',
         },
         created_at: '2026-03-16T00:00:00.000Z',
@@ -245,7 +100,8 @@ describe('Connected Accounts - Fathom', () => {
         account_id: 'fathom-user-123',
         account_name: 'Fathom',
         config: {
-          api_key: 'fv2_valid_key',
+          account_type: 'oauth',
+          access_token: 'oauth-access-token',
           // No webhook_id
         },
         created_at: '2026-03-16T00:00:00.000Z',
@@ -272,7 +128,8 @@ describe('Connected Accounts - Fathom', () => {
         account_id: 'fathom-user-123',
         account_name: 'Fathom',
         config: {
-          api_key: 'fv2_valid_key',
+          account_type: 'oauth',
+          access_token: 'oauth-access-token',
           webhook_id: 'wh-123',
         },
         created_at: '2026-03-16T00:00:00.000Z',
@@ -296,7 +153,7 @@ describe('Connected Accounts - Fathom', () => {
   });
 
   describe('GET /api/oauth/connected-accounts - Fathom account in list', () => {
-    it('should show Fathom account as permanently connected (no token expiry)', async () => {
+    it('should show Fathom OAuth account with refresh token as permanently connected', async () => {
       const mockAccounts = [
         {
           platform: 'fathom',
@@ -305,11 +162,10 @@ describe('Connected Accounts - Fathom', () => {
           created_at: '2026-03-16T00:00:00.000Z',
           updated_at: '2026-03-16T00:00:00.000Z',
           config: {
-            api_key: 'fv2_key',
-            account_type: 'api_key',
-            // token_expires_at set to far future for API key accounts
-            token_expires_at: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000,
-            access_token: 'fv2_key',
+            account_type: 'oauth',
+            token_expires_at: Date.now() + 3600 * 1000,
+            access_token: 'oauth-token',
+            refresh_token: 'refresh-token',
           },
         },
       ];
@@ -321,6 +177,9 @@ describe('Connected Accounts - Fathom', () => {
       expect(response.status).toBe(200);
       expect(response.body.accounts).toHaveLength(1);
       expect(response.body.accounts[0].platform).toBe('fathom');
+      // Accounts with refresh_token show as permanently connected
+      expect(response.body.accounts[0].status).toBe('active');
+      expect(response.body.accounts[0].expiry_message).toBe('Connected');
     });
   });
 });
