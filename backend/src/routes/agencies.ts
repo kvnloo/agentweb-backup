@@ -1,5 +1,4 @@
 import express from "express";
-import jwt from "jsonwebtoken";
 import { AuthRequest } from "../types/express";
 import { agencyService } from "../services/agencyService";
 
@@ -168,81 +167,6 @@ router.get(
     } catch (error) {
       console.error(
         "GET /api/agencies/:agencyTeamId/clients/:clientTeamId/check error:",
-        error
-      );
-      return res.status(500).json({
-        success: false,
-        message: "Internal server error",
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
-    }
-  }
-);
-
-/**
- * POST /api/agencies/:agencyTeamId/clients/:clientTeamId/switch
- * Generate a scoped JWT for an agency user to access a client workspace.
- * The scoped token contains agencyAccess fields that the auth middleware
- * uses to scope data access to the client's workspace.
- * Auth: authenticated agency user with active link to client
- */
-router.post(
-  "/:agencyTeamId/clients/:clientTeamId/switch",
-  async (req: AuthRequest, res) => {
-    try {
-      const userId = req.user?.userId;
-      if (!userId) {
-        return res
-          .status(401)
-          .json({ success: false, message: "Unauthorized" });
-      }
-
-      const { agencyTeamId, clientTeamId } = req.params;
-
-      // Verify the agency has an active link to this client
-      const isLinked = await agencyService.isAgencyForClient(
-        agencyTeamId,
-        clientTeamId
-      );
-
-      if (!isLinked) {
-        return res.status(403).json({
-          success: false,
-          message: `Agency ${agencyTeamId} is not linked to client ${clientTeamId} or link is not active`,
-        });
-      }
-
-      // Generate scoped JWT with agency access fields
-      const scopedPayload = {
-        userId,
-        email: req.user?.email,
-        roles: (req as any).user?.roles || ["customer"],
-        isAdmin: false,
-        agencyAccess: {
-          agencyTeamId,
-          clientTeamId,
-          originalUserId: userId,
-        },
-      };
-
-      const scopedToken = jwt.sign(
-        scopedPayload,
-        process.env.JWT_SECRET || "your-secret-key",
-        { expiresIn: "8h" } // Scoped tokens are short-lived for security
-      );
-
-      return res.json({
-        success: true,
-        data: {
-          scopedToken,
-          agencyTeamId,
-          clientTeamId,
-          expiresIn: "8h",
-        },
-      });
-    } catch (error) {
-      console.error(
-        "POST /api/agencies/:agencyTeamId/clients/:clientTeamId/switch error:",
         error
       );
       return res.status(500).json({

@@ -1,13 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { userDb } from '../services/db';
-import { agencyService } from '../services/agencyService';
-
-export interface AgencyAccessInfo {
-  agencyTeamId: string;
-  clientTeamId: string;
-  originalUserId: string;
-}
 
 export interface AuthenticatedRequest extends Request {
   user: {
@@ -21,7 +14,6 @@ export interface AuthenticatedRequest extends Request {
     adminEmail: string;
     isDelegated: boolean;
   };
-  agencyAccess?: AgencyAccessInfo;
 }
 
 export interface UserPayload {
@@ -36,21 +28,14 @@ export interface UserPayload {
     targetUserId: string;
     targetEmail: string;
   };
-  // Agency scoped access fields
-  agencyAccess?: {
-    agencyTeamId: string;
-    clientTeamId: string;
-    originalUserId: string;
-  };
 }
 
 // Common function to extract user from request token (returns null if no token or invalid)
-// Also returns the decoded payload for delegate info and agency access if needed
-export async function getUserFromToken(req: Request): Promise<{
+// Also returns the decoded payload for delegate info if needed
+export async function getUserFromToken(req: Request): Promise<{ 
   user: { userId: string; email: string; isAdmin: boolean; roles?: ('partner' | 'customer' | 'free')[] } | null;
   decoded?: UserPayload;
   adminUser?: { userId: string; email: string };
-  agencyAccess?: AgencyAccessInfo;
 }> {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -70,7 +55,7 @@ export async function getUserFromToken(req: Request): Promise<{
       // This is a delegate token - admin accessing as another user
       const adminUser = await userDb.getUserById(decoded.delegateAccess.adminUserId);
       const targetUser = await userDb.getUserById(decoded.delegateAccess.targetUserId);
-
+      
       if (!adminUser || !targetUser || !adminUser.isAdmin) {
         return { user: null };
       }
@@ -87,36 +72,6 @@ export async function getUserFromToken(req: Request): Promise<{
           userId: adminUser.userId,
           email: adminUser.email
         }
-      };
-    } else if (decoded.agencyAccess) {
-      // This is an agency-scoped token — agency user accessing client workspace
-      const { agencyTeamId, clientTeamId, originalUserId } = decoded.agencyAccess;
-
-      // Verify the agency-client link is still active
-      const isLinked = await agencyService.isAgencyForClient(agencyTeamId, clientTeamId);
-      if (!isLinked) {
-        return { user: null };
-      }
-
-      // Get the original agency user
-      const agencyUser = await userDb.getUserById(originalUserId);
-      if (!agencyUser) {
-        return { user: null };
-      }
-
-      return {
-        user: {
-          userId: agencyUser.userId,
-          email: agencyUser.email,
-          isAdmin: false,
-          roles: (agencyUser.roles && agencyUser.roles.length > 0 ? agencyUser.roles : ['customer']) as ('partner' | 'customer' | 'free')[]
-        },
-        decoded,
-        agencyAccess: {
-          agencyTeamId,
-          clientTeamId,
-          originalUserId,
-        },
       };
     } else {
       // Normal token - get the user data
@@ -167,11 +122,6 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
     };
   }
 
-  // Handle agency access info
-  if (result.agencyAccess) {
-    authReq.agencyAccess = result.agencyAccess;
-  }
-
   next();
 }
 
@@ -187,19 +137,6 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
   }
   
   next();
-}
-
-/**
- * Returns the effective owner ID for data access.
- * When in agency-switch mode, returns the clientTeamId so the agency user
- * sees the client's data. Otherwise returns the user's own userId.
- */
-export function getEffectiveOwnerId(req: Request): string | undefined {
-  const authReq = req as AuthenticatedRequest;
-  if (authReq.agencyAccess) {
-    return authReq.agencyAccess.clientTeamId;
-  }
-  return authReq.user?.userId;
 }
 
 export async function isAdmin(req: Request, res: Response, next: NextFunction) {
