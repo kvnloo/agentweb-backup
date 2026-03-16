@@ -96,12 +96,25 @@ process.on('message', async (message: any) => {
       });
     }
   } catch (error) {
-    // Send error back to parent process
+    // Log error with full context for debugging
+    console.error('[Worker] Error in generateMarketingResponse:', {
+      requestId,
+      sessionId: message.params?.sessionId,
+      llmModel: message.params?.llmModel,
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    });
+
+    // Send error back to parent process with context
     process.send!({
       type: 'error',
       requestId,
       error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined
+      stack: error instanceof Error ? error.stack : undefined,
+      context: {
+        sessionId: message.params?.sessionId,
+        llmModel: message.params?.llmModel,
+      }
     });
   }
 });

@@ -695,7 +695,30 @@ export class AgentModeService {
         return res;
       } catch (error) {
         const isLastAttempt = attempt >= maxAttempts;
+
+        // Log Gemini-specific errors with more context for debugging
+        if (model.startsWith('gemini-')) {
+          console.error(`AgentMode: Gemini API error on attempt ${attempt}/${maxAttempts}:`, {
+            model,
+            error: error instanceof Error ? error.message : String(error),
+            errorName: error instanceof Error ? error.name : 'Unknown',
+            isTransient: isTransientLLMError(error),
+            willRetry: !isLastAttempt && isTransientLLMError(error),
+            messageCount: messages.length,
+            hasTools: tools && tools.length > 0
+          });
+        }
+
         if (!isTransientLLMError(error) || isLastAttempt) {
+          // On last attempt or non-transient error, log full error details
+          if (isLastAttempt || !isTransientLLMError(error)) {
+            console.error(`AgentMode: callLLM failed for model "${model}":`, {
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+              attempt,
+              maxAttempts
+            });
+          }
           throw error;
         }
         const jitterMs = Math.floor(Math.random() * 500);

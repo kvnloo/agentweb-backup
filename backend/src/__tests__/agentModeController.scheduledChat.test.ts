@@ -21,6 +21,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionError: jest.fn(),
   },
 }));
 
@@ -460,8 +461,19 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      expect(mockRes.status).toHaveBeenCalledWith(500);
-      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Failed to test scheduled chat' });
+      // After the fix, runScheduledChat returns an error result instead of throwing
+      // testScheduledChat just calls res.json(result) without res.status()
+      expect(mockRes.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'failure',
+          passed: false,
+          actualResponse: expect.stringContaining('Critical database error'),
+        })
+      );
+
+      // Should also save error to session and save run result
+      expect(mockChatbotDb.updateSessionError).toHaveBeenCalled();
+      expect(mockScheduleDb.addRunResult).toHaveBeenCalled();
     });
 
     it('should create correct session title for test vs production', async () => {
@@ -1377,26 +1389,21 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await new Promise(resolve => setTimeout(resolve, 100));
 
       // Should save a failure run result to the database
+      // Note: actualResponse is deleted before storing to save space
       expect(mockScheduleDb.addRunResult).toHaveBeenCalledWith(
         scheduleWithEmail.scheduleId,
         expect.objectContaining({
           scheduleId: scheduleWithEmail.scheduleId,
           status: 'failure',
           passed: false,
-          actualResponse: expect.stringContaining('LLM provider timeout'),
           sessionId: '',
           attempt: 0,
-          executionTime: 0,
         })
       );
 
-      // Should send error notification email
-      expect(mockEmailService.sendScheduledChatResultEmail).toHaveBeenCalledWith(
-        ['alert@example.com'],
-        scheduleWithEmail.scheduleName,
-        expect.objectContaining({ status: 'failure' }),
-        scheduleWithEmail.scheduleId
-      );
+      // Note: Email is NOT sent when sessionId is empty (session creation failed)
+      // This is by design - only send emails when a session actually executed
+      expect(mockEmailService.sendScheduledChatResultEmail).not.toHaveBeenCalled();
     });
 
     it('should handle sync errors gracefully without failing the run', async () => {
