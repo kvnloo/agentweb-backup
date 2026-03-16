@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -116,7 +116,15 @@ export interface YouTubeConfig extends BaseOAuthConfig {
   granted_scopes: string[];
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig; // | TwitterConfig
+/**
+ * Fathom API key configuration
+ * Uses access_token to store the Fathom API key (no OAuth — simple API key auth)
+ */
+export interface FathomConfig extends BaseOAuthConfig {
+  account_type: 'api_key';
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig; // | TwitterConfig
 
 /**
  * Connected Account configuration stored in the User record
