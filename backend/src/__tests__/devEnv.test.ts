@@ -51,6 +51,9 @@ import {
   addNotionComment,
   launchEnvironment,
   teardownEnvironment,
+  getNotionCommentText,
+  getNotionBotUserId,
+  relayPromptToEC2,
 } from '../services/devEnvService';
 
 const mockAxios = axios as any as jest.Mock;
@@ -99,6 +102,7 @@ describe('devEnvService', () => {
         status: 'Start',
         instanceId: 'i-abc123',
         sgId: 'sg-xyz',
+        publicIp: '',
         databaseId: 'db-123',
       });
     });
@@ -123,6 +127,7 @@ describe('devEnvService', () => {
         status: '',
         instanceId: '',
         sgId: '',
+        publicIp: '',
         databaseId: '',
       });
     });
@@ -550,6 +555,137 @@ describe('devEnvService', () => {
 
       // Should still update Notion despite SG failure
       expect(mockAxios).toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getNotionPage — publicIp extraction
+  // -------------------------------------------------------------------------
+  describe('getNotionPage — publicIp', () => {
+    it('should return publicIp from page properties', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          parent: { database_id: 'db-1' },
+          properties: {
+            Name: { type: 'title', title: [{ plain_text: 'Task' }] },
+            Status: { status: { name: 'In Progress' } },
+            'Instance ID': { rich_text: [{ plain_text: 'i-abc' }] },
+            'SG ID': { rich_text: [{ plain_text: 'sg-xyz' }] },
+            'Public IP': { rich_text: [{ plain_text: '10.0.0.5' }] },
+          },
+        },
+      });
+
+      const result = await getNotionPage('page-ip');
+
+      expect(result.publicIp).toBe('10.0.0.5');
+    });
+
+    it('should return empty publicIp when property is missing', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          parent: {},
+          properties: {
+            Name: { type: 'title', title: [{ plain_text: 'Task' }] },
+          },
+        },
+      });
+
+      const result = await getNotionPage('page-no-ip');
+
+      expect(result.publicIp).toBe('');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getNotionCommentText
+  // -------------------------------------------------------------------------
+  describe('getNotionCommentText', () => {
+    it('should find and return correct comment text by ID', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          results: [
+            { id: 'comment-1', rich_text: [{ plain_text: 'First comment' }] },
+            { id: 'comment-2', rich_text: [{ plain_text: 'Second comment' }] },
+          ],
+        },
+      });
+
+      const text = await getNotionCommentText('page-1', 'comment-2');
+
+      expect(text).toBe('Second comment');
+    });
+
+    it('should return empty string for unknown commentId', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          results: [
+            { id: 'comment-1', rich_text: [{ plain_text: 'Hello' }] },
+          ],
+        },
+      });
+
+      const text = await getNotionCommentText('page-1', 'nonexistent');
+
+      expect(text).toBe('');
+    });
+
+    it('should handle comment with no rich_text', async () => {
+      mockAxios.mockResolvedValue({
+        data: {
+          results: [
+            { id: 'comment-1' },
+          ],
+        },
+      });
+
+      const text = await getNotionCommentText('page-1', 'comment-1');
+
+      expect(text).toBe('');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getNotionBotUserId
+  // -------------------------------------------------------------------------
+  describe('getNotionBotUserId', () => {
+    it('should return bot user ID from /users/me', async () => {
+      mockAxios.mockResolvedValue({
+        data: { id: 'bot-user-123' },
+      });
+
+      const botId = await getNotionBotUserId();
+
+      expect(botId).toBe('bot-user-123');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // relayPromptToEC2
+  // -------------------------------------------------------------------------
+  describe('relayPromptToEC2', () => {
+    it('should POST prompt to EC2 with notion token as relay secret', async () => {
+      // notionRequest uses mockAxios for the Notion /users/me etc calls;
+      // relayPromptToEC2 uses axios.post — mock separately
+      (axios.post as jest.Mock) = jest.fn().mockResolvedValue({ data: { ok: true } });
+
+      await relayPromptToEC2('10.0.0.1', 'Hello Claude', 'page-1');
+
+      expect(axios.post).toHaveBeenCalledWith(
+        'http://10.0.0.1:5175/api/claude-prompt',
+        { prompt: 'Hello Claude', notionPageId: 'page-1' },
+        expect.objectContaining({
+          headers: { 'X-Relay-Secret': 'mock-notion-token' },
+          timeout: 10000,
+        })
+      );
+    });
+
+    it('should not throw on network error (logs and continues)', async () => {
+      (axios.post as jest.Mock) = jest.fn().mockRejectedValue(new Error('ECONNREFUSED'));
+
+      // Should not throw
+      await relayPromptToEC2('10.0.0.1', 'test', 'page-1');
     });
   });
 });

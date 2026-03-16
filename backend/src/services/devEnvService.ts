@@ -66,7 +66,7 @@ async function notionRequest(
  */
 export async function getNotionPage(
   pageId: string
-): Promise<{ title: string; status: string; instanceId: string; sgId: string; databaseId: string }> {
+): Promise<{ title: string; status: string; instanceId: string; sgId: string; publicIp: string; databaseId: string }> {
   const res = await notionRequest("get", `/pages/${pageId}`);
   const props = res.data.properties;
 
@@ -103,10 +103,18 @@ export async function getNotionPage(
       .join("");
   }
 
+  // Extract Public IP (rich_text property — may not exist yet)
+  let publicIp = "";
+  if (props["Public IP"]?.rich_text?.length > 0) {
+    publicIp = props["Public IP"].rich_text
+      .map((t: any) => t.plain_text)
+      .join("");
+  }
+
   // Extract database ID from parent
   const databaseId = res.data.parent?.database_id || "";
 
-  return { title, status, instanceId, sgId, databaseId };
+  return { title, status, instanceId, sgId, publicIp, databaseId };
 }
 
 /**
@@ -306,6 +314,64 @@ export async function addNotionComment(
 }
 
 // ---------------------------------------------------------------------------
+// Comment relay helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the text of a specific Notion comment by listing comments on a page.
+ * Notion doesn't have GET /comments/{id}, so we list and find.
+ */
+export async function getNotionCommentText(
+  pageId: string,
+  commentId: string
+): Promise<string> {
+  const res = await notionRequest("get", `/comments?block_id=${pageId}`);
+  const comment = res.data.results?.find((c: any) => c.id === commentId);
+  if (!comment) return "";
+  return comment.rich_text?.map((t: any) => t.plain_text).join("") || "";
+}
+
+/**
+ * Get the Notion integration's own bot user ID (for filtering out self-comments).
+ */
+let cachedBotUserId: string | null = null;
+
+export async function getNotionBotUserId(): Promise<string> {
+  if (cachedBotUserId) return cachedBotUserId;
+  const res = await notionRequest("get", "/users/me");
+  cachedBotUserId = res.data.id;
+  return cachedBotUserId!;
+}
+
+/**
+ * Relay a prompt to an EC2 test-env-access instance for Claude Code execution.
+ * Uses a shared secret from Secrets Manager for authentication.
+ */
+export async function relayPromptToEC2(
+  publicIp: string,
+  prompt: string,
+  notionPageId: string
+): Promise<void> {
+  try {
+    const notionToken = await getNotionToken();
+    await axios.post(
+      `http://${publicIp}:5175/api/claude-prompt`,
+      { prompt, notionPageId },
+      {
+        headers: { "X-Relay-Secret": notionToken },
+        timeout: 10000,
+      }
+    );
+    console.log(`[devEnv] Relayed prompt to ${publicIp} for page ${notionPageId}`);
+  } catch (err: any) {
+    console.error(
+      `[devEnv] Failed to relay prompt to ${publicIp}:`,
+      err.message || err
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // EC2 launch / teardown
 // ---------------------------------------------------------------------------
 
@@ -467,31 +533,28 @@ export async function launchEnvironment(
       status: "In Progress",
     });
 
-    // 9. Add Notion comment with dev instructions
-    const comment = [
-      `Dev environment launched!`,
-      ``,
-      `Register your IP: http://${publicIp}:5175`,
-      ``,
-      `SSH (install sshpass first: brew install sshpass):`,
-      `  export SSHPASS=<password from 1Password under "SSH for Cloud Dev">`,
-      `  sshpass -e ssh ec2-user@${publicIp}`,
-      ``,
-      `Services (after IP registration):`,
-      `  Backend:          http://${publicIp}:3001`,
-      `  Partner Portal:   http://${publicIp}:5173`,
-      `  Customer Portal:  http://${publicIp}:5174`,
-      ``,
-      `Claude Code auto-ran "prep branch for ${title}".`,
-      `To continue development:`,
-      `  sshpass -e ssh ec2-user@${publicIp}`,
-      `  cd ~/agentweb && claude`,
-      `  /resume to pick up where it left off`,
-      ``,
-      `Set status to "Done" when finished to tear down.`,
-    ].join("\n");
+    // 9. Add Notion comment with dev instructions (links are clickable)
+    const ipUrl = (port: number) => `http://${publicIp}:${port}`;
+    const link = (text: string, url: string) => ({
+      text: { content: text, link: { url } },
+    });
+    const plain = (text: string) => ({ text: { content: text } });
 
-    await addNotionComment(notionPageId, comment);
+    await notionRequest("post", "/comments", {
+      parent: { page_id: notionPageId },
+      rich_text: [
+        plain("Dev environment launched!\n\nRegister your IP: "),
+        link(ipUrl(5175), ipUrl(5175)),
+        plain("\n\nSSH (install sshpass first: brew install sshpass):\n  export SSHPASS=<password from 1Password under \"SSH for Cloud Dev\">\n  sshpass -e ssh ec2-user@" + publicIp),
+        plain("\n\nServices (after IP registration):\n  Backend:          "),
+        link(ipUrl(3001), ipUrl(3001)),
+        plain("\n  Partner Portal:   "),
+        link(ipUrl(5173), ipUrl(5173)),
+        plain("\n  Customer Portal:  "),
+        link(ipUrl(5174), ipUrl(5174)),
+        plain(`\n\nClaude Code auto-ran "prep branch for ${title}".\nClaude will post its output as a comment when done.\nYou can then continue development by posting comments.\n\nSet status to "Done" when finished to tear down.`),
+      ],
+    });
     console.log(`[devEnv] Launch complete for ${instanceId} (${publicIp})`);
   } catch (error: any) {
     console.error(`[devEnv] Launch failed for page ${notionPageId}:`, error);

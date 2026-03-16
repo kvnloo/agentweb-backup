@@ -183,10 +183,13 @@ SG_ID=$(get_instance_tag "sg-id")
 TEA_ENV=$(get_secret "agentweb/test-env/test-env-access-env")
 RESEND_KEY=$(echo "$TEA_ENV" | grep '^RESEND_API_KEY=' | cut -d= -f2-)
 
+NOTION_PAGE_ID=$(get_instance_tag "notion-page-id")
+
 cat > "$APP_DIR/test-env-access/.env" <<ENVEOF
 RESEND_API_KEY=${RESEND_KEY}
 SG_ID=${SG_ID}
 AWS_REGION=${REGION}
+NOTION_PAGE_ID=${NOTION_PAGE_ID}
 ENVEOF
 
 ###############################################################################
@@ -216,7 +219,7 @@ fi
 ###############################################################################
 # 12. Launch Claude Code with Notion task context
 ###############################################################################
-NOTION_PAGE_ID=$(get_instance_tag "notion-page-id")
+# NOTION_PAGE_ID already set in step 9
 NOTION_TOKEN=$(get_secret "agentweb/test-env/notion-token")
 
 # Fetch page title from Notion API
@@ -310,9 +313,52 @@ fi
 echo "$CLAUDE_PROMPT" > "$APP_DIR/.claude-prompt"
 chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
 
+# Script to run Claude and post its output as a Notion comment
+cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
+#!/bin/bash
+source ~/.bashrc
+cd ~/agentweb
+
+OUTPUT=$(claude -p "$(cat .claude-prompt)" 2>&1)
+EXIT_CODE=$?
+
+NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
+NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
+if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
+  if [[ $EXIT_CODE -ne 0 ]]; then
+    OUTPUT="Claude Code exited with code $EXIT_CODE:\n$OUTPUT"
+  fi
+  # Truncate to ~9900 chars (Notion rich_text limit is 2000 per element, max ~5 chunks)
+  TRUNCATED="${OUTPUT:0:9900}"
+  if [[ ${#OUTPUT} -gt 9900 ]]; then
+    TRUNCATED="$TRUNCATED\n\n...(truncated)"
+  fi
+  # Escape for JSON
+  JSON_TEXT=$(printf '%s' "$TRUNCATED" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+  # Split into 2000-char rich_text chunks via python
+  RICH_TEXT=$(python3 -c "
+import json, sys
+text = json.loads($JSON_TEXT)
+chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+print(json.dumps([{'text': {'content': c}} for c in chunks]))
+")
+  curl -s -X POST "https://api.notion.com/v1/comments" \
+    -H "Authorization: Bearer $NOTION_TOKEN" \
+    -H "Notion-Version: 2022-06-28" \
+    -H "Content-Type: application/json" \
+    -d "{\"parent\":{\"page_id\":\"$NOTION_PAGE_ID\"},\"rich_text\":$RICH_TEXT}"
+fi
+exec bash
+RUNEOF
+chmod +x "$APP_DIR/.claude-run.sh"
+
+# Write Notion page ID and token for the post-session script
+echo "$NOTION_PAGE_ID" > "$APP_DIR/.notion-page-id"
+echo "$NOTION_TOKEN" > "$APP_DIR/.notion-token"
+chown ec2-user:ec2-user "$APP_DIR/.claude-run.sh" "$APP_DIR/.notion-page-id" "$APP_DIR/.notion-token"
+
 # Launch Claude Code in a tmux session as ec2-user
-sudo -u ec2-user tmux new-session -d -s claude \
-  "source ~/.bashrc && cd $APP_DIR && claude -p \"\$(cat .claude-prompt)\"; exec bash"
+sudo -u ec2-user tmux new-session -d -s claude "$APP_DIR/.claude-run.sh"
 
 ###############################################################################
 # 13. Signal readiness
