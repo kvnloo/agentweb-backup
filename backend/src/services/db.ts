@@ -3036,6 +3036,7 @@ export const crmDb = {
       csvExportHistory?: any[];
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       listType?: 'sales' | 'customers';
+      slackWebhookUrl?: string | null;
     }
   ) {
     try {
@@ -3131,6 +3132,12 @@ export const crmDb = {
         expressionAttributeNames['#listType'] = 'listType';
         updateExpressions.push('#listType = :listType');
         expressionAttributeValues[':listType'] = updates.listType;
+      }
+
+      if (updates.slackWebhookUrl !== undefined) {
+        expressionAttributeNames['#slackWebhookUrl'] = 'slackWebhookUrl';
+        updateExpressions.push('#slackWebhookUrl = :slackWebhookUrl');
+        expressionAttributeValues[':slackWebhookUrl'] = updates.slackWebhookUrl;
       }
 
       if (updateExpressions.length === 0) {

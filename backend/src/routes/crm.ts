@@ -516,7 +516,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType, slackWebhookUrl } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -544,6 +544,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       engagedOnly?: boolean;
       statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>;
       listType?: 'sales' | 'customers';
+      slackWebhookUrl?: string | null;
     } = {};
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
@@ -654,6 +655,24 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
         return res.status(400).json({ message: 'listType is already set and cannot be changed' });
       }
       updates.listType = listType;
+    }
+
+    if (slackWebhookUrl !== undefined) {
+      if (slackWebhookUrl === null || slackWebhookUrl === '') {
+        updates.slackWebhookUrl = null;
+      } else if (typeof slackWebhookUrl === 'string') {
+        try {
+          const parsed = new URL(slackWebhookUrl);
+          if (parsed.protocol !== 'https:') {
+            return res.status(400).json({ message: 'slackWebhookUrl must use HTTPS' });
+          }
+        } catch {
+          return res.status(400).json({ message: 'slackWebhookUrl must be a valid URL' });
+        }
+        updates.slackWebhookUrl = slackWebhookUrl;
+      } else {
+        return res.status(400).json({ message: 'slackWebhookUrl must be a string or null' });
+      }
     }
 
     const updatedList = await crmDb.updateLeadList(listId, updates);
