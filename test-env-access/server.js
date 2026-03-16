@@ -377,6 +377,9 @@ async function processQueue() {
       if (truncated && truncated !== "(no output)") {
         await postNotionComment(notionPageId, truncated);
         recentlyPostedComments.add(truncated.slice(0, 200));
+      } else if (!retryMatch) {
+        // No output and no retry — let the user know Claude ran but produced nothing
+        await postNotionComment(notionPageId, "(Claude produced no output for this prompt. You may need to re-prompt or check the instance.)");
       }
 
       // If Claude requested a retry, re-queue after the specified delay
