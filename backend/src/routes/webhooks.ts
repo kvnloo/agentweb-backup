@@ -4,10 +4,11 @@ import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { crmDb } from '../services/db';
+import { crmDb, userDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
+import { fathomWebhookService, FathomMeetingPayload } from '../services/fathomWebhookService';
 
 const router = express.Router();
 
@@ -451,6 +452,75 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
     res.status(500).json({
       success: false,
       message: error.message || 'Failed to forward lead'
+    });
+  }
+});
+
+// Fathom meeting webhook endpoint
+router.post('/fathom', async (req: express.Request, res: express.Response) => {
+  try {
+    // Verify webhook signature
+    const payload = JSON.stringify(req.body);
+    const headers = {
+      'webhook-id': req.headers['webhook-id'] as string | undefined,
+      'webhook-timestamp': req.headers['webhook-timestamp'] as string | undefined,
+      'webhook-signature': req.headers['webhook-signature'] as string | undefined,
+    };
+
+    fathomWebhookService.verifySignature(payload, headers);
+
+    // Respond 200 immediately (fire-and-forget pattern)
+    res.status(200).json({ message: 'Webhook received' });
+
+    // Process asynchronously
+    void (async () => {
+      try {
+        const meetingPayload = req.body as FathomMeetingPayload;
+        const parsed = fathomWebhookService.parseMeetingPayload(meetingPayload);
+
+        console.log(`[FathomWebhook] Processing meeting: "${parsed.title}" (recording ${parsed.recordingId})`);
+
+        // Resolve a user from the first internal participant
+        let userId: string | null = null;
+        for (const participant of parsed.participants) {
+          if (!participant.isExternal && participant.email) {
+            const user = await userDb.getUserByEmail(participant.email);
+            if (user?.userId) {
+              userId = user.userId;
+              break;
+            }
+          }
+        }
+
+        if (!userId) {
+          // Try all participants as fallback
+          for (const participant of parsed.participants) {
+            if (participant.email) {
+              const user = await userDb.getUserByEmail(participant.email);
+              if (user?.userId) {
+                userId = user.userId;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!userId) {
+          console.warn(`[FathomWebhook] No registered user found among participants for meeting "${parsed.title}". Skipping session creation.`);
+          return;
+        }
+
+        const sessionId = await fathomWebhookService.createEmmaSession(parsed, userId);
+        console.log(`[FathomWebhook] Created Emma session ${sessionId} for meeting "${parsed.title}"`);
+      } catch (err) {
+        console.error('[FathomWebhook] Async processing error:', err);
+      }
+    })();
+  } catch (error: any) {
+    console.error('[FathomWebhook] Signature verification failed:', error.message);
+    res.status(401).json({
+      message: 'Webhook signature verification failed',
+      error: error.message,
     });
   }
 });
