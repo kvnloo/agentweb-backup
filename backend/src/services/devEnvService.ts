@@ -66,7 +66,7 @@ async function notionRequest(
  */
 export async function getNotionPage(
   pageId: string
-): Promise<{ title: string; status: string; instanceId: string; sgId: string; publicIp: string; databaseId: string }> {
+): Promise<{ title: string; status: string; instanceId: string; sgId: string; publicIp: string; databaseId: string; launchedBy: string }> {
   const res = await notionRequest("get", `/pages/${pageId}`);
   const props = res.data.properties;
 
@@ -111,10 +111,18 @@ export async function getNotionPage(
       .join("");
   }
 
+  // Extract Launched By (rich_text property — may not exist yet)
+  let launchedBy = "";
+  if (props["Launched By"]?.rich_text?.length > 0) {
+    launchedBy = props["Launched By"].rich_text
+      .map((t: any) => t.plain_text)
+      .join("");
+  }
+
   // Extract database ID from parent
   const databaseId = res.data.parent?.database_id || "";
 
-  return { title, status, instanceId, sgId, publicIp, databaseId };
+  return { title, status, instanceId, sgId, publicIp, databaseId, launchedBy };
 }
 
 /**
@@ -130,6 +138,7 @@ async function ensureDatabaseProperties(databaseId: string): Promise<void> {
         "Instance ID": { rich_text: {} },
         "Public IP": { rich_text: {} },
         "SG ID": { rich_text: {} },
+        "Launched By": { rich_text: {} },
       },
     });
     console.log(`[devEnv] Database properties ensured on ${databaseId}`);
@@ -263,6 +272,7 @@ export async function updateNotionPageProperties(
     publicIp?: string;
     sgId?: string;
     status?: string;
+    launchedBy?: string;
   }
 ): Promise<void> {
   const properties: any = {};
@@ -294,6 +304,14 @@ export async function updateNotionPageProperties(
   if (updates.status !== undefined) {
     properties.Status = {
       status: { name: updates.status },
+    };
+  }
+
+  if (updates.launchedBy !== undefined) {
+    properties["Launched By"] = {
+      rich_text: updates.launchedBy
+        ? [{ text: { content: updates.launchedBy } }]
+        : [],
     };
   }
 
@@ -531,6 +549,7 @@ export async function launchEnvironment(
       publicIp,
       sgId,
       status: "In Progress",
+      launchedBy: process.env.NODE_ENV || "development",
     });
 
     // 9. Add Notion comment with dev instructions (links are clickable)
@@ -622,6 +641,7 @@ export async function teardownEnvironment(
       instanceId: "",
       publicIp: "",
       sgId: "",
+      launchedBy: "",
     });
 
     // 6. Add teardown comment
