@@ -127,6 +127,51 @@ interface ScheduledChatTestResult {
   createdAt: string;
 }
 
+/**
+ * Detects if a user message contains formatting restrictions like "no markdown" or "plain text only".
+ * Returns a formatting override instruction to append to the system prompt if detected.
+ */
+function detectFormattingRestrictions(userMessage: string): string | null {
+  const lowerMessage = userMessage.toLowerCase();
+
+  // Patterns that indicate the user wants plain text without markdown/HTML formatting
+  const plainTextPatterns = [
+    /no\s+markdown/i,
+    /plain\s+text\s+only/i,
+    /plain\s+text\s+format/i,
+    /text\s+only/i,
+    /without\s+markdown/i,
+    /don't\s+use\s+markdown/i,
+    /do\s+not\s+use\s+markdown/i,
+    /no\s+formatting/i,
+    /without\s+formatting/i,
+    /no\s+html/i,
+    /without\s+html/i,
+  ];
+
+  const hasPlainTextRequirement = plainTextPatterns.some(pattern => pattern.test(lowerMessage));
+
+  if (hasPlainTextRequirement) {
+    return `
+
+## CRITICAL FORMATTING OVERRIDE
+
+The user has explicitly requested plain text formatting without markdown or HTML. You MUST follow these rules:
+
+1. **NO MARKDOWN SYNTAX**: Do not use **bold**, *italic*, \`code\`, [links](url), # headings, - lists, or any other markdown formatting
+2. **NO HTML TAGS**: Do not use <strong>, <em>, <code>, <a>, <ul>, <li>, or any HTML tags
+3. **PLAIN TEXT ONLY**: Use only plain text with line breaks for structure
+4. **Line breaks**: Use blank lines to separate paragraphs
+5. **Emphasis**: Use UPPERCASE or "quotation marks" for emphasis if needed
+6. **Lists**: Use simple dashes (—) or bullets (•) without markdown list syntax
+7. **Links**: Paste full URLs directly without link formatting
+
+This formatting override takes precedence over all other formatting instructions in this prompt.`;
+  }
+
+  return null;
+}
+
 interface ScheduledChatVariable {
   name: string;
   description?: string;
@@ -1134,7 +1179,15 @@ export async function generateSessionResponse(
   if (isFirstMessage) {
     try {
       // Get the current system prompt version
-      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      let systemPrompt = await agentModeService.getMarketingSystemPrompt();
+
+      // Detect formatting restrictions in user message and append override if needed
+      const formattingOverride = detectFormattingRestrictions(userMessage);
+      if (formattingOverride) {
+        systemPrompt += formattingOverride;
+        console.log('AgentMode: Detected formatting restrictions in user message, appending override to system prompt');
+      }
+
       const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
 
       // Add system message with version info (hash only in metadata)
