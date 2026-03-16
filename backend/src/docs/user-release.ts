@@ -15,6 +15,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improvement: Agent Mode — Knowledge Base Search Results Include File Names',
       '- Knowledge base search results now include the source file name for each result',
       '- Makes it easier to identify where information came from when searching across multiple knowledge base files',
+      'Fix: Scheduled Chats — Enhanced Error Capture and Logging',
+      '- Scheduled chat failures now save complete error details (message and stack trace) to the session record for easier debugging',
+      '- Added Gemini-specific error logging with retry status, model info, and context details',
+      '- Worker process errors now include session ID and model context for better troubleshooting',
+      '- Failed scheduled chats return structured error results instead of throwing, allowing proper database logging',
     ],
   },
   {
