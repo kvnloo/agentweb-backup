@@ -3,9 +3,6 @@ import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
 
-// Side-effect import: registers Fathom meeting tools on emmaToolRegistry
-import './fathomTools';
-
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
@@ -2684,7 +2681,7 @@ emmaToolRegistry.register({
       properties: {
         platform: {
           type: 'string',
-          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "facebook", "meta", "twitter", "youtube" (YouTube channels - for uploading videos and viewing channel metrics), "unipile" (LinkedIn Outreach - use this when the user asks about sending connection requests or direct messages on LinkedIn), "fathom" (Fathom meeting recordings and transcripts), or "all" for every platform.',
+          description: 'Filter by platform. Common values: "linkedin" (standard LinkedIn posts), "facebook", "meta", "twitter", "youtube" (YouTube channels - for uploading videos and viewing channel metrics), "unipile" (LinkedIn Outreach - use this when the user asks about sending connection requests or direct messages on LinkedIn), or "all" for every platform.',
           default: 'all'
         }
       },
