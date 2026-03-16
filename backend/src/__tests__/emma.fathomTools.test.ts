@@ -9,6 +9,19 @@ jest.mock('axios');
 // Mock connectedAccountsDb
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
+  updateAccountConfig: jest.fn(),
+}));
+
+// Mock integrations config
+jest.mock('../config/integrations', () => ({
+  getFathomConfig: jest.fn().mockResolvedValue({
+    clientId: 'test-client-id',
+    clientSecret: 'test-client-secret',
+    redirectUri: 'http://localhost:3001/api/oauth/fathom/callback',
+    scopes: ['public_api'],
+    authorizationUrl: 'https://fathom.ai/oauth/authorize',
+    tokenUrl: 'https://api.fathom.ai/external/v1/oauth2/token',
+  }),
 }));
 
 import axios from 'axios';
@@ -95,7 +108,7 @@ describe('fathom_get_meetings', () => {
     expect(mockedAxios.get).toHaveBeenCalledWith(
       expect.stringContaining('https://api.fathom.ai/external/v1/meetings'),
       expect.objectContaining({
-        headers: { 'X-Api-Key': 'test-fathom-key' },
+        headers: { 'Authorization': 'Bearer test-fathom-key' },
       })
     );
   });
@@ -174,7 +187,7 @@ describe('fathom_get_transcript', () => {
     expect(mockedAxios.get).toHaveBeenCalledWith(
       'https://api.fathom.ai/external/v1/recordings/101/transcript',
       expect.objectContaining({
-        headers: { 'X-Api-Key': 'test-fathom-key' },
+        headers: { 'Authorization': 'Bearer test-fathom-key' },
       })
     );
   });
