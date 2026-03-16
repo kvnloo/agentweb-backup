@@ -183,7 +183,7 @@ router.get('/conversation-starters', requireAdmin, asyncHandler(agentModeControl
 
 // GET /api/agent-mode/admin/chat-history
 // Get chat history by time range with satisfaction scores (admin only)
-router.get('/admin/chat-history', requireAdmin, asyncHandler(agentModeController.getAdminChatHistory));
+router.get('/admin/chat-history', requireAdmin, asyncHandlerAuth(agentModeController.getAdminChatHistory));
 
 // DELETE /api/agent-mode/session/:sessionId
 // Archive a chat session
