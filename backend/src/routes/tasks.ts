@@ -36,7 +36,7 @@ const upload = multer({
  * Uses getEffectiveOwnerId() so team members can access each other's tasks.
  * Admin users always have access.
  */
-function hasTaskAccess(req: Request, task: { userId: string }): boolean {
+function hasTaskAccess(req: Request, task: Record<string, any>): boolean {
   const authReq = req as AuthenticatedRequest;
   if (authReq.user?.isAdmin) return true;
   const ownerId = getEffectiveOwnerId(req);

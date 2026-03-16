@@ -106,7 +106,7 @@ class TeamService {
 
       return team;
     } catch (error) {
-      handleError(error, "createTeam");
+      return handleError(error, "createTeam");
     }
   }
 
@@ -117,7 +117,7 @@ class TeamService {
         .promise();
       return (result.Item as Team) || null;
     } catch (error) {
-      handleError(error, "getTeam");
+      return handleError(error, "getTeam");
     }
   }
 
@@ -158,7 +158,7 @@ class TeamService {
         .promise();
       return result.Attributes as Team;
     } catch (error) {
-      handleError(error, "updateTeam");
+      return handleError(error, "updateTeam");
     }
   }
 
@@ -185,7 +185,7 @@ class TeamService {
         .promise();
       return member;
     } catch (error) {
-      handleError(error, "addMember");
+      return handleError(error, "addMember");
     }
   }
 
@@ -198,7 +198,7 @@ class TeamService {
         })
         .promise();
     } catch (error) {
-      handleError(error, "removeMember");
+      return handleError(error, "removeMember");
     }
   }
 
@@ -213,7 +213,7 @@ class TeamService {
         .promise();
       return (result.Items as TeamMember[]) || [];
     } catch (error) {
-      handleError(error, "getTeamMembers");
+      return handleError(error, "getTeamMembers");
     }
   }
 
@@ -229,7 +229,7 @@ class TeamService {
         .promise();
       return (result.Items as TeamMember[]) || [];
     } catch (error) {
-      handleError(error, "getTeamsForUser");
+      return handleError(error, "getTeamsForUser");
     }
   }
 
@@ -263,7 +263,7 @@ class TeamService {
         .promise();
       return invite;
     } catch (error) {
-      handleError(error, "createInvite");
+      return handleError(error, "createInvite");
     }
   }
 
@@ -277,7 +277,7 @@ class TeamService {
         .promise();
       return (result.Item as TeamInvite) || null;
     } catch (error) {
-      handleError(error, "getInvite");
+      return handleError(error, "getInvite");
     }
   }
 }
