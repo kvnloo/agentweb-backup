@@ -1,8 +1,9 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, deleteAccount, deleteAccountById, createAccount, getAccountByPlatform, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, deleteAccount, deleteAccountById, createAccount, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { FathomApiService } from '../services/fathomApiService';
 
 const router = express.Router();
 
@@ -97,11 +98,32 @@ router.post('/connected-accounts/fathom', authenticateToken, async (req: any, re
       token_expires_at: Date.now() + TEN_YEARS_MS,
     };
 
+    const accountId = `fathom-${userId}`;
     const account = await createAccount(userId, 'fathom', {
-      account_id: `fathom-${userId}`,
+      account_id: accountId,
       account_name: 'Fathom',
       config: fathomConfig,
     });
+
+    // Register webhook with Fathom so meetings flow in automatically.
+    // This is best-effort — if it fails, the account is still connected
+    // and the user can retry or we can register later.
+    try {
+      const fathomApi = new FathomApiService(api_key);
+      const baseUrl = process.env.API_BASE_URL || 'https://api.agentweb.pro';
+      const webhookUrl = `${baseUrl}/api/webhooks/fathom`;
+      const { id: webhookId } = await fathomApi.registerWebhook(webhookUrl);
+
+      // Store webhook_id so we can clean it up on disconnect
+      await updateAccountConfig(userId, 'fathom', accountId, {
+        webhook_id: webhookId,
+        webhook_url: webhookUrl,
+      });
+      console.log(`[Fathom] Registered webhook ${webhookId} for user ${userId}`);
+    } catch (webhookErr: any) {
+      // Non-fatal: account is saved, webhook can be registered later
+      console.warn(`[Fathom] Webhook registration failed for user ${userId}:`, webhookErr?.message);
+    }
 
     res.json({ success: true, account });
   } catch (error) {
@@ -110,7 +132,7 @@ router.post('/connected-accounts/fathom', authenticateToken, async (req: any, re
   }
 });
 
-// Disconnect Fathom — with webhook cleanup
+// Disconnect Fathom — with webhook cleanup via FathomApiService
 router.delete('/connected-accounts/fathom', authenticateToken, async (req: any, res) => {
   const userId = req.user.userId;
 
@@ -121,13 +143,8 @@ router.delete('/connected-accounts/fathom', authenticateToken, async (req: any, 
       const config = existingAccount.config as FathomConfig;
       if (config.webhook_id && config.api_key) {
         try {
-          await fetch(`https://api.fathom.ai/external/v1/webhooks/${config.webhook_id}`, {
-            method: 'DELETE',
-            headers: {
-              'X-Api-Key': config.api_key,
-              'Content-Type': 'application/json',
-            },
-          });
+          const fathomApi = new FathomApiService(config.api_key);
+          await fathomApi.deleteWebhook(config.webhook_id);
           console.log(`[Fathom] Deleted webhook ${config.webhook_id} for user ${userId}`);
         } catch (webhookErr: any) {
           // Non-fatal: log and continue with DB deletion

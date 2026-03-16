@@ -298,6 +298,48 @@ export const updateAccountTokens = async (
 };
 
 /**
+ * Update arbitrary config fields on a connected account.
+ * Used to store webhook_id, webhook_url, etc. after initial creation.
+ */
+export const updateAccountConfig = async (
+  userId: string,
+  platform: PlatformType,
+  accountId: string,
+  configUpdates: Record<string, any>
+): Promise<void> => {
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const accounts = normalizeAccounts((user as User).connected_accounts);
+  const accountIndex = accounts.findIndex(
+    acc => acc.platform === platform && acc.account_id === accountId
+  );
+
+  if (accountIndex < 0) {
+    throw new Error(`No ${platform} account with id "${accountId}" connected`);
+  }
+
+  const existingAccount = accounts[accountIndex];
+  const updatedAccount: ConnectedAccountConfig = {
+    ...existingAccount,
+    config: {
+      ...existingAccount.config,
+      ...configUpdates,
+    },
+    updated_at: new Date().toISOString(),
+  };
+
+  const updatedAccounts = [...accounts];
+  updatedAccounts[accountIndex] = updatedAccount;
+
+  await userDb.updateUser(userId, {
+    connected_accounts: updatedAccounts,
+  } as Partial<User>);
+};
+
+/**
  * Remove a connected account (all accounts for a platform)
  */
 export const deleteAccount = async (
