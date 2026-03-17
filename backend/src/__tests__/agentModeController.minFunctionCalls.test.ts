@@ -37,6 +37,10 @@ jest.mock('../services/agentModeService', () => ({
       'create_work_plan', 'modify_work_plan', 'set_work_plan_status',
       'save_file', 'describe_image',
     ])),
+    getAdminToolNames: jest.fn().mockReturnValue([
+      'list_predefined_work_plans', 'manage_predefined_work_plan',
+      'list_skills', 'manage_skill', 'get_chat_history',
+    ]),
   },
 }));
 
@@ -54,6 +58,9 @@ jest.mock('../services/db', () => ({
     updateScheduleAfterRun: jest.fn(),
     createSchedule: jest.fn(),
     updateSchedule: jest.fn(),
+  },
+  userDb: {
+    getUserById: jest.fn().mockResolvedValue({ userId: 'test-user-1', email: 'test@example.com', isAdmin: false }),
   },
 }));
 

@@ -717,8 +717,10 @@ export default function AdminDashboard() {
   const [editingSeoDomainsUserId, setEditingSeoDomainsUserId] = useState<string | null>(null);
   const [seoDomainsText, setSeoDomainsText] = useState("");
   const [googleAnalyticsPropertyId, setGoogleAnalyticsPropertyId] = useState("");
+  const [googleAnalyticsProperties, setGoogleAnalyticsProperties] = useState<Array<{ propertyId: string; label: string }>>([]);
   const [gaFilteredDomainsText, setGaFilteredDomainsText] = useState("");
   const [clarityProjectId, setClarityProjectId] = useState("");
+  const [clarityProjects, setClarityProjects] = useState<Array<{ projectId: string; label: string }>>([]);
   const [productDomain, setProductDomain] = useState("");
   const [seoDomainsEditLoading, setSeoDomainsEditLoading] = useState(false);
   const [editingCmsTypeUserId, setEditingCmsTypeUserId] = useState<string | null>(null);
@@ -2076,86 +2078,149 @@ export default function AdminDashboard() {
     // Clear any previous errors
     setError("");
 
-    try {
-      setSeoDomainsEditLoading(true);
-      
-      // Parse domains from text (one per line or comma-separated)
-      const domainsText = seoDomainsText.trim();
-      let domains: string[] = [];
-      
-      if (domainsText) {
-        // Split by newlines or commas, then filter and validate
-        domains = domainsText
-          .split(/[\n,]+/)
-          .map(d => d.trim())
-          .filter(d => d.length > 0);
-        
-        // Validate each domain format
-        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-        for (const domain of domains) {
-          if (!domainRegex.test(domain)) {
-            setError(`Invalid domain format: ${domain}. Please use format like example.com`);
-            return;
-          }
-        }
-      }
-      
-      // Validate Google Analytics Property ID format if provided
-      // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
-      const gaId = googleAnalyticsPropertyId.trim();
-      if (gaId && !/^\d+$/.test(gaId)) {
-        setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
-        return;
-      }
+    // Parse domains from text (one per line or comma-separated)
+    const domainsText = seoDomainsText.trim();
+    let domains: string[] = [];
 
-      const clarityId = clarityProjectId.trim();
-      if (clarityId && !/^[a-zA-Z0-9_-]{6,32}$/.test(clarityId)) {
-        setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
-        return;
-      }
+    if (domainsText) {
+      // Split by newlines or commas, then filter and validate
+      domains = domainsText
+        .split(/[\n,]+/)
+        .map(d => d.trim())
+        .filter(d => d.length > 0);
 
-      // Validate product domain format if provided
-      const prodDomain = productDomain.trim();
-      if (prodDomain) {
-        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-        if (!domainRegex.test(prodDomain)) {
-          setError(`Invalid product domain format: ${prodDomain}. Please use format like app.example.com`);
+      // Validate each domain format (allow both domain and URL-prefix formats)
+      // Domain property: example.com
+      // URL-prefix property: https://example.com or https://example.com/
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
+
+      for (const domain of domains) {
+        if (!domainRegex.test(domain) && !urlPrefixRegex.test(domain)) {
+          setError(`Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`);
           return;
         }
       }
+    }
 
-      // Parse filtered domains from text (one per line or comma-separated)
-      const filteredDomainsText = gaFilteredDomainsText.trim();
-      let filteredDomains: string[] = [];
 
-      if (filteredDomainsText) {
-        // Split by newlines or commas, then filter and validate
-        filteredDomains = filteredDomainsText
-          .split(/[\n,]+/)
-          .map(d => d.trim())
-          .filter(d => d.length > 0);
+    // Validate Google Analytics Property ID format if provided
+    // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
+    const gaId = googleAnalyticsPropertyId.trim();
+    if (gaId && !/^\d+$/.test(gaId)) {
+      setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
+      return;
+    }
 
-        // Validate each domain format (allow localhost and standard domains)
-        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-        for (const domain of filteredDomains) {
-          // Allow localhost and IP addresses (common for filtering local/dev traffic)
-          const isLocalhost = domain === 'localhost' || domain.startsWith('localhost:');
-          const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(domain);
+    // Validate Google Analytics Properties array
+    const validatedGaProperties = googleAnalyticsProperties
+      .filter(p => p.propertyId.trim() || p.label.trim()) // Filter out empty entries
+      .map(p => ({ propertyId: p.propertyId.trim(), label: p.label.trim() }));
 
-          if (!isLocalhost && !isIpAddress && !domainRegex.test(domain)) {
-            setError(`Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`);
-            return;
-          }
+    const gaIdRegex = /^\d+$/;
+    const seenPropertyIds = new Set<string>();
+
+    for (const property of validatedGaProperties) {
+      if (!property.propertyId || !property.label) {
+        setError('Each GA4 property must have both Property ID and Label');
+        return;
+      }
+      if (!gaIdRegex.test(property.propertyId)) {
+        setError(`Invalid Google Analytics Property ID format: ${property.propertyId}. Please enter the numeric Property ID (e.g., 123456789).`);
+        return;
+      }
+      if (property.label.length > 100) {
+        setError(`GA4 property label too long: ${property.label}. Maximum 100 characters.`);
+        return;
+      }
+      if (seenPropertyIds.has(property.propertyId)) {
+        setError(`Duplicate Google Analytics Property ID: ${property.propertyId}`);
+        return;
+      }
+      seenPropertyIds.add(property.propertyId);
+    }
+
+    const clarityId = clarityProjectId.trim();
+    if (clarityId && !/^[a-zA-Z0-9_-]{6,32}$/.test(clarityId)) {
+      setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
+      return;
+    }
+
+    // Validate Clarity Projects array
+    const validatedClarityProjects = clarityProjects
+      .filter(p => p.projectId.trim() || p.label.trim()) // Filter out empty entries
+      .map(p => ({ projectId: p.projectId.trim(), label: p.label.trim() }));
+
+    const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
+    const seenProjectIds = new Set<string>();
+
+    for (const project of validatedClarityProjects) {
+      if (!project.projectId || !project.label) {
+        setError('Each Clarity project must have both Project ID and Label');
+        return;
+      }
+      if (!clarityIdRegex.test(project.projectId)) {
+        setError(`Invalid Microsoft Clarity Project ID format: ${project.projectId}. Please enter the project ID (e.g., ul13e4f7fe).`);
+        return;
+      }
+      if (project.label.length > 100) {
+        setError(`Clarity project label too long: ${project.label}. Maximum 100 characters.`);
+        return;
+      }
+      if (seenProjectIds.has(project.projectId)) {
+        setError(`Duplicate Microsoft Clarity Project ID: ${project.projectId}`);
+        return;
+      }
+      seenProjectIds.add(project.projectId);
+    }
+
+    // Validate product domain format if provided
+    const prodDomain = productDomain.trim();
+    if (prodDomain) {
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      if (!domainRegex.test(prodDomain)) {
+        setError(`Invalid product domain format: ${prodDomain}. Please use format like app.example.com`);
+        return;
+      }
+    }
+
+    // Parse filtered domains from text (one per line or comma-separated)
+    const filteredDomainsText = gaFilteredDomainsText.trim();
+    let filteredDomains: string[] = [];
+
+    if (filteredDomainsText) {
+      // Split by newlines or commas, then filter and validate
+      filteredDomains = filteredDomainsText
+        .split(/[\n,]+/)
+        .map(d => d.trim())
+        .filter(d => d.length > 0);
+
+      // Validate each domain format (allow localhost and standard domains)
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      for (const domain of filteredDomains) {
+        // Allow localhost and IP addresses (common for filtering local/dev traffic)
+        const isLocalhost = domain === 'localhost' || domain.startsWith('localhost:');
+        const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(domain);
+
+        if (!isLocalhost && !isIpAddress && !domainRegex.test(domain)) {
+          setError(`Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`);
+          return;
         }
       }
+    }
+
+    try {
+      setSeoDomainsEditLoading(true);
 
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
         {
           seoDomains: domains,
           googleAnalyticsPropertyId: gaId || null,
+          googleAnalyticsProperties: validatedGaProperties.length > 0 ? validatedGaProperties : undefined,
           gaFilteredDomains: filteredDomains,
           clarityProjectId: clarityId || null,
+          clarityProjects: validatedClarityProjects.length > 0 ? validatedClarityProjects : undefined,
           productDomain: prodDomain || null
         },
         {
@@ -2172,8 +2237,10 @@ export default function AdminDashboard() {
                   ...user,
                   seoDomains: response.data.seoDomains || [],
                   googleAnalyticsPropertyId: response.data.googleAnalyticsPropertyId || undefined,
+                  googleAnalyticsProperties: response.data.googleAnalyticsProperties || undefined,
                   gaFilteredDomains: response.data.gaFilteredDomains || [],
                   clarityProjectId: response.data.clarityProjectId || undefined,
+                  clarityProjects: response.data.clarityProjects || undefined,
                   productDomain: response.data.productDomain || undefined
                 }
               : user
@@ -2184,8 +2251,10 @@ export default function AdminDashboard() {
         setEditingSeoDomainsUserId(null);
         setSeoDomainsText("");
         setGoogleAnalyticsPropertyId("");
+        setGoogleAnalyticsProperties([]);
         setGaFilteredDomainsText("");
         setClarityProjectId("");
+        setClarityProjects([]);
         setProductDomain("");
       }
     } catch (error: any) {
@@ -3507,30 +3576,38 @@ export default function AdminDashboard() {
                                   No domains
                                 </Typography>
                               )}
-                              {user.googleAnalyticsPropertyId ? (
-                                <Typography variant="body2" color="text.secondary">
+                              {((user as any).googleAnalyticsProperties && (user as any).googleAnalyticsProperties.length > 0) ? (
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
+                                  GA: {(user as any).googleAnalyticsProperties.map((p: any) => `${p.label} (${p.propertyId})`).join(', ')}
+                                </Typography>
+                              ) : user.googleAnalyticsPropertyId ? (
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   GA: {user.googleAnalyticsPropertyId}
                                 </Typography>
                               ) : (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   No GA ID
                                 </Typography>
                               )}
-                              {user.clarityProjectId ? (
-                                <Typography variant="body2" color="text.secondary">
+                              {((user as any).clarityProjects && (user as any).clarityProjects.length > 0) ? (
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
+                                  Clarity: {(user as any).clarityProjects.map((p: any) => `${p.label} (${p.projectId})`).join(', ')}
+                                </Typography>
+                              ) : user.clarityProjectId ? (
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   Clarity: {user.clarityProjectId}
                                 </Typography>
                               ) : (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   No Clarity ID
                                 </Typography>
                               )}
                               {user.productDomain ? (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   Product: {user.productDomain}
                                 </Typography>
                               ) : (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   No Product Domain
                                 </Typography>
                               )}
@@ -3541,8 +3618,30 @@ export default function AdminDashboard() {
                                 setEditingSeoDomainsUserId(user.userId);
                                 setSeoDomainsText(user.seoDomains?.join("\n") || "");
                                 setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
+
+                                // Migrate from old single value to new array format if needed
+                                const gaProps = (user as any).googleAnalyticsProperties;
+                                if (gaProps && Array.isArray(gaProps) && gaProps.length > 0) {
+                                  setGoogleAnalyticsProperties(gaProps);
+                                } else if (user.googleAnalyticsPropertyId) {
+                                  setGoogleAnalyticsProperties([{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }]);
+                                } else {
+                                  setGoogleAnalyticsProperties([]);
+                                }
+
                                 setGaFilteredDomainsText(user.gaFilteredDomains?.join("\n") || "");
                                 setClarityProjectId(user.clarityProjectId || "");
+
+                                // Migrate from old single value to new array format if needed
+                                const clarityProjs = (user as any).clarityProjects;
+                                if (clarityProjs && Array.isArray(clarityProjs) && clarityProjs.length > 0) {
+                                  setClarityProjects(clarityProjs);
+                                } else if (user.clarityProjectId) {
+                                  setClarityProjects([{ projectId: user.clarityProjectId, label: "Main Project" }]);
+                                } else {
+                                  setClarityProjects([]);
+                                }
+
                                 setProductDomain(user.productDomain || "");
                                 setSeoDomainsDialogOpen(true);
                               }}
@@ -5894,11 +5993,13 @@ export default function AdminDashboard() {
           setEditingSeoDomainsUserId(null);
           setSeoDomainsText("");
           setGoogleAnalyticsPropertyId("");
+          setGoogleAnalyticsProperties([]);
           setGaFilteredDomainsText("");
           setClarityProjectId("");
+          setClarityProjects([]);
           setProductDomain("");
         }}
-        maxWidth="sm"
+        maxWidth="md"
         fullWidth
       >
         <DialogTitle>
@@ -5910,8 +6011,10 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setGoogleAnalyticsProperties([]);
               setGaFilteredDomainsText("");
               setClarityProjectId("");
+              setClarityProjects([]);
               setProductDomain("");
             }}
             sx={{
@@ -5934,21 +6037,71 @@ export default function AdminDashboard() {
                 label="SEO Domains"
                 value={seoDomainsText}
                 onChange={(e) => setSeoDomainsText(e.target.value)}
-                placeholder="example.com&#10;subdomain.example.com&#10;another-domain.com"
-                helperText="Enter one domain per line. These domains will be tracked for SEO metrics in the customer portal. Format: example.com (without http:// or https://)"
+                placeholder="example.com&#10;https://subdomain.example.com/&#10;another-domain.com"
+                helperText="Enter one domain per line. For Domain properties: example.com (no https://). For URL-prefix properties: https://example.com/ (with https:// and trailing slash)"
                 disabled={seoDomainsEditLoading}
               />
             </Grid>
             <Grid item xs={12}>
-              <TextField
-                fullWidth
-                label="Google Analytics Property ID"
-                value={googleAnalyticsPropertyId}
-                onChange={(e) => setGoogleAnalyticsPropertyId(e.target.value)}
-                placeholder="123456789"
-                helperText="Enter your Google Analytics 4 Property ID (numeric, e.g., 123456789). You can find this in GA4 Admin > Property Settings. This will enable Google Analytics metrics on the SEO/AEO page."
-                disabled={seoDomainsEditLoading}
-              />
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Google Analytics 4 Properties
+                </Typography>
+                {googleAnalyticsProperties.map((property, index) => (
+                  <Box key={index} sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                    <TextField
+                      size="small"
+                      label="Label"
+                      value={property.label}
+                      onChange={(e) => {
+                        const newProps = [...googleAnalyticsProperties];
+                        newProps[index].label = e.target.value;
+                        setGoogleAnalyticsProperties(newProps);
+                      }}
+                      placeholder="Main Website"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <TextField
+                      size="small"
+                      label="Property ID"
+                      value={property.propertyId}
+                      onChange={(e) => {
+                        const newProps = [...googleAnalyticsProperties];
+                        newProps[index].propertyId = e.target.value;
+                        setGoogleAnalyticsProperties(newProps);
+                      }}
+                      placeholder="123456789"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        const newProps = googleAnalyticsProperties.filter((_, i) => i !== index);
+                        setGoogleAnalyticsProperties(newProps);
+                      }}
+                      disabled={seoDomainsEditLoading}
+                      color="error"
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  </Box>
+                ))}
+                <Button
+                  startIcon={<AddIcon />}
+                  onClick={() => {
+                    setGoogleAnalyticsProperties([...googleAnalyticsProperties, { propertyId: '', label: '' }]);
+                  }}
+                  disabled={seoDomainsEditLoading}
+                  size="small"
+                >
+                  Add GA4 Property
+                </Button>
+                <Typography variant="caption" display="block" sx={{ mt: 1, color: 'text.secondary' }}>
+                  Enter your Google Analytics 4 Property IDs (numeric, e.g., 123456789). You can find this in GA4 Admin &gt; Property Settings.
+                </Typography>
+              </Box>
             </Grid>
             <Grid item xs={12}>
               <TextField
@@ -5964,15 +6117,65 @@ export default function AdminDashboard() {
               />
             </Grid>
             <Grid item xs={12}>
-              <TextField
-                fullWidth
-                label="Microsoft Clarity Project ID"
-                value={clarityProjectId}
-                onChange={(e) => setClarityProjectId(e.target.value)}
-                placeholder="ul13e4f7fe"
-                helperText="Enter your Microsoft Clarity Project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings."
-                disabled={seoDomainsEditLoading}
-              />
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1 }}>
+                  Microsoft Clarity Projects
+                </Typography>
+                {clarityProjects.map((project, index) => (
+                  <Box key={index} sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                    <TextField
+                      size="small"
+                      label="Label"
+                      value={project.label}
+                      onChange={(e) => {
+                        const newProjects = [...clarityProjects];
+                        newProjects[index].label = e.target.value;
+                        setClarityProjects(newProjects);
+                      }}
+                      placeholder="Main Site"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <TextField
+                      size="small"
+                      label="Project ID"
+                      value={project.projectId}
+                      onChange={(e) => {
+                        const newProjects = [...clarityProjects];
+                        newProjects[index].projectId = e.target.value;
+                        setClarityProjects(newProjects);
+                      }}
+                      placeholder="ul13e4f7fe"
+                      sx={{ flex: 1 }}
+                      disabled={seoDomainsEditLoading}
+                    />
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        const newProjects = clarityProjects.filter((_, i) => i !== index);
+                        setClarityProjects(newProjects);
+                      }}
+                      disabled={seoDomainsEditLoading}
+                      color="error"
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  </Box>
+                ))}
+                <Button
+                  startIcon={<AddIcon />}
+                  onClick={() => {
+                    setClarityProjects([...clarityProjects, { projectId: '', label: '' }]);
+                  }}
+                  disabled={seoDomainsEditLoading}
+                  size="small"
+                >
+                  Add Clarity Project
+                </Button>
+                <Typography variant="caption" display="block" sx={{ mt: 1, color: 'text.secondary' }}>
+                  Enter your Microsoft Clarity Project IDs (e.g., ul13e4f7fe). You can find this in Clarity project settings.
+                </Typography>
+              </Box>
             </Grid>
             <Grid item xs={12}>
               <TextField
@@ -5994,8 +6197,10 @@ export default function AdminDashboard() {
               setEditingSeoDomainsUserId(null);
               setSeoDomainsText("");
               setGoogleAnalyticsPropertyId("");
+              setGoogleAnalyticsProperties([]);
               setGaFilteredDomainsText("");
               setClarityProjectId("");
+              setClarityProjects([]);
               setProductDomain("");
             }}
             disabled={seoDomainsEditLoading}
@@ -6626,6 +6831,11 @@ const AgentModeSettings = () => {
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
   const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
   const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
+  const [planSyncStatus, setPlanSyncStatus] = useState<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>>({});
+  const [syncEnvironment, setSyncEnvironment] = useState<'development' | 'production'>('production');
+  const [syncingPlanId, setSyncingPlanId] = useState<string | null>(null);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [planToSync, setPlanToSync] = useState<PredefinedWorkPlan | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
@@ -6675,6 +6885,9 @@ const AgentModeSettings = () => {
 
       // Load predefined work plans
       await loadPredefinedWorkPlans();
+
+      // Load plan sync status
+      await loadPlanSyncStatus();
 
       // Load content model
       await loadContentModel();
@@ -6977,6 +7190,47 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading predefined work plans:', error);
       setPredefinedWorkPlans([]);
+    }
+  };
+
+  const loadPlanSyncStatus = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync-status'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setPlanSyncStatus(response.data.plans || {});
+      setSyncEnvironment(response.data.environment || 'production');
+    } catch (err) {
+      console.error('Error loading plan sync status:', err);
+    }
+  };
+
+  const syncDirection = syncEnvironment === 'development' ? 'dev-to-prod' : 'prod-to-dev';
+  const syncLabel = syncEnvironment === 'development' ? 'Dev → Prod' : 'Prod → Dev';
+
+  const handleOpenSyncDialog = (workPlan: PredefinedWorkPlan) => {
+    setPlanToSync(workPlan);
+    setSyncDialogOpen(true);
+  };
+
+  const handleSyncPlan = async () => {
+    if (!planToSync?.id) return;
+    try {
+      setSyncingPlanId(planToSync.id);
+      await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync'), {
+        planId: planToSync.id,
+        direction: syncDirection
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setSuccess(`Plan "${planToSync.title}" synced ${syncLabel}`);
+      setSyncDialogOpen(false);
+      setPlanToSync(null);
+      await loadPlanSyncStatus();
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Failed to sync plan');
+    } finally {
+      setSyncingPlanId(null);
     }
   };
 
@@ -8242,9 +8496,39 @@ const AgentModeSettings = () => {
                           {workPlan.requireLogin && <Chip label="Login Required" size="small" color="warning" variant="outlined" />}
                           {workPlan.autocomplete && <Chip label="Autocomplete" size="small" color="info" variant="outlined" />}
                           {workPlan.defaultModel && <Chip label={workPlan.defaultModel} size="small" variant="outlined" />}
+                          {workPlan.id && planSyncStatus[workPlan.id] && (
+                            planSyncStatus[workPlan.id].inSync
+                              ? <Chip label="In Sync" size="small" color="success" variant="outlined" />
+                              : planSyncStatus[workPlan.id].existsInProd && planSyncStatus[workPlan.id].existsInDev
+                                ? <Chip label={`Out of Sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`} size="small" color="warning" variant="outlined" />
+                                : <Chip label={syncEnvironment === 'development' ? 'Dev Only' : 'Prod Only'} size="small" color="info" variant="outlined" />
+                          )}
                         </Box>
                       </Box>
                       <Box display="flex" gap={0.5} flexShrink={0}>
+                        {workPlan.id && syncEnvironment && (
+                          <Tooltip title={
+                            planSyncStatus[workPlan.id]?.inSync
+                              ? "Prod & Dev in sync"
+                              : planSyncStatus[workPlan.id]?.changedFields?.length
+                                ? `Out of sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`
+                                : !planSyncStatus[workPlan.id]?.existsInProd
+                                  ? "Missing in Prod"
+                                  : !planSyncStatus[workPlan.id]?.existsInDev
+                                    ? "Missing in Dev"
+                                    : `Sync Plan (${syncLabel})`
+                          }>
+                            <span>
+                              <IconButton
+                                size="small"
+                                onClick={() => handleOpenSyncDialog(workPlan)}
+                                disabled={planSyncStatus[workPlan.id]?.inSync}
+                              >
+                                {syncingPlanId === workPlan.id ? <CircularProgress size={18} /> : <SyncIcon fontSize="small" />}
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        )}
                         <Tooltip title="Duplicate plan">
                           <IconButton
                             size="small"
@@ -8588,11 +8872,51 @@ const AgentModeSettings = () => {
           )}
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
-            Predefined work plans can be used to quickly set up structured workflows in Agent Mode. 
+            Predefined work plans can be used to quickly set up structured workflows in Agent Mode.
             Each step can have a title, optional description, and optional required function calls.
           </Typography>
         </CardContent>
       </Card>
+
+      {/* Sync Plan Dialog */}
+      <Dialog open={syncDialogOpen} onClose={() => { setSyncDialogOpen(false); setPlanToSync(null); }}>
+        <DialogTitle>Sync Plan ({syncLabel})</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ mb: 2 }}>
+            Sync <strong>{planToSync?.title}</strong> {syncLabel}:
+          </Typography>
+          {planToSync?.id && planSyncStatus[planToSync.id] && (() => {
+            const info = planSyncStatus[planToSync.id];
+            if (!info.existsInProd) {
+              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Dev. It will be created in Prod.</Alert>;
+            }
+            if (!info.existsInDev) {
+              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Prod. It will be created in Dev.</Alert>;
+            }
+            if (info.changedFields.length > 0) {
+              return (
+                <Alert severity="info" sx={{ mb: 2 }}>
+                  <strong>Fields that will change:</strong> {info.changedFields.join(', ')}
+                </Alert>
+              );
+            }
+            return null;
+          })()}
+          {syncEnvironment === 'development' && (
+            <Alert severity="warning" sx={{ mt: 1 }}>
+              This will overwrite the production version of this plan.
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setSyncDialogOpen(false); setPlanToSync(null); }} color="inherit">
+            Cancel
+          </Button>
+          <Button onClick={handleSyncPlan} variant="contained" color="primary" disabled={syncingPlanId === planToSync?.id}>
+            {syncingPlanId === planToSync?.id ? <CircularProgress size={20} color="inherit" /> : `Sync ${syncLabel}`}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };

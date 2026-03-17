@@ -64,7 +64,7 @@ export async function getUserFromToken(req: Request): Promise<{
         user: {
           userId: targetUser.userId,
           email: targetUser.email,
-          isAdmin: false, // Target user permissions, not admin permissions
+          isAdmin: targetUser.isAdmin || false, // Use target user's actual admin status
           roles: (targetUser.roles && targetUser.roles.length > 0 ? targetUser.roles : ['customer']) as ('partner' | 'customer' | 'free')[]
         },
         decoded,

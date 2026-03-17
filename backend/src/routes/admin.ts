@@ -642,11 +642,19 @@ router.put("/users/:userId/seo-domains", async (req, res) => {
   }
 });
 
-// Update user SEO/AEO configuration (SEO domains and Google Analytics Measurement ID)
+// Update user SEO/AEO configuration (SEO domains, Google Analytics, and Clarity)
 router.put("/users/:userId/seo-aeo", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { seoDomains, googleAnalyticsPropertyId, gaFilteredDomains, clarityProjectId, productDomain } = req.body;
+    const {
+      seoDomains,
+      googleAnalyticsPropertyId,  // Legacy single value (kept for backward compatibility)
+      googleAnalyticsProperties,  // New array format
+      gaFilteredDomains,
+      clarityProjectId,  // Legacy single value (kept for backward compatibility)
+      clarityProjects,  // New array format
+      productDomain
+    } = req.body;
 
     // Check if user exists
     const user = await userDb.getUserById(userId);
@@ -660,12 +668,17 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
         return res.status(400).json({ message: "seoDomains must be an array" });
       }
 
-      // Validate each domain format
+      // Validate each domain format (allow both domain and URL-prefix formats)
+      // Domain property: example.com
+      // URL-prefix property: https://example.com or https://example.com/
       const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
+
       for (const domain of seoDomains) {
-        if (typeof domain !== 'string' || !domainRegex.test(domain.trim())) {
+        const trimmedDomain = domain.trim();
+        if (typeof domain !== 'string' || (!domainRegex.test(trimmedDomain) && !urlPrefixRegex.test(trimmedDomain))) {
           return res.status(400).json({
-            message: `Invalid domain format: ${domain}. Please use format like example.com`
+            message: `Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`
           });
         }
       }
@@ -700,16 +713,64 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
       }
     }
 
-    // Validate Google Analytics Property ID format if provided
+    // Validate Google Analytics Property ID format if provided (legacy single value)
     // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
     if (googleAnalyticsPropertyId !== undefined && googleAnalyticsPropertyId !== null && googleAnalyticsPropertyId !== "") {
       // GA4 Property ID is numeric (e.g., 123456789)
       const gaIdRegex = /^\d+$/;
       const trimmedId = googleAnalyticsPropertyId.trim();
       if (typeof googleAnalyticsPropertyId !== 'string' || !gaIdRegex.test(trimmedId)) {
-        return res.status(400).json({ 
-          message: `Invalid Google Analytics Property ID format: ${googleAnalyticsPropertyId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.` 
+        return res.status(400).json({
+          message: `Invalid Google Analytics Property ID format: ${googleAnalyticsPropertyId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`
         });
+      }
+    }
+
+    // Validate Google Analytics Properties array (new format)
+    if (googleAnalyticsProperties !== undefined) {
+      if (!Array.isArray(googleAnalyticsProperties)) {
+        return res.status(400).json({ message: "googleAnalyticsProperties must be an array" });
+      }
+
+      const gaIdRegex = /^\d+$/;
+      const seenPropertyIds = new Set<string>();
+
+      for (const property of googleAnalyticsProperties) {
+        // Validate structure
+        if (!property || typeof property !== 'object' || !property.propertyId || !property.label) {
+          return res.status(400).json({
+            message: "Each GA4 property must have 'propertyId' and 'label' fields"
+          });
+        }
+
+        // Validate property ID format
+        const trimmedId = property.propertyId.trim();
+        if (typeof property.propertyId !== 'string' || !gaIdRegex.test(trimmedId)) {
+          return res.status(400).json({
+            message: `Invalid Google Analytics Property ID format: ${property.propertyId}. Please enter the numeric Property ID (e.g., 123456789).`
+          });
+        }
+
+        // Validate label
+        if (typeof property.label !== 'string' || property.label.trim().length === 0) {
+          return res.status(400).json({
+            message: "Each GA4 property must have a non-empty label"
+          });
+        }
+
+        if (property.label.trim().length > 100) {
+          return res.status(400).json({
+            message: `GA4 property label too long: ${property.label}. Maximum 100 characters.`
+          });
+        }
+
+        // Check for duplicate property IDs
+        if (seenPropertyIds.has(trimmedId)) {
+          return res.status(400).json({
+            message: `Duplicate Google Analytics Property ID: ${trimmedId}`
+          });
+        }
+        seenPropertyIds.add(trimmedId);
       }
     }
 
@@ -720,6 +781,54 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
         return res.status(400).json({
           message: `Invalid Microsoft Clarity Project ID format: ${clarityProjectId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`
         });
+      }
+    }
+
+    // Validate Clarity Projects array (new format)
+    if (clarityProjects !== undefined) {
+      if (!Array.isArray(clarityProjects)) {
+        return res.status(400).json({ message: "clarityProjects must be an array" });
+      }
+
+      const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
+      const seenProjectIds = new Set<string>();
+
+      for (const project of clarityProjects) {
+        // Validate structure
+        if (!project || typeof project !== 'object' || !project.projectId || !project.label) {
+          return res.status(400).json({
+            message: "Each Clarity project must have 'projectId' and 'label' fields"
+          });
+        }
+
+        // Validate project ID format
+        const trimmedId = project.projectId.trim();
+        if (typeof project.projectId !== 'string' || !clarityIdRegex.test(trimmedId)) {
+          return res.status(400).json({
+            message: `Invalid Microsoft Clarity Project ID format: ${project.projectId}. Please enter the project ID (e.g., ul13e4f7fe).`
+          });
+        }
+
+        // Validate label
+        if (typeof project.label !== 'string' || project.label.trim().length === 0) {
+          return res.status(400).json({
+            message: "Each Clarity project must have a non-empty label"
+          });
+        }
+
+        if (project.label.trim().length > 100) {
+          return res.status(400).json({
+            message: `Clarity project label too long: ${project.label}. Maximum 100 characters.`
+          });
+        }
+
+        // Check for duplicate project IDs
+        if (seenProjectIds.has(trimmedId)) {
+          return res.status(400).json({
+            message: `Duplicate Microsoft Clarity Project ID: ${trimmedId}`
+          });
+        }
+        seenProjectIds.add(trimmedId);
       }
     }
 
@@ -737,16 +846,29 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
     // Build update object with only provided fields
     const updateData: any = {};
     if (seoDomains !== undefined) {
+      console.log('[SEO/AEO Update] Saving seoDomains:', JSON.stringify(seoDomains));
       updateData.seoDomains = seoDomains;
     }
     if (googleAnalyticsPropertyId !== undefined) {
       updateData.googleAnalyticsPropertyId = googleAnalyticsPropertyId?.trim() || null;
+    }
+    if (googleAnalyticsProperties !== undefined) {
+      updateData.googleAnalyticsProperties = googleAnalyticsProperties.map((p: any) => ({
+        propertyId: p.propertyId.trim(),
+        label: p.label.trim()
+      }));
     }
     if (gaFilteredDomains !== undefined) {
       updateData.gaFilteredDomains = gaFilteredDomains;
     }
     if (clarityProjectId !== undefined) {
       updateData.clarityProjectId = clarityProjectId?.trim() || null;
+    }
+    if (clarityProjects !== undefined) {
+      updateData.clarityProjects = clarityProjects.map((p: any) => ({
+        projectId: p.projectId.trim(),
+        label: p.label.trim()
+      }));
     }
     if (productDomain !== undefined) {
       updateData.productDomain = productDomain?.trim() || null;
@@ -2255,8 +2377,16 @@ router.post("/announcements/load-from-url", async (req, res) => {
 // Add the chat sessions route
 router.get("/chat-sessions", async (req, res) => {
   try {
+    const startTime = typeof req.query.startTime === "string" ? req.query.startTime : undefined;
+    const endTime = typeof req.query.endTime === "string" ? req.query.endTime : undefined;
+    const timeRange = startTime && endTime ? { startTime, endTime } : undefined;
+    const syncMode = req.query.sync === "true" || req.query.sync === "1";
+
+    // Allow higher limit when time-range is specified (matching old chat-history behavior)
+    const maxLimit = timeRange ? 1000 : 100;
+    const defaultLimit = timeRange ? 100 : 30;
     const rawLimit = Number(req.query.limit);
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 30;
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), maxLimit) : defaultLimit;
     const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
     let lastEvaluatedKey: DynamoDB.DocumentClient.Key | undefined;
 
@@ -2270,7 +2400,8 @@ router.get("/chat-sessions", async (req, res) => {
 
     const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
       limit,
-      lastEvaluatedKey
+      lastEvaluatedKey,
+      timeRange
     );
 
     // Load messages from the messages table for each session
@@ -2285,6 +2416,18 @@ router.get("/chat-sessions", async (req, res) => {
         }
       })
     );
+
+    // Sync mode: batch-score sessions that need it
+    if (syncMode) {
+      const { scoreSessionIfNeeded } = await import("../services/sessionScoringService");
+      for (const session of sessionsWithMessages) {
+        try {
+          await scoreSessionIfNeeded(session as any);
+        } catch (error) {
+          console.error(`Error scoring session ${(session as any).sessionId}:`, error);
+        }
+      }
+    }
 
     const nextCursor = nextKey
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")

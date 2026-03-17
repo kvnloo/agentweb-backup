@@ -181,6 +181,7 @@ router.get('/welcome-message', requireAdmin, asyncHandler(agentModeController.ge
 // Get current conversation starters (admin only)
 router.get('/conversation-starters', requireAdmin, asyncHandler(agentModeController.getConversationStarters));
 
+
 // DELETE /api/agent-mode/session/:sessionId
 // Archive a chat session
 router.delete('/session/:sessionId', asyncHandler(agentModeController.archiveSession));

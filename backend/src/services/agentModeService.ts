@@ -22,7 +22,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -765,8 +765,17 @@ export class AgentModeService {
         getAllowedSkills(userId),
         skillService.getPublishedSkills(),
         this.getMarketingSystemPrompt(),
-        userDbForAdmin.getUserById(userId).catch(() => null)
+        userDbForAdmin.getUserById(userId).catch((err) => {
+          console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+          return null;
+        })
       ]);
+
+      // Log if user not found (indicates orphaned schedule or deleted user)
+      if (!currentUser) {
+        console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
+      }
+
       const isAdmin = currentUser?.isAdmin === true;
 
       const workPlan = currentSession?.workPlan;

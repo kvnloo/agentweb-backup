@@ -72,7 +72,7 @@ describe("Admin chat sessions endpoint", () => {
 
     const res = await request(app).get("/api/admin/chat-sessions").expect(200);
 
-    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, undefined);
+    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, undefined, undefined);
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(2);
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("session-1");
     expect(mockChatbotDb.getChatSession).toHaveBeenCalledWith("session-2");
@@ -156,7 +156,7 @@ describe("Admin chat sessions endpoint", () => {
       .get(`/api/admin/chat-sessions?cursor=${encodeURIComponent(cursor)}`)
       .expect(200);
 
-    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, lastEvaluatedKey);
+    expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, lastEvaluatedKey, undefined);
     expect(res.body.sessions).toHaveLength(0);
     expect(res.body.nextCursor).toBeNull();
   });

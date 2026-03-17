@@ -17,6 +17,7 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
 
@@ -539,10 +540,17 @@ export async function runVerifiedChat(
       }
 
       // Also check if any required tools are "other" (not in any published skill)
+      const adminToolNames = new Set(agentModeService.getAdminToolNames());
       const allSkillToolNames = new Set(publishedSkills.flatMap(s => s.toolNames || []));
-      const hasOtherTools = [...requiredToolNames].some(t => !allSkillToolNames.has(t));
+      const hasOtherTools = [...requiredToolNames].some(t => !allSkillToolNames.has(t) && !adminToolNames.has(t));
       if (hasOtherTools && (isWildcard || userAllowedSkillIds.includes('__other_skills__'))) {
         skillIdsToInstall.push('__other_skills__');
+      }
+
+      // Auto-install admin tools if any required function calls are admin-only tools
+      const hasAdminTools = [...requiredToolNames].some(t => adminToolNames.has(t));
+      if (hasAdminTools) {
+        skillIdsToInstall.push('__admin_tools__');
       }
 
       if (skillIdsToInstall.length > 0) {
@@ -833,20 +841,22 @@ async function runScheduledChat(
 
       // Foundation tools are always allowed regardless of subscription
       const foundationTools = agentModeService.getFoundationToolNames();
+      // Admin tools are allowed for admin users
+      const { userDb } = await import('../services/db');
+      const scheduleUser = await userDb.getUserById(userId);
+      const adminToolNames = new Set(agentModeService.getAdminToolNames());
+      const isAdminUser = scheduleUser?.isAdmin || false;
       const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
-        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName)
+        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName) && !(isAdminUser && adminToolNames.has(funcName))
       );
 
       if (disallowedFunctions.length > 0) {
-        // Get user info for email
-        const { userDb } = await import('../services/db');
-        const user = await userDb.getUserById(userId);
         const emailNotifications = schedule.emailNotifications || [];
         
         // Send error email instead of running
         const { emailService } = await import('../services/emailService');
         await emailService.sendScheduledChatErrorEmail(
-          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
+          emailNotifications.length > 0 ? emailNotifications : (scheduleUser?.email ? [scheduleUser.email] : []),
           schedule.scheduleName,
           disallowedFunctions,
           schedule.scheduleId

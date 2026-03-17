@@ -76,8 +76,11 @@ export interface User {
   slackChannel?: string; // Default Slack channel for this user
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
-  googleAnalyticsPropertyId?: string; // Google Analytics Property ID (numeric, e.g., 123456789)
-  clarityProjectId?: string; // Microsoft Clarity Project ID (e.g., ul13e4f7fe)
+  googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
+  googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>; // Array of GA4 properties with labels
+  gaFilteredDomains?: string[]; // Domains to exclude from Google Analytics (e.g., ["app.example.com", "admin.example.com"])
+  clarityProjectId?: string; // DEPRECATED: Microsoft Clarity Project ID (e.g., ul13e4f7fe) - use clarityProjects instead
+  clarityProjects?: Array<{ projectId: string; label: string }>; // Array of Clarity projects with labels
   productDomain?: string; // Product site domain for feature usage tracking (e.g., "app.example.com")
   funnelConfig?: {
     stages: Array<{
