@@ -2360,7 +2360,7 @@ emmaToolRegistry.register({
   name: 'delete_leads',
   definition: {
     name: 'delete_leads',
-    description: 'Delete one or more leads from a lead list. Maximum 100 leads per call.',
+    description: '⚠️ DESTRUCTIVE: Permanently delete one or more leads from a lead list. This action CANNOT be undone. Use ONLY when the user explicitly requests deletion. Maximum 100 leads per call. Bulk deletions (≥5 leads) require explicit user confirmation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2371,7 +2371,7 @@ emmaToolRegistry.register({
         lead_ids: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Array of lead IDs to delete (max 100)'
+          description: 'Array of lead IDs to delete (max 100). CAUTION: Deletion is permanent.'
         }
       },
       required: ['list_id', 'lead_ids']
