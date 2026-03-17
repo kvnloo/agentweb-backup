@@ -294,7 +294,8 @@ describe('CrmEnrichmentService', () => {
 
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 5);
+      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 10);
+      expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
       expect(mockGeminiCreate).toHaveBeenCalled();
     });
 
@@ -479,6 +480,195 @@ describe('CrmEnrichmentService', () => {
       expect(result.processedCount).toBe(20);
       // Gemini called once per lead
       expect(mockGeminiCreate).toHaveBeenCalledTimes(20);
+    });
+  });
+
+  // ─── buildFieldGuidance ───────────────────────────────────────────────────
+
+  describe('buildFieldGuidance', () => {
+    const buildFieldGuidance = (fields: string[]): string =>
+      (CrmEnrichmentService as any).buildFieldGuidance(fields);
+
+    it('should include range estimate guidance for employee fields', () => {
+      const guidance = buildFieldGuidance(['employee_count']);
+      expect(guidance).toContain('employee_count');
+      expect(guidance).toContain('range');
+      // Unknown is a last resort, not the default
+      expect(guidance).toContain('Only return "Unknown" if');
+    });
+
+    it('should default to Bootstrapped for funding fields when not found', () => {
+      const guidance = buildFieldGuidance(['funding_status']);
+      expect(guidance).toContain('funding_status');
+      expect(guidance).toContain('Bootstrapped');
+    });
+
+    it('should use Not publicly disclosed for revenue fields', () => {
+      const guidance = buildFieldGuidance(['annual_revenue']);
+      expect(guidance).toContain('Not publicly disclosed');
+    });
+
+    it('should never say Unknown for industry field', () => {
+      const guidance = buildFieldGuidance(['industry']);
+      expect(guidance).toContain('industry');
+      expect(guidance).toContain('never return');
+    });
+
+    it('should handle empty fields list with fallback string', () => {
+      const guidance = buildFieldGuidance([]);
+      expect(guidance).toContain('Unknown');
+    });
+
+    it('should include guidance for all fields in a mixed list', () => {
+      const guidance = buildFieldGuidance(['company_profile', 'employee_count', 'funding_status']);
+      expect(guidance).toContain('employee_count');
+      expect(guidance).toContain('funding_status');
+      expect(guidance).toContain('company_profile');
+    });
+  });
+
+  // ─── splitFields ─────────────────────────────────────────────────────────
+
+  describe('splitFields', () => {
+    const splitFields = (fields: Record<string, string>) =>
+      (CrmEnrichmentService as any).splitFields(fields);
+
+    it('should map known field names to standard lead fields', () => {
+      const { standardUpdates, customUpdates } = splitFields({
+        company: 'Acme Corp',
+        phone: '555-1234',
+        title: 'CTO',
+      });
+      expect(standardUpdates).toEqual({ company: 'Acme Corp', phone: '555-1234', title: 'CTO' });
+      expect(customUpdates).toEqual({});
+    });
+
+    it('should map variant field names like company_name, job_title, first_name', () => {
+      const { standardUpdates, customUpdates } = splitFields({
+        company_name: 'Acme',
+        job_title: 'Engineer',
+        first_name: 'John',
+        last_name: 'Doe',
+        linkedin_url: 'https://linkedin.com/in/johndoe',
+      });
+      expect(standardUpdates).toEqual({
+        company: 'Acme',
+        title: 'Engineer',
+        firstName: 'John',
+        lastName: 'Doe',
+        linkedin: 'https://linkedin.com/in/johndoe',
+      });
+      expect(customUpdates).toEqual({});
+    });
+
+    it('should put unrecognized fields into customUpdates', () => {
+      const { standardUpdates, customUpdates } = splitFields({
+        employee_count: '51-200',
+        funding_status: 'Series A',
+        company: 'Acme',
+      });
+      expect(standardUpdates).toEqual({ company: 'Acme' });
+      expect(customUpdates).toEqual({ employee_count: '51-200', funding_status: 'Series A' });
+    });
+
+    it('should handle empty fields object', () => {
+      const { standardUpdates, customUpdates } = splitFields({});
+      expect(standardUpdates).toEqual({});
+      expect(customUpdates).toEqual({});
+    });
+  });
+
+  // ─── execute - standard field updates ───────────────────────────────────
+
+  describe('execute - standard field mapping', () => {
+    it('should update standard lead fields instead of creating custom fields', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({ leadId: 'lead1', company: '', title: '' })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Tech company' }] });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({
+        company: 'Black Tiger',
+        title: 'VP Engineering',
+        employee_count: '51-200',
+      }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find company, title, and employee count',
+        outputFields: ['company', 'title', 'employee_count'],
+        sources: ['web_search'],
+      };
+
+      await service.execute(spec);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.objectContaining({
+        company: 'Black Tiger',
+        title: 'VP Engineering',
+        customFields: expect.objectContaining({ employee_count: '51-200' }),
+      }));
+      // company and title should NOT be in customFields
+      const updateCall = mockCrmDb.updateLead.mock.calls[0][2];
+      expect(updateCall.customFields).not.toHaveProperty('company');
+      expect(updateCall.customFields).not.toHaveProperty('title');
+    });
+  });
+
+  // ─── EMAIL DOMAIN FALLBACK ────────────────────────────────────────────────
+
+  describe('execute - email domain fallback when company is empty', () => {
+    it('should search using email domain when lead has no company name', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({ leadId: 'lead1', company: '', email: 'reed@blacktiger.tech' })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Black Tiger', snippet: '51-200 employees' }] });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: '51-200' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find employee count',
+        outputFields: ['employee_count'],
+        sources: ['web_search'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+      // Should search using the email domain, not skip the search
+      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(
+        expect.stringContaining('blacktiger.tech'),
+        10,
+      );
+    });
+
+    it('should skip web search entirely when both company and email are empty', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [createLead({ leadId: 'lead1', company: '', email: '' })];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ employee_count: 'Unknown' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find employee count',
+        outputFields: ['employee_count'],
+        sources: ['web_search'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+      // No search term available — web search should be skipped
+      expect(mockAgentModeService.searchWeb).not.toHaveBeenCalled();
     });
   });
 
