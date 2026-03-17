@@ -59,6 +59,9 @@ jest.mock('../services/db', () => ({
     createSchedule: jest.fn(),
     updateSchedule: jest.fn(),
   },
+  userDb: {
+    getUserById: jest.fn().mockResolvedValue({ userId: 'test-user-1', email: 'test@example.com', isAdmin: false }),
+  },
 }));
 
 jest.mock('uuid', () => ({
