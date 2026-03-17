@@ -25,6 +25,32 @@ export interface Setting {
   updatedBy: string;
 }
 
+export interface PredefinedPlan {
+  id: string;
+  title: string;
+  description?: string;
+  welcomeMessage?: string;
+  autocomplete?: boolean;
+  requireLogin?: boolean;
+  showLoginSignup?: string;
+  showInAgentMode?: boolean;
+  defaultModel?: string;
+  steps: Array<{
+    stepCount: number;
+    title: string;
+    description?: string;
+    requiredFunctionCalls?: string[];
+    skillIds?: string[];
+  }>;
+}
+
+export interface PlanSyncInfo {
+  inSync: boolean;
+  existsInProd: boolean;
+  existsInDev: boolean;
+  changedFields: string[];
+}
+
 export class SettingsService {
   private tableName: string;
 
@@ -100,6 +126,147 @@ export class SettingsService {
       await dynamodb.delete(params).promise();
     } catch (error) {
       console.error('Error deleting setting:', error);
+      throw error;
+    }
+  }
+
+  async syncPlan(planId: string, direction: 'prod-to-dev' | 'dev-to-prod'): Promise<PredefinedPlan | null> {
+    const sourceTable = direction === 'prod-to-dev' ? 'AW-Settings' : 'Dev-AW-Settings';
+    const targetTable = direction === 'prod-to-dev' ? 'Dev-AW-Settings' : 'AW-Settings';
+
+    try {
+      // Read from source table
+      const sourceResult = await dynamodb.get({
+        TableName: sourceTable,
+        Key: { settingName: 'agent-mode-predefined-workplans' },
+      }).promise();
+
+      if (!sourceResult.Item || !sourceResult.Item.settingValue) {
+        return null;
+      }
+
+      const sourcePlans: PredefinedPlan[] = JSON.parse(sourceResult.Item.settingValue);
+      const planToSync = sourcePlans.find((p) => p.id === planId);
+
+      if (!planToSync) {
+        return null;
+      }
+
+      // Read from target table
+      const targetResult = await dynamodb.get({
+        TableName: targetTable,
+        Key: { settingName: 'agent-mode-predefined-workplans' },
+      }).promise();
+
+      let targetPlans: PredefinedPlan[] = [];
+      if (targetResult.Item && targetResult.Item.settingValue) {
+        try {
+          targetPlans = JSON.parse(targetResult.Item.settingValue);
+        } catch (error) {
+          console.error('Error parsing target plans:', error);
+          targetPlans = [];
+        }
+      }
+
+      // Find existing plan in target or add new
+      const existingIndex = targetPlans.findIndex((p) => p.id === planId);
+      if (existingIndex >= 0) {
+        targetPlans[existingIndex] = planToSync;
+      } else {
+        targetPlans.push(planToSync);
+      }
+
+      // Write back to target table
+      await dynamodb.put({
+        TableName: targetTable,
+        Item: {
+          settingName: 'agent-mode-predefined-workplans',
+          settingValue: JSON.stringify(targetPlans),
+          description: targetResult.Item?.description || 'Agent Mode predefined work plans',
+          updatedAt: new Date().toISOString(),
+          updatedBy: 'sync-operation'
+        }
+      }).promise();
+
+      return planToSync;
+    } catch (error) {
+      console.error(`Error syncing plan ${planId} (${direction}):`, error);
+      throw error;
+    }
+  }
+
+  private getChangedPlanFields(a: PredefinedPlan, b: PredefinedPlan): string[] {
+    const changed: string[] = [];
+    if (a.title !== b.title) changed.push('title');
+    if ((a.description || '') !== (b.description || '')) changed.push('description');
+    if ((a.welcomeMessage || '') !== (b.welcomeMessage || '')) changed.push('welcomeMessage');
+    if (a.autocomplete !== b.autocomplete) changed.push('autocomplete');
+    if (a.requireLogin !== b.requireLogin) changed.push('requireLogin');
+    if ((a.showLoginSignup || '') !== (b.showLoginSignup || '')) changed.push('showLoginSignup');
+    if (a.showInAgentMode !== b.showInAgentMode) changed.push('showInAgentMode');
+    if ((a.defaultModel || '') !== (b.defaultModel || '')) changed.push('defaultModel');
+
+    // Deep comparison of steps
+    if (JSON.stringify(a.steps) !== JSON.stringify(b.steps)) {
+      changed.push('steps');
+    }
+
+    return changed;
+  }
+
+  async getPlanSyncStatus(): Promise<Record<string, PlanSyncInfo>> {
+    try {
+      const [prodResult, devResult] = await Promise.all([
+        dynamodb.get({
+          TableName: 'AW-Settings',
+          Key: { settingName: 'agent-mode-predefined-workplans' }
+        }).promise(),
+        dynamodb.get({
+          TableName: 'Dev-AW-Settings',
+          Key: { settingName: 'agent-mode-predefined-workplans' }
+        }).promise(),
+      ]);
+
+      let prodPlans: PredefinedPlan[] = [];
+      let devPlans: PredefinedPlan[] = [];
+
+      if (prodResult.Item && prodResult.Item.settingValue) {
+        try {
+          prodPlans = JSON.parse(prodResult.Item.settingValue);
+        } catch (error) {
+          console.error('Error parsing prod plans:', error);
+        }
+      }
+
+      if (devResult.Item && devResult.Item.settingValue) {
+        try {
+          devPlans = JSON.parse(devResult.Item.settingValue);
+        } catch (error) {
+          console.error('Error parsing dev plans:', error);
+        }
+      }
+
+      const prodMap = new Map(prodPlans.map((p) => [p.id, p]));
+      const devMap = new Map(devPlans.map((p) => [p.id, p]));
+
+      const allIds = new Set([...prodMap.keys(), ...devMap.keys()]);
+      const result: Record<string, PlanSyncInfo> = {};
+
+      for (const id of allIds) {
+        const prod = prodMap.get(id);
+        const dev = devMap.get(id);
+        const changedFields = (prod && dev) ? this.getChangedPlanFields(prod, dev) : [];
+        result[id] = {
+          inSync: !!(prod && dev && changedFields.length === 0),
+          existsInProd: !!prod,
+          existsInDev: !!dev,
+          changedFields,
+        };
+      }
+
+      return result;
+    } catch (error) {
+      console.error('Error getting plan sync status:', error);
       throw error;
     }
   }
