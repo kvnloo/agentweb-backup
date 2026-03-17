@@ -4205,12 +4205,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
           success: true,
           exists: false,
           message: 'No market strategy found',
-          marketData: {
-            businessOverview: '',
-            competitors: [],
-            icp: []
-          }
+          formattedContent: 'No market strategy found'
         };
+      }
+
+      // Cap competitors at 40
+      const MAX_COMPETITORS = 40;
+      if (marketStrategy.competitors && marketStrategy.competitors.length > MAX_COMPETITORS) {
+        console.log(`AgentMode: Capping competitors from ${marketStrategy.competitors.length} to ${MAX_COMPETITORS}`);
+        marketStrategy.competitors = marketStrategy.competitors.slice(0, MAX_COMPETITORS);
       }
 
       // Format the market strategy for LLM consumption
@@ -4219,12 +4222,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
         marketData: marketStrategy
       });
 
-      // Return structured response similar to readBrandGuidelines
+      // Return structured response — no raw marketData to keep tool result size manageable
       return {
         success: true,
         message: `Market strategy retrieved successfully`,
         exists: true,
-        marketData: marketStrategy,
         createdAt: marketStrategy.createdAt,
         updatedAt: marketStrategy.updatedAt,
         formattedContent
@@ -6666,7 +6668,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
       // Add market strategy
       if (marketStrategy.exists) {
-        emailPrompt += `\n\n## Market Strategy:\n${marketStrategy.formattedContent || JSON.stringify(marketStrategy.marketData, null, 2)}`;
+        emailPrompt += `\n\n## Market Strategy:\n${marketStrategy.formattedContent}`;
       } else {
         emailPrompt += `\n\n## Market Strategy: Not configured`;
       }
@@ -11609,6 +11611,11 @@ Format the response as JSON with this structure:
    * Truncate large tool-result messages in a copy of the messages array to stay within
    * LLM context limits. Preserves the most recent tool results at full size.
    */
+  // Tools whose results are allowed a higher truncation limit (e.g. market strategy data)
+  private static readonly LARGE_TOOL_RESULT_LIMIT: Record<string, number> = {
+    'read_market_strategy': 50000,
+  };
+
   trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
     // Find indices of all tool-role messages
     const toolIndices: number[] = [];
@@ -11626,10 +11633,12 @@ Format the response as JSON with this structure:
       if (
         msg.role === 'tool' &&
         !preserveSet.has(idx) &&
-        typeof msg.content === 'string' &&
-        msg.content.length > maxToolContentLength
+        typeof msg.content === 'string'
       ) {
-        return { ...msg, content: msg.content.slice(0, maxToolContentLength) + '\n[truncated]' };
+        const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+        if (msg.content.length > limit) {
+          return { ...msg, content: msg.content.slice(0, limit) + '\n[truncated]' };
+        }
       }
       return msg;
     });
