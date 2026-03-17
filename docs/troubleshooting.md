@@ -17,6 +17,14 @@ lsof -ti:3001 | xargs kill -9
 - Check if GSI exists: `aws dynamodb describe-table --table-name Dev-AW-TaskExecutions --region us-west-2`
 - Create missing index using AWS CLI commands in `dev.md`
 
+### Scheduled Chat Research Sessions
+
+**LLM repeats previous output on retry instead of performing fresh research:**
+- Check if `search_web` or other search tools are listed in the schedule's `requiredFunctionCalls` unnecessarily
+- When search tools are required, `runVerifiedChat` retries until they're called, but the LLM sees its previous output in context and repeats it
+- Fix: remove search tools from `requiredFunctionCalls` unless the schedule truly needs to enforce they are called a minimum number of times
+- The LLM will still call search tools organically as part of its research flow
+
 ### Agent Engine Issues
 
 **Memory system database errors (Azure OpenAI models):**
