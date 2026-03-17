@@ -34,6 +34,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Upgrade: Default Claude Model to Sonnet 4.6',
       '- HTML template generation (create_html_file, create_html_template) now uses Claude Sonnet 4.6 instead of Sonnet 4.5',
       '- Both Sonnet 4.5 and 4.6 remain available in the Agent Mode model selector and Content Agent Model dropdown',
+      'Improvement: Admin — Session Titles in Chat History Tab',
+      '- The Chat History tab in the admin dashboard now displays session titles in a dedicated column',
+      '- Long titles are truncated with ellipsis and show the full title on hover',
     ],
   },
   {
