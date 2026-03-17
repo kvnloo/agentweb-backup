@@ -2377,8 +2377,16 @@ router.post("/announcements/load-from-url", async (req, res) => {
 // Add the chat sessions route
 router.get("/chat-sessions", async (req, res) => {
   try {
+    const startTime = typeof req.query.startTime === "string" ? req.query.startTime : undefined;
+    const endTime = typeof req.query.endTime === "string" ? req.query.endTime : undefined;
+    const timeRange = startTime && endTime ? { startTime, endTime } : undefined;
+    const syncMode = req.query.sync === "true" || req.query.sync === "1";
+
+    // Allow higher limit when time-range is specified (matching old chat-history behavior)
+    const maxLimit = timeRange ? 1000 : 100;
+    const defaultLimit = timeRange ? 100 : 30;
     const rawLimit = Number(req.query.limit);
-    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 30;
+    const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), maxLimit) : defaultLimit;
     const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
     let lastEvaluatedKey: DynamoDB.DocumentClient.Key | undefined;
 
@@ -2392,7 +2400,8 @@ router.get("/chat-sessions", async (req, res) => {
 
     const { sessions, lastEvaluatedKey: nextKey } = await chatbotDb.getRecentSessionsPage(
       limit,
-      lastEvaluatedKey
+      lastEvaluatedKey,
+      timeRange
     );
 
     // Load messages from the messages table for each session
@@ -2407,6 +2416,18 @@ router.get("/chat-sessions", async (req, res) => {
         }
       })
     );
+
+    // Sync mode: batch-score sessions that need it
+    if (syncMode) {
+      const { scoreSessionIfNeeded } = await import("../services/sessionScoringService");
+      for (const session of sessionsWithMessages) {
+        try {
+          await scoreSessionIfNeeded(session as any);
+        } catch (error) {
+          console.error(`Error scoring session ${(session as any).sessionId}:`, error);
+        }
+      }
+    }
 
     const nextCursor = nextKey
       ? Buffer.from(JSON.stringify(nextKey)).toString("base64")
