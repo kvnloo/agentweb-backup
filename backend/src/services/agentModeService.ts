@@ -765,8 +765,17 @@ export class AgentModeService {
         getAllowedSkills(userId),
         skillService.getPublishedSkills(),
         this.getMarketingSystemPrompt(),
-        userDbForAdmin.getUserById(userId).catch(() => null)
+        userDbForAdmin.getUserById(userId).catch((err) => {
+          console.error(`[AgentMode] Failed to fetch user ${userId} for admin check:`, err);
+          return null;
+        })
       ]);
+
+      // Log if user not found (indicates orphaned schedule or deleted user)
+      if (!currentUser) {
+        console.warn(`[AgentMode] User ${userId} not found for admin check (orphaned schedule or deleted user)`);
+      }
+
       const isAdmin = currentUser?.isAdmin === true;
 
       const workPlan = currentSession?.workPlan;
