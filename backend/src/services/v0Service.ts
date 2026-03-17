@@ -630,26 +630,72 @@ export async function deployLandingPage(
       () => v0.chats.getById({ chatId: record.v0ChatId! }),
       "v0 chat fetch"
     );
-    const versionId = chat.latestVersion?.id;
+    let versionId = chat.latestVersion?.id;
 
     if (!versionId) {
       throw new Error("No version found in v0 chat — generation may still be in progress");
     }
 
-    // Step 2: Download project files from v0 (with retry)
-    console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId})`);
-    const zipBuffer = await withRetry(
-      () => v0.chats.downloadVersion({
-        chatId: record.v0ChatId!,
-        versionId,
-        // @ts-ignore — SDK types may not include these yet
-        format: "zip",
-        includeDefaultFiles: true,
-      }),
-      "v0 zip download"
-    );
+    // Step 2: Download + validate v0 output (with retry on bad output)
+    const V0_VALIDATION_MAX_RETRIES = 2;
+    let zipBuffer: any;
 
-    // Step 3: Create GitHub repo and push files
+    for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
+      console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId}, attempt ${validationAttempt + 1})`);
+      zipBuffer = await withRetry(
+        () => v0.chats.downloadVersion({
+          chatId: record.v0ChatId!,
+          versionId: versionId!,
+          // @ts-ignore — SDK types may not include these yet
+          format: "zip",
+          includeDefaultFiles: true,
+        }),
+        "v0 zip download"
+      );
+
+      // Unzip and validate before pushing to GitHub
+      const previewFiles = await unzipBuffer(zipBuffer);
+      autoFixV0Files(previewFiles);
+
+      try {
+        validateV0Output(previewFiles);
+        break; // validation passed
+      } catch (valErr: any) {
+        if (valErr instanceof V0OutputValidationError && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          console.warn(`[V0 SERVICE] v0 output validation failed (attempt ${validationAttempt + 1}): ${valErr.reason}`);
+
+          // Send correction message to v0 and re-download
+          await withRetry(
+            () => v0.chats.sendMessage({
+              chatId: record.v0ChatId!,
+              message:
+                "The previous output was not valid code. Please generate actual React/Next.js code — " +
+                "not markdown, not a prompt description, not empty files. " +
+                "Output must include .tsx files with real React components using export and function/const. " +
+                `Issue: ${valErr.reason}`,
+            }),
+            "v0 correction message"
+          );
+
+          // Wait for v0 to process the correction
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+
+          // Get the new version
+          const updatedChat = await withRetry(
+            () => v0.chats.getById({ chatId: record.v0ChatId! }),
+            "v0 chat re-fetch"
+          );
+          versionId = updatedChat.latestVersion?.id;
+          if (!versionId) throw new Error("No version found after correction message");
+
+          continue;
+        }
+        // Out of retries or not a validation error — rethrow
+        throw valErr;
+      }
+    }
+
+    // Step 3: Create GitHub repo and push files (validation already passed)
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
     const slug = record.name
       .toLowerCase()
@@ -836,6 +882,79 @@ function autoFixV0Files(files: Array<{ path: string; content: Buffer }>): number
   }
 
   return fixCount;
+}
+
+// ---------------------------------------------------------------------------
+// v0 output validation — catches "prompts instead of code", empty files, garbage
+// ---------------------------------------------------------------------------
+
+export class V0OutputValidationError extends Error {
+  constructor(public readonly reason: string) {
+    super(`v0 output validation failed: ${reason}`);
+    this.name = "V0OutputValidationError";
+  }
+}
+
+/**
+ * Validate that unzipped v0 output contains actual React/Next.js code.
+ * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
+ */
+export function validateV0Output(files: Array<{ path: string; content: Buffer }>): void {
+  // 1. Must have at least one .tsx file
+  const tsxFiles = files.filter((f) => f.path.endsWith(".tsx"));
+  if (tsxFiles.length === 0) {
+    throw new V0OutputValidationError("No .tsx files found in v0 output");
+  }
+
+  // 2. At least one .tsx file must have meaningful content (>50 chars)
+  const meaningfulTsx = tsxFiles.filter((f) => f.content.toString("utf-8").trim().length > 50);
+  if (meaningfulTsx.length === 0) {
+    throw new V0OutputValidationError("All .tsx files are empty or trivially small (<50 chars)");
+  }
+
+  // 3. At least one .tsx file must look like React code (has export + function/const)
+  const reactFiles = meaningfulTsx.filter((f) => {
+    const content = f.content.toString("utf-8");
+    return /\bexport\b/.test(content) && (/\bfunction\b/.test(content) || /\bconst\b/.test(content));
+  });
+  if (reactFiles.length === 0) {
+    throw new V0OutputValidationError(
+      "No .tsx file contains React code (missing export + function/const)"
+    );
+  }
+
+  // 4. Anti-markdown check: reject if >50% of lines in main .tsx files start with # or >
+  for (const file of reactFiles) {
+    const lines = file.content.toString("utf-8").split("\n").filter((l) => l.trim().length > 0);
+    if (lines.length === 0) continue;
+    const markdownLines = lines.filter((l) => /^\s*[#>]/.test(l));
+    if (markdownLines.length / lines.length > 0.5) {
+      throw new V0OutputValidationError(
+        `File ${file.path} appears to be markdown, not code (${markdownLines.length}/${lines.length} lines start with # or >)`
+      );
+    }
+  }
+
+  // 5. Anti-prompt-echo check: reject if a .tsx file contains common prompt patterns
+  const promptPatterns = [
+    /^Create a (?:landing page|website|page)/m,
+    /^Build (?:me )?a/m,
+    /^Generate a/m,
+    /^Design a (?:modern|professional|sleek)/m,
+    /^Make a (?:landing page|website)/m,
+  ];
+  for (const file of reactFiles) {
+    const content = file.content.toString("utf-8");
+    for (const pattern of promptPatterns) {
+      if (pattern.test(content)) {
+        throw new V0OutputValidationError(
+          `File ${file.path} appears to echo the user's prompt instead of containing code`
+        );
+      }
+    }
+  }
+
+  console.log(`[V0 SERVICE] Output validation passed: ${tsxFiles.length} .tsx files, ${reactFiles.length} with React code`);
 }
 
 /**

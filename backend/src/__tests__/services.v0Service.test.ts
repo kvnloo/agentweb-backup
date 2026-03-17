@@ -91,6 +91,8 @@ import {
   getLandingPage,
   listLandingPages,
   deleteLandingPage,
+  validateV0Output,
+  V0OutputValidationError,
   BrandContext,
 } from "../services/v0Service";
 
@@ -538,5 +540,140 @@ describe("v0Service - deleteLandingPage", () => {
     ).resolves.toBeUndefined();
     // deleteLandingPage now does a soft-delete (archive) via update, not a hard delete
     expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// =============================================================================
+// validateV0Output
+// =============================================================================
+
+function makeFile(path: string, content: string) {
+  return { path, content: Buffer.from(content) };
+}
+
+const VALID_TSX = `'use client'
+
+import React, { useState } from 'react';
+
+export default function LandingPage() {
+  const [email, setEmail] = useState('');
+  return (
+    <main className="min-h-screen bg-white">
+      <section className="max-w-4xl mx-auto px-6 py-20 text-center">
+        <h1 className="text-4xl font-bold mb-4">Welcome</h1>
+        <p className="text-xl text-gray-600 mb-8">A great landing page</p>
+        <input value={email} onChange={(e) => setEmail(e.target.value)} />
+      </section>
+    </main>
+  );
+}
+`;
+
+describe("v0Service - validateV0Output", () => {
+  it("passes for valid React .tsx files", () => {
+    const files = [
+      makeFile("app/page.tsx", VALID_TSX),
+      makeFile("package.json", '{"name":"test"}'),
+    ];
+    expect(() => validateV0Output(files)).not.toThrow();
+  });
+
+  it("FAIL: throws when no .tsx files are present", () => {
+    const files = [
+      makeFile("package.json", '{"name":"test"}'),
+      makeFile("README.md", "# Hello"),
+    ];
+    expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    expect(() => validateV0Output(files)).toThrow("No .tsx files found");
+  });
+
+  it("FAIL: throws when all .tsx files are empty or tiny", () => {
+    const files = [
+      makeFile("app/page.tsx", "// hi"),
+      makeFile("app/layout.tsx", ""),
+    ];
+    expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    expect(() => validateV0Output(files)).toThrow("trivially small");
+  });
+
+  it("FAIL: throws when .tsx files lack React code patterns", () => {
+    const files = [
+      makeFile(
+        "app/page.tsx",
+        "// This is a long comment that is more than fifty characters but has no exports or functions in it at all whatsoever."
+      ),
+    ];
+    expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    expect(() => validateV0Output(files)).toThrow("missing export");
+  });
+
+  it("FAIL: throws when .tsx file is mostly markdown", () => {
+    const markdownContent = [
+      "# Landing Page Design",
+      "> This is a quote",
+      "# Section 1",
+      "> Another quote",
+      "# Section 2",
+      "> More quotes",
+      "# Section 3",
+      "export function Page() {}",
+      "const x = 1;",
+    ].join("\n");
+
+    const files = [makeFile("app/page.tsx", markdownContent)];
+    expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    expect(() => validateV0Output(files)).toThrow("markdown");
+  });
+
+  it("FAIL: throws when .tsx file echoes a prompt", () => {
+    const promptEcho = `export default function Page() {
+  const content = "some stuff";
+  return <div>{content}</div>;
+}
+
+Create a landing page for my business that sells widgets.
+This should have a hero section and a contact form.`;
+
+    const files = [makeFile("app/page.tsx", promptEcho)];
+    expect(() => validateV0Output(files)).toThrow(V0OutputValidationError);
+    expect(() => validateV0Output(files)).toThrow("echo the user's prompt");
+  });
+
+  it("passes when markdown-like patterns are in JSX strings (minority of lines)", () => {
+    const jsxWithMarkdown = `'use client'
+
+export default function Page() {
+  const features = [
+    "# Feature 1 - heading in string",
+    "> Quote in string",
+  ];
+  return (
+    <main className="min-h-screen">
+      <h1>Hello World</h1>
+      {features.map((f, i) => <p key={i}>{f}</p>)}
+    </main>
+  );
+}
+`;
+    const files = [makeFile("app/page.tsx", jsxWithMarkdown)];
+    expect(() => validateV0Output(files)).not.toThrow();
+  });
+
+  it("passes with multiple .tsx files where at least one is valid", () => {
+    const files = [
+      makeFile("app/layout.tsx", "// tiny file"),
+      makeFile("app/page.tsx", VALID_TSX),
+      makeFile("components/header.tsx", `export const Header = () => <header>Hi</header>;`),
+    ];
+    expect(() => validateV0Output(files)).not.toThrow();
+  });
+});
+
+describe("V0OutputValidationError", () => {
+  it("has correct name and reason", () => {
+    const err = new V0OutputValidationError("test reason");
+    expect(err.name).toBe("V0OutputValidationError");
+    expect(err.reason).toBe("test reason");
+    expect(err.message).toContain("test reason");
   });
 });
