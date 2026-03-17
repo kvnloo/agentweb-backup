@@ -1580,6 +1580,54 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Chat History (admin-only) ──────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'get_chat_history',
+  definition: {
+    name: 'get_chat_history',
+    description: 'Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don\'t have them (slower but ensures all scores are present).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        start_time: {
+          type: 'string',
+          description: 'Start time in ISO 8601 format (e.g., "2024-03-01T00:00:00.000Z")'
+        },
+        end_time: {
+          type: 'string',
+          description: 'End time in ISO 8601 format (e.g., "2024-03-02T00:00:00.000Z")'
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of sessions to return (1-1000, default: 100)',
+          default: 100
+        },
+        sync: {
+          type: 'boolean',
+          description: 'When true, generates satisfaction scores for sessions that don\'t have them before returning (default: false). Use this for complete satisfaction score coverage, but expect slower response times.',
+          default: false
+        }
+      },
+      required: ['start_time', 'end_time']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const queryParams = new URLSearchParams({
+      startTime: args.start_time,
+      endTime: args.end_time,
+      ...(args.limit && { limit: args.limit.toString() }),
+      ...(args.sync && { sync: args.sync.toString() })
+    });
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/agent-mode/admin/chat-history?${queryParams}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 mcpToolRegistry.register({
   name: 'save_file',
   internal: true,

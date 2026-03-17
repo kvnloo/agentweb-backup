@@ -196,7 +196,7 @@ ENVEOF
 # 10. Start all services (including test-env-access)
 ###############################################################################
 sudo -u ec2-user tmux new-session -d -s backend -c "$APP_DIR/backend" \
-  "npx ts-node-dev --respawn --exit-child --transpile-only src/server.ts 2>&1 | tee -a $LOG_DIR/backend.log; exec bash"
+  "while true; do echo \"[backend] Starting ts-node-dev at \$(date)\" | tee -a $LOG_DIR/backend.log; npx ts-node-dev --respawn --exit-child --transpile-only src/server.ts 2>&1 | tee -a $LOG_DIR/backend.log; echo \"[backend] Process exited (\$?) at \$(date). Restarting in 3s...\" | tee -a $LOG_DIR/backend.log; sleep 3; done"
 
 sudo -u ec2-user tmux new-session -d -s partner-portal -c "$APP_DIR/partner-portal" \
   "npx vite --host 0.0.0.0 --port 5173 2>&1 | tee -a $LOG_DIR/partner-portal.log; exec bash"

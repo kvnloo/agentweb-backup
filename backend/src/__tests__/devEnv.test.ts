@@ -104,6 +104,7 @@ describe('devEnvService', () => {
         sgId: 'sg-xyz',
         publicIp: '',
         databaseId: 'db-123',
+        launchedBy: '',
       });
     });
 
@@ -129,6 +130,7 @@ describe('devEnvService', () => {
         sgId: '',
         publicIp: '',
         databaseId: '',
+        launchedBy: '',
       });
     });
 

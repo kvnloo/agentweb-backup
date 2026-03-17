@@ -58,3 +58,4 @@ Use the Playwright MCP tools (`mcp__playwright__browser_*`) to test against the 
 - Navigate to `http://PUBLIC_IP:5173` for the partner portal
 - Navigate to `http://PUBLIC_IP:5174` for the customer portal
 - Login with test credentials from the project CLAUDE.md
+
