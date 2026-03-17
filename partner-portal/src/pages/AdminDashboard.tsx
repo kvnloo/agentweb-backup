@@ -2038,138 +2038,139 @@ export default function AdminDashboard() {
     // Clear any previous errors
     setError("");
 
+    // Parse domains from text (one per line or comma-separated)
+    const domainsText = seoDomainsText.trim();
+    let domains: string[] = [];
+
+    if (domainsText) {
+      // Split by newlines or commas, then filter and validate
+      domains = domainsText
+        .split(/[\n,]+/)
+        .map(d => d.trim())
+        .filter(d => d.length > 0);
+
+      // Validate each domain format (allow both domain and URL-prefix formats)
+      // Domain property: example.com
+      // URL-prefix property: https://example.com or https://example.com/
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
+
+      for (const domain of domains) {
+        if (!domainRegex.test(domain) && !urlPrefixRegex.test(domain)) {
+          setError(`Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`);
+          return;
+        }
+      }
+    }
+
+
+    // Validate Google Analytics Property ID format if provided
+    // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
+    const gaId = googleAnalyticsPropertyId.trim();
+    if (gaId && !/^\d+$/.test(gaId)) {
+      setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
+      return;
+    }
+
+    // Validate Google Analytics Properties array
+    const validatedGaProperties = googleAnalyticsProperties
+      .filter(p => p.propertyId.trim() || p.label.trim()) // Filter out empty entries
+      .map(p => ({ propertyId: p.propertyId.trim(), label: p.label.trim() }));
+
+    const gaIdRegex = /^\d+$/;
+    const seenPropertyIds = new Set<string>();
+
+    for (const property of validatedGaProperties) {
+      if (!property.propertyId || !property.label) {
+        setError('Each GA4 property must have both Property ID and Label');
+        return;
+      }
+      if (!gaIdRegex.test(property.propertyId)) {
+        setError(`Invalid Google Analytics Property ID format: ${property.propertyId}. Please enter the numeric Property ID (e.g., 123456789).`);
+        return;
+      }
+      if (property.label.length > 100) {
+        setError(`GA4 property label too long: ${property.label}. Maximum 100 characters.`);
+        return;
+      }
+      if (seenPropertyIds.has(property.propertyId)) {
+        setError(`Duplicate Google Analytics Property ID: ${property.propertyId}`);
+        return;
+      }
+      seenPropertyIds.add(property.propertyId);
+    }
+
+    const clarityId = clarityProjectId.trim();
+    if (clarityId && !/^[a-zA-Z0-9_-]{6,32}$/.test(clarityId)) {
+      setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
+      return;
+    }
+
+    // Validate Clarity Projects array
+    const validatedClarityProjects = clarityProjects
+      .filter(p => p.projectId.trim() || p.label.trim()) // Filter out empty entries
+      .map(p => ({ projectId: p.projectId.trim(), label: p.label.trim() }));
+
+    const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
+    const seenProjectIds = new Set<string>();
+
+    for (const project of validatedClarityProjects) {
+      if (!project.projectId || !project.label) {
+        setError('Each Clarity project must have both Project ID and Label');
+        return;
+      }
+      if (!clarityIdRegex.test(project.projectId)) {
+        setError(`Invalid Microsoft Clarity Project ID format: ${project.projectId}. Please enter the project ID (e.g., ul13e4f7fe).`);
+        return;
+      }
+      if (project.label.length > 100) {
+        setError(`Clarity project label too long: ${project.label}. Maximum 100 characters.`);
+        return;
+      }
+      if (seenProjectIds.has(project.projectId)) {
+        setError(`Duplicate Microsoft Clarity Project ID: ${project.projectId}`);
+        return;
+      }
+      seenProjectIds.add(project.projectId);
+    }
+
+    // Validate product domain format if provided
+    const prodDomain = productDomain.trim();
+    if (prodDomain) {
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      if (!domainRegex.test(prodDomain)) {
+        setError(`Invalid product domain format: ${prodDomain}. Please use format like app.example.com`);
+        return;
+      }
+    }
+
+    // Parse filtered domains from text (one per line or comma-separated)
+    const filteredDomainsText = gaFilteredDomainsText.trim();
+    let filteredDomains: string[] = [];
+
+    if (filteredDomainsText) {
+      // Split by newlines or commas, then filter and validate
+      filteredDomains = filteredDomainsText
+        .split(/[\n,]+/)
+        .map(d => d.trim())
+        .filter(d => d.length > 0);
+
+      // Validate each domain format (allow localhost and standard domains)
+      const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
+      for (const domain of filteredDomains) {
+        // Allow localhost and IP addresses (common for filtering local/dev traffic)
+        const isLocalhost = domain === 'localhost' || domain.startsWith('localhost:');
+        const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(domain);
+
+        if (!isLocalhost && !isIpAddress && !domainRegex.test(domain)) {
+          setError(`Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`);
+          return;
+        }
+      }
+    }
+
     try {
       setSeoDomainsEditLoading(true);
-      
-      // Parse domains from text (one per line or comma-separated)
-      const domainsText = seoDomainsText.trim();
-      let domains: string[] = [];
-      
-      if (domainsText) {
-        // Split by newlines or commas, then filter and validate
-        domains = domainsText
-          .split(/[\n,]+/)
-          .map(d => d.trim())
-          .filter(d => d.length > 0);
-        
-        // Validate each domain format (allow both domain and URL-prefix formats)
-        // Domain property: example.com
-        // URL-prefix property: https://example.com or https://example.com/
-        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-        const urlPrefixRegex = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}\/?$/;
-
-        for (const domain of domains) {
-          if (!domainRegex.test(domain) && !urlPrefixRegex.test(domain)) {
-            setError(`Invalid domain format: ${domain}. Use 'example.com' for domain properties or 'https://example.com' or 'https://example.com/' for URL-prefix properties`);
-            return;
-          }
-        }
-      }
-      
-      // Validate Google Analytics Property ID format if provided
-      // Note: The API uses Property ID (numeric), not Measurement ID (G-XXXXXXXXXX)
-      const gaId = googleAnalyticsPropertyId.trim();
-      if (gaId && !/^\d+$/.test(gaId)) {
-        setError(`Invalid Google Analytics Property ID format: ${gaId}. Please enter the numeric Property ID (e.g., 123456789). You can find this in GA4 Admin > Property Settings.`);
-        return;
-      }
-
-      // Validate Google Analytics Properties array
-      const validatedGaProperties = googleAnalyticsProperties
-        .filter(p => p.propertyId.trim() || p.label.trim()) // Filter out empty entries
-        .map(p => ({ propertyId: p.propertyId.trim(), label: p.label.trim() }));
-
-      const gaIdRegex = /^\d+$/;
-      const seenPropertyIds = new Set<string>();
-
-      for (const property of validatedGaProperties) {
-        if (!property.propertyId || !property.label) {
-          setError('Each GA4 property must have both Property ID and Label');
-          return;
-        }
-        if (!gaIdRegex.test(property.propertyId)) {
-          setError(`Invalid Google Analytics Property ID format: ${property.propertyId}. Please enter the numeric Property ID (e.g., 123456789).`);
-          return;
-        }
-        if (property.label.length > 100) {
-          setError(`GA4 property label too long: ${property.label}. Maximum 100 characters.`);
-          return;
-        }
-        if (seenPropertyIds.has(property.propertyId)) {
-          setError(`Duplicate Google Analytics Property ID: ${property.propertyId}`);
-          return;
-        }
-        seenPropertyIds.add(property.propertyId);
-      }
-
-      const clarityId = clarityProjectId.trim();
-      if (clarityId && !/^[a-zA-Z0-9_-]{6,32}$/.test(clarityId)) {
-        setError(`Invalid Microsoft Clarity Project ID format: ${clarityId}. Please enter the project ID (e.g., ul13e4f7fe). You can find this in Clarity project settings.`);
-        return;
-      }
-
-      // Validate Clarity Projects array
-      const validatedClarityProjects = clarityProjects
-        .filter(p => p.projectId.trim() || p.label.trim()) // Filter out empty entries
-        .map(p => ({ projectId: p.projectId.trim(), label: p.label.trim() }));
-
-      const clarityIdRegex = /^[a-zA-Z0-9_-]{6,32}$/;
-      const seenProjectIds = new Set<string>();
-
-      for (const project of validatedClarityProjects) {
-        if (!project.projectId || !project.label) {
-          setError('Each Clarity project must have both Project ID and Label');
-          return;
-        }
-        if (!clarityIdRegex.test(project.projectId)) {
-          setError(`Invalid Microsoft Clarity Project ID format: ${project.projectId}. Please enter the project ID (e.g., ul13e4f7fe).`);
-          return;
-        }
-        if (project.label.length > 100) {
-          setError(`Clarity project label too long: ${project.label}. Maximum 100 characters.`);
-          return;
-        }
-        if (seenProjectIds.has(project.projectId)) {
-          setError(`Duplicate Microsoft Clarity Project ID: ${project.projectId}`);
-          return;
-        }
-        seenProjectIds.add(project.projectId);
-      }
-
-      // Validate product domain format if provided
-      const prodDomain = productDomain.trim();
-      if (prodDomain) {
-        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-        if (!domainRegex.test(prodDomain)) {
-          setError(`Invalid product domain format: ${prodDomain}. Please use format like app.example.com`);
-          return;
-        }
-      }
-
-      // Parse filtered domains from text (one per line or comma-separated)
-      const filteredDomainsText = gaFilteredDomainsText.trim();
-      let filteredDomains: string[] = [];
-
-      if (filteredDomainsText) {
-        // Split by newlines or commas, then filter and validate
-        filteredDomains = filteredDomainsText
-          .split(/[\n,]+/)
-          .map(d => d.trim())
-          .filter(d => d.length > 0);
-
-        // Validate each domain format (allow localhost and standard domains)
-        const domainRegex = /^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}$/;
-        for (const domain of filteredDomains) {
-          // Allow localhost and IP addresses (common for filtering local/dev traffic)
-          const isLocalhost = domain === 'localhost' || domain.startsWith('localhost:');
-          const isIpAddress = /^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(domain);
-
-          if (!isLocalhost && !isIpAddress && !domainRegex.test(domain)) {
-            setError(`Invalid filtered domain format: ${domain}. Please use format like app.example.com, localhost, or an IP address`);
-            return;
-          }
-        }
-      }
 
       const response = await axios.put(
         buildApiUrl(`/api/admin/users/${editingSeoDomainsUserId}/seo-aeo`),
@@ -3488,37 +3489,37 @@ export default function AdminDashboard() {
                                 </Typography>
                               )}
                               {((user as any).googleAnalyticsProperties && (user as any).googleAnalyticsProperties.length > 0) ? (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   GA: {(user as any).googleAnalyticsProperties.map((p: any) => `${p.label} (${p.propertyId})`).join(', ')}
                                 </Typography>
                               ) : user.googleAnalyticsPropertyId ? (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   GA: {user.googleAnalyticsPropertyId}
                                 </Typography>
                               ) : (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   No GA ID
                                 </Typography>
                               )}
                               {((user as any).clarityProjects && (user as any).clarityProjects.length > 0) ? (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   Clarity: {(user as any).clarityProjects.map((p: any) => `${p.label} (${p.projectId})`).join(', ')}
                                 </Typography>
                               ) : user.clarityProjectId ? (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   Clarity: {user.clarityProjectId}
                                 </Typography>
                               ) : (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   No Clarity ID
                                 </Typography>
                               )}
                               {user.productDomain ? (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   Product: {user.productDomain}
                                 </Typography>
                               ) : (
-                                <Typography variant="body2" color="text.secondary">
+                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
                                   No Product Domain
                                 </Typography>
                               )}

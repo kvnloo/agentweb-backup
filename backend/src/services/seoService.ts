@@ -200,7 +200,10 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
 
   const metricsPromises = user.seoDomains.map(async (domain: string) => {
     try {
+      console.log('[GSC Debug] Raw domain from DB:', domain);
+      console.log('[GSC Debug] domain.startsWith("http"):', domain.startsWith("http"));
       const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
+      console.log('[GSC Debug] Formatted siteUrl:', siteUrl);
       const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
 
       // Fetch daily data

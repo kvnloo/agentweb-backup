@@ -48,7 +48,9 @@ router.get("/metrics", async (req, res) => {
     const metricsPromises = user.seoDomains.map(async (domain: string) => {
       try {
         // Format domain for Search Console API (sc-domain:example.com or https://example.com)
+        console.log(`[GSC Fetch] Raw domain from DB: "${domain}"`);
         const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
+        console.log(`[GSC Fetch] Formatted siteUrl: "${siteUrl}"`);
 
         // Calculate date range based on timeframe
         // End date is today

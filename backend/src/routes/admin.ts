@@ -846,6 +846,7 @@ router.put("/users/:userId/seo-aeo", async (req, res) => {
     // Build update object with only provided fields
     const updateData: any = {};
     if (seoDomains !== undefined) {
+      console.log('[SEO/AEO Update] Saving seoDomains:', JSON.stringify(seoDomains));
       updateData.seoDomains = seoDomains;
     }
     if (googleAnalyticsPropertyId !== undefined) {
