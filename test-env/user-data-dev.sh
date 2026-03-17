@@ -24,6 +24,11 @@ dnf install -y dnf-plugins-core
 dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
 dnf install -y gh
 
+# Install Google Chrome for Playwright MCP (npx playwright install chrome only works on Ubuntu/Debian)
+curl -o /tmp/chrome.rpm https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+dnf localinstall -y /tmp/chrome.rpm
+rm -f /tmp/chrome.rpm
+
 # Install Playwright browser for MCP
 sudo -u ec2-user npx playwright install chromium
 
