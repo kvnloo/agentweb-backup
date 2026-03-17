@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-17',
     changes: [
+      'Fix: Agent Mode — Anti-Loop Detection for Repetitive Tool Calls',
+      '- Agent mode now detects when the LLM calls the same tools with identical arguments 3 consecutive times',
+      '- When detected, a system warning is injected into the conversation prompting the LLM to stop and summarize progress',
+      '- If the maximum iteration limit (20) is reached without a final response, a user-visible fallback message is shown instead of empty content',
+      '- Prevents sessions from appearing stuck or unresponsive when the LLM enters a tool-calling loop',
       'Fix: Scheduled Chats — Admin Tools Now Available',
       '- Scheduled chats created by admin users can now use admin-only tools (e.g., get_chat_history, list_skills, manage_skill)',
       '- Previously, admin tools were never auto-installed for scheduled chat sessions, causing them to fail when required',
