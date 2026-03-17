@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-17',
+    changes: [
+      'Feature: Admin — Predefined Work Plan Sync Between Dev and Prod',
+      '- Admin can sync predefined work plans between dev and prod environments from the Agent Mode settings tab',
+      '- Sync status chips show whether each plan is in sync, out of sync (with changed fields listed), or missing in one environment',
+      '- Confirmation dialog shows exactly what will change before syncing, with a warning when overwriting production',
+    ],
+  },
+  {
     date: '2026-03-16',
     changes: [
       'Security: Interactive Share — Admin Tools Blocked',
