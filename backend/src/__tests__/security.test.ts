@@ -243,6 +243,42 @@ describe('Security Tests', () => {
         isDelegated: true,
       });
     });
+
+    it('SUCCESS: delegated token to admin target → req.user.isAdmin is true', async () => {
+      const req: any = { headers: { authorization: 'Bearer delegate-admin-jwt' } };
+      const res = createRes();
+      const next = createNext();
+
+      (mockJwt.verify as jest.Mock).mockReturnValue({
+        userId: 'admin-123',
+        delegateAccess: {
+          adminUserId: 'admin-123',
+          adminEmail: 'admin@example.com',
+          targetUserId: 'admin-456',
+          targetEmail: 'admin2@example.com',
+        },
+      });
+      mockUserDb.getUserById.mockImplementation(async (id: string) => {
+        if (id === 'admin-123') return { userId: 'admin-123', email: 'admin@example.com', isAdmin: true } as any;
+        if (id === 'admin-456') return { userId: 'admin-456', email: 'admin2@example.com', isAdmin: true, roles: ['partner'] } as any;
+        return undefined as any;
+      });
+
+      await authenticateToken(req, res, next);
+
+      expect(next).toHaveBeenCalled();
+      expect(req.user).toEqual({
+        userId: 'admin-456',
+        email: 'admin2@example.com',
+        isAdmin: true,
+        roles: ['partner'],
+      });
+      expect(req.delegateInfo).toEqual({
+        adminUserId: 'admin-123',
+        adminEmail: 'admin@example.com',
+        isDelegated: true,
+      });
+    });
   });
 
   describe('requireAdmin middleware', () => {

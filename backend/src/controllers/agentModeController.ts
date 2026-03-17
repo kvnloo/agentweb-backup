@@ -841,20 +841,22 @@ async function runScheduledChat(
 
       // Foundation tools are always allowed regardless of subscription
       const foundationTools = agentModeService.getFoundationToolNames();
+      // Admin tools are allowed for admin users
+      const { userDb } = await import('../services/db');
+      const scheduleUser = await userDb.getUserById(userId);
+      const adminToolNames = new Set(agentModeService.getAdminToolNames());
+      const isAdminUser = scheduleUser?.isAdmin || false;
       const disallowedFunctions = allAllowed ? [] : expectedFunctionCalls.filter((funcName: string) =>
-        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName)
+        !allowedFunctionCalls.includes(funcName) && !foundationTools.has(funcName) && !(isAdminUser && adminToolNames.has(funcName))
       );
 
       if (disallowedFunctions.length > 0) {
-        // Get user info for email
-        const { userDb } = await import('../services/db');
-        const user = await userDb.getUserById(userId);
         const emailNotifications = schedule.emailNotifications || [];
         
         // Send error email instead of running
         const { emailService } = await import('../services/emailService');
         await emailService.sendScheduledChatErrorEmail(
-          emailNotifications.length > 0 ? emailNotifications : (user?.email ? [user.email] : []),
+          emailNotifications.length > 0 ? emailNotifications : (scheduleUser?.email ? [scheduleUser.email] : []),
           schedule.scheduleName,
           disallowedFunctions,
           schedule.scheduleId
