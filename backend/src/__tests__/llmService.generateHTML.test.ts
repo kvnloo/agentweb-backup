@@ -46,7 +46,7 @@ describe('LLMService - generateHTML', () => {
     });
     
     // Create LLMService instance with Claude model (doesn't require Azure credentials)
-    llmService = createLLMService('anthropic.claude-sonnet-4-5-20250929-v1:0', 0.8, 4000);
+    llmService = createLLMService('anthropic.claude-sonnet-4-6', 0.8, 4000);
   });
 
   describe('generateHTML', () => {

@@ -129,7 +129,7 @@ Agent: Uses create_html_template with:
 - Separate into regular and array variable lists
 
 **LLM Configuration:**
-- Model: Claude Sonnet 4.5 (`anthropic.claude-sonnet-4-5-20250929-v1:0`)
+- Model: Claude Sonnet 4.6 (`anthropic.claude-sonnet-4-6`)
 - Temperature: 0.8 for creative template enhancement
 - Max tokens: 4000
 - System prompt emphasizes email compatibility, inline styles, responsive design

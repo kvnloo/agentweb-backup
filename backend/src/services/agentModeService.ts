@@ -15053,7 +15053,7 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
   ): Promise<any> {
     try {
       // Use Claude model by default (check for Claude in model name)
-      const defaultClaudeModel = 'anthropic.claude-sonnet-4-5-20250929-v1:0';
+      const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
@@ -15150,7 +15150,7 @@ Please generate a complete, professional HTML document that properly formats and
       }
 
       // Use Claude model to process/enhance the HTML based on instructions
-      const defaultClaudeModel = 'anthropic.claude-sonnet-4-5-20250929-v1:0';
+      const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
       const { createLLMService } = await import('../utils/llmService');
       // Use 16K tokens for HTML template generation to avoid truncation
