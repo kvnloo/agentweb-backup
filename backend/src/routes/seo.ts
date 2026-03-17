@@ -7,6 +7,7 @@ import {
   getGoogleSearchConsoleAccessToken,
   getGoogleAnalyticsDataClient,
   getTechnicalSeoScore,
+  getGoogleAnalyticsProperties,
 } from "../services/seoService";
 
 const router = express.Router();
@@ -47,7 +48,9 @@ router.get("/metrics", async (req, res) => {
     const metricsPromises = user.seoDomains.map(async (domain: string) => {
       try {
         // Format domain for Search Console API (sc-domain:example.com or https://example.com)
+        console.log(`[GSC Fetch] Raw domain from DB: "${domain}"`);
         const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
+        console.log(`[GSC Fetch] Formatted siteUrl: "${siteUrl}"`);
 
         // Calculate date range based on timeframe
         // End date is today
@@ -285,91 +288,184 @@ router.get("/metrics", async (req, res) => {
 
     const metrics = await Promise.all(metricsPromises);
 
-    // Fetch Google Analytics metrics if Property ID is configured
-    let gaMetrics: any = null;
-    if (user.googleAnalyticsPropertyId) {
-      try {
-        const gaClient = await getGoogleAnalyticsDataClient();
-        if (gaClient) {
-          // Calculate date range based on timeframe
-          const now = new Date();
-          const endDate = new Date(now);
-          endDate.setUTCHours(0, 0, 0, 0); // Today in UTC
-          
-          const startDate = new Date(endDate);
-          const timeframe = (req.query.timeframe as string) || "30d";
-          
-          if (timeframe === "7d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 6); // 7 days total (including end date)
-          } else if (timeframe === "14d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 13); // 14 days total
-          } else if (timeframe === "30d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 29); // 30 days total
-          } else if (timeframe === "90d") {
-            startDate.setUTCDate(endDate.getUTCDate() - 89); // 90 days total
-          } else {
-            startDate.setUTCDate(endDate.getUTCDate() - 29); // Default 30 days total
-          }
-          startDate.setUTCHours(0, 0, 0, 0);
+    // Fetch Google Analytics metrics for all configured properties
+    let gaMetricsArray: any[] = [];
+    const gaProperties = getGoogleAnalyticsProperties(user);
 
-          const startDateStr = startDate.toISOString().split("T")[0];
-          const endDateStr = endDate.toISOString().split("T")[0];
+    if (gaProperties.length > 0) {
+      const gaClient = await getGoogleAnalyticsDataClient();
 
-          const propertyId = user.googleAnalyticsPropertyId;
+      if (gaClient) {
+        // Fetch metrics for each property in parallel
+        const gaMetricsPromises = gaProperties.map(async (property) => {
+          try {
+            // Calculate date range based on timeframe
+            const now = new Date();
+            const endDate = new Date(now);
+            endDate.setUTCHours(0, 0, 0, 0); // Today in UTC
 
-          // Build dimension filter to exclude filtered domains
-          let dimensionFilter: any = undefined;
-          if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
-            const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
-              notExpression: {
-                filter: {
-                  fieldName: "hostName",
-                  stringFilter: {
-                    matchType: "CONTAINS" as const,
-                    value: domain,
+            const startDate = new Date(endDate);
+            const timeframe = (req.query.timeframe as string) || "30d";
+
+            if (timeframe === "7d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 6); // 7 days total (including end date)
+            } else if (timeframe === "14d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 13); // 14 days total
+            } else if (timeframe === "30d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 29); // 30 days total
+            } else if (timeframe === "90d") {
+              startDate.setUTCDate(endDate.getUTCDate() - 89); // 90 days total
+            } else {
+              startDate.setUTCDate(endDate.getUTCDate() - 29); // Default 30 days total
+            }
+            startDate.setUTCHours(0, 0, 0, 0);
+
+            const startDateStr = startDate.toISOString().split("T")[0];
+            const endDateStr = endDate.toISOString().split("T")[0];
+
+            const propertyId = property.propertyId;
+
+            // Build dimension filter to exclude filtered domains
+            let dimensionFilter: any = undefined;
+            if (user.gaFilteredDomains && user.gaFilteredDomains.length > 0) {
+              const notExpressions = user.gaFilteredDomains.map((domain: string) => ({
+                notExpression: {
+                  filter: {
+                    fieldName: "hostName",
+                    stringFilter: {
+                      matchType: "CONTAINS" as const,
+                      value: domain,
+                    },
                   },
                 },
-              },
-            }));
+              }));
 
-            dimensionFilter = {
-              andGroup: {
-                expressions: notExpressions,
-              },
-            };
-          }
+              dimensionFilter = {
+                andGroup: {
+                  expressions: notExpressions,
+                },
+              };
+            }
 
-          // Fetch overall metrics (basic metrics first)
-          const [overallResponse] = await gaClient.runReport({
-            property: `properties/${propertyId}`,
-            dateRanges: [
-              {
-                startDate: startDateStr,
-                endDate: endDateStr,
-              },
-            ],
-            metrics: [
-              { name: "sessions" },
-              { name: "activeUsers" },
-              { name: "screenPageViews" },
-              { name: "averageSessionDuration" },
-              { name: "bounceRate" },
-            ],
-            ...(dimensionFilter && { dimensionFilter }),
-          });
+            // Fetch overall metrics (basic metrics first)
+            const [overallResponse] = await gaClient.runReport({
+              property: `properties/${propertyId}`,
+              dateRanges: [
+                {
+                  startDate: startDateStr,
+                  endDate: endDateStr,
+                },
+              ],
+              metrics: [
+                { name: "sessions" },
+                { name: "activeUsers" },
+                { name: "screenPageViews" },
+                { name: "averageSessionDuration" },
+                { name: "bounceRate" },
+              ],
+              ...(dimensionFilter && { dimensionFilter }),
+            });
 
-          // Fetch top pages by engagement
-          let topPagesByEngagement: Array<{
-            pageTitle: string;
-            pagePath: string;
-            sessions: number;
-            engagementRate: number;
-            userEngagementDuration: number;
-            eventCount: number;
-          }> = [];
+            // Fetch top pages by engagement
+            let topPagesByEngagement: Array<{
+              pageTitle: string;
+              pagePath: string;
+              sessions: number;
+              engagementRate: number;
+              userEngagementDuration: number;
+              eventCount: number;
+            }> = [];
 
-          try {
-            const [pagesEngagementResponse] = await gaClient.runReport({
+            try {
+              const [pagesEngagementResponse] = await gaClient.runReport({
+                property: `properties/${propertyId}`,
+                dateRanges: [
+                  {
+                    startDate: startDateStr,
+                    endDate: endDateStr,
+                  },
+                ],
+                dimensions: [
+                  // Only use pagePath and hostName to avoid duplicate rows for different page titles
+                  { name: "pagePath" },
+                  { name: "hostName" },
+                ],
+                metrics: [
+                  { name: "sessions" },
+                  { name: "engagementRate" },
+                  { name: "userEngagementDuration" },
+                  { name: "eventCount" },
+                ],
+                orderBys: [
+                  {
+                    metric: { metricName: "userEngagementDuration" },
+                    desc: true,
+                  },
+                ],
+                limit: 20,
+                ...(dimensionFilter && { dimensionFilter }),
+              });
+
+              if (pagesEngagementResponse.rows) {
+                pagesEngagementResponse.rows.forEach((row) => {
+                  const dimensions = row.dimensionValues || [];
+                  const metrics = row.metricValues || [];
+                  const pagePath = dimensions[0]?.value || "";
+                  const hostName = dimensions[1]?.value || "";
+                  const sessions = parseInt(metrics[0]?.value || "0");
+                  const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
+                  const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
+                  const eventCount = parseInt(metrics[3]?.value || "0");
+
+                  // Construct full URL with domain
+                  let fullUrl = pagePath;
+                  if (hostName) {
+                    // Ensure path starts with /
+                    const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+                    fullUrl = `https://${hostName}${path}`;
+                  } else if (user.seoDomains && user.seoDomains.length > 0) {
+                    // Fallback to first SEO domain if hostname not available
+                    const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
+                    fullUrl = `https://${user.seoDomains[0]}${path}`;
+                  }
+
+                  // Use the path as the title since we're grouping by path
+                  topPagesByEngagement.push({
+                    pageTitle: pagePath,
+                    pagePath: fullUrl,
+                    sessions,
+                    engagementRate,
+                    userEngagementDuration,
+                    eventCount,
+                  });
+                });
+              }
+            } catch (engagementError: any) {
+              console.warn("Error fetching top pages by engagement:", engagementError.message);
+              // Continue without engagement data
+            }
+
+            // Fetch daily data for timeline
+            const [dailyResponse] = await gaClient.runReport({
+              property: `properties/${propertyId}`,
+              dateRanges: [
+                {
+                  startDate: startDateStr,
+                  endDate: endDateStr,
+                },
+              ],
+              dimensions: [{ name: "date" }],
+              metrics: [
+                { name: "sessions" },
+                { name: "activeUsers" },
+                { name: "screenPageViews" },
+              ],
+              keepEmptyRows: false,
+              ...(dimensionFilter && { dimensionFilter }),
+            });
+
+            // Fetch traffic sources for AEO analysis
+            const [trafficSourcesResponse] = await gaClient.runReport({
               property: `properties/${propertyId}`,
               dateRanges: [
                 {
@@ -378,219 +474,140 @@ router.get("/metrics", async (req, res) => {
                 },
               ],
               dimensions: [
-                // Only use pagePath and hostName to avoid duplicate rows for different page titles
-                { name: "pagePath" },
-                { name: "hostName" },
+                { name: "sessionSource" },
+                { name: "sessionMedium" },
               ],
               metrics: [
                 { name: "sessions" },
-                { name: "engagementRate" },
-                { name: "userEngagementDuration" },
-                { name: "eventCount" },
+                { name: "activeUsers" },
+                { name: "screenPageViews" },
+                { name: "averageSessionDuration" },
               ],
               orderBys: [
                 {
-                  metric: { metricName: "userEngagementDuration" },
+                  metric: { metricName: "sessions" },
                   desc: true,
                 },
               ],
-              limit: 20,
+              limit: 50,
               ...(dimensionFilter && { dimensionFilter }),
             });
 
-            if (pagesEngagementResponse.rows) {
-              pagesEngagementResponse.rows.forEach((row) => {
+
+            // Process overall metrics
+            let totalSessions = 0;
+            let totalUsers = 0;
+            let totalPageViews = 0;
+            let avgSessionDuration = 0;
+            let bounceRate = 0;
+
+            if (overallResponse.rows && overallResponse.rows.length > 0) {
+              const row = overallResponse.rows[0];
+              const metrics = row.metricValues || [];
+              totalSessions = parseInt(metrics[0]?.value || "0");
+              totalUsers = parseInt(metrics[1]?.value || "0");
+              totalPageViews = parseInt(metrics[2]?.value || "0");
+              avgSessionDuration = parseFloat(metrics[3]?.value || "0");
+              bounceRate = parseFloat(metrics[4]?.value || "0") * 100; // Convert to percentage
+            }
+
+            // Process daily data
+            const dailyData: Array<{ date: string; sessions: number; users: number; pageViews: number }> = [];
+            if (dailyResponse.rows) {
+              dailyResponse.rows.forEach((row) => {
                 const dimensions = row.dimensionValues || [];
                 const metrics = row.metricValues || [];
-                const pagePath = dimensions[0]?.value || "";
-                const hostName = dimensions[1]?.value || "";
-                const sessions = parseInt(metrics[0]?.value || "0");
-                const engagementRate = parseFloat(metrics[1]?.value || "0") * 100;
-                const userEngagementDuration = parseFloat(metrics[2]?.value || "0");
-                const eventCount = parseInt(metrics[3]?.value || "0");
+                const dateValue = dimensions[0]?.value || "";
 
-                // Construct full URL with domain
-                let fullUrl = pagePath;
-                if (hostName) {
-                  // Ensure path starts with /
-                  const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-                  fullUrl = `https://${hostName}${path}`;
-                } else if (user.seoDomains && user.seoDomains.length > 0) {
-                  // Fallback to first SEO domain if hostname not available
-                  const path = pagePath.startsWith("/") ? pagePath : `/${pagePath}`;
-                  fullUrl = `https://${user.seoDomains[0]}${path}`;
+                if (!dateValue || dateValue.length !== 8) {
+                  return;
                 }
 
-                // Use the path as the title since we're grouping by path
-                topPagesByEngagement.push({
-                  pageTitle: pagePath,
-                  pagePath: fullUrl,
+                const sessions = parseInt(metrics[0]?.value || "0");
+                const users = parseInt(metrics[1]?.value || "0");
+                const pageViews = parseInt(metrics[2]?.value || "0");
+
+                // GA4 returns date in YYYYMMDD format, convert to YYYY-MM-DD
+                const formattedDate = `${dateValue.substring(0, 4)}-${dateValue.substring(4, 6)}-${dateValue.substring(6, 8)}`;
+
+                dailyData.push({
+                  date: formattedDate,
                   sessions,
-                  engagementRate,
-                  userEngagementDuration,
-                  eventCount,
+                  users,
+                  pageViews,
                 });
               });
             }
-          } catch (engagementError: any) {
-            console.warn("Error fetching top pages by engagement:", engagementError.message);
-            // Continue without engagement data
-          }
 
-          // Fetch daily data for timeline
-          const [dailyResponse] = await gaClient.runReport({
-            property: `properties/${propertyId}`,
-            dateRanges: [
-              {
+            // Sort daily data by date to ensure proper chronological order
+            dailyData.sort((a, b) => a.date.localeCompare(b.date));
+
+            // Process traffic sources
+            interface TrafficSource {
+              source: string;
+              medium: string;
+              sessions: number;
+              users: number;
+              pageViews: number;
+              avgSessionDuration: number;
+            }
+
+            const trafficSources: TrafficSource[] = [];
+
+            if (trafficSourcesResponse.rows) {
+              trafficSourcesResponse.rows.forEach((row) => {
+                const dimensions = row.dimensionValues || [];
+                const metrics = row.metricValues || [];
+                const source = dimensions[0]?.value || "(direct)";
+                const medium = dimensions[1]?.value || "(none)";
+                const sessions = parseInt(metrics[0]?.value || "0");
+                const users = parseInt(metrics[1]?.value || "0");
+                const pageViews = parseInt(metrics[2]?.value || "0");
+                const avgSessionDuration = parseFloat(metrics[3]?.value || "0");
+
+                trafficSources.push({
+                  source,
+                  medium,
+                  sessions,
+                  users,
+                  pageViews,
+                  avgSessionDuration,
+                });
+              });
+            }
+
+            return {
+              propertyId,
+              label: property.label,
+              sessions: totalSessions,
+              users: totalUsers,
+              pageViews: totalPageViews,
+              avgSessionDuration,
+              bounceRate,
+              dailyData: dailyData.sort((a, b) => a.date.localeCompare(b.date)),
+              trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
+              topPagesByEngagement,
+              dateRange: {
                 startDate: startDateStr,
                 endDate: endDateStr,
               },
-            ],
-            dimensions: [{ name: "date" }],
-            metrics: [
-              { name: "sessions" },
-              { name: "activeUsers" },
-              { name: "screenPageViews" },
-            ],
-            keepEmptyRows: false,
-            ...(dimensionFilter && { dimensionFilter }),
-          });
-
-          // Fetch traffic sources for AEO analysis
-          const [trafficSourcesResponse] = await gaClient.runReport({
-            property: `properties/${propertyId}`,
-            dateRanges: [
-              {
-                startDate: startDateStr,
-                endDate: endDateStr,
-              },
-            ],
-            dimensions: [
-              { name: "sessionSource" },
-              { name: "sessionMedium" },
-            ],
-            metrics: [
-              { name: "sessions" },
-              { name: "activeUsers" },
-              { name: "screenPageViews" },
-              { name: "averageSessionDuration" },
-            ],
-            orderBys: [
-              {
-                metric: { metricName: "sessions" },
-                desc: true,
-              },
-            ],
-            limit: 50,
-            ...(dimensionFilter && { dimensionFilter }),
-          });
-
-
-          // Process overall metrics
-          let totalSessions = 0;
-          let totalUsers = 0;
-          let totalPageViews = 0;
-          let avgSessionDuration = 0;
-          let bounceRate = 0;
-
-          if (overallResponse.rows && overallResponse.rows.length > 0) {
-            const row = overallResponse.rows[0];
-            const metrics = row.metricValues || [];
-            totalSessions = parseInt(metrics[0]?.value || "0");
-            totalUsers = parseInt(metrics[1]?.value || "0");
-            totalPageViews = parseInt(metrics[2]?.value || "0");
-            avgSessionDuration = parseFloat(metrics[3]?.value || "0");
-            bounceRate = parseFloat(metrics[4]?.value || "0") * 100; // Convert to percentage
+            };
+          } catch (error: any) {
+            console.error(`Error fetching Google Analytics metrics for property ${property.propertyId}:`, error);
+            return {
+              propertyId: property.propertyId,
+              label: property.label,
+              error: error.message || "Failed to fetch Google Analytics metrics",
+            };
           }
+        });
 
-          // Process daily data
-          const dailyData: Array<{ date: string; sessions: number; users: number; pageViews: number }> = [];
-          if (dailyResponse.rows) {
-            dailyResponse.rows.forEach((row) => {
-              const dimensions = row.dimensionValues || [];
-              const metrics = row.metricValues || [];
-              const dateValue = dimensions[0]?.value || "";
-              
-              if (!dateValue || dateValue.length !== 8) {
-                return;
-              }
-              
-              const sessions = parseInt(metrics[0]?.value || "0");
-              const users = parseInt(metrics[1]?.value || "0");
-              const pageViews = parseInt(metrics[2]?.value || "0");
-              
-              // GA4 returns date in YYYYMMDD format, convert to YYYY-MM-DD
-              const formattedDate = `${dateValue.substring(0, 4)}-${dateValue.substring(4, 6)}-${dateValue.substring(6, 8)}`;
-              
-              dailyData.push({
-                date: formattedDate,
-                sessions,
-                users,
-                pageViews,
-              });
-            });
-          }
-          
-          // Sort daily data by date to ensure proper chronological order
-          dailyData.sort((a, b) => a.date.localeCompare(b.date));
-
-          // Process traffic sources
-          interface TrafficSource {
-            source: string;
-            medium: string;
-            sessions: number;
-            users: number;
-            pageViews: number;
-            avgSessionDuration: number;
-          }
-
-          const trafficSources: TrafficSource[] = [];
-
-          if (trafficSourcesResponse.rows) {
-            trafficSourcesResponse.rows.forEach((row) => {
-              const dimensions = row.dimensionValues || [];
-              const metrics = row.metricValues || [];
-              const source = dimensions[0]?.value || "(direct)";
-              const medium = dimensions[1]?.value || "(none)";
-              const sessions = parseInt(metrics[0]?.value || "0");
-              const users = parseInt(metrics[1]?.value || "0");
-              const pageViews = parseInt(metrics[2]?.value || "0");
-              const avgSessionDuration = parseFloat(metrics[3]?.value || "0");
-
-              trafficSources.push({
-                source,
-                medium,
-                sessions,
-                users,
-                pageViews,
-                avgSessionDuration,
-              });
-            });
-          }
-
-          gaMetrics = {
-            propertyId,
-            sessions: totalSessions,
-            users: totalUsers,
-            pageViews: totalPageViews,
-            avgSessionDuration,
-            bounceRate,
-            dailyData: dailyData.sort((a, b) => a.date.localeCompare(b.date)),
-            trafficSources: trafficSources.sort((a, b) => b.sessions - a.sessions).slice(0, 20),
-            topPagesByEngagement,
-            dateRange: {
-              startDate: startDateStr,
-              endDate: endDateStr,
-            },
-          };
-        }
-      } catch (error: any) {
-        console.error("Error fetching Google Analytics metrics:", error);
-        gaMetrics = {
-          error: error.message || "Failed to fetch Google Analytics metrics",
-        };
+        gaMetricsArray = await Promise.all(gaMetricsPromises);
       }
     }
+
+    // For backward compatibility, also provide gaMetrics as single object (first property)
+    const gaMetrics = gaMetricsArray.length > 0 ? gaMetricsArray[0] : null;
 
     // Calculate funnel metrics if GA4 is configured and funnelId provided
     let funnelMetrics: any = null;
@@ -661,7 +678,8 @@ router.get("/metrics", async (req, res) => {
 
     res.json({
       metrics,
-      gaMetrics,
+      gaMetrics,  // Backward compatibility: first property or null
+      gaMetricsArray,  // New format: array of all properties
       funnelMetrics,
       timestamp: new Date().toISOString(),
     });
