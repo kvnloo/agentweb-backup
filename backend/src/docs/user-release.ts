@@ -31,6 +31,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Admin can sync predefined work plans between dev and prod environments from the Agent Mode settings tab',
       '- Sync status chips show whether each plan is in sync, out of sync (with changed fields listed), or missing in one environment',
       '- Confirmation dialog shows exactly what will change before syncing, with a warning when overwriting production',
+      'Upgrade: Default Claude Model to Sonnet 4.6',
+      '- HTML template generation (create_html_file, create_html_template) now uses Claude Sonnet 4.6 instead of Sonnet 4.5',
+      '- Both Sonnet 4.5 and 4.6 remain available in the Agent Mode model selector and Content Agent Model dropdown',
     ],
   },
   {
