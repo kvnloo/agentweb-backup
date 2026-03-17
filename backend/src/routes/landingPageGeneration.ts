@@ -19,42 +19,96 @@ const router = Router();
 // Constants
 // ---------------------------------------------------------------------------
 const MAX_INPUT_LENGTH = 10_000;
-const RATE_LIMIT_MAX = 10;
-const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+// Expensive operations (v0 generation, deploy, iterate) — costs real credits
+const GENERATION_RATE_LIMIT_MAX = 10;
+const GENERATION_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+// Cheap operations (GitHub file edits) — just API calls, no credit cost
+const EDIT_RATE_LIMIT_MAX = 60;
+const EDIT_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 // ---------------------------------------------------------------------------
-// In-memory per-user rate limiter for expensive endpoints
+// In-memory per-user rate limiters
 // ---------------------------------------------------------------------------
-const rateLimitMap = new Map<string, number[]>();
+const generationRateLimitMap = new Map<string, number[]>();
+const editRateLimitMap = new Map<string, number[]>();
+
+/** @deprecated Use _resetRateLimitState instead — kept for backward compat */
+export const rateLimitMap = generationRateLimitMap;
 
 /** Exported for testing — allows tests to clear state between runs. */
 export function _resetRateLimitState(): void {
-  rateLimitMap.clear();
+  generationRateLimitMap.clear();
+  editRateLimitMap.clear();
 }
 
-function rateLimiter(req: Request, res: Response, next: NextFunction): void {
-  const userId = (req as unknown as AuthenticatedRequest).user?.userId;
-  if (!userId) {
-    // Auth middleware will catch this; just pass through
+function createRateLimiter(
+  map: Map<string, number[]>,
+  max: number,
+  windowMs: number,
+  label: string
+) {
+  return function (req: Request, res: Response, next: NextFunction): void {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) {
+      next();
+      return;
+    }
+
+    const now = Date.now();
+    const timestamps = map.get(userId) || [];
+    const recent = timestamps.filter((t) => now - t < windowMs);
+
+    if (recent.length >= max) {
+      const oldestInWindow = Math.min(...recent);
+      const resetInSec = Math.ceil((oldestInWindow + windowMs - now) / 1000);
+      res.status(429).json({
+        error: `Rate limit exceeded. Max ${max} ${label} requests per hour.`,
+        retry_after_seconds: resetInSec,
+        limit: max,
+        remaining: 0,
+      });
+      return;
+    }
+
+    // Only count the request against the limit AFTER the response succeeds.
+    // Failed requests (5xx) should not consume rate limit quota — this prevents
+    // a death spiral where transient errors eat up the user's limit on retries.
+    const originalEnd = res.end;
+    const originalJson = res.json;
+    let counted = false;
+
+    const countIfSuccess = () => {
+      if (!counted) {
+        counted = true;
+        if (res.statusCode < 500) {
+          recent.push(now);
+          map.set(userId, recent);
+        }
+      }
+    };
+
+    res.end = function (this: any, ...args: any[]) {
+      countIfSuccess();
+      return (originalEnd as Function).apply(this, args);
+    } as any;
+
+    res.json = function (this: any, body: any) {
+      countIfSuccess();
+      return (originalJson as Function).call(this, body);
+    } as any;
+
     next();
-    return;
-  }
-
-  const now = Date.now();
-  const timestamps = rateLimitMap.get(userId) || [];
-
-  // Evict entries outside the current window
-  const recent = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-
-  if (recent.length >= RATE_LIMIT_MAX) {
-    res.status(429).json({ error: "Rate limit exceeded. Max 10 requests per hour for generation endpoints." });
-    return;
-  }
-
-  recent.push(now);
-  rateLimitMap.set(userId, recent);
-  next();
+  };
 }
+
+const rateLimiter = createRateLimiter(
+  generationRateLimitMap, GENERATION_RATE_LIMIT_MAX, GENERATION_RATE_LIMIT_WINDOW_MS, "generation"
+);
+const editRateLimiter = createRateLimiter(
+  editRateLimitMap, EDIT_RATE_LIMIT_MAX, EDIT_RATE_LIMIT_WINDOW_MS, "file edit"
+);
 
 router.use(authenticateToken);
 
@@ -328,7 +382,7 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
  * The actual GitHub operations are handled by the GitHub MCP server.
  * This route validates ownership and returns repo info for the MCP tool to use.
  */
-router.put("/generated/:id/github-edit", rateLimiter, async (req, res: Response) => {
+router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {

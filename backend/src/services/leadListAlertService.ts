@@ -1,5 +1,6 @@
 import { crmDb, userDb } from './db';
 import { emailService } from './emailService';
+import { sendLeadNotification } from './slackService';
 
 const normalizeEventType = (eventType: string) => eventType.trim().toLowerCase();
 
@@ -207,6 +208,31 @@ export const leadListAlertService = {
       eventData,
       createdAt,
     });
+
+    // Send Slack notification if the user has a slackChannel configured
+    if (user.slackChannel) {
+      try {
+        const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+        const crmUrl = `${customerFrontendUrl}/crm?listId=${encodeURIComponent(list.listId)}`;
+
+        await sendLeadNotification(user.slackChannel, {
+          firstName: lead.firstName,
+          lastName: lead.lastName,
+          email: lead.email,
+          company: lead.company,
+          phone: lead.phone,
+          linkedin: lead.linkedin,
+          listName: list.name || 'Lead List',
+          listId: list.listId,
+          crmUrl,
+          eventType: normalizedEventType,
+          timestamp: createdAt || new Date().toISOString(),
+        });
+      } catch (slackError) {
+        // Log but don't fail — email was already sent successfully
+        console.error('Failed to send Slack lead notification:', slackError);
+      }
+    }
   },
 
   async notifyForEmailEvent(emailEvent: any) {

@@ -22,6 +22,7 @@ import {
   getGitHubOrgToken,
   getVercelToken,
   getStripeCredentials,
+  getFathomCredentials,
 } from '../../utils/secretsManager';
 
 describe('secretsManager utils', () => {
@@ -1238,6 +1239,119 @@ describe('secretsManager utils', () => {
       expect(process.env.STRIPE_SECRET_KEY).toBe('sk_test_minimal');
       // undefined fields still get set (as "undefined" string or undefined)
       expect(result.publishableKey).toBeUndefined();
+    });
+  });
+
+  describe('getFathomCredentials', () => {
+    it('should return Fathom credentials', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({
+            clientId: 'fathom-client-123',
+            clientSecret: 'fathom-secret-456'
+          })
+        })
+      });
+
+      const result = await getFathomCredentials();
+      expect(result.clientId).toBe('fathom-client-123');
+      expect(result.clientSecret).toBe('fathom-secret-456');
+    });
+
+    it('should throw error when credentials are empty', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: '   ' })
+      });
+
+      await expect(getFathomCredentials()).rejects.toThrow(
+        'Failed to fetch Fathom credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when clientId is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientSecret: 'secret' })
+        })
+      });
+
+      await expect(getFathomCredentials()).rejects.toThrow(
+        'Failed to fetch Fathom credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when clientSecret is missing', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'client' })
+        })
+      });
+
+      await expect(getFathomCredentials()).rejects.toThrow(
+        'Failed to fetch Fathom credentials from Secrets Manager'
+      );
+    });
+
+    it('should use prod secret in production', async () => {
+      process.env.NODE_ENV = 'production';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getFathomCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'prod/AgentWeb/Fathom'
+      });
+    });
+
+    it('should use dev secret in development', async () => {
+      process.env.NODE_ENV = 'development';
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getFathomCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Fathom'
+      });
+    });
+
+    it('should default to dev secret when NODE_ENV is not set', async () => {
+      delete process.env.NODE_ENV;
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          SecretString: JSON.stringify({ clientId: 'id', clientSecret: 'secret' })
+        })
+      });
+
+      await getFathomCredentials();
+      expect(mockGetSecretValue).toHaveBeenCalledWith({
+        SecretId: 'dev/AgentWeb/Fathom'
+      });
+    });
+
+    it('should throw error when Secrets Manager fails', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('AWS Error'))
+      });
+
+      await expect(getFathomCredentials()).rejects.toThrow(
+        'Failed to fetch Fathom credentials from Secrets Manager'
+      );
+    });
+
+    it('should throw error when secret string is null', async () => {
+      mockGetSecretValue.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ SecretString: undefined })
+      });
+
+      await expect(getFathomCredentials()).rejects.toThrow(
+        'Failed to fetch Fathom credentials from Secrets Manager'
+      );
     });
   });
 });

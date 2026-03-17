@@ -686,3 +686,123 @@ export async function sendApprovalRequestWithTracking(
   };
 }
 
+/**
+ * Lead notification payload for Slack bot messages
+ */
+export interface LeadNotificationPayload {
+  firstName?: string;
+  lastName?: string;
+  email?: string;
+  company?: string;
+  phone?: string;
+  linkedin?: string;
+  listName: string;
+  listId: string;
+  crmUrl?: string;
+  eventType?: string;
+  timestamp?: string;
+}
+
+/**
+ * Format a Slack Block Kit message for a new lead notification.
+ * Exported separately so it can be unit-tested without HTTP calls.
+ */
+export function formatLeadNotificationPayload(lead: LeadNotificationPayload): {
+  text: string;
+  blocks: any[];
+} {
+  const fullName = [lead.firstName, lead.lastName].filter(Boolean).join(' ') || 'Unknown';
+  const timestamp = lead.timestamp || new Date().toISOString();
+  const eventLabel = lead.eventType || 'New lead added';
+
+  const fields: Array<{ type: string; text: string }> = [];
+
+  fields.push({ type: 'mrkdwn', text: `*Name:*\n${fullName}` });
+
+  if (lead.email) {
+    fields.push({ type: 'mrkdwn', text: `*Email:*\n${lead.email}` });
+  }
+
+  if (lead.company) {
+    fields.push({ type: 'mrkdwn', text: `*Company:*\n${lead.company}` });
+  }
+
+  if (lead.phone) {
+    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${lead.phone}` });
+  }
+
+  if (lead.linkedin) {
+    fields.push({ type: 'mrkdwn', text: `*LinkedIn:*\n<${lead.linkedin}|Profile>` });
+  }
+
+  fields.push({ type: 'mrkdwn', text: `*List:*\n${lead.listName}` });
+
+  const blocks: any[] = [
+    {
+      type: 'header',
+      text: {
+        type: 'plain_text',
+        text: eventLabel,
+        emoji: true,
+      },
+    },
+    {
+      type: 'section',
+      fields,
+    },
+    {
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `Received at ${timestamp}`,
+        },
+      ],
+    },
+  ];
+
+  if (lead.crmUrl) {
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Open CRM', emoji: true },
+          url: lead.crmUrl,
+          action_id: 'open_crm',
+        },
+      ],
+    });
+  }
+
+  const fallbackText = `${eventLabel}: ${fullName}${lead.email ? ` (${lead.email})` : ''} — ${lead.listName}`;
+
+  return { text: fallbackText, blocks };
+}
+
+/**
+ * Send a lead notification to a Slack channel using the internal bot token.
+ * Uses the same slackClient (WebClient) as the approval flow.
+ * The channelId comes from the user's slackChannel field in DynamoDB.
+ */
+export async function sendLeadNotification(
+  channelId: string,
+  lead: LeadNotificationPayload
+): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const payload = formatLeadNotificationPayload(lead);
+
+  const result = await slackClient.chat.postMessage({
+    channel: channelId,
+    text: payload.text,
+    blocks: payload.blocks,
+  });
+
+  if (!result.ok) {
+    throw new Error(`Slack API error: ${result.error}`);
+  }
+}
+
