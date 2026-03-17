@@ -1244,23 +1244,26 @@ export class AgentModeService {
     } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);
 
-      // Handle Azure OpenAI content filtering errors specifically
+      // Determine user-friendly message based on error type
+      let userMessage: string;
       if (error?.code === 'content_filter' || error?.error?.code === 'ResponsibleAIPolicyViolation') {
-        throw new Error('I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.');
+        userMessage = 'I apologize, but I cannot respond to that request as it may violate content policies. Please try rephrasing your question or asking about something else.';
+      } else if (error?.status === 429) {
+        userMessage = 'I\'m currently experiencing high demand. Please wait a moment and try again.';
+      } else if (error?.status === 400) {
+        userMessage = 'I encountered an issue processing your request. Please try rephrasing your question.';
+      } else {
+        userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }
 
-      // Handle other OpenAI API errors
-      if (error?.status === 400) {
-        throw new Error('I encountered an issue processing your request. Please try rephrasing your question.');
-      }
-
-      // Handle rate limiting
-      if (error?.status === 429) {
-        throw new Error('I\'m currently experiencing high demand. Please wait a moment and try again.');
-      }
-
-      // Generic error fallback
-      throw new Error('I apologize, but I encountered an error processing your request. Please try again.');
+      // Preserve original error details for upstream error classification (e.g. isContextLimitError)
+      // while still providing a user-friendly message
+      const wrappedError: any = new Error(userMessage);
+      wrappedError.originalError = error;
+      wrappedError.originalMessage = error?.message || String(error);
+      if (error?.status) wrappedError.status = error.status;
+      if (error?.code) wrappedError.code = error.code;
+      throw wrappedError;
     }
   }
 
@@ -5973,6 +5976,157 @@ When a user requests client onboarding or says "onboard new client" or similar:
     } catch (error) {
       console.error('AgentMode: Error deleting leads:', error);
       return { success: false, message: 'Failed to delete leads', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  public async deleteLeadsByFilter(listId: string, filters: Array<{ field: string; operator: string; value?: any }>, userId: string, confirm?: boolean): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+
+      // Verify list ownership
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+      }
+
+      if (!filters || filters.length === 0) {
+        return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion to identify leads to delete' };
+      }
+
+      const standardFields = ['email', 'firstName', 'lastName', 'company', 'title', 'phone', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
+
+      // Helper function to check if a lead matches all filters
+      const leadMatchesFilters = (lead: any): boolean => {
+        return filters.every((filter: any) => {
+          const { field, operator, value } = filter;
+
+          let fieldValue: any;
+          if (field === 'icpScore') {
+            fieldValue = lead.icpMatch?.score;
+          } else if (field === 'icpMatch') {
+            fieldValue = lead.icpMatch?.isMatch;
+          } else if (field === 'engagementCount') {
+            fieldValue = lead.engagementCount;
+          } else if (standardFields.includes(field)) {
+            fieldValue = lead[field];
+          } else {
+            fieldValue = lead.customFields?.[field];
+          }
+
+          switch (operator) {
+            case 'is_empty':
+              return fieldValue === null || fieldValue === undefined || fieldValue === '';
+            case 'is_not_empty':
+              return fieldValue !== null && fieldValue !== undefined && fieldValue !== '';
+            case 'equals':
+              if (typeof fieldValue === 'boolean') return fieldValue === value;
+              return String(fieldValue || '').toLowerCase() === String(value || '').toLowerCase();
+            case 'not_equals':
+              return String(fieldValue || '').toLowerCase() !== String(value || '').toLowerCase();
+            case 'contains':
+              return String(fieldValue || '').toLowerCase().includes(String(value || '').toLowerCase());
+            case 'starts_with':
+              return String(fieldValue || '').toLowerCase().startsWith(String(value || '').toLowerCase());
+            case 'greater_than':
+              return Number(fieldValue) > Number(value);
+            case 'less_than':
+              return Number(fieldValue) < Number(value);
+            default:
+              return false;
+          }
+        });
+      };
+
+      // Phase 1: Count matching leads and return preview (if confirm not explicitly true)
+      if (confirm !== true) {
+        let matchCount = 0;
+        let scannedCount = 0;
+        let cursor: any = undefined;
+        const sampleLeads: any[] = [];
+        const sampleLimit = 5;
+
+        do {
+          const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
+          const leads = pageResult.items || [];
+
+          for (const lead of leads) {
+            scannedCount++;
+            if (leadMatchesFilters(lead)) {
+              matchCount++;
+              if (sampleLeads.length < sampleLimit) {
+                sampleLeads.push({
+                  email: lead.email || '',
+                  firstName: lead.firstName || '',
+                  lastName: lead.lastName || '',
+                  company: lead.company || ''
+                });
+              }
+            }
+          }
+
+          cursor = pageResult.lastEvaluatedKey;
+        } while (cursor);
+
+        if (matchCount === 0) {
+          return {
+            success: true,
+            message: `No leads matched the filter criteria (scanned ${scannedCount} leads)`,
+            matchCount: 0,
+            scannedCount,
+            requiresConfirmation: false
+          };
+        }
+
+        return {
+          success: true,
+          message: `Found ${matchCount} lead(s) matching the filter criteria. Call again with confirm=true to delete them.`,
+          matchCount,
+          scannedCount,
+          sampleLeads,
+          requiresConfirmation: true
+        };
+      }
+
+      // Phase 2: Actually delete matching leads (confirm=true)
+      let successCount = 0;
+      let failCount = 0;
+      let scannedCount = 0;
+      let cursor: any = undefined;
+
+      do {
+        const pageResult = await crmDb.getLeadsByListId(listId, 200, cursor);
+        const leads = pageResult.items || [];
+
+        for (const lead of leads) {
+          scannedCount++;
+          if (leadMatchesFilters(lead)) {
+            try {
+              await crmDb.deleteLead(listId, lead.leadId);
+              successCount++;
+            } catch (err) {
+              failCount++;
+            }
+          }
+        }
+
+        cursor = pageResult.lastEvaluatedKey;
+      } while (cursor);
+
+      return {
+        success: successCount > 0 || (successCount === 0 && failCount === 0),
+        message: successCount === 0 && failCount === 0
+          ? `No leads matched the filter criteria (scanned ${scannedCount} leads)`
+          : `Deleted ${successCount} lead(s)${failCount > 0 ? `, ${failCount} failed` : ''} (scanned ${scannedCount} leads)`,
+        successCount,
+        failCount,
+        scannedCount
+      };
+    } catch (error) {
+      console.error('AgentMode: Error deleting leads by filter:', error);
+      return { success: false, message: 'Failed to delete leads by filter', error: error instanceof Error ? error.message : 'Unknown error' };
     }
   }
 

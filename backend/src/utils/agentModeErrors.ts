@@ -27,7 +27,9 @@ const CONTEXT_LIMIT_PATTERNS = [
 export function isContextLimitError(error: unknown): boolean {
   if (!error) return false;
   const message = error instanceof Error ? error.message : String(error);
-  return CONTEXT_LIMIT_PATTERNS.some((pattern) => pattern.test(message));
+  // Also check originalMessage from wrapped errors (generateMarketingResponse preserves it)
+  const originalMessage = (error as any)?.originalMessage || '';
+  return CONTEXT_LIMIT_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
 }
 
 const TRANSIENT_STATUS_CODES = [429, 500, 502, 503, 504];
@@ -56,11 +58,13 @@ export function isTransientLLMError(error: unknown): boolean {
   if (isContextLimitError(error)) return false;
 
   const message = error instanceof Error ? error.message : String(error);
+  // Also check originalMessage from wrapped errors (generateMarketingResponse preserves it)
+  const originalMessage = (error as any)?.originalMessage || '';
   const statusCode = (error as any)?.status ?? (error as any)?.code ?? (error as any)?.response?.status;
 
   if (typeof statusCode === 'number' && TRANSIENT_STATUS_CODES.includes(statusCode)) {
     return true;
   }
 
-  return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
+  return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message) || pattern.test(originalMessage));
 }

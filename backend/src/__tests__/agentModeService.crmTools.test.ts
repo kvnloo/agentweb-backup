@@ -958,4 +958,215 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.error).toBe('Network error');
     });
   });
+
+  // ─── deleteLeadsByFilter ─────────────────────────────────────────────
+
+  describe('deleteLeadsByFilter', () => {
+    const makeLeads = (overrides: Array<Record<string, any>>) =>
+      overrides.map((o, i) => ({
+        leadId: `lead-${i}`,
+        listId,
+        email: `user${i}@test.com`,
+        firstName: 'User',
+        lastName: `${i}`,
+        company: '',
+        title: '',
+        customFields: {},
+        ...o,
+      }));
+
+    // ─── Preview Phase (confirm=false or undefined) ───────────────────────
+
+    it('should return preview with count when confirm is not set', async () => {
+      const leads = makeLeads([
+        { customFields: { lead_source: 'google' } },
+        { customFields: {} },                        // lead_source is empty
+        { customFields: { lead_source: '' } },        // lead_source is empty string
+      ]);
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.matchCount).toBe(2);
+      expect(result.scannedCount).toBe(3);
+      expect(result.requiresConfirmation).toBe(true);
+      expect(result.sampleLeads).toHaveLength(2);
+      expect(result.message).toContain('Found 2 lead(s)');
+      expect(result.message).toContain('confirm=true');
+      expect(mockCrmDb.deleteLead).not.toHaveBeenCalled();
+    });
+
+    it('should return preview with no confirmation needed when zero matches', async () => {
+      const leads = makeLeads([
+        { customFields: { lead_source: 'google' } },
+      ]);
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.matchCount).toBe(0);
+      expect(result.requiresConfirmation).toBe(false);
+      expect(result.message).toContain('No leads matched');
+      expect(mockCrmDb.deleteLead).not.toHaveBeenCalled();
+    });
+
+    it('should limit sample leads to 5 in preview', async () => {
+      const leads = makeLeads(Array(10).fill({ customFields: {} }));
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.matchCount).toBe(10);
+      expect(result.sampleLeads).toHaveLength(5);
+    });
+
+    // ─── Deletion Phase (confirm=true) ────────────────────────────────────
+
+    it('should delete leads when confirm=true', async () => {
+      const leads = makeLeads([
+        { customFields: { lead_source: 'google' } },
+        { customFields: {} },                        // lead_source is empty
+        { customFields: { lead_source: '' } },        // lead_source is empty string
+      ]);
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+      mockCrmDb.deleteLead.mockResolvedValue({ success: true } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId,
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.successCount).toBe(2);
+      expect(result.scannedCount).toBe(3);
+      expect(mockCrmDb.deleteLead).toHaveBeenCalledTimes(2);
+    });
+
+    it('should delete leads matching equals filter when confirmed', async () => {
+      const leads = makeLeads([
+        { company: 'Acme' },
+        { company: 'Beta' },
+        { company: 'acme' },  // case-insensitive match
+      ]);
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+      mockCrmDb.deleteLead.mockResolvedValue({ success: true } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'company', operator: 'equals', value: 'Acme' }],
+        userId,
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.successCount).toBe(2);
+    });
+
+    it('should return success with zero deletes when no leads match and confirmed', async () => {
+      const leads = makeLeads([
+        { customFields: { lead_source: 'google' } },
+      ]);
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId,
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.successCount).toBe(0);
+      expect(result.message).toContain('No leads matched');
+    });
+
+    it('should paginate through all leads when deleting', async () => {
+      const page1Leads = makeLeads([{ customFields: {} }]);
+      const page2Leads = makeLeads([{ customFields: {} }]).map(l => ({ ...l, leadId: 'lead-page2' }));
+
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId
+        .mockResolvedValueOnce({ items: page1Leads, lastEvaluatedKey: { id: 'cursor1' } } as any)
+        .mockResolvedValueOnce({ items: page2Leads, lastEvaluatedKey: null } as any);
+      mockCrmDb.deleteLead.mockResolvedValue({ success: true } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId,
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.successCount).toBe(2);
+      expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(2);
+    });
+
+    it('should handle delete failures gracefully', async () => {
+      const leads = makeLeads([{ customFields: {} }, { customFields: {} }]);
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null } as any);
+      mockCrmDb.deleteLead
+        .mockResolvedValueOnce({ success: true } as any)
+        .mockRejectedValueOnce(new Error('DB error'));
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'lead_source', operator: 'is_empty' }],
+        userId,
+        true
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.successCount).toBe(1);
+      expect(result.failCount).toBe(1);
+    });
+
+    // ─── Error Cases (both phases) ────────────────────────────────────────
+
+    it('should reject empty filters', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
+
+      const result = await service.deleteLeadsByFilter(listId, [], userId);
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('At least one filter');
+    });
+
+    it('should reject when list not owned by user', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
+
+      const result = await service.deleteLeadsByFilter(
+        listId,
+        [{ field: 'email', operator: 'is_empty' }],
+        userId
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('Access denied');
+    });
+  });
 });
