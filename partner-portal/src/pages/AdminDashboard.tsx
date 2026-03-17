@@ -8272,6 +8272,9 @@ const AgentModeSettings = () => {
               label="Content Agent Model"
             >
               <MenuItem value="gpt-5-chat-2">GPT-5 Chat 2 (Azure)</MenuItem>
+              <MenuItem value="anthropic.claude-sonnet-4-6">
+                Claude Sonnet 4.6 (AWS Bedrock)
+              </MenuItem>
               <MenuItem value="anthropic.claude-sonnet-4-5-20250929-v1:0">
                 Claude Sonnet 4.5 (AWS Bedrock)
               </MenuItem>
