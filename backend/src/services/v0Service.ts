@@ -1,6 +1,8 @@
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import axios from "axios";
+import fs from "fs";
+import path from "path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
 import { settingsService } from "./settingsService";
@@ -336,10 +338,24 @@ async function generateFirstPage(
           console.warn("[V0 SERVICE] landing-page-v2 template not found in email_templates_public, continuing without");
         }
       } else {
-        console.warn("[V0 SERVICE] email_templates_public setting not found, continuing without template");
+        console.warn("[V0 SERVICE] email_templates_public setting not found, trying filesystem fallback");
       }
     } catch (err) {
-      console.warn("[V0 SERVICE] Could not load landing page template, continuing without:", err);
+      console.warn("[V0 SERVICE] Could not load landing page template from DynamoDB, trying filesystem fallback:", err);
+    }
+
+    // Filesystem fallback: if DynamoDB didn't yield a template, try the local file
+    if (!effectiveTemplate) {
+      try {
+        const fallbackPath = path.join(__dirname, "..", "templates", "landing-page-v2.html");
+        if (fs.existsSync(fallbackPath)) {
+          const fallbackHtml = fs.readFileSync(fallbackPath, "utf-8");
+          effectiveTemplate = extractTemplateOutline(fallbackHtml);
+          console.log(`[V0 SERVICE] Loaded landing page template outline from filesystem fallback (${effectiveTemplate.length} chars)`);
+        }
+      } catch (fsErr) {
+        console.warn("[V0 SERVICE] Filesystem template fallback also failed, continuing without:", fsErr);
+      }
     }
   }
 

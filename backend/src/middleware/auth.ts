@@ -125,32 +125,47 @@ export async function authenticateToken(req: Request, res: Response, next: NextF
   next();
 }
 
+/**
+ * Returns true only if the request represents a real (non-delegated) admin session.
+ * When an admin delegates to another admin user, the delegated session should NOT
+ * inherit admin privileges — it should operate as the target user only.
+ * Use this helper instead of checking `req.user.isAdmin` directly.
+ */
+export function isRealAdmin(req: Request): boolean {
+  const authReq = req as AuthenticatedRequest;
+  if (!authReq.user?.isAdmin) return false;
+  // Delegated sessions must not get admin powers, even if target is also an admin
+  if (authReq.delegateInfo?.isDelegated) return false;
+  return true;
+}
+
 export function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const authReq = req as AuthenticatedRequest;
-  
+
   if (!authReq.user) {
     return res.status(401).json({ message: 'Authentication required' });
   }
-  
-  if (!authReq.user.isAdmin) {
+
+  // Delegated sessions must not get admin powers, even if target user is an admin
+  if (!isRealAdmin(req)) {
     return res.status(403).json({ message: 'Admin access required' });
   }
-  
+
   next();
 }
 
 export async function isAdmin(req: Request, res: Response, next: NextFunction) {
   const authReq = req as AuthenticatedRequest;
-  
+
   // Check if user exists in request (should be added by authenticateToken)
   if (!authReq.user) {
     return res.status(401).json({ message: 'Authentication required' });
   }
-  
-  // Check if user is admin
-  if (!authReq.user.isAdmin) {
+
+  // Delegated sessions must not get admin powers, even if target user is an admin
+  if (!isRealAdmin(req)) {
     return res.status(403).json({ message: 'Admin access required' });
   }
-  
+
   next();
 } 

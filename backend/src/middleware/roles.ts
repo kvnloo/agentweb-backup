@@ -17,8 +17,9 @@ export const hasRole = (allowedRoles: string[]) => async (req: AuthRequest, res:
       return res.status(404).json({ message: 'User not found' });
     }
     
-    // Admin always has access
-    if (user.isAdmin) {
+    // Admin always has access — but not delegated admin sessions.
+    // Delegated sessions operate as the target user only.
+    if (user.isAdmin && !(req as any).delegateInfo?.isDelegated) {
       return next();
     }
     
