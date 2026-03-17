@@ -6538,6 +6538,11 @@ const AgentModeSettings = () => {
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
   const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
   const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
+  const [planSyncStatus, setPlanSyncStatus] = useState<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>>({});
+  const [syncEnvironment, setSyncEnvironment] = useState<'development' | 'production'>('production');
+  const [syncingPlanId, setSyncingPlanId] = useState<string | null>(null);
+  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
+  const [planToSync, setPlanToSync] = useState<PredefinedWorkPlan | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
@@ -6587,6 +6592,9 @@ const AgentModeSettings = () => {
 
       // Load predefined work plans
       await loadPredefinedWorkPlans();
+
+      // Load plan sync status
+      await loadPlanSyncStatus();
 
       // Load content model
       await loadContentModel();
@@ -6889,6 +6897,47 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading predefined work plans:', error);
       setPredefinedWorkPlans([]);
+    }
+  };
+
+  const loadPlanSyncStatus = async () => {
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync-status'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setPlanSyncStatus(response.data.plans || {});
+      setSyncEnvironment(response.data.environment || 'production');
+    } catch (err) {
+      console.error('Error loading plan sync status:', err);
+    }
+  };
+
+  const syncDirection = syncEnvironment === 'development' ? 'dev-to-prod' : 'prod-to-dev';
+  const syncLabel = syncEnvironment === 'development' ? 'Dev → Prod' : 'Prod → Dev';
+
+  const handleOpenSyncDialog = (workPlan: PredefinedWorkPlan) => {
+    setPlanToSync(workPlan);
+    setSyncDialogOpen(true);
+  };
+
+  const handleSyncPlan = async () => {
+    if (!planToSync?.id) return;
+    try {
+      setSyncingPlanId(planToSync.id);
+      await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync'), {
+        planId: planToSync.id,
+        direction: syncDirection
+      }, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setSuccess(`Plan "${planToSync.title}" synced ${syncLabel}`);
+      setSyncDialogOpen(false);
+      setPlanToSync(null);
+      await loadPlanSyncStatus();
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Failed to sync plan');
+    } finally {
+      setSyncingPlanId(null);
     }
   };
 
@@ -8154,9 +8203,39 @@ const AgentModeSettings = () => {
                           {workPlan.requireLogin && <Chip label="Login Required" size="small" color="warning" variant="outlined" />}
                           {workPlan.autocomplete && <Chip label="Autocomplete" size="small" color="info" variant="outlined" />}
                           {workPlan.defaultModel && <Chip label={workPlan.defaultModel} size="small" variant="outlined" />}
+                          {workPlan.id && planSyncStatus[workPlan.id] && (
+                            planSyncStatus[workPlan.id].inSync
+                              ? <Chip label="In Sync" size="small" color="success" variant="outlined" />
+                              : planSyncStatus[workPlan.id].existsInProd && planSyncStatus[workPlan.id].existsInDev
+                                ? <Chip label={`Out of Sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`} size="small" color="warning" variant="outlined" />
+                                : <Chip label={syncEnvironment === 'development' ? 'Dev Only' : 'Prod Only'} size="small" color="info" variant="outlined" />
+                          )}
                         </Box>
                       </Box>
                       <Box display="flex" gap={0.5} flexShrink={0}>
+                        {workPlan.id && syncEnvironment && (
+                          <Tooltip title={
+                            planSyncStatus[workPlan.id]?.inSync
+                              ? "Prod & Dev in sync"
+                              : planSyncStatus[workPlan.id]?.changedFields?.length
+                                ? `Out of sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`
+                                : !planSyncStatus[workPlan.id]?.existsInProd
+                                  ? "Missing in Prod"
+                                  : !planSyncStatus[workPlan.id]?.existsInDev
+                                    ? "Missing in Dev"
+                                    : `Sync Plan (${syncLabel})`
+                          }>
+                            <span>
+                              <IconButton
+                                size="small"
+                                onClick={() => handleOpenSyncDialog(workPlan)}
+                                disabled={planSyncStatus[workPlan.id]?.inSync}
+                              >
+                                {syncingPlanId === workPlan.id ? <CircularProgress size={18} /> : <SyncIcon fontSize="small" />}
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        )}
                         <Tooltip title="Duplicate plan">
                           <IconButton
                             size="small"
@@ -8500,11 +8579,51 @@ const AgentModeSettings = () => {
           )}
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
-            Predefined work plans can be used to quickly set up structured workflows in Agent Mode. 
+            Predefined work plans can be used to quickly set up structured workflows in Agent Mode.
             Each step can have a title, optional description, and optional required function calls.
           </Typography>
         </CardContent>
       </Card>
+
+      {/* Sync Plan Dialog */}
+      <Dialog open={syncDialogOpen} onClose={() => { setSyncDialogOpen(false); setPlanToSync(null); }}>
+        <DialogTitle>Sync Plan ({syncLabel})</DialogTitle>
+        <DialogContent>
+          <Typography sx={{ mb: 2 }}>
+            Sync <strong>{planToSync?.title}</strong> {syncLabel}:
+          </Typography>
+          {planToSync?.id && planSyncStatus[planToSync.id] && (() => {
+            const info = planSyncStatus[planToSync.id];
+            if (!info.existsInProd) {
+              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Dev. It will be created in Prod.</Alert>;
+            }
+            if (!info.existsInDev) {
+              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Prod. It will be created in Dev.</Alert>;
+            }
+            if (info.changedFields.length > 0) {
+              return (
+                <Alert severity="info" sx={{ mb: 2 }}>
+                  <strong>Fields that will change:</strong> {info.changedFields.join(', ')}
+                </Alert>
+              );
+            }
+            return null;
+          })()}
+          {syncEnvironment === 'development' && (
+            <Alert severity="warning" sx={{ mt: 1 }}>
+              This will overwrite the production version of this plan.
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => { setSyncDialogOpen(false); setPlanToSync(null); }} color="inherit">
+            Cancel
+          </Button>
+          <Button onClick={handleSyncPlan} variant="contained" color="primary" disabled={syncingPlanId === planToSync?.id}>
+            {syncingPlanId === planToSync?.id ? <CircularProgress size={20} color="inherit" /> : `Sync ${syncLabel}`}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 };
