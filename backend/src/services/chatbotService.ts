@@ -2506,15 +2506,25 @@ export class ChatbotDB {
 
   async getRecentSessionsPage(
     limit: number,
-    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key
+    lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key,
+    timeRange?: { startTime: string; endTime: string }
   ): Promise<{ sessions: ChatSession[]; lastEvaluatedKey?: AWS.DynamoDB.DocumentClient.Key }> {
+    const expressionValues: Record<string, any> = {
+      ":adminListPartition": "all",
+    };
+
+    let keyCondition = "adminListPartition = :adminListPartition";
+    if (timeRange) {
+      keyCondition += " AND updatedAt BETWEEN :start AND :end";
+      expressionValues[":start"] = timeRange.startTime;
+      expressionValues[":end"] = timeRange.endTime;
+    }
+
     const params: AWS.DynamoDB.DocumentClient.QueryInput = {
       TableName: this.tableName,
       IndexName: "AdminUpdatedAtIndex",
-      KeyConditionExpression: "adminListPartition = :adminListPartition",
-      ExpressionAttributeValues: {
-        ":adminListPartition": "all",
-      },
+      KeyConditionExpression: keyCondition,
+      ExpressionAttributeValues: expressionValues,
       Limit: limit,
       ScanIndexForward: false,
     };
