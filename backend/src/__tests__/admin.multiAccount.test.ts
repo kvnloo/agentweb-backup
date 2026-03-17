@@ -1,5 +1,5 @@
 import request from 'supertest';
-import { app } from '../app';
+import app from '../app';
 import { userDb } from '../services/db';
 
 describe('Admin Routes - Multiple Account Configuration', () => {
