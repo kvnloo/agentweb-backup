@@ -477,9 +477,18 @@ async function addPageToExistingRepo(
   // Build the page content — a simple React component from the template/prompt
   const pageContent = buildNewPageContent(name, prompt, brandContext, leadListId, templateHtml);
 
-  // Derive the base URL from the Vercel project name in the GitHub repo URL
-  const repoSlug = repoName; // e.g. "lp-taskflow-landing-9262210a"
-  const baseUrl = `https://${repoSlug}.vercel.app`;
+  // Use the existing page's deployed URL as the base — Vercel truncates long project
+  // names so the domain often differs from the GitHub repo name.
+  // Extract just the origin (scheme + host) from the root page's URL.
+  let baseUrl = `https://${repoName}.vercel.app`;
+  if (existingPage.deployedUrl) {
+    try {
+      const parsed = new URL(existingPage.deployedUrl);
+      baseUrl = parsed.origin; // e.g. "https://lp-calculate-your-360-savi.vercel.app"
+    } catch {
+      // URL parse failed — fall back to repo-name-based URL
+    }
+  }
 
   const record: GeneratedLandingPage = {
     id,
