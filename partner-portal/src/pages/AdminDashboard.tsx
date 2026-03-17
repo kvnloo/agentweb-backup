@@ -164,6 +164,7 @@ interface AdminChatSession {
     welcomeMessage?: string;
     autocomplete?: boolean;
   };
+  title?: string;
   llmModel?: string;
   messageCount?: number;
   satisfactionScore?: {
@@ -4746,6 +4747,7 @@ export default function AdminDashboard() {
               <TableHead>
                 <TableRow>
                   <TableCell>Session ID</TableCell>
+                  <TableCell>Title</TableCell>
                   <TableCell>User ID</TableCell>
                   <TableCell>Portal Type</TableCell>
                   <TableCell>Session Type</TableCell>
@@ -4763,7 +4765,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={12} align="center">
+                    <TableCell colSpan={14} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4778,6 +4780,22 @@ export default function AdminDashboard() {
                               8
                             )}...`}</span>
                           </Tooltip>
+                        </TableCell>
+                        <TableCell sx={{ maxWidth: 200 }}>
+                          {session.title ? (
+                            <Tooltip title={session.title}>
+                              <span style={{
+                                display: 'block',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}>
+                                {session.title}
+                              </span>
+                            </Tooltip>
+                          ) : (
+                            <span style={{ color: '#999' }}>-</span>
+                          )}
                         </TableCell>
                         <TableCell>
                           <Link
