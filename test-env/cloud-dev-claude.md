@@ -49,8 +49,17 @@ The relay system will re-invoke you after the specified number of seconds (300 =
 1. Push your changes, create/update the PR
 2. In your response, include `[RELAY_RETRY_AFTER:300]` and explain what you're waiting for
 3. When re-invoked, check CI status with `gh pr checks <number>` or `gh run list`
-4. If CI passed, merge. If still running, include `[RELAY_RETRY_AFTER:180]` again
-5. If CI failed, investigate and fix
+4. **Before merging, always check if the branch is up to date:**
+   ```bash
+   gh api repos/AgentWebPro/agentweb/pulls/<number> --jq '.mergeable_state'
+   ```
+   If the result is `behind`, rebase before merging:
+   ```bash
+   git fetch origin main && git rebase origin/main && git push --force-with-lease
+   ```
+   Then wait for CI to re-run on the rebased branch before merging.
+5. If CI passed and branch is up to date, merge. If still running, include `[RELAY_RETRY_AFTER:180]` again
+6. If CI failed, investigate and fix
 
 ## Browser Testing
 
