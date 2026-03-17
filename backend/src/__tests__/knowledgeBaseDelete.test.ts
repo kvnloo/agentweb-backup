@@ -45,7 +45,7 @@ describe('Knowledge Base Delete Endpoint - DELETE /api/tasks/:taskId/knowledge-b
       next();
       return undefined;
     });
-    
+
     // Setup GCS mocks
     mockFile = {
       exists: jest.fn().mockResolvedValue([true]),

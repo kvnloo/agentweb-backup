@@ -1,10 +1,11 @@
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import axios from "axios";
+import fs from "fs";
+import path from "path";
 import { Agent, setGlobalDispatcher } from "undici";
-import * as fs from "fs";
-import * as path from "path";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
+import { settingsService } from "./settingsService";
 
 // v0 code generation can take several minutes — extend Node's default fetch timeouts.
 // Node 20's built-in undici has headersTimeout=300s which is too short for v0.
@@ -14,6 +15,51 @@ setGlobalDispatcher(new Agent({
   connectTimeout: 30 * 1000,       // 30 seconds for initial connection
 }));
 console.log("[V0 SERVICE] Extended fetch timeouts to 10 minutes for v0 API calls");
+
+// ---------------------------------------------------------------------------
+// Retry helper — exponential backoff for transient network failures
+// ---------------------------------------------------------------------------
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 2_000; // 2s, 4s, 8s
+
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxRetries = MAX_RETRIES,
+  baseDelayMs = BASE_DELAY_MS
+): Promise<T> {
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const isRetryable =
+        err.message?.includes("fetch failed") ||
+        err.message?.includes("ECONNREFUSED") ||
+        err.message?.includes("ENOTFOUND") ||
+        err.message?.includes("network error") ||
+        err.message?.includes("NetworkError") ||
+        err.message?.includes("ETIMEDOUT") ||
+        err.message?.includes("socket hang up") ||
+        err.code === "ECONNRESET" ||
+        err.code === "UND_ERR_HEADERS_TIMEOUT";
+
+      if (!isRetryable || attempt === maxRetries) {
+        console.error(`[V0 SERVICE] ${label} failed after ${attempt} attempt(s):`, err.message);
+        throw err;
+      }
+
+      const jitter = Math.random() * 500;
+      const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
+      console.warn(
+        `[V0 SERVICE] ${label} attempt ${attempt}/${maxRetries} failed (${err.message}), retrying in ${delay}ms...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
 
 const dynamodb = new AWS.DynamoDB.DocumentClient({
   region: process.env.AWS_REGION || "us-west-2",
@@ -275,13 +321,41 @@ async function generateFirstPage(
   let effectiveTemplate = templateHtml;
   if (!effectiveTemplate) {
     try {
-      const templatePath = path.join(__dirname, "../templates/landing-page-v2.html");
-      const fullTemplate = fs.readFileSync(templatePath, "utf-8");
-      // Extract a condensed version: section structure + key CSS variables + first body section
-      effectiveTemplate = extractTemplateOutline(fullTemplate);
-      console.log(`[V0 SERVICE] Loaded landing page template outline (${effectiveTemplate.length} chars) as design inspiration`);
+      const publicSetting = await settingsService.getSetting("email_templates_public");
+      if (publicSetting) {
+        let templates: any[];
+        try {
+          templates = JSON.parse(publicSetting.settingValue);
+        } catch (parseErr) {
+          console.warn("[V0 SERVICE] email_templates_public settingValue is not valid JSON, continuing without template");
+          templates = [];
+        }
+        const match = templates.find((t: any) => t.template_name === "landing-page-v2");
+        if (match && match.html_content) {
+          effectiveTemplate = extractTemplateOutline(match.html_content);
+          console.log(`[V0 SERVICE] Loaded landing page template outline from DynamoDB (${effectiveTemplate.length} chars) as design inspiration`);
+        } else {
+          console.warn("[V0 SERVICE] landing-page-v2 template not found in email_templates_public, continuing without");
+        }
+      } else {
+        console.warn("[V0 SERVICE] email_templates_public setting not found, trying filesystem fallback");
+      }
     } catch (err) {
-      console.warn("[V0 SERVICE] Could not load landing page template, continuing without:", err);
+      console.warn("[V0 SERVICE] Could not load landing page template from DynamoDB, trying filesystem fallback:", err);
+    }
+
+    // Filesystem fallback: if DynamoDB didn't yield a template, try the local file
+    if (!effectiveTemplate) {
+      try {
+        const fallbackPath = path.join(__dirname, "..", "templates", "landing-page-v2.html");
+        if (fs.existsSync(fallbackPath)) {
+          const fallbackHtml = fs.readFileSync(fallbackPath, "utf-8");
+          effectiveTemplate = extractTemplateOutline(fallbackHtml);
+          console.log(`[V0 SERVICE] Loaded landing page template outline from filesystem fallback (${effectiveTemplate.length} chars)`);
+        }
+      } catch (fsErr) {
+        console.warn("[V0 SERVICE] Filesystem template fallback also failed, continuing without:", fsErr);
+      }
     }
   }
 
@@ -307,7 +381,10 @@ async function generateFirstPage(
   try {
     const v0 = await getV0Client();
 
-    const chatResponse = await v0.chats.create({ message: enrichedPrompt });
+    const chatResponse = await withRetry(
+      () => v0.chats.create({ message: enrichedPrompt }),
+      "v0 chat creation"
+    );
 
     if (!("id" in chatResponse) || !chatResponse.id) {
       throw new Error("v0 chat creation did not return a ChatDetail with an id");
@@ -400,9 +477,18 @@ async function addPageToExistingRepo(
   // Build the page content — a simple React component from the template/prompt
   const pageContent = buildNewPageContent(name, prompt, brandContext, leadListId, templateHtml);
 
-  // Derive the base URL from the Vercel project name in the GitHub repo URL
-  const repoSlug = repoName; // e.g. "lp-taskflow-landing-9262210a"
-  const baseUrl = `https://${repoSlug}.vercel.app`;
+  // Use the existing page's deployed URL as the base — Vercel truncates long project
+  // names so the domain often differs from the GitHub repo name.
+  // Extract just the origin (scheme + host) from the root page's URL.
+  let baseUrl = `https://${repoName}.vercel.app`;
+  if (existingPage.deployedUrl) {
+    try {
+      const parsed = new URL(existingPage.deployedUrl);
+      baseUrl = parsed.origin; // e.g. "https://lp-calculate-your-360-savi.vercel.app"
+    } catch {
+      // URL parse failed — fall back to repo-name-based URL
+    }
+  }
 
   const record: GeneratedLandingPage = {
     id,
@@ -563,26 +649,78 @@ export async function deployLandingPage(
   try {
     const v0 = await getV0Client();
 
-    // Step 1: Get the latest version from v0 chat
+    // Step 1: Get the latest version from v0 chat (with retry)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    const chat = await v0.chats.getById({ chatId: record.v0ChatId });
-    const versionId = chat.latestVersion?.id;
+    const chat = await withRetry(
+      () => v0.chats.getById({ chatId: record.v0ChatId! }),
+      "v0 chat fetch"
+    );
+    let versionId = chat.latestVersion?.id;
 
     if (!versionId) {
       throw new Error("No version found in v0 chat — generation may still be in progress");
     }
 
-    // Step 2: Download project files from v0
-    console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId})`);
-    const zipBuffer = await v0.chats.downloadVersion({
-      chatId: record.v0ChatId,
-      versionId,
-      // @ts-ignore — SDK types may not include these yet
-      format: "zip",
-      includeDefaultFiles: true,
-    });
+    // Step 2: Download + validate v0 output (with retry on bad output)
+    const V0_VALIDATION_MAX_RETRIES = 2;
+    let zipBuffer: any;
 
-    // Step 3: Create GitHub repo and push files
+    for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
+      console.log(`[V0 SERVICE] Step 2: Downloading files from v0 (version ${versionId}, attempt ${validationAttempt + 1})`);
+      zipBuffer = await withRetry(
+        () => v0.chats.downloadVersion({
+          chatId: record.v0ChatId!,
+          versionId: versionId!,
+          // @ts-ignore — SDK types may not include these yet
+          format: "zip",
+          includeDefaultFiles: true,
+        }),
+        "v0 zip download"
+      );
+
+      // Unzip and validate before pushing to GitHub
+      const previewFiles = await unzipBuffer(zipBuffer);
+      autoFixV0Files(previewFiles);
+
+      try {
+        validateV0Output(previewFiles);
+        break; // validation passed
+      } catch (valErr: any) {
+        if (valErr instanceof V0OutputValidationError && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          console.warn(`[V0 SERVICE] v0 output validation failed (attempt ${validationAttempt + 1}): ${valErr.reason}`);
+
+          // Send correction message to v0 and re-download
+          await withRetry(
+            () => v0.chats.sendMessage({
+              chatId: record.v0ChatId!,
+              message:
+                "The previous output was not valid code. Please generate actual React/Next.js code — " +
+                "not markdown, not a prompt description, not empty files. " +
+                "Output must include .tsx files with real React components using export and function/const. " +
+                `Issue: ${valErr.reason}`,
+            }),
+            "v0 correction message"
+          );
+
+          // Wait for v0 to process the correction
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+
+          // Get the new version
+          const updatedChat = await withRetry(
+            () => v0.chats.getById({ chatId: record.v0ChatId! }),
+            "v0 chat re-fetch"
+          );
+          versionId = updatedChat.latestVersion?.id;
+          if (!versionId) throw new Error("No version found after correction message");
+
+          continue;
+        }
+        // Out of retries or not a validation error — rethrow
+        throw valErr;
+      }
+    }
+
+    // Step 3: Create GitHub repo and push files (validation already passed)
     console.log("[V0 SERVICE] Step 3: Creating GitHub repo and pushing files");
     const slug = record.name
       .toLowerCase()
@@ -769,6 +907,79 @@ function autoFixV0Files(files: Array<{ path: string; content: Buffer }>): number
   }
 
   return fixCount;
+}
+
+// ---------------------------------------------------------------------------
+// v0 output validation — catches "prompts instead of code", empty files, garbage
+// ---------------------------------------------------------------------------
+
+export class V0OutputValidationError extends Error {
+  constructor(public readonly reason: string) {
+    super(`v0 output validation failed: ${reason}`);
+    this.name = "V0OutputValidationError";
+  }
+}
+
+/**
+ * Validate that unzipped v0 output contains actual React/Next.js code.
+ * Rejects: empty output, markdown/prompts echoed back, files too small to be real code.
+ */
+export function validateV0Output(files: Array<{ path: string; content: Buffer }>): void {
+  // 1. Must have at least one .tsx file
+  const tsxFiles = files.filter((f) => f.path.endsWith(".tsx"));
+  if (tsxFiles.length === 0) {
+    throw new V0OutputValidationError("No .tsx files found in v0 output");
+  }
+
+  // 2. At least one .tsx file must have meaningful content (>50 chars)
+  const meaningfulTsx = tsxFiles.filter((f) => f.content.toString("utf-8").trim().length > 50);
+  if (meaningfulTsx.length === 0) {
+    throw new V0OutputValidationError("All .tsx files are empty or trivially small (<50 chars)");
+  }
+
+  // 3. At least one .tsx file must look like React code (has export + function/const)
+  const reactFiles = meaningfulTsx.filter((f) => {
+    const content = f.content.toString("utf-8");
+    return /\bexport\b/.test(content) && (/\bfunction\b/.test(content) || /\bconst\b/.test(content));
+  });
+  if (reactFiles.length === 0) {
+    throw new V0OutputValidationError(
+      "No .tsx file contains React code (missing export + function/const)"
+    );
+  }
+
+  // 4. Anti-markdown check: reject if >50% of lines in main .tsx files start with # or >
+  for (const file of reactFiles) {
+    const lines = file.content.toString("utf-8").split("\n").filter((l) => l.trim().length > 0);
+    if (lines.length === 0) continue;
+    const markdownLines = lines.filter((l) => /^\s*[#>]/.test(l));
+    if (markdownLines.length / lines.length > 0.5) {
+      throw new V0OutputValidationError(
+        `File ${file.path} appears to be markdown, not code (${markdownLines.length}/${lines.length} lines start with # or >)`
+      );
+    }
+  }
+
+  // 5. Anti-prompt-echo check: reject if a .tsx file contains common prompt patterns
+  const promptPatterns = [
+    /^Create a (?:landing page|website|page)/m,
+    /^Build (?:me )?a/m,
+    /^Generate a/m,
+    /^Design a (?:modern|professional|sleek)/m,
+    /^Make a (?:landing page|website)/m,
+  ];
+  for (const file of reactFiles) {
+    const content = file.content.toString("utf-8");
+    for (const pattern of promptPatterns) {
+      if (pattern.test(content)) {
+        throw new V0OutputValidationError(
+          `File ${file.path} appears to echo the user's prompt instead of containing code`
+        );
+      }
+    }
+  }
+
+  console.log(`[V0 SERVICE] Output validation passed: ${tsxFiles.length} .tsx files, ${reactFiles.length} with React code`);
 }
 
 /**
@@ -1156,10 +1367,13 @@ export async function iterateLandingPage(
   try {
     const v0 = await getV0Client();
 
-    await v0.chats.sendMessage({
-      chatId: record.v0ChatId,
-      message,
-    });
+    await withRetry(
+      () => v0.chats.sendMessage({
+        chatId: record.v0ChatId!,
+        message,
+      }),
+      "v0 chat iterate"
+    );
 
     // Reset status to draft (needs re-deploy after iteration)
     const newStatus = record.status === "deployed" ? "draft" : record.status;

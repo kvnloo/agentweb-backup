@@ -39,6 +39,7 @@ import clickupAuthRoutes from "./routes/clickupAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import linkedInOutreachAuthRoutes from "./routes/linkedInOutreachAuth";
 import youtubeAuthRoutes from "./routes/youtubeAuth";
+import fathomAuthRoutes from "./routes/fathomAuth";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
@@ -54,8 +55,6 @@ import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
-
-const { version } = require('../package.json');
 
 
 import { setupMcpServer } from "./mcp/server/mcpServer";
@@ -129,7 +128,9 @@ const corsOptions = {
       callback(new Error("Not allowed by CORS"));
     }
   },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  // OPTIONS is intentionally omitted — the cors middleware handles preflight (OPTIONS)
+  // requests automatically. This list specifies allowed methods for actual requests.
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 };
@@ -208,6 +209,9 @@ app.use("/api/oauth/gmail", gmailAuthRoutes);
 app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
+app.use("/api/oauth/fathom", fathomAuthRoutes);
+// Fathom's registered redirect URI uses /api/oauth/callback/fathom
+app.use("/api/oauth/callback/fathom", fathomAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
@@ -256,7 +260,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "healthy", version });
+  res.status(200).json({ status: "healthy" });
 });
 
 export default app;

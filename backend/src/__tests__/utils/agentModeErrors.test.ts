@@ -234,5 +234,27 @@ describe('agentModeErrors utils', () => {
     it('should detect TimeoutError by name in message', () => {
       expect(isTransientLLMError(new Error('TimeoutError: signal timed out'))).toBe(true);
     });
+
+    it('should handle non-Error object with status code and use String() for message', () => {
+      // This exercises the String(error) branch on line 58 combined with numeric status check
+      const error = { status: 503, toString: () => 'service unavailable' };
+      expect(isTransientLLMError(error)).toBe(true);
+    });
+
+    it('should return false for non-Error object with non-transient status and non-matching message', () => {
+      const error = { status: 401, toString: () => 'unauthorized' };
+      expect(isTransientLLMError(error)).toBe(false);
+    });
+
+    it('should return false for zero/falsy error value', () => {
+      expect(isTransientLLMError(0)).toBe(false);
+      expect(isTransientLLMError(false)).toBe(false);
+    });
+
+    it('should handle number error via String()', () => {
+      // Number is not instanceof Error, exercises String(error) path
+      expect(isTransientLLMError(503)).toBe(true); // String(503) = "503" matches pattern
+      expect(isTransientLLMError(200)).toBe(false);
+    });
   });
 });

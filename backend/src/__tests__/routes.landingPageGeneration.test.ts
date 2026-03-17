@@ -437,4 +437,47 @@ describe("Rate limiting on expensive endpoints", () => {
     res = await request(app).post("/api/landing-pages/v0/generate").send({ prompt: "Page" });
     expect(res.status).toBe(201);
   });
+
+  it("SUCCESS: 5xx errors do NOT count against rate limit", async () => {
+    // First 8 calls succeed
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
+    for (let i = 0; i < 8; i++) {
+      const r = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Page" });
+      expect(r.status).toBe(201);
+    }
+
+    // Next 5 calls fail with 500 — should NOT consume quota
+    mockGenerateLandingPage.mockRejectedValue(new Error("fetch failed"));
+    for (let i = 0; i < 5; i++) {
+      const r = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Page" });
+      expect(r.status).toBe(500);
+    }
+
+    // The 9th successful call should still work (only 8 counted, not 13)
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-2", status: "draft" });
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Page" });
+    expect(res.status).toBe(201);
+  });
+
+  it("FAIL: 4xx errors DO count against rate limit", async () => {
+    // Validation errors (400) are client mistakes — they should count
+    for (let i = 0; i < 10; i++) {
+      const r = await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "" }); // triggers 400
+      expect(r.status).toBe(400);
+    }
+
+    // 11th request should be rate limited (400s counted)
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generate")
+      .send({ prompt: "Valid prompt" });
+    expect(res.status).toBe(429);
+  });
 });

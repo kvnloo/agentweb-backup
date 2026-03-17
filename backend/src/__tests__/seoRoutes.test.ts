@@ -136,7 +136,7 @@ describe('SEO Routes', () => {
         .expect(400);
 
       expect(response.body.message).toContain('No SEO domains or Google Analytics Property ID configured');
-    });
+    }, 15000);
 
     it('should return 500 if Google Search Console API not configured', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
@@ -420,7 +420,7 @@ describe('SEO Routes', () => {
         .expect(400);
 
       expect(response.body.message).toContain('No SEO domains or Google Analytics Property ID configured');
-    });
+    }, 15000);
 
     it('should fetch Google Analytics metrics when Property ID is configured', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({

@@ -44,7 +44,7 @@ describe('Knowledge Base Update Endpoint - PUT /api/tasks/:taskId/knowledge-base
       next();
       return undefined;
     });
-    
+
     // Setup GCS mocks
     mockFile = {
       save: jest.fn().mockResolvedValue(undefined),

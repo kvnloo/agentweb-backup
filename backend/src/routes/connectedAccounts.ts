@@ -1,8 +1,9 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, deleteAccount, deleteAccountById } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, deleteAccount, deleteAccountById, getAccountByPlatform, FathomConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
+import { FathomApiService } from '../services/fathomApiService';
 
 const router = express.Router();
 
@@ -51,6 +52,35 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
   } catch (error) {
     console.error('List Accounts Error:', error);
     res.status(500).json({ error: 'Failed to list connected accounts' });
+  }
+});
+
+// Disconnect Fathom — with webhook cleanup via FathomApiService
+router.delete('/connected-accounts/fathom', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+
+  try {
+    // Check for existing webhook to clean up
+    const existingAccount = await getAccountByPlatform(userId, 'fathom');
+    if (existingAccount) {
+      const config = existingAccount.config as FathomConfig;
+      if (config.webhook_id && config.access_token) {
+        try {
+          const fathomApi = new FathomApiService(config.access_token);
+          await fathomApi.deleteWebhook(config.webhook_id);
+          console.log(`[Fathom] Deleted webhook ${config.webhook_id} for user ${userId}`);
+        } catch (webhookErr: any) {
+          // Non-fatal: log and continue with DB deletion
+          console.warn(`[Fathom] Failed to delete webhook ${config.webhook_id}:`, webhookErr?.message);
+        }
+      }
+    }
+
+    await deleteAccount(userId, 'fathom');
+    res.json({ success: true, message: 'Fathom account disconnected' });
+  } catch (error) {
+    console.error('[Fathom] Disconnect error:', error);
+    res.status(500).json({ error: 'Failed to disconnect Fathom account' });
   }
 });
 

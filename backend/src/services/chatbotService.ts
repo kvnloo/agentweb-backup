@@ -172,7 +172,7 @@ export interface ChatSession {
   archives?: Record<string, boolean>; // Track archived assets by URL (key: assetUrl, value: true if archived)
   feedbacks?: Record<string, MessageFeedback>; // Track image feedback by URL (key: imageUrl, value: feedback)
   publishStatuses?: Record<string, string>; // Track publish status by asset URL (key: assetUrl, value: 'draft' | 'published')
-  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email"; // Type of session based on how it was created
+  sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake"; // Type of session based on how it was created
   emailMetadata?: {
     senderEmail?: string;
     lastInboundEmailId?: string;
@@ -448,7 +448,7 @@ export class ChatbotDB {
     workflowId?: string,
     executionId?: string,
     emailCampaignTaskId?: string,
-    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email",
+    sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
     delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
   ): Promise<ChatSession> {
     const sessionId = uuidv4();

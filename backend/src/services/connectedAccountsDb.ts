@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'youtube' | 'fathom';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -116,7 +116,20 @@ export interface YouTubeConfig extends BaseOAuthConfig {
   granted_scopes: string[];
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig; // | TwitterConfig
+/**
+ * Fathom API key configuration (not OAuth — direct API key)
+ */
+export interface FathomConfig {
+  account_type: 'oauth' | 'api_key';
+  api_key?: string; // backward compat for old API key accounts
+  webhook_id?: string;  // Stored after webhook registration
+  webhook_url?: string; // Our endpoint URL
+  access_token: string;
+  refresh_token?: string;
+  token_expires_at: number;
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig; // | TwitterConfig
 
 /**
  * Connected Account configuration stored in the User record
@@ -271,6 +284,48 @@ export const updateAccountTokens = async (
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token ?? existingAccount.config.refresh_token,
       token_expires_at: tokens.token_expires_at,
+    },
+    updated_at: new Date().toISOString(),
+  };
+
+  const updatedAccounts = [...accounts];
+  updatedAccounts[accountIndex] = updatedAccount;
+
+  await userDb.updateUser(userId, {
+    connected_accounts: updatedAccounts,
+  } as Partial<User>);
+};
+
+/**
+ * Update arbitrary config fields on a connected account.
+ * Used to store webhook_id, webhook_url, etc. after initial creation.
+ */
+export const updateAccountConfig = async (
+  userId: string,
+  platform: PlatformType,
+  accountId: string,
+  configUpdates: Record<string, any>
+): Promise<void> => {
+  const user = await userDb.getUserById(userId);
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const accounts = normalizeAccounts((user as User).connected_accounts);
+  const accountIndex = accounts.findIndex(
+    acc => acc.platform === platform && acc.account_id === accountId
+  );
+
+  if (accountIndex < 0) {
+    throw new Error(`No ${platform} account with id "${accountId}" connected`);
+  }
+
+  const existingAccount = accounts[accountIndex];
+  const updatedAccount: ConnectedAccountConfig = {
+    ...existingAccount,
+    config: {
+      ...existingAccount.config,
+      ...configUpdates,
     },
     updated_at: new Date().toISOString(),
   };
