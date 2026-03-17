@@ -846,6 +846,11 @@ export class AgentModeService {
       let skillsUpdated = false;
       let filteredToolsCache: any[] | null = null; // Cache for filtered tools
 
+      // Anti-loop detection: track consecutive identical tool call patterns
+      let lastToolSignature = '';
+      let consecutiveRepeats = 0;
+      const MAX_CONSECUTIVE_REPEATS = 3;
+
       while (iteration < maxIterations) {
         iteration++;
 
@@ -1166,11 +1171,33 @@ export class AgentModeService {
           }
         }
 
+        // Anti-loop detection: check if the LLM is repeating the same tool calls
+        const currentToolSignature = responseMessage.tool_calls
+          ?.map((tc: any) => `${tc.function.name}:${tc.function.arguments}`)
+          .sort()
+          .join('|') || '';
+        if (currentToolSignature && currentToolSignature === lastToolSignature) {
+          consecutiveRepeats++;
+          if (consecutiveRepeats >= MAX_CONSECUTIVE_REPEATS) {
+            console.warn(`AgentMode: Detected ${consecutiveRepeats} consecutive identical tool calls in session ${sessionId}, injecting anti-loop warning`);
+            (messages as any[]).push({
+              role: 'user',
+              content: '[SYSTEM] You have been calling the same tools with the same arguments repeatedly without making progress. STOP calling tools and provide your final response to the user. Summarize what you accomplished and what could not be completed.'
+            });
+          }
+        } else {
+          consecutiveRepeats = 0;
+        }
+        lastToolSignature = currentToolSignature;
+
         // Do not append an assistant message; tool messages above are sufficient for model continuation
       }
 
       if (iteration >= maxIterations) {
         console.warn('AgentMode: Reached maximum tool execution iterations');
+        if (!content) {
+          content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
+        }
       }
 
       // Attach timing metadata, memory usage, and tool calls to the last assistant message
