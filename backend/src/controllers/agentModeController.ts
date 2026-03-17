@@ -540,10 +540,17 @@ export async function runVerifiedChat(
       }
 
       // Also check if any required tools are "other" (not in any published skill)
+      const adminToolNames = new Set(agentModeService.getAdminToolNames());
       const allSkillToolNames = new Set(publishedSkills.flatMap(s => s.toolNames || []));
-      const hasOtherTools = [...requiredToolNames].some(t => !allSkillToolNames.has(t));
+      const hasOtherTools = [...requiredToolNames].some(t => !allSkillToolNames.has(t) && !adminToolNames.has(t));
       if (hasOtherTools && (isWildcard || userAllowedSkillIds.includes('__other_skills__'))) {
         skillIdsToInstall.push('__other_skills__');
+      }
+
+      // Auto-install admin tools if any required function calls are admin-only tools
+      const hasAdminTools = [...requiredToolNames].some(t => adminToolNames.has(t));
+      if (hasAdminTools) {
+        skillIdsToInstall.push('__admin_tools__');
       }
 
       if (skillIdsToInstall.length > 0) {
