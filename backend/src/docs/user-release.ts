@@ -7,6 +7,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-17',
+    changes: [
+      'Fix: Scheduled Chats — Admin Tools Now Available',
+      '- Scheduled chats created by admin users can now use admin-only tools (e.g., get_chat_history, list_skills, manage_skill)',
+      '- Previously, admin tools were never auto-installed for scheduled chat sessions, causing them to fail when required',
+      '- The fix auto-installs the __admin_tools__ skill when required function calls include admin tools',
+    ],
+  },
+  {
     date: '2026-03-16',
     changes: [
       'Feature: SEO/GEO — Multiple Google Analytics and Clarity Accounts',
