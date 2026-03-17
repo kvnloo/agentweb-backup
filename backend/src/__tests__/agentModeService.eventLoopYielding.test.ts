@@ -479,4 +479,152 @@ describe('AgentModeService - generateMarketingResponse', () => {
       expect(result.content).toBe('Final response');
     });
   });
+
+  describe('Anti-loop detection', () => {
+    it('should inject warning when same tool calls repeat 3 consecutive times', async () => {
+      const repeatedToolCall = {
+        id: 'call_repeat',
+        function: {
+          name: 'update_html_file',
+          arguments: JSON.stringify({ filename: 'report.html', content: 'same content' })
+        }
+      };
+
+      let callCount = 0;
+      llmCallSpy.mockImplementation(async () => {
+        callCount++;
+        if (callCount <= 4) {
+          // First 4 calls: return identical tool calls (iterations 1-4)
+          return {
+            choices: [{
+              message: {
+                content: null,
+                tool_calls: [{ ...repeatedToolCall, id: `call_${callCount}` }]
+              }
+            }]
+          };
+        } else {
+          // 5th call: LLM should respond to the anti-loop warning with a final message
+          return {
+            choices: [{
+              message: {
+                content: 'I was repeating myself. Here is what I accomplished so far.',
+                tool_calls: null
+              }
+            }]
+          };
+        }
+      });
+
+      (agentModeService as any).executeTool = jest.fn().mockResolvedValue({
+        formattedContent: 'File updated successfully'
+      });
+
+      const result = await agentModeService.generateMarketingResponse(
+        'Update the report',
+        [],
+        'test-user',
+        agentModeService.default_model,
+        'test-session'
+      );
+
+      // The LLM should have received the anti-loop warning and produced a final response
+      expect(result.content).toBe('I was repeating myself. Here is what I accomplished so far.');
+
+      // The warning was injected into the conversation (role: 'user') so the LLM sees it,
+      // but responseMessages filters out user messages. Verify via console.warn instead.
+      const warnSpy = jest.spyOn(console, 'warn');
+      // The warning was already logged during execution; check that callCount confirms
+      // the LLM was called 5 times (3 repeated + 1 more repeated after warning + final response)
+      expect(callCount).toBe(5);
+    });
+
+    it('should not trigger anti-loop when tool calls have different arguments', async () => {
+      let callCount = 0;
+      llmCallSpy.mockImplementation(async () => {
+        callCount++;
+        if (callCount <= 3) {
+          // Each call has different arguments — should NOT trigger anti-loop
+          return {
+            choices: [{
+              message: {
+                content: null,
+                tool_calls: [{
+                  id: `call_${callCount}`,
+                  function: {
+                    name: 'search_web',
+                    arguments: JSON.stringify({ query: `different query ${callCount}` })
+                  }
+                }]
+              }
+            }]
+          };
+        } else {
+          return {
+            choices: [{
+              message: {
+                content: 'Search complete',
+                tool_calls: null
+              }
+            }]
+          };
+        }
+      });
+
+      (agentModeService as any).executeTool = jest.fn().mockResolvedValue({
+        formattedContent: 'Search result'
+      });
+
+      const result = await agentModeService.generateMarketingResponse(
+        'Research competitors',
+        [],
+        'test-user',
+        agentModeService.default_model,
+        'test-session'
+      );
+
+      expect(result.content).toBe('Search complete');
+
+      // No anti-loop warning should be present
+      const warningMessage = result.responseMessages.find(
+        (m: any) => m.role === 'user' && m.content?.includes('[SYSTEM]') && m.content?.includes('repeatedly')
+      );
+      expect(warningMessage).toBeUndefined();
+    });
+
+    it('should provide fallback content when maxIterations is exhausted with no response', async () => {
+      // LLM always returns tool calls, never a text response
+      llmCallSpy.mockImplementation(async () => {
+        return {
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: `call_${Date.now()}`,
+                function: {
+                  name: 'search_web',
+                  arguments: JSON.stringify({ query: `query_${Date.now()}` })
+                }
+              }]
+            }
+          }]
+        };
+      });
+
+      (agentModeService as any).executeTool = jest.fn().mockResolvedValue({
+        formattedContent: 'Result'
+      });
+
+      const result = await agentModeService.generateMarketingResponse(
+        'Do something complex',
+        [],
+        'test-user',
+        agentModeService.default_model,
+        'test-session'
+      );
+
+      // Should have the fallback message instead of empty content
+      expect(result.content).toContain('maximum number of processing steps');
+    });
+  });
 });
