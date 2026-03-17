@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-17',
     changes: [
+      'Fix: CRM — Bulk Delete-by-Filter Tool for Lead Management',
+      '- New "delete_leads_by_filter" tool allows deleting leads by criteria (e.g., empty lead_source) in a single operation',
+      '- Includes a confirmation flow: first call returns a count and sample of matching leads, second call with explicit confirm executes the deletion',
+      '- Eliminates the need for expensive search→collect→delete loops that previously caused session failures on large lead lists',
+      'Fix: Agent Mode — Error Wrapping Preserves Original Error Messages',
+      '- Fixed a bug where errors from Bedrock/LLM providers were swallowed and replaced with a generic "Marketing response generation failed" message',
+      '- Original error messages are now preserved in wrapped errors, allowing proper context-limit detection and debugging',
       'Fix: Agent Mode — Anti-Loop Detection for Repetitive Tool Calls',
       '- Agent mode now detects when the LLM calls the same tools with identical arguments 3 consecutive times',
       '- When detected, a system warning is injected into the conversation prompting the LLM to stop and summarize progress',
