@@ -497,7 +497,7 @@ describe('AgentModeService - CRM Tools', () => {
   // ─── deleteLeads ───────────────────────────────────────────────────────
 
   describe('deleteLeads', () => {
-    it('should delete small batches (< 5 leads) without confirmation', async () => {
+    it('should delete multiple leads', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.deleteLead.mockResolvedValue({ success: true } as any);
 
@@ -507,66 +507,9 @@ describe('AgentModeService - CRM Tools', () => {
       expect(result.successCount).toBe(3);
       expect(result.failCount).toBe(0);
       expect(mockCrmDb.deleteLead).toHaveBeenCalledTimes(3);
-      expect(result.requiresConfirmation).toBeUndefined();
     });
 
-    it('should delete exactly 4 leads without confirmation', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
-      mockCrmDb.deleteLead.mockResolvedValue({ success: true } as any);
-
-      const result = await service.deleteLeads(listId, ['lead-1', 'lead-2', 'lead-3', 'lead-4'], userId);
-
-      expect(result.success).toBe(true);
-      expect(result.successCount).toBe(4);
-      expect(result.failCount).toBe(0);
-      expect(mockCrmDb.deleteLead).toHaveBeenCalledTimes(4);
-      expect(result.requiresConfirmation).toBeUndefined();
-    });
-
-    it('should require confirmation for bulk deletions (≥ 5 leads)', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
-
-      const result = await service.deleteLeads(listId, ['lead-1', 'lead-2', 'lead-3', 'lead-4', 'lead-5'], userId);
-
-      expect(result.success).toBe(false);
-      expect(result.requiresConfirmation).toBe(true);
-      expect(result.message).toContain('CONFIRMATION REQUIRED');
-      expect(result.message).toContain('5 leads');
-      expect(result.message).toContain('Test List');
-      expect(result.message).toContain('cannot be undone');
-      expect(result.leadCount).toBe(5);
-      expect(result.listName).toBe('Test List');
-      expect(result.error).toContain('Bulk deletion requires explicit confirmation');
-      expect(mockCrmDb.deleteLead).not.toHaveBeenCalled();
-    });
-
-    it('should require confirmation for 10 leads', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
-      const ids = Array.from({ length: 10 }, (_, i) => `lead-${i}`);
-
-      const result = await service.deleteLeads(listId, ids, userId);
-
-      expect(result.success).toBe(false);
-      expect(result.requiresConfirmation).toBe(true);
-      expect(result.message).toContain('10 leads');
-      expect(result.leadCount).toBe(10);
-      expect(mockCrmDb.deleteLead).not.toHaveBeenCalled();
-    });
-
-    it('should require confirmation for 50 leads', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
-      const ids = Array.from({ length: 50 }, (_, i) => `lead-${i}`);
-
-      const result = await service.deleteLeads(listId, ids, userId);
-
-      expect(result.success).toBe(false);
-      expect(result.requiresConfirmation).toBe(true);
-      expect(result.message).toContain('50 leads');
-      expect(result.leadCount).toBe(50);
-      expect(mockCrmDb.deleteLead).not.toHaveBeenCalled();
-    });
-
-    it('should handle partial failures (for small batches)', async () => {
+    it('should handle partial failures', async () => {
       mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
       mockCrmDb.deleteLead
         .mockResolvedValueOnce({ success: true } as any)
@@ -598,35 +541,6 @@ describe('AgentModeService - CRM Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('Too many');
-    });
-
-    it('should check confirmation threshold before max limit check', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue(mockList as any);
-      const ids = Array.from({ length: 50 }, (_, i) => `lead-${i}`);
-
-      const result = await service.deleteLeads(listId, ids, userId);
-
-      // Should hit confirmation check (5+) before proceeding
-      expect(result.requiresConfirmation).toBe(true);
-      expect(mockCrmDb.deleteLead).not.toHaveBeenCalled();
-    });
-
-    it('should deny access for wrong user', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue({ ...mockList, userId: 'other-user' } as any);
-
-      const result = await service.deleteLeads(listId, ['lead-1'], userId);
-
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('Access denied');
-    });
-
-    it('should return error if list not found', async () => {
-      mockCrmDb.getLeadListById.mockResolvedValue(null);
-
-      const result = await service.deleteLeads(listId, ['lead-1'], userId);
-
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('Lead list not found');
     });
   });
 

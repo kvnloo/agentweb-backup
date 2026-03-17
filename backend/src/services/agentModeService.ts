@@ -1368,22 +1368,6 @@ export class AgentModeService {
       * **Check Tool Availability**: Before installing, verify if you already have the tool from a previously installed skill
       * **No Generic Tools Default**: You do not have generic tools like web_search or image_generation initially. If you need them and they are missing, install them.
 
-      ## Destructive Operations (CRITICAL)
-      NEVER perform destructive operations (delete, remove, drop, purge) unless:
-      1. User EXPLICITLY uses words like "delete", "remove", "purge" in their request
-      2. You have confirmed understanding of the scope and impact
-      3. The user has acknowledged the action is permanent
-
-      If a user asks about "missing", "incomplete", "empty", or "null" data:
-      - DEFAULT to analysis, reporting, or updating the data
-      - DO NOT assume they want to delete records
-      - Ask for clarification if their intent is ambiguous
-
-      Examples:
-      - ❌ "find leads with missing source" → DO NOT delete them
-      - ✅ "find leads with missing source" → report count, show examples, offer to update
-      - ✅ "delete all leads with missing source" → ask for confirmation, explain impact
-
       ## Account Memory
       You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
 
@@ -5962,19 +5946,6 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
       if (leadIds.length > 100) {
         return { success: false, message: 'Too many leads', error: 'Maximum 100 leads can be deleted per call' };
-      }
-
-      // Require explicit confirmation for bulk deletions
-      const BULK_DELETE_THRESHOLD = 5;
-      if (leadIds.length >= BULK_DELETE_THRESHOLD) {
-        return {
-          success: false,
-          requiresConfirmation: true,
-          message: `⚠️ CONFIRMATION REQUIRED: You are about to permanently delete ${leadIds.length} leads from "${list.name}". This action cannot be undone. Please explicitly confirm if you want to proceed with deletion.`,
-          leadCount: leadIds.length,
-          listName: list.name,
-          error: 'Bulk deletion requires explicit confirmation'
-        };
       }
 
       let successCount = 0;
