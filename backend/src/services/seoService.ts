@@ -200,7 +200,10 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
 
   const metricsPromises = user.seoDomains.map(async (domain: string) => {
     try {
+      console.log('[GSC Debug] Raw domain from DB:', domain);
+      console.log('[GSC Debug] domain.startsWith("http"):', domain.startsWith("http"));
       const siteUrl = domain.startsWith("http") ? domain : `sc-domain:${domain}`;
+      console.log('[GSC Debug] Formatted siteUrl:', siteUrl);
       const searchAnalyticsUrl = `https://www.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
 
       // Fetch daily data
@@ -385,15 +388,51 @@ export async function fetchSearchConsoleMetrics(userId: string, timeframe: strin
   return { metrics, timeframe, timestamp: new Date().toISOString() };
 }
 
+/**
+ * Migration helper: Get Google Analytics properties from user, with fallback to legacy field.
+ * Returns array of { propertyId, label } objects.
+ */
+export function getGoogleAnalyticsProperties(user: any): Array<{ propertyId: string; label: string }> {
+  // New format: multiple properties with labels
+  if (user.googleAnalyticsProperties && user.googleAnalyticsProperties.length > 0) {
+    return user.googleAnalyticsProperties;
+  }
+  // Legacy format: single property ID
+  if (user.googleAnalyticsPropertyId) {
+    return [{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }];
+  }
+  return [];
+}
+
+/**
+ * Migration helper: Get Clarity projects from user, with fallback to legacy field.
+ * Returns array of { projectId, label } objects.
+ */
+export function getClarityProjects(user: any): Array<{ projectId: string; label: string }> {
+  // New format: multiple projects with labels
+  if (user.clarityProjects && user.clarityProjects.length > 0) {
+    return user.clarityProjects;
+  }
+  // Legacy format: single project ID
+  if (user.clarityProjectId) {
+    return [{ projectId: user.clarityProjectId, label: "Main Project" }];
+  }
+  return [];
+}
+
 export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: string = "30d"): Promise<any> {
   const user = await userDb.getUserById(userId);
   if (!user) {
     return { error: "User not found" };
   }
 
-  if (!user.googleAnalyticsPropertyId) {
+  const gaProperties = getGoogleAnalyticsProperties(user);
+  if (gaProperties.length === 0) {
     return { message: "No Google Analytics Property ID configured. Please configure GA4 in your account settings." };
   }
+
+  // Use first property for backward compatibility (will be updated to support multiple in next iteration)
+  const propertyId = gaProperties[0].propertyId;
 
   const gaClient = await getGoogleAnalyticsDataClient();
   if (!gaClient) {
@@ -402,7 +441,6 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
 
   try {
     const { startDateStr, endDateStr } = calculateGaDateRange(timeframe);
-    const propertyId = user.googleAnalyticsPropertyId;
 
     // Build dimension filter to exclude filtered domains
     let dimensionFilter: any = undefined;

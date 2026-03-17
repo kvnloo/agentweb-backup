@@ -18,6 +18,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-16',
     changes: [
+      'Feature: SEO/GEO — Multiple Google Analytics and Clarity Accounts',
+      '- Admins can now configure multiple Google Analytics 4 properties and Microsoft Clarity projects per user',
+      '- Each property/project includes a custom label (e.g., "Main Website", "Product Site") for easy identification',
+      '- Customer portal displays a dropdown selector when multiple properties are configured',
+      '- Supports both GSC domain properties (example.com) and URL-prefix properties (https://example.com/)',
+      '- All properties are fetched in parallel for optimal performance',
+      '- Fully backward compatible with existing single-property configurations',
       'Security: Interactive Share — Admin Tools Blocked',
       '- Admin management tools (skill and work plan management) are now blocked in interactive share sessions for security',
       '- This prevents potential privilege escalation even when sharing sessions from admin accounts',
@@ -37,6 +44,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Admin Tools — get_chat_history Satisfaction Scores',
       '- Fixed bug where get_chat_history with sync=true would not return satisfaction scores for sessions that were already scored',
       '- Now correctly preserves existing satisfaction scores when scoreSessionIfNeeded returns null (skipped)',
+      'Fix: Admin Tools — get_chat_history Correct Message Counts and Scoring',
+      '- Fixed bug where get_chat_history always returned messageCount: 0 because it used raw GSI query results without loading full sessions',
+      '- Now loads full sessions via the same backend as the admin Chat History page, producing accurate message counts',
+      '- Scoring now runs on fully-loaded sessions instead of partial GSI results, preventing incorrect scores on active sessions',
     ],
   },
   {

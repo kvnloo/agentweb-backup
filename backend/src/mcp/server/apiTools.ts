@@ -1621,10 +1621,29 @@ mcpToolRegistry.register({
     });
     const data = await mcpFetch({
       method: 'GET',
-      path: `/api/agent-mode/admin/chat-history?${queryParams}`,
+      path: `/api/admin/chat-sessions?${queryParams}`,
       context: ctx(context)
     });
-    return jsonResult(data);
+
+    // Format response for backward compatibility with Emma's expected shape
+    const sessions = (data as any)?.sessions || [];
+    const formattedSessions = sessions.map((session: any) => ({
+      sessionId: session.sessionId,
+      userId: session.userId,
+      title: session.title,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      sessionType: session.sessionType,
+      messageCount: session.messages?.length || 0,
+      satisfactionScore: session.satisfactionScore,
+    }));
+
+    return jsonResult({
+      sessions: formattedSessions,
+      count: formattedSessions.length,
+      timeRange: { startTime: args.start_time, endTime: args.end_time },
+      syncMode: args.sync || false,
+    });
   }
 });
 
