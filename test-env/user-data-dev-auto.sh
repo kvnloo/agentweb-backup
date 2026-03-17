@@ -95,6 +95,11 @@ dnf install -y dnf-plugins-core
 dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
 dnf install -y gh
 
+# Install Google Chrome for Playwright MCP (npx playwright install chrome only works on Ubuntu/Debian)
+curl -o /tmp/chrome.rpm https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+dnf localinstall -y /tmp/chrome.rpm
+rm -f /tmp/chrome.rpm
+
 # Install Playwright browser for MCP
 sudo -u ec2-user npx playwright install chromium
 
@@ -109,6 +114,10 @@ git clone "https://${GITHUB_PAT}@github.com/AgentWebPro/agentweb-customer-portal
 
 mkdir -p "$LOG_DIR"
 chown -R ec2-user:ec2-user "$APP_DIR"
+
+# Install @playwright/test in project so MCP browser_install tool doesn't fail
+# (without this dep, npx playwright install warns about missing project deps and the MCP tool treats it as error)
+cd "$APP_DIR" && sudo -u ec2-user npm install @playwright/test --no-save 2>/dev/null && cd /
 
 # Ensure Playwright browser_install is allowed in Claude settings
 SETTINGS_FILE="$APP_DIR/.claude/settings.local.json"
@@ -194,6 +203,16 @@ cd "$APP_DIR/test-env-access" && sudo -u ec2-user npm ci
 # 9. Configure test-env-access
 ###############################################################################
 SG_ID=$(get_instance_tag "sg-id")
+
+# Allow the instance to reach its own public IP (needed for Playwright browser testing)
+for PORT in 3001 5173 5174; do
+  aws ec2 authorize-security-group-ingress \
+    --group-id "$SG_ID" \
+    --protocol tcp \
+    --port "$PORT" \
+    --cidr "$PUBLIC_IP/32" \
+    --region "$REGION" 2>/dev/null || true
+done
 
 # Fetch Resend API key from Secrets Manager
 TEA_ENV=$(get_secret "agentweb/test-env/test-env-access-env")
