@@ -591,6 +591,10 @@ export async function runVerifiedChat(
           userMessage = `Please perform the work on pending steps. After you are done, mark the steps as completed with set_work_plan_status.`;
         } else {
           // Work plan completed or doesn't exist - check keywords and function calls
+          // NOTE: Only missing function calls are requested on retry. If a search tool
+          // (e.g. search_web) was already called, it won't be re-requested even if the
+          // output was insufficient. Avoid adding search tools to requiredFunctionCalls
+          // unless a minimum call count is truly needed — the LLM calls them organically.
           const keywordText = remainingKeywords.length > 0
             ? `include these keywords: ${remainingKeywords.join(', ')}`
             : '';
