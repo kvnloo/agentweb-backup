@@ -156,6 +156,7 @@ CLAUDE_ENV=$(get_secret "agentweb/test-env/claude-code-env")
   while IFS= read -r line; do
     [[ -n "$line" ]] && echo "export $line"
   done <<< "$CLAUDE_ENV"
+  echo 'export CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1'
 } >> /home/ec2-user/.bashrc
 
 ###############################################################################
