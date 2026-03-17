@@ -13,6 +13,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Scheduled chats created by admin users can now use admin-only tools (e.g., get_chat_history, list_skills, manage_skill)',
       '- Previously, admin tools were never auto-installed for scheduled chat sessions, causing them to fail when required',
       '- The fix auto-installs the __admin_tools__ skill when required function calls include admin tools',
+      'Feature: Admin — Predefined Work Plan Sync Between Dev and Prod',
+      '- Admin can sync predefined work plans between dev and prod environments from the Agent Mode settings tab',
+      '- Sync status chips show whether each plan is in sync, out of sync (with changed fields listed), or missing in one environment',
+      '- Confirmation dialog shows exactly what will change before syncing, with a warning when overwriting production',
     ],
   },
   {

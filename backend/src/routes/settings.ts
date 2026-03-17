@@ -457,6 +457,50 @@ router.delete('/:settingName', authenticateToken, requireAdmin, async (req, res)
 // Individual Work Plan endpoints - MUST be before /:settingName route to avoid conflicts
 // These endpoints allow saving individual work plans to prevent conflicts when multiple admins edit different plans
 
+// Get sync status for all predefined work plans (compares prod vs dev)
+router.get('/agent-mode-predefined-workplans/sync-status', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const status = await settingsService.getPlanSyncStatus();
+    const environment = process.env.NODE_ENV === "development" ? "development" : "production";
+    res.status(200).json({ plans: status, environment });
+  } catch (error) {
+    console.error('Error getting plan sync status:', error);
+    res.status(500).json({ error: 'Failed to get plan sync status' });
+  }
+});
+
+// Sync a predefined work plan between prod and dev
+router.post('/agent-mode-predefined-workplans/sync', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { planId, direction } = req.body;
+
+    if (!planId || !direction) {
+      return res.status(400).json({ error: 'planId and direction are required' });
+    }
+
+    if (direction !== 'prod-to-dev' && direction !== 'dev-to-prod') {
+      return res.status(400).json({ error: 'direction must be "prod-to-dev" or "dev-to-prod"' });
+    }
+
+    const isDev = process.env.NODE_ENV === "development";
+    const allowedDirection = isDev ? "dev-to-prod" : "prod-to-dev";
+    if (direction !== allowedDirection) {
+      return res.status(400).json({ error: `In ${isDev ? "dev" : "prod"} environment, only "${allowedDirection}" sync is allowed` });
+    }
+
+    const plan = await settingsService.syncPlan(planId, direction);
+
+    if (!plan) {
+      return res.status(404).json({ error: 'Plan not found in source environment' });
+    }
+
+    res.status(200).json(plan);
+  } catch (error) {
+    console.error('Error syncing plan:', error);
+    res.status(500).json({ error: 'Failed to sync plan' });
+  }
+});
+
 // Get a specific work plan by ID
 router.get('/agent-mode-predefined-workplans/:planId', authenticateToken, requireAdmin, async (req, res) => {
   try {

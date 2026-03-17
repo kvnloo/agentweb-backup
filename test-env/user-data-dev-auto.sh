@@ -110,6 +110,22 @@ git clone "https://${GITHUB_PAT}@github.com/AgentWebPro/agentweb-customer-portal
 mkdir -p "$LOG_DIR"
 chown -R ec2-user:ec2-user "$APP_DIR"
 
+# Ensure Playwright browser_install is allowed in Claude settings
+SETTINGS_FILE="$APP_DIR/.claude/settings.local.json"
+if [[ -f "$SETTINGS_FILE" ]]; then
+  python3 -c "
+import json
+with open('$SETTINGS_FILE') as f:
+    s = json.load(f)
+tool = 'mcp__playwright__browser_install'
+if tool not in s.get('permissions',{}).get('allow',[]):
+    s.setdefault('permissions',{}).setdefault('allow',[]).append(tool)
+    with open('$SETTINGS_FILE','w') as f:
+        json.dump(s, f, indent=2)
+        f.write('\n')
+"
+fi
+
 # Set up git config for ec2-user
 sudo -u ec2-user git config --global user.name "ec2-user"
 sudo -u ec2-user git config --global user.email "ec2-user@test-env"
@@ -156,7 +172,6 @@ CLAUDE_ENV=$(get_secret "agentweb/test-env/claude-code-env")
   while IFS= read -r line; do
     [[ -n "$line" ]] && echo "export $line"
   done <<< "$CLAUDE_ENV"
-  echo 'export CLAUDE_MODEL=us.anthropic.claude-opus-4-6-v1'
 } >> /home/ec2-user/.bashrc
 
 ###############################################################################
