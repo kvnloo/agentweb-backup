@@ -35,6 +35,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Admin Tools — get_chat_history Satisfaction Scores',
       '- Fixed bug where get_chat_history with sync=true would not return satisfaction scores for sessions that were already scored',
       '- Now correctly preserves existing satisfaction scores when scoreSessionIfNeeded returns null (skipped)',
+      'Fix: Admin Tools — get_chat_history Correct Message Counts and Scoring',
+      '- Fixed bug where get_chat_history always returned messageCount: 0 because it used raw GSI query results without loading full sessions',
+      '- Now loads full sessions via the same backend as the admin Chat History page, producing accurate message counts',
+      '- Scoring now runs on fully-loaded sessions instead of partial GSI results, preventing incorrect scores on active sessions',
     ],
   },
   {
