@@ -97,6 +97,10 @@ router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedMo
 // Get models suitable for report generation (public)
 router.get('/public/reports-model-options', asyncHandler(agentModeController.getReportsModelOptions));
 
+// GET /api/agent-mode/public/customer-support-default-model
+// Get default model for customer support agent (public)
+router.get('/public/customer-support-default-model', asyncHandler(agentModeController.getCustomerSupportDefaultModel));
+
 
 // POST /api/agent-mode/run-scheduled-chats
 // Run all scheduled chats that are ready to execute (called by agent-engine)
