@@ -1,3 +1,51 @@
+# March 18, 2026: Suspicious Bot Account Signups — No Payment Gate on Registration
+
+## Accounts Investigated
+
+Three suspicious accounts signed up over consecutive days with gibberish Gmail addresses using the Gmail dot trick (dots in local part are ignored by Gmail, allowing unique-looking emails that deliver to one inbox):
+
+| Email | Signed Up (UTC) | User ID |
+|-------|-----------------|---------|
+| `noqid.eho.b.6.4@gmail.com` | 2026-03-14 23:39 | `3f4a357e-ecb6-41c1-9ffd-40de73d27725` |
+| `s.a.c.e.wo.mag.or2.8.1@gmail.com` | 2026-03-15 14:54 | `0b989e86-e5cf-4947-bb1e-46f337e23c89` |
+| `l.i.j.o.ba.yug.ido.4.7@gmail.com` | 2026-03-17 21:06 | `cf9ab519-7592-424c-b75e-609283057248` |
+
+All three accounts were deactivated (`isActive: false`).
+
+## Behavior
+
+All accounts followed an identical automated pattern:
+- Signed up via email/password (not Google OAuth)
+- Within 1–6 seconds of signup, 4 chat sessions were auto-created as the bot navigated: `dashboard` → `plan-Onboarding` → `plan/Onboarding` → `agent-mode`
+- Zero user messages sent, zero tasks created, zero executions — no actual product usage
+- One account also hit `forgot-password` 16s after signup
+- Two accounts returned days later and visited the `settings` page
+
+## Root Cause: Registration Endpoint Has No Payment Verification
+
+The Stripe payment flow is entirely optional and easily bypassed:
+
+1. **Intended flow:** User visits pricing → Stripe Checkout → redirect to `/register?session_id=cs_xxx` → email pre-filled and locked → set password → account created
+2. **Actual exploit:** Bot goes directly to `POST /api/auth/register` with `{email, password}` — no `session_id` required. The backend creates the account with `roles: ["customer"]` unconditionally.
+
+**Backend** (`POST /api/auth/register`): No Stripe session validation. Assigns `customer` role to all signups regardless of payment.
+
+**Frontend** (`Register.tsx`): The `session_id` query param only pre-fills the email field; it's completely optional. Registration works without it.
+
+**ProtectedRoute**: Only checks for `customer` role (which all registrants get). No subscription status or payment verification.
+
+The only protection is a rate limiter (10 req/15min per IP), which the bots circumvented by signing up once per day.
+
+## Future Fix (Deferred)
+
+Options to prevent this:
+1. **Require Stripe session validation** in the register endpoint — verify `session_id` with Stripe before creating the account
+2. **Don't assign `customer` role at registration** — use a `pending` role and upgrade to `customer` only after Stripe webhook `checkout.session.completed`
+3. **Add email verification** — require confirmation link click before activation
+4. **Add CAPTCHA** (reCAPTCHA/hCaptcha/Turnstile) to the registration form
+
+---
+
 # March 11, 2026: LinkedIn API Limitations — Activity URNs, Post Monitoring, and Metrics Caching
 
 ## LinkedIn Activity URN vs Share URN
