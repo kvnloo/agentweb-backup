@@ -543,6 +543,9 @@ export class AgentModeService {
               }));
             }
 
+            // Extract native stop reason from Bedrock response metadata
+            const nativeStopReason: string = response.response_metadata?.stopReason || '';
+
             // Extract usage information
             const usage = response.response_metadata?.usage || response.usage_metadata || {};
             const inputTokens = usage.input_tokens || usage.prompt_tokens || 0;
@@ -573,7 +576,8 @@ export class AgentModeService {
                   content: messageContent,
                   tool_calls: toolCalls,
                 },
-                finish_reason: toolCalls ? 'tool_calls' : 'stop',
+                finish_reason: toolCalls ? 'tool_calls' : (nativeStopReason === 'max_tokens' ? 'length' : 'stop'),
+                stop_reason: nativeStopReason || (toolCalls ? 'tool_use' : 'end_turn'),
               }],
               usage: {
                 prompt_tokens: inputTokens,
@@ -853,6 +857,10 @@ export class AgentModeService {
       let consecutiveRepeats = 0;
       const MAX_CONSECUTIVE_REPEATS = 3;
 
+      // Track max_tokens continuations to prevent infinite continuation loops
+      let maxTokensContinuations = 0;
+      const MAX_TOKEN_CONTINUATIONS = 3;
+
       while (iteration < maxIterations) {
         iteration++;
 
@@ -985,8 +993,36 @@ export class AgentModeService {
         // Append the model's message to conversation before handling tool calls
         (messages as any[]).push(responseMessage);
 
-        // If no tool calls, break the loop
+        // Check stop reason to determine next action
+        const finishReason = response.choices[0]?.finish_reason;
+        const stopReason = response.choices[0]?.stop_reason;
+
         if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+          // No tool calls — check WHY the model stopped
+
+          if (finishReason === 'length' && maxTokensContinuations < MAX_TOKEN_CONTINUATIONS) {
+            // Model hit max_tokens and was truncated — ask it to continue
+            maxTokensContinuations++;
+            console.warn(`AgentMode: Response truncated (max_tokens) in session ${sessionId}, continuation ${maxTokensContinuations}/${MAX_TOKEN_CONTINUATIONS}`);
+            (messages as any[]).push({
+              role: 'user',
+              content: '[SYSTEM] Your previous response was cut off because it exceeded the token limit. Please continue exactly where you left off.'
+            });
+            continue;
+          }
+
+          if (finishReason === 'content_filter' || stopReason === 'guardrail_intervened' || stopReason === 'content_filtered') {
+            console.warn(`AgentMode: Response blocked by content filter in session ${sessionId}, reason: ${stopReason || finishReason}`);
+            if (!content) {
+              content = "I'm unable to complete this request due to content safety guidelines. Please try rephrasing your request.";
+            }
+          }
+
+          // Log the stop reason for debugging
+          if (finishReason && finishReason !== 'stop') {
+            console.log(`AgentMode: Loop exiting with finish_reason=${finishReason}, stop_reason=${stopReason || 'N/A'}, session=${sessionId}`);
+          }
+
           // Send progress update: final response ready
           if (onProgress) {
             onProgress({
