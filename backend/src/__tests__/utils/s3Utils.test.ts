@@ -26,6 +26,8 @@ import {
   generatePresignedUrl,
   presignS3Url,
   isS3Url,
+  getS3ObjectStream,
+  getS3ObjectMetadata,
 } from '../../utils/s3Utils';
 
 describe('s3Utils', () => {
@@ -431,6 +433,49 @@ describe('s3Utils', () => {
         'https://example.com/file.txt',
         'test-bucket'
       )).toBe(false);
+    });
+  });
+
+  describe('getS3ObjectStream', () => {
+    it('should call s3.getObject with correct params and return a stream', () => {
+      const mockStream = { pipe: jest.fn() };
+      mockGetObject.mockReturnValue({ createReadStream: () => mockStream });
+
+      const result = getS3ObjectStream('users/123/file.txt', 'test-bucket');
+
+      expect(mockGetObject).toHaveBeenCalledWith({ Bucket: 'test-bucket', Key: 'users/123/file.txt' });
+      expect(result).toBe(mockStream);
+    });
+
+    it('should use default bucket when none specified', () => {
+      delete process.env.AWS_S3_BUCKET;
+      const mockStream = { pipe: jest.fn() };
+      mockGetObject.mockReturnValue({ createReadStream: () => mockStream });
+
+      getS3ObjectStream('file.txt');
+
+      expect(mockGetObject).toHaveBeenCalledWith({ Bucket: 'agentweb-user-files', Key: 'file.txt' });
+    });
+  });
+
+  describe('getS3ObjectMetadata', () => {
+    it('should call s3.headObject with correct params', async () => {
+      const mockMetadata = { ContentType: 'text/html', ContentLength: 1234 };
+      mockHeadObject.mockReturnValue({ promise: () => Promise.resolve(mockMetadata) });
+
+      const result = await getS3ObjectMetadata('users/123/file.txt', 'test-bucket');
+
+      expect(mockHeadObject).toHaveBeenCalledWith({ Bucket: 'test-bucket', Key: 'users/123/file.txt' });
+      expect(result).toEqual(mockMetadata);
+    });
+
+    it('should use default bucket when none specified', async () => {
+      delete process.env.AWS_S3_BUCKET;
+      mockHeadObject.mockReturnValue({ promise: () => Promise.resolve({}) });
+
+      await getS3ObjectMetadata('file.txt');
+
+      expect(mockHeadObject).toHaveBeenCalledWith({ Bucket: 'agentweb-user-files', Key: 'file.txt' });
     });
   });
 });
