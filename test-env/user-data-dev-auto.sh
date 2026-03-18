@@ -135,9 +135,9 @@ if tool not in s.get('permissions',{}).get('allow',[]):
 "
 fi
 
-# Set up git config for ec2-user
-sudo -u ec2-user git config --global user.name "ec2-user"
-sudo -u ec2-user git config --global user.email "ec2-user@test-env"
+# Set up git config for ec2-user (use john-the-dev identity for commit attribution)
+sudo -u ec2-user git config --global user.name "Rui Wang"
+sudo -u ec2-user git config --global user.email "52230987+john-the-dev@users.noreply.github.com"
 
 # Authenticate gh CLI with GitHub PAT
 echo "$GITHUB_PAT" | sudo -u ec2-user gh auth login --with-token

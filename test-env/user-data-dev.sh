@@ -36,9 +36,9 @@ sudo -u ec2-user npx playwright install chromium
 mkdir -p /home/ec2-user/agentweb/logs
 chown -R ec2-user:ec2-user /home/ec2-user/agentweb
 
-# Set up minimal git config for ec2-user
-sudo -u ec2-user git config --global user.name "ec2-user"
-sudo -u ec2-user git config --global user.email "ec2-user@test-env"
+# Set up git config for ec2-user (use john-the-dev identity for commit attribution)
+sudo -u ec2-user git config --global user.name "Rui Wang"
+sudo -u ec2-user git config --global user.email "52230987+john-the-dev@users.noreply.github.com"
 
 # Signal readiness — the launch script polls for this file
 touch /home/ec2-user/.test-env-dev-ready
