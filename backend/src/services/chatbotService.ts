@@ -117,6 +117,7 @@ export interface ChatMessage {
     }>;
     feedback?: MessageFeedback;        // NEW: Feedback data
     isErrorMessage?: boolean;           // True when message is an auto-persisted error
+    stopped?: boolean;                  // True when generation was stopped by user
   };
 }
 

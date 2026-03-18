@@ -43,8 +43,16 @@ ensureInitialized()
     process.exit(1);
   });
 
+// Track cancelled request IDs
+const cancelledRequestIds = new Set<string>();
+
 // Listen for messages from parent process
 process.on('message', async (message: any) => {
+  if (message.type === 'cancel') {
+    cancelledRequestIds.add(message.requestId);
+    return;
+  }
+
   const requestId = message.requestId;
   currentRequestId = requestId;
 
@@ -70,6 +78,8 @@ process.on('message', async (message: any) => {
         process.send!({ type: 'socketEmit', room, event, payload });
       };
 
+      const isCancelled = () => cancelledRequestIds.has(requestId);
+
       const result = await agentModeService.generateMarketingResponse(
         messageContent,
         sessionHistory,
@@ -79,14 +89,18 @@ process.on('message', async (message: any) => {
         mockMode,
         onProgress,
         socketEmit,
-        isInteractiveShare
+        isInteractiveShare,
+        isCancelled
       );
+
+      // Clean up cancelled flag
+      cancelledRequestIds.delete(requestId);
 
       // Send result back to parent process
       process.send!({
         type: 'success',
         requestId,
-        result
+        result: { ...result, cancelled: isCancelled() || result.cancelled }
       });
     } else {
       process.send!({

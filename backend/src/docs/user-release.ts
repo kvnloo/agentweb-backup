@@ -9,6 +9,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-18',
     changes: [
+      'Feature: Agent Mode — Stop Response Button',
+      '- Users can now stop an in-progress Agent Mode response by clicking the red stop button that replaces the send button during generation',
+      '- Cancellation propagates through the backend worker process, stopping LLM calls and tool executions at the next iteration boundary',
+      '- Partial responses and tool results accumulated before stopping are preserved in the session',
+      '- Chat continues normally after stopping — users can send new messages immediately',
+      '- Works in both authenticated and conversable (shared link) modes',
       'Improvement: Agent Mode — Better Stop Signal Handling',
       '- Agent Mode now reads the native stop reason from each LLM provider (Bedrock/Claude, OpenAI, Gemini) instead of relying solely on the absence of tool calls',
       '- Truncated responses (max_tokens) are automatically continued up to 3 times, preventing incomplete answers from being returned',
