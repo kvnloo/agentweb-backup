@@ -35,7 +35,8 @@ interface ImageGenerationParams {
 }
 
 export class ImageService {
-  // Default timeout for image generation API calls (10 minutes)
+  // Default timeout for a single image generation API call (10 minutes).
+  // Prevents sessions from hanging indefinitely when a provider is unresponsive.
   private readonly IMAGE_GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
 
   constructor() {
