@@ -11,6 +11,12 @@ jest.mock('openai');
 jest.mock('axios');
 jest.mock('@google/generative-ai');
 jest.mock('@runwayml/sdk');
+jest.mock('sharp', () => {
+  return jest.fn().mockImplementation(() => ({
+    png: jest.fn().mockReturnThis(),
+    toBuffer: jest.fn().mockResolvedValue(Buffer.from('cleaned-image-data')),
+  }));
+});
 
 // Mock @google/genai for Gemini 3 Pro - create a shared mock that can be accessed in tests
 const mockGenerateContentStream = jest.fn();
@@ -1242,10 +1248,20 @@ describe('ImageService', () => {
   });
 
   describe('Retry with Exponential Backoff', () => {
+    const realSetTimeout = global.setTimeout;
+
     beforeEach(() => {
       jest.clearAllMocks();
-      // Speed up tests by reducing real timers
-      jest.spyOn(global, 'setTimeout').mockImplementation((fn: any) => { fn(); return 0 as any; });
+      imageService = new ImageService();
+      // Speed up retry delays by calling fn() immediately for short delays,
+      // but use real setTimeout for large timeouts (e.g., withTimeout wrapper)
+      jest.spyOn(global, 'setTimeout').mockImplementation((fn: any, delay?: number) => {
+        if (delay && delay > 60000) {
+          // Large timeout (e.g., IMAGE_GENERATION_TIMEOUT_MS) — use real timer
+          return realSetTimeout(fn, delay) as any;
+        }
+        fn(); return 0 as any;
+      });
       jest.spyOn(Math, 'random').mockReturnValue(0.5);
     });
 
