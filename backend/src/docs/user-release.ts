@@ -9,6 +9,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-18',
     changes: [
+      'Fix: Scheduled Chats — Oncall Alerts for Failures',
+      '- Scheduled chats that fail validation (missing required function calls or keywords) now trigger an oncall alert email',
+      '- Scheduled chats that throw exceptions during execution now trigger an oncall alert email',
+      '- Added a safety-net oncall alert for unhandled errors in the scheduled chat fire-and-forget handler',
+      '- Previously, scheduled chat failures were silent — no oncall notification was sent to the team',
       'Fix: Image Generation — Model Validation and Reliability Improvements',
       '- Invalid image model names are now caught immediately with a clear error listing the supported models, instead of silently falling back or crashing',
       '- Image generation API calls now have a 10-minute timeout, preventing sessions from hanging indefinitely when an API provider is unresponsive',
