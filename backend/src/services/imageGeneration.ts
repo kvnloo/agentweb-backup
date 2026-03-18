@@ -35,8 +35,8 @@ interface ImageGenerationParams {
 }
 
 export class ImageService {
-  // Default timeout for image generation API calls (5 minutes)
-  private readonly IMAGE_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
+  // Default timeout for image generation API calls (10 minutes)
+  private readonly IMAGE_GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
 
   constructor() {
     // No initialization needed - clients will be created as needed
