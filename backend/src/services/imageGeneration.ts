@@ -35,8 +35,31 @@ interface ImageGenerationParams {
 }
 
 export class ImageService {
+  // Default timeout for image generation API calls (5 minutes)
+  private readonly IMAGE_GENERATION_TIMEOUT_MS = 5 * 60 * 1000;
+
   constructor() {
     // No initialization needed - clients will be created as needed
+  }
+
+  /**
+   * Wraps a promise with a timeout. If the promise doesn't resolve within the timeout,
+   * it rejects with a timeout error.
+   */
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    operationName: string
+  ): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`${operationName} timed out after ${timeoutMs / 1000} seconds`)),
+          timeoutMs
+        )
+      ),
+    ]);
   }
 
   /**
@@ -112,17 +135,23 @@ export class ImageService {
   }
 
   /**
-   * Retry a function with exponential backoff for transient API errors (503, 429)
+   * Retry a function with exponential backoff for transient API errors (503, 429).
+   * Includes a total timeout (default 5 minutes) to prevent hanging for 30+ minutes.
    */
   private async retryWithBackoff<T>(
     fn: () => Promise<T>,
-    opts: { maxRetries?: number; baseDelayMs?: number; retryableCheck?: (err: any) => boolean } = {}
+    opts: { maxRetries?: number; baseDelayMs?: number; totalTimeoutMs?: number; retryableCheck?: (err: any) => boolean } = {}
   ): Promise<T> {
-    const { maxRetries = 3, baseDelayMs = 3000, retryableCheck } = opts;
+    const { maxRetries = 3, baseDelayMs = 3000, totalTimeoutMs = 5 * 60 * 1000, retryableCheck } = opts;
+    const startTime = Date.now();
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         return await fn();
       } catch (err: any) {
+        const elapsed = Date.now() - startTime;
+        if (elapsed >= totalTimeoutMs) {
+          throw new Error(`Image generation timed out after ${Math.round(elapsed / 1000)}s. Please try again or use a different model.`);
+        }
         const isRetryable = retryableCheck
           ? retryableCheck(err)
           : (err.status === 503 || err.status === 429 || err.code === 503 || err.code === 429
@@ -184,20 +213,28 @@ export class ImageService {
       // Determine which model to use for generation
       const modelToUse = params.imageModel;
       
-      // Generate or edit image
+      // Generate or edit image with timeout
       let result: ImageGenerationResult;
       try {
+        let generationPromise: Promise<ImageGenerationResult>;
         if (modelToUse === "gpt-image-1") {
-          result = await this.generateWithAzureAI(params, modelToUse, hasInputImages);
+          generationPromise = this.generateWithAzureAI(params, modelToUse, hasInputImages);
         } else if (modelToUse === "gemini-2.5-flash-image") {
-          result = await this.generateWithGoogleGemini(params);
+          generationPromise = this.generateWithGoogleGemini(params);
         } else if (modelToUse === "gemini-3-pro-image-preview" || modelToUse === "gemini-3.1-flash-image-preview") {
-          result = await this.generateWithGoogleGemini3Pro(params);
+          generationPromise = this.generateWithGoogleGemini3Pro(params);
         } else if (modelToUse === "gen4_image" || modelToUse === "gemini_2.5_flash") {
-          result = await this.generateWithRunwayML(params, modelToUse);
+          generationPromise = this.generateWithRunwayML(params, modelToUse);
         } else {
-          result = await this.generateWithOpenAI(params, modelToUse);
+          generationPromise = this.generateWithOpenAI(params, modelToUse);
         }
+
+        // Wrap the generation call with a timeout
+        result = await this.withTimeout(
+          generationPromise,
+          this.IMAGE_GENERATION_TIMEOUT_MS,
+          `Image generation with ${modelToUse}`
+        );
         
         // If generation was successful, upload to S3
         if (result.success && result.imageUrl) {
