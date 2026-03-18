@@ -15,8 +15,6 @@ import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
-import { generateSessionResponse } from "../controllers/agentModeController";
-import { io } from "../server";
 
 const router = express.Router();
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
@@ -3582,6 +3580,8 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
     // Fire-and-forget: trigger AI response generation in the background
     // generateSessionResponse syncs GTM work item status via session.gtmWorkItem
     const planUserId = plan.userId;
+    const { generateSessionResponse } = await import('../controllers/agentModeController');
+    const { io } = await import('../server');
     generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse)
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated (admin)`);

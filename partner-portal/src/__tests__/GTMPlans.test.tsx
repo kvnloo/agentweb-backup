@@ -34,6 +34,20 @@ jest.mock('../contexts/AuthContext', () => {
 });
 
 // Mock MUI DatePicker
+// Mock react-markdown (ESM module that Jest can't parse)
+jest.mock('react-markdown', () => {
+  const MockReactMarkdown = ({ children }: { children: string }) => <div>{children}</div>;
+  return { __esModule: true, default: MockReactMarkdown };
+});
+
+// Mock socket.io-client
+jest.mock('socket.io-client', () => ({
+  io: () => ({
+    on: jest.fn(),
+    disconnect: jest.fn(),
+  }),
+}));
+
 jest.mock('@mui/x-date-pickers/DatePicker', () => ({
   DatePicker: ({ value, onChange, label }: any) => {
     const dateValue = value && value instanceof Date && !isNaN(value.getTime())
@@ -790,6 +804,10 @@ describe('GTMPlans - Due Date Management', () => {
     await waitFor(() => {
       expect(screen.getByText('Test Plan 1')).toBeInTheDocument();
     });
+
+    // Click "Show Done" to reveal completed items (hidden by default)
+    const showDoneButton = screen.getByText('Show Done');
+    await user.click(showDoneButton);
 
     const phaseHeader = screen.getByText('Phase 1');
     const accordion = phaseHeader.closest('[role="button"]');
