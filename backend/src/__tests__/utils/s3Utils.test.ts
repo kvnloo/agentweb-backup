@@ -3,17 +3,30 @@ let mockUploadPromise = jest.fn();
 const mockUpload = jest.fn(() => ({
   promise: mockUploadPromise
 }));
+const mockGetSignedUrl = jest.fn();
+const mockGetObject = jest.fn();
+const mockHeadObject = jest.fn();
 
 jest.mock('aws-sdk', () => {
   return {
     S3: jest.fn(() => ({
-      upload: mockUpload
+      upload: mockUpload,
+      getSignedUrl: mockGetSignedUrl,
+      getObject: mockGetObject,
+      headObject: mockHeadObject,
     }))
   };
 });
 
 // Import after mocking
-import { uploadFileToS3, uploadFileToS3WithPath } from '../../utils/s3Utils';
+import {
+  uploadFileToS3,
+  uploadFileToS3WithPath,
+  extractS3KeyFromUrl,
+  generatePresignedUrl,
+  presignS3Url,
+  isS3Url,
+} from '../../utils/s3Utils';
 
 describe('s3Utils', () => {
   beforeEach(() => {
@@ -299,6 +312,125 @@ describe('s3Utils', () => {
 
       expect(result.success).toBe(true);
       expect(result.key).toBe('path/test.txt');
+    });
+  });
+
+  describe('extractS3KeyFromUrl', () => {
+    it('should extract key from virtual-hosted style URL', () => {
+      const key = extractS3KeyFromUrl(
+        'https://test-bucket.s3.amazonaws.com/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBe('users/123/file.txt');
+    });
+
+    it('should extract key from virtual-hosted style URL with region', () => {
+      const key = extractS3KeyFromUrl(
+        'https://test-bucket.s3.us-west-2.amazonaws.com/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBe('users/123/file.txt');
+    });
+
+    it('should extract key from path-style URL', () => {
+      const key = extractS3KeyFromUrl(
+        'https://s3.amazonaws.com/test-bucket/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBe('users/123/file.txt');
+    });
+
+    it('should return null for non-matching bucket', () => {
+      const key = extractS3KeyFromUrl(
+        'https://other-bucket.s3.amazonaws.com/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBeNull();
+    });
+
+    it('should return null for non-S3 URL', () => {
+      const key = extractS3KeyFromUrl(
+        'https://example.com/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBeNull();
+    });
+
+    it('should return null for invalid URL', () => {
+      const key = extractS3KeyFromUrl('not-a-url', 'test-bucket');
+      expect(key).toBeNull();
+    });
+
+    it('should use default bucket when none specified', () => {
+      delete process.env.AWS_S3_BUCKET;
+      const key = extractS3KeyFromUrl(
+        'https://agentweb-user-files.s3.amazonaws.com/users/123/file.txt'
+      );
+      expect(key).toBe('users/123/file.txt');
+    });
+  });
+
+  describe('generatePresignedUrl', () => {
+    it('should call S3 getSignedUrl with correct params', () => {
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+
+      const result = generatePresignedUrl('users/123/file.txt', 'test-bucket');
+
+      expect(mockGetSignedUrl).toHaveBeenCalledWith('getObject', {
+        Bucket: 'test-bucket',
+        Key: 'users/123/file.txt',
+        Expires: 3600,
+      });
+      expect(result).toBe('https://presigned-url.example.com');
+    });
+
+    it('should accept custom expiry', () => {
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+
+      generatePresignedUrl('file.txt', 'test-bucket', 7200);
+
+      expect(mockGetSignedUrl).toHaveBeenCalledWith('getObject', {
+        Bucket: 'test-bucket',
+        Key: 'file.txt',
+        Expires: 7200,
+      });
+    });
+  });
+
+  describe('presignS3Url', () => {
+    it('should convert a public S3 URL to a presigned URL', () => {
+      mockGetSignedUrl.mockReturnValue('https://presigned-url.example.com');
+
+      const result = presignS3Url(
+        'https://test-bucket.s3.amazonaws.com/users/123/file.txt',
+        'test-bucket'
+      );
+
+      expect(result).toBe('https://presigned-url.example.com');
+    });
+
+    it('should return null for non-S3 URL', () => {
+      const result = presignS3Url(
+        'https://example.com/file.txt',
+        'test-bucket'
+      );
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('isS3Url', () => {
+    it('should return true for matching S3 URL', () => {
+      expect(isS3Url(
+        'https://test-bucket.s3.amazonaws.com/file.txt',
+        'test-bucket'
+      )).toBe(true);
+    });
+
+    it('should return false for non-matching URL', () => {
+      expect(isS3Url(
+        'https://example.com/file.txt',
+        'test-bucket'
+      )).toBe(false);
     });
   });
 });
