@@ -237,6 +237,7 @@ export class AgentModeService {
         // Dynamic import to avoid circular dependencies
         await import('../emma/registry');
         await import('../emma/tools');
+        await import('../emma/fathomTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
