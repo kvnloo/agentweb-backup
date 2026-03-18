@@ -158,7 +158,7 @@ export class CrmEnrichmentService {
       const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
       const searchTerm = companyName || emailDomain;
       if (searchTerm) {
-        const webResult = await agentModeService.searchWeb(`${searchTerm} company overview`, 10);
+        const webResult = await agentModeService.searchWeb(`${searchTerm} company overview`, 5);
         if (webResult?.success && Array.isArray(webResult.results) && webResult.results.length > 0) {
           webContext = `\nWeb search results for "${searchTerm}":\n${JSON.stringify(webResult.results, null, 2)}`;
         } else if (!webResult?.success) {
@@ -567,7 +567,13 @@ No markdown, no backticks, no extra text.`;
     });
 
     const raw = completion.choices?.[0]?.message?.content || '';
-    const parsed = JSON.parse(raw);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      console.warn('[CrmEnrichment] suggestEnrichment: failed to parse LLM response, falling back to original goal');
+      return { instruction: goal, outputFields: [] };
+    }
 
     return {
       instruction: typeof parsed.instruction === 'string' ? parsed.instruction.trim() : goal,

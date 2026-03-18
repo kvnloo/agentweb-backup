@@ -2207,9 +2207,14 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       if (!goal) {
         return res.status(400).json({ message: 'goal is required' });
       }
-      const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-      const result = await CrmEnrichmentService.suggestEnrichment(goal);
-      return res.json({ success: true, instruction: result.instruction, outputFields: result.outputFields });
+      try {
+        const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+        const result = await CrmEnrichmentService.suggestEnrichment(goal);
+        return res.json({ success: true, instruction: result.instruction, outputFields: result.outputFields });
+      } catch (err: any) {
+        console.error('[CRM] suggestEnrichment failed:', err.message);
+        return res.status(502).json({ message: 'AI suggestion failed. Please try again.' });
+      }
     }
 
     const defaultInstruction = 'Write a 3-6 sentence company profile covering what they do, their industry, products, and notable context. If no good company information is available, return "Company information not found".';

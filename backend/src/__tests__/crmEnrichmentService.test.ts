@@ -294,7 +294,7 @@ describe('CrmEnrichmentService', () => {
 
       const result = await service.execute(spec);
       expect(result.processedCount).toBe(1);
-      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 10);
+      expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(expect.stringContaining('Acme Corp'), 5);
       expect(mockAgentModeService.searchWeb).toHaveBeenCalledTimes(1);
       expect(mockGeminiCreate).toHaveBeenCalled();
     });
@@ -644,7 +644,7 @@ describe('CrmEnrichmentService', () => {
       // Should search using the email domain, not skip the search
       expect(mockAgentModeService.searchWeb).toHaveBeenCalledWith(
         expect.stringContaining('blacktiger.tech'),
-        10,
+        5,
       );
     });
 
