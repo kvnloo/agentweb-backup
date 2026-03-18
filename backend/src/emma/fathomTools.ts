@@ -77,10 +77,6 @@ emmaToolRegistry.register({
     inputSchema: {
       type: 'object',
       properties: {
-        limit: {
-          type: 'number',
-          description: 'Maximum number of meetings to return (default 10, max 50)',
-        },
         created_after: {
           type: 'string',
           description: 'Only return meetings created after this ISO date (e.g. "2026-03-01T00:00:00Z")',
@@ -109,11 +105,8 @@ emmaToolRegistry.register({
     }
 
     try {
-      const limit = Math.min(Math.max(args.limit || 10, 1), 50);
       const params = new URLSearchParams({
-        include_summary: 'true',
         include_action_items: 'true',
-        limit: String(limit),
       });
       if (args.created_after) params.set('created_after', args.created_after);
       if (args.created_before) params.set('created_before', args.created_before);
