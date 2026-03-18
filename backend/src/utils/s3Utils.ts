@@ -8,6 +8,89 @@ const s3 = new AWS.S3({
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 });
 
+const DEFAULT_BUCKET = process.env.AWS_S3_BUCKET || 'agentweb-user-files';
+const PRESIGNED_URL_EXPIRY = 3600; // 1 hour
+
+/**
+ * Extract an S3 key from a public S3 URL.
+ * Supports virtual-hosted style (bucket.s3.amazonaws.com/key)
+ * and path-style (s3.amazonaws.com/bucket/key).
+ */
+export function extractS3KeyFromUrl(
+  fileUrl: string,
+  bucket: string = DEFAULT_BUCKET
+): string | null {
+  try {
+    const url = new URL(fileUrl);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname.replace(/^\/+/, '');
+
+    // Virtual-hosted style: bucket.s3.amazonaws.com/key or bucket.s3.region.amazonaws.com/key
+    if (host.startsWith(`${bucket}.`)) {
+      return path || null;
+    }
+
+    // Path-style: s3.amazonaws.com/bucket/key
+    if (path.startsWith(`${bucket}/`)) {
+      return path.substring(bucket.length + 1) || null;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Generate a presigned GET URL for an S3 object.
+ */
+export function generatePresignedUrl(
+  key: string,
+  bucket: string = DEFAULT_BUCKET,
+  expiresIn: number = PRESIGNED_URL_EXPIRY
+): string {
+  return s3.getSignedUrl('getObject', {
+    Bucket: bucket,
+    Key: key,
+    Expires: expiresIn,
+  });
+}
+
+/**
+ * Convert a public S3 URL to a presigned URL.
+ * Returns null if the URL doesn't belong to the specified bucket.
+ */
+export function presignS3Url(
+  publicUrl: string,
+  bucket: string = DEFAULT_BUCKET,
+  expiresIn: number = PRESIGNED_URL_EXPIRY
+): string | null {
+  const key = extractS3KeyFromUrl(publicUrl, bucket);
+  if (!key) return null;
+  return generatePresignedUrl(key, bucket, expiresIn);
+}
+
+/**
+ * Check if a URL is a public S3 URL for our bucket.
+ */
+export function isS3Url(url: string, bucket: string = DEFAULT_BUCKET): boolean {
+  return extractS3KeyFromUrl(url, bucket) !== null;
+}
+
+/**
+ * Get an S3 object as a readable stream (for proxying without public access).
+ */
+export function getS3ObjectStream(key: string, bucket: string = DEFAULT_BUCKET) {
+  return s3.getObject({ Bucket: bucket, Key: key }).createReadStream();
+}
+
+/**
+ * Get S3 object metadata (content type, size, etc.).
+ */
+export async function getS3ObjectMetadata(key: string, bucket: string = DEFAULT_BUCKET) {
+  return s3.headObject({ Bucket: bucket, Key: key }).promise();
+}
+
 export interface S3UploadResult {
   success: boolean;
   url?: string;
