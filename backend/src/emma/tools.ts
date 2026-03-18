@@ -2383,6 +2383,53 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'delete_leads_by_filter',
+  definition: {
+    name: 'delete_leads_by_filter',
+    description: 'Delete all leads matching filter criteria from a lead list. Use this instead of search_leads + delete_leads when deleting many leads by condition (e.g. all leads without a certain field, all leads with low ICP score). TWO-PHASE WORKFLOW: (1) First call without confirm=true to see count and preview of matching leads. (2) If user approves, call again with confirm=true to actually delete them. This prevents accidental mass deletions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list'
+        },
+        filters: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              field: {
+                type: 'string',
+                description: 'Field name: standard fields (email, firstName, lastName, company, title, phone, notes, linkedin, status, dealValue, dealCurrency, icpScore, icpMatch, engagementCount) or any custom field name'
+              },
+              operator: {
+                type: 'string',
+                enum: ['equals', 'not_equals', 'contains', 'starts_with', 'is_empty', 'is_not_empty', 'greater_than', 'less_than'],
+                description: 'Comparison operator'
+              },
+              value: {
+                description: 'Value to compare against (not needed for is_empty/is_not_empty)'
+              }
+            },
+            required: ['field', 'operator']
+          },
+          description: 'Array of filter conditions (all must match for a lead to be deleted)'
+        },
+        confirm: {
+          type: 'boolean',
+          description: 'Set to true to actually delete leads. Omit or set to false to preview count and sample leads first. ALWAYS preview first before setting confirm=true.'
+        }
+      },
+      required: ['list_id', 'filters']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.deleteLeadsByFilter(args.list_id, args.filters, context?.userId, args.confirm);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'update_lead_list',
   definition: {
     name: 'update_lead_list',
