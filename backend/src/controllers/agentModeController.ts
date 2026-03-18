@@ -1003,6 +1003,26 @@ async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
+    // Send oncall alert if scheduled chat failed validation (not for test runs)
+    if (!finalResult.passed && !isTest) {
+      sendAgentModeOncallAlert({
+        subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
+        message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+        sessionId,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Attempts': finalResult.attempt,
+          'Execution Time (ms)': finalResult.executionTime,
+          'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
+          'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
+          'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
+          'Timestamp': finalResult.createdAt
+        }
+      }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
+    }
+
     // Also sync Research Reports execution for email campaigns
     try {
       if (schedule.emailCampaignTaskId && finalResult.sessionId) {
@@ -1063,6 +1083,23 @@ async function runScheduledChat(
       console.error('Error saving error run result:', saveError);
       // Continue even if saving fails - we still want to return the result
     }
+
+    // Send oncall alert for scheduled chat exception (always, including test runs)
+    sendAgentModeOncallAlert({
+      subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
+      message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      sessionId: sessionId || undefined,
+      context: {
+        'Schedule ID': schedule.scheduleId,
+        'Schedule Name': schedule.scheduleName,
+        'User ID': userId,
+        'Is Test Run': isTest ? 'Yes' : 'No',
+        'Error Message': errorMessage,
+        'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
+        'Execution Time (ms)': errorResult.executionTime,
+        'Timestamp': errorResult.createdAt
+      }
+    }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
 
     // Return error result for error reporting
     return errorResult;
@@ -4047,6 +4084,20 @@ export const agentModeController = {
             scheduleDb.addRunResult(schedule.scheduleId, errorResult).catch((saveError) => {
               console.error(`Error saving failure run result for schedule ${schedule.scheduleName}:`, saveError);
             });
+
+            // Send oncall alert for unhandled scheduled chat error (safety net)
+            sendAgentModeOncallAlert({
+              subject: `Scheduled Chat Unhandled Error: ${schedule.scheduleName}`,
+              message: `Scheduled chat "${schedule.scheduleName}" failed with an unhandled error in the fire-and-forget handler.\n\nError: ${error.message || 'Unknown error'}`,
+              context: {
+                'Schedule ID': schedule.scheduleId,
+                'Schedule Name': schedule.scheduleName,
+                'User ID': schedule.userId,
+                'Error Message': error.message || 'Unknown error',
+                'Error Stack': error.stack || 'No stack trace',
+                'Timestamp': new Date().toISOString()
+              }
+            }).catch(err => console.error('Failed to send oncall alert for unhandled scheduled chat error:', err));
 
             // Send error notification email
             const emailNotifications = schedule.emailNotifications || [];
