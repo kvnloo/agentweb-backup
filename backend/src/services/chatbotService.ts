@@ -221,6 +221,11 @@ export interface ChatSession {
     evaluatedMessageIndex: number; // messageIndex up to which we evaluated
     adminOverride?: boolean;    // When true, auto-scoring skips this session
   };
+  gtmWorkItem?: {
+    planId: string;
+    phaseId: string;
+    workItemId: string;
+  };
 }
 
 // Interface for context chunks
@@ -2121,6 +2126,36 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session work plan:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionGtmWorkItem(
+    sessionId: string,
+    gtmWorkItem: { planId: string; phaseId: string; workItemId: string }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET gtmWorkItem = :gtmWorkItem, updatedAt = :updatedAt, adminListPartition = :adminListPartition",
+      ExpressionAttributeValues: {
+        ":gtmWorkItem": gtmWorkItem,
+        ":updatedAt": timestamp,
+        ":adminListPartition": "all",
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session GTM work item:", error);
       throw error;
     }
   }

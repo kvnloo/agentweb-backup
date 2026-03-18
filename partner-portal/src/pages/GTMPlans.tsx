@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import {
   Box,
   Typography,
@@ -52,12 +52,19 @@ import {
   Delete as DeleteIcon,
   ArrowUpward as ArrowUpwardIcon,
   ArrowDownward as ArrowDownwardIcon,
+  PlayArrow as PlayArrowIcon,
+  Visibility as VisibilityIcon,
+  VisibilityOff as VisibilityOffIcon,
+  SmartToy as SmartToyIcon,
+  Send as SendIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
 import axios from "axios";
+import { io, Socket } from "socket.io-client";
+import ReactMarkdown from "react-markdown";
 import { useAuth } from "../contexts/AuthContext";
-import { buildApiUrl } from "../config";
+import { buildApiUrl, API_URL } from "../config";
 
 interface WorkItem {
   id: string;
@@ -65,10 +72,11 @@ interface WorkItem {
   description?: string;
   duration?: number;
   dri?: string;
-  status: "pending" | "completed" | "skipped";
+  status: "pending" | "in_progress" | "completed" | "skipped" | "agent_in_progress" | "pending_review";
   notes?: string;
   dueDate?: string;
   completedAt?: string;
+  agentSessionId?: string;
 }
 
 interface Phase {
@@ -140,8 +148,11 @@ export default function GTMPlans() {
   const { token } = useAuth();
   const [tabValue, setTabValue] = useState(0);
   const [plans, setPlans] = useState<GTMPlan[]>([]);
+  const [showDone, setShowDone] = useState(false);
+  const [startingSession, setStartingSession] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [editingItem, setEditingItem] = useState<{
     planId: string;
@@ -216,6 +227,101 @@ export default function GTMPlans() {
   const [editingCommonItem, setEditingCommonItem] = useState<GTMCommonItem | null>(null);
   const [commonItemTitle, setCommonItemTitle] = useState("");
   const [commonItemDescription, setCommonItemDescription] = useState("");
+
+  // Chat dialog state
+  const [chatDialogOpen, setChatDialogOpen] = useState(false);
+  const [chatDialogSessionId, setChatDialogSessionId] = useState("");
+  const [chatDialogTitle, setChatDialogTitle] = useState("");
+  const [chatMessages, setChatMessages] = useState<Array<{ role: string; content: string }>>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatLoadingMessages, setChatLoadingMessages] = useState(false);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+
+  // Socket.IO for real-time GTM status updates
+  const socketRef = useRef<Socket | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    const socket = io(API_URL, {
+      auth: { token },
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 2000,
+    });
+    socketRef.current = socket;
+
+    socket.on("gtm-session-ready", (data: { sessionId: string; workItemId: string; workItemTitle: string; error?: boolean }) => {
+      setPlans(prevPlans => prevPlans.map(plan => ({
+        ...plan,
+        phases: plan.phases.map(phase => ({
+          ...phase,
+          workItems: phase.workItems.map(item => {
+            if (item.id === data.workItemId && item.status === "agent_in_progress") {
+              return { ...item, status: data.error ? "pending" as const : "pending_review" as const, agentSessionId: item.agentSessionId || data.sessionId };
+            }
+            return item;
+          }),
+        })),
+      })));
+
+      if (!data.error) {
+        setSuccessMessage(`Emma has finished working on "${data.workItemTitle}". Click the status to review.`);
+        setTimeout(() => setSuccessMessage(null), 8000);
+      }
+    });
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [token]);
+
+  // Load chat messages when dialog opens
+  useEffect(() => {
+    if (!chatDialogOpen || !chatDialogSessionId || !token) return;
+    setChatLoadingMessages(true);
+    fetch(buildApiUrl(`/api/agent-mode/session/${chatDialogSessionId}`), {
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    })
+      .then((res) => res.ok ? res.json() : Promise.reject())
+      .then((session) => setChatMessages(session.messages || []))
+      .catch(() => console.error("Failed to load session messages"))
+      .finally(() => setChatLoadingMessages(false));
+  }, [chatDialogOpen, chatDialogSessionId, token]);
+
+  // Scroll to bottom when messages change
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatMessages, chatLoading]);
+
+  const handleChatSend = async () => {
+    const text = chatInput.trim();
+    if (!text || chatLoading) return;
+    setChatMessages((prev) => [...prev, { role: "user", content: text }]);
+    setChatInput("");
+    setChatLoading(true);
+    try {
+      const response = await fetch(buildApiUrl("/api/agent-mode/generate"), {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: chatDialogSessionId, userMessage: text }),
+      });
+      if (!response.ok) throw new Error("Failed");
+      const data = await response.json();
+      if (data.messages) {
+        setChatMessages(data.messages);
+      } else {
+        setChatMessages((prev) => [...prev, { role: "assistant", content: data.content }]);
+      }
+    } catch {
+      setChatMessages((prev) => [...prev, { role: "assistant", content: "Sorry, something went wrong." }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
 
   useEffect(() => {
     fetchPlans();
@@ -432,6 +538,27 @@ export default function GTMPlans() {
       return { ...cat, items: sorted };
     });
     saveCommonItems(updated);
+  };
+
+  const handleStartSession = async (planId: string, phaseId: string, workItemId: string) => {
+    if (!token) return;
+    setStartingSession(workItemId);
+    try {
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/gtm-plans/${planId}/phases/${phaseId}/work-items/${workItemId}/start-session`),
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const { workItemTitle } = response.data.data;
+      setSuccessMessage(`Emma is working on "${workItemTitle}". Click the status to see the response when ready.`);
+      setTimeout(() => setSuccessMessage(null), 8000);
+      // Refresh plans to show updated status
+      fetchPlans();
+    } catch (err: any) {
+      setError(err.response?.data?.error || "Failed to start session");
+    } finally {
+      setStartingSession(null);
+    }
   };
 
   const handleEditClick = (
@@ -933,12 +1060,27 @@ export default function GTMPlans() {
         return "success";
       case "in_progress":
         return "info";
+      case "agent_in_progress":
+        return "info";
+      case "pending_review":
+        return "warning";
       case "pending":
         return "warning";
       case "skipped":
         return "default";
       default:
         return "default";
+    }
+  };
+
+  const getStatusLabel = (status: string) => {
+    switch (status) {
+      case "agent_in_progress":
+        return "Agent Working";
+      case "pending_review":
+        return "Review Ready";
+      default:
+        return status;
     }
   };
 
@@ -957,7 +1099,7 @@ export default function GTMPlans() {
     
     // Only show warning/overdue colors for active items
     if (itemType === "workItem") {
-      if (itemStatus !== "pending") {
+      if (itemStatus !== "pending" && itemStatus !== "in_progress") {
         return null; // Don't show warning/overdue for completed or skipped items
       }
     } else if (itemType === "plan" || itemType === "phase") {
@@ -1157,9 +1299,19 @@ export default function GTMPlans() {
       <Typography variant="h4" component="h1" gutterBottom>
         GTM Tracker
       </Typography>
-      <Typography variant="body1" color="text.secondary" paragraph>
-        Track GTM plans from all users. Update status, notes, and assign PoC for plan items.
-      </Typography>
+      <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
+        <Typography variant="body1" color="text.secondary">
+          Track GTM plans from all users. Update status, notes, and assign PoC for plan items.
+        </Typography>
+        <Button
+          variant="outlined"
+          size="small"
+          startIcon={showDone ? <VisibilityOffIcon /> : <VisibilityIcon />}
+          onClick={() => setShowDone(!showDone)}
+        >
+          {showDone ? "Hide Done" : "Show Done"}
+        </Button>
+      </Box>
 
       <Box sx={{ borderBottom: 1, borderColor: "divider", mb: 0 }}>
         <Tabs value={tabValue} onChange={(_, v) => {
@@ -1181,6 +1333,12 @@ export default function GTMPlans() {
       {error && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
           {error}
+        </Alert>
+      )}
+
+      {successMessage && (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccessMessage(null)}>
+          {successMessage}
         </Alert>
       )}
 
@@ -1546,7 +1704,9 @@ export default function GTMPlans() {
                                 </TableRow>
                               </TableHead>
                               <TableBody>
-                                {phase.workItems.map((item) => (
+                                {phase.workItems
+                                  .filter((item) => showDone || (item.status !== "completed" && item.status !== "skipped"))
+                                  .map((item) => (
                                   <TableRow key={item.id}>
                                     <TableCell>
                                       <Typography variant="body2" fontWeight="medium">
@@ -1560,9 +1720,24 @@ export default function GTMPlans() {
                                     </TableCell>
                                     <TableCell>
                                       <Chip
-                                        label={item.status}
+                                        label={getStatusLabel(item.status)}
                                         color={getStatusColor(item.status) as any}
                                         size="small"
+                                        icon={item.status === "agent_in_progress" ? <CircularProgress size={14} color="inherit" /> : undefined}
+                                        onClick={
+                                          item.agentSessionId && (item.status === "agent_in_progress" || item.status === "pending_review")
+                                            ? () => {
+                                                setChatDialogSessionId(item.agentSessionId!);
+                                                setChatDialogTitle(item.title);
+                                                setChatDialogOpen(true);
+                                              }
+                                            : undefined
+                                        }
+                                        sx={
+                                          item.agentSessionId && (item.status === "agent_in_progress" || item.status === "pending_review")
+                                            ? { cursor: "pointer" }
+                                            : undefined
+                                        }
                                       />
                                       {item.completedAt && (
                                         <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
@@ -1624,6 +1799,22 @@ export default function GTMPlans() {
                                     </TableCell>
                                     <TableCell align="right">
                                       <Box sx={{ display: "flex", gap: 0.5, justifyContent: "flex-end" }}>
+                                        {item.status === "pending" && (
+                                          <Tooltip title="Start in Agent Mode">
+                                            <IconButton
+                                              size="small"
+                                              color="success"
+                                              disabled={startingSession === item.id}
+                                              onClick={() => handleStartSession(plan.planId, phase.id, item.id)}
+                                            >
+                                              {startingSession === item.id ? (
+                                                <CircularProgress size={18} />
+                                              ) : (
+                                                <PlayArrowIcon fontSize="small" />
+                                              )}
+                                            </IconButton>
+                                          </Tooltip>
+                                        )}
                                         <Tooltip title="Edit Status & Notes">
                                           <IconButton
                                             size="small"
@@ -1704,6 +1895,7 @@ export default function GTMPlans() {
                   label="Status"
                 >
                   <MenuItem value="pending">Pending</MenuItem>
+                  <MenuItem value="in_progress">In Progress</MenuItem>
                   <MenuItem value="completed">Completed</MenuItem>
                   <MenuItem value="skipped">Skipped</MenuItem>
                 </Select>
@@ -1727,6 +1919,7 @@ export default function GTMPlans() {
                 label="Status"
               >
                 <MenuItem value="pending">Pending</MenuItem>
+                <MenuItem value="in_progress">In Progress</MenuItem>
                 <MenuItem value="completed">Completed</MenuItem>
                 <MenuItem value="skipped">Skipped</MenuItem>
               </Select>
@@ -2358,6 +2551,107 @@ export default function GTMPlans() {
             {sendingStatusReport ? <CircularProgress size={20} /> : "Send Status Report"}
           </Button>
         </DialogActions>
+      </Dialog>
+
+      {/* Agent Mode Chat Dialog */}
+      <Dialog
+        open={chatDialogOpen}
+        onClose={() => { setChatDialogOpen(false); fetchPlans(); }}
+        maxWidth="md"
+        fullWidth
+        PaperProps={{ sx: { height: "80vh", display: "flex", flexDirection: "column" } }}
+      >
+        <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1, py: 1.5, flexShrink: 0 }}>
+          <SmartToyIcon sx={{ color: "secondary.main" }} />
+          {chatDialogTitle}
+          <Typography variant="body2" color="text.secondary" sx={{ ml: 1 }}>
+            — Chat with Emma
+          </Typography>
+        </DialogTitle>
+        <DialogContent dividers sx={{ flex: 1, overflow: "auto", p: 2 }} ref={chatScrollRef}>
+          {chatLoadingMessages ? (
+            <Box display="flex" justifyContent="center" alignItems="center" height="100%">
+              <CircularProgress size={24} />
+            </Box>
+          ) : chatMessages.length === 0 ? (
+            <Box display="flex" justifyContent="center" alignItems="center" height="100%">
+              <Typography color="text.secondary">No messages yet</Typography>
+            </Box>
+          ) : (
+            chatMessages
+              .filter((m) => m.role !== "system")
+              .map((message, index) => (
+                <Box
+                  key={index}
+                  sx={{
+                    display: "flex",
+                    gap: 1.5,
+                    mb: 2,
+                    justifyContent: message.role === "user" ? "flex-end" : "flex-start",
+                  }}
+                >
+                  {message.role === "assistant" && (
+                    <SmartToyIcon sx={{ color: "secondary.main", mt: 0.5, fontSize: 20 }} />
+                  )}
+                  <Paper
+                    elevation={0}
+                    sx={{
+                      px: 2,
+                      py: 1,
+                      maxWidth: "80%",
+                      bgcolor: message.role === "user" ? "primary.main" : "grey.100",
+                      color: message.role === "user" ? "primary.contrastText" : "text.primary",
+                      borderRadius: 2,
+                    }}
+                  >
+                    {message.role === "assistant" ? (
+                      <ReactMarkdown>{message.content || ""}</ReactMarkdown>
+                    ) : (
+                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                        {message.content}
+                      </Typography>
+                    )}
+                  </Paper>
+                  {message.role === "user" && (
+                    <PersonIcon sx={{ color: "primary.main", mt: 0.5, fontSize: 20 }} />
+                  )}
+                </Box>
+              ))
+          )}
+          {chatLoading && (
+            <Box sx={{ display: "flex", gap: 1.5, mb: 2 }}>
+              <SmartToyIcon sx={{ color: "secondary.main", mt: 0.5, fontSize: 20 }} />
+              <Paper elevation={0} sx={{ px: 2, py: 1, bgcolor: "grey.100", borderRadius: 2 }}>
+                <CircularProgress size={16} />
+              </Paper>
+            </Box>
+          )}
+        </DialogContent>
+        <Box sx={{ display: "flex", gap: 1, p: 2, flexShrink: 0 }}>
+          <TextField
+            fullWidth
+            size="small"
+            placeholder="Type a message..."
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                handleChatSend();
+              }
+            }}
+            disabled={chatLoading}
+            multiline
+            maxRows={3}
+          />
+          <IconButton
+            color="primary"
+            onClick={handleChatSend}
+            disabled={!chatInput.trim() || chatLoading}
+          >
+            {chatLoading ? <CircularProgress size={20} /> : <SendIcon />}
+          </IconButton>
+        </Box>
       </Dialog>
     </Box>
   );
