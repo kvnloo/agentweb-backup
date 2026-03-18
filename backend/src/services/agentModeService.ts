@@ -238,6 +238,7 @@ export class AgentModeService {
         await import('../emma/registry');
         await import('../emma/tools');
         await import('../emma/fathomTools');
+        await import('../emma/meetingActionRouter');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
