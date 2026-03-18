@@ -215,8 +215,6 @@ app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/fathom", fathomAuthRoutes);
-// Fathom's registered redirect URI uses /api/oauth/callback/fathom
-app.use("/api/oauth/callback/fathom", fathomAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
