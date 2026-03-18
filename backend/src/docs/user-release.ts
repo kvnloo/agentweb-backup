@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-18',
     changes: [
+      'Fix: Image Generation — Model Validation and Reliability Improvements',
+      '- Invalid image model names are now caught immediately with a clear error listing the supported models, instead of silently falling back or crashing',
+      '- Image generation API calls now have a 10-minute timeout, preventing sessions from hanging indefinitely when an API provider is unresponsive',
+      '- The describe_video tool now gracefully rejects image files (.jpg, .png, etc.) with a helpful message directing users to use describe_image instead',
       'Feature: Emma Chat — Configurable Default Model for Customer Support Agent',
       '- Admins can now set a dedicated default LLM model for Emma Chat (the customer support sidebar) from the Agent Mode tab in Admin Dashboard',
       '- When configured, the customer portal Emma Chat automatically defaults to the selected model instead of the general Agent Mode default',
