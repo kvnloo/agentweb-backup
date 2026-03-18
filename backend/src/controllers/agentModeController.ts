@@ -17,6 +17,7 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
@@ -1177,6 +1178,48 @@ function hasActiveProgress(sessionId: string): boolean {
   return latestProgress.status !== 'complete';
 }
 
+// Helper to update a GTM work item's status in the GTM plan
+async function updateGtmWorkItemStatus(
+  gtmWorkItem: { planId: string; phaseId: string; workItemId: string },
+  status: string
+): Promise<void> {
+  const dynamoClient = new DynamoDB.DocumentClient({
+    region: process.env.AWS_REGION || 'us-west-2',
+    ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    }),
+  });
+  const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+  const result = await dynamoClient.get({ TableName: TABLE_NAME, Key: { planId: gtmWorkItem.planId } }).promise();
+  if (!result.Item) return;
+
+  const phases = result.Item.phases || [];
+  const phaseIdx = phases.findIndex((p: any) => p.id === gtmWorkItem.phaseId);
+  if (phaseIdx === -1) return;
+
+  const items = phases[phaseIdx].workItems || [];
+  const itemIdx = items.findIndex((i: any) => i.id === gtmWorkItem.workItemId);
+  if (itemIdx === -1) return;
+
+  items[itemIdx] = { ...items[itemIdx], status };
+  phases[phaseIdx] = { ...phases[phaseIdx], workItems: items };
+
+  await dynamoClient.update({
+    TableName: TABLE_NAME,
+    Key: { planId: gtmWorkItem.planId },
+    UpdateExpression: 'SET #phases = :phases, #updatedAt = :updatedAt',
+    ExpressionAttributeNames: { '#phases': 'phases', '#updatedAt': 'updatedAt' },
+    ExpressionAttributeValues: { ':phases': phases, ':updatedAt': new Date().toISOString() },
+  }).promise();
+
+  console.log(`GTM work item ${gtmWorkItem.workItemId}: status updated to ${status}`);
+}
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
 export async function generateSessionResponse(
@@ -1287,6 +1330,15 @@ export async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
+  // If this session is linked to a GTM work item, update status to agent_in_progress
+  if (updatedSession.gtmWorkItem) {
+    try {
+      await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'agent_in_progress');
+    } catch (error) {
+      console.error('GTM status sync: Failed to set agent_in_progress:', error);
+    }
+  }
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -1308,6 +1360,15 @@ export async function generateSessionResponse(
   // Add all response messages to session (includes assistant responses and tool calls)
   if (response.responseMessages.length > 0) {
     await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+  }
+
+  // If this session is linked to a GTM work item, update status to pending_review after AI responds
+  if (updatedSession.gtmWorkItem) {
+    try {
+      await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'pending_review');
+    } catch (error) {
+      console.error('GTM status sync: Failed to set pending_review:', error);
+    }
   }
 
   // If cancelled, add a stopped indicator message

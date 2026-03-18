@@ -3,6 +3,10 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { settingsService } from "../services/settingsService";
+import { chatbotDb } from "../services/chatbotService";
+import { agentModeService } from "../services/agentModeService";
+import { generateSessionResponse } from "../controllers/agentModeController";
+import { io } from "../server";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient({
@@ -1244,6 +1248,149 @@ router.post("/:planId/add-common-items", authenticateToken, async (req, res) => 
     });
   } catch (error: any) {
     console.error("Error adding common items:", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
+// Start an Agent Mode session from a GTM work item
+router.post("/:planId/phases/:phaseId/work-items/:workItemId/start-session", authenticateToken, async (req, res) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { planId, phaseId, workItemId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    // Get the existing plan to verify ownership
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: { planId },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    // Find the phase and work item
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    const workItem = workItems[workItemIndex];
+
+    if (workItem.status !== "pending") {
+      return res.status(400).json({ error: "Only pending work items can be started" });
+    }
+
+    // Create Agent Mode session
+    const delegateInfo = authReq.delegateInfo;
+    const session = await chatbotDb.createChatSession(
+      userId,
+      undefined, // pageContent
+      "agent",   // portalType
+      "agent-mode", // pageIdentifier
+      undefined, // selectedStartupId
+      undefined, // workflowId
+      undefined, // executionId
+      undefined, // emailCampaignTaskId
+      "regular", // sessionType
+      delegateInfo
+    );
+
+    // Set default model and attach GTM work item metadata to the session
+    const modelToUse = await agentModeService.getDefaultModel();
+    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+    await chatbotDb.updateSessionGtmWorkItem(session.sessionId, { planId, phaseId, workItemId });
+
+    // Build the initial message from work item title + description
+    const initialMessage = workItem.description
+      ? `${workItem.title}\n\n${workItem.description}`
+      : workItem.title;
+
+    // Fire-and-forget: trigger AI response generation in the background
+    // generateSessionResponse handles adding the user message + generating the AI response
+    // It also syncs GTM work item status (agent_in_progress → pending_review) via session.gtmWorkItem
+    generateSessionResponse(session.sessionId, initialMessage, userId, modelToUse)
+      .then(() => {
+        console.log(`GTM work item session ${session.sessionId}: AI response generated`);
+        io.to(`user:${userId}`).emit("gtm-session-ready", {
+          sessionId: session.sessionId,
+          workItemId,
+          workItemTitle: workItem.title,
+        });
+      })
+      .catch((error) => {
+        console.error(`GTM work item session ${session.sessionId}: AI response generation failed:`, error);
+        io.to(`user:${userId}`).emit("gtm-session-ready", {
+          sessionId: session.sessionId,
+          workItemId,
+          workItemTitle: workItem.title,
+          error: true,
+        });
+      });
+
+    // Update work item status to agent_in_progress and store session ID
+    workItems[workItemIndex] = {
+      ...workItem,
+      status: "agent_in_progress",
+      agentSessionId: session.sessionId,
+    };
+
+    phases[phaseIndex] = {
+      ...phase,
+      workItems,
+    };
+
+    // Update plan in DynamoDB
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#phases": "phases",
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":phases": phases,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: session.sessionId,
+        workItemTitle: workItem.title,
+        workItemDescription: workItem.description,
+      },
+      message: "Agent Mode session started",
+    });
+  } catch (error: any) {
+    console.error("Error starting Agent Mode session from GTM work item:", error);
     return res.status(500).json({
       success: false,
       error: error?.message || "Internal server error",
