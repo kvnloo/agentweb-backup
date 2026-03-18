@@ -1157,6 +1157,9 @@ export async function generateSessionResponse(
   responseMessages: any[];
   workPlan?: any;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
+  backupModelUsed?: boolean;
+  originalModel?: string;
+  backupModel?: string;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -1588,7 +1591,8 @@ export const agentModeController = {
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         workPlan: response.workPlan,
-        skills: response.skills
+        skills: response.skills,
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -2144,7 +2148,8 @@ export const agentModeController = {
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         workPlan: response.workPlan,
-        skills: response.skills
+        skills: response.skills,
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -4155,7 +4160,8 @@ export const agentModeController = {
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         workPlan: response.workPlan,
-        skills: response.skills
+        skills: response.skills,
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);

@@ -395,6 +395,19 @@ export class AgentModeService {
     return this.getDefaultModel();
   }
 
+  async getBackupModel(primaryModel: string): Promise<string | null> {
+    try {
+      const setting = await settingsService.getSetting('agent_mode_backup_model');
+      const configured = setting?.settingValue?.trim();
+      if (configured && this.llmModels[configured] && configured !== primaryModel) {
+        return configured;
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting backup model setting:', error);
+    }
+    return null;
+  }
+
   // Helper method to create Azure OpenAI client for a specific deployment
   private getAzureOpenAIClient(deploymentName: string): OpenAI {
     return new OpenAI({
@@ -769,8 +782,12 @@ export class AgentModeService {
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
     isCancelled?: () => boolean
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     try {
+      // Track backup model usage
+      const originalLlmModel = llmModel;
+      let backupModelUsed = false;
+
       // Track memory usage for optimization
       const startMemory = process.memoryUsage();
       const startTime = Date.now();
@@ -967,14 +984,44 @@ export class AgentModeService {
         // Trim large old tool results to prevent context window overflow
         const trimmedMessages = this.trimToolMessagesForContext(messages);
 
-        // Make LLM call
+        // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
-        const response: any = await this.callLLM(llmModel, trimmedMessages, {
-          tools: filteredToolsCache,
-          tool_choice: 'auto',
-          max_completion_tokens: 12384,
-          temperature: 0.1
-        });
+        let response: any;
+        try {
+          response = await this.callLLM(llmModel, trimmedMessages, {
+            tools: filteredToolsCache,
+            tool_choice: 'auto',
+            max_completion_tokens: 12384,
+            temperature: 0.1
+          });
+        } catch (callError) {
+          if (isTransientLLMError(callError) && !backupModelUsed) {
+            const backup = await this.getBackupModel(llmModel);
+            if (backup) {
+              console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
+              if (onProgress) {
+                onProgress({
+                  iteration,
+                  status: 'switching_model',
+                  toolCalls: toolCalls.slice(),
+                  pendingTools: [`Primary model timed out. Switching to ${backup}...`]
+                });
+              }
+              llmModel = backup;
+              backupModelUsed = true;
+              response = await this.callLLM(llmModel, trimmedMessages, {
+                tools: filteredToolsCache,
+                tool_choice: 'auto',
+                max_completion_tokens: 12384,
+                temperature: 0.1
+              });
+            } else {
+              throw callError;
+            }
+          } else {
+            throw callError;
+          }
+        }
         const llmDurationMs = Date.now() - llmStart;
 
         // Yield control back to event loop after LLM call to allow health checks and other requests
@@ -1306,7 +1353,8 @@ export class AgentModeService {
         knowledgeBaseQueries,
         sources,
         responseMessages,
-        ...(wasCancelled ? { cancelled: true } : {})
+        ...(wasCancelled ? { cancelled: true } : {}),
+        ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);
