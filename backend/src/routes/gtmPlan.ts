@@ -5,8 +5,8 @@ import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusRe
 import { settingsService } from "../services/settingsService";
 import { chatbotDb } from "../services/chatbotService";
 import { agentModeService } from "../services/agentModeService";
-import { generateSessionResponse } from "../controllers/agentModeController";
-import { io } from "../server";
+// generateSessionResponse and io are imported dynamically inside handlers
+// to avoid loading server.ts → app.ts → templates.ts chain at import time
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient({
@@ -1332,6 +1332,9 @@ router.post("/:planId/phases/:phaseId/work-items/:workItemId/start-session", aut
     // Fire-and-forget: trigger AI response generation in the background
     // generateSessionResponse handles adding the user message + generating the AI response
     // It also syncs GTM work item status (agent_in_progress → pending_review) via session.gtmWorkItem
+    // Dynamic imports to avoid loading server.ts → app.ts chain at module load time
+    const { generateSessionResponse } = await import('../controllers/agentModeController');
+    const { io } = await import('../server');
     generateSessionResponse(session.sessionId, initialMessage, userId, modelToUse)
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated`);
