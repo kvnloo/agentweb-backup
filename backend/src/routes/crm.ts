@@ -423,7 +423,7 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(401).json({ message: 'Unauthorized' });
     }
 
-    const { name, description, alertEvents, listSenderId, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, alertEvents, alertCcEmails, listSenderId, autoDraftEnabled, statusConfig, listType } = req.body;
 
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ message: 'List name is required' });
@@ -455,6 +455,23 @@ router.post('/lists', async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'autoDraftEnabled must be a boolean' });
     }
 
+    let normalizedCcEmails: string[] | undefined;
+    if (alertCcEmails !== undefined) {
+      if (!Array.isArray(alertCcEmails)) {
+        return res.status(400).json({ message: 'alertCcEmails must be an array' });
+      }
+      if (alertCcEmails.length > 10) {
+        return res.status(400).json({ message: 'alertCcEmails cannot have more than 10 entries' });
+      }
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      for (const email of alertCcEmails) {
+        if (typeof email !== 'string' || !emailRegex.test(email.trim())) {
+          return res.status(400).json({ message: `Invalid email in alertCcEmails: ${email}` });
+        }
+      }
+      normalizedCcEmails = alertCcEmails.map((e: string) => e.trim().toLowerCase());
+    }
+
     const list = await crmDb.createLeadList(
       userId,
       name.trim(),
@@ -467,6 +484,12 @@ router.post('/lists', async (req: Request, res: Response) => {
       statusConfig,
       listType
     );
+
+    if (normalizedCcEmails && normalizedCcEmails.length > 0) {
+      await crmDb.updateLeadList(list.listId, { alertCcEmails: normalizedCcEmails });
+      (list as any).alertCcEmails = normalizedCcEmails;
+    }
+
     res.status(201).json(list);
   } catch (error: any) {
     console.error('Error creating lead list:', error);
@@ -517,7 +540,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.user?.userId;
     const { listId } = req.params;
-    const { name, description, displayFields, sortConfig, alertEvents, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
+    const { name, description, displayFields, sortConfig, alertEvents, alertCcEmails, listSenderId, icpsOnly, engagedOnly, autoDraftEnabled, statusConfig, listType } = req.body;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -539,6 +562,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       displayFields?: string[];
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
+      alertCcEmails?: string[];
       listSenderId?: string | null;
       autoDraftEnabled?: boolean;
       icpsOnly?: boolean;
@@ -589,6 +613,22 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       } catch (error: any) {
         return res.status(400).json({ message: error.message || 'Invalid alertEvents' });
       }
+    }
+
+    if (alertCcEmails !== undefined) {
+      if (!Array.isArray(alertCcEmails)) {
+        return res.status(400).json({ message: 'alertCcEmails must be an array' });
+      }
+      if (alertCcEmails.length > 10) {
+        return res.status(400).json({ message: 'alertCcEmails cannot have more than 10 entries' });
+      }
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      for (const email of alertCcEmails) {
+        if (typeof email !== 'string' || !emailRegex.test(email.trim())) {
+          return res.status(400).json({ message: `Invalid email in alertCcEmails: ${email}` });
+        }
+      }
+      updates.alertCcEmails = alertCcEmails.map((e: string) => e.trim().toLowerCase());
     }
 
     if (listSenderId !== undefined) {

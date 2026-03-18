@@ -122,6 +122,7 @@ const sendAlertEmail = async ({
   eventType,
   eventData,
   createdAt,
+  ccEmails,
 }: {
   userEmail: string;
   listName: string;
@@ -130,6 +131,7 @@ const sendAlertEmail = async ({
   eventType: string;
   eventData: any;
   createdAt: string;
+  ccEmails?: string[];
 }) => {
   const leadName = formatLeadName(lead);
   const leadEmail = lead.email || 'Unknown email';
@@ -172,7 +174,11 @@ const sendAlertEmail = async ({
     </div>
   `;
 
-  await emailService.sendEmail(userEmail, subject, text, html);
+  if (Array.isArray(ccEmails) && ccEmails.length > 0) {
+    await emailService.sendEmail(userEmail, subject, text, html, ccEmails);
+  } else {
+    await emailService.sendEmail(userEmail, subject, text, html);
+  }
 };
 
 export const leadListAlertService = {
@@ -199,6 +205,7 @@ export const leadListAlertService = {
       return;
     }
 
+    const ccEmails = Array.isArray(list.alertCcEmails) ? list.alertCcEmails.filter((e: string) => typeof e === 'string' && e.trim()) : undefined;
     await sendAlertEmail({
       userEmail: user.email,
       listName: list.name || 'Lead List',
@@ -207,6 +214,7 @@ export const leadListAlertService = {
       eventType: normalizedEventType,
       eventData,
       createdAt,
+      ccEmails,
     });
 
     // Send Slack notification if the user has a slackChannel configured

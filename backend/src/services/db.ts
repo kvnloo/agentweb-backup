@@ -3029,6 +3029,7 @@ export const crmDb = {
       displayFields?: string[];
       sortConfig?: { column: string; direction: 'asc' | 'desc' } | null;
       alertEvents?: string[];
+      alertCcEmails?: string[];
       listSenderId?: string | null;
       publicAccessEnabled?: boolean;
       autoDraftEnabled?: boolean;
@@ -3074,6 +3075,12 @@ export const crmDb = {
         expressionAttributeNames['#alertEvents'] = 'alertEvents';
         updateExpressions.push('#alertEvents = :alertEvents');
         expressionAttributeValues[':alertEvents'] = updates.alertEvents;
+      }
+
+      if (updates.alertCcEmails !== undefined) {
+        expressionAttributeNames['#alertCcEmails'] = 'alertCcEmails';
+        updateExpressions.push('#alertCcEmails = :alertCcEmails');
+        expressionAttributeValues[':alertCcEmails'] = updates.alertCcEmails;
       }
 
       if (updates.listSenderId !== undefined) {
