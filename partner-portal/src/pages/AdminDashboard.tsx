@@ -6844,6 +6844,8 @@ const AgentModeSettings = () => {
   const [savingImageGenerationDefaultModel, setSavingImageGenerationDefaultModel] = useState(false);
   const [videoGenerationDefaultModel, setVideoGenerationDefaultModel] = useState('');
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
+  const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
+  const [savingCustomerSupportDefaultModel, setSavingCustomerSupportDefaultModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
@@ -6921,6 +6923,9 @@ const AgentModeSettings = () => {
 
       // Load video generation default model
       await loadVideoGenerationDefaultModel(models);
+
+      // Load customer support default model
+      await loadCustomerSupportDefaultModel(models);
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
@@ -7503,6 +7508,56 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadCustomerSupportDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setCustomerSupportDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading customer support default model:', settingsError);
+      }
+    }
+    setCustomerSupportDefaultModel('');
+  };
+
+  const saveCustomerSupportDefaultModel = async () => {
+    try {
+      setSavingCustomerSupportDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (customerSupportDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+          settingValue: customerSupportDefaultModel,
+          description: 'Default LLM model for customer support agent (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Customer support default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving customer support default model:', error);
+      setError('Failed to save customer support default model');
+    } finally {
+      setSavingCustomerSupportDefaultModel(false);
+    }
+  };
+
   const saveSystemPrompt = async () => {
     try {
       setSavingSystemPrompt(true);
@@ -7868,7 +7923,7 @@ const AgentModeSettings = () => {
     setPredefinedWorkPlans(updated);
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7956,6 +8011,14 @@ const AgentModeSettings = () => {
 
         setVideoGenerationDefaultModel('');
         setSuccess('Reset video generation default model successfully!');
+      } else if (type === 'customerSupportDefaultModel') {
+        setSavingCustomerSupportDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setCustomerSupportDefaultModel('');
+        setSuccess('Reset customer support default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -7977,6 +8040,8 @@ const AgentModeSettings = () => {
         setSavingImageGenerationDefaultModel(false);
       } else if (type === 'videoGenerationDefaultModel') {
         setSavingVideoGenerationDefaultModel(false);
+      } else if (type === 'customerSupportDefaultModel') {
+        setSavingCustomerSupportDefaultModel(false);
       }
     }
   };
@@ -8264,6 +8329,58 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             If set, video generation uses this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Customer Support Agent Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Customer Support Agent Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('customerSupportDefaultModel')}
+                disabled={savingCustomerSupportDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveCustomerSupportDefaultModel}
+                disabled={savingCustomerSupportDefaultModel}
+              >
+                {savingCustomerSupportDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-customer-support-model-label">Customer Support Agent Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-customer-support-model-label"
+              value={customerSupportDefaultModel}
+              label="Customer Support Agent Default Model"
+              onChange={(e) => setCustomerSupportDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for Emma Chat in the customer portal. If not set, uses the general default model.
           </Typography>
         </CardContent>
       </Card>

@@ -98,6 +98,7 @@ export class AgentModeService {
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
+  private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -372,6 +373,23 @@ export class AgentModeService {
       }
     } catch (error) {
       console.error('AgentMode: Error getting video generation default model setting:', error);
+    }
+    // Fall back to the general default model
+    return this.getDefaultModel();
+  }
+
+  async getCustomerSupportDefaultModel(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting(this.customerSupportDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported customer support default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting customer support default model setting:', error);
     }
     // Fall back to the general default model
     return this.getDefaultModel();

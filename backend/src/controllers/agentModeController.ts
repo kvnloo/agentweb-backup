@@ -1772,6 +1772,16 @@ export const agentModeController = {
     }
   },
 
+  async getCustomerSupportDefaultModel(req: Request, res: Response) {
+    try {
+      const model = await agentModeService.getCustomerSupportDefaultModel();
+      res.json({ model });
+    } catch (error) {
+      console.error('AgentMode: Get customer support default model error:', error);
+      res.status(500).json({ error: 'Failed to get customer support default model' });
+    }
+  },
+
   // Get system prompt
   async getSystemPrompt(req: Request, res: Response) {
     try {
