@@ -22,8 +22,11 @@ router.get('/lists/:listId/leads/:leadId/group-email-status', async (req: Reques
       return res.status(403).json({ message: 'Email does not match lead record' });
     }
 
+    const { isDoNotContact } = await import('../utils/leadContactStatus');
     return res.json({
-      unsubscribed: lead.unsubscribedFromGroupEmail === true,
+      unsubscribed: lead.unsubscribedFromGroupEmail === true || isDoNotContact(lead),
+      contactStatus: lead.contactStatus || (lead.unsubscribedFromGroupEmail === true ? 'unsubscribed' : 'active'),
+      contactStatusReason: lead.contactStatusReason || undefined,
     });
   } catch (error) {
     console.error('Error checking group email status:', error);
@@ -50,14 +53,16 @@ router.post('/lists/:listId/leads/:leadId/group-email-unsubscribe', async (req: 
       return res.status(403).json({ message: 'Email does not match lead record' });
     }
 
+    const now = new Date().toISOString();
     await crmDb.updateLead(listId, leadId, {
       unsubscribedFromGroupEmail: true,
-      unsubscribedFromGroupEmailAt: new Date().toISOString(),
+      unsubscribedFromGroupEmailAt: now,
+      contactStatus: 'unsubscribed',
+      contactStatusReason: 'opted-out',
+      contactStatusNote: feedback || undefined,
+      contactStatusUpdatedAt: now,
+      contactStatusUpdatedBy: 'lead-self',
     });
-
-    if (feedback) {
-      console.log(`Unsubscribe feedback from ${email} (list: ${listId}): ${feedback}`);
-    }
 
     return res.json({ message: 'Successfully unsubscribed' });
   } catch (error) {
@@ -87,6 +92,11 @@ router.post('/lists/:listId/leads/:leadId/group-email-resubscribe', async (req: 
 
     await crmDb.updateLead(listId, leadId, {
       unsubscribedFromGroupEmail: false,
+      contactStatus: 'active',
+      contactStatusReason: null,
+      contactStatusNote: null,
+      contactStatusUpdatedAt: new Date().toISOString(),
+      contactStatusUpdatedBy: 'lead-self',
     });
 
     return res.json({ message: 'Successfully resubscribed' });

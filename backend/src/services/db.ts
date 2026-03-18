@@ -3279,6 +3279,10 @@ export const crmDb = {
     status?: string | null;
     dealValue?: number | null;
     dealCurrency?: string;
+    contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed';
+    contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other';
+    contactStatusNote?: string;
+    contactStatusUpdatedBy?: string;
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -3325,6 +3329,17 @@ export const crmDb = {
       }
       if (leadData.dealCurrency) {
         item.dealCurrency = leadData.dealCurrency;
+      }
+      if (leadData.contactStatus) {
+        item.contactStatus = leadData.contactStatus;
+        if (leadData.contactStatusReason) {
+          item.contactStatusReason = leadData.contactStatusReason;
+        }
+        if (leadData.contactStatusNote) {
+          item.contactStatusNote = leadData.contactStatusNote;
+        }
+        item.contactStatusUpdatedAt = new Date().toISOString();
+        item.contactStatusUpdatedBy = leadData.contactStatusUpdatedBy || 'system';
       }
 
       const params = {
@@ -3571,6 +3586,11 @@ export const crmDb = {
     dealCurrency?: string;
     unsubscribedFromGroupEmail?: boolean;
     unsubscribedFromGroupEmailAt?: string;
+    contactStatus?: 'active' | 'do-not-contact' | 'unsubscribed' | null;
+    contactStatusReason?: 'opted-out' | 'bounced' | 'requested-removal' | 'admin-flagged' | 'compliance' | 'other' | null;
+    contactStatusNote?: string | null;
+    contactStatusUpdatedAt?: string;
+    contactStatusUpdatedBy?: string;
   }) {
     try {
       const setExpressions: string[] = [];
@@ -3723,6 +3743,43 @@ export const crmDb = {
       if (updates.unsubscribedFromGroupEmailAt !== undefined) {
         setExpressions.push('unsubscribedFromGroupEmailAt = :unsubGEAt');
         expressionAttributeValues[':unsubGEAt'] = updates.unsubscribedFromGroupEmailAt;
+      }
+
+      if (updates.contactStatus !== undefined) {
+        if (updates.contactStatus === null) {
+          removeExpressions.push('contactStatus');
+          removeExpressions.push('contactStatusReason');
+          removeExpressions.push('contactStatusNote');
+          removeExpressions.push('contactStatusUpdatedAt');
+          removeExpressions.push('contactStatusUpdatedBy');
+        } else {
+          setExpressions.push('contactStatus = :contactStatus');
+          expressionAttributeValues[':contactStatus'] = updates.contactStatus;
+          setExpressions.push('contactStatusUpdatedAt = :csUpdatedAt');
+          expressionAttributeValues[':csUpdatedAt'] = updates.contactStatusUpdatedAt || new Date().toISOString();
+          if (updates.contactStatusUpdatedBy) {
+            setExpressions.push('contactStatusUpdatedBy = :csUpdatedBy');
+            expressionAttributeValues[':csUpdatedBy'] = updates.contactStatusUpdatedBy;
+          }
+        }
+      }
+
+      if (updates.contactStatusReason !== undefined) {
+        if (updates.contactStatusReason === null) {
+          removeExpressions.push('contactStatusReason');
+        } else {
+          setExpressions.push('contactStatusReason = :csReason');
+          expressionAttributeValues[':csReason'] = updates.contactStatusReason;
+        }
+      }
+
+      if (updates.contactStatusNote !== undefined) {
+        if (updates.contactStatusNote === null) {
+          removeExpressions.push('contactStatusNote');
+        } else {
+          setExpressions.push('contactStatusNote = :csNote');
+          expressionAttributeValues[':csNote'] = updates.contactStatusNote;
+        }
       }
 
       // Always update updatedAt

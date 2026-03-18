@@ -4,10 +4,11 @@ import { WebhookRequiredHeaders } from 'svix';
 import { webhookService, ResendWebhookEvent } from '../services/webhookService';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { crmDb } from '../services/db';
+import { crmDb, userDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { resendService } from '../services/resendService';
 import { emmaEmailService } from '../services/emmaEmailService';
+import { isDoNotContact } from '../utils/leadContactStatus';
 
 const router = express.Router();
 
@@ -72,9 +73,40 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         console.log(`Email delivered: ${event.data.email_id} to ${event.data.to.join(', ')}`);
         break;
       
-      case 'email.bounced':
-        console.log(`Email bounced: ${event.data.email_id} - ${event.data.bounce?.reason || 'Unknown reason'}`);
+      case 'email.bounced': {
+        const bounceReason = event.data.bounce?.reason || 'Unknown reason';
+        console.log(`Email bounced: ${event.data.email_id} - ${bounceReason}`);
+        // Auto-flag bounced leads as do-not-contact
+        const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        void (async () => {
+          try {
+            const users = await userDb.getUsersByEmailDomain(emailDomain);
+            for (const user of users) {
+              const lists = await crmDb.getLeadListsByUserId(user.userId);
+              for (const list of (lists || [])) {
+                for (const recipientEmail of bouncedTo) {
+                  const lead = await crmDb.getLeadByEmail(list.listId, recipientEmail);
+                  if (lead && !isDoNotContact(lead)) {
+                    await crmDb.updateLead(list.listId, lead.leadId, {
+                      contactStatus: 'do-not-contact',
+                      contactStatusReason: 'bounced',
+                      contactStatusNote: `Email bounced: ${bounceReason}`,
+                      contactStatusUpdatedAt: new Date().toISOString(),
+                      contactStatusUpdatedBy: 'system',
+                      unsubscribedFromGroupEmail: true,
+                      unsubscribedFromGroupEmailAt: new Date().toISOString(),
+                    });
+                    console.log(`Auto-flagged lead ${lead.leadId} in list ${list.listId} as do-not-contact (bounced)`);
+                  }
+                }
+              }
+            }
+          } catch (err) {
+            console.error('Error auto-flagging bounced lead:', err);
+          }
+        })();
         break;
+      }
       
       case 'email.complained':
         console.log(`Email complaint: ${event.data.email_id} - ${event.data.complaint?.reason || 'Unknown reason'}`);

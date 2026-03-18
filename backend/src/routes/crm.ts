@@ -12,6 +12,7 @@ import AdmZip from 'adm-zip';
 import { emailEventsDb } from '../services/emailEventsDb';
 import { dynamodb } from '../config/aws';
 import { io } from '../server';
+import { isDoNotContact } from '../utils/leadContactStatus';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
 
@@ -948,6 +949,90 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
   } catch (error: any) {
     console.error('Error fetching lead:', error);
     res.status(500).json({ message: error.message || 'Failed to fetch lead' });
+  }
+});
+
+/**
+ * @route PUT /api/crm/lists/:listId/leads/bulk-contact-status
+ * @desc Bulk update contact status for multiple leads
+ * @access Private
+ * NOTE: Must be registered BEFORE the :leadId route to avoid Express treating
+ * "bulk-contact-status" as a leadId parameter.
+ */
+router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { leadIds, contactStatus, contactStatusReason, contactStatusNote } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!Array.isArray(leadIds) || leadIds.length === 0) {
+      return res.status(400).json({ message: 'leadIds array is required and must not be empty' });
+    }
+
+    const validStatuses = ['active', 'do-not-contact', 'unsubscribed'];
+    if (!contactStatus || !validStatuses.includes(contactStatus)) {
+      return res.status(400).json({ message: `contactStatus must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    const validReasons = ['opted-out', 'bounced', 'requested-removal', 'admin-flagged', 'compliance', 'other'];
+    if (contactStatusReason && !validReasons.includes(contactStatusReason)) {
+      return res.status(400).json({ message: `contactStatusReason must be one of: ${validReasons.join(', ')}` });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    let updated = 0;
+    let failed = 0;
+    const now = new Date().toISOString();
+
+    for (const leadId of leadIds) {
+      try {
+        const updates: any = {
+          contactStatus,
+          contactStatusUpdatedAt: now,
+          contactStatusUpdatedBy: userId,
+        };
+        if (contactStatusReason) {
+          updates.contactStatusReason = contactStatusReason;
+        }
+        if (contactStatusNote) {
+          updates.contactStatusNote = contactStatusNote;
+        }
+        // When setting to active, also clear legacy unsubscribe flag
+        if (contactStatus === 'active') {
+          updates.unsubscribedFromGroupEmail = false;
+          updates.contactStatusReason = null;
+          updates.contactStatusNote = null;
+        }
+        // When setting to unsubscribed/dnc, also set legacy flag for backward compat
+        if (contactStatus === 'do-not-contact' || contactStatus === 'unsubscribed') {
+          updates.unsubscribedFromGroupEmail = true;
+          updates.unsubscribedFromGroupEmailAt = now;
+        }
+        await crmDb.updateLead(listId, leadId, updates);
+        updated++;
+      } catch (err) {
+        console.error(`Failed to update contact status for lead ${leadId}:`, err);
+        failed++;
+      }
+    }
+
+    return res.json({ updated, failed, total: leadIds.length });
+  } catch (error: any) {
+    console.error('Error bulk updating contact status:', error);
+    return res.status(500).json({ message: error.message || 'Failed to bulk update contact status' });
   }
 });
 
@@ -2752,14 +2837,15 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
     }
 
     const totalLeads = leads.length;
-    const unsubscribedCount = leads.filter((l: any) => l.unsubscribedFromGroupEmail === true).length;
+    const doNotContactCount = leads.filter((l: any) => isDoNotContact(l)).length;
     const noEmailCount = leads.filter((l: any) => !l.email).length;
-    const eligibleLeads = totalLeads - unsubscribedCount - noEmailCount;
+    const eligibleLeads = totalLeads - doNotContactCount - noEmailCount;
 
     return res.json({
       totalLeads,
       eligibleLeads,
-      unsubscribedCount,
+      unsubscribedCount: doNotContactCount,
+      doNotContactCount,
       noEmailCount,
     });
   } catch (error) {
@@ -2801,8 +2887,8 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
 
-    // Only consider eligible leads (have email, not unsubscribed)
-    const eligibleLeads = leads.filter((l: any) => l.email && l.unsubscribedFromGroupEmail !== true);
+    // Only consider eligible leads (have email, not do-not-contact/unsubscribed)
+    const eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
     const eligibleCount = eligibleLeads.length;
 
     if (variables.length === 0) {
@@ -2884,9 +2970,9 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       leads = leads.filter((l: any) => idSet.has(l.leadId));
     }
 
-    // Separate eligible leads from skipped ones
-    const skippedUnsubscribed = leads.filter((l: any) => l.unsubscribedFromGroupEmail === true).length;
-    let eligibleLeads = leads.filter((l: any) => l.email && l.unsubscribedFromGroupEmail !== true);
+    // Separate eligible leads from skipped ones (do-not-contact includes unsubscribed + DNC)
+    const skippedDoNotContact = leads.filter((l: any) => isDoNotContact(l)).length;
+    let eligibleLeads = leads.filter((l: any) => l.email && !isDoNotContact(l));
 
     // Filter out leads missing required variable values
     const allTemplate = (subject || '') + (htmlContent || '');
@@ -2955,7 +3041,8 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       sent,
       failed,
       failedEmails,
-      skippedUnsubscribed,
+      skippedUnsubscribed: skippedDoNotContact,
+      skippedDoNotContact,
       skippedMissingVars,
     });
   } catch (error) {
