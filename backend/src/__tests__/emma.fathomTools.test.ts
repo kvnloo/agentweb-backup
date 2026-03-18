@@ -119,14 +119,15 @@ describe('fathom_get_meetings', () => {
 
     await executeTool(
       'fathom_get_meetings',
-      { limit: 5, created_after: '2026-03-01T00:00:00Z', created_before: '2026-03-15T00:00:00Z' },
+      { created_after: '2026-03-01T00:00:00Z', created_before: '2026-03-15T00:00:00Z' },
       { userId: 'user-1' }
     );
 
     const callUrl = (mockedAxios.get as jest.Mock).mock.calls[0][0];
     expect(callUrl).toContain('created_after=2026-03-01T00%3A00%3A00Z');
     expect(callUrl).toContain('created_before=2026-03-15T00%3A00%3A00Z');
-    expect(callUrl).toContain('limit=5');
+    expect(callUrl).not.toContain('limit=');
+    expect(callUrl).not.toContain('include_summary');
   });
 
   it('returns helpful error when no Fathom account is connected', async () => {
