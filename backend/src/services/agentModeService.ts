@@ -3548,6 +3548,21 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
+      // Reject image files — the LLM should use describe_image instead
+      const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.tif', '.ico', '.heic', '.heif', '.avif'];
+      try {
+        const parsedUrl = new URL(videoFileUrl);
+        const ext = path.extname(parsedUrl.pathname).toLowerCase();
+        if (imageExtensions.includes(ext)) {
+          return {
+            success: false,
+            message: `This appears to be an image file (${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+          };
+        }
+      } catch {
+        // URL parsing failed — continue and let downstream handling deal with it
+      }
+
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
       const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
       const geminiApiKey = await getSecret(geminiSecretName);
@@ -3611,6 +3626,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
         const fallbackMimeType = mimeTypeMap[urlExtension] || 'video/mp4';
         const mimeType = contentTypeHeader.startsWith('video/') ? contentTypeHeader : fallbackMimeType;
+
+        // Reject if Content-Type indicates this is an image, not a video
+        if (contentTypeHeader.startsWith('image/')) {
+          return {
+            success: false,
+            message: `This appears to be an image file (${contentTypeHeader}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+          };
+        }
 
         tempDirPath = await fs.mkdtemp(path.join(os.tmpdir(), 'agentweb-video-'));
         const fileExtension = urlExtension || '.mp4';
