@@ -672,6 +672,148 @@ describe('CrmEnrichmentService', () => {
     });
   });
 
+  // ─── LEAD IDS FILTERING ──────────────────────────────────────────────────
+
+  describe('leadIds filtering', () => {
+    it('should only process leads matching the provided leadIds', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [
+        createLead({ leadId: 'lead1' }),
+        createLead({ leadId: 'lead2' }),
+        createLead({ leadId: 'lead3' }),
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find industry',
+        outputFields: ['industry'],
+        sources: ['web_search'],
+        leadIds: ['lead1', 'lead3'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(2);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledTimes(2);
+      const updatedLeadIds = mockCrmDb.updateLead.mock.calls.map(c => c[1]);
+      expect(updatedLeadIds).toContain('lead1');
+      expect(updatedLeadIds).toContain('lead3');
+      expect(updatedLeadIds).not.toContain('lead2');
+    });
+
+    it('should process all leads when leadIds is not provided', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [
+        createLead({ leadId: 'lead1' }),
+        createLead({ leadId: 'lead2' }),
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find industry',
+        outputFields: ['industry'],
+        sources: ['web_search'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(2);
+    });
+
+    it('should return zero results when leadIds match no leads', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [
+        createLead({ leadId: 'lead1' }),
+        createLead({ leadId: 'lead2' }),
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find industry',
+        outputFields: ['industry'],
+        sources: ['web_search'],
+        leadIds: ['nonexistent-lead'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(0);
+    });
+
+    it('should apply leadIds filter before field filters', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [
+        createLead({ leadId: 'lead1', customFields: { status: 'active' } }),
+        createLead({ leadId: 'lead2', customFields: { status: 'active' } }),
+        createLead({ leadId: 'lead3', customFields: { status: 'inactive' } }),
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find industry',
+        outputFields: ['industry'],
+        sources: ['web_search'],
+        leadIds: ['lead1', 'lead3'],
+        filters: [{ field: 'status', operator: 'equals', value: 'active' }],
+      };
+
+      // leadIds narrows to lead1 + lead3, then status filter keeps only lead1
+      const result = await service.execute(spec);
+      expect(result.processedCount).toBe(1);
+      expect(mockCrmDb.updateLead).toHaveBeenCalledWith('list1', 'lead1', expect.anything());
+    });
+
+    it('should preview correctly with leadIds filter', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      const leads = [
+        createLead({ leadId: 'lead1' }),
+        createLead({ leadId: 'lead2' }),
+        createLead({ leadId: 'lead3', customFields: { industry: 'Finance' } }),
+      ];
+      mockCrmDb.getLeadsByListId.mockResolvedValue({ items: leads, lastEvaluatedKey: null, hasMore: false });
+
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockAgentModeService.searchWeb
+        .mockResolvedValue({ success: true, results: [{ title: 'Acme', snippet: 'Company' }] });
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1',
+        userId: 'user1',
+        instruction: 'Find industry',
+        outputFields: ['industry'],
+        sources: ['web_search'],
+        leadIds: ['lead1'],
+      };
+
+      const result = await service.preview(spec);
+      expect(result.totalLeads).toBe(1); // only lead1 selected via leadIds
+      expect(result.leadsToProcess).toBe(1); // only lead1, which has no industry
+    });
+  });
+
   // ─── BACKWARD COMPATIBILITY ───────────────────────────────────────────────
 
   describe('enrichWebCompat', () => {

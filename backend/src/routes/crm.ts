@@ -1922,6 +1922,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
     const mode = (req.query.mode as string || 'preview').toLowerCase();
     const socketId = req.body.socketId;
     const forceRematch = req.body.forceRematch === true;
+    const leadIds: string[] | undefined = Array.isArray(req.body.leadIds) ? req.body.leadIds : undefined;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1976,21 +1977,26 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       lastKey = result.lastEvaluatedKey;
     } while (lastKey);
 
+    // Filter by specific leadIds if provided
+    const leadPool = leadIds && leadIds.length > 0
+      ? allLeads.filter(lead => leadIds.includes(lead.leadId))
+      : allLeads;
+
     // Filter leads based on forceRematch flag
     const leadsToProcess = forceRematch
-      ? allLeads // Process all leads if force rematch
-      : allLeads.filter(lead => !lead.icpMatch); // Only unmatched leads by default
+      ? leadPool // Process all leads if force rematch
+      : leadPool.filter(lead => !lead.icpMatch); // Only unmatched leads by default
 
-    const unmatchedLeads = allLeads.filter(lead => !lead.icpMatch);
+    const unmatchedLeads = leadPool.filter(lead => !lead.icpMatch);
 
     console.log(`[ICP Match] Found ${leadsToProcess.length} leads to process (forceRematch: ${forceRematch}). ${unmatchedLeads.length} unmatched, ${allLeads.length - unmatchedLeads.length} already matched.`);
 
     if (mode === 'preview') {
       return res.json({
         success: true,
-        totalLeads: allLeads.length,
+        totalLeads: leadPool.length,
         unmatchedLeads: unmatchedLeads.length,
-        matchedLeads: allLeads.length - unmatchedLeads.length,
+        matchedLeads: leadPool.length - unmatchedLeads.length,
         leadsToProcess: leadsToProcess.length,
         forceRematch,
       });
@@ -2181,6 +2187,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     const mode = (req.query.mode as string || 'preview').toLowerCase();
     const socketId = req.body.socketId;
     const forceEnrich = req.body.forceEnrich === true;
+    const leadIds: string[] | undefined = Array.isArray(req.body.leadIds) ? req.body.leadIds : undefined;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -2228,6 +2235,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         outputFields,
         sources,
         forceOverwrite: forceEnrich,
+        leadIds,
       });
 
       return res.json({
@@ -2250,6 +2258,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
         outputFields,
         sources,
         forceOverwrite: forceEnrich,
+        leadIds,
       }, socketId);
 
       return res.json({

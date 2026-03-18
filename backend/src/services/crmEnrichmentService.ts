@@ -33,6 +33,7 @@ export interface EnrichmentJobSpec {
   sources: ('web_search' | 'linkedin' | 'existing_data')[];
   filters?: { field: string; operator: string; value?: any }[];
   forceOverwrite?: boolean;
+  leadIds?: string[];
 }
 
 interface EnrichmentPreviewResult {
@@ -58,7 +59,7 @@ interface EnrichmentExecuteResult {
 }
 
 export class CrmEnrichmentService {
-  private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<{ allLeads: any[]; leadsToProcess: any[]; alreadyEnriched: number }> {
+  private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<{ allLeads: any[]; leadsToProcess: any[]; alreadyEnriched: number; filteredTotal: number }> {
     const list = await crmDb.getLeadListById(spec.listId);
     if (!list) {
       throw new Error('Lead list not found');
@@ -73,10 +74,14 @@ export class CrmEnrichmentService {
       lastKey = result.lastEvaluatedKey;
     } while (lastKey);
 
+    // Filter by specific leadIds if provided
+    let filtered = spec.leadIds && spec.leadIds.length > 0
+      ? allLeads.filter(lead => spec.leadIds!.includes(lead.leadId))
+      : allLeads;
+
     // Apply filters
-    let filtered = allLeads;
     if (spec.filters && spec.filters.length > 0) {
-      filtered = allLeads.filter(lead => {
+      filtered = filtered.filter(lead => {
         return spec.filters!.every(filter => {
           const value = lead[filter.field] ?? lead?.customFields?.[filter.field];
           switch (filter.operator) {
@@ -103,7 +108,7 @@ export class CrmEnrichmentService {
       ? filtered
       : filtered.filter(lead => !hasAllFields(lead));
 
-    return { allLeads, leadsToProcess, alreadyEnriched };
+    return { allLeads, leadsToProcess, alreadyEnriched, filteredTotal: filtered.length };
   }
 
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
@@ -353,7 +358,7 @@ Valid example:
   }
 
   async preview(spec: EnrichmentJobSpec): Promise<EnrichmentPreviewResult> {
-    const { allLeads, leadsToProcess, alreadyEnriched } = await this.loadAndFilterLeads(spec);
+    const { allLeads, leadsToProcess, alreadyEnriched, filteredTotal } = await this.loadAndFilterLeads(spec);
 
     // Process up to 2 samples
     const samples: EnrichmentPreviewResult['samples'] = [];
@@ -377,7 +382,7 @@ Valid example:
     }
 
     return {
-      totalLeads: allLeads.length,
+      totalLeads: spec.leadIds ? filteredTotal : allLeads.length,
       leadsToProcess: leadsToProcess.length,
       alreadyEnriched,
       samples,
