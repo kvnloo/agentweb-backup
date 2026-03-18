@@ -9,6 +9,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-18',
     changes: [
+      'Feature: Emma Chat — Configurable Default Model for Customer Support Agent',
+      '- Admins can now set a dedicated default LLM model for Emma Chat (the customer support sidebar) from the Agent Mode tab in Admin Dashboard',
+      '- When configured, the customer portal Emma Chat automatically defaults to the selected model instead of the general Agent Mode default',
+      '- Falls back to the general default model if no customer support model is configured',
       'Feature: Agent Mode — Stop Response Button',
       '- Users can now stop an in-progress Agent Mode response by clicking the red stop button that replaces the send button during generation',
       '- Cancellation propagates through the backend worker process, stopping LLM calls and tool executions at the next iteration boundary',
