@@ -53,6 +53,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- New "set_lead_contact_status" tool allows Emma to mark leads as Do Not Contact or reactivate them',
       '- Supports bulk updates for up to 200 leads at once',
       '- Emma blocks email sends and draft creation for Do Not Contact leads with a clear error message',
+      'Feature: Agent Mode — Backup Model Fallback',
+      '- When the primary LLM model fails with a transient error (timeout, rate limit, server error), Agent Mode automatically retries with a configured backup model',
+      '- Conversation context is fully preserved when switching models — no work is lost from the timed-out request',
+      '- Admins can configure the backup model in Admin Dashboard → Agent Mode tab',
+      '- Default is no backup model; admin must explicitly select one',
+      '- The default model and backup model dropdowns prevent selecting the same model for both',
+      '- A toast notification informs the user when the backup model is activated during a session',
     ],
   },
   {

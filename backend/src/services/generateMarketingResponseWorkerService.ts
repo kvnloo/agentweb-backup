@@ -23,6 +23,9 @@ interface GenerateMarketingResponseResult {
   sources: string[];
   responseMessages: any[];
   cancelled?: boolean;
+  backupModelUsed?: boolean;
+  originalModel?: string;
+  backupModel?: string;
 }
 
 export class GenerateMarketingResponseWorkerService {
