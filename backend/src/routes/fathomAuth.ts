@@ -97,7 +97,7 @@ router.get('/init', authenticateToken, async (req: any, res) => {
 });
 
 // GET /callback — Fathom redirects here after user authorizes
-// Mounted at both /api/oauth/fathom/callback and /api/oauth/callback/fathom
+// Mounted at /api/oauth/fathom/callback (same pattern as all other integrations)
 router.get('/callback', (req, res) => {
   const { code, state, error } = req.query;
   const frontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
