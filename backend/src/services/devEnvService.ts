@@ -476,25 +476,33 @@ export async function launchEnvironment(
       .promise();
 
     // Open ports 22 (SSH) and 5175 (test-env-access / IP registration) to the world
-    await ec2
-      .authorizeSecurityGroupIngress({
-        GroupId: sgId,
-        IpPermissions: [
-          {
-            IpProtocol: "tcp",
-            FromPort: 22,
-            ToPort: 22,
-            IpRanges: [{ CidrIp: "0.0.0.0/0" }],
-          },
-          {
-            IpProtocol: "tcp",
-            FromPort: 5175,
-            ToPort: 5175,
-            IpRanges: [{ CidrIp: "0.0.0.0/0" }],
-          },
-        ],
-      })
-      .promise();
+    try {
+      await ec2
+        .authorizeSecurityGroupIngress({
+          GroupId: sgId,
+          IpPermissions: [
+            {
+              IpProtocol: "tcp",
+              FromPort: 22,
+              ToPort: 22,
+              IpRanges: [{ CidrIp: "0.0.0.0/0" }],
+            },
+            {
+              IpProtocol: "tcp",
+              FromPort: 5175,
+              ToPort: 5175,
+              IpRanges: [{ CidrIp: "0.0.0.0/0" }],
+            },
+          ],
+        })
+        .promise();
+    } catch (ruleErr: any) {
+      if (ruleErr.code === "InvalidPermission.Duplicate") {
+        console.log(`[devEnv] SG ingress rules already exist, skipping`);
+      } else {
+        throw ruleErr;
+      }
+    }
 
     // 4. Read user-data script
     const userDataPath = path.resolve(
