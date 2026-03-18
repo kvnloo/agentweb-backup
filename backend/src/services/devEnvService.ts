@@ -435,14 +435,33 @@ export async function launchEnvironment(
 
     // 3. Create security group (port 5175 open to 0.0.0.0/0 only)
     const sgName = `agentweb-test-env-notion-${notionPageId.replace(/-/g, "").slice(0, 20)}`;
-    const sgRes = await ec2
-      .createSecurityGroup({
-        GroupName: sgName,
-        Description: `AgentWeb dev env for Notion page ${notionPageId}`,
-        VpcId: vpcId,
-      })
-      .promise();
-    const sgId = sgRes.GroupId!;
+    let sgId: string;
+    try {
+      const sgRes = await ec2
+        .createSecurityGroup({
+          GroupName: sgName,
+          Description: `AgentWeb dev env for Notion page ${notionPageId}`,
+          VpcId: vpcId,
+        })
+        .promise();
+      sgId = sgRes.GroupId!;
+    } catch (sgErr: any) {
+      if (sgErr.code === "InvalidGroup.Duplicate") {
+        // Reuse existing SG from a previous failed launch attempt
+        const existing = await ec2
+          .describeSecurityGroups({
+            Filters: [
+              { Name: "group-name", Values: [sgName] },
+              { Name: "vpc-id", Values: [vpcId] },
+            ],
+          })
+          .promise();
+        sgId = existing.SecurityGroups?.[0]?.GroupId!;
+        console.log(`[devEnv] Reusing existing security group: ${sgId}`);
+      } else {
+        throw sgErr;
+      }
+    }
     console.log(`[devEnv] Security group: ${sgId}`);
 
     // Tag the security group
