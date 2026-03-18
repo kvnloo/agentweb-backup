@@ -44,6 +44,9 @@ jest.mock('../utils/sseProgress', () => ({
   },
   emitProgress: jest.fn(),
   hasActiveProgress: jest.fn().mockReturnValue(false),
+  requestCancel: jest.fn(),
+  clearCancel: jest.fn(),
+  isCancelled: jest.fn().mockReturnValue(false),
 }));
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;

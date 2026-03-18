@@ -37,7 +37,10 @@ jest.mock('../utils/sseProgress', () => ({
   registerProgressCallback: jest.fn(),
   getLatestProgress: jest.fn(),
   cleanupProgress: jest.fn(),
-  progressStore: new Map()
+  progressStore: new Map(),
+  requestCancel: jest.fn(),
+  clearCancel: jest.fn(),
+  isCancelled: jest.fn().mockReturnValue(false),
 }));
 
 interface User {
