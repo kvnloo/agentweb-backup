@@ -17,6 +17,15 @@
 #   agentweb/test-env/claude-code-env  — Claude Code Bedrock config
 set -euxo pipefail
 
+###############################################################################
+# 0. Create swap space (prevents OOM when tsc + Claude + services run together)
+###############################################################################
+fallocate -l 4G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
 REGION="${AWS_REGION:-us-west-2}"
 APP_DIR="/home/ec2-user/agentweb"
 LOG_DIR="$APP_DIR/logs"

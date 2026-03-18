@@ -3,6 +3,13 @@
 # (no Docker needed — dev servers run directly on the instance)
 set -euxo pipefail
 
+# Create swap space (prevents OOM when tsc + Claude + services run together)
+fallocate -l 4G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
 # Install dev tools: git, tmux, rsync, cron, build tools for native npm modules
 # Also install Playwright system dependencies for browser MCP
 dnf install -y git tmux rsync cronie gcc-c++ make \
