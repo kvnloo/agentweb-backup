@@ -173,6 +173,7 @@ describe('CRM Group Email Endpoints', () => {
         totalLeads: 4,
         eligibleLeads: 2,
         unsubscribedCount: 1,
+        doNotContactCount: 1,
         noEmailCount: 1,
       });
     });
@@ -199,6 +200,7 @@ describe('CRM Group Email Endpoints', () => {
         totalLeads: 2,
         eligibleLeads: 2,
         unsubscribedCount: 0,
+        doNotContactCount: 0,
         noEmailCount: 0,
       });
     });
@@ -531,9 +533,9 @@ describe('CRM Public Unsubscribe Endpoints', () => {
         'get'
       );
       await handler!(mockReq, mockRes);
-      expect(mockRes.json).toHaveBeenCalledWith({
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
         unsubscribed: true,
-      });
+      }));
     });
   });
 
@@ -577,10 +579,13 @@ describe('CRM Public Unsubscribe Endpoints', () => {
       );
       await handler!(mockReq, mockRes);
 
-      expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', {
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
         unsubscribedFromGroupEmail: true,
         unsubscribedFromGroupEmailAt: expect.any(String),
-      });
+        contactStatus: 'unsubscribed',
+        contactStatusReason: 'opted-out',
+        contactStatusUpdatedBy: 'lead-self',
+      }));
       expect(mockRes.json).toHaveBeenCalledWith({
         message: 'Successfully unsubscribed',
       });
@@ -604,9 +609,13 @@ describe('CRM Public Unsubscribe Endpoints', () => {
       expect(handler).toBeTruthy();
       await handler!(mockReq, mockRes);
 
-      expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', {
+      expect(crmDb.updateLead).toHaveBeenCalledWith('list-1', 'lead-1', expect.objectContaining({
         unsubscribedFromGroupEmail: false,
-      });
+        contactStatus: 'active',
+        contactStatusReason: null,
+        contactStatusNote: null,
+        contactStatusUpdatedBy: 'lead-self',
+      }));
       expect(mockRes.json).toHaveBeenCalledWith({
         message: 'Successfully resubscribed',
       });

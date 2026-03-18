@@ -5997,6 +5997,92 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  public async setLeadContactStatus(
+    listId: string,
+    leadIds: string[],
+    contactStatus: string,
+    contactStatusReason: string | undefined,
+    contactStatusNote: string | undefined,
+    userId: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const { isDoNotContact } = await import('../utils/leadContactStatus');
+
+      const validStatuses = ['active', 'do-not-contact', 'unsubscribed'];
+      if (!validStatuses.includes(contactStatus)) {
+        return { success: false, message: `contactStatus must be one of: ${validStatuses.join(', ')}` };
+      }
+
+      const validReasons = ['opted-out', 'bounced', 'requested-removal', 'admin-flagged', 'compliance', 'other'];
+      if (contactStatusReason && !validReasons.includes(contactStatusReason)) {
+        return { success: false, message: `contactStatusReason must be one of: ${validReasons.join(', ')}` };
+      }
+
+      if (!leadIds || leadIds.length === 0) {
+        return { success: false, message: 'No lead IDs provided' };
+      }
+      if (leadIds.length > 200) {
+        return { success: false, message: 'Maximum 200 leads per call' };
+      }
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied' };
+      }
+
+      const now = new Date().toISOString();
+      let updated = 0;
+      let failed = 0;
+      const errors: string[] = [];
+
+      for (const leadId of leadIds) {
+        try {
+          const updates: any = {
+            contactStatus,
+            contactStatusUpdatedAt: now,
+            contactStatusUpdatedBy: userId,
+          };
+          if (contactStatusReason) {
+            updates.contactStatusReason = contactStatusReason;
+          }
+          if (contactStatusNote) {
+            updates.contactStatusNote = contactStatusNote;
+          }
+          if (contactStatus === 'active') {
+            updates.unsubscribedFromGroupEmail = false;
+            updates.contactStatusReason = null;
+            updates.contactStatusNote = null;
+          }
+          if (contactStatus === 'do-not-contact' || contactStatus === 'unsubscribed') {
+            updates.unsubscribedFromGroupEmail = true;
+            updates.unsubscribedFromGroupEmailAt = now;
+          }
+          await crmDb.updateLead(listId, leadId, updates);
+          updated++;
+        } catch (err) {
+          failed++;
+          errors.push(`${leadId}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
+      }
+
+      return {
+        success: true,
+        message: `Contact status updated: ${updated} succeeded, ${failed} failed out of ${leadIds.length}`,
+        updated,
+        failed,
+        total: leadIds.length,
+        ...(errors.length > 0 ? { errors } : {}),
+      };
+    } catch (error) {
+      console.error('AgentMode: Error setting lead contact status:', error);
+      return { success: false, message: 'Failed to set contact status', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   public async deleteLeads(listId: string, leadIds: string[], userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -6550,6 +6636,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
         return { success: false, message: 'No email address', error: 'This lead does not have an email address' };
       }
 
+      // Check do-not-contact status
+      const { isDoNotContact, getDoNotContactReason } = await import('../utils/leadContactStatus');
+      if (isDoNotContact(lead)) {
+        const reason = getDoNotContactReason(lead);
+        return { success: false, message: 'Do not contact', error: `Cannot send email to this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.` };
+      }
+
       if (!lead.emailDraft) {
         return { success: false, message: 'No email draft', error: 'This lead does not have an email draft. Use update_email_draft_for_lead to create one first.' };
       }
@@ -6801,6 +6894,17 @@ When a user requests client onboarding or says "onboard new client" or similar:
           success: false,
           message: 'Lead not found',
           error: 'The specified lead does not exist'
+        };
+      }
+
+      // Check do-not-contact status
+      const { isDoNotContact: isDNC, getDoNotContactReason: getDNCReason } = await import('../utils/leadContactStatus');
+      if (isDNC(lead)) {
+        const reason = getDNCReason(lead);
+        return {
+          success: false,
+          message: 'Do not contact',
+          error: `Cannot draft email for this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.`
         };
       }
 
