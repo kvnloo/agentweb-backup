@@ -749,8 +749,9 @@ export class AgentModeService {
     mockMode: boolean = false,
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
     socketEmit?: (room: string, event: string, payload: any) => void,
-    isInteractiveShare: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
+    isInteractiveShare: boolean = false,
+    isCancelled?: () => boolean
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean }> {
     try {
       // Track memory usage for optimization
       const startMemory = process.memoryUsage();
@@ -859,7 +860,18 @@ export class AgentModeService {
       let maxTokensContinuations = 0;
       const MAX_TOKEN_CONTINUATIONS = 3;
 
+      let wasCancelled = false;
       while (iteration < maxIterations) {
+        // Check for cancellation before each iteration
+        if (isCancelled?.()) {
+          console.log(`AgentMode: Generation cancelled for session ${sessionId} at iteration ${iteration}`);
+          wasCancelled = true;
+          if (!content) {
+            content = 'Generation was stopped.';
+          }
+          break;
+        }
+
         iteration++;
 
         // 4. Refresh Context if Skills Changed
@@ -1275,7 +1287,8 @@ export class AgentModeService {
         toolCalls,
         knowledgeBaseQueries,
         sources,
-        responseMessages
+        responseMessages,
+        ...(wasCancelled ? { cancelled: true } : {})
       };
     } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);

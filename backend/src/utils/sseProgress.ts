@@ -71,3 +71,18 @@ export function cleanupProgress(sessionId: string) {
   activeConnections.delete(sessionId);
   progressStore.delete(sessionId);
 }
+
+// Cancel store - tracks sessions whose generation should be stopped
+const cancelledSessions = new Set<string>();
+
+export function requestCancel(sessionId: string) {
+  cancelledSessions.add(sessionId);
+}
+
+export function isCancelled(sessionId: string): boolean {
+  return cancelledSessions.has(sessionId);
+}
+
+export function clearCancel(sessionId: string) {
+  cancelledSessions.delete(sessionId);
+}

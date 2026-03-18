@@ -11,7 +11,7 @@ import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { emitProgress, registerProgressCallback, getLatestProgress, progressStore } from '../utils/sseProgress';
+import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
@@ -1158,6 +1158,9 @@ export async function generateSessionResponse(
   workPlan?: any;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
 }> {
+  // Clear any stale cancel from a previous request on this session
+  clearCancel(sessionId);
+
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
   if (!session) {
@@ -1263,7 +1266,27 @@ export async function generateSessionResponse(
   );
 
   // Add all response messages to session (includes assistant responses and tool calls)
-  await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+  if (response.responseMessages.length > 0) {
+    await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+  }
+
+  // If cancelled, add a stopped indicator message
+  if (response.cancelled) {
+    const stoppedMessage: ChatMessage = {
+      role: 'assistant',
+      content: response.content || 'Generation was stopped.',
+      timestamp: new Date().toISOString(),
+      metadata: {
+        timestamp: new Date().toISOString(),
+        stopped: true,
+      },
+    };
+    // Only add if we didn't already have response messages (avoid duplicate content)
+    if (response.responseMessages.length === 0) {
+      await chatbotDb.addMessageToSession(sessionId, stoppedMessage);
+    }
+    clearCancel(sessionId);
+  }
 
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
@@ -2274,6 +2297,56 @@ export const agentModeController = {
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
+    }
+  },
+
+  // Stop generation for a session
+  async stopGeneration(req: Request, res: Response) {
+    try {
+      const { sessionId } = req.params;
+
+      // Signal cancellation
+      requestCancel(sessionId);
+      generateMarketingResponseWorkerService.cancelSession(sessionId);
+
+      // Emit complete progress so the frontend SSE stream gets the signal
+      emitProgress(sessionId, { iteration: 0, status: 'complete' });
+      progressStore.delete(sessionId);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Stop generation error:', error);
+      res.status(500).json({ error: 'Failed to stop generation' });
+    }
+  },
+
+  // Stop generation for an interactive shared session (public)
+  async stopGenerationPublic(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+
+      if (!shareId || !conversable) {
+        return res.status(400).json({ error: 'Session ID and conversable token are required' });
+      }
+
+      // Verify session exists and conversable token is valid
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session || !session.interactiveShareMetadata?.isActive) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Signal cancellation
+      requestCancel(shareId);
+      generateMarketingResponseWorkerService.cancelSession(shareId);
+
+      emitProgress(shareId, { iteration: 0, status: 'complete' });
+      progressStore.delete(shareId);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Stop generation (public) error:', error);
+      res.status(500).json({ error: 'Failed to stop generation' });
     }
   },
 
