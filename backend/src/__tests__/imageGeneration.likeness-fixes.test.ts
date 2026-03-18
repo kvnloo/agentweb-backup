@@ -116,7 +116,7 @@ describe('ImageService - Likeness Fixes', () => {
   });
 
   describe('Fix C: Generation timeout', () => {
-    it('should timeout if generation takes longer than 5 minutes', async () => {
+    it('should timeout if generation takes longer than 10 minutes', async () => {
       // Note: This test verifies timeout mechanism exists but uses short timeout for testing
       // Create a new instance with shorter timeout for testing
       const testImageService = new ImageService();
