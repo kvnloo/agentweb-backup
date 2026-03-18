@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-18',
+    changes: [
+      'Improvement: Agent Mode — Better Stop Signal Handling',
+      '- Agent Mode now reads the native stop reason from each LLM provider (Bedrock/Claude, OpenAI, Gemini) instead of relying solely on the absence of tool calls',
+      '- Truncated responses (max_tokens) are automatically continued up to 3 times, preventing incomplete answers from being returned',
+      '- Content filter blocks now show a clear user-facing message instead of returning empty or partial responses',
+      '- Added diagnostic logging for non-normal stop reasons to aid debugging',
+    ],
+  },
+  {
     date: '2026-03-17',
     changes: [
       'Fix: CRM — Bulk Delete-by-Filter Tool for Lead Management',
