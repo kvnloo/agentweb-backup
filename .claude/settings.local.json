@@ -20,6 +20,7 @@
       "Bash(grep:*)",
       "Bash(ls:*)",
       "Bash(curl:*)",
+      "Bash(aws:*)",
       "Bash(aws apigatewayv2 get-apis:*)",
       "Bash(aws lambda list-functions:*)",
       "Bash(aws lambda get-function-configuration:*)",
