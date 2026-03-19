@@ -212,8 +212,8 @@ describe('Client Health - listAllClients', () => {
     expect(result.error).toMatch(/admin/i);
   });
 
-  // FAIL test 2: No clients found (all users are admins)
-  it('should return empty list when no non-admin users exist', async () => {
+  // FAIL test 2: Should return admin users as well
+  it('should return admin users in the list', async () => {
     const adminUserId = 'admin-user';
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
       userId: adminUserId,
@@ -223,11 +223,13 @@ describe('Client Health - listAllClients', () => {
     (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
       { userId: adminUserId, email: 'admin@example.com', isAdmin: true },
     ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
 
     const result = await listAllClients(adminUserId);
 
     expect(result.success).toBe(true);
-    expect(result.clients).toEqual([]);
+    expect(result.clients).toHaveLength(1);
+    expect(result.clients[0].email).toBe('admin@example.com');
   });
 
   // FAIL test 3: Error handling when DB fails
@@ -246,8 +248,8 @@ describe('Client Health - listAllClients', () => {
     expect(result.error).toMatch(/failed/i);
   });
 
-  // SUCCESS test: Returns client list with health indicators
-  it('should return all non-admin clients with health indicators', async () => {
+  // SUCCESS test: Returns client list with health indicators (including admins)
+  it('should return all clients (including admins) with health indicators', async () => {
     const adminUserId = 'admin-user';
     (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
       userId: adminUserId,
@@ -277,6 +279,7 @@ describe('Client Health - listAllClients', () => {
     ]);
 
     (getAccountsByUserId as jest.Mock)
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([
         { platform: 'meta', account_id: 'meta-1', account_name: 'Meta', config: { account_type: 'ad_account' } },
       ])
@@ -285,10 +288,11 @@ describe('Client Health - listAllClients', () => {
     const result = await listAllClients(adminUserId);
 
     expect(result.success).toBe(true);
-    expect(result.clients).toHaveLength(2);
-    expect(result.clients[0].email).toBe('client1@example.com');
-    expect(result.clients[0].has_ads).toBe(true);
-    expect(result.clients[1].email).toBe('client2@example.com');
-    expect(result.clients[1].has_ads).toBe(false);
+    expect(result.clients).toHaveLength(3);
+    expect(result.clients[0].email).toBe('admin@example.com');
+    expect(result.clients[1].email).toBe('client1@example.com');
+    expect(result.clients[1].has_ads).toBe(true);
+    expect(result.clients[2].email).toBe('client2@example.com');
+    expect(result.clients[2].has_ads).toBe(false);
   });
 });
