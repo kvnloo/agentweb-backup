@@ -33,18 +33,15 @@ jobs:
         with:
           fetch-depth: 100
 
-      - name: Paths filter (scheduled)
+      - name: Check changes (scheduled)
         if: github.event_name == 'schedule'
         id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          base: HEAD~10
-          filters: |
-            backend:
-              - 'backend/**'
-            partner:
-              - 'partner-portal/**'
+        run: |
+          BASE=$(git rev-parse HEAD~10 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          BACKEND=$(git diff --name-only "$BASE" HEAD -- backend/ | head -1)
+          PARTNER=$(git diff --name-only "$BASE" HEAD -- partner-portal/ | head -1)
+          echo "backend=$( [ -n \"$BACKEND\" ] && echo true || echo false )" >> $GITHUB_OUTPUT
+          echo "partner=$( [ -n \"$PARTNER\" ] && echo true || echo false )" >> $GITHUB_OUTPUT
 
       - name: Deploy all (manual trigger)
         if: github.event_name == 'workflow_dispatch'
