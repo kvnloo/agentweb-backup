@@ -96,9 +96,13 @@ import {
   BrandContext,
 } from "../services/v0Service";
 
+import { setV0PollIntervals } from "../services/v0Service";
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockGetV0ApiKey.mockResolvedValue("test-v0-api-key");
+  // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
+  setV0PollIntervals([0, 0, 0, 0, 0]);
 });
 
 // =============================================================================
@@ -311,7 +315,7 @@ describe("v0Service - deployLandingPage", () => {
     );
   });
 
-  it("FAIL: no latestVersion on chat → throws no version", async () => {
+  it("FAIL: no latestVersion on chat → polls then throws no version", async () => {
     mockGet.mockReturnValueOnce({
       promise: () =>
         Promise.resolve({
@@ -325,11 +329,52 @@ describe("v0Service - deployLandingPage", () => {
         }),
     });
 
-    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1" }); // no latestVersion
+    // Return no latestVersion for all poll attempts
+    mockChatsGetById.mockResolvedValue({ id: "chat_1" }); // no latestVersion
 
     await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
       "No version found"
     );
+
+    // Verify it polled multiple times (5 attempts with zero-delay intervals)
+    expect(mockChatsGetById).toHaveBeenCalledTimes(5);
+
+    // Reset to default after test
+    mockChatsGetById.mockReset();
+  });
+
+  it("SUCCESS: polls until version becomes available on 3rd attempt", async () => {
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            status: "draft",
+            v0ProjectId: "proj_1",
+            v0ChatId: "chat_1",
+          },
+        }),
+    });
+
+    // First 2 poll attempts return no version, 3rd succeeds
+    mockChatsGetById
+      .mockResolvedValueOnce({ id: "chat_1" }) // no latestVersion
+      .mockResolvedValueOnce({ id: "chat_1" }) // no latestVersion
+      .mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+
+    // Mock the rest of the deploy pipeline to fail fast (we only care about polling)
+    mockChatsDownloadVersion.mockRejectedValueOnce(
+      new Error("Download version API error")
+    );
+
+    // It should get past polling and fail at download step
+    await expect(deployLandingPage("page-1", "user-1")).rejects.toThrow(
+      "Deployment failed"
+    );
+
+    // Verify it polled 3 times before finding the version
+    expect(mockChatsGetById).toHaveBeenCalledTimes(3);
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
