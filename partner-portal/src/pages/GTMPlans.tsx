@@ -57,6 +57,9 @@ import {
   VisibilityOff as VisibilityOffIcon,
   SmartToy as SmartToyIcon,
   Send as SendIcon,
+  AttachFile as AttachFileIcon,
+  InsertDriveFile as InsertDriveFileIcon,
+  Close as CloseIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
@@ -65,6 +68,15 @@ import { io, Socket } from "socket.io-client";
 import ReactMarkdown from "react-markdown";
 import { useAuth } from "../contexts/AuthContext";
 import { buildApiUrl, API_URL } from "../config";
+
+interface WorkItemAttachment {
+  id: string;
+  filename: string;
+  size: number;
+  contentType: string;
+  url: string;
+  uploadedAt: string;
+}
 
 interface WorkItem {
   id: string;
@@ -77,6 +89,7 @@ interface WorkItem {
   dueDate?: string;
   completedAt?: string;
   agentSessionId?: string;
+  attachments?: WorkItemAttachment[];
 }
 
 interface Phase {
@@ -232,7 +245,7 @@ export default function GTMPlans() {
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [chatDialogSessionId, setChatDialogSessionId] = useState("");
   const [chatDialogTitle, setChatDialogTitle] = useState("");
-  const [chatMessages, setChatMessages] = useState<Array<{ role: string; content: string }>>([]);
+  const [chatMessages, setChatMessages] = useState<Array<{ role: string; content: string; metadata?: { attachments?: Array<{ url: string; filename: string; size: number; mimetype: string }> } }>>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatLoadingMessages, setChatLoadingMessages] = useState(false);
@@ -559,6 +572,74 @@ export default function GTMPlans() {
     } finally {
       setStartingSession(null);
     }
+  };
+
+  const handleUploadAttachment = async (planId: string, phaseId: string, workItemId: string, file: File) => {
+    if (!token) return;
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/gtm-plans/${planId}/phases/${phaseId}/work-items/${workItemId}/attachments`),
+        formData,
+        { headers: { Authorization: `Bearer ${token}`, "Content-Type": "multipart/form-data" } }
+      );
+      const att = response.data.data;
+      setPlans((prev) =>
+        prev.map((p) =>
+          p.planId !== planId ? p : {
+            ...p,
+            phases: p.phases.map((ph) =>
+              ph.id !== phaseId ? ph : {
+                ...ph,
+                workItems: ph.workItems.map((item) =>
+                  item.id !== workItemId ? item : { ...item, attachments: [...(item.attachments || []), att] }
+                ),
+              }
+            ),
+          }
+        )
+      );
+      setSuccessMessage("Attachment uploaded");
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err: any) {
+      setError(err.response?.data?.error || "Failed to upload attachment");
+    }
+  };
+
+  const handleDeleteAttachment = async (planId: string, phaseId: string, workItemId: string, attachmentId: string) => {
+    if (!token) return;
+    try {
+      await axios.delete(
+        buildApiUrl(`/api/admin/gtm-plans/${planId}/phases/${phaseId}/work-items/${workItemId}/attachments/${attachmentId}`),
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setPlans((prev) =>
+        prev.map((p) =>
+          p.planId !== planId ? p : {
+            ...p,
+            phases: p.phases.map((ph) =>
+              ph.id !== phaseId ? ph : {
+                ...ph,
+                workItems: ph.workItems.map((item) =>
+                  item.id !== workItemId ? item : { ...item, attachments: (item.attachments || []).filter((a) => a.id !== attachmentId) }
+                ),
+              }
+            ),
+          }
+        )
+      );
+      setSuccessMessage("Attachment deleted");
+      setTimeout(() => setSuccessMessage(null), 3000);
+    } catch (err: any) {
+      setError(err.response?.data?.error || "Failed to delete attachment");
+    }
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
   const handleEditClick = (
@@ -1717,6 +1798,22 @@ export default function GTMPlans() {
                                           {item.description}
                                         </Typography>
                                       )}
+                                      {item.attachments && item.attachments.length > 0 && (
+                                        <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mt: 0.5 }}>
+                                          {item.attachments.map((att) => (
+                                            <Chip
+                                              key={att.id}
+                                              icon={<InsertDriveFileIcon />}
+                                              label={att.filename}
+                                              size="small"
+                                              variant="outlined"
+                                              onDelete={() => handleDeleteAttachment(plan.planId, phase.id, item.id, att.id)}
+                                              deleteIcon={<CloseIcon sx={{ fontSize: 14 }} />}
+                                              sx={{ maxWidth: 200 }}
+                                            />
+                                          ))}
+                                        </Box>
+                                      )}
                                     </TableCell>
                                     <TableCell>
                                       <Chip
@@ -1843,6 +1940,24 @@ export default function GTMPlans() {
                                             }
                                           >
                                             <CalendarTodayIcon fontSize="small" />
+                                          </IconButton>
+                                        </Tooltip>
+                                        <Tooltip title={`Attach Files${item.attachments?.length ? ` (${item.attachments.length})` : ""}`}>
+                                          <IconButton
+                                            size="small"
+                                            component="label"
+                                          >
+                                            <input
+                                              type="file"
+                                              hidden
+                                              multiple
+                                              onChange={(e) => {
+                                                const files = Array.from(e.target.files || []);
+                                                files.forEach((file) => handleUploadAttachment(plan.planId, phase.id, item.id, file));
+                                                e.target.value = "";
+                                              }}
+                                            />
+                                            <AttachFileIcon fontSize="small" />
                                           </IconButton>
                                         </Tooltip>
                                       </Box>
@@ -2607,9 +2722,33 @@ export default function GTMPlans() {
                     {message.role === "assistant" ? (
                       <ReactMarkdown>{message.content || ""}</ReactMarkdown>
                     ) : (
-                      <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
-                        {message.content}
-                      </Typography>
+                      <>
+                        <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+                          {message.content}
+                        </Typography>
+                        {message.metadata?.attachments && message.metadata.attachments.length > 0 && (
+                          <Box sx={{ mt: 1, display: "flex", flexDirection: "column", gap: 0.5 }}>
+                            {message.metadata.attachments.map((att, i) => (
+                              <Box key={i} sx={{ display: "flex", alignItems: "center", gap: 0.5, opacity: 0.9 }}>
+                                <InsertDriveFileIcon sx={{ fontSize: 14 }} />
+                                <Typography
+                                  variant="caption"
+                                  component="a"
+                                  href={att.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  sx={{ color: "inherit", textDecoration: "underline", "&:hover": { opacity: 0.8 } }}
+                                >
+                                  {att.filename}
+                                </Typography>
+                                <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                                  ({formatFileSize(att.size)})
+                                </Typography>
+                              </Box>
+                            ))}
+                          </Box>
+                        )}
+                      </>
                     )}
                   </Paper>
                   {message.role === "user" && (
