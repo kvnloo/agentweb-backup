@@ -30,6 +30,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Moved list_all_clients and assess_client_health from "Other Skills" to the Admin Tools skill section',
       '- These admin-only tools were previously visible under "Other Skills" for all users on the Skills page',
       '- The list_all_clients tool now includes admin users in results for a complete account overview',
+      'Feature: GTM Tracker — File Attachments for Work Items',
+      '- Work items now support file attachments — upload files when creating a work item or add them to existing items',
+      '- Attachments are displayed as badges in the work item row with one-click delete',
+      '- When starting an Agent Mode session from a work item, attachments are passed to Emma as actual file attachments (not just links), so she can analyze their content',
+      '- The chat dialog for work item sessions now renders attached files on the user message bubble',
+      '- Supported in both the Customer Portal and Partner Portal GTM Tracker pages',
     ],
   },
   {

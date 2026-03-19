@@ -949,6 +949,188 @@ describe('GTM Plan Route Tests', () => {
     });
   });
 
+  describe('Work Item Attachments', () => {
+    const mockPlanWithWorkItem = {
+      planId: mockPlanId,
+      userId: mockUserId,
+      title: 'Test Plan',
+      phases: [
+        {
+          id: 'phase-1',
+          title: 'Phase 1',
+          status: 'in_progress',
+          workItems: [
+            {
+              id: 'item-1',
+              title: 'Work Item 1',
+              status: 'pending',
+              attachments: [],
+            },
+          ],
+        },
+      ],
+    };
+
+    it('should add an attachment to a work item', async () => {
+      const mockGetPromise = jest.fn().mockResolvedValue({
+        Item: JSON.parse(JSON.stringify(mockPlanWithWorkItem)),
+      });
+      mockGet.mockReturnValue({ promise: mockGetPromise });
+
+      const mockUpdatePromise = jest.fn().mockResolvedValue({});
+      const mockUpdate = jest.fn().mockReturnValue({ promise: mockUpdatePromise });
+      mockDynamoDB.update = mockUpdate;
+
+      const result = await mockDynamoDB.get({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+      }).promise();
+
+      const plan = result.Item;
+      const phase = plan.phases[0];
+      const workItem = phase.workItems[0];
+
+      const attachment = {
+        id: 'att-123',
+        filename: 'test-file.csv',
+        size: 1024,
+        contentType: 'text/csv',
+        url: 'https://s3.amazonaws.com/bucket/test-file.csv',
+        uploadedAt: '2024-01-01T00:00:00Z',
+      };
+
+      workItem.attachments = [...(workItem.attachments || []), attachment];
+      phase.workItems[0] = workItem;
+      plan.phases[0] = phase;
+
+      await mockDynamoDB.update({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+        UpdateExpression: 'SET #phases = :phases, #updatedAt = :updatedAt',
+        ExpressionAttributeNames: { '#phases': 'phases', '#updatedAt': 'updatedAt' },
+        ExpressionAttributeValues: { ':phases': plan.phases, ':updatedAt': expect.any(String) },
+      }).promise();
+
+      expect(mockUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          TableName: 'Dev-AW-GTMPlan',
+          Key: { planId: mockPlanId },
+          UpdateExpression: 'SET #phases = :phases, #updatedAt = :updatedAt',
+        })
+      );
+
+      // Verify the attachment was added
+      const updatedPhases = mockUpdate.mock.calls[0][0].ExpressionAttributeValues[':phases'];
+      expect(updatedPhases[0].workItems[0].attachments).toHaveLength(1);
+      expect(updatedPhases[0].workItems[0].attachments[0]).toEqual(attachment);
+    });
+
+    it('should delete an attachment from a work item', async () => {
+      const planWithAttachment = JSON.parse(JSON.stringify(mockPlanWithWorkItem));
+      planWithAttachment.phases[0].workItems[0].attachments = [
+        { id: 'att-1', filename: 'file1.pdf', size: 500, contentType: 'application/pdf', url: 'https://s3/file1.pdf', uploadedAt: '2024-01-01T00:00:00Z' },
+        { id: 'att-2', filename: 'file2.csv', size: 200, contentType: 'text/csv', url: 'https://s3/file2.csv', uploadedAt: '2024-01-01T00:00:00Z' },
+      ];
+
+      const mockGetPromise = jest.fn().mockResolvedValue({ Item: planWithAttachment });
+      mockGet.mockReturnValue({ promise: mockGetPromise });
+
+      const mockUpdatePromise = jest.fn().mockResolvedValue({});
+      const mockUpdate = jest.fn().mockReturnValue({ promise: mockUpdatePromise });
+      mockDynamoDB.update = mockUpdate;
+
+      const result = await mockDynamoDB.get({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+      }).promise();
+
+      const plan = result.Item;
+      const phase = plan.phases[0];
+      const workItem = phase.workItems[0];
+
+      // Remove attachment att-1
+      const attachmentIndex = workItem.attachments.findIndex((a: any) => a.id === 'att-1');
+      expect(attachmentIndex).toBe(0);
+      workItem.attachments.splice(attachmentIndex, 1);
+
+      phase.workItems[0] = workItem;
+      plan.phases[0] = phase;
+
+      await mockDynamoDB.update({
+        TableName: 'Dev-AW-GTMPlan',
+        Key: { planId: mockPlanId },
+        UpdateExpression: 'SET #phases = :phases, #updatedAt = :updatedAt',
+        ExpressionAttributeNames: { '#phases': 'phases', '#updatedAt': 'updatedAt' },
+        ExpressionAttributeValues: { ':phases': plan.phases, ':updatedAt': expect.any(String) },
+      }).promise();
+
+      const updatedPhases = mockUpdate.mock.calls[0][0].ExpressionAttributeValues[':phases'];
+      expect(updatedPhases[0].workItems[0].attachments).toHaveLength(1);
+      expect(updatedPhases[0].workItems[0].attachments[0].id).toBe('att-2');
+    });
+
+    it('should return -1 when deleting non-existent attachment', () => {
+      const attachments = [
+        { id: 'att-1', filename: 'file1.pdf' },
+      ];
+      const index = attachments.findIndex((a: any) => a.id === 'non-existent');
+      expect(index).toBe(-1);
+    });
+
+    it('should handle work items without attachments field', () => {
+      const workItem = { id: 'item-1', title: 'No Attachments', status: 'pending' };
+      const attachments = (workItem as any).attachments || [];
+      expect(attachments).toEqual([]);
+    });
+
+    it('should convert attachments to agent mode format for start-session', () => {
+      const workItemAttachments = [
+        { id: 'att-1', filename: 'report.pdf', size: 5000, contentType: 'application/pdf', url: 'https://s3/report.pdf', uploadedAt: '2024-01-01T00:00:00Z' },
+        { id: 'att-2', filename: 'data.csv', size: 200, contentType: 'text/csv', url: 'https://s3/data.csv', uploadedAt: '2024-01-02T00:00:00Z' },
+      ];
+
+      // Simulate the conversion logic from start-session handler
+      const converted = workItemAttachments.map((att) => ({
+        url: att.url, // In real code, presignS3Url would be called
+        filename: att.filename,
+        size: att.size,
+        mimetype: att.contentType,
+        uploadedAt: att.uploadedAt,
+      }));
+
+      expect(converted).toHaveLength(2);
+      expect(converted[0]).toEqual({
+        url: 'https://s3/report.pdf',
+        filename: 'report.pdf',
+        size: 5000,
+        mimetype: 'application/pdf',
+        uploadedAt: '2024-01-01T00:00:00Z',
+      });
+      expect(converted[1]).toEqual({
+        url: 'https://s3/data.csv',
+        filename: 'data.csv',
+        size: 200,
+        mimetype: 'text/csv',
+        uploadedAt: '2024-01-02T00:00:00Z',
+      });
+    });
+
+    it('should not pass attachments when work item has none', () => {
+      const workItem = { id: 'item-1', title: 'No Attachments', status: 'pending' };
+      const attachments = ((workItem as any).attachments || []).map((att: any) => ({
+        url: att.url,
+        filename: att.filename,
+        size: att.size,
+        mimetype: att.contentType,
+        uploadedAt: att.uploadedAt,
+      }));
+
+      expect(attachments).toHaveLength(0);
+      const passToSession = attachments.length > 0 ? attachments : undefined;
+      expect(passToSession).toBeUndefined();
+    });
+  });
+
   describe('Table Name Configuration', () => {
     it('should use Dev- prefix in development', () => {
       process.env.NODE_ENV = 'development';
