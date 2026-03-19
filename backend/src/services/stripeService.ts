@@ -1,7 +1,7 @@
 import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { userDb } from './db';
-import { getDefaultTierConfig, DEFAULT_PAGES } from './subscriptionService';
+import { getDefaultTierConfig } from './subscriptionService';
 
 dotenv.config();
 
@@ -182,12 +182,16 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
   }
 
   const freeTierConfig = getDefaultTierConfig('Free');
+  if (!freeTierConfig) {
+    console.error('Free tier config not found — cannot downgrade user on subscription deletion');
+    return;
+  }
 
   await userDb.updateUser(user.userId, {
     subscription_status: 'canceled',
     subscriptionType: 'Free',
-    allowedPages: freeTierConfig!.allowedPages,
-    allowedSkills: freeTierConfig!.allowedSkills,
+    allowedPages: freeTierConfig.allowedPages,
+    allowedSkills: freeTierConfig.allowedSkills,
   });
 
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
