@@ -1,7 +1,7 @@
 import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { userDb } from './db';
-import { getDefaultTierConfig } from './subscriptionService';
+import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 
 dotenv.config();
 
@@ -126,17 +126,15 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
 
   // Derive subscription tier from the price ID in the checkout session
   const subscriptionType = deriveSubscriptionType(session);
-  const tierConfig = getDefaultTierConfig(subscriptionType);
+  const tierConfig = await getTierConfig(subscriptionType);
 
   await userDb.updateUser(user.userId, {
     stripe_customer_id: stripeCustomerId,
     stripe_subscription_id: stripeSubscriptionId,
     subscriptionType,
     subscription_status: 'active',
-    ...(tierConfig && {
-      allowedPages: tierConfig.allowedPages,
-      allowedSkills: tierConfig.allowedSkills,
-    }),
+    allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+    allowedSkills: tierConfig?.allowedSkills ?? ['*'],
   });
 
   console.log(
@@ -181,17 +179,13 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     return;
   }
 
-  const freeTierConfig = getDefaultTierConfig('Free');
-  if (!freeTierConfig) {
-    console.error('Free tier config not found — cannot downgrade user on subscription deletion');
-    return;
-  }
+  const freeTierConfig = await getTierConfig('Free');
 
   await userDb.updateUser(user.userId, {
     subscription_status: 'canceled',
     subscriptionType: 'Free',
-    allowedPages: freeTierConfig.allowedPages,
-    allowedSkills: freeTierConfig.allowedSkills,
+    allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+    allowedSkills: freeTierConfig?.allowedSkills ?? [],
   });
 
   console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);

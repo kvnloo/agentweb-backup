@@ -61,9 +61,10 @@ jest.mock('../services/agentModeService', () => ({
 
 import { userDb } from '../services/db';
 import { waitlistDb } from '../services/waitlistDb';
+import { settingsService } from '../services/settingsService';
 import {
-  getDefaultTierConfig,
-  TIER_CONFIGS,
+  getTierConfig,
+  DEFAULT_PAGES,
 } from '../services/subscriptionService';
 import {
   handleCheckoutSessionCompleted,
@@ -72,6 +73,40 @@ import {
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
+const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
+
+// DB-driven subscription types (simulates what admin portal stores in DynamoDB)
+const DB_SUBSCRIPTION_TYPES = [
+  {
+    name: 'Free',
+    allowedPages: ['/', '/agent-mode', '/settings', '/guide'],
+    allowedSkills: [],
+  },
+  {
+    name: 'Basic',
+    allowedPages: [
+      '/', '/agent-mode', '/settings', '/guide',
+      '/brand-guidelines', '/market-strategy', '/tasks',
+      '/knowledge-base', '/research-reports', '/email-templates',
+    ],
+    allowedSkills: ['*'],
+  },
+  {
+    name: 'Super Premium',
+    allowedPages: ['*'],
+    allowedSkills: ['*'],
+  },
+];
+
+/** Helper: configure the settings mock to return our DB tier configs */
+function mockDbTierConfigs() {
+  mockSettingsService.getSetting.mockImplementation(async (key: string) => {
+    if (key === 'subscription_types') {
+      return { settingValue: JSON.stringify(DB_SUBSCRIPTION_TYPES) } as any;
+    }
+    return null;
+  });
+}
 
 // We need to mock bcrypt and jwt for register tests
 jest.mock('bcryptjs', () => ({
@@ -94,13 +129,14 @@ jest.mock('../services/emailService', () => ({
 describe('Tier-based Access Control', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockDbTierConfigs();
   });
 
   // ─── 1. Tier Configuration ───────────────────────────────────────────
 
-  describe('Tier Configuration (getDefaultTierConfig)', () => {
-    it('returns Free tier config with DEFAULT_PAGES only', () => {
-      const config = getDefaultTierConfig('Free');
+  describe('Tier Configuration (getTierConfig — DB-driven)', () => {
+    it('returns Free tier config with DEFAULT_PAGES only', async () => {
+      const config = await getTierConfig('Free');
       expect(config).not.toBeNull();
       expect(config!.name).toBe('Free');
       expect(config!.allowedPages).toEqual(['/', '/agent-mode', '/settings', '/guide']);
@@ -108,8 +144,8 @@ describe('Tier-based Access Control', () => {
       expect(config!.allowedSkills).not.toContain('*');
     });
 
-    it('returns Basic tier config with core feature pages', () => {
-      const config = getDefaultTierConfig('Basic');
+    it('returns Basic tier config with core feature pages', async () => {
+      const config = await getTierConfig('Basic');
       expect(config).not.toBeNull();
       expect(config!.name).toBe('Basic');
       // Basic should have more pages than Free
@@ -124,25 +160,25 @@ describe('Tier-based Access Control', () => {
       expect(config!.allowedPages).toContain('/tasks');
     });
 
-    it('returns Super Premium tier config with wildcard access', () => {
-      const config = getDefaultTierConfig('Super Premium');
+    it('returns Super Premium tier config with wildcard access', async () => {
+      const config = await getTierConfig('Super Premium');
       expect(config).not.toBeNull();
       expect(config!.name).toBe('Super Premium');
       expect(config!.allowedPages).toEqual(['*']);
       expect(config!.allowedSkills).toEqual(['*']);
     });
 
-    it('returns null for unknown tier', () => {
-      const config = getDefaultTierConfig('NonExistentTier');
+    it('returns null for unknown tier', async () => {
+      const config = await getTierConfig('NonExistentTier');
       expect(config).toBeNull();
     });
 
-    it('TIER_CONFIGS has exactly Free, Basic, and Super Premium', () => {
-      const tierNames = Object.keys(TIER_CONFIGS);
-      expect(tierNames).toContain('Free');
-      expect(tierNames).toContain('Basic');
-      expect(tierNames).toContain('Super Premium');
-      expect(tierNames).toHaveLength(3);
+    it('falls back to Free defaults when DB is unavailable', async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null);
+      const config = await getTierConfig('Free');
+      expect(config).not.toBeNull();
+      expect(config!.allowedPages).toEqual(DEFAULT_PAGES);
+      expect(config!.allowedSkills).toEqual([]);
     });
   });
 
