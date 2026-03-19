@@ -1,3 +1,37 @@
+# March 19, 2026: Investigation — X/Twitter Outreach via Unipile
+
+## Context
+
+Investigated adding X/Twitter outreach support via Unipile, mirroring our existing LinkedIn outreach integration. Unipile's SDK includes `TWITTER` as a supported provider (`AvailableAccountProvider` union), and the hosted auth link API accepts `providers: ['TWITTER']`.
+
+## Findings
+
+### Unipile SDK Support
+
+- The `unipile-node-sdk` package lists `TWITTER` as a valid provider alongside `LINKEDIN`, `WHATSAPP`, `INSTAGRAM`, `MESSENGER`, `TELEGRAM`, `MAIL`, `GOOGLE`, `OUTLOOK`, and `IMAP`.
+- Account creation types (`accounts-create.types.d.ts`) include Twitter-specific schemas.
+- The messaging API (`messaging.startNewChat`, `messaging.sendMessage`) is provider-agnostic and would work for Twitter DMs.
+- The users API (`users.sendInvitation`, `users.getAllRelations`) maps to follow/following on Twitter.
+
+### Implementation Plan (Designed but Not Built)
+
+The plan was to mirror the LinkedIn outreach pattern:
+- New platform type `'unipile_twitter'` in `connectedAccountsDb.ts`
+- New service `xTwitterOutreachService.ts` reusing the shared Unipile client
+- New auth route `xTwitterOutreachAuth.ts` with `providers: ['TWITTER']`
+- New emma tool `x_twitter_outreach` with actions: `send-dm`, `get-profile`, `follow`, `search-users`, `list-following`, `get-posts`
+- Frontend: callback page, Settings platform card, ConnectedAccountsList section
+
+### Blocker: Unipile Twitter Support Suspended
+
+Per Unipile's website and support team (March 2026): **Twitter/X integration is no longer actively maintained.** Their support indicated it may return in a few months. The SDK types still include `TWITTER` but the backend service may reject connections.
+
+## Decision
+
+Paused implementation. Will revisit when Unipile confirms Twitter support is restored. The implementation design is documented above and in `.claude/plans/whimsical-conjuring-stroustrup.md` for when we're ready to proceed.
+
+---
+
 # March 19, 2026: Investigation — Sessions with 0 Messages
 
 ## Context
