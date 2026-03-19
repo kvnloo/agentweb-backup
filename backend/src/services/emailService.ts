@@ -1308,6 +1308,8 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   ) {
     try {
       const oncallEmails = process.env.ONCALL_EMAIL_LIST?.split(',').filter(Boolean) || ['ruiw@agentweb.pro'];
+      const env = process.env.NODE_ENV || 'unknown';
+      const envLabel = env === 'production' ? 'PROD' : env.toUpperCase();
 
       const contextHtml = context
         ? Object.entries(context)
@@ -1321,7 +1323,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const html = `
         <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f8f9fa;">
           <div style="background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
-            <h1 style="margin: 0; font-size: 24px;">⚠️ URGENT: Oncall Alert</h1>
+            <h1 style="margin: 0; font-size: 24px;">⚠️ [${envLabel}] Oncall Alert</h1>
           </div>
           <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
             <h2 style="color: #dc3545; margin-top: 0;">${this.escapeHtml(subject)}</h2>
@@ -1342,7 +1344,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       `;
 
       const text = `
-⚠️ URGENT: Oncall Alert
+⚠️ [${envLabel}] Oncall Alert
 
 ${subject}
 
@@ -1351,7 +1353,7 @@ ${message}
 ${context ? Object.entries(context).map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value, null, 2) : value}`).join('\n') : ''}
       `.trim();
 
-      await this.sendEmail(oncallEmails, `[URGENT] ${subject}`, text, html);
+      await this.sendEmail(oncallEmails, `[${envLabel}] ${subject}`, text, html);
       console.log(`Oncall alert sent to: ${oncallEmails.join(', ')}`);
     } catch (error) {
       console.error('Error sending oncall alert:', error);
