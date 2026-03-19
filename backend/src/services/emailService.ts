@@ -1,6 +1,7 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
 import { resendService } from './resendService';
+import { chatbotDb } from './chatbotService';
 
 dotenv.config();
 
@@ -945,8 +946,6 @@ Schedule ID: ${scheduleId}
       // Create an interactive share for the session so user can access without login
       let sessionUrl = `${customerFrontendUrl}/agent-mode/${result.sessionId}`;
       try {
-        const { chatbotDb } = require('./chatbotService');
-        
         // Use the common function to create or reuse interactive share
         sessionUrl = await chatbotDb.createOrReuseInteractiveShare(result.sessionId);
         
@@ -1131,8 +1130,6 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       for (const result of todaysResults) {
         if (result.sessionId) {
           try {
-            const { chatbotDb } = require('./chatbotService');
-            
             // Use the common function to create or reuse interactive share
             sessionUrls[result.sessionId] = await chatbotDb.createOrReuseInteractiveShare(result.sessionId);
           } catch (shareError) {
