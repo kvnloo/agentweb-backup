@@ -9,6 +9,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-19',
     changes: [
+      'Feature: Agent Mode — Token Usage & Cost Tracking',
+      '- Every Agent Mode LLM call now records input tokens, output tokens, and estimated cost on the message',
+      '- Session-level totals (totalTokens, totalCost) are incrementally updated as messages are added',
+      '- Admin Chat History tab shows a new "Tokens / Cost" column with compact display and hover tooltip for full breakdown',
+      '- Cost values are color-coded: orange for sessions over $0.10, red for sessions over $1.00',
+      '- The get_chat_history admin tool now returns totalTokens and totalCost per session',
+      '- Supports all LLM providers: Claude (Bedrock), GPT (Azure OpenAI), and Gemini',
       'Fix: Landing Page Editor — Reliable File Writes',
       '- Fixed edit_landing_page_file failing repeatedly on large landing page files (>1MB) by adding Blob API fallback — the GitHub Contents API has a 1MB limit that was silently rejecting writes',
       '- Fixed SHA mismatch errors causing cascading failures — the editor now automatically retries once with a fresh SHA when a 409 conflict occurs',
