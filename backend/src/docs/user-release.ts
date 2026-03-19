@@ -7,6 +7,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-19',
+    changes: [
+      'Fix: Landing Page Editor — Reliable File Writes',
+      '- Fixed edit_landing_page_file failing repeatedly on large landing page files (>1MB) by adding Blob API fallback — the GitHub Contents API has a 1MB limit that was silently rejecting writes',
+      '- Fixed SHA mismatch errors causing cascading failures — the editor now automatically retries once with a fresh SHA when a 409 conflict occurs',
+      '- Added 30-second timeouts to all GitHub API calls to prevent sessions from hanging indefinitely',
+      '- Error messages now include actionable details (auth errors, conflicts, validation failures) instead of a generic "Failed to process edit request"',
+    ],
+  },
+  {
     date: '2026-03-18',
     changes: [
       'Fix: Scheduled Chats — Oncall Alerts for Failures',
