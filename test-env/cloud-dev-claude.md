@@ -61,6 +61,29 @@ The relay system will re-invoke you after the specified number of seconds (300 =
 5. If CI passed and branch is up to date, merge. If still running, include `[RELAY_RETRY_AFTER:180]` again
 6. If CI failed, investigate and fix
 
+## Checking Production Backend Logs
+
+You have AWS CLI access and can retrieve production Elastic Beanstalk logs directly from this EC2 instance.
+
+```bash
+# Request and retrieve tail logs (last ~100 lines per log file per instance)
+aws elasticbeanstalk request-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail --region us-west-2
+sleep 5
+aws elasticbeanstalk retrieve-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type tail --region us-west-2
+
+# Request and retrieve full bundle logs (complete log files as zip)
+aws elasticbeanstalk request-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type bundle --region us-west-2
+sleep 15
+aws elasticbeanstalk retrieve-environment-info --environment-name Agentweb-backend-env-prod-3 --info-type bundle --region us-west-2
+```
+
+The retrieve commands return S3 URLs for each instance. Download and inspect:
+- `web.stdout.log` — Node.js application logs (main process + worker)
+- `nginx/access.log` — HTTP request logs
+- `nginx/error.log` — Nginx error/warning logs
+
+**Note:** EB logs rotate frequently. For investigating sessions, also query DynamoDB directly (`AW-ChatSessions` table, prod prefix is just `AW-`) by `sessionId` to get session state, work plan status, messages, and error fields.
+
 ## Browser Testing
 
 Use the Playwright MCP tools (`mcp__playwright__browser_*`) to test against the running services:
