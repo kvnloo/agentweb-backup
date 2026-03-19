@@ -26,6 +26,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Landing page deployments no longer fail when v0 code generation is still in progress',
       '- Added automatic polling with backoff (up to ~2.5 minutes) instead of failing immediately',
       '- Previously, the deploy would fail instantly and the AI assistant had to manually retry, wasting multiple tool call iterations',
+      'Fix: Admin Tools — Correct Skill Categorization',
+      '- Moved list_all_clients and assess_client_health from "Other Skills" to the Admin Tools skill section',
+      '- These admin-only tools were previously visible under "Other Skills" for all users on the Skills page',
+      '- The list_all_clients tool now includes admin users in results for a complete account overview',
     ],
   },
   {
