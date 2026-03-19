@@ -22,6 +22,14 @@ console.log("[V0 SERVICE] Extended fetch timeouts to 10 minutes for v0 API calls
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2_000; // 2s, 4s, 8s
 
+// Poll intervals for waiting on v0 generation to complete
+let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
+
+/** Override poll intervals (for testing) */
+export function setV0PollIntervals(intervals: number[]) {
+  v0PollIntervalsMs = intervals;
+}
+
 export async function withRetry<T>(
   fn: () => Promise<T>,
   label: string,
@@ -649,16 +657,31 @@ export async function deployLandingPage(
   try {
     const v0 = await getV0Client();
 
-    // Step 1: Get the latest version from v0 chat (with retry)
+    // Step 1: Get the latest version from v0 chat (poll with backoff if generation is still in progress)
     console.log(`[V0 SERVICE] Step 1: Getting latest version for chat ${record.v0ChatId}`);
-    const chat = await withRetry(
-      () => v0.chats.getById({ chatId: record.v0ChatId! }),
-      "v0 chat fetch"
-    );
-    let versionId = chat.latestVersion?.id;
+    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs; // total wait: up to ~2.5 min
+    let versionId: string | undefined;
+
+    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
+      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
+        console.log(`[V0 SERVICE] v0 generation not ready yet, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s before retry (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
+        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
+      }
+
+      const chat = await withRetry(
+        () => v0.chats.getById({ chatId: record.v0ChatId! }),
+        "v0 chat fetch"
+      );
+      versionId = chat.latestVersion?.id;
+
+      if (versionId) {
+        console.log(`[V0 SERVICE] v0 version found: ${versionId} (poll attempt ${pollAttempt + 1})`);
+        break;
+      }
+    }
 
     if (!versionId) {
-      throw new Error("No version found in v0 chat — generation may still be in progress");
+      throw new Error("No version found in v0 chat after polling for ~2.5 minutes — generation may have failed");
     }
 
     // Step 2: Download + validate v0 output (with retry on bad output)
