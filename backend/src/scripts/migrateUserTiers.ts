@@ -29,28 +29,41 @@ if (!TABLE_PREFIX) {
   process.exit(1);
 }
 
-// ── Tier definitions (mirrors subscriptionService.ts) ─────────────────────
-const DEFAULT_PAGES = ['/', '/agent-mode', '/settings', '/guide'];
+// ── Tier definitions ─────────────────────────────────────────────────────
+// Uses getSubscriptionTypeConfig from subscriptionService to read from DynamoDB.
+// Falls back to minimal defaults if DB config is unavailable.
+import { getSubscriptionTypeConfig, DEFAULT_PAGES } from '../services/subscriptionService';
 
-const TIER_ALLOWED_PAGES: Record<string, string[]> = {
-  Free: [...DEFAULT_PAGES],
-  Basic: [
-    ...DEFAULT_PAGES,
-    '/brand-guidelines',
-    '/market-strategy',
-    '/tasks',
-    '/knowledge-base',
-    '/research-reports',
-    '/email-templates',
-  ],
-  'Super Premium': ['*'],
-};
+// In-memory cache populated at migration start from DynamoDB
+let tierCache: Record<string, { allowedPages: string[]; allowedSkills: string[] }> = {};
 
-const TIER_ALLOWED_SKILLS: Record<string, string[]> = {
-  Free: [],
-  Basic: ['*'],
-  'Super Premium': ['*'],
-};
+async function loadTierConfigs(): Promise<void> {
+  const tierNames = ['Free', 'Basic', 'Super Premium'];
+  for (const name of tierNames) {
+    const config = await getSubscriptionTypeConfig(name);
+    if (config) {
+      tierCache[name] = {
+        allowedPages: config.allowedPages,
+        allowedSkills: config.allowedSkills,
+      };
+    }
+  }
+  // Ensure Free fallback always exists
+  if (!tierCache['Free']) {
+    tierCache['Free'] = {
+      allowedPages: [...DEFAULT_PAGES],
+      allowedSkills: [],
+    };
+  }
+}
+
+function getTierAllowedPages(tier: string): string[] {
+  return tierCache[tier]?.allowedPages ?? tierCache['Free']?.allowedPages ?? [...DEFAULT_PAGES];
+}
+
+function getTierAllowedSkills(tier: string): string[] {
+  return tierCache[tier]?.allowedSkills ?? tierCache['Free']?.allowedSkills ?? [];
+}
 
 // ── AWS setup ─────────────────────────────────────────────────────────────
 AWS.config.update({
@@ -132,6 +145,10 @@ export async function migrateUserTiers(): Promise<{
 }> {
   console.log(`\nMigrating user tiers in table: ${USERS_TABLE}`);
 
+  // Load tier configs from DynamoDB (with fallbacks)
+  await loadTierConfigs();
+  console.log(`Loaded tier configs: ${Object.keys(tierCache).join(', ')}`);
+
   const users = await scanAllUsers();
   console.log(`Found ${users.length} total users.`);
 
@@ -163,8 +180,8 @@ export async function migrateUserTiers(): Promise<{
       if (!hasSubscriptionType) {
         // Determine tier from subscription status
         const tier = determineTier(user);
-        const allowedPages = TIER_ALLOWED_PAGES[tier] || TIER_ALLOWED_PAGES.Free;
-        const allowedSkills = TIER_ALLOWED_SKILLS[tier] || TIER_ALLOWED_SKILLS.Free;
+        const allowedPages = getTierAllowedPages(tier);
+        const allowedSkills = getTierAllowedSkills(tier);
 
         await updateUser(email, {
           subscriptionType: tier,
@@ -178,8 +195,8 @@ export async function migrateUserTiers(): Promise<{
       } else {
         // Has subscriptionType but missing allowedPages → back-fill
         const tier = user.subscriptionType;
-        const allowedPages = TIER_ALLOWED_PAGES[tier] || TIER_ALLOWED_PAGES.Free;
-        const allowedSkills = TIER_ALLOWED_SKILLS[tier] || TIER_ALLOWED_SKILLS.Free;
+        const allowedPages = getTierAllowedPages(tier);
+        const allowedSkills = getTierAllowedSkills(tier);
 
         await updateUser(email, { allowedPages, allowedSkills });
         backfilled++;

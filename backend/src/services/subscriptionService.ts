@@ -19,44 +19,31 @@ export const DEFAULT_PAGES = [
   "/guide", // User Guide
 ];
 
-// ─── Tier Configurations ────────────────────────────────────────────────
-// Explicit tier definitions. Stripe checkout maps plans to these tiers:
-//   Starter plan → "Basic"
-//   Pro plan     → "Super Premium"
-// Registration defaults to "Free". Cancellation downgrades back to "Free".
+// ─── Tier Fallback ──────────────────────────────────────────────────────
+// The canonical tier definitions now live in DynamoDB (admin-managed via
+// the "subscription_types" setting).  getSubscriptionTypeConfig() reads
+// them.  The constant below is only used as a last-resort fallback when
+// the DB config cannot be reached (e.g. during initial bootstrap).
 
-export const TIER_CONFIGS: Record<string, SubscriptionType> = {
-  Free: {
-    name: "Free",
-    allowedPages: [...DEFAULT_PAGES],
-    allowedSkills: [], // No premium skills on Free tier
-  },
-  Basic: {
-    name: "Basic",
-    allowedPages: [
-      ...DEFAULT_PAGES,
-      "/brand-guidelines",
-      "/market-strategy",
-      "/tasks",
-      "/knowledge-base",
-      "/research-reports",
-      "/email-templates",
-    ],
-    allowedSkills: ["*"], // All skills allowed for Basic (Starter plan)
-  },
-  "Super Premium": {
-    name: "Super Premium",
-    allowedPages: ["*"], // All pages
-    allowedSkills: ["*"], // All skills
-  },
+const FREE_TIER_FALLBACK: SubscriptionType = {
+  name: "Free",
+  allowedPages: [...DEFAULT_PAGES],
+  allowedSkills: [], // No premium skills on Free tier
 };
 
 /**
- * Get the default tier configuration by name.
- * Returns null if the tier name is not recognized.
+ * Get tier configuration by name — reads from DynamoDB first, falls back
+ * to a minimal Free config if the DB is unreachable or the tier is not
+ * defined.  Replaces the old hardcoded TIER_CONFIGS / getDefaultTierConfig.
  */
-export function getDefaultTierConfig(tierName: string): SubscriptionType | null {
-  return TIER_CONFIGS[tierName] ?? null;
+export async function getTierConfig(tierName: string): Promise<SubscriptionType | null> {
+  const dbConfig = await getSubscriptionTypeConfig(tierName);
+  if (dbConfig) return dbConfig;
+
+  // Graceful fallback: only Free tier has a built-in fallback
+  if (tierName === "Free") return { ...FREE_TIER_FALLBACK };
+
+  return null;
 }
 
 /**
