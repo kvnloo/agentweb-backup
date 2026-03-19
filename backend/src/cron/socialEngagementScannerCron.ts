@@ -3,17 +3,26 @@ import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { v4 as uuidv4 } from 'uuid';
 
+/**
+ * Scans all users with any account that has autoEngagement = true.
+ * For each such user, all their participating accounts monitor each other's posts
+ * and schedule engagement actions. This is SINGLE-USER scope — accounts of different
+ * users never engage with each other.
+ */
 export class SocialEngagementScanner {
-    /**
-     * Main entry point — discover all posts that need engagement and schedule them.
-     */
     public async runScanner() {
         console.log('[SocialEngagementScanner] Starting discovery scan...');
         try {
             const allUsers = await userDb.getAllUsers();
-            const activeUsers = allUsers.filter(u => (u as any).socialEngagementConfig?.isEnabled === true);
 
-            console.log(`[SocialEngagementScanner] Found ${activeUsers.length} users with active config.`);
+            // A user participates if at least one connected account has autoEngagement = true
+            const activeUsers = allUsers.filter((u: any) =>
+                (u.connected_accounts || []).some(
+                    (a: any) => a.engagementSettings?.autoEngagement === true
+                )
+            );
+
+            console.log(`[SocialEngagementScanner] Found ${activeUsers.length} users with at least one auto-engagement account.`);
 
             for (const user of activeUsers) {
                 await this.processUser(user as any);
@@ -25,89 +34,109 @@ export class SocialEngagementScanner {
     }
 
     private async processUser(user: any) {
-        const config = user.socialEngagementConfig;
-        if (!config || !user.connected_accounts) return;
+        const connectedAccounts: any[] = user.connected_accounts || [];
 
-        for (const targetAccountId of config.targets) {
-            const targetConnection = user.connected_accounts.find(
-                (c: ConnectedAccount) => c.account_id === targetAccountId && c.platform === 'linkedin'
-            );
-            if (!targetConnection) {
-                console.warn(`[Scanner] Target ${targetAccountId} not found in connected_accounts for user ${user.userId}`);
-                continue;
-            }
-            await this.scanTarget(user, targetConnection, config);
+        // All accounts of this user with autoEngagement enabled (LinkedIn only for now)
+        const participants = connectedAccounts.filter(
+            (a: any) => a.platform === 'linkedin' && a.engagementSettings?.autoEngagement === true
+        );
+
+        if (participants.length < 2) {
+            console.log(`[Scanner] User ${user.userId}: only ${participants.length} participant(s) — need at least 2 to engage. Skipping.`);
+            return;
+        }
+
+        console.log(`[Scanner] User ${user.userId}: ${participants.length} participants: ${participants.map((p: any) => p.account_name).join(', ')}`);
+
+        // Each participant's posts are scanned; all OTHER participants are potential engagers
+        for (const ownerAccount of participants) {
+            await this.scanOwnerPosts(user, ownerAccount, participants);
         }
     }
 
-    private async scanTarget(user: any, targetConnection: ConnectedAccount, config: any) {
+    private async scanOwnerPosts(user: any, ownerAccount: any, allParticipants: any[]) {
+        const ownerSettings = ownerAccount.engagementSettings;
+
+        console.log(`[Scanner] Fetching recent posts for ${ownerAccount.account_name} (${ownerAccount.account_id})`);
         try {
             const adapter = new LinkedInAdapter();
-            if (targetConnection.config?.account_type === 'company_page') {
-                console.log(`[Scanner] Fetching recent posts from organization page: ${targetConnection.account_name} (${targetConnection.account_id})`);
-            }
-            const posts = await adapter.listPosts(targetConnection, { limit: 10 }, user.userId);
+            const posts = await adapter.listPosts(ownerAccount as ConnectedAccount, { limit: 10 }, user.userId);
 
             // Only process posts from the last 7 days
             const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
             const recentPosts = posts.filter((p: any) => {
-                // Handle different timestamp formats:
-                // - Organization posts (versioned API): p.createdAt
-                // - Personal posts (DB-backed): p.created.time
-                // - Legacy/Other: p.timestamp
                 const ts = p.createdAt || p.publishedAt || p.created?.time || p.timestamp || 0;
                 return ts >= cutoff;
             });
+
+            console.log(`[Scanner] ${ownerAccount.account_name}: ${recentPosts.length} recent post(s) to process.`);
 
             for (const post of recentPosts) {
                 const postUrn: string = post.id || post.urn;
                 if (!postUrn) continue;
 
-                await this.scheduleBoostersForPost(user, postUrn, config);
+                // Engagers = all OTHER participants (not the post owner itself)
+                const potentialEngagers = allParticipants.filter(
+                    (a: any) => a.account_id !== ownerAccount.account_id
+                );
+
+                await this.scheduleEngagers(user, postUrn, ownerAccount, ownerSettings, potentialEngagers);
             }
         } catch (error) {
-            console.error(`[Scanner] Failed to fetch posts for ${targetConnection.account_id}:`, error);
+            console.error(`[Scanner] Failed to fetch posts for ${ownerAccount.account_id}:`, error);
         }
     }
 
-    private async scheduleBoostersForPost(user: any, postUrn: string, config: any) {
-        const available: string[] = [];
+    private async scheduleEngagers(
+        user: any,
+        postUrn: string,
+        ownerAccount: any,
+        ownerSettings: any,
+        potentialEngagers: any[]
+    ) {
+        const preferredActions: ('like' | 'comment')[] = ownerSettings.preferredActions || ['like'];
+        const wantsLike = preferredActions.includes('like');
+        const wantsComment = preferredActions.includes('comment');
 
-        for (const boosterAccountId of config.boosters) {
+        // Determine how many engagements each type can receive (incoming caps from owner settings)
+        const maxLikes = wantsLike ? (ownerSettings.maxLikesPerPost || 0) : 0;
+        const maxComments = wantsComment ? (ownerSettings.maxCommentsPerPost || 0) : 0;
+        const windowMs = (ownerSettings.engagementWindowMinutes || 60) * 60 * 1000;
+
+        // Filter engagers not yet queued
+        const availableEngagers: any[] = [];
+        for (const engager of potentialEngagers) {
             const alreadyQueued = await socialEngagementTrackingDb.hasEngaged(
-                user.userId, postUrn, boosterAccountId
+                user.userId, postUrn, engager.account_id
             );
             if (!alreadyQueued) {
-                available.push(boosterAccountId);
+                availableEngagers.push(engager);
             }
         }
 
-        // Determine action type and limit based on strategy
-        const strategy = config.strategy || {};
-        const preferredAction = strategy.preferredAction;
-        const maxComments = strategy.maxCommentsPerPost || 0;
-        const maxLikes = strategy.maxLikesPerPost || 0;
+        if (availableEngagers.length === 0) return;
 
-        let actionType: 'comment_and_like' | 'like' = 'comment_and_like';
-        let limit = maxComments;
+        // Schedule likes (up to maxLikes from available engagers)
+        let likeCount = 0;
+        let commentCount = 0;
 
-        // If caller explicitly asks for 'like', or if comment cap is 0 but like cap is > 0
-        if (preferredAction === 'like' || (maxComments === 0 && maxLikes > 0)) {
-            actionType = 'like';
-            limit = maxLikes;
-        }
+        for (const engager of availableEngagers) {
+            const canLike = wantsLike && likeCount < maxLikes;
+            const canComment = wantsComment && commentCount < maxComments;
 
-        const toQueue = available.slice(0, limit);
-        if (toQueue.length === 0) return;
+            if (!canLike && !canComment) break;
 
-        console.log(`[Scanner] Post ${postUrn}: scheduling ${toQueue.length} engagements.`);
-        const windowMs = config.strategy.engagementWindowMinutes * 60 * 1000;
+            const actionType: 'like' | 'comment' | 'comment_and_like' =
+                canLike && canComment ? 'comment_and_like'
+                    : canComment ? 'comment'
+                        : 'like';
 
-        for (const boosterAccountId of toQueue) {
+            if (canLike) likeCount++;
+            if (canComment) commentCount++;
+
             const delayMs = Math.floor(Math.random() * windowMs);
             const executionTime = new Date(Date.now() + delayMs).toISOString();
 
-            // Push to scheduleDb as a queued task
             await scheduleDb.createSchedule({
                 scheduleId: uuidv4(),
                 taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
@@ -118,24 +147,25 @@ export class SocialEngagementScanner {
                 status: 'active',
                 createdAt: new Date().toISOString(),
                 type: 'social_engagement_action',
-                description: `Engage post ${postUrn} as ${boosterAccountId}`,
+                description: `Engage post ${postUrn} as ${engager.account_name}`,
                 variableValues: {
                     targetPostUrn: postUrn,
-                    boosterAccountId,
+                    ownerAccountId: ownerAccount.account_id,
+                    engagingAccountId: engager.account_id,
                     actionType,
                 },
             });
 
-            // Record so scanner won't re-queue on next run
             await socialEngagementTrackingDb.recordEngagement({
                 userId: user.userId,
                 targetPostUrn: postUrn,
-                boosterAccountId,
+                ownerAccountId: ownerAccount.account_id,
+                engagingAccountId: engager.account_id,
                 actionType,
                 scheduledAt: executionTime,
             });
 
-            console.log(`[Scanner] Scheduled engagement for post ${postUrn} via ${boosterAccountId} at ${executionTime}`);
+            console.log(`[Scanner] Scheduled "${actionType}" on post ${postUrn} by ${engager.account_name} at ${executionTime}`);
         }
     }
 }

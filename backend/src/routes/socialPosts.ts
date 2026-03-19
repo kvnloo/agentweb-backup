@@ -28,7 +28,7 @@ router.get('/social-posts', authenticateToken, async (req: Request, res: Respons
   }
 });
 
-// ─── GET engagement config + linked accounts for the form ───────────────────
+// ─── GET engagement config: return all connected accounts with their inline engagementSettings ─────
 router.get('/social-posts/config', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
@@ -37,74 +37,97 @@ router.get('/social-posts/config', authenticateToken, async (req: Request, res: 
     const user = await userDb.getUserById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Only expose LinkedIn accounts for target/booster selection
-    const linkedinAccounts = (user.connected_accounts || []).filter(
-      (a: any) => a.platform === 'linkedin'
-    ).map((a: any) => ({
+    // Return all connected accounts (all platforms) with their engagementSettings
+    // Frontend will filter down to the platforms it wants to display
+    const accounts = (user.connected_accounts || []).map((a: any) => ({
       account_id: a.account_id,
       account_name: a.account_name,
+      platform: a.platform,
       account_type: a.config?.account_type || 'personal',
+      engagementSettings: a.engagementSettings || null,
     }));
 
-    return res.json({
-      config: user.socialEngagementConfig || null,
-      linkedinAccounts,
-    });
+    return res.json({ accounts });
   } catch (error) {
     console.error('[SocialPosts/Config GET] Error:', error);
     return res.status(500).json({ error: 'Failed to fetch config' });
   }
 });
 
-// ─── PUT save/update engagement config ──────────────────────────────────────
+// ─── PUT save engagement settings for a single account ──────────────────────────────────────────
+// Body: { accountId: string, engagementSettings: { autoEngagement, preferredActions, maxLikesPerPost, maxCommentsPerPost, engagementWindowMinutes } }
 router.put('/social-posts/config', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { isEnabled, targets, boosters, strategy } = req.body;
+    const { accountId, engagementSettings } = req.body;
 
-    // Validate targets & boosters are arrays
-    if (!Array.isArray(targets) || !Array.isArray(boosters)) {
-      return res.status(400).json({ error: 'targets and boosters must be arrays' });
+    if (!accountId || typeof accountId !== 'string') {
+      return res.status(400).json({ error: 'accountId is required' });
     }
 
-    // Validate no overlap between targets and boosters
-    const overlap = targets.filter((id: string) => boosters.includes(id));
-    if (overlap.length > 0) {
-      return res.status(400).json({
-        error: `Account(s) cannot be both a target and a booster: ${overlap.join(', ')}`,
-      });
+    if (!engagementSettings || typeof engagementSettings !== 'object') {
+      return res.status(400).json({ error: 'engagementSettings is required' });
     }
 
-    // Validate strategy fields
-    const { maxCommentsPerPost, maxLikesPerPost, engagementWindowMinutes, preferredAction } = strategy || {};
-    if (
-      typeof maxCommentsPerPost !== 'number' || maxCommentsPerPost < 0 ||
-      typeof maxLikesPerPost !== 'number' || maxLikesPerPost < 0 ||
-      typeof engagementWindowMinutes !== 'number' || engagementWindowMinutes < 1
-    ) {
-      return res.status(400).json({ error: 'Invalid strategy values' });
+    const { autoEngagement, preferredActions, maxLikesPerPost, maxCommentsPerPost, engagementWindowMinutes } = engagementSettings;
+
+    // Validate preferredActions
+    if (!Array.isArray(preferredActions) || preferredActions.length === 0) {
+      return res.status(400).json({ error: 'preferredActions must be a non-empty array of "like" and/or "comment"' });
     }
-    if (preferredAction && !['like', 'comment_and_like'].includes(preferredAction)) {
-      return res.status(400).json({ error: 'Invalid preferredAction value' });
+    const validActions = ['like', 'comment'];
+    const invalidActions = preferredActions.filter((a: any) => !validActions.includes(a));
+    if (invalidActions.length > 0) {
+      return res.status(400).json({ error: `Invalid preferredActions values: ${invalidActions.join(', ')}` });
     }
 
-    const newConfig = {
-      isEnabled: !!isEnabled,
-      targets,
-      boosters,
-      strategy: {
-        maxCommentsPerPost,
-        maxLikesPerPost,
-        engagementWindowMinutes,
-        preferredAction: preferredAction || 'comment_and_like',
-      },
-    };
+    // Validate numeric fields
+    if (typeof maxLikesPerPost !== 'number' || maxLikesPerPost < 0) {
+      return res.status(400).json({ error: 'maxLikesPerPost must be a non-negative number' });
+    }
+    if (typeof maxCommentsPerPost !== 'number' || maxCommentsPerPost < 0) {
+      return res.status(400).json({ error: 'maxCommentsPerPost must be a non-negative number' });
+    }
+    if (typeof engagementWindowMinutes !== 'number' || engagementWindowMinutes < 1) {
+      return res.status(400).json({ error: 'engagementWindowMinutes must be at least 1' });
+    }
 
-    await userDb.updateUser(userId, { socialEngagementConfig: newConfig });
+    // Load user to find the account and update it in-place
+    const user = await userDb.getUserById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-    return res.json({ success: true, config: newConfig });
+    const accounts = user.connected_accounts || [];
+    const accountIndex = accounts.findIndex((a: any) => a.account_id === accountId);
+    if (accountIndex === -1) {
+      return res.status(404).json({ error: `Account ${accountId} not found in connected accounts` });
+    }
+
+    // Update the specific account's engagementSettings
+    const updatedAccounts = accounts.map((a: any) => {
+      if (a.account_id !== accountId) return a;
+      return {
+        ...a,
+        engagementSettings: {
+          autoEngagement: !!autoEngagement,
+          preferredActions,
+          maxLikesPerPost,
+          // Store maxCommentsPerPost even if not used (easier to preserve);
+          // scanner ignores it when 'comment' not in preferredActions
+          maxCommentsPerPost,
+          engagementWindowMinutes,
+        },
+      };
+    });
+
+    await userDb.updateUser(userId, { connected_accounts: updatedAccounts } as any);
+
+    return res.json({
+      success: true,
+      accountId,
+      engagementSettings: updatedAccounts[accountIndex].engagementSettings,
+    });
   } catch (error) {
     console.error('[SocialPosts/Config PUT] Error:', error);
     return res.status(500).json({ error: 'Failed to save config' });

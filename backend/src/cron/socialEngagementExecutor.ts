@@ -34,21 +34,22 @@ export class SocialEngagementExecutor {
 
     private async processAction(action: any) {
         const { userId, variableValues, scheduleId } = action;
-        const { targetPostUrn, boosterAccountId, actionType } = variableValues || {};
+        const { targetPostUrn, ownerAccountId, engagingAccountId, actionType } = variableValues || {};
 
         console.log(`\n[Executor] ════ Processing action ${scheduleId} ════`);
         console.log(`[Executor] User: ${userId}`);
         console.log(`[Executor] Target post: ${targetPostUrn}`);
-        console.log(`[Executor] Booster account: ${boosterAccountId}`);
+        console.log(`[Executor] Owner account: ${ownerAccountId}`);
+        console.log(`[Executor] Engaging account: ${engagingAccountId}`);
         console.log(`[Executor] Action type: ${actionType}`);
 
-        if (!userId || !targetPostUrn || !boosterAccountId) {
+        if (!userId || !targetPostUrn || !engagingAccountId) {
             console.warn(`[Executor] Skipping invalid action ${scheduleId}: missing required fields.`);
             await this.markActionDone(scheduleId);
             return;
         }
 
-        // 1. Load user and find the booster connected account
+        // 1. Load user and find the engaging connected account
         const user = await userDb.getUserById(userId);
         if (!user || !user.connected_accounts) {
             console.warn(`[Executor] User ${userId} not found or has no connected accounts.`);
@@ -56,54 +57,60 @@ export class SocialEngagementExecutor {
             return;
         }
 
-        const boosterConnection = user.connected_accounts.find(
-            (c: ConnectedAccount) => c.account_id === boosterAccountId && c.platform === 'linkedin'
+        const engagingConnection = user.connected_accounts.find(
+            (c: ConnectedAccount) => c.account_id === engagingAccountId && c.platform === 'linkedin'
         );
 
-        if (!boosterConnection) {
-            console.warn(`[Executor] Booster account ${boosterAccountId} not found in connected LinkedIn accounts for user ${userId}.`);
+        if (!engagingConnection) {
+            console.warn(`[Executor] Engaging account ${engagingAccountId} not found in connected LinkedIn accounts for user ${userId}.`);
             console.warn(`[Executor] Available accounts: ${user.connected_accounts.filter((c: ConnectedAccount) => c.platform === 'linkedin').map((c: ConnectedAccount) => c.account_id).join(', ')}`);
             await this.markActionDone(scheduleId);
             return;
         }
 
-        console.log(`[Executor] Found booster connection: "${boosterConnection.account_name}" (${boosterAccountId})`);
+        console.log(`[Executor] Found engaging connection: "${engagingConnection.account_name}" (${engagingAccountId})`);
 
-        // 2. Find the TARGET account connection to fetch the post content
-        //    (The post belongs to the target account, not the booster)
-        const config = (user as any).socialEngagementConfig;
-        const targetAccountId = config?.targets?.find(() => true); // first target — the post URN carries identity
+        // 2. Find the owner account connection to fetch post content
+        //    Fall back to the engaging account if owner account not found
+        const ownerConnection = ownerAccountId
+            ? user.connected_accounts.find(
+                (c: ConnectedAccount) => c.account_id === ownerAccountId && c.platform === 'linkedin'
+            ) || engagingConnection
+            : engagingConnection;
 
-        // Try to find the target account connection; fall back to booster if not found
-        const targetConnection = user.connected_accounts.find(
-            (c: ConnectedAccount) => config?.targets?.includes(c.account_id) && c.platform === 'linkedin'
-        ) || boosterConnection;
-
-        console.log(`[Executor] Fetching post content via account: "${targetConnection.account_name}" (${targetConnection.account_id})`);
+        console.log(`[Executor] Fetching post content via account: "${ownerConnection.account_name}"`);
 
         // 3. Fetch the target post to give Emma context
         let postContent = '[Post content unavailable]';
         try {
             const adapter = new LinkedInAdapter();
-            // Try the target connection first (more likely to have the post)
-            const posts = await adapter.listPosts(targetConnection, { limit: 20 }, userId);
+            const posts = await adapter.listPosts(ownerConnection, { limit: 20 }, userId);
             const post = posts.find((p: any) => (p.id || p.urn) === targetPostUrn);
             if (post) {
                 postContent = post.commentary || post.content || post.text || '[No text content]';
                 console.log(`[Executor] Found post – content preview: "${postContent.slice(0, 100)}..."`);
             } else {
-                console.warn(`[Executor] Could not find post ${targetPostUrn} in the last ${posts.length} posts from ${targetConnection.account_name}. Proceeding without post text.`);
+                console.warn(`[Executor] Could not find post ${targetPostUrn} in the last ${posts.length} posts. Proceeding without post text.`);
             }
         } catch (error) {
             console.warn(`[Executor] Could not fetch post content for ${targetPostUrn}:`, error);
         }
 
-        // 4. Build the Emma prompt
-        const boosterName = boosterConnection.account_name || boosterAccountId;
-        const doComment = actionType === 'comment_and_like';
+        // 4. Build the Emma prompt based on actionType
+        const engagingName = engagingConnection.account_name || engagingAccountId;
+        const doComment = actionType === 'comment_and_like' || actionType === 'comment';
+        const doLike = actionType === 'comment_and_like' || actionType === 'like';
 
-        const prompt = doComment
-            ? `You are an automated social engagement assistant. Your job is to engage with a LinkedIn post using the account "${boosterName}" (account_id: "${boosterAccountId}").
+        let taskLines: string[] = [];
+        if (doComment) {
+            taskLines.push(`- Write a professional, thoughtful 1-2 sentence comment that adds genuine value. Avoid clichés like "Great post!" or "Absolutely!". The comment should feel natural and insightful based on the post content.`);
+            taskLines.push(`- Post the comment on the post (URN: ${targetPostUrn}) using account "${engagingAccountId}".`);
+        }
+        if (doLike) {
+            taskLines.push(`- "LIKE" the post (URN: ${targetPostUrn}) using account "${engagingAccountId}".`);
+        }
+
+        const prompt = `You are an automated social engagement assistant. Your job is to engage with a LinkedIn post using the account "${engagingName}" (account_id: "${engagingAccountId}").
 
 Here is the LinkedIn post to engage with:
 
@@ -112,21 +119,11 @@ CONTENT:
 ${postContent}
 
 Task:
-- Write a professional, thoughtful 1-2 sentence comment that adds genuine value to this post. Avoid clichés like "Great post!" or "Absolutely!". The comment should feel natural and insightful based on the post content.
-- Post the comment on the post (URN: ${targetPostUrn}) using account "${boosterAccountId}".
-- Also "LIKE" the same post using account "${boosterAccountId}".
-
-Do this now without asking for confirmation.`
-            : `You are an automated social engagement assistant. Your job is to engage with a LinkedIn post using the account "${boosterName}" (account_id: "${boosterAccountId}").
-
-LinkedIn post URN to engage with: ${targetPostUrn}
-
-Task:
-- "LIKE" this post using account "${boosterAccountId}".
+${taskLines.join('\n')}
 
 Do this now without asking for confirmation.`;
 
-        console.log(`[Executor] Action: ${doComment ? 'COMMENT + LIKE' : 'LIKE ONLY'}`);
+        console.log(`[Executor] Action: ${actionType.toUpperCase()}`);
         console.log(`[Executor] Prompt preview:\n${prompt.slice(0, 300)}...`);
 
         // 5. Fire it as a scheduled chat using the existing infrastructure
@@ -134,7 +131,7 @@ Do this now without asking for confirmation.`;
             ...action,
             type: 'scheduled_chat',
             startingMessage: prompt,
-            scheduleName: `Social Engagement – ${targetPostUrn.slice(-12)} via ${boosterName}`,
+            scheduleName: `Social Engagement – ${targetPostUrn.slice(-12)} via ${engagingName}`,
             taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
             variables: [],
             variableValues: {},
@@ -155,9 +152,6 @@ Do this now without asking for confirmation.`;
         console.log(`[Executor] ── Tool calls made: [${(result?.actualFunctionCalls || []).join(', ')}]`);
         if (result?.functionCallMisses?.length > 0) {
             console.warn(`[Executor] ── Missing expected tool calls: [${result.functionCallMisses.join(', ')}]`);
-        }
-        if (result?.sessionId) {
-            console.log(`[Executor] ── 👉 To inspect: find chat session "${result.sessionId}" in Emma's session list.`);
         }
         if (!result?.passed && result?.actualResponse) {
             console.warn(`[Executor] ── Emma response (first 500 chars): ${result.actualResponse?.slice(0, 500)}`);

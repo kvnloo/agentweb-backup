@@ -172,20 +172,21 @@ export interface User {
       token_expires_at: number;
       scopes: string[];
     };
+    /** Per-account automated engagement settings (inline on the account) */
+    engagementSettings?: {
+      autoEngagement: boolean;
+      /** Which actions this account's posts can receive from other participants */
+      preferredActions: ('like' | 'comment')[];
+      /** Incoming cap: max likes this account's posts can receive per post */
+      maxLikesPerPost: number;
+      /** Incoming cap: max comments this account's posts can receive per post (only relevant when 'comment' in preferredActions) */
+      maxCommentsPerPost: number;
+      /** Spread engagements randomly within this window (minutes) */
+      engagementWindowMinutes: number;
+    };
     created_at: string;
     updated_at: string;
   }>;
-  socialEngagementConfig?: {
-    isEnabled: boolean;
-    targets: string[];
-    boosters: string[];
-    strategy: {
-      maxCommentsPerPost: number;
-      maxLikesPerPost: number;
-      engagementWindowMinutes: number;
-      preferredAction?: 'comment_and_like' | 'like';
-    };
-  };
 }
 
 interface UserInteraction {
@@ -4830,7 +4831,8 @@ export const socialEngagementTrackingDb = {
   async recordEngagement(tracker: {
     userId: string;
     targetPostUrn: string;
-    boosterAccountId: string;
+    ownerAccountId: string;
+    engagingAccountId: string;
     actionType: string;
     scheduledAt: string;
   }) {
@@ -4839,7 +4841,9 @@ export const socialEngagementTrackingDb = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Item: {
           ...tracker,
-          targetPostUrn_booster: `${tracker.targetPostUrn}#${tracker.boosterAccountId}`,
+          // Composite sort key: unique per (post, engager)
+          // Note: using 'targetPostUrn_booster' name to match existing DynamoDB schema
+          targetPostUrn_booster: `${tracker.targetPostUrn}#${tracker.engagingAccountId}`,
           createdAt: new Date().toISOString()
         },
       };
@@ -4852,14 +4856,14 @@ export const socialEngagementTrackingDb = {
     }
   },
 
-  async hasEngaged(userId: string, targetPostUrn: string, boosterAccountId: string): Promise<boolean> {
+  async hasEngaged(userId: string, targetPostUrn: string, engagingAccountId: string): Promise<boolean> {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         KeyConditionExpression: "userId = :userId AND targetPostUrn_booster = :targetPostUrn_booster",
         ExpressionAttributeValues: {
           ":userId": userId,
-          ":targetPostUrn_booster": `${targetPostUrn}#${boosterAccountId}`
+          ":targetPostUrn_booster": `${targetPostUrn}#${engagingAccountId}`
         }
       };
 
