@@ -88,21 +88,77 @@ chown -R ec2-user:ec2-user "$APP_DIR"
 
 cd "$APP_DIR" && sudo -u ec2-user npm install @playwright/test --no-save 2>/dev/null && cd /
 
-# Add Playwright browser_install to Claude settings
-SETTINGS_FILE="$APP_DIR/.claude/settings.local.json"
-if [[ -f "$SETTINGS_FILE" ]]; then
-  python3 -c "
-import json
-with open('$SETTINGS_FILE') as f:
-    s = json.load(f)
-tool = 'mcp__playwright__browser_install'
-if tool not in s.get('permissions',{}).get('allow',[]):
-    s.setdefault('permissions',{}).setdefault('allow',[]).append(tool)
-    with open('$SETTINGS_FILE','w') as f:
-        json.dump(s, f, indent=2)
-        f.write('\n')
-"
-fi
+# Create Claude Code project settings with pre-approved tool permissions
+# This goes in the user-level project settings directory (not the repo .claude/)
+CLAUDE_PROJECT_DIR="/home/ec2-user/.claude/projects/-home-ec2-user-agentweb"
+mkdir -p "$CLAUDE_PROJECT_DIR"
+cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm test*)",
+      "Bash(npx tsc*)",
+      "Bash(npx vite*)",
+      "Bash(npx ts-node*)",
+      "Bash(npx playwright*)",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(curl *)",
+      "Bash(cd *)",
+      "Bash(aws *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm *)",
+      "Bash(echo *)",
+      "Bash(tail *)",
+      "Bash(head *)",
+      "Bash(wc *)",
+      "Bash(diff *)",
+      "Bash(sed *)",
+      "Bash(sort *)",
+      "Bash(tmux *)",
+      "Bash(~/agentweb/test-env/*)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_type",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_file_upload",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_press_key",
+      "mcp__playwright__browser_select_option",
+      "mcp__playwright__browser_hover",
+      "mcp__playwright__browser_wait_for",
+      "mcp__playwright__browser_tabs",
+      "mcp__playwright__browser_navigate_back",
+      "mcp__playwright__browser_console_messages",
+      "mcp__playwright__browser_network_requests",
+      "mcp__playwright__browser_handle_dialog",
+      "mcp__playwright__browser_drag",
+      "mcp__playwright__browser_evaluate",
+      "mcp__playwright__browser_run_code",
+      "mcp__playwright__browser_resize",
+      "mcp__playwright__browser_close",
+      "mcp__playwright__browser_install",
+      "mcp__notion__API-post-search",
+      "mcp__notion__API-retrieve-a-page",
+      "mcp__notion__API-retrieve-a-comment",
+      "mcp__notion__API-create-a-comment",
+      "mcp__notion__API-patch-page",
+      "mcp__notion__API-get-block-children",
+      "mcp__notion__API-retrieve-a-database",
+      "mcp__notion__API-query-data-source"
+    ],
+    "deny": []
+  }
+}
+CLSEOF
+chown -R ec2-user:ec2-user /home/ec2-user/.claude
 
 sudo -u ec2-user git config --global user.name "Rui Wang"
 sudo -u ec2-user git config --global user.email "52230987+john-the-dev@users.noreply.github.com"
