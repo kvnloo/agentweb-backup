@@ -66,6 +66,7 @@ import {
   getPresignedFileUrl,
   batchPresignUrls,
 } from "./controllers/filesController";
+import { serveAsset, getAssetStats } from "./controllers/assetController";
 
 const app = express();
 
@@ -228,6 +229,8 @@ app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
+app.get("/asset/:assetHash/stats", getAssetStats);
+app.get("/asset/:assetHash", serveAsset);
 app.use("/review", reviewRouter);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 
