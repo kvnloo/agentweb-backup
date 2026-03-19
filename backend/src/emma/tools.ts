@@ -138,13 +138,14 @@ emmaToolRegistry.register({
       const { userDb } = await import('../services/db');
       const currentUser = await userDb.getUserById(userId);
       if (currentUser?.isAdmin === true) {
-        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
+        const { agentModeService } = await import('../services/agentModeService');
+        const adminToolNamesList = agentModeService.getAdminToolNames();
         availableSkills.push({
           skillId: '__admin_tools__',
           name: 'Admin Tools',
-          description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-          toolNames: adminToolNames,
-          toolCount: adminToolNames.length
+          description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
+          toolNames: adminToolNamesList,
+          toolCount: adminToolNamesList.length
         });
       }
     } catch {
