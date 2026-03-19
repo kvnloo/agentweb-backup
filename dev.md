@@ -1774,3 +1774,106 @@ Investigated session `b34576c1-70f9-40da-a628-6fc8f9a3b129` ("Test: Weekly Compe
 - The `runVerifiedChat` retry prompt (lines 583-618 of `agentModeController.ts`) intentionally avoids re-requesting tools that already ran. When all required functions have been called but the work plan isn't complete, it sends generic "complete pending steps" messages. This means retries don't force the LLM to use different search parameters.
 - 229 sessions use `perform_deep_research`. Overall 84% succeed at producing blog articles. `gemini-3-pro-preview` has a 23% failure rate vs 1% for `gemini-3.1-pro-preview`.
 - 42 sessions show durations >2 hours (stuck/zombie sessions), likely due to long-running deep research polls that don't properly clean up.
+
+## Message Limit & Context Window Investigation (2026-03-19)
+
+### Current State
+
+Agent Mode sessions are capped at **300 messages** (`MAX_MESSAGE_SIZE_PER_SESSION` in `backend/src/config.ts`). Raised from 150 in a previous release.
+
+### Bug Found: 10-User-Message Sliding Window
+
+**`buildMarketingContext()`** (agentModeService.ts:1785) currently slices conversation history to only the **last 10 user messages** + associated assistant/tool responses. This means the LLM is blind to most of the conversation history in any session with more than ~10 exchanges. This is a bug — context from earlier messages is silently dropped.
+
+**Code location:** Lines 1801-1813 in `buildMarketingContext()`:
+```
+let userCount = 0;
+let startIdx = 1;
+for (let i = filteredHistory.length - 1; i >= 0; i--) {
+  if (filteredHistory[i].role === 'user') {
+    userCount++;
+    if (userCount === 10) { startIdx = i; break; }
+  }
+}
+const sliced = filteredHistory.slice(startIdx);
+```
+
+**Fix:** Remove this sliding window entirely. All messages should be included in context.
+
+### How Context is Built Today
+
+```
+1. System prompt
+2. Skills context (available + installed skills)
+3. Account memory (cross-session facts)
+4. Last 10 user messages + their assistant/tool responses  <-- BUG: should be ALL messages
+5. Task statuses
+6. Work plan (if active)
+7. Current user message
+   |
+trimToolMessagesForContext()  (truncate old tool outputs to 8000 chars)
+   |
+callLLM()
+```
+
+**Key files:**
+- `agentModeService.ts:774` — `generateMarketingResponse()` main entry
+- `agentModeService.ts:1785` — `buildMarketingContext()` slices to last 10 user msgs
+- `agentModeService.ts:12015` — `trimToolMessagesForContext()` truncates old tool results
+- `chatbotService.ts:806` — `getMessagesFromMessagesTable()` loads from DynamoDB
+- `config.ts:4` — `MAX_MESSAGE_SIZE_PER_SESSION = 300`
+
+### Proposed Solution: Summarization + `query_message_details` Tool
+
+Two complementary mechanisms that together enable **unlimited messages**:
+
+1. **Periodic Summarization:** Every 200 messages, generate a summary using Gemini Flash Lite and inject it as a system-level context message. Original messages are preserved in DB but replaced by summaries in the LLM context.
+
+2. **`query_message_details` Tool:** A foundation tool that lets the LLM retrieve specific details from older messages on-demand. Uses Gemini Flash Lite (~$0.01/query, 1-2s latency) to answer questions against the full message history.
+
+**Why this works:**
+- Summaries give the LLM a high-level map of the full conversation
+- The tool lets the LLM drill into details when needed (the LLM decides when)
+- Gemini Flash Lite has ~1M token context window — can read hundreds of messages cheaply
+- No new infrastructure needed — just another tool + cheap LLM call
+- Scales infinitely — only summaries accumulate (~500 tokens each)
+
+**Architecture:**
+```
+Messages 1-200:     [Summary A injected as system message]
+Messages 201-400:   [Summary B injected as system message]
+Messages 401-600:   [Summary C injected as system message]
+Messages 601-700:   [Full detail messages in context]
+
+System prompt says: "Use query_message_details to look up specific details
+from earlier in the conversation when needed."
+
+When LLM needs detail -> calls query_message_details("what was the blog URL?")
+  -> Gemini Flash Lite reads relevant messages, answers the question
+  -> Result returned as tool response
+```
+
+**Cost for a 1000-message session:** ~$0.18 extra (4 summaries + ~10 detail queries).
+
+### Implementation Plan
+
+**Phase 1: Core Changes**
+1. Remove the 10-user-message sliding window in `buildMarketingContext()`
+2. Add `generateConversationSummary()` method using Gemini Flash Lite
+3. Add `query_message_details` foundation tool + `handleQueryMessageDetails()` handler
+4. Inject summaries into context via `buildMarketingContext(summaries)` parameter
+5. Store summaries on session record (`ChatSession.summaries[]`)
+6. Add `updateSessionSummaries()` to `ChatbotDB`
+7. Raise `MAX_MESSAGE_SIZE_PER_SESSION` to 10,000
+8. Update system prompt with "Long Conversation Support" guidance
+
+**Phase 2: Polish**
+- Frontend: show "Conversation summarized up to message X" indicator
+- Admin controls: summarization interval, enable/disable
+- Smart triggers: summarize based on token count, not just message count
+
+### Files to Modify
+- `backend/src/config.ts` — raise message limit
+- `backend/src/services/agentModeService.ts` — remove window, add summarization, add tool handler, add to foundation tools
+- `backend/src/services/chatbotService.ts` — add `summaries` to ChatSession, add `updateSessionSummaries()`
+- `backend/src/emma/tools.ts` — register `query_message_details` tool
