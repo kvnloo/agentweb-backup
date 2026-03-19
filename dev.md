@@ -26,6 +26,17 @@ The plan was to mirror the LinkedIn outreach pattern:
 
 Per Unipile's website and support team (March 2026): **Twitter/X integration is no longer actively maintained.** Their support indicated it may return in a few months. The SDK types still include `TWITTER` but the backend service may reject connections.
 
+### Unipile Actively Maintained Integrations (as of March 2026)
+
+Per Unipile support, the following providers are currently actively maintained:
+- **Emails** (MAIL, GOOGLE, OUTLOOK, IMAP)
+- **WhatsApp**
+- **LinkedIn**
+- **Telegram**
+- **Instagram**
+
+Twitter/X and Messenger are not on the active list.
+
 ## Decision
 
 Paused implementation. Will revisit when Unipile confirms Twitter support is restored. The implementation design is documented above and in `.claude/plans/whimsical-conjuring-stroustrup.md` for when we're ready to proceed.
