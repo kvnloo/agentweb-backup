@@ -80,16 +80,14 @@ jobs:
       - name: Resolve deployment label suffix
         id: pr-num
         run: |
-          # For scheduled deployments, use 'scheduled'
-          # For manual deployments, use 'manual'
-          # For PR merges (legacy), extract PR number
+          SHORT_SHA=$(git rev-parse --short HEAD)
           if [ "${{ github.event_name }}" == "schedule" ]; then
-            SUFFIX="scheduled"
+            SUFFIX="scheduled-${SHORT_SHA}"
           elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            SUFFIX="manual"
+            SUFFIX="manual-${SHORT_SHA}"
           else
-            # Extract PR number from merge commit message (e.g. "Merge pull request #123 ...")
-            SUFFIX=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "$(git rev-parse --short HEAD)")
+            PR_NUM=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "${SHORT_SHA}")
+            SUFFIX="${PR_NUM}"
           fi
           echo "pr_num=$SUFFIX" >> $GITHUB_OUTPUT
 
@@ -170,16 +168,14 @@ jobs:
       - name: Resolve deployment label suffix
         id: pr-num
         run: |
-          # For scheduled deployments, use 'scheduled'
-          # For manual deployments, use 'manual'
-          # For PR merges (legacy), extract PR number
+          SHORT_SHA=$(git rev-parse --short HEAD)
           if [ "${{ github.event_name }}" == "schedule" ]; then
-            SUFFIX="scheduled"
+            SUFFIX="scheduled-${SHORT_SHA}"
           elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            SUFFIX="manual"
+            SUFFIX="manual-${SHORT_SHA}"
           else
-            # Extract PR number from merge commit message (e.g. "Merge pull request #123 ...")
-            SUFFIX=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "$(git rev-parse --short HEAD)")
+            PR_NUM=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "${SHORT_SHA}")
+            SUFFIX="${PR_NUM}"
           fi
           echo "pr_num=$SUFFIX" >> $GITHUB_OUTPUT
 
