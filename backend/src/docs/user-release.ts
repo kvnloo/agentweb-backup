@@ -36,6 +36,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- When starting an Agent Mode session from a work item, attachments are passed to Emma as actual file attachments (not just links), so she can analyze their content',
       '- The chat dialog for work item sessions now renders attached files on the user message bubble',
       '- Supported in both the Customer Portal and Partner Portal GTM Tracker pages',
+      'Feature: Shareable Report Links for WeChat & Messaging Apps',
+      '- HTML reports can now be shared via a "Copy Shareable Link" button on the Reports page',
+      '- Links use our own domain (/asset/<hash>) instead of raw S3 URLs, which are blocked by WeChat and other messaging platforms',
+      '- Visit tracking with best-effort IP dedup counts unique viewers per report',
+      '- Stats endpoint available at /asset/<hash>/stats to check visit counts',
     ],
   },
   {
