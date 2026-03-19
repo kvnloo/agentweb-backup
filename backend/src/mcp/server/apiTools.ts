@@ -1649,6 +1649,73 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Client Health Assessment (admin-only) ──────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'list_all_clients',
+  definition: {
+    name: 'list_all_clients',
+    description: `List all client accounts (including admins) with quick health indicators. Admin-only tool.
+
+Returns for each client:
+- Name, email, roles
+- has_ads: whether they have a Meta ad account connected
+- has_lander: whether they have landing pages (productDomain or seoDomains)
+- has_crm: whether they have CRM integrations (email domain, LinkedIn)
+- last_activity: last login timestamp
+
+Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/client-health',
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'assess_client_health',
+  definition: {
+    name: 'assess_client_health',
+    description: `Assess the health of a specific client account across three layers: ads, landing pages, and lead quality. Admin-only tool.
+
+Returns a structured health assessment with:
+- **Ads layer**: Meta ad account connectivity, active campaigns
+- **Lander layer**: Landing page / website presence (productDomain, seoDomains)
+- **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
+- **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
+- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
+
+Use this to quickly diagnose a client's marketing funnel completeness.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 mcpToolRegistry.register({
   name: 'save_file',
   internal: true,
