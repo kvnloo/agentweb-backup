@@ -239,6 +239,16 @@ export const googleCallback = async (
             null
           );
         }
+
+        // Set Free tier defaults for OAuth registrations
+        const freeTierConfig = getDefaultTierConfig("Free");
+        if (freeTierConfig) {
+          await userDb.updateUser(user.userId, {
+            subscriptionType: "Free",
+            allowedPages: freeTierConfig.allowedPages,
+            allowedSkills: freeTierConfig.allowedSkills,
+          });
+        }
       } else {
         // For other portals, look up waitlist for bonus data (no gate)
         const waitlistEntry = await waitlistDb.getByEmail(email);
@@ -278,6 +288,16 @@ export const googleCallback = async (
             new Error("User creation failed after Google OAuth process."),
             null
           );
+        }
+
+        // Set Free tier defaults for OAuth registrations
+        const freeTierConfigOAuth = getDefaultTierConfig("Free");
+        if (freeTierConfigOAuth) {
+          await userDb.updateUser(user.userId, {
+            subscriptionType: "Free",
+            allowedPages: freeTierConfigOAuth.allowedPages,
+            allowedSkills: freeTierConfigOAuth.allowedSkills,
+          });
         }
       }
     }
