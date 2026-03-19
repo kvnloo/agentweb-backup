@@ -25,27 +25,33 @@ jobs:
     name: Detect changed projects
     runs-on: ubuntu-latest
     outputs:
-      backend: ${{ steps.filter.outputs.backend }}
-      partner: ${{ steps.filter.outputs.partner }}
+      backend: ${{ steps.filter.outputs.backend || steps.manual.outputs.backend }}
+      partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 100
 
-      - name: Paths filter
+      - name: Paths filter (scheduled)
+        if: github.event_name == 'schedule'
         id: filter
         uses: dorny/paths-filter@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # For scheduled runs, check changes in the last 24 hours
-          # For manual runs, check recent changes
-          base: ${{ github.event_name == 'schedule' && 'HEAD~10' || 'HEAD~1' }}
+          base: HEAD~10
           filters: |
             backend:
               - 'backend/**'
             partner:
               - 'partner-portal/**'
+
+      - name: Deploy all (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        id: manual
+        run: |
+          echo "backend=true" >> $GITHUB_OUTPUT
+          echo "partner=true" >> $GITHUB_OUTPUT
 
 
   backend-deploy:
