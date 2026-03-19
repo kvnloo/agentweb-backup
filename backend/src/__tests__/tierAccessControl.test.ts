@@ -151,8 +151,8 @@ describe('Tier-based Access Control', () => {
   describe('Registration defaults to Free tier', () => {
     it('sets subscriptionType=Free and Free-tier allowedPages on new user', async () => {
       // Mock: no existing user
-      mockUserDb.getUserByEmail.mockResolvedValue(null);
-      mockWaitlistDb.getByEmail.mockResolvedValue(null);
+      mockUserDb.getUserByEmail.mockResolvedValue(undefined as any);
+      mockWaitlistDb.getByEmail.mockResolvedValue(undefined as any);
 
       // Mock createUser to return the created user
       mockUserDb.createUser.mockResolvedValue({
@@ -162,7 +162,7 @@ describe('Tier-based Access Control', () => {
       } as any);
 
       // Mock updateUser for the post-creation tier assignment
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      mockUserDb.updateUser.mockResolvedValue(undefined as any);
 
       // Import register
       const { register } = await import('../controllers/auth');
@@ -209,7 +209,7 @@ describe('Tier-based Access Control', () => {
         email: 'test@example.com',
         subscriptionType: 'Free',
       } as any);
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      mockUserDb.updateUser.mockResolvedValue(undefined as any);
 
       const session = {
         customer: 'cus_123',
@@ -235,8 +235,9 @@ describe('Tier-based Access Control', () => {
 
       // Verify allowedPages is set for Basic tier
       const updateCall = mockUserDb.updateUser.mock.calls[0];
-      expect(updateCall[1].allowedPages).toBeDefined();
-      expect(updateCall[1].allowedPages.length).toBeGreaterThan(4);
+      const updateData = updateCall[1] as any;
+      expect(updateData.allowedPages).toBeDefined();
+      expect(updateData.allowedPages.length).toBeGreaterThan(4);
     });
 
     it('upgrades to Super Premium tier for Pro plan checkout', async () => {
@@ -245,7 +246,7 @@ describe('Tier-based Access Control', () => {
         email: 'pro@example.com',
         subscriptionType: 'Free',
       } as any);
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      mockUserDb.updateUser.mockResolvedValue(undefined as any);
 
       const session = {
         customer: 'cus_456',
@@ -275,7 +276,7 @@ describe('Tier-based Access Control', () => {
         userId: 'user-3',
         email: 'unknown@example.com',
       } as any);
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      mockUserDb.updateUser.mockResolvedValue(undefined as any);
 
       const session = {
         customer: 'cus_789',
@@ -307,7 +308,7 @@ describe('Tier-based Access Control', () => {
       mockUserDb.scanWithFilter.mockResolvedValue([
         { userId: 'user-1', email: 'test@example.com', stripe_customer_id: 'cus_123' },
       ]);
-      mockUserDb.updateUser.mockResolvedValue(undefined);
+      mockUserDb.updateUser.mockResolvedValue(undefined as any);
 
       const subscription = {
         customer: 'cus_123',

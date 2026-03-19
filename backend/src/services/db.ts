@@ -175,6 +175,8 @@ export interface User {
     created_at: string;
     updated_at: string;
   }>;
+  allowedPages?: string[];
+  allowedSkills?: string[];
 }
 
 interface UserInteraction {
