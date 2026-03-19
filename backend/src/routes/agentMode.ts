@@ -55,6 +55,10 @@ router.patch('/ishare/:shareId/llm-model', asyncHandler(agentModeController.upda
 // SSE endpoint for progress updates (public, with conversable token)
 router.get('/ishare/:shareId/progress', asyncHandler(agentModeController.getProgressPublic));
 
+// POST /api/agent-mode/ishare/:shareId/stop
+// Stop generation for an interactive shared session (public, with conversable token)
+router.post('/ishare/:shareId/stop', asyncHandler(agentModeController.stopGenerationPublic));
+
 // PUT /api/agent-mode/ishare/:shareId/message/:messageIndex/feedback
 // Submit message feedback for ishare sessions (public, with conversable token)
 router.put('/ishare/:shareId/message/:messageIndex/feedback', asyncHandler(agentModeController.submitIShareMessageFeedback));
@@ -92,6 +96,10 @@ router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedMo
 // GET /api/agent-mode/public/reports-model-options
 // Get models suitable for report generation (public)
 router.get('/public/reports-model-options', asyncHandler(agentModeController.getReportsModelOptions));
+
+// GET /api/agent-mode/public/customer-support-default-model
+// Get default model for customer support agent (public)
+router.get('/public/customer-support-default-model', asyncHandler(agentModeController.getCustomerSupportDefaultModel));
 
 
 // POST /api/agent-mode/run-scheduled-chats
@@ -148,6 +156,10 @@ router.get('/function-calls', asyncHandler(agentModeController.getAvailableFunct
 // GET /api/agent-mode/session/:sessionId/progress
 // SSE endpoint for progress updates
 router.get('/session/:sessionId/progress', authenticateToken, asyncHandlerAuth(agentModeController.getProgress));
+
+// POST /api/agent-mode/session/:sessionId/stop
+// Stop generation for a session
+router.post('/session/:sessionId/stop', asyncHandlerAuth(agentModeController.stopGeneration));
 
 // POST /api/agent-mode/generate
 // Generate AI response for marketing conversation

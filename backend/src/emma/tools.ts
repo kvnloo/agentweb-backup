@@ -2357,6 +2357,53 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'set_lead_contact_status',
+  definition: {
+    name: 'set_lead_contact_status',
+    description: 'Set the contact status for one or more leads. Use "do-not-contact" to flag leads that should not receive any emails or outreach. Use "active" to clear the flag and allow contact again. Leads flagged as do-not-contact will be blocked from all email sends, draft creation, and group emails.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        list_id: {
+          type: 'string',
+          description: 'The ID of the lead list containing the leads'
+        },
+        lead_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of lead IDs to update (max 200)'
+        },
+        contact_status: {
+          type: 'string',
+          enum: ['active', 'do-not-contact', 'unsubscribed'],
+          description: 'The contact status to set. "do-not-contact" blocks all outreach, "unsubscribed" marks as opted out, "active" clears the flag.'
+        },
+        reason: {
+          type: 'string',
+          enum: ['opted-out', 'bounced', 'requested-removal', 'admin-flagged', 'compliance', 'other'],
+          description: 'Reason for the status change (optional but recommended for do-not-contact/unsubscribed)'
+        },
+        note: {
+          type: 'string',
+          description: 'Optional free-text note explaining the status change'
+        }
+      },
+      required: ['list_id', 'lead_ids', 'contact_status']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    return await agentModeService.setLeadContactStatus(
+      args.list_id,
+      args.lead_ids,
+      args.contact_status,
+      args.reason,
+      args.note,
+      context?.userId
+    );
+  }
+});
+
+emmaToolRegistry.register({
   name: 'delete_leads',
   definition: {
     name: 'delete_leads',
@@ -3271,8 +3318,8 @@ emmaToolRegistry.register({
         },
         imageModel: {
           type: 'string',
-          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gemini-2.5-flash-image-preview (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
-          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image-preview', 'gen4_image', 'gemini_2.5_flash']
+          description: 'Optional: Specific image generation model to use. Must be one of: gemini-3-pro-image-preview (by Google), gemini-3.1-flash-image-preview (Nano Banana 2 by Google), gpt-image-1 (by Azure), gemini-2.5-flash-image (by Google), gen4_image (by Runway), gemini_2.5_flash (by Runway).',
+          enum: ['gemini-3-pro-image-preview', 'gemini-3.1-flash-image-preview', 'gpt-image-1', 'gemini-2.5-flash-image', 'gen4_image', 'gemini_2.5_flash']
         }
       },
       required: ['prompt', 'filename']

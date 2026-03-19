@@ -1,3 +1,112 @@
+# March 19, 2026: storywithai.info Blog Publishing — GoDaddy Website Builder Investigation
+
+## Context
+
+Customer site `storywithai.info` uses GoDaddy for CMS. Investigated whether we can support GoDaddy API or MCP for automated blog publishing.
+
+## Site Details
+
+- **Platform:** GoDaddy Website Builder 8.0 (Starfield Technologies)
+- **Generator meta tag:** `<meta name="generator" content="Starfield Technologies; Go Daddy Website Builder 8.0.0000"/>`
+- **Site ID:** `137516a9-3722-4cf9-8003-6a1c6c535872`
+- **Blog URL:** `https://storywithai.info/blogs` (50 existing posts)
+- **Read-only feeds:** `/blogs/f.json`, `/blogs/f.rss`, `/blogs/f.atom`
+- **Content CDN:** `img1.wsimg.com/isteam/ip/{siteId}/` (images), `img1.wsimg.com/blobby/go/{siteId}/` (scripts)
+- **Blog server:** DPS/2.0.0 (Digital Publishing System)
+
+## GoDaddy API Investigation
+
+GoDaddy offers 12 REST APIs at `developer.godaddy.com`, **none of which support CMS or blog content management**:
+
+| API | Purpose |
+|-----|---------|
+| Domains | Domain registration, DNS, availability |
+| Certificates | SSL certificate management |
+| Abuse, Aftermarket, Agreements, ANS, Auctions, Countries, Orders, Parking, Shoppers, Subscriptions | Infrastructure/account management |
+
+**Authentication:** API Key + Secret via `Authorization: sso-key [KEY]:[SECRET]` header. Rate limit: 60 req/min.
+
+**Key limitation:** GoDaddy's ToS prohibits commercial use of their API behind a paywall.
+
+## GoDaddy MCP Investigation
+
+- **No CMS/blog MCP exists.** Only domain-related MCPs found.
+- One community MCP (`Harshalkatakiya/godaddy-mcp`) — domain availability checks only, 2 GitHub stars.
+- Nine auto-generated MCP wrappers — all cover registrar APIs (domains, orders, certs), not content.
+- GoDaddy is not listed in the official MCP servers directory.
+
+## Internal API Discovery
+
+GoDaddy Website Builder uses `content.godaddy.com/api` internally:
+- Responds with `"Missing X-App-Key header."` when called without auth
+- CORS headers allow `GET,POST,PUT,PATCH,DELETE` — confirms write operations exist
+- Required headers: `x-app-key`, `authorization`, `x-csrftoken`
+- Requires GoDaddy SSO JWT token — not accessible externally
+- **Undocumented, likely violates GoDaddy ToS.** No one has reverse-engineered it publicly.
+
+## Recommendation
+
+**Browser automation via our agent engine (Playwright)** is the most practical path:
+1. Fits our existing architecture — this is what our platform does
+2. Customer doesn't need to change their site
+3. Log into `websites.godaddy.com`, navigate to blog editor, create/publish posts through UI
+4. Fragile to GoDaddy UI changes, but no better alternative exists for this proprietary CMS
+
+**Alternatives considered:**
+- **Migrate blog to supported CMS** (Webflow/BaseHub/WordPress) — most reliable long-term, but requires customer buy-in and migration effort
+- **Subdomain approach** (`blog.storywithai.info` on supported CMS) — good option since blog already exists at `/blogs`, but changes URL structure
+- **Reverse-engineer internal API** — fragile, undocumented, ToS-violating, not recommended
+
+---
+
+# March 18, 2026: Suspicious Bot Account Signups — No Payment Gate on Registration
+
+## Accounts Investigated
+
+Three suspicious accounts signed up over consecutive days with gibberish Gmail addresses using the Gmail dot trick (dots in local part are ignored by Gmail, allowing unique-looking emails that deliver to one inbox):
+
+| Email | Signed Up (UTC) | User ID |
+|-------|-----------------|---------|
+| `noqid.eho.b.6.4@gmail.com` | 2026-03-14 23:39 | `3f4a357e-ecb6-41c1-9ffd-40de73d27725` |
+| `s.a.c.e.wo.mag.or2.8.1@gmail.com` | 2026-03-15 14:54 | `0b989e86-e5cf-4947-bb1e-46f337e23c89` |
+| `l.i.j.o.ba.yug.ido.4.7@gmail.com` | 2026-03-17 21:06 | `cf9ab519-7592-424c-b75e-609283057248` |
+
+All three accounts were deactivated (`isActive: false`).
+
+## Behavior
+
+All accounts followed an identical automated pattern:
+- Signed up via email/password (not Google OAuth)
+- Within 1–6 seconds of signup, 4 chat sessions were auto-created as the bot navigated: `dashboard` → `plan-Onboarding` → `plan/Onboarding` → `agent-mode`
+- Zero user messages sent, zero tasks created, zero executions — no actual product usage
+- One account also hit `forgot-password` 16s after signup
+- Two accounts returned days later and visited the `settings` page
+
+## Root Cause: Registration Endpoint Has No Payment Verification
+
+The Stripe payment flow is entirely optional and easily bypassed:
+
+1. **Intended flow:** User visits pricing → Stripe Checkout → redirect to `/register?session_id=cs_xxx` → email pre-filled and locked → set password → account created
+2. **Actual exploit:** Bot goes directly to `POST /api/auth/register` with `{email, password}` — no `session_id` required. The backend creates the account with `roles: ["customer"]` unconditionally.
+
+**Backend** (`POST /api/auth/register`): No Stripe session validation. Assigns `customer` role to all signups regardless of payment.
+
+**Frontend** (`Register.tsx`): The `session_id` query param only pre-fills the email field; it's completely optional. Registration works without it.
+
+**ProtectedRoute**: Only checks for `customer` role (which all registrants get). No subscription status or payment verification.
+
+The only protection is a rate limiter (10 req/15min per IP), which the bots circumvented by signing up once per day.
+
+## Future Fix (Deferred)
+
+Options to prevent this:
+1. **Require Stripe session validation** in the register endpoint — verify `session_id` with Stripe before creating the account
+2. **Don't assign `customer` role at registration** — use a `pending` role and upgrade to `customer` only after Stripe webhook `checkout.session.completed`
+3. **Add email verification** — require confirmation link click before activation
+4. **Add CAPTCHA** (reCAPTCHA/hCaptcha/Turnstile) to the registration form
+
+---
+
 # March 11, 2026: LinkedIn API Limitations — Activity URNs, Post Monitoring, and Metrics Caching
 
 ## LinkedIn Activity URN vs Share URN

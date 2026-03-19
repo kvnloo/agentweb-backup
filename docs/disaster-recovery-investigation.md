@@ -319,15 +319,23 @@ All 51 secrets show `RotationEnabled: None` and `LastRotated: None`.
 
 ### P0 — Immediate (Week 1) — Prevent data loss today
 
-| # | Action | Details |
-|---|--------|---------|
-| 1 | Enable DynamoDB deletion protection | ALL 29 tables currently have deletion protection DISABLED |
-| 2 | Enable DynamoDB PITR on remaining 7 tables | AW-AgentApiKeys, AW-BookContents, AW-Books, AW-ConnectedAccountPosts, AW-LandingPages, AW-MCPOAuthClients, AW-MCPOAuthCodes, AW-MCPOAuthTokens |
-| 3 | Enable S3 versioning | On `agentweb-user-files`, `agentweb-execution-gifs`, `agentweb-bedrock-logs`, `agentweb-cost` |
-| 4 | Enable S3 public access block | On `agentweb-user-files` and `agentweb-execution-gifs` — user data and execution recordings are currently potentially publicly accessible via object URLs |
-| 5 | Enable CloudTrail | ZERO trails configured — no API audit logging at all |
-| 6 | Enable CloudWatch log streaming | On prod EB environment (verified `StreamLogs: false`, zero log groups exist) |
-| 7 | Review vendor IAM access | `vendor-argusoft-access` has console access, last used Feb 20. Verify if still needed and disable if not. |
+| # | Action | Details | Status |
+|---|--------|---------|--------|
+| 1 | Enable DynamoDB deletion protection | ALL 29 tables currently have deletion protection DISABLED | **RESOLVED** — enabled manually via AWS Console on all 29 tables (CLI `--deletion-protection-enabled` requires AWS CLI v2.13+; script uses `--cli-input-json` fallback) |
+| 2 | Enable DynamoDB PITR on remaining 7 tables | AW-AgentApiKeys, AW-BookContents, AW-Books, AW-ConnectedAccountPosts, AW-LandingPages, AW-MCPOAuthClients, AW-MCPOAuthCodes, AW-MCPOAuthTokens | **RESOLVED** — script enables PITR on all 7 tables |
+| 3 | Enable S3 versioning | On `agentweb-user-files`, `agentweb-execution-gifs`, `agentweb-bedrock-logs`, `agentweb-cost` | **RESOLVED** — script enables versioning on all 4 buckets |
+| 4 | Enable S3 public access block | On `agentweb-user-files` and `agentweb-execution-gifs` — user data and execution recordings are currently potentially publicly accessible via object URLs | **RESOLVED** — code migrated to presigned URLs (backend `s3Utils.ts`, `filesController.ts`; frontend `PresignedMedia` components). After code is deployed, run the S3 public access block commands in the script. |
+| 5 | Enable CloudTrail | ZERO trails configured — no API audit logging at all | **RESOLVED** — script creates `agentweb-prod-trail` with multi-region coverage, log validation, and dedicated S3 bucket |
+| 6 | Enable CloudWatch log streaming | On prod EB environment (verified `StreamLogs: false`, zero log groups exist) | **RESOLVED** — script enables log streaming on `Agentweb-backend-env-prod-3` with 30-day retention |
+| 7 | Review vendor IAM access | `vendor-argusoft-access` has console access, last used Feb 20. Verify if still needed and disable if not. | **RESOLVED** — script gathers IAM details for review; manual disable commands provided |
+
+**Resolution details (2026-03-17):**
+
+- **Infrastructure script:** `scripts/dr-p0-fixes.sh` — run with admin AWS credentials to apply items 1-3, 5-7
+- **Code changes (item 4):**
+  - Backend: Added presigned URL generation (`s3Utils.ts`), new `/api/files/presign` and `/api/files/presign-batch` endpoints, updated `getFileContent` and `viewExternalFile` to read from S3 via SDK instead of public HTTP
+  - Frontend: Added `PresignedImg`, `PresignedVideo`, `PresignedIframe` components and `usePresignedUrl` hook; updated `ChatMessageItem`, `Images`, `LeadMagnetPage`, `ExecutionResultPage`
+- **Deployment order for item 4:** Deploy code first (presigned URL support), then enable S3 public access block via script
 
 ### P1 — Urgent (Weeks 2-4) — Breach response capability
 

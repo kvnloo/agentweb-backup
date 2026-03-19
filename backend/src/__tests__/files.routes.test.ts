@@ -15,9 +15,22 @@ jest.mock('../middleware/auth', () => ({
 // Mock axios
 jest.mock('axios');
 
+// Mock S3 utils for getFileContent which now reads directly via SDK
+const mockGetS3ObjectStream = jest.fn();
+const mockGetS3ObjectMetadata = jest.fn();
+jest.mock('../utils/s3Utils', () => {
+  const actual = jest.requireActual('../utils/s3Utils');
+  return {
+    ...actual,
+    getS3ObjectStream: (...args: any[]) => mockGetS3ObjectStream(...args),
+    getS3ObjectMetadata: (...args: any[]) => mockGetS3ObjectMetadata(...args),
+  };
+});
+
 import request from 'supertest';
 import express from 'express';
 import axios from 'axios';
+import { Readable } from 'stream';
 import { getFileContent, saveHtmlContent } from '../controllers/filesController';
 import { authenticateToken } from '../middleware/auth';
 
@@ -57,7 +70,7 @@ describe('Files routes', () => {
       expect(response.status).toBe(401);
     });
 
-    it('should reject non-allowlisted domains', async () => {
+    it('should reject non-S3-bucket URLs', async () => {
       const response = await request(app)
         .get('/api/files/content')
         .set('Authorization', `Bearer ${validToken}`)
@@ -65,25 +78,27 @@ describe('Files routes', () => {
 
       expect(response.status).toBe(403);
       expect(response.body).toHaveProperty('success', false);
-      expect(response.body.message).toContain('not in allowlist');
+      expect(response.body.message).toContain('configured S3 bucket');
     });
 
-    it('should accept allowlisted S3 bucket URLs', async () => {
-      // Mock successful axios response
-      mockedAxios.get.mockResolvedValueOnce({
-        data: '<html><body>Test content</body></html>',
-        headers: { 'content-type': 'text/html' },
-      } as any);
+    it('should accept S3 bucket URLs and read via SDK', async () => {
+      // Mock S3 SDK stream response
+      const htmlContent = '<html><body>Test content</body></html>';
+      const readable = Readable.from([Buffer.from(htmlContent)]);
+      mockGetS3ObjectStream.mockReturnValueOnce(readable);
+      mockGetS3ObjectMetadata.mockResolvedValueOnce({
+        ContentType: 'text/html',
+      });
 
       const response = await request(app)
         .get('/api/files/content')
         .set('Authorization', `Bearer ${validToken}`)
         .query({ url: 'https://agentweb-user-files.s3.us-west-2.amazonaws.com/test.html' });
 
-      // Should pass validation and return success
       expect(response.status).toBe(200);
       expect(response.body).toHaveProperty('success', true);
-      expect(response.body).toHaveProperty('content');
+      expect(response.body).toHaveProperty('content', htmlContent);
+      expect(mockGetS3ObjectStream).toHaveBeenCalledWith('test.html', expect.any(String));
     });
 
     it('should reject missing URL parameter', async () => {

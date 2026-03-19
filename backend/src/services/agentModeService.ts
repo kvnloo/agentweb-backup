@@ -98,6 +98,7 @@ export class AgentModeService {
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
   private imageGenerationDefaultModelSettingName = 'agent_mode_image_generation_default_model';
   private videoGenerationDefaultModelSettingName = 'agent_mode_video_generation_default_model';
+  private customerSupportDefaultModelSettingName = 'agent_mode_customer_support_default_model';
 
   constructor() {
     this.toolRegistry = new ToolRegistry();
@@ -377,6 +378,36 @@ export class AgentModeService {
     }
     // Fall back to the general default model
     return this.getDefaultModel();
+  }
+
+  async getCustomerSupportDefaultModel(): Promise<string> {
+    try {
+      const setting = await settingsService.getSetting(this.customerSupportDefaultModelSettingName);
+      const configuredModel = setting?.settingValue?.trim();
+      if (configuredModel) {
+        if (this.llmModels[configuredModel]) {
+          return configuredModel;
+        }
+        console.warn(`AgentMode: Unsupported customer support default model "${configuredModel}" in settings; using fallback.`);
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting customer support default model setting:', error);
+    }
+    // Fall back to the general default model
+    return this.getDefaultModel();
+  }
+
+  async getBackupModel(primaryModel: string): Promise<string | null> {
+    try {
+      const setting = await settingsService.getSetting('agent_mode_backup_model');
+      const configured = setting?.settingValue?.trim();
+      if (configured && this.llmModels[configured] && configured !== primaryModel) {
+        return configured;
+      }
+    } catch (error) {
+      console.error('AgentMode: Error getting backup model setting:', error);
+    }
+    return null;
   }
 
   // Helper method to create Azure OpenAI client for a specific deployment
@@ -751,9 +782,14 @@ export class AgentModeService {
     mockMode: boolean = false,
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
     socketEmit?: (room: string, event: string, payload: any) => void,
-    isInteractiveShare: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[] }> {
+    isInteractiveShare: boolean = false,
+    isCancelled?: () => boolean
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     try {
+      // Track backup model usage
+      const originalLlmModel = llmModel;
+      let backupModelUsed = false;
+
       // Track memory usage for optimization
       const startMemory = process.memoryUsage();
       const startTime = Date.now();
@@ -861,7 +897,18 @@ export class AgentModeService {
       let maxTokensContinuations = 0;
       const MAX_TOKEN_CONTINUATIONS = 3;
 
+      let wasCancelled = false;
       while (iteration < maxIterations) {
+        // Check for cancellation before each iteration
+        if (isCancelled?.()) {
+          console.log(`AgentMode: Generation cancelled for session ${sessionId} at iteration ${iteration}`);
+          wasCancelled = true;
+          if (!content) {
+            content = 'Generation was stopped.';
+          }
+          break;
+        }
+
         iteration++;
 
         // 4. Refresh Context if Skills Changed
@@ -939,14 +986,44 @@ export class AgentModeService {
         // Trim large old tool results to prevent context window overflow
         const trimmedMessages = this.trimToolMessagesForContext(messages);
 
-        // Make LLM call
+        // Make LLM call (with backup model fallback on transient errors)
         const llmStart = Date.now();
-        const response: any = await this.callLLM(llmModel, trimmedMessages, {
-          tools: filteredToolsCache,
-          tool_choice: 'auto',
-          max_completion_tokens: 12384,
-          temperature: 0.1
-        });
+        let response: any;
+        try {
+          response = await this.callLLM(llmModel, trimmedMessages, {
+            tools: filteredToolsCache,
+            tool_choice: 'auto',
+            max_completion_tokens: 12384,
+            temperature: 0.1
+          });
+        } catch (callError) {
+          if (isTransientLLMError(callError) && !backupModelUsed) {
+            const backup = await this.getBackupModel(llmModel);
+            if (backup) {
+              console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
+              if (onProgress) {
+                onProgress({
+                  iteration,
+                  status: 'switching_model',
+                  toolCalls: toolCalls.slice(),
+                  pendingTools: [`Primary model timed out. Switching to ${backup}...`]
+                });
+              }
+              llmModel = backup;
+              backupModelUsed = true;
+              response = await this.callLLM(llmModel, trimmedMessages, {
+                tools: filteredToolsCache,
+                tool_choice: 'auto',
+                max_completion_tokens: 12384,
+                temperature: 0.1
+              });
+            } else {
+              throw callError;
+            }
+          } else {
+            throw callError;
+          }
+        }
         const llmDurationMs = Date.now() - llmStart;
 
         // Yield control back to event loop after LLM call to allow health checks and other requests
@@ -1277,7 +1354,9 @@ export class AgentModeService {
         toolCalls,
         knowledgeBaseQueries,
         sources,
-        responseMessages
+        responseMessages,
+        ...(wasCancelled ? { cancelled: true } : {}),
+        ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
       console.error('AgentMode: Response generation failed:', error);
@@ -3550,6 +3629,21 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
+      // Reject image files — the LLM should use describe_image instead
+      const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.tiff', '.tif', '.ico', '.heic', '.heif', '.avif'];
+      try {
+        const parsedUrl = new URL(videoFileUrl);
+        const ext = path.extname(parsedUrl.pathname).toLowerCase();
+        if (imageExtensions.includes(ext)) {
+          return {
+            success: false,
+            message: `This appears to be an image file (${ext}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+          };
+        }
+      } catch {
+        // URL parsing failed — continue and let downstream handling deal with it
+      }
+
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
       const geminiSecretName = `${environment}/AgentWeb/GeminiAPIKey`;
       const geminiApiKey = await getSecret(geminiSecretName);
@@ -3613,6 +3707,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
         const fallbackMimeType = mimeTypeMap[urlExtension] || 'video/mp4';
         const mimeType = contentTypeHeader.startsWith('video/') ? contentTypeHeader : fallbackMimeType;
+
+        // Reject if Content-Type indicates this is an image, not a video
+        if (contentTypeHeader.startsWith('image/')) {
+          return {
+            success: false,
+            message: `This appears to be an image file (${contentTypeHeader}), not a video. Please use the 'describe_image' tool instead to analyze images.`
+          };
+        }
 
         tempDirPath = await fs.mkdtemp(path.join(os.tmpdir(), 'agentweb-video-'));
         const fileExtension = urlExtension || '.mp4';
@@ -5968,6 +6070,92 @@ When a user requests client onboarding or says "onboard new client" or similar:
     }
   }
 
+  public async setLeadContactStatus(
+    listId: string,
+    leadIds: string[],
+    contactStatus: string,
+    contactStatusReason: string | undefined,
+    contactStatusNote: string | undefined,
+    userId: string
+  ): Promise<any> {
+    try {
+      const { crmDb } = await import('./db');
+      const { isDoNotContact } = await import('../utils/leadContactStatus');
+
+      const validStatuses = ['active', 'do-not-contact', 'unsubscribed'];
+      if (!validStatuses.includes(contactStatus)) {
+        return { success: false, message: `contactStatus must be one of: ${validStatuses.join(', ')}` };
+      }
+
+      const validReasons = ['opted-out', 'bounced', 'requested-removal', 'admin-flagged', 'compliance', 'other'];
+      if (contactStatusReason && !validReasons.includes(contactStatusReason)) {
+        return { success: false, message: `contactStatusReason must be one of: ${validReasons.join(', ')}` };
+      }
+
+      if (!leadIds || leadIds.length === 0) {
+        return { success: false, message: 'No lead IDs provided' };
+      }
+      if (leadIds.length > 200) {
+        return { success: false, message: 'Maximum 200 leads per call' };
+      }
+
+      const list = await crmDb.getLeadListById(listId);
+      if (!list) {
+        return { success: false, message: 'Lead list not found' };
+      }
+      if (list.userId !== userId) {
+        return { success: false, message: 'Access denied' };
+      }
+
+      const now = new Date().toISOString();
+      let updated = 0;
+      let failed = 0;
+      const errors: string[] = [];
+
+      for (const leadId of leadIds) {
+        try {
+          const updates: any = {
+            contactStatus,
+            contactStatusUpdatedAt: now,
+            contactStatusUpdatedBy: userId,
+          };
+          if (contactStatusReason) {
+            updates.contactStatusReason = contactStatusReason;
+          }
+          if (contactStatusNote) {
+            updates.contactStatusNote = contactStatusNote;
+          }
+          if (contactStatus === 'active') {
+            updates.unsubscribedFromGroupEmail = false;
+            updates.contactStatusReason = null;
+            updates.contactStatusNote = null;
+          }
+          if (contactStatus === 'do-not-contact' || contactStatus === 'unsubscribed') {
+            updates.unsubscribedFromGroupEmail = true;
+            updates.unsubscribedFromGroupEmailAt = now;
+          }
+          await crmDb.updateLead(listId, leadId, updates);
+          updated++;
+        } catch (err) {
+          failed++;
+          errors.push(`${leadId}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
+      }
+
+      return {
+        success: true,
+        message: `Contact status updated: ${updated} succeeded, ${failed} failed out of ${leadIds.length}`,
+        updated,
+        failed,
+        total: leadIds.length,
+        ...(errors.length > 0 ? { errors } : {}),
+      };
+    } catch (error) {
+      console.error('AgentMode: Error setting lead contact status:', error);
+      return { success: false, message: 'Failed to set contact status', error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   public async deleteLeads(listId: string, leadIds: string[], userId: string): Promise<any> {
     try {
       const { crmDb } = await import('./db');
@@ -6521,6 +6709,13 @@ When a user requests client onboarding or says "onboard new client" or similar:
         return { success: false, message: 'No email address', error: 'This lead does not have an email address' };
       }
 
+      // Check do-not-contact status
+      const { isDoNotContact, getDoNotContactReason } = await import('../utils/leadContactStatus');
+      if (isDoNotContact(lead)) {
+        const reason = getDoNotContactReason(lead);
+        return { success: false, message: 'Do not contact', error: `Cannot send email to this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.` };
+      }
+
       if (!lead.emailDraft) {
         return { success: false, message: 'No email draft', error: 'This lead does not have an email draft. Use update_email_draft_for_lead to create one first.' };
       }
@@ -6772,6 +6967,17 @@ When a user requests client onboarding or says "onboard new client" or similar:
           success: false,
           message: 'Lead not found',
           error: 'The specified lead does not exist'
+        };
+      }
+
+      // Check do-not-contact status
+      const { isDoNotContact: isDNC, getDoNotContactReason: getDNCReason } = await import('../utils/leadContactStatus');
+      if (isDNC(lead)) {
+        const reason = getDNCReason(lead);
+        return {
+          success: false,
+          message: 'Do not contact',
+          error: `Cannot draft email for this lead: ${reason}. Remove the do-not-contact flag first if you want to contact them.`
         };
       }
 

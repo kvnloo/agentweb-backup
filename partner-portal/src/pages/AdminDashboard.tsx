@@ -6844,6 +6844,10 @@ const AgentModeSettings = () => {
   const [savingImageGenerationDefaultModel, setSavingImageGenerationDefaultModel] = useState(false);
   const [videoGenerationDefaultModel, setVideoGenerationDefaultModel] = useState('');
   const [savingVideoGenerationDefaultModel, setSavingVideoGenerationDefaultModel] = useState(false);
+  const [customerSupportDefaultModel, setCustomerSupportDefaultModel] = useState('');
+  const [savingCustomerSupportDefaultModel, setSavingCustomerSupportDefaultModel] = useState(false);
+  const [backupModel, setBackupModel] = useState('');
+  const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
@@ -6921,6 +6925,12 @@ const AgentModeSettings = () => {
 
       // Load video generation default model
       await loadVideoGenerationDefaultModel(models);
+
+      // Load customer support default model
+      await loadCustomerSupportDefaultModel(models);
+
+      // Load backup model
+      await loadBackupModel(models);
     } catch (error) {
       console.error('Error loading settings:', error);
       setError('Failed to load settings');
@@ -7503,6 +7513,106 @@ const AgentModeSettings = () => {
     }
   };
 
+  const loadCustomerSupportDefaultModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setCustomerSupportDefaultModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading customer support default model:', settingsError);
+      }
+    }
+    setCustomerSupportDefaultModel('');
+  };
+
+  const saveCustomerSupportDefaultModel = async () => {
+    try {
+      setSavingCustomerSupportDefaultModel(true);
+      setError('');
+      setSuccess('');
+
+      if (customerSupportDefaultModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+          settingValue: customerSupportDefaultModel,
+          description: 'Default LLM model for customer support agent (overrides the general default model)'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Customer support default model updated successfully!');
+    } catch (error) {
+      console.error('Error saving customer support default model:', error);
+      setError('Failed to save customer support default model');
+    } finally {
+      setSavingCustomerSupportDefaultModel(false);
+    }
+  };
+
+  const loadBackupModel = async (models: string[] = []) => {
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    try {
+      const response = await axios.get(buildApiUrl('/api/settings/agent_mode_backup_model'), {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (response.data && response.data.settingValue) {
+        const configuredModel = response.data.settingValue.trim();
+        if (configuredModel && availableModels.includes(configuredModel)) {
+          setBackupModel(configuredModel);
+          return;
+        }
+      }
+    } catch (settingsError: any) {
+      if (settingsError.response?.status !== 404) {
+        console.error('Error loading backup model setting:', settingsError);
+      }
+    }
+    setBackupModel('');
+  };
+
+  const saveBackupModel = async () => {
+    try {
+      setSavingBackupModel(true);
+      setError('');
+      setSuccess('');
+
+      if (backupModel) {
+        await axios.put(buildApiUrl('/api/settings/agent_mode_backup_model'), {
+          settingValue: backupModel,
+          description: 'Backup LLM model used when the primary model times out or encounters transient errors'
+        }, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      } else {
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_backup_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+      }
+
+      setSuccess('Backup model updated successfully!');
+    } catch (error) {
+      console.error('Error saving backup model:', error);
+      setError('Failed to save backup model');
+    } finally {
+      setSavingBackupModel(false);
+    }
+  };
+
   const saveSystemPrompt = async () => {
     try {
       setSavingSystemPrompt(true);
@@ -7868,7 +7978,7 @@ const AgentModeSettings = () => {
     setPredefinedWorkPlans(updated);
   };
 
-  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel') => {
+  const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
     try {
       setError('');
       setSuccess('');
@@ -7924,6 +8034,14 @@ const AgentModeSettings = () => {
 
         setDefaultModel(fallbackDefaultModel);
         setSuccess('Reset to default model successfully!');
+      } else if (type === 'backupModel') {
+        setSavingBackupModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_backup_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setBackupModel('');
+        setSuccess('Backup model cleared. No automatic fallback will occur on timeout.');
       } else if (type === 'scheduledChatsDefaultModel') {
         setSavingScheduledChatsDefaultModel(true);
         await axios.delete(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
@@ -7956,6 +8074,14 @@ const AgentModeSettings = () => {
 
         setVideoGenerationDefaultModel('');
         setSuccess('Reset video generation default model successfully!');
+      } else if (type === 'customerSupportDefaultModel') {
+        setSavingCustomerSupportDefaultModel(true);
+        await axios.delete(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        setCustomerSupportDefaultModel('');
+        setSuccess('Reset customer support default model successfully!');
       }
     } catch (error) {
       console.error('Error resetting setting:', error);
@@ -7969,6 +8095,8 @@ const AgentModeSettings = () => {
         setSavingConversationStarters(false);
       } else if (type === 'defaultModel') {
         setSavingDefaultModel(false);
+      } else if (type === 'backupModel') {
+        setSavingBackupModel(false);
       } else if (type === 'scheduledChatsDefaultModel') {
         setSavingScheduledChatsDefaultModel(false);
       } else if (type === 'reportGenerationDefaultModel') {
@@ -7977,6 +8105,8 @@ const AgentModeSettings = () => {
         setSavingImageGenerationDefaultModel(false);
       } else if (type === 'videoGenerationDefaultModel') {
         setSavingVideoGenerationDefaultModel(false);
+      } else if (type === 'customerSupportDefaultModel') {
+        setSavingCustomerSupportDefaultModel(false);
       }
     }
   };
@@ -8047,8 +8177,8 @@ const AgentModeSettings = () => {
                 ? supportedModels
                 : [fallbackDefaultModel, 'gemini-3-pro-preview']
               ).map((model) => (
-                <MenuItem key={model} value={model}>
-                  {model}
+                <MenuItem key={model} value={model} disabled={model === backupModel}>
+                  {model}{model === backupModel ? ' (used as backup model)' : ''}
                 </MenuItem>
               ))}
             </Select>
@@ -8056,6 +8186,58 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             Sets the default model for newly created Agent Mode sessions. Existing sessions keep their current model.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Backup Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Backup Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('backupModel')}
+                disabled={savingBackupModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveBackupModel}
+                disabled={savingBackupModel}
+              >
+                {savingBackupModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-backup-model-label">Backup Model</InputLabel>
+            <Select
+              labelId="agent-mode-backup-model-label"
+              value={backupModel}
+              label="Backup Model"
+              onChange={(e) => setBackupModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>None (no backup)</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model} disabled={model === defaultModel}>
+                  {model}{model === defaultModel ? ' (current default model)' : ''}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            When the primary model times out or encounters transient errors, the system automatically switches to this backup model. If not set, no automatic fallback occurs and the error is returned to the user.
           </Typography>
         </CardContent>
       </Card>
@@ -8264,6 +8446,58 @@ const AgentModeSettings = () => {
 
           <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
             If set, video generation uses this model instead of the general default. Leave as "Use general default" to follow the Default Model setting above.
+          </Typography>
+        </CardContent>
+      </Card>
+
+      {/* Customer Support Agent Default Model */}
+      <Card sx={{ mb: 3 }}>
+        <CardContent>
+          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+            <Typography variant="h6">Customer Support Agent Default Model</Typography>
+            <Box>
+              <Button
+                variant="outlined"
+                onClick={() => resetToDefault('customerSupportDefaultModel')}
+                disabled={savingCustomerSupportDefaultModel}
+                sx={{ mr: 1 }}
+              >
+                Reset to Default
+              </Button>
+              <Button
+                variant="contained"
+                onClick={saveCustomerSupportDefaultModel}
+                disabled={savingCustomerSupportDefaultModel}
+              >
+                {savingCustomerSupportDefaultModel ? <CircularProgress size={20} /> : 'Save Changes'}
+              </Button>
+            </Box>
+          </Box>
+
+          <FormControl fullWidth>
+            <InputLabel id="agent-mode-customer-support-model-label">Customer Support Agent Default Model</InputLabel>
+            <Select
+              labelId="agent-mode-customer-support-model-label"
+              value={customerSupportDefaultModel}
+              label="Customer Support Agent Default Model"
+              onChange={(e) => setCustomerSupportDefaultModel(e.target.value as string)}
+            >
+              <MenuItem value="">
+                <em>Use general default</em>
+              </MenuItem>
+              {(supportedModels.length > 0
+                ? supportedModels
+                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+              ).map((model) => (
+                <MenuItem key={model} value={model}>
+                  {model}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+            Sets the default model for Emma Chat in the customer portal. If not set, uses the general default model.
           </Typography>
         </CardContent>
       </Card>

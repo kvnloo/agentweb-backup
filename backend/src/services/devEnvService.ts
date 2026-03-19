@@ -435,14 +435,33 @@ export async function launchEnvironment(
 
     // 3. Create security group (port 5175 open to 0.0.0.0/0 only)
     const sgName = `agentweb-test-env-notion-${notionPageId.replace(/-/g, "").slice(0, 20)}`;
-    const sgRes = await ec2
-      .createSecurityGroup({
-        GroupName: sgName,
-        Description: `AgentWeb dev env for Notion page ${notionPageId}`,
-        VpcId: vpcId,
-      })
-      .promise();
-    const sgId = sgRes.GroupId!;
+    let sgId: string;
+    try {
+      const sgRes = await ec2
+        .createSecurityGroup({
+          GroupName: sgName,
+          Description: `AgentWeb dev env for Notion page ${notionPageId}`,
+          VpcId: vpcId,
+        })
+        .promise();
+      sgId = sgRes.GroupId!;
+    } catch (sgErr: any) {
+      if (sgErr.code === "InvalidGroup.Duplicate") {
+        // Reuse existing SG from a previous failed launch attempt
+        const existing = await ec2
+          .describeSecurityGroups({
+            Filters: [
+              { Name: "group-name", Values: [sgName] },
+              { Name: "vpc-id", Values: [vpcId] },
+            ],
+          })
+          .promise();
+        sgId = existing.SecurityGroups?.[0]?.GroupId!;
+        console.log(`[devEnv] Reusing existing security group: ${sgId}`);
+      } else {
+        throw sgErr;
+      }
+    }
     console.log(`[devEnv] Security group: ${sgId}`);
 
     // Tag the security group
@@ -457,25 +476,33 @@ export async function launchEnvironment(
       .promise();
 
     // Open ports 22 (SSH) and 5175 (test-env-access / IP registration) to the world
-    await ec2
-      .authorizeSecurityGroupIngress({
-        GroupId: sgId,
-        IpPermissions: [
-          {
-            IpProtocol: "tcp",
-            FromPort: 22,
-            ToPort: 22,
-            IpRanges: [{ CidrIp: "0.0.0.0/0" }],
-          },
-          {
-            IpProtocol: "tcp",
-            FromPort: 5175,
-            ToPort: 5175,
-            IpRanges: [{ CidrIp: "0.0.0.0/0" }],
-          },
-        ],
-      })
-      .promise();
+    try {
+      await ec2
+        .authorizeSecurityGroupIngress({
+          GroupId: sgId,
+          IpPermissions: [
+            {
+              IpProtocol: "tcp",
+              FromPort: 22,
+              ToPort: 22,
+              IpRanges: [{ CidrIp: "0.0.0.0/0" }],
+            },
+            {
+              IpProtocol: "tcp",
+              FromPort: 5175,
+              ToPort: 5175,
+              IpRanges: [{ CidrIp: "0.0.0.0/0" }],
+            },
+          ],
+        })
+        .promise();
+    } catch (ruleErr: any) {
+      if (ruleErr.code === "InvalidPermission.Duplicate") {
+        console.log(`[devEnv] SG ingress rules already exist, skipping`);
+      } else {
+        throw ruleErr;
+      }
+    }
 
     // 4. Read user-data script
     const userDataPath = path.resolve(

@@ -11,12 +11,13 @@ import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { emitProgress, registerProgressCallback, getLatestProgress, progressStore } from '../utils/sseProgress';
+import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
 const LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS = 7;
@@ -1003,6 +1004,26 @@ async function runScheduledChat(
       // Continue even if saving fails - we still want to return the result
     }
 
+    // Send oncall alert if scheduled chat failed validation (not for test runs)
+    if (!finalResult.passed && !isTest) {
+      sendAgentModeOncallAlert({
+        subject: `Scheduled Chat Failed: ${schedule.scheduleName}`,
+        message: `Scheduled chat "${schedule.scheduleName}" completed but failed validation.\n\nMissing function calls: ${finalResult.functionCallMisses.join(', ') || 'none'}\nKeyword misses: ${finalResult.keywordMisses.join(', ') || 'none'}`,
+        sessionId,
+        context: {
+          'Schedule ID': schedule.scheduleId,
+          'Schedule Name': schedule.scheduleName,
+          'User ID': userId,
+          'Attempts': finalResult.attempt,
+          'Execution Time (ms)': finalResult.executionTime,
+          'Function Call Misses': finalResult.functionCallMisses.join(', ') || 'none',
+          'Function Call Matches': finalResult.functionCallMatches.join(', ') || 'none',
+          'Keyword Misses': finalResult.keywordMisses.join(', ') || 'none',
+          'Timestamp': finalResult.createdAt
+        }
+      }).catch(err => console.error('Failed to send oncall alert for scheduled chat failure:', err));
+    }
+
     // Also sync Research Reports execution for email campaigns
     try {
       if (schedule.emailCampaignTaskId && finalResult.sessionId) {
@@ -1063,6 +1084,23 @@ async function runScheduledChat(
       console.error('Error saving error run result:', saveError);
       // Continue even if saving fails - we still want to return the result
     }
+
+    // Send oncall alert for scheduled chat exception (always, including test runs)
+    sendAgentModeOncallAlert({
+      subject: `Scheduled Chat Error: ${schedule.scheduleName}`,
+      message: `Scheduled chat "${schedule.scheduleName}" threw an exception during execution.\n\nError: ${errorMessage}`,
+      sessionId: sessionId || undefined,
+      context: {
+        'Schedule ID': schedule.scheduleId,
+        'Schedule Name': schedule.scheduleName,
+        'User ID': userId,
+        'Is Test Run': isTest ? 'Yes' : 'No',
+        'Error Message': errorMessage,
+        'Error Stack': error instanceof Error ? (error.stack || 'No stack trace') : 'N/A',
+        'Execution Time (ms)': errorResult.executionTime,
+        'Timestamp': errorResult.createdAt
+      }
+    }).catch(err => console.error('Failed to send oncall alert for scheduled chat error:', err));
 
     // Return error result for error reporting
     return errorResult;
@@ -1140,6 +1178,48 @@ function hasActiveProgress(sessionId: string): boolean {
   return latestProgress.status !== 'complete';
 }
 
+// Helper to update a GTM work item's status in the GTM plan
+async function updateGtmWorkItemStatus(
+  gtmWorkItem: { planId: string; phaseId: string; workItemId: string },
+  status: string
+): Promise<void> {
+  const dynamoClient = new DynamoDB.DocumentClient({
+    region: process.env.AWS_REGION || 'us-west-2',
+    ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+      },
+    }),
+  });
+  const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
+  const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+  const result = await dynamoClient.get({ TableName: TABLE_NAME, Key: { planId: gtmWorkItem.planId } }).promise();
+  if (!result.Item) return;
+
+  const phases = result.Item.phases || [];
+  const phaseIdx = phases.findIndex((p: any) => p.id === gtmWorkItem.phaseId);
+  if (phaseIdx === -1) return;
+
+  const items = phases[phaseIdx].workItems || [];
+  const itemIdx = items.findIndex((i: any) => i.id === gtmWorkItem.workItemId);
+  if (itemIdx === -1) return;
+
+  items[itemIdx] = { ...items[itemIdx], status };
+  phases[phaseIdx] = { ...phases[phaseIdx], workItems: items };
+
+  await dynamoClient.update({
+    TableName: TABLE_NAME,
+    Key: { planId: gtmWorkItem.planId },
+    UpdateExpression: 'SET #phases = :phases, #updatedAt = :updatedAt',
+    ExpressionAttributeNames: { '#phases': 'phases', '#updatedAt': 'updatedAt' },
+    ExpressionAttributeValues: { ':phases': phases, ':updatedAt': new Date().toISOString() },
+  }).promise();
+
+  console.log(`GTM work item ${gtmWorkItem.workItemId}: status updated to ${status}`);
+}
+
 // Common function to generate AI response for a session
 // Always uses worker process to prevent blocking the main event loop
 export async function generateSessionResponse(
@@ -1157,7 +1237,13 @@ export async function generateSessionResponse(
   responseMessages: any[];
   workPlan?: any;
   skills?: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[];
+  backupModelUsed?: boolean;
+  originalModel?: string;
+  backupModel?: string;
 }> {
+  // Clear any stale cancel from a previous request on this session
+  clearCancel(sessionId);
+
   // Get session
   const session = await chatbotDb.getChatSession(sessionId);
   if (!session) {
@@ -1244,6 +1330,15 @@ export async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
+  // If this session is linked to a GTM work item, update status to agent_in_progress
+  if (updatedSession.gtmWorkItem) {
+    try {
+      await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'agent_in_progress');
+    } catch (error) {
+      console.error('GTM status sync: Failed to set agent_in_progress:', error);
+    }
+  }
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -1263,7 +1358,36 @@ export async function generateSessionResponse(
   );
 
   // Add all response messages to session (includes assistant responses and tool calls)
-  await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+  if (response.responseMessages.length > 0) {
+    await chatbotDb.addMessagesToSession(sessionId, response.responseMessages);
+  }
+
+  // If this session is linked to a GTM work item, update status to pending_review after AI responds
+  if (updatedSession.gtmWorkItem) {
+    try {
+      await updateGtmWorkItemStatus(updatedSession.gtmWorkItem, 'pending_review');
+    } catch (error) {
+      console.error('GTM status sync: Failed to set pending_review:', error);
+    }
+  }
+
+  // If cancelled, add a stopped indicator message
+  if (response.cancelled) {
+    const stoppedMessage: ChatMessage = {
+      role: 'assistant',
+      content: response.content || 'Generation was stopped.',
+      timestamp: new Date().toISOString(),
+      metadata: {
+        timestamp: new Date().toISOString(),
+        stopped: true,
+      },
+    };
+    // Only add if we didn't already have response messages (avoid duplicate content)
+    if (response.responseMessages.length === 0) {
+      await chatbotDb.addMessageToSession(sessionId, stoppedMessage);
+    }
+    clearCancel(sessionId);
+  }
 
   // Get the updated session to include workPlan if it was modified
   const finalSession = await chatbotDb.getChatSession(sessionId);
@@ -1565,7 +1689,8 @@ export const agentModeController = {
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         workPlan: response.workPlan,
-        skills: response.skills
+        skills: response.skills,
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate response error:', error);
@@ -1746,6 +1871,16 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get reports model options error:', error);
       res.status(500).json({ error: 'Failed to get reports model options' });
+    }
+  },
+
+  async getCustomerSupportDefaultModel(req: Request, res: Response) {
+    try {
+      const model = await agentModeService.getCustomerSupportDefaultModel();
+      res.json({ model });
+    } catch (error) {
+      console.error('AgentMode: Get customer support default model error:', error);
+      res.status(500).json({ error: 'Failed to get customer support default model' });
     }
   },
 
@@ -2111,7 +2246,8 @@ export const agentModeController = {
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         workPlan: response.workPlan,
-        skills: response.skills
+        skills: response.skills,
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate shared response error:', error);
@@ -2274,6 +2410,56 @@ export const agentModeController = {
       }
 
       res.status(500).json({ error: 'Failed to generate response' });
+    }
+  },
+
+  // Stop generation for a session
+  async stopGeneration(req: Request, res: Response) {
+    try {
+      const { sessionId } = req.params;
+
+      // Signal cancellation
+      requestCancel(sessionId);
+      generateMarketingResponseWorkerService.cancelSession(sessionId);
+
+      // Emit complete progress so the frontend SSE stream gets the signal
+      emitProgress(sessionId, { iteration: 0, status: 'complete' });
+      progressStore.delete(sessionId);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Stop generation error:', error);
+      res.status(500).json({ error: 'Failed to stop generation' });
+    }
+  },
+
+  // Stop generation for an interactive shared session (public)
+  async stopGenerationPublic(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { conversable } = req.query;
+
+      if (!shareId || !conversable) {
+        return res.status(400).json({ error: 'Session ID and conversable token are required' });
+      }
+
+      // Verify session exists and conversable token is valid
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session || !session.interactiveShareMetadata?.isActive) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Signal cancellation
+      requestCancel(shareId);
+      generateMarketingResponseWorkerService.cancelSession(shareId);
+
+      emitProgress(shareId, { iteration: 0, status: 'complete' });
+      progressStore.delete(shareId);
+
+      res.json({ success: true });
+    } catch (error) {
+      console.error('AgentMode: Stop generation (public) error:', error);
+      res.status(500).json({ error: 'Failed to stop generation' });
     }
   },
 
@@ -3960,6 +4146,20 @@ export const agentModeController = {
               console.error(`Error saving failure run result for schedule ${schedule.scheduleName}:`, saveError);
             });
 
+            // Send oncall alert for unhandled scheduled chat error (safety net)
+            sendAgentModeOncallAlert({
+              subject: `Scheduled Chat Unhandled Error: ${schedule.scheduleName}`,
+              message: `Scheduled chat "${schedule.scheduleName}" failed with an unhandled error in the fire-and-forget handler.\n\nError: ${error.message || 'Unknown error'}`,
+              context: {
+                'Schedule ID': schedule.scheduleId,
+                'Schedule Name': schedule.scheduleName,
+                'User ID': schedule.userId,
+                'Error Message': error.message || 'Unknown error',
+                'Error Stack': error.stack || 'No stack trace',
+                'Timestamp': new Date().toISOString()
+              }
+            }).catch(err => console.error('Failed to send oncall alert for unhandled scheduled chat error:', err));
+
             // Send error notification email
             const emailNotifications = schedule.emailNotifications || [];
             if (emailNotifications.length > 0) {
@@ -4072,7 +4272,8 @@ export const agentModeController = {
         knowledgeBaseQueries: response.knowledgeBaseQueries,
         sources: response.sources,
         workPlan: response.workPlan,
-        skills: response.skills
+        skills: response.skills,
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
       console.error('AgentMode: Generate conversable response error:', error);
@@ -4330,8 +4531,43 @@ export const agentModeController = {
           startingMessage.trim(),
           userId,
           selectedModel
-        ).catch((err: any) => {
+        ).catch(async (err: any) => {
           console.error('AgentMode: Error sending starting message for session', session.sessionId, err);
+
+          // Persist error message to session so the user sees something went wrong
+          try {
+            const errorMessage: ChatMessage = {
+              role: 'assistant',
+              content: 'I encountered an error while processing your request. Please try sending your message again or start a new session.',
+              timestamp: new Date().toISOString(),
+              metadata: {
+                timestamp: new Date().toISOString(),
+                isErrorMessage: true
+              }
+            };
+            await chatbotDb.addMessageToSession(session.sessionId, errorMessage);
+          } catch (saveErr) {
+            console.error('AgentMode: Failed to save error message to session', session.sessionId, saveErr);
+          }
+
+          // Emit progress complete so the frontend stops showing the loading state and refreshes
+          emitProgress(session.sessionId, { iteration: 0, status: 'complete' });
+
+          // Send oncall alert so the team is notified
+          sendAgentModeOncallAlert({
+            subject: `Work Plan Session Failed: ${session.sessionId}`,
+            message: `A predefined work plan session failed during fire-and-forget response generation.\n\nError: ${err?.message || 'Unknown error'}`,
+            sessionId: session.sessionId,
+            context: {
+              'Session ID': session.sessionId,
+              'User ID': userId,
+              'Plan Title': workPlanWithWelcome?.title || 'Unknown',
+              'LLM Model': selectedModel,
+              'Error Message': err?.message || 'Unknown error',
+              'Error Stack': err?.stack || 'No stack trace',
+              'Timestamp': new Date().toISOString()
+            }
+          }).catch(alertErr => console.error('Failed to send oncall alert for work plan session error:', alertErr));
         });
       }
     } catch (error) {

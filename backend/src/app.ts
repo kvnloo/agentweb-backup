@@ -64,6 +64,8 @@ import {
   viewExternalFile,
   getFileContent,
   saveHtmlContent,
+  getPresignedFileUrl,
+  batchPresignUrls,
 } from "./controllers/filesController";
 
 const app = express();
@@ -167,6 +169,8 @@ app.use(passport.initialize());
 const fileRoutes = express.Router();
 fileRoutes.get("/content", authenticateToken, getFileContent);
 fileRoutes.post("/html", authenticateToken, saveHtmlContent);
+fileRoutes.get("/presign", authenticateToken, getPresignedFileUrl);
+fileRoutes.post("/presign-batch", authenticateToken, batchPresignUrls);
 
 // Routes
 app.use("/api/auth", authRoutes);

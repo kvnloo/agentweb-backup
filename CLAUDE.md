@@ -401,9 +401,12 @@ Uses browser-use library with Playwright:
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
   - Automatically deploys backend to staging after tests pass on PRs
   - Deploys are triggered by file changes in `backend/` or `partner-portal/`
-- `.github/workflows/deploy.yml` - Deploys to production on merge to main
-  - Deploys are triggered by file changes detected via path filters (no version bump required)
-  - Separate jobs for backend and partner-portal
+- `.github/workflows/deploy.yml` - Deploys to production at safe times only
+  - **Manual trigger:** Use GitHub Actions UI to manually trigger deployment (Actions tab → Deploy → Run workflow)
+  - **Scheduled trigger:** Automatically runs daily at 7:00 AM UTC (11:00 PM PST) to deploy any merged changes
+  - Detects changes via path filters and only deploys components with actual changes
+  - Separate jobs for backend and partner-portal (agentweb repo) and customer portal (separate repo)
+  - Version labels: `<component>-<YYYYMMDD>-scheduled` or `<component>-<YYYYMMDD>-manual`
 
 ### Deployment Targets
 
@@ -415,6 +418,33 @@ Uses browser-use library with Playwright:
 **Staging:**
 - Backend: AWS Elastic Beanstalk, environment `Agentweb-backend-env-1` → `https://api-stage.agentweb.pro`
 - Frontend: Run locally pointing to staging backend
+
+### Triggering Production Deployments
+
+**IMPORTANT:** Production deployments no longer trigger automatically on merge to main. This prevents disruptions during active usage times.
+
+**Option 1: Manual Deployment (via GitHub UI)**
+1. Go to the Actions tab in GitHub
+2. Select "Deploy" workflow (for agentweb repo) or "Deploy to AWS Elastic Beanstalk" (for customer-portal repo)
+3. Click "Run workflow"
+4. Select the branch (usually `main`)
+5. Click "Run workflow" button
+6. The workflow will detect changes and deploy only components with actual changes
+
+**Option 2: Scheduled Deployment (automatic)**
+- Deployments automatically run daily at 7:00 AM UTC (11:00 PM PST)
+- Only deploys components with changes merged since the last deployment
+- Check the Actions tab to monitor deployment status
+
+**To deploy manually via GitHub CLI:**
+```bash
+# For agentweb repo (backend + partner-portal)
+gh workflow run deploy.yml --ref main
+
+# For customer-portal repo
+cd customer-portal
+gh workflow run deploy.yml --ref main
+```
 
 ### Checking Production Backend Logs
 
@@ -439,7 +469,9 @@ The retrieve commands return S3 URLs for each instance. Download and inspect:
 
 **Note:** EB logs rotate frequently. For investigating sessions, query DynamoDB directly (`AW-ChatSessions` table) by `sessionId` to get session state, work plan status, messages, and error fields. For scheduled sessions, also check the `runResults` field on `AW-TaskSchedules`.
 
-### Manual Deployment
+### Manual Deployment (Local Builds)
+
+**Note:** The preferred method is to use the GitHub Actions workflow (see "Triggering Production Deployments" above). Use this manual method only for emergency hotfixes or when GitHub Actions is unavailable.
 
 **Backend:**
 ```bash

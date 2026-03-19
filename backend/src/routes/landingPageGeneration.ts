@@ -379,8 +379,8 @@ router.post("/generated/:id/duplicate", async (req, res: Response) => {
 /**
  * PUT /api/landing-pages/v0/generated/:id/github-edit
  * Edit a file in the landing page's GitHub repository.
- * The actual GitHub operations are handled by the GitHub MCP server.
- * This route validates ownership and returns repo info for the MCP tool to use.
+ * Uses Contents API for files <=1MB, Blob API for larger files.
+ * Retries once on SHA mismatch (409 conflict).
  */
 router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Response) => {
   try {
@@ -423,44 +423,138 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github.v3+json",
     };
+    const GITHUB_TIMEOUT_MS = 30_000;
+    const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
 
-    // Get the current file SHA (needed for updates)
-    let fileSha: string | undefined;
-    try {
-      const fileRes = await axios.get<any>(
-        `https://api.github.com/repos/${owner}/${repoName}/contents/${file_path}`,
-        { headers: ghHeaders }
-      );
-      fileSha = fileRes.data.sha;
-    } catch (err: any) {
-      if (err.response?.status !== 404) throw err;
-      // 404 means new file — no sha needed
-    }
+    const base64Content = Buffer.from(content, "utf-8").toString("base64");
+    const contentSizeBytes = Buffer.byteLength(content, "utf-8");
+    const CONTENTS_API_LIMIT = 1_000_000; // 1MB limit for Contents API
 
-    // Create or update the file
-    const putBody: any = {
-      message: commit_message || `Update ${file_path} via Emma`,
-      content: Buffer.from(content, "utf-8").toString("base64"),
+    // Helper: get current file SHA (needed for updates via Contents API)
+    const getFileSha = async (): Promise<string | undefined> => {
+      try {
+        const fileRes = await axios.get<any>(
+          `${repoBase}/contents/${file_path}`,
+          { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+        );
+        return fileRes.data.sha;
+      } catch (err: any) {
+        if (err.response?.status === 404) return undefined; // new file
+        throw err;
+      }
     };
-    if (fileSha) putBody.sha = fileSha;
 
-    const commitRes = await axios.put<any>(
-      `https://api.github.com/repos/${owner}/${repoName}/contents/${file_path}`,
-      putBody,
-      { headers: ghHeaders }
-    );
+    // Helper: commit via Contents API (files <=1MB)
+    const commitViaContentsApi = async (sha: string | undefined) => {
+      const putBody: any = {
+        message: commit_message || `Update ${file_path} via Emma`,
+        content: base64Content,
+      };
+      if (sha) putBody.sha = sha;
+
+      return axios.put<any>(
+        `${repoBase}/contents/${file_path}`,
+        putBody,
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+    };
+
+    // Helper: commit via Blob + Tree + Commit API (files >1MB)
+    const commitViaBlobApi = async () => {
+      // 1. Create a blob
+      const blobRes = await axios.post<any>(
+        `${repoBase}/git/blobs`,
+        { content: base64Content, encoding: "base64" },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      const blobSha = blobRes.data.sha;
+
+      // 2. Get the latest commit SHA on the default branch
+      const refRes = await axios.get<any>(
+        `${repoBase}/git/ref/heads/main`,
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+      const latestCommitSha = refRes.data.object.sha;
+
+      // 3. Create a tree with the new blob
+      const treeRes = await axios.post<any>(
+        `${repoBase}/git/trees`,
+        {
+          base_tree: latestCommitSha,
+          tree: [{ path: file_path, mode: "100644", type: "blob", sha: blobSha }],
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+
+      // 4. Create a commit
+      const newCommitRes = await axios.post<any>(
+        `${repoBase}/git/commits`,
+        {
+          message: commit_message || `Update ${file_path} via Emma`,
+          tree: treeRes.data.sha,
+          parents: [latestCommitSha],
+        },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+
+      // 5. Update the ref
+      await axios.patch<any>(
+        `${repoBase}/git/refs/heads/main`,
+        { sha: newCommitRes.data.sha },
+        { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+      );
+
+      return newCommitRes;
+    };
+
+    let commitRes: any;
+
+    if (contentSizeBytes > CONTENTS_API_LIMIT) {
+      // Large file: use Blob API (no size limit)
+      console.log(`[LP GENERATION] File ${file_path} is ${contentSizeBytes} bytes, using Blob API`);
+      commitRes = await commitViaBlobApi();
+    } else {
+      // Normal file: use Contents API with SHA mismatch retry
+      let fileSha = await getFileSha();
+      try {
+        commitRes = await commitViaContentsApi(fileSha);
+      } catch (err: any) {
+        if (err.response?.status === 409) {
+          // SHA mismatch — refetch SHA and retry once
+          console.log(`[LP GENERATION] SHA mismatch for ${file_path}, retrying with fresh SHA`);
+          fileSha = await getFileSha();
+          commitRes = await commitViaContentsApi(fileSha);
+        } else {
+          throw err;
+        }
+      }
+    }
 
     res.json({
       success: true,
-      commit_url: commitRes.data.commit?.html_url,
+      commit_url: commitRes.data.commit?.html_url || commitRes.data.html_url,
       file_path,
       page_id: page.id,
       deployed_url: page.deployedUrl,
       message: `File "${file_path}" updated. Changes will auto-deploy to ${page.deployedUrl} within ~30 seconds.`,
     });
   } catch (error: any) {
-    console.error("[LP GENERATION] Error with github edit:", error);
-    res.status(500).json({ error: "Failed to process edit request" });
+    const ghStatus = error.response?.status;
+    const ghMessage = error.response?.data?.message || error.message;
+    console.error(`[LP GENERATION] Error with github edit (HTTP ${ghStatus}):`, ghMessage);
+
+    // Return actionable error details so Emma can adjust
+    if (ghStatus === 401 || ghStatus === 403) {
+      res.status(ghStatus).json({ error: `GitHub auth error: ${ghMessage}` });
+    } else if (ghStatus === 409) {
+      res.status(409).json({ error: `SHA conflict: the file was modified externally. ${ghMessage}` });
+    } else if (ghStatus === 422) {
+      res.status(422).json({ error: `GitHub rejected the request: ${ghMessage}` });
+    } else if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+      res.status(504).json({ error: `GitHub API timed out after 30s. The file may be too large or GitHub is slow.` });
+    } else {
+      res.status(500).json({ error: `GitHub API error (${ghStatus || 'unknown'}): ${ghMessage}` });
+    }
   }
 });
 

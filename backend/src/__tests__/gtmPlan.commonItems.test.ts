@@ -5,17 +5,33 @@ import express from "express";
 const mockGet = jest.fn();
 const mockUpdate = jest.fn();
 
-jest.mock("aws-sdk", () => ({
-  DynamoDB: {
-    DocumentClient: jest.fn(() => ({
-      query: jest.fn(),
-      get: mockGet,
-      put: jest.fn(),
-      update: mockUpdate,
-      delete: jest.fn(),
+jest.mock("aws-sdk", () => {
+  const mockDocClient = {
+    query: jest.fn(),
+    get: mockGet,
+    put: jest.fn(),
+    update: mockUpdate,
+    delete: jest.fn(),
+    scan: jest.fn(),
+  };
+  return {
+    DynamoDB: {
+      DocumentClient: jest.fn(() => mockDocClient),
+    },
+    S3: jest.fn(() => ({
+      upload: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ Location: 'https://mock-s3-url.com/file', Key: 'mock-key' }) }),
+      getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      putObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+      deleteObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
     })),
-  },
-}));
+    SecretsManager: jest.fn(() => ({
+      getSecretValue: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({ SecretString: '{}' }) }),
+    })),
+    config: {
+      update: jest.fn(),
+    },
+  };
+});
 
 jest.mock("../middleware/auth", () => ({
   authenticateToken: (req: any, _res: any, next: any) => {

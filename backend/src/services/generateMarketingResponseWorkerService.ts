@@ -22,11 +22,16 @@ interface GenerateMarketingResponseResult {
   knowledgeBaseQueries: string[];
   sources: string[];
   responseMessages: any[];
+  cancelled?: boolean;
+  backupModelUsed?: boolean;
+  originalModel?: string;
+  backupModel?: string;
 }
 
 export class GenerateMarketingResponseWorkerService {
   private worker: ChildProcess | null = null;
   private pendingRequests: Map<string, { resolve: Function; reject: Function; onProgress?: Function; timeout: NodeJS.Timeout }> = new Map();
+  private sessionToRequestId: Map<string, string> = new Map();
   private requestIdCounter = 0;
   private workerReady = false;
   private workerInitPromise: Promise<void> | null = null;
@@ -140,6 +145,13 @@ export class GenerateMarketingResponseWorkerService {
 
       clearTimeout(pending.timeout);
       this.pendingRequests.delete(message.requestId);
+      // Clean up session mapping
+      for (const [sid, rid] of this.sessionToRequestId.entries()) {
+        if (rid === message.requestId) {
+          this.sessionToRequestId.delete(sid);
+          break;
+        }
+      }
 
       if (message.type === 'success') {
         pending.resolve(message.result);
@@ -196,6 +208,16 @@ export class GenerateMarketingResponseWorkerService {
   }
 
   /**
+   * Send a cancel signal to the worker for a given session
+   */
+  cancelSession(sessionId: string): void {
+    const requestId = this.sessionToRequestId.get(sessionId);
+    if (requestId && this.worker && !this.worker.killed) {
+      this.worker.send({ type: 'cancel', requestId });
+    }
+  }
+
+  /**
    * Shutdown the worker process
    */
   async shutdown(): Promise<void> {
@@ -239,13 +261,14 @@ export class GenerateMarketingResponseWorkerService {
         }
       }, 45 * 60 * 1000);
 
-      // Store the request callbacks
+      // Store the request callbacks and session mapping
       this.pendingRequests.set(requestId, {
         resolve,
         reject,
         onProgress,
         timeout
       });
+      this.sessionToRequestId.set(params.sessionId, requestId);
 
       // Send the request to the worker
       this.worker!.send({

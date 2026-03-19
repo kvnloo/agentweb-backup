@@ -30,6 +30,10 @@ jest.mock('../utils/sseProgress', () => ({
     delete: jest.fn().mockReturnValue(true),
   },
   getLatestProgress: jest.fn().mockReturnValue(undefined),
+  requestCancel: jest.fn(),
+  clearCancel: jest.fn(),
+  isCancelled: jest.fn().mockReturnValue(false),
+  emitProgress: jest.fn(),
 }));
 
 // Import mocked services

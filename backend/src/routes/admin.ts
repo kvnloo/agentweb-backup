@@ -3504,6 +3504,146 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
   }
 });
 
+// Start an Agent Mode session from a GTM work item (admin)
+router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-session", async (req, res) => {
+  try {
+    const { planId, phaseId, workItemId } = req.params;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    const getResult = await dynamodb
+      .get({
+        TableName: TABLE_NAME,
+        Key: { planId },
+      })
+      .promise();
+
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    const workItem = workItems[workItemIndex];
+
+    if (workItem.status !== "pending") {
+      return res.status(400).json({ error: "Only pending work items can be started" });
+    }
+
+    // Create Agent Mode session for the plan's owner
+    const session = await chatbotDb.createChatSession(
+      plan.userId,
+      undefined,
+      "agent",
+      "agent-mode",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "regular"
+    );
+
+    const { agentModeService } = await import('../services/agentModeService');
+    const modelToUse = await agentModeService.getDefaultModel();
+    await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+    await chatbotDb.updateSessionGtmWorkItem(session.sessionId, { planId, phaseId, workItemId });
+
+    // Build the initial message from work item title + description
+    const initialMessage = workItem.description
+      ? `${workItem.title}\n\n${workItem.description}`
+      : workItem.title;
+
+    // Fire-and-forget: trigger AI response generation in the background
+    // generateSessionResponse syncs GTM work item status via session.gtmWorkItem
+    const planUserId = plan.userId;
+    const { generateSessionResponse } = await import('../controllers/agentModeController');
+    const { io } = await import('../server');
+    generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse)
+      .then(() => {
+        console.log(`GTM work item session ${session.sessionId}: AI response generated (admin)`);
+        io.to(`user:${planUserId}`).emit("gtm-session-ready", {
+          sessionId: session.sessionId,
+          workItemId,
+          workItemTitle: workItem.title,
+        });
+      })
+      .catch((error) => {
+        console.error(`GTM work item session ${session.sessionId}: AI response generation failed (admin):`, error);
+        io.to(`user:${planUserId}`).emit("gtm-session-ready", {
+          sessionId: session.sessionId,
+          workItemId,
+          workItemTitle: workItem.title,
+          error: true,
+        });
+      });
+
+    // Update work item
+    workItems[workItemIndex] = {
+      ...workItem,
+      status: "agent_in_progress",
+      agentSessionId: session.sessionId,
+    };
+
+    phases[phaseIndex] = { ...phase, workItems };
+
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { planId },
+        UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+        ExpressionAttributeNames: {
+          "#phases": "phases",
+          "#updatedAt": "updatedAt",
+        },
+        ExpressionAttributeValues: {
+          ":phases": phases,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    return res.json({
+      success: true,
+      data: {
+        sessionId: session.sessionId,
+        workItemTitle: workItem.title,
+        workItemDescription: workItem.description,
+      },
+      message: "Agent Mode session started",
+    });
+  } catch (error: any) {
+    console.error("Error starting Agent Mode session from GTM work item (admin):", error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || "Internal server error",
+    });
+  }
+});
+
 // Subscription Types endpoints
 
 // Get all available skills for subscription configuration
