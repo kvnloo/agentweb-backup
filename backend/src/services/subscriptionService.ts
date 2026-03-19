@@ -12,12 +12,52 @@ export interface SubscriptionType {
 
 // Default pages that are always available regardless of subscription type
 // These match the routes in customer-portal/src/App.tsx
-const DEFAULT_PAGES = [
+export const DEFAULT_PAGES = [
   "/", // Agent Mode home
   "/agent-mode", // Agent Mode
   "/settings", // Settings page
   "/guide", // User Guide
 ];
+
+// ─── Tier Configurations ────────────────────────────────────────────────
+// Explicit tier definitions. Stripe checkout maps plans to these tiers:
+//   Starter plan → "Basic"
+//   Pro plan     → "Super Premium"
+// Registration defaults to "Free". Cancellation downgrades back to "Free".
+
+export const TIER_CONFIGS: Record<string, SubscriptionType> = {
+  Free: {
+    name: "Free",
+    allowedPages: [...DEFAULT_PAGES],
+    allowedSkills: [], // No premium skills on Free tier
+  },
+  Basic: {
+    name: "Basic",
+    allowedPages: [
+      ...DEFAULT_PAGES,
+      "/brand-guidelines",
+      "/market-strategy",
+      "/tasks",
+      "/knowledge-base",
+      "/research-reports",
+      "/email-templates",
+    ],
+    allowedSkills: ["*"], // All skills allowed for Basic (Starter plan)
+  },
+  "Super Premium": {
+    name: "Super Premium",
+    allowedPages: ["*"], // All pages
+    allowedSkills: ["*"], // All skills
+  },
+};
+
+/**
+ * Get the default tier configuration by name.
+ * Returns null if the tier name is not recognized.
+ */
+export function getDefaultTierConfig(tierName: string): SubscriptionType | null {
+  return TIER_CONFIGS[tierName] ?? null;
+}
 
 /**
  * Get subscription type for a user (defaults to "Basic" if not set)
