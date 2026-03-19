@@ -226,6 +226,13 @@ export interface ChatSession {
     phaseId: string;
     workItemId: string;
   };
+  // Incremental token usage and cost tracking for the session
+  totalTokens?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  totalCost?: number; // Total estimated cost in USD
 }
 
 // Interface for context chunks
@@ -619,6 +626,72 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Atomically increment totalTokens and totalCost on the session record.
+   * Extracts usage from messages that have a usage field.
+   */
+  async incrementTokenUsage(sessionId: string, messages: ChatMessage[]): Promise<void> {
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let totalTokens = 0;
+    let cost = 0;
+    for (const msg of messages) {
+      if (msg.usage) {
+        promptTokens += msg.usage.prompt_tokens || 0;
+        completionTokens += msg.usage.completion_tokens || 0;
+        totalTokens += msg.usage.total_tokens || 0;
+        cost += msg.usage.estimated_cost || 0;
+      }
+    }
+    if (totalTokens === 0) return;
+
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: `
+          ADD totalCost :cost,
+              #tt.prompt_tokens :pt,
+              #tt.completion_tokens :ct,
+              #tt.total_tokens :tot
+        `,
+        ExpressionAttributeNames: {
+          '#tt': 'totalTokens',
+        },
+        ExpressionAttributeValues: {
+          ':cost': cost,
+          ':pt': promptTokens,
+          ':ct': completionTokens,
+          ':tot': totalTokens,
+        },
+      }).promise();
+    } catch (error) {
+      // If totalTokens map doesn't exist yet, initialize it
+      if ((error as any).code === 'ValidationException') {
+        try {
+          await dynamodb.update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: 'SET totalTokens = :tokens, totalCost = if_not_exists(totalCost, :zero) + :cost',
+            ExpressionAttributeValues: {
+              ':tokens': {
+                prompt_tokens: promptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: totalTokens,
+              },
+              ':cost': cost,
+              ':zero': 0,
+            },
+          }).promise();
+        } catch (initError) {
+          console.error(`Error initializing token usage for session ${sessionId}:`, initError);
+        }
+      } else {
+        console.error(`Error incrementing token usage for session ${sessionId}:`, error);
+      }
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -645,6 +718,9 @@ export class ChatbotDB {
 
     // Atomically increment messageCount on the session record for asset cache tracking
     await this.incrementMessageCount(sessionId, 1);
+
+    // Incrementally update token usage on the session
+    await this.incrementTokenUsage(sessionId, [message]);
 
     // Return session with updated messages (no need to update session table)
     return {
@@ -684,6 +760,9 @@ export class ChatbotDB {
 
     // Atomically increment messageCount on the session record for asset cache tracking
     await this.incrementMessageCount(sessionId, messages.length);
+
+    // Incrementally update token usage on the session
+    await this.incrementTokenUsage(sessionId, messages);
 
     // Return session with updated messages (no need to update session table)
     return {

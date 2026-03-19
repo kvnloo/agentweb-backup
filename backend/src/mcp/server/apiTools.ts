@@ -1636,6 +1636,8 @@ mcpToolRegistry.register({
       sessionType: session.sessionType,
       messageCount: session.messages?.length || 0,
       satisfactionScore: session.satisfactionScore,
+      totalTokens: session.totalTokens || null,
+      totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
     }));
 
     return jsonResult({
