@@ -1077,6 +1077,57 @@ router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res:
 });
 
 /**
+ * @route DELETE /api/crm/lists/:listId/leads/bulk-delete
+ * @desc Bulk delete multiple leads from a list
+ * @access Private
+ * NOTE: Must be registered BEFORE the :leadId route to avoid Express treating
+ * "bulk-delete" as a leadId parameter.
+ */
+router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+    const { listId } = req.params;
+    const { leadIds } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    if (!Array.isArray(leadIds) || leadIds.length === 0) {
+      return res.status(400).json({ message: 'leadIds array is required and must not be empty' });
+    }
+
+    // Verify list ownership
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ message: 'Lead list not found' });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    let deleted = 0;
+    let failed = 0;
+
+    for (const leadId of leadIds) {
+      try {
+        await crmDb.deleteLead(listId, leadId);
+        deleted++;
+      } catch (err) {
+        console.error(`Failed to delete lead ${leadId}:`, err);
+        failed++;
+      }
+    }
+
+    return res.json({ deleted, failed, total: leadIds.length });
+  } catch (error: any) {
+    console.error('Error bulk deleting leads:', error);
+    return res.status(500).json({ message: error.message || 'Failed to bulk delete leads' });
+  }
+});
+
+/**
  * @route PUT /api/crm/lists/:listId/leads/:leadId
  * @desc Update a lead
  * @access Private
