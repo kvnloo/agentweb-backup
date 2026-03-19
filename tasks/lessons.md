@@ -51,7 +51,22 @@ This file captures patterns and mistakes to avoid. Updated after corrections fro
 ### Elastic Beanstalk Logs
 - **Lesson:** EB logs rotate frequently - use DynamoDB for investigation
   - **Why:** Session state in AW-ChatSessions table persists longer
-  - **Fix:** Query by sessionId to get messages, errors, work plan status
+  - **Fix:** Query by sessionId to get work plan status, errors, metadata
+
+### Chat Messages Are in a SEPARATE Table (AW-ChatMessages)
+- **Lesson:** The `messages` field on `AW-ChatSessions` is EMPTY for most sessions. Actual messages are stored in the `AW-ChatMessages` table.
+  - **Why:** Messages were migrated out of the session record to a dedicated table (DynamoDB item size limits). The session record keeps `messageCount` as a counter but `messages: []` is empty.
+  - **Fix:** To read session messages, query `AW-ChatMessages` with `sessionId` as the partition key and `messageIndex` as the sort key. Each item has a `message` map containing `role`, `content`, `metadata`, `tool_calls`, etc.
+  - **Example:**
+    ```
+    aws dynamodb query --table-name AW-ChatMessages \
+      --key-condition-expression "sessionId = :sid" \
+      --expression-attribute-values '{":sid": {"S": "SESSION_ID_HERE"}}' \
+      --output json
+    ```
+  - **Common mistake:** Looking at `AW-ChatSessions.messages` (empty), concluding there are no messages, and giving up. Always check `AW-ChatMessages`.
+  - **Code reference:** `chatbotService.ts` handles the migration and read logic.
+  - **Date:** 2026-03-19
 
 ### Portal Distinction
 - **Lesson:** partner-portal is admin-only; customer-portal is for ALL user-facing features
