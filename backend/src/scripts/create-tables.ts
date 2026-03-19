@@ -1539,6 +1539,33 @@ const createAccountMemoryTable = async () => {
   }
 };
 
+// Create Social Engagement Tracking table
+const createSocialEngagementTrackingTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'targetPostUrn_booster', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'targetPostUrn_booster', KeyType: 'RANGE' }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const main = async () => {
   try {
     console.log(`Creating tables for environment: ${process.env.NODE_ENV || 'production'}`);
@@ -1573,6 +1600,7 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
+    await createSocialEngagementTrackingTable();
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

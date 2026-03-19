@@ -158,7 +158,7 @@ export interface User {
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
   connected_accounts?: Array<{
-    platform: 'linkedin' | 'facebook' 
+    platform: 'linkedin' | 'facebook'
     | 'meta' | 'twitter' | 'instagram';
     account_id: string;
     account_name: string;
@@ -175,6 +175,17 @@ export interface User {
     created_at: string;
     updated_at: string;
   }>;
+  socialEngagementConfig?: {
+    isEnabled: boolean;
+    targets: string[];
+    boosters: string[];
+    strategy: {
+      maxCommentsPerPost: number;
+      maxLikesPerPost: number;
+      engagementWindowMinutes: number;
+      preferredAction?: 'comment_and_like' | 'like';
+    };
+  };
 }
 
 interface UserInteraction {
@@ -976,7 +987,7 @@ export const taskDb = {
           expressionAttributeNames[`#${key}`] = key;
           // DynamoDB handles arrays and objects automatically, but ensure proper serialization
           expressionAttributeValues[`:${key}`] = value;
-          
+
           // Log knowledgeBaseFiles updates for debugging
           if (key === 'knowledgeBaseFiles') {
             console.log('Updating knowledgeBaseFiles:', {
@@ -1026,7 +1037,7 @@ export const taskDb = {
       }
 
       const result = await dynamodb.update(params).promise();
-      
+
       return result.Attributes;
     } catch (error) {
       console.error(`[db.ts] Error in updateTask for taskId ${taskId}:`, error);
@@ -1289,11 +1300,11 @@ export const taskDb = {
         averageExecutionTime: (() => {
           const completedExecutions = executions.filter((e) => e.status === "completed" && e.completedAt);
           if (completedExecutions.length === 0) return null;
-          
+
           const totalTime = completedExecutions.reduce((acc, e) => {
             return acc + (new Date(e.completedAt!).getTime() - new Date(e.startTime).getTime());
           }, 0);
-          
+
           return totalTime / completedExecutions.length;
         })(),
       };
@@ -1351,9 +1362,8 @@ export const taskDb = {
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
 
-      const key = `tasks/${taskId}/attachments/${Date.now()}-${randomToken}-${
-        file.originalname
-      }`;
+      const key = `tasks/${taskId}/attachments/${Date.now()}-${randomToken}-${file.originalname
+        }`;
 
       // Upload to S3 without ACL setting
       await s3
@@ -1366,9 +1376,8 @@ export const taskDb = {
         .promise();
 
       // Generate regular S3 URL
-      const url = `https://${
-        process.env.AWS_S3_BUCKET || "agentweb-user-files"
-      }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
+      const url = `https://${process.env.AWS_S3_BUCKET || "agentweb-user-files"
+        }.s3.${process.env.AWS_REGION || "us-west-2"}.amazonaws.com/${key}`;
 
       // Update task with attachment URL
       const attachments = [
@@ -1436,12 +1445,12 @@ export const taskDb = {
     try {
       // Get all executions for this task
       const executions = await this.getTaskExecutions(taskId);
-      
+
       if (!executions || executions.length === 0) {
         console.log(`No executions found for task ${taskId}`);
         return;
       }
-      
+
       // Update each execution's userId
       const updatePromises = executions.map(async (execution) => {
         const params = {
@@ -1541,18 +1550,18 @@ export const taskDb = {
 
       // Filter tasks with non-empty knowledge base
       const tasksWithKnowledgeBase = tasks.filter((task: any) => {
-        const size = typeof task.knowledgeBaseSize === 'string' 
-          ? parseInt(task.knowledgeBaseSize) 
+        const size = typeof task.knowledgeBaseSize === 'string'
+          ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
         return size > 0;
       });
 
       // Map to return standardized fields
       const knowledgeBaseTasks = tasksWithKnowledgeBase.map((task: any) => {
-        const size = typeof task.knowledgeBaseSize === 'string' 
-          ? parseInt(task.knowledgeBaseSize) 
+        const size = typeof task.knowledgeBaseSize === 'string'
+          ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
-        
+
         return {
           taskId: task.taskId,
           name: task.name,
@@ -1568,11 +1577,11 @@ export const taskDb = {
 
       // Sort by last updated (most recent first)
       knowledgeBaseTasks.sort((a, b) => {
-        const dateA = a.knowledgeBaseUpdatedAt 
-          ? new Date(a.knowledgeBaseUpdatedAt).getTime() 
+        const dateA = a.knowledgeBaseUpdatedAt
+          ? new Date(a.knowledgeBaseUpdatedAt).getTime()
           : 0;
-        const dateB = b.knowledgeBaseUpdatedAt 
-          ? new Date(b.knowledgeBaseUpdatedAt).getTime() 
+        const dateB = b.knowledgeBaseUpdatedAt
+          ? new Date(b.knowledgeBaseUpdatedAt).getTime()
           : 0;
         return dateB - dateA;
       });
@@ -1767,199 +1776,227 @@ export const scheduleDb = {
     }
   },
 
-        async updateSchedule(
-          scheduleId: string,
-          updates: Partial<{
-            frequency: string;
-            frequencyIntervalDays: number;
-            nextRunTime: string;
-            status: string;
-            lastRunTime: string;
-            timezone: string;
-            scheduleName: string;
-            description: string;
-            startingMessage: string;
-            keywords: string[];
-            requiredFunctionCalls: string[];
-            functionCallMinCalls: { [functionName: string]: number };
-            emailNotifications: string[];
-            dailyDigest: boolean;
-            updatedAt: string;
-            emailCampaignTaskId: string;
-            runCount: number;
-            variables: Array<{ name: string; description?: string }>;
-            variableValues: { [variableName: string]: string };
-            variableRequestStatus: 'idle' | 'pending' | 'provided';
-            variableRequestSentAt: string;
-            variableValuesUpdatedAt: string;
-            variableRequestAccessTokenHash: string;
-            variableRequestAccessTokenExpiresAt: string;
-            variableRequestAccessTokenConsumedAt: string;
-          }>
-        ) {
-          try {
-            const updateExpressions: string[] = [];
-            const expressionAttributeNames: { [key: string]: string } = {};
-            const expressionAttributeValues: { [key: string]: any } = {};
+  async updateSchedule(
+    scheduleId: string,
+    updates: Partial<{
+      frequency: string;
+      frequencyIntervalDays: number;
+      nextRunTime: string;
+      status: string;
+      lastRunTime: string;
+      timezone: string;
+      scheduleName: string;
+      description: string;
+      startingMessage: string;
+      keywords: string[];
+      requiredFunctionCalls: string[];
+      functionCallMinCalls: { [functionName: string]: number };
+      emailNotifications: string[];
+      dailyDigest: boolean;
+      updatedAt: string;
+      emailCampaignTaskId: string;
+      runCount: number;
+      variables: Array<{ name: string; description?: string }>;
+      variableValues: { [variableName: string]: string };
+      variableRequestStatus: 'idle' | 'pending' | 'provided';
+      variableRequestSentAt: string;
+      variableValuesUpdatedAt: string;
+      variableRequestAccessTokenHash: string;
+      variableRequestAccessTokenExpiresAt: string;
+      variableRequestAccessTokenConsumedAt: string;
+    }>
+  ) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: { [key: string]: string } = {};
+      const expressionAttributeValues: { [key: string]: any } = {};
 
-            Object.entries(updates).forEach(([key, value]) => {
-              updateExpressions.push(`#${key} = :${key}`);
-              expressionAttributeNames[`#${key}`] = key;
-              expressionAttributeValues[`:${key}`] = value;
-            });
+      Object.entries(updates).forEach(([key, value]) => {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      });
 
-            const params = {
-              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              Key: {
-                scheduleId,
-              },
-              UpdateExpression: `SET ${updateExpressions.join(", ")}`,
-              ExpressionAttributeNames: expressionAttributeNames,
-              ExpressionAttributeValues: expressionAttributeValues,
-              ReturnValues: "ALL_NEW",
-            };
-
-            const result = await dynamodb.update(params).promise();
-            return result.Attributes;
-          } catch (error) {
-            handleDynamoDbError(error, "updateSchedule");
-          }
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: {
+          scheduleId,
         },
+        UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: "ALL_NEW",
+      };
 
-        async addRunResult(scheduleId: string, runResult: any) {
-          try {
-            const params = {
-              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              Key: {
-                scheduleId,
-              },
-              UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
-              ExpressionAttributeNames: {
-                '#runResults': 'runResults',
-                '#updatedAt': 'updatedAt',
-              },
-              ExpressionAttributeValues: {
-                ':runResult': [runResult],
-                ':emptyList': [],
-                ':updatedAt': new Date().toISOString(),
-              },
-              ReturnValues: 'ALL_NEW',
-            };
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateSchedule");
+    }
+  },
 
-            const result = await dynamodb.update(params).promise();
-            return result.Attributes;
-          } catch (error) {
-            handleDynamoDbError(error, "addRunResult");
-            throw error;
-          }
+  async addRunResult(scheduleId: string, runResult: any) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: {
+          scheduleId,
         },
-
-        async getRunResults(scheduleId: string) {
-          try {
-            const params = {
-              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              Key: {
-                scheduleId,
-              },
-            };
-
-            const result = await dynamodb.get(params).promise();
-            return result.Item?.runResults || [];
-          } catch (error) {
-            handleDynamoDbError(error, "getRunResults");
-            return [];
-          }
+        UpdateExpression: 'SET #runResults = list_append(if_not_exists(#runResults, :emptyList), :runResult), #updatedAt = :updatedAt',
+        ExpressionAttributeNames: {
+          '#runResults': 'runResults',
+          '#updatedAt': 'updatedAt',
         },
-
-        async getSchedulesReadyToRun() {
-          try {
-            const now = new Date().toISOString();
-            const params = {
-              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              IndexName: 'StatusStartTimeIndex',
-              KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
-              FilterExpression: '#type = :type',
-              ExpressionAttributeNames: {
-                '#status': 'status',
-                '#nextRunTime': 'nextRunTime',
-                '#type': 'type',
-              },
-              ExpressionAttributeValues: {
-                ':status': 'active',
-                ':now': now,
-                ':type': 'scheduled_chat',
-              },
-            };
-
-            const result = await dynamodb.query(params).promise();
-            return result.Items || [];
-          } catch (error) {
-            handleDynamoDbError(error, "getSchedulesReadyToRun");
-            return [];
-          }
+        ExpressionAttributeValues: {
+          ':runResult': [runResult],
+          ':emptyList': [],
+          ':updatedAt': new Date().toISOString(),
         },
+        ReturnValues: 'ALL_NEW',
+      };
 
-        async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true) {
-          try {
-            // First, get the current schedule to check runCount
-            const getParams = {
-              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              Key: { scheduleId },
-            };
-            const currentSchedule = await dynamodb.get(getParams).promise();
-            const runCount = currentSchedule.Item?.runCount;
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "addRunResult");
+      throw error;
+    }
+  },
 
-            // Determine if we should pause the schedule
-            // When runCount is 1, after decrementing it will be 0, so we should pause
-            const shouldPause = decrementRunCount && runCount !== undefined && runCount !== -1 && runCount === 1;
-
-            // Build update expression dynamically
-            const updateParts: string[] = [
-              '#lastRunTime = :lastRunTime',
-              '#nextRunTime = :nextRunTime',
-              '#updatedAt = :updatedAt',
-            ];
-            const attributeNames: { [key: string]: string } = {
-              '#lastRunTime': 'lastRunTime',
-              '#nextRunTime': 'nextRunTime',
-              '#updatedAt': 'updatedAt',
-            };
-            const attributeValues: { [key: string]: any } = {
-              ':lastRunTime': lastRunTime,
-              ':nextRunTime': nextRunTime,
-              ':updatedAt': new Date().toISOString(),
-            };
-
-            // Handle runCount decrement
-            if (decrementRunCount && runCount !== undefined && runCount !== -1) {
-              updateParts.push('#runCount = #runCount - :one');
-              attributeNames['#runCount'] = 'runCount';
-              attributeValues[':one'] = 1;
-            }
-
-            // Auto-pause if runCount reaches 0
-            if (shouldPause) {
-              updateParts.push('#status = :paused');
-              attributeNames['#status'] = 'status';
-              attributeValues[':paused'] = 'paused';
-            }
-
-            const params = {
-              TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
-              Key: { scheduleId },
-              UpdateExpression: `SET ${updateParts.join(', ')}`,
-              ExpressionAttributeNames: attributeNames,
-              ExpressionAttributeValues: attributeValues,
-              ReturnValues: 'ALL_NEW',
-            };
-
-            const result = await dynamodb.update(params).promise();
-            return result.Attributes;
-          } catch (error) {
-            handleDynamoDbError(error, "updateScheduleAfterRun");
-            throw error;
-          }
+  async getRunResults(scheduleId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: {
+          scheduleId,
         },
+      };
+
+      const result = await dynamodb.get(params).promise();
+      return result.Item?.runResults || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getRunResults");
+      return [];
+    }
+  },
+
+  async getSchedulesReadyToRun() {
+    try {
+      const now = new Date().toISOString();
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        IndexName: 'StatusStartTimeIndex',
+        KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
+        FilterExpression: '#type = :type',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+          '#nextRunTime': 'nextRunTime',
+          '#type': 'type',
+        },
+        ExpressionAttributeValues: {
+          ':status': 'active',
+          ':now': now,
+          ':type': 'scheduled_chat',
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getSchedulesReadyToRun");
+      return [];
+    }
+  },
+
+  async getDueSocialEngagementActions() {
+    try {
+      const now = new Date().toISOString();
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        IndexName: 'StatusStartTimeIndex',
+        KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
+        FilterExpression: '#type = :type',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+          '#nextRunTime': 'nextRunTime',
+          '#type': 'type',
+        },
+        ExpressionAttributeValues: {
+          ':status': 'active',
+          ':now': now,
+          ':type': 'social_engagement_action',
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, "getDueSocialEngagementActions");
+      return [];
+    }
+  },
+
+  async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true) {
+    try {
+      // First, get the current schedule to check runCount
+      const getParams = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+      };
+      const currentSchedule = await dynamodb.get(getParams).promise();
+      const runCount = currentSchedule.Item?.runCount;
+
+      // Determine if we should pause the schedule
+      // When runCount is 1, after decrementing it will be 0, so we should pause
+      const shouldPause = decrementRunCount && runCount !== undefined && runCount !== -1 && runCount === 1;
+
+      // Build update expression dynamically
+      const updateParts: string[] = [
+        '#lastRunTime = :lastRunTime',
+        '#nextRunTime = :nextRunTime',
+        '#updatedAt = :updatedAt',
+      ];
+      const attributeNames: { [key: string]: string } = {
+        '#lastRunTime': 'lastRunTime',
+        '#nextRunTime': 'nextRunTime',
+        '#updatedAt': 'updatedAt',
+      };
+      const attributeValues: { [key: string]: any } = {
+        ':lastRunTime': lastRunTime,
+        ':nextRunTime': nextRunTime,
+        ':updatedAt': new Date().toISOString(),
+      };
+
+      // Handle runCount decrement
+      if (decrementRunCount && runCount !== undefined && runCount !== -1) {
+        updateParts.push('#runCount = #runCount - :one');
+        attributeNames['#runCount'] = 'runCount';
+        attributeValues[':one'] = 1;
+      }
+
+      // Auto-pause if runCount reaches 0
+      if (shouldPause) {
+        updateParts.push('#status = :paused');
+        attributeNames['#status'] = 'status';
+        attributeValues[':paused'] = 'paused';
+      }
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: `SET ${updateParts.join(', ')}`,
+        ExpressionAttributeNames: attributeNames,
+        ExpressionAttributeValues: attributeValues,
+        ReturnValues: 'ALL_NEW',
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateScheduleAfterRun");
+      throw error;
+    }
+  },
 
   async getScheduledChatByVariableAccessTokenHash(variableRequestAccessTokenHash: string) {
     try {
@@ -2057,12 +2094,12 @@ export const subscriberDb = {
     try {
       // Check if subscriber already exists
       const existingSubscriber = await this.getTaskSubscriberByEmail(taskId, email);
-      
+
       if (existingSubscriber) {
         // Email already exists - throw error regardless of subscription status
         throw new Error(`Email ${email} is already in the subscriber list for this task`);
       }
-      
+
       // Add new subscriber only if they don't exist at all
       const subscribedAt = new Date().toISOString();
       const params = {
@@ -2100,15 +2137,15 @@ export const subscriberDb = {
 
   async softUnsubscribe(taskId: string, email: string, feedback?: string) {
     try {
-      const updateExpression = feedback 
+      const updateExpression = feedback
         ? "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt, feedback = :feedback"
         : "SET unsubscribed = :unsubscribed, unsubscribedAt = :unsubscribedAt";
-      
+
       const expressionAttributeValues: any = {
         ":unsubscribed": true,
         ":unsubscribedAt": new Date().toISOString(),
       };
-      
+
       if (feedback) {
         expressionAttributeValues[":feedback"] = feedback;
       }
@@ -2294,7 +2331,7 @@ export const subscriberDb = {
       }
 
       // Update the specific email history entry
-      const updatedHistory = subscriber.emailHistory.map((emailHistory: any) => 
+      const updatedHistory = subscriber.emailHistory.map((emailHistory: any) =>
         emailHistory.id === emailId ? { ...emailHistory, status } : emailHistory
       );
 
@@ -2357,7 +2394,7 @@ export const subscriberDb = {
       const batchSize = 25;
       for (let i = 0; i < newSubscribers.length; i += batchSize) {
         const batch = newSubscribers.slice(i, i + batchSize);
-        
+
         const writeRequests = batch.map(subscriber => ({
           PutRequest: {
             Item: {
@@ -2654,7 +2691,7 @@ class BenchmarkTestDB {
         }
 
         const result = await this.docClient.query(params).promise();
-        
+
         if (result.Items && result.Items.length > 0) {
           allItems.push(...result.Items);
         }
@@ -2685,7 +2722,7 @@ class BenchmarkTestDB {
         }
 
         const result = await this.docClient.scan(params).promise();
-        
+
         if (result.Items && result.Items.length > 0) {
           allItems.push(...result.Items);
         }
@@ -2907,7 +2944,7 @@ export const crmDb = {
       const normalizedAlertEvents = Array.isArray(alertEvents)
         ? alertEvents
         : ['email.received'];
-      
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
         Item: {
@@ -3249,7 +3286,7 @@ export const crmDb = {
     try {
       // Get unique field names and sort them
       const uniqueFieldNames = Array.from(new Set(fieldNames)).sort();
-      
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
         Key: {
@@ -3293,7 +3330,7 @@ export const crmDb = {
   }) {
     try {
       const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
+
       // Check for duplicate email if email is provided
       if (leadData.email && leadData.email.trim()) {
         const existingLead = await this.getLeadByEmail(listId, leadData.email.trim().toLowerCase());
@@ -3320,7 +3357,7 @@ export const crmDb = {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      
+
       // Only include email if it's provided (GSI key cannot be empty string)
       if (emailValue) {
         item.email = emailValue;
@@ -3371,7 +3408,7 @@ export const crmDb = {
           }
         });
       }
-      
+
       // Update field names in list
       if (fieldNames.length > 0) {
         const list = await this.getLeadListById(listId);
@@ -3379,10 +3416,10 @@ export const crmDb = {
         const allFieldNames = [...existingFieldNames, ...fieldNames];
         await this.updateFieldNames(listId, allFieldNames);
       }
-      
+
       // Increment lead count
       await this.incrementLeadCount(listId, 1);
-      
+
       return params.Item;
     } catch (error) {
       handleDynamoDbError(error, "createLead");
@@ -3864,10 +3901,10 @@ export const crmDb = {
       };
 
       await dynamodb.delete(params).promise();
-      
+
       // Decrement lead count
       await this.incrementLeadCount(listId, -1);
-      
+
       return { success: true };
     } catch (error) {
       handleDynamoDbError(error, "deleteLead");
@@ -3919,12 +3956,12 @@ export const crmDb = {
       // Separate leads into new leads and leads to update
       const newLeads: typeof leads = [];
       const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
-      
+
       // Deduplicate leads within the upload by email (case-insensitive)
       const uniqueLeads = new Map<string, typeof leads[0]>();
       leads.forEach((lead, index) => {
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
-        
+
         // Only deduplicate if email is provided
         if (lead.email && lead.email.trim()) {
           if (uniqueLeads.has(emailKey)) {
@@ -3932,7 +3969,7 @@ export const crmDb = {
             results.errors.push(`Row ${index + 1}: Duplicate email "${lead.email}" found in upload data`);
             return;
           }
-          
+
           // Check against existing leads - if exists, mark for update instead of error
           const existingLead = existingLeadsByEmail.get(emailKey);
           if (existingLead) {
@@ -3940,7 +3977,7 @@ export const crmDb = {
             return; // Skip adding to uniqueLeads, will be handled separately
           }
         }
-        
+
         uniqueLeads.set(emailKey, lead);
       });
 
@@ -3953,11 +3990,11 @@ export const crmDb = {
       const batchSize = 25;
       for (let i = 0; i < newLeads.length; i += batchSize) {
         const batch = newLeads.slice(i, i + batchSize);
-        
+
         const writeRequests = batch.map(lead => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
-          
+
           const item: any = {
             listId,
             leadId,
@@ -3975,7 +4012,7 @@ export const crmDb = {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
-          
+
           // Only include email if it's provided (GSI key cannot be empty string)
           if (emailValue) {
             item.email = emailValue;
@@ -4018,7 +4055,7 @@ export const crmDb = {
       // Extract all field names from imported leads (both new and updated)
       const allFieldNames: string[] = [];
       const standardFields = ['email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes', 'linkedin', 'status', 'dealValue', 'dealCurrency'];
-      
+
       // Extract from new leads
       newLeads.forEach(lead => {
         standardFields.forEach(field => {
@@ -4034,7 +4071,7 @@ export const crmDb = {
           });
         }
       });
-      
+
       // Extract from leads being updated
       leadsToUpdate.forEach(({ newData }) => {
         standardFields.forEach(field => {
@@ -4050,7 +4087,7 @@ export const crmDb = {
           });
         }
       });
-      
+
       // Update field names in list
       if (allFieldNames.length > 0) {
         const list = await this.getLeadListById(listId);
@@ -4058,7 +4095,7 @@ export const crmDb = {
         const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
         await this.updateFieldNames(listId, combinedFieldNames);
       }
-      
+
       // Process leads to update (merge existing leads with new data)
       for (const { existingLead, newData } of leadsToUpdate) {
         try {
@@ -4071,7 +4108,7 @@ export const crmDb = {
           // Build update object - only include fields that have values in newData
           const updates: any = {};
           let changed = false;
-          
+
           // Check and update standard fields - only if newData has a value and it's different
           if (newData.firstName !== undefined && newData.firstName.trim()) {
             const newValue = newData.firstName.trim();
@@ -4129,12 +4166,12 @@ export const crmDb = {
               changed = true;
             }
           }
-          
+
           // Check customFields - only if newData has customFields
           if (newData.customFields !== undefined) {
             const existingCustomFields = existingLead.customFields || {};
             const newCustomFields = newData.customFields || {};
-            
+
             // Normalize function for consistent comparison (sort keys, trim strings, handle null/undefined/empty consistently)
             const normalizeCustomFields = (fields: Record<string, any>): Record<string, any> => {
               if (!fields || typeof fields !== 'object') return {};
@@ -4149,21 +4186,21 @@ export const crmDb = {
               });
               return normalized;
             };
-            
+
             // Normalize existing and new separately
             const existingNormalized = normalizeCustomFields(existingCustomFields);
             const newNormalized = normalizeCustomFields(newCustomFields);
-            
+
             // Merge normalized versions
             const mergedNormalized = {
               ...existingNormalized,
               ...newNormalized,
             };
-            
+
             // Compare normalized existing with normalized merged result
             const existingStr = JSON.stringify(existingNormalized);
             const mergedStr = JSON.stringify(mergedNormalized);
-            
+
             // Only update if the merged result is different from existing
             if (existingStr !== mergedStr) {
               // Use the actual merged customFields (not normalized) for the update
@@ -4175,7 +4212,7 @@ export const crmDb = {
               changed = true;
             }
           }
-          
+
           // Only update if there are changes
           if (changed) {
             await this.updateLead(listId, existingLead.leadId, updates);
@@ -4341,7 +4378,7 @@ export const crmDb = {
           if ((event.eventType === 'email.received' || event.eventType === 'email.delivered') && event.data?.email_id) {
             try {
               let emailContent: { html?: string; text?: string; headers?: Record<string, string> } | null = null;
-              
+
               // Check if email content is already cached in the event record
               if (event.emailContent) {
                 return {
@@ -4349,16 +4386,16 @@ export const crmDb = {
                   emailContent: event.emailContent, // Use cached content from event record
                 };
               }
-              
+
               // Fetch from Resend if not cached
               const resendService = require('./resendService').resendService;
-              
+
               if (event.eventType === 'email.received') {
                 emailContent = await resendService.getReceivedEmailContent(event.data.email_id);
               } else if (event.eventType === 'email.delivered') {
                 emailContent = await resendService.getDeliveredEmailContent(event.data.email_id);
               }
-              
+
               if (emailContent) {
                 // Store in event record for caching (truncated to 10k if needed)
                 try {
@@ -4368,18 +4405,18 @@ export const crmDb = {
                   console.error(`Failed to update email event content for ${event.data.email_id}:`, updateError);
                   // Continue even if update fails
                 }
-                
+
                 // Truncate for response if needed (same logic as in updateEmailEventContent)
                 const truncatedContent = {
-                  html: emailContent.html && emailContent.html.length > 10000 
+                  html: emailContent.html && emailContent.html.length > 10000
                     ? emailContent.html.substring(0, 10000) + '... [truncated]'
                     : emailContent.html,
-                  text: emailContent.text && emailContent.text.length > 10000 
+                  text: emailContent.text && emailContent.text.length > 10000
                     ? emailContent.text.substring(0, 10000) + '... [truncated]'
                     : emailContent.text,
                   headers: emailContent.headers
                 };
-                
+
                 return {
                   ...baseEngagement,
                   emailContent: truncatedContent, // Add html, text, and headers
@@ -4487,7 +4524,7 @@ export const crmDb = {
 
       // Find the engagement by eventId
       const engagementIndex = existingEngagements.findIndex((eng) => eng.eventId === eventId);
-      
+
       if (engagementIndex === -1) {
         throw new Error('Engagement not found');
       }
@@ -4691,18 +4728,18 @@ export const accountMemoryDb = {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = category
         ? {
-            TableName: ACCOUNT_MEMORY_TABLE,
-            IndexName: 'UserIdCategoryIndex',
-            KeyConditionExpression: 'userId = :userId AND category = :category',
-            ExpressionAttributeValues: { ':userId': userId, ':category': category },
-            ...(limit ? { Limit: limit } : {}),
-          }
+          TableName: ACCOUNT_MEMORY_TABLE,
+          IndexName: 'UserIdCategoryIndex',
+          KeyConditionExpression: 'userId = :userId AND category = :category',
+          ExpressionAttributeValues: { ':userId': userId, ':category': category },
+          ...(limit ? { Limit: limit } : {}),
+        }
         : {
-            TableName: ACCOUNT_MEMORY_TABLE,
-            KeyConditionExpression: 'userId = :userId',
-            ExpressionAttributeValues: { ':userId': userId },
-            ...(limit ? { Limit: limit } : {}),
-          };
+          TableName: ACCOUNT_MEMORY_TABLE,
+          KeyConditionExpression: 'userId = :userId',
+          ExpressionAttributeValues: { ':userId': userId },
+          ...(limit ? { Limit: limit } : {}),
+        };
 
       const result = await dynamodb.query(params).promise();
       return result.Items || [];
@@ -4787,4 +4824,50 @@ export const accountMemoryDb = {
       throw error;
     }
   },
+};
+
+export const socialEngagementTrackingDb = {
+  async recordEngagement(tracker: {
+    userId: string;
+    targetPostUrn: string;
+    boosterAccountId: string;
+    actionType: string;
+    scheduledAt: string;
+  }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        Item: {
+          ...tracker,
+          targetPostUrn_booster: `${tracker.targetPostUrn}#${tracker.boosterAccountId}`,
+          createdAt: new Date().toISOString()
+        },
+      };
+
+      await dynamodb.put(params).promise();
+      return tracker;
+    } catch (error) {
+      handleDynamoDbError(error, "recordEngagement");
+      throw error;
+    }
+  },
+
+  async hasEngaged(userId: string, targetPostUrn: string, boosterAccountId: string): Promise<boolean> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        KeyConditionExpression: "userId = :userId AND targetPostUrn_booster = :targetPostUrn_booster",
+        ExpressionAttributeValues: {
+          ":userId": userId,
+          ":targetPostUrn_booster": `${targetPostUrn}#${boosterAccountId}`
+        }
+      };
+
+      const result = await dynamodb.query(params).promise();
+      return (result.Items && result.Items.length > 0) ? true : false;
+    } catch (error) {
+      handleDynamoDbError(error, "hasEngaged");
+      return false;
+    }
+  }
 };

@@ -211,22 +211,22 @@ export class AgentModeService {
    */
   public async refreshMcpTools(): Promise<void> {
     console.log('AgentMode: Refreshing MCP tools...');
-    
+
     // Clear existing MCP tools from registry
     const existingTools = this.mcpClientService.getTools();
     for (const tool of existingTools) {
       this.toolRegistry.unregister(tool.name);
     }
-    
+
     // Refresh the MCP client service
     await this.mcpClientService.refresh();
-    
+
     // Re-register tools
     const mcpTools = this.mcpClientService.getTools();
     for (const tool of mcpTools) {
       this.toolRegistry.register(tool);
     }
-    
+
     console.log(`AgentMode: Refreshed ${mcpTools.length} MCP tools`);
   }
 
@@ -241,14 +241,14 @@ export class AgentModeService {
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
-         console.error('AgentMode: Error loading server tools:', error);
+        console.error('AgentMode: Error loading server tools:', error);
       }
     }
 
     // 2. Register tools from the emmaToolRegistry into THIS instance's toolRegistry
     try {
-       const { emmaToolRegistry } = await import('../emma/registry');
-       const toolNames = emmaToolRegistry.getToolNames();
+      const { emmaToolRegistry } = await import('../emma/registry');
+      const toolNames = emmaToolRegistry.getToolNames();
 
       for (const name of toolNames) {
         const toolHandler = emmaToolRegistry.getTool(name);
@@ -272,7 +272,7 @@ export class AgentModeService {
         }
       }
     } catch (error) {
-       console.error('AgentMode: Error registering tools to instance:', error);
+      console.error('AgentMode: Error registering tools to instance:', error);
     }
   }
 
@@ -911,39 +911,39 @@ export class AgentModeService {
 
         // 4. Refresh Context if Skills Changed
         if (skillsUpdated) {
-            try {
-                // Refresh session and skills
-                currentSession = await chatbotDb.getChatSession(sessionId);
-                const updatedAssociatedSkillIds = currentSession?.associatedSkills || [];
-                
-                if (updatedAssociatedSkillIds.length) {
-                  associatedSkills = await skillService.getSkillsByIds(updatedAssociatedSkillIds);
-                } else {
-                  associatedSkills = [];
-                }
-                
-                // Re-build context using helper
-                const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds);
-                allowedToolNames = skillContext.allowedToolNames;
-                installedSkillContextMsg = skillContext.installedSkillContextMsg;
+          try {
+            // Refresh session and skills
+            currentSession = await chatbotDb.getChatSession(sessionId);
+            const updatedAssociatedSkillIds = currentSession?.associatedSkills || [];
 
-                // Rebuild available skills (excluding newly associated ones, filtered by subscription)
-                availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, isAdmin);
-
-                // Update messages using helper — track length change to keep initialMessageCount accurate
-                const preUpdateLen = messages.length;
-                this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
-                const delta = messages.length - preUpdateLen;
-                if (delta !== 0) {
-                  initialMessageCount += delta;
-                }
-
-                // Invalidate tools cache
-                filteredToolsCache = null;
-                skillsUpdated = false;
-            } catch (error) {
-                console.error('Error refreshing skill context:', error);
+            if (updatedAssociatedSkillIds.length) {
+              associatedSkills = await skillService.getSkillsByIds(updatedAssociatedSkillIds);
+            } else {
+              associatedSkills = [];
             }
+
+            // Re-build context using helper
+            const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds);
+            allowedToolNames = skillContext.allowedToolNames;
+            installedSkillContextMsg = skillContext.installedSkillContextMsg;
+
+            // Rebuild available skills (excluding newly associated ones, filtered by subscription)
+            availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, updatedAssociatedSkillIds, userAllowedSkillIds, isAdmin);
+
+            // Update messages using helper — track length change to keep initialMessageCount accurate
+            const preUpdateLen = messages.length;
+            this.updateConversationContext(messages, installedSkillContextMsg, availableSkillContextMsg);
+            const delta = messages.length - preUpdateLen;
+            if (delta !== 0) {
+              initialMessageCount += delta;
+            }
+
+            // Invalidate tools cache
+            filteredToolsCache = null;
+            skillsUpdated = false;
+          } catch (error) {
+            console.error('Error refreshing skill context:', error);
+          }
         }
 
         if (onProgress) {
@@ -959,26 +959,26 @@ export class AgentModeService {
         // New sessions: use skill-based filtering. When no skills are installed, only install_skills
         // is in allowedToolNames, forcing the LLM to install a skill first.
         if (!filteredToolsCache) {
-             // Discover tools from MCP servers that require per-user secrets (e.g. ClickUp).
-             // These servers can't list tools during startup (no user context), so we
-             // discover them here once per session and register into the tool registry.
-             try {
-               const discovered = await this.mcpClientService.discoverToolsForUser(userId, sessionId);
-               if (discovered > 0) {
-                 const newTools = this.mcpClientService.getTools();
-                 for (const tool of newTools) {
-                   if (!this.toolRegistry.getTool(tool.name)) {
-                     this.toolRegistry.register(tool);
-                   }
-                 }
-                 console.log(`[MCP-DISCOVER] Registered tools from ${discovered} per-user MCP server(s) for user ${userId}`);
-               }
-             } catch (e) {
-               console.warn('[MCP-DISCOVER] Error discovering per-user MCP tools:', (e as Error).message);
-             }
+          // Discover tools from MCP servers that require per-user secrets (e.g. ClickUp).
+          // These servers can't list tools during startup (no user context), so we
+          // discover them here once per session and register into the tool registry.
+          try {
+            const discovered = await this.mcpClientService.discoverToolsForUser(userId, sessionId);
+            if (discovered > 0) {
+              const newTools = this.mcpClientService.getTools();
+              for (const tool of newTools) {
+                if (!this.toolRegistry.getTool(tool.name)) {
+                  this.toolRegistry.register(tool);
+                }
+              }
+              console.log(`[MCP-DISCOVER] Registered tools from ${discovered} per-user MCP server(s) for user ${userId}`);
+            }
+          } catch (e) {
+            console.warn('[MCP-DISCOVER] Error discovering per-user MCP tools:', (e as Error).message);
+          }
 
-             const skillFilter = isLegacySession ? undefined : allowedToolNames;
-             filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+          const skillFilter = isLegacySession ? undefined : allowedToolNames;
+          filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
         }
 
         // Trim large old tool results to prevent context window overflow
@@ -1171,7 +1171,7 @@ export class AgentModeService {
 
             // Check if we need to refresh skills for next iteration
             if (toolCall.function.name === 'install_skills') {
-                skillsUpdated = true;
+              skillsUpdated = true;
             }
 
             preparedCalls.push({ toolCall, functionArgs });
@@ -1346,7 +1346,7 @@ export class AgentModeService {
       const responseMessages = messages.slice(initialMessageCount).filter(
         (msg: any) => msg.role !== 'user'
       );
-      
+
       return {
         content,
         toolCalls,
@@ -1785,14 +1785,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any): any[] {
     // Build structured messages preserving roles (assume the first is system) and including tool messages
     const messages: any[] = [];
-    
+
     // Filter out the last user message if it matches current messageContent
     // This prevents duplication when sessionHistory already includes current message
     const filteredHistory = sessionHistory.filter((msg, index) => {
       // If this is the last message and it matches current content, skip it
-      if (index === sessionHistory.length - 1 && 
-          msg.role === 'user' && 
-          msg.content === messageContent) {
+      if (index === sessionHistory.length - 1 &&
+        msg.role === 'user' &&
+        msg.content === messageContent) {
         return false;
       }
       return true;
@@ -1950,14 +1950,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
       const publishedSkills = await skillService.getPublishedSkills();
-      
+
       if (!publishedSkills.length)
         return { message: "No skills available in the library." };
 
       const session = await chatbotDb.getChatSession(sessionId);
       const currentAssociated = session?.associatedSkills || [];
       const associatedSkillIds = new Set(currentAssociated);
-      
+
       const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
 
       // Add admin skill for admin users (if not already installed)
@@ -2226,74 +2226,74 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
-        const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-          skillService.getPublishedSkills(),
-          getAllowedSkills(userId)
-        ]);
+      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
+        skillService.getPublishedSkills(),
+        getAllowedSkills(userId)
+      ]);
 
-        const isWildcard = userAllowedSkillIds.includes("*");
-        const allowedSkillSet = new Set(userAllowedSkillIds);
+      const isWildcard = userAllowedSkillIds.includes("*");
+      const allowedSkillSet = new Set(userAllowedSkillIds);
 
-        // Check admin status for admin skill gating
-        let isAdmin = false;
-        if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
-          try {
-            const { userDb } = await import('./db');
-            const user = await userDb.getUserById(userId);
-            isAdmin = user?.isAdmin === true;
-          } catch (e) {
-            console.warn('[installSkills] Error checking admin status:', (e as Error).message);
+      // Check admin status for admin skill gating
+      let isAdmin = false;
+      if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
+        try {
+          const { userDb } = await import('./db');
+          const user = await userDb.getUserById(userId);
+          isAdmin = user?.isAdmin === true;
+        } catch (e) {
+          console.warn('[installSkills] Error checking admin status:', (e as Error).message);
+        }
+      }
+
+      // Filter valid IDs: exists in published skills OR is a virtual skill ID
+      // AND is allowed by user's subscription (or admin for admin skill)
+      const validSkillIds = skillIds.filter(id =>
+        (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || publishedSkills.some(s => s.skillId === id)) &&
+        (id === ADMIN_SKILL_VIRTUAL_ID || isWildcard || allowedSkillSet.has(id))
+      );
+
+      const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
+
+      const installedNames: string[] = [];
+
+      if (validSkillIds.length > 0) {
+        await chatbotDb.addAssociatedSkills(sessionId, validSkillIds);
+
+        // Get names for response
+        validSkillIds.forEach(id => {
+          if (id === OTHER_SKILLS_VIRTUAL_ID) {
+            installedNames.push('other_skills');
+          } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
+            installedNames.push('Admin Tools');
+          } else {
+            const skill = publishedSkills.find(s => s.skillId === id);
+            if (skill) installedNames.push(skill.name);
           }
-        }
+        });
+      }
 
-        // Filter valid IDs: exists in published skills OR is a virtual skill ID
-        // AND is allowed by user's subscription (or admin for admin skill)
-        const validSkillIds = skillIds.filter(id =>
-          (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || publishedSkills.some(s => s.skillId === id)) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isWildcard || allowedSkillSet.has(id))
-        );
-
-        const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
-
-        const installedNames: string[] = [];
-
-        if (validSkillIds.length > 0) {
-          await chatbotDb.addAssociatedSkills(sessionId, validSkillIds);
-
-          // Get names for response
-          validSkillIds.forEach(id => {
-            if (id === OTHER_SKILLS_VIRTUAL_ID) {
-              installedNames.push('other_skills');
-            } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
-              installedNames.push('Admin Tools');
-            } else {
-              const skill = publishedSkills.find(s => s.skillId === id);
-              if (skill) installedNames.push(skill.name);
-            }
-          });
-        }
-
-        if (!installedNames.length) {
-          if (rejectedSkillIds.length > 0) {
-            return { message: "The requested skills are not available with your current subscription." };
-          }
-          return { message: "No valid skills found for the provided IDs." };
-        }
-
-        const result: any = {
-          success: true,
-          message: `Successfully installed ${installedNames.length} skill(s).`,
-          installedSkills: installedNames
-        };
-
+      if (!installedNames.length) {
         if (rejectedSkillIds.length > 0) {
-          result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+          return { message: "The requested skills are not available with your current subscription." };
         }
+        return { message: "No valid skills found for the provided IDs." };
+      }
 
-        return result;
+      const result: any = {
+        success: true,
+        message: `Successfully installed ${installedNames.length} skill(s).`,
+        installedSkills: installedNames
+      };
+
+      if (rejectedSkillIds.length > 0) {
+        result.message += ` ${rejectedSkillIds.length} skill(s) were not available with your subscription.`;
+      }
+
+      return result;
     } catch (error) {
-        console.error('AgentMode: Error in installSkills:', error);
-        return { message: "An error occurred while installing skills." };
+      console.error('AgentMode: Error in installSkills:', error);
+      return { message: "An error occurred while installing skills." };
     }
   }
 
@@ -7872,9 +7872,9 @@ Format the response as JSON with this structure:
         } catch (error: any) {
           const errorMessage = error.message?.toLowerCase() || '';
           const isNotFound = error.code === 404 ||
-                            errorMessage.includes('no such object') ||
-                            errorMessage.includes('not found') ||
-                            errorMessage.includes('does not exist');
+            errorMessage.includes('no such object') ||
+            errorMessage.includes('not found') ||
+            errorMessage.includes('does not exist');
 
           if (isNotFound) {
             console.log(`[updateKnowledgeBaseFile] No existing file ${fileName} for task ${taskId}, creating new`);
@@ -8901,11 +8901,11 @@ Format the response as JSON with this structure:
         object_type === "account"
           ? `act_${accountId}`
           : object_id ??
-            (() => {
-              throw new Error(
-                `object_id is required for object_type ${object_type}`
-              );
-            })();
+          (() => {
+            throw new Error(
+              `object_id is required for object_type ${object_type}`
+            );
+          })();
 
       const version = process.env.META_API_VERSION || "v24.0";
       const baseUrl = `https://graph.facebook.com/${version}`;
@@ -9060,11 +9060,11 @@ Format the response as JSON with this structure:
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
       case 'UPLOAD_IMAGE':
-          if (!params.image_url) throw new Error('image_url is required for UPLOAD_IMAGE action');
-          return this.uploadMetaAdsImage(userId, params.image_url, account_id);
+        if (!params.image_url) throw new Error('image_url is required for UPLOAD_IMAGE action');
+        return this.uploadMetaAdsImage(userId, params.image_url, account_id);
       case 'UPLOAD_VIDEO':
-          if (!params.video_url && !params.image_url) throw new Error('video_url (or image_url as proxy) is required for UPLOAD_VIDEO action');
-          return this.uploadMetaAdsVideo(userId, params.video_url || params.image_url, account_id);
+        if (!params.video_url && !params.image_url) throw new Error('video_url (or image_url as proxy) is required for UPLOAD_VIDEO action');
+        return this.uploadMetaAdsVideo(userId, params.video_url || params.image_url, account_id);
       default:
         throw new Error(`Invalid action: ${action}`);
     }
@@ -9075,7 +9075,7 @@ Format the response as JSON with this structure:
       case 'LIST':
         return this.listMetaAdsAds(userId, ad_set_id, account_id);
       case 'CREATE':
-         return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
+        return this.createMetaAdsAd(userId, { ...params, account_id, adset_id: ad_set_id });
       case 'UPDATE':
         if (!ad_id) throw new Error('ad_id is required for UPDATE action');
         console.log(`AgentMode: Updating ad ${ad_id} with params:`, params);
@@ -9558,7 +9558,7 @@ Format the response as JSON with this structure:
   public async uploadMetaAdsImage(userId: string, imageUrl: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      
+
       // Download image from URL
       const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
       const buffer = Buffer.from(response.data as any);
@@ -9594,7 +9594,7 @@ Format the response as JSON with this structure:
   public async uploadMetaAdsVideo(userId: string, videoUrl: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      
+
       console.log(`AgentMode: Uploading video to Meta Ads (Account: ${accountId})`);
       const video = await metaService.uploadVideo(accountId, accessToken, videoUrl);
 
@@ -9944,17 +9944,17 @@ Format the response as JSON with this structure:
       case 'CAMPAIGN':
         // Map master params to specific params if needed, but schema is unified so passing through is safe
         return this.manageMetaAdsCampaigns(userId, action as any, account_id, campaign_id, params);
-      
+
       case 'AD_SET':
         // Validation for Ad Set CREATE handled within manageMetaAdsAdSets -> createMetaAdsAdSet
         return this.manageMetaAdsAdSets(userId, action as any, account_id, campaign_id, ad_set_id, params);
-      
+
       case 'AD_CREATIVE':
         return this.manageMetaAdsAdCreatives(userId, action as any, account_id, params);
-      
+
       case 'AD':
         return this.manageMetaAdsAds(userId, action as any, account_id, ad_set_id, ad_id, params);
-      
+
       case 'CUSTOM_AUDIENCE':
         return this.manageMetaCustomAudiences(userId, action as any, account_id, params);
 
@@ -9979,174 +9979,174 @@ Format the response as JSON with this structure:
     params: any
   ): Promise<MetaApiResult> {
     try {
-       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
 
-       switch (action) {
-         case 'LIST': {
-            const result = await metaService.listCustomAudiences(accountId, accessToken);
-            const audiences = Array.isArray(result) ? result : [];
-            return {
-              success: true,
-              message: `Found ${audiences.length} custom audience(s)`,
-              audiences: audiences
-            };
-         }
-         case 'CREATE': {
-            // Validate required fields
-            if (!params.name) {
-              throw new Error('Custom audience requires a "name".');
-            }
-            if (!params.subtype || !['CUSTOM', 'LOOKALIKE'].includes(params.subtype)) {
-              throw new Error('Custom audience requires "subtype" — must be "CUSTOM" or "LOOKALIKE".');
-            }
+      switch (action) {
+        case 'LIST': {
+          const result = await metaService.listCustomAudiences(accountId, accessToken);
+          const audiences = Array.isArray(result) ? result : [];
+          return {
+            success: true,
+            message: `Found ${audiences.length} custom audience(s)`,
+            audiences: audiences
+          };
+        }
+        case 'CREATE': {
+          // Validate required fields
+          if (!params.name) {
+            throw new Error('Custom audience requires a "name".');
+          }
+          if (!params.subtype || !['CUSTOM', 'LOOKALIKE'].includes(params.subtype)) {
+            throw new Error('Custom audience requires "subtype" — must be "CUSTOM" or "LOOKALIKE".');
+          }
 
-            // Lookalike spec validation
-            if (params.subtype === 'LOOKALIKE') {
-              const spec = params.lookalike_spec;
-              if (!spec || typeof spec !== 'object') {
-                throw new Error('LOOKALIKE audiences require "lookalike_spec" with origin, ratio, and country.');
-              }
-              if (!spec.origin || !Array.isArray(spec.origin) || spec.origin.length === 0) {
-                throw new Error('lookalike_spec.origin must be a non-empty array with at least one source audience: [{ "id": "AUDIENCE_ID", "type": "custom_audience" }].');
-              }
-              for (const source of spec.origin) {
-                if (!source.id) {
-                  throw new Error('Each lookalike_spec.origin entry must have an "id" (source audience ID).');
-                }
-              }
-              if (spec.ratio === undefined || spec.ratio === null) {
-                throw new Error('lookalike_spec.ratio is required (0.01 to 0.20, e.g., 0.01 = top 1% of country population).');
-              }
-              if (spec.ratio < 0.01 || spec.ratio > 0.20) {
-                throw new Error(`lookalike_spec.ratio must be between 0.01 and 0.20 (got ${spec.ratio}). Use 0.01-0.05 for best quality.`);
-              }
-              if (!spec.country || typeof spec.country !== 'string' || spec.country.length !== 2) {
-                throw new Error('lookalike_spec.country is required and must be a 2-letter ISO country code (e.g., "US").');
+          // Lookalike spec validation
+          if (params.subtype === 'LOOKALIKE') {
+            const spec = params.lookalike_spec;
+            if (!spec || typeof spec !== 'object') {
+              throw new Error('LOOKALIKE audiences require "lookalike_spec" with origin, ratio, and country.');
+            }
+            if (!spec.origin || !Array.isArray(spec.origin) || spec.origin.length === 0) {
+              throw new Error('lookalike_spec.origin must be a non-empty array with at least one source audience: [{ "id": "AUDIENCE_ID", "type": "custom_audience" }].');
+            }
+            for (const source of spec.origin) {
+              if (!source.id) {
+                throw new Error('Each lookalike_spec.origin entry must have an "id" (source audience ID).');
               }
             }
+            if (spec.ratio === undefined || spec.ratio === null) {
+              throw new Error('lookalike_spec.ratio is required (0.01 to 0.20, e.g., 0.01 = top 1% of country population).');
+            }
+            if (spec.ratio < 0.01 || spec.ratio > 0.20) {
+              throw new Error(`lookalike_spec.ratio must be between 0.01 and 0.20 (got ${spec.ratio}). Use 0.01-0.05 for best quality.`);
+            }
+            if (!spec.country || typeof spec.country !== 'string' || spec.country.length !== 2) {
+              throw new Error('lookalike_spec.country is required and must be a 2-letter ISO country code (e.g., "US").');
+            }
+          }
 
-            const audience = await metaService.createCustomAudience(accountId, accessToken, params);
-            return {
-              success: true,
-              message: `Custom Audience "${audience.name}" created successfully`,
-              audience: audience
-            };
-         }
-         case 'UPLOAD_USERS': {
-            if (!params.id || !params.payload || !params.schema) {
-              throw new Error('UPLOAD_USERS requires "id", "schema", and "payload".');
-            }
-            let userPayload = params.payload;
-            
-            // Smart handling: Check if payload is a URL (S3 or otherwise)
-            if (typeof userPayload === 'string' && (userPayload.startsWith('http://') || userPayload.startsWith('https://'))) {
-               try {
-                  console.log(`[AgentMode] Detected URL in payload, fetching content: ${userPayload}`);
-                  const response = await axios.get(userPayload);
-                  // Ensure response data is a string for parsing
-                  userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
-               } catch (fetchError: any) {
-                  throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
-               }
-            }
+          const audience = await metaService.createCustomAudience(accountId, accessToken, params);
+          return {
+            success: true,
+            message: `Custom Audience "${audience.name}" created successfully`,
+            audience: audience
+          };
+        }
+        case 'UPLOAD_USERS': {
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('UPLOAD_USERS requires "id", "schema", and "payload".');
+          }
+          let userPayload = params.payload;
 
-            // Parse CSV/String payload into Arrays
-            let parsedPayload: string[][] = [];
-            if (Array.isArray(userPayload)) {
-                // Already an array (e.g. from JSON)
-                parsedPayload = userPayload;
-            } else if (typeof userPayload === 'string') {
-                // Split by newline to get rows
-                const rows = userPayload.split(/\r?\n/).filter(row => row.trim().length > 0);
-                // Split by comma to get columns
-                parsedPayload = rows.map(row => row.split(',').map(cell => cell.trim()));
-            } else {
-                // Fallback or error
-                parsedPayload = []; 
-                console.warn('[AgentMode] Payload format unrecognized for UPLOAD_USERS, sending empty array.');
+          // Smart handling: Check if payload is a URL (S3 or otherwise)
+          if (typeof userPayload === 'string' && (userPayload.startsWith('http://') || userPayload.startsWith('https://'))) {
+            try {
+              console.log(`[AgentMode] Detected URL in payload, fetching content: ${userPayload}`);
+              const response = await axios.get(userPayload);
+              // Ensure response data is a string for parsing
+              userPayload = typeof response.data === 'object' ? JSON.stringify(response.data) : response.data;
+            } catch (fetchError: any) {
+              throw new Error(`Failed to fetch CSV content from URL: ${fetchError.message}`);
             }
+          }
 
-            // Validate schema/payload column count alignment
-            const schemaLength = params.schema.length;
-            if (parsedPayload.length === 0) {
-              throw new Error('Payload is empty — no user rows to upload.');
+          // Parse CSV/String payload into Arrays
+          let parsedPayload: string[][] = [];
+          if (Array.isArray(userPayload)) {
+            // Already an array (e.g. from JSON)
+            parsedPayload = userPayload;
+          } else if (typeof userPayload === 'string') {
+            // Split by newline to get rows
+            const rows = userPayload.split(/\r?\n/).filter(row => row.trim().length > 0);
+            // Split by comma to get columns
+            parsedPayload = rows.map(row => row.split(',').map(cell => cell.trim()));
+          } else {
+            // Fallback or error
+            parsedPayload = [];
+            console.warn('[AgentMode] Payload format unrecognized for UPLOAD_USERS, sending empty array.');
+          }
+
+          // Validate schema/payload column count alignment
+          const schemaLength = params.schema.length;
+          if (parsedPayload.length === 0) {
+            throw new Error('Payload is empty — no user rows to upload.');
+          }
+          for (let i = 0; i < parsedPayload.length; i++) {
+            if (parsedPayload[i].length !== schemaLength) {
+              throw new Error(
+                `Row ${i + 1} has ${parsedPayload[i].length} column(s) but schema expects ${schemaLength}. ` +
+                `Schema: [${params.schema.join(', ')}]. Row data: [${parsedPayload[i].join(', ')}]`
+              );
             }
-            for (let i = 0; i < parsedPayload.length; i++) {
-              if (parsedPayload[i].length !== schemaLength) {
-                throw new Error(
-                  `Row ${i + 1} has ${parsedPayload[i].length} column(s) but schema expects ${schemaLength}. ` +
-                  `Schema: [${params.schema.join(', ')}]. Row data: [${parsedPayload[i].join(', ')}]`
-                );
+          }
+
+          // SHA256 Hashing logic
+          // Iterating through parsed payload and hashing fields based on schema
+
+          const hashedPayload = parsedPayload.map((row: string[]) => {
+            return row.map((cell: string, index: number) => {
+              const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';
+              let value = cell ? cell.trim() : '';
+
+              if (!value) return '';
+
+              // Pass through if already a SHA256 hash (64 hex chars)
+              if (/^[a-fA-F0-9]{64}$/.test(value)) {
+                return value;
               }
-            }
 
-            // SHA256 Hashing logic
-            // Iterating through parsed payload and hashing fields based on schema
+              // Normalization Rules per Meta requirements:
+              if (['EMAIL'].includes(fieldType)) {
+                value = value.toLowerCase();
+              } else if (['PHONE'].includes(fieldType)) {
+                // Standardize to digits only (strip spaces, dashes, parens)
+                value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
+              } else if (['GEN'].includes(fieldType)) {
+                // Gender: 'f' or 'm'
+                value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
+              } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
+                // Keep trimmed string
+                value = value.trim();
+              } else if (['COUNTRY'].includes(fieldType)) {
+                // Country codes must be lowercase 2-letter ISO
+                value = value.toLowerCase();
+              } else {
+                // Default: lowercase + trim
+                value = value.toLowerCase();
+              }
 
-            const hashedPayload = parsedPayload.map((row: string[]) => {
-                return row.map((cell: string, index: number) => {
-                    const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';
-                    let value = cell ? cell.trim() : '';
-
-                    if (!value) return '';
-
-                    // Pass through if already a SHA256 hash (64 hex chars)
-                    if (/^[a-fA-F0-9]{64}$/.test(value)) {
-                        return value;
-                    }
-
-                    // Normalization Rules per Meta requirements:
-                    if (['EMAIL'].includes(fieldType)) {
-                        value = value.toLowerCase();
-                    } else if (['PHONE'].includes(fieldType)) {
-                        // Standardize to digits only (strip spaces, dashes, parens)
-                        value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
-                    } else if (['GEN'].includes(fieldType)) {
-                        // Gender: 'f' or 'm'
-                        value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
-                    } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
-                         // Keep trimmed string
-                         value = value.trim();
-                    } else if (['COUNTRY'].includes(fieldType)) {
-                        // Country codes must be lowercase 2-letter ISO
-                        value = value.toLowerCase();
-                    } else {
-                        // Default: lowercase + trim
-                        value = value.toLowerCase();
-                    }
-
-                    // Compute SHA256
-                    return createHash('sha256').update(value).digest('hex');
-                });
+              // Compute SHA256
+              return createHash('sha256').update(value).digest('hex');
             });
+          });
 
-            console.log(`[AgentMode] Hashed ${hashedPayload.length} rows for upload.`);
+          console.log(`[AgentMode] Hashed ${hashedPayload.length} rows for upload.`);
 
-            const result = await metaService.uploadCustomAudienceUsers(
-              accountId, 
-              accessToken, 
-              params.id, 
-              params.schema, 
-              hashedPayload
-            );
+          const result = await metaService.uploadCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            hashedPayload
+          );
 
-            return {
-              success: true,
-              message: `Successfully initiated user upload to audience ${params.id}`,
-              result: result
-            };
-         }
-         default:
-           throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
-       }
-     } catch (error: any) {
-       console.error('AgentMode: Error managing custom audiences:', error);
-       return {
-         success: false,
-         message: error.message || 'Failed to manage custom audiences.',
-         error: error.message
-       };
-     }
+          return {
+            success: true,
+            message: `Successfully initiated user upload to audience ${params.id}`,
+            result: result
+          };
+        }
+        default:
+          throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
+      }
+    } catch (error: any) {
+      console.error('AgentMode: Error managing custom audiences:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to manage custom audiences.',
+        error: error.message
+      };
+    }
   }
 
   /**
@@ -10160,10 +10160,10 @@ Format the response as JSON with this structure:
   ): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
-      
+
       const searchResult = await metaService.searchTargeting(accountId, accessToken, q, type);
       const results = Array.isArray(searchResult) ? searchResult : [];
-      
+
       return {
         success: true,
         message: `Found ${results.length} results for "${q}"`,
@@ -11600,8 +11600,8 @@ Format the response as JSON with this structure:
       const pdfData = await pdfParse(content);
       return pdfData.text || '';
     } else if (['txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'log'].includes(extension) ||
-               mimeType.startsWith('text/') ||
-               mimeType.startsWith('application/vnd.google-apps.')) {
+      mimeType.startsWith('text/') ||
+      mimeType.startsWith('application/vnd.google-apps.')) {
       return content.toString('utf-8');
     } else {
       return content.toString('base64');
@@ -16982,7 +16982,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // List connected accounts helper
-   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
+  async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
       const { getAccountsByUserId, isTokenValid } = await import('./connectedAccountsDb');
 
@@ -17029,9 +17029,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       try {
         console.log('[AgentMode] Looking up account:', accountId);
         const account = await getAccountById(accountId, userId);
-        console.log('[AgentMode] Account lookup result:', account ? { 
-          found: true, 
-          platform: account.platform, 
+        console.log('[AgentMode] Account lookup result:', account ? {
+          found: true,
+          platform: account.platform,
           accountType: account.config?.account_type,
           accountName: account.account_name
         } : { found: false });
@@ -17064,7 +17064,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         if (message.includes('access token expired')) {
           message = 'Account token expired. Please reconnect the account in Settings.';
         }
-        
+
         return {
           success: false,
           message: `Failed to post: ${message}`
@@ -17116,6 +17116,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           return {
             success: false,
             message: 'Commenting is currently only supported for LinkedIn accounts'
+          };
+        }
+
+        // Guard: comment_text must not be empty — return a clear error so Emma retries with actual text
+        if (!commentText || !commentText.trim()) {
+          console.warn('[AgentMode] commentOnLinkedInPost rejected: comment_text is empty or missing');
+          return {
+            success: false,
+            message: 'comment_text is required and must not be empty. Please provide the actual comment text you want to post, then call this tool again.'
           };
         }
 

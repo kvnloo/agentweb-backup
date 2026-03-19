@@ -94,9 +94,9 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: { 
-    sessionId: string; 
-    message: string; 
+  socket.on('message', async (data: {
+    sessionId: string;
+    message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
@@ -152,7 +152,7 @@ async function createTestAccount() {
 
     // Access the users object from the auth controller
     const users = (global as any).users || {};
-    
+
     // Check if test account already exists
     if (users[TEST_EMAIL]) {
       console.log('Test account already exists');
@@ -213,7 +213,7 @@ const gracefulShutdown = async (signal: string) => {
     } else {
       console.log('HTTP server closed');
     }
-    
+
     // Exit after cleanup
     process.exit(0);
   });
@@ -258,5 +258,42 @@ createTestAccount().then(async () => {
           .catch((error) => console.error('Failed to pre-start worker process:', error));
       })
       .catch((error) => console.error('Failed to initialize Agent Mode Tools:', error));
+
+    // Social Engagement Automation polling
+    // Scanner: finds new posts and queues engagements — runs every 15 minutes
+    // Executor: processes due queued engagement actions — runs every 5 minutes
+    const SCANNER_INTERVAL_MS = 15 * 60 * 1000;   // 15 minutes
+    const EXECUTOR_INTERVAL_MS = 5 * 60 * 1000;    // 5 minutes
+
+    setTimeout(async () => {
+      try {
+        const { SocialEngagementScanner } = await import('./cron/socialEngagementScannerCron');
+        const scanner = new SocialEngagementScanner();
+
+        console.log('[SocialEngagement] Scanner initialized — running first pass...');
+        scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+
+        setInterval(() => {
+          scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+        }, SCANNER_INTERVAL_MS);
+      } catch (error) {
+        console.error('[SocialEngagement] Failed to initialize scanner:', error);
+      }
+
+      try {
+        const { SocialEngagementExecutor } = await import('./cron/socialEngagementExecutor');
+        const executor = new SocialEngagementExecutor();
+
+        console.log('[SocialEngagement] Executor initialized — running first pass...');
+        executor.processQueue().catch(e => console.error('[SocialEngagement] Executor error:', e));
+
+        setInterval(() => {
+          console.log('[SocialEngagement] Executor running...');
+          executor.processQueue().catch(e => console.error('[SocialEngagement] Executor error:', e));
+        }, EXECUTOR_INTERVAL_MS);
+      } catch (error) {
+        console.error('[SocialEngagement] Failed to initialize executor:', error);
+      }
+    }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 
