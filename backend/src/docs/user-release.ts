@@ -1,4 +1,5 @@
 // Define the interface for release notes
+
 export interface UserReleaseNote {
   date: string;
   changes: string[];
