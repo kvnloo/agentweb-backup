@@ -22,6 +22,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Fixed SHA mismatch errors causing cascading failures — the editor now automatically retries once with a fresh SHA when a 409 conflict occurs',
       '- Added 30-second timeouts to all GitHub API calls to prevent sessions from hanging indefinitely',
       '- Error messages now include actionable details (auth errors, conflicts, validation failures) instead of a generic "Failed to process edit request"',
+      'Fix: Landing Page Deploy — v0 Generation Polling',
+      '- Landing page deployments no longer fail when v0 code generation is still in progress',
+      '- Added automatic polling with backoff (up to ~2.5 minutes) instead of failing immediately',
+      '- Previously, the deploy would fail instantly and the AI assistant had to manually retry, wasting multiple tool call iterations',
     ],
   },
   {
