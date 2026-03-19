@@ -168,9 +168,8 @@ export class AgentModeService {
           skill.isBuiltIn = true;
           skill.category = builtin.category as any;
           await skillService.updateSkill(skill);
+          console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
         }
-
-        console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
       }
     } catch (error) {
       console.error('AgentMode: Error ensuring built-in skills:', error);
