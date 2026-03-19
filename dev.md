@@ -1,3 +1,64 @@
+# March 19, 2026: storywithai.info Blog Publishing — GoDaddy Website Builder Investigation
+
+## Context
+
+Customer site `storywithai.info` uses GoDaddy for CMS. Investigated whether we can support GoDaddy API or MCP for automated blog publishing.
+
+## Site Details
+
+- **Platform:** GoDaddy Website Builder 8.0 (Starfield Technologies)
+- **Generator meta tag:** `<meta name="generator" content="Starfield Technologies; Go Daddy Website Builder 8.0.0000"/>`
+- **Site ID:** `137516a9-3722-4cf9-8003-6a1c6c535872`
+- **Blog URL:** `https://storywithai.info/blogs` (50 existing posts)
+- **Read-only feeds:** `/blogs/f.json`, `/blogs/f.rss`, `/blogs/f.atom`
+- **Content CDN:** `img1.wsimg.com/isteam/ip/{siteId}/` (images), `img1.wsimg.com/blobby/go/{siteId}/` (scripts)
+- **Blog server:** DPS/2.0.0 (Digital Publishing System)
+
+## GoDaddy API Investigation
+
+GoDaddy offers 12 REST APIs at `developer.godaddy.com`, **none of which support CMS or blog content management**:
+
+| API | Purpose |
+|-----|---------|
+| Domains | Domain registration, DNS, availability |
+| Certificates | SSL certificate management |
+| Abuse, Aftermarket, Agreements, ANS, Auctions, Countries, Orders, Parking, Shoppers, Subscriptions | Infrastructure/account management |
+
+**Authentication:** API Key + Secret via `Authorization: sso-key [KEY]:[SECRET]` header. Rate limit: 60 req/min.
+
+**Key limitation:** GoDaddy's ToS prohibits commercial use of their API behind a paywall.
+
+## GoDaddy MCP Investigation
+
+- **No CMS/blog MCP exists.** Only domain-related MCPs found.
+- One community MCP (`Harshalkatakiya/godaddy-mcp`) — domain availability checks only, 2 GitHub stars.
+- Nine auto-generated MCP wrappers — all cover registrar APIs (domains, orders, certs), not content.
+- GoDaddy is not listed in the official MCP servers directory.
+
+## Internal API Discovery
+
+GoDaddy Website Builder uses `content.godaddy.com/api` internally:
+- Responds with `"Missing X-App-Key header."` when called without auth
+- CORS headers allow `GET,POST,PUT,PATCH,DELETE` — confirms write operations exist
+- Required headers: `x-app-key`, `authorization`, `x-csrftoken`
+- Requires GoDaddy SSO JWT token — not accessible externally
+- **Undocumented, likely violates GoDaddy ToS.** No one has reverse-engineered it publicly.
+
+## Recommendation
+
+**Browser automation via our agent engine (Playwright)** is the most practical path:
+1. Fits our existing architecture — this is what our platform does
+2. Customer doesn't need to change their site
+3. Log into `websites.godaddy.com`, navigate to blog editor, create/publish posts through UI
+4. Fragile to GoDaddy UI changes, but no better alternative exists for this proprietary CMS
+
+**Alternatives considered:**
+- **Migrate blog to supported CMS** (Webflow/BaseHub/WordPress) — most reliable long-term, but requires customer buy-in and migration effort
+- **Subdomain approach** (`blog.storywithai.info` on supported CMS) — good option since blog already exists at `/blogs`, but changes URL structure
+- **Reverse-engineer internal API** — fragile, undocumented, ToS-violating, not recommended
+
+---
+
 # March 18, 2026: Suspicious Bot Account Signups — No Payment Gate on Registration
 
 ## Accounts Investigated
