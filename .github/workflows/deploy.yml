@@ -1,17 +1,21 @@
 name: Deploy
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    types: [closed]
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - prod
+  schedule:
+    # Run at 7:00 AM UTC (11:00 PM PST) every day
+    - cron: '0 7 * * *'
 
 permissions:
   contents: read
-  pull-requests: read
 
 env:
   AWS_REGION: 'us-west-2'
@@ -20,7 +24,6 @@ jobs:
   detect-changes:
     name: Detect changed projects
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
@@ -35,6 +38,9 @@ jobs:
         uses: dorny/paths-filter@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # For scheduled runs, check changes in the last 24 hours
+          # For manual runs, check recent changes
+          base: ${{ github.event_name == 'schedule' && 'HEAD~10' || 'HEAD~1' }}
           filters: |
             backend:
               - 'backend/**'
@@ -68,15 +74,21 @@ jobs:
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
 
-      - name: Resolve PR number
+      - name: Resolve deployment label suffix
         id: pr-num
         run: |
-          # Extract PR number from merge commit message (e.g. "Merge pull request #123 ...")
-          PR_NUM=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || true)
-          if [ -z "$PR_NUM" ]; then
-            PR_NUM=$(git rev-parse --short HEAD)
+          # For scheduled deployments, use 'scheduled'
+          # For manual deployments, use 'manual'
+          # For PR merges (legacy), extract PR number
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            SUFFIX="scheduled"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SUFFIX="manual"
+          else
+            # Extract PR number from merge commit message (e.g. "Merge pull request #123 ...")
+            SUFFIX=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "$(git rev-parse --short HEAD)")
           fi
-          echo "pr_num=$PR_NUM" >> $GITHUB_OUTPUT
+          echo "pr_num=$SUFFIX" >> $GITHUB_OUTPUT
 
       - name: Copy dev env user-data script into dist
         working-directory: backend
@@ -152,15 +164,21 @@ jobs:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json
 
-      - name: Resolve PR number
+      - name: Resolve deployment label suffix
         id: pr-num
         run: |
-          # Extract PR number from merge commit message (e.g. "Merge pull request #123 ...")
-          PR_NUM=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || true)
-          if [ -z "$PR_NUM" ]; then
-            PR_NUM=$(git rev-parse --short HEAD)
+          # For scheduled deployments, use 'scheduled'
+          # For manual deployments, use 'manual'
+          # For PR merges (legacy), extract PR number
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            SUFFIX="scheduled"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            SUFFIX="manual"
+          else
+            # Extract PR number from merge commit message (e.g. "Merge pull request #123 ...")
+            SUFFIX=$(git log -1 --pretty=%s | grep -oP '#\K[0-9]+' || echo "$(git rev-parse --short HEAD)")
           fi
-          echo "pr_num=$PR_NUM" >> $GITHUB_OUTPUT
+          echo "pr_num=$SUFFIX" >> $GITHUB_OUTPUT
 
       - name: Install dependencies
         working-directory: partner-portal
