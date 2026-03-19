@@ -40,6 +40,7 @@ services:
       - "5174:5174"
     environment:
       - API_URL=http://backend:3001
+      - BROWSER_API_URL=http://${PUBLIC_IP}:3001
     depends_on:
       - backend
     restart: unless-stopped
