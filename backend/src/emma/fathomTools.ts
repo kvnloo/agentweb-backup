@@ -116,16 +116,29 @@ emmaToolRegistry.register({
         headers: { 'Authorization': `Bearer ${accessToken}` },
       });
 
-      const meetings = ((response.data as any) || []).map((m: any) => ({
-        id: m.id,
+      console.log('[fathom_get_meetings] Response type:', typeof response.data, 'isArray:', Array.isArray(response.data), 'keys:', Object.keys(response.data || {}), 'sample:', JSON.stringify(response.data).substring(0, 300));
+
+      // Fathom API returns { items: [...], limit, next_cursor }
+      const rawData = response.data as any;
+      const meetingsArray = Array.isArray(rawData) ? rawData
+        : Array.isArray(rawData?.items) ? rawData.items
+        : Array.isArray(rawData?.calls) ? rawData.calls
+        : Array.isArray(rawData?.meetings) ? rawData.meetings
+        : [];
+
+      const meetings = meetingsArray.map((m: any) => ({
         recording_id: m.recording_id,
-        title: m.title,
+        title: m.title || m.meeting_title,
+        url: m.url || m.share_url,
         created_at: m.created_at,
-        duration_seconds: m.duration_seconds,
-        participants: m.participants || [],
-        summary: m.summary || null,
+        scheduled_start_time: m.scheduled_start_time,
+        recording_start_time: m.recording_start_time,
+        recording_end_time: m.recording_end_time,
+        recorded_by: m.recorded_by?.name || m.recorded_by?.email || null,
+        participants: m.calendar_invitees?.map((i: any) => i.name || i.email) || [],
+        summary: m.default_summary?.short_hand_bullet || m.default_summary || null,
         action_items_count: Array.isArray(m.action_items) ? m.action_items.length : 0,
-        action_items: (m.action_items || []).map((ai: any) => ai.text || ai),
+        action_items: (m.action_items || []).map((ai: any) => ai.text || ai.title || ai),
       }));
 
       return {
