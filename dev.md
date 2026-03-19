@@ -1,3 +1,59 @@
+# March 19, 2026: Investigation — Sessions with 0 Messages
+
+## Context
+
+Production data shows a high ratio of sessions with 0 messages. For example, in a 24-hour window there were ~54 sessions but only ~22 had messages. This investigation identifies the root cause.
+
+## Findings
+
+### Session Creation Flow
+
+1. **Frontend** (`customer-portal/src/pages/AgentMode.tsx:2176-2253`): `createNewSession()` calls `POST /api/agent-mode/sessions` eagerly — on page load when no sessionId is in the URL, or when the user clicks "New Chat".
+
+2. **Backend controller** (`backend/src/controllers/agentModeController.ts:1529-1568`): Creates the session record immediately with `portalType: 'agent'`.
+
+3. **Database layer** (`backend/src/services/chatbotService.ts:455-550`): For Agent Mode sessions (`portalType === "agent"`), the system message is `null`, so the session is created with **`messages: []`** (empty array). Messages are only added later when the user actually sends a message, and they go into the separate `AW-ChatMessages` table.
+
+### Why So Many Empty Sessions
+
+The primary cause is **eager session creation on page load**. Every time a user navigates to `/agent-mode` (or `/agent-mode/new`), a new session is created before they type anything. Common scenarios that produce empty sessions:
+
+- **Page refresh**: User refreshes the Agent Mode page → new session created, old one abandoned
+- **Navigation bounce**: User opens Agent Mode, then navigates away without sending a message
+- **Multiple tabs**: Each tab/window opening Agent Mode creates its own session
+- **URL routing**: When no sessionId is in the URL, the frontend routes to `/agent-mode/new` which triggers `createNewSession()`
+
+Additional creation points that may produce empty sessions:
+- **Admin/GTM Plan** (`backend/src/routes/admin.ts:3558`): Creates sessions for GTM work items
+- **GTM Plan Route** (`backend/src/routes/gtmPlan.ts:1309`): Creates sessions during GTM plan operations
+- **Slack Bot** (`backend/src/routes/slack.ts:230`): Creates sessions on Slack events
+
+### Key Data Points
+
+- `messageCount` on the session record reflects the count of messages in the `AW-ChatMessages` table (separate from the legacy `messages` array on the session itself)
+- Sessions with `messageCount = 0` never had any user or assistant messages sent
+- This is not a data integrity issue — the sessions genuinely have no messages
+
+## Recommended Fix: Lazy Session Creation
+
+**Approach**: Don't create a session until the user sends their first message.
+
+### Frontend Changes (`customer-portal/src/pages/AgentMode.tsx`)
+
+1. When navigating to `/agent-mode/new`, show an empty chat UI without calling `createNewSession()`
+2. On first message send, call `createNewSession()` first, then send the message
+3. The "New Chat" button should reset the UI state locally without creating a backend session
+
+### Backend Changes (minimal)
+
+No backend changes needed — the `POST /api/agent-mode/sessions` endpoint works fine. The change is purely about **when** the frontend calls it.
+
+### Expected Impact
+
+This should reduce empty sessions by ~60% (the ratio seen in production). Sessions created by admin/GTM/Slack flows would still exist but are a much smaller volume.
+
+---
+
 # March 19, 2026: storywithai.info Blog Publishing — GoDaddy Website Builder Investigation
 
 ## Context
