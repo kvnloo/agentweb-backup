@@ -131,6 +131,48 @@ describe('Tier Migration', () => {
       expect(result.freeCount).toBe(1);
     });
 
+    it('assigns Basic tier to trialing users with stripe subscription', async () => {
+      mockScan.mockResolvedValueOnce({
+        Items: [
+          {
+            email: 'trial@test.com',
+            userId: 'u-trial',
+            subscription_status: 'trialing',
+            stripe_subscription_id: 'sub_trial_789',
+          },
+        ],
+        LastEvaluatedKey: undefined,
+      });
+      mockUpdate.mockResolvedValue({});
+
+      const result = await migrateUserTiers();
+
+      expect(result.migrated).toBe(1);
+      expect(result.basicCount).toBe(1);
+      expect(result.freeCount).toBe(0);
+    });
+
+    it('assigns Basic tier to canceling users (period not ended)', async () => {
+      mockScan.mockResolvedValueOnce({
+        Items: [
+          {
+            email: 'canceling@test.com',
+            userId: 'u-canceling',
+            subscription_status: 'canceling',
+            stripe_subscription_id: 'sub_cancel_abc',
+          },
+        ],
+        LastEvaluatedKey: undefined,
+      });
+      mockUpdate.mockResolvedValue({});
+
+      const result = await migrateUserTiers();
+
+      expect(result.migrated).toBe(1);
+      expect(result.basicCount).toBe(1);
+      expect(result.freeCount).toBe(0);
+    });
+
     it('is idempotent — skips users who already have subscriptionType + allowedPages', async () => {
       mockScan.mockResolvedValueOnce({
         Items: [

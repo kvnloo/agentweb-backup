@@ -88,7 +88,7 @@ function determineTier(user: any): string {
   const status = user.subscription_status;
   const hasStripeSubscription = !!user.stripe_subscription_id;
 
-  if (status === 'active' && hasStripeSubscription) return 'Basic';
+  if ((status === 'active' || status === 'trialing' || status === 'canceling') && hasStripeSubscription) return 'Basic';
   if (status === 'canceled' || status === 'past_due') return 'Free';
   // No subscription status at all → Free
   return 'Free';
