@@ -576,9 +576,10 @@ export class AgentModeService {
             const nativeStopReason: string = response.response_metadata?.stopReason || '';
 
             // Extract usage information
+            // response_metadata.usage uses camelCase (inputTokens), usage_metadata uses snake_case (input_tokens)
             const usage = response.response_metadata?.usage || response.usage_metadata || {};
-            const inputTokens = usage.input_tokens || usage.prompt_tokens || 0;
-            const outputTokens = usage.output_tokens || usage.completion_tokens || 0;
+            const inputTokens = usage.inputTokens || usage.input_tokens || usage.prompt_tokens || 0;
+            const outputTokens = usage.outputTokens || usage.output_tokens || usage.completion_tokens || 0;
 
             // Extract text content - handle both string and array formats (Anthropic returns array)
             let messageContent: string = '';
@@ -768,6 +769,27 @@ export class AgentModeService {
 
     // Unreachable, but TypeScript needs it
     throw new Error('callLLM: unexpected code path');
+  }
+
+  /**
+   * Estimate cost in USD for an LLM call based on model pricing.
+   * Prices are per 1M tokens (input/output).
+   */
+  private estimateCost(model: string, inputTokens: number, outputTokens: number): number {
+    // Pricing per 1M tokens: [input, output]
+    const pricing: Record<string, [number, number]> = {
+      'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
+      'anthropic.claude-sonnet-4-6': [3, 15],
+      'anthropic.claude-opus-4-6-v1': [15, 75],
+      'gpt-5-chat-2': [2.5, 10],
+      'gpt-5.2-chat': [3, 12],
+      'gemini-3-pro-preview': [1.25, 10],
+      'gemini-3-flash-preview': [0.15, 0.6],
+      'gemini-3.1-pro-preview': [1.25, 10],
+      'gemini-3.1-flash-lite-preview': [0.075, 0.3],
+    };
+    const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
+    return (inputTokens * inputPrice + outputTokens * outputPrice) / 1_000_000;
   }
 
   // Generate AI response for marketing conversation
@@ -1064,6 +1086,17 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+
+        // Attach token usage from the LLM response to the message
+        const responseUsage = response.usage;
+        if (responseUsage) {
+          responseMessage.usage = {
+            prompt_tokens: responseUsage.prompt_tokens || 0,
+            completion_tokens: responseUsage.completion_tokens || 0,
+            total_tokens: responseUsage.total_tokens || 0,
+            estimated_cost: this.estimateCost(llmModel, responseUsage.prompt_tokens || 0, responseUsage.completion_tokens || 0),
+          };
+        }
 
         // Append the model's message to conversation before handling tool calls
         (messages as any[]).push(responseMessage);

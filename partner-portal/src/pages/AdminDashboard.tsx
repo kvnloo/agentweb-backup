@@ -167,6 +167,12 @@ interface AdminChatSession {
   title?: string;
   llmModel?: string;
   messageCount?: number;
+  totalTokens?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  totalCost?: number;
   satisfactionScore?: {
     score: number;
     reason: string;
@@ -4755,6 +4761,7 @@ export default function AdminDashboard() {
                   <TableCell>Created At</TableCell>
                   <TableCell>Updated At</TableCell>
                   <TableCell>Message Count</TableCell>
+                  <TableCell>Tokens / Cost</TableCell>
                   <TableCell>Longest Wait</TableCell>
                   <TableCell>Max Heap</TableCell>
                   <TableCell>Feedback</TableCell>
@@ -4765,7 +4772,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {chatSessionsLoading && chatSessions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={14} align="center">
+                    <TableCell colSpan={15} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -4891,6 +4898,25 @@ export default function AdminDashboard() {
                             color="primary"
                             size="small"
                           />
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            if (!session.totalTokens && session.totalCost == null) {
+                              return <span style={{ color: '#999' }}>-</span>;
+                            }
+                            const tokens = session.totalTokens?.total_tokens || 0;
+                            const cost = session.totalCost || 0;
+                            const tokenLabel = tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(1)}M` : tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}K` : `${tokens}`;
+                            const costLabel = cost >= 1 ? `$${cost.toFixed(2)}` : `$${cost.toFixed(4)}`;
+                            const costColor = cost > 1 ? '#d32f2f' : cost > 0.1 ? '#ed6c02' : '#666';
+                            return (
+                              <Tooltip title={`Input: ${(session.totalTokens?.prompt_tokens || 0).toLocaleString()} | Output: ${(session.totalTokens?.completion_tokens || 0).toLocaleString()} | Total: ${tokens.toLocaleString()} tokens | Cost: ${costLabel}`}>
+                                <span style={{ color: costColor, fontSize: '0.85rem' }}>
+                                  {tokenLabel} / {costLabel}
+                                </span>
+                              </Tooltip>
+                            );
+                          })()}
                         </TableCell>
                         <TableCell>
                           {(() => {
@@ -5084,7 +5110,7 @@ export default function AdminDashboard() {
                     ))}
                     {chatSessionsLoading && (
                       <TableRow>
-                        <TableCell colSpan={11} align="center">
+                        <TableCell colSpan={15} align="center">
                           <CircularProgress size={24} />
                         </TableCell>
                       </TableRow>
