@@ -174,15 +174,37 @@ export interface User {
     };
     /** Per-account automated engagement settings (inline on the account) */
     engagementSettings?: {
-      autoEngagement: boolean;
-      /** Which actions this account's posts can receive from other participants */
+      // POST ENGAGEMENT — OWNER ROLE
+      /** Allow others to engage on my posts */
+      enablePostDiscovery: boolean;
+      /** Which actions this account's posts can receive from other engagers */
       preferredActions: ('like' | 'comment')[];
       /** Incoming cap: max likes this account's posts can receive per post */
       maxLikesPerPost: number;
-      /** Incoming cap: max comments this account's posts can receive per post (only relevant when 'comment' in preferredActions) */
+      /** Incoming cap: max comments this account's posts can receive per post */
       maxCommentsPerPost: number;
       /** Spread engagements randomly within this window (minutes) */
       engagementWindowMinutes: number;
+
+      // POST ENGAGEMENT — ENGAGER ROLE
+      /** Allow this account to engage on others' posts */
+      enableAsPostEngager: boolean;
+
+      // COMMENT ENGAGEMENT — OWNER ROLE
+      /** Allow others to engage on comments on my posts */
+      enableCommentDiscovery: boolean;
+      /** Which actions others can take on comments on my posts */
+      commentPreferredActions: ('like' | 'reply')[];
+      /** Max likes each comment on my posts can receive */
+      maxCommentLikesPerPost: number;
+      /** Max replies each comment on my posts can receive */
+      maxCommentRepliesPerPost: number;
+      /** Spread comment engagements randomly within this window (minutes) */
+      commentEngagementWindowMinutes: number;
+
+      // COMMENT ENGAGEMENT — ENGAGER ROLE
+      /** Allow this account to engage on others' post comments */
+      enableAsCommentEngager: boolean;
     };
     created_at: string;
     updated_at: string;
@@ -4830,20 +4852,23 @@ export const accountMemoryDb = {
 export const socialEngagementTrackingDb = {
   async recordEngagement(tracker: {
     userId: string;
-    targetPostUrn: string;
+    postId: string;
+    platform: string;
     ownerAccountId: string;
     engagingAccountId: string;
     actionType: string;
-    scheduledAt: string;
+    scheduleId: string;
+    status: 'completed' | 'failed';
+    executedAt: string;
+    commentText?: string;
   }) {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Item: {
           ...tracker,
-          // Composite sort key: unique per (post, engager)
-          // Note: using 'targetPostUrn_booster' name to match existing DynamoDB schema
-          targetPostUrn_booster: `${tracker.targetPostUrn}#${tracker.engagingAccountId}`,
+          // Composite sort key: unique per (post, engager) — used for dedup check
+          postId_engagingAccountId: `${tracker.postId}#${tracker.engagingAccountId}`,
           createdAt: new Date().toISOString()
         },
       };
@@ -4856,14 +4881,14 @@ export const socialEngagementTrackingDb = {
     }
   },
 
-  async hasEngaged(userId: string, targetPostUrn: string, engagingAccountId: string): Promise<boolean> {
+  async hasEngaged(userId: string, postId: string, engagingAccountId: string): Promise<boolean> {
     try {
       const params = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
-        KeyConditionExpression: "userId = :userId AND targetPostUrn_booster = :targetPostUrn_booster",
+        KeyConditionExpression: "userId = :userId AND postId_engagingAccountId = :postId_engagingAccountId",
         ExpressionAttributeValues: {
           ":userId": userId,
-          ":targetPostUrn_booster": `${targetPostUrn}#${engagingAccountId}`
+          ":postId_engagingAccountId": `${postId}#${engagingAccountId}`
         }
       };
 
@@ -4873,5 +4898,59 @@ export const socialEngagementTrackingDb = {
       handleDynamoDbError(error, "hasEngaged");
       return false;
     }
-  }
+  },
+
+  // Query all engagement activity for a specific account (account-wise view)
+  async getEngagementsByAccount(engagingAccountId: string, options: { from?: string; to?: string } = {}): Promise<any[]> {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        IndexName: 'EngagingAccountIndex',
+        KeyConditionExpression: 'engagingAccountId = :engagingAccountId' + (options.from ? ' AND executedAt >= :from' : ''),
+        ExpressionAttributeValues: {
+          ':engagingAccountId': engagingAccountId,
+          ...(options.from && { ':from': options.from }),
+        },
+      };
+
+      if (options.to) {
+        params.KeyConditionExpression = 'engagingAccountId = :engagingAccountId AND executedAt BETWEEN :from AND :to';
+        params.ExpressionAttributeValues![':from'] = options.from || '0';
+        params.ExpressionAttributeValues![':to'] = options.to;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getEngagementsByAccount');
+      throw error;
+    }
+  },
+
+  // Query all accounts that engaged with a specific post (post-wise view)
+  async getEngagementsByPost(postId: string, options: { from?: string; to?: string } = {}): Promise<any[]> {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        IndexName: 'PostEngagementIndex',
+        KeyConditionExpression: 'postId = :postId' + (options.from ? ' AND executedAt >= :from' : ''),
+        ExpressionAttributeValues: {
+          ':postId': postId,
+          ...(options.from && { ':from': options.from }),
+        },
+      };
+
+      if (options.to) {
+        params.KeyConditionExpression = 'postId = :postId AND executedAt BETWEEN :from AND :to';
+        params.ExpressionAttributeValues![':from'] = options.from || '0';
+        params.ExpressionAttributeValues![':to'] = options.to;
+      }
+
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getEngagementsByPost');
+      throw error;
+    }
+  },
 };

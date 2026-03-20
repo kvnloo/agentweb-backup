@@ -1,11 +1,28 @@
 import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
+import { agentModeService } from '../services/agentModeService';
+
+const COMMENT_MODEL = 'gemini-2.0-flash';
+
+const POST_COMMENT_SYSTEM_PROMPT = `You are a professional social media engagement assistant.
+Write a thoughtful, genuine 1-2 sentence comment on the following LinkedIn post.
+Avoid generic phrases like "Great post!" or "Totally agree!".
+Return ONLY the comment text, no quotes or explanation.`;
+
+const COMMENT_REPLY_SYSTEM_PROMPT = `You are a professional social media engagement assistant.
+Write a genuine, concise reply to the following comment on a LinkedIn post.
+The reply should add value or acknowledge the comment naturally.
+Return ONLY the reply text, no quotes or explanation.`;
+
+function getLinkedInAdapter(): LinkedInAdapter {
+    return new LinkedInAdapter();
+}
 
 /**
  * Processes all due social engagement actions from the scheduleDb queue.
- * For each action, it builds a prompt and fires a headless chat session via
- * the existing `runScheduledChat` mechanism in agentModeController.
+ * Executes directly via LinkedIn adapter + optional LLM for comment generation.
+ * No Emma / runScheduledChat involved.
  */
 export class SocialEngagementExecutor {
     public async processQueue() {
@@ -34,133 +51,218 @@ export class SocialEngagementExecutor {
 
     private async processAction(action: any) {
         const { userId, variableValues, scheduleId } = action;
-        const { targetPostUrn, ownerAccountId, engagingAccountId, actionType } = variableValues || {};
+        const { postId, commentId, platform, ownerAccountId, engagingAccountId, engagingUserId, actionType, targetType } = variableValues || {};
 
         console.log(`\n[Executor] ════ Processing action ${scheduleId} ════`);
-        console.log(`[Executor] User: ${userId}`);
-        console.log(`[Executor] Target post: ${targetPostUrn}`);
-        console.log(`[Executor] Owner account: ${ownerAccountId}`);
-        console.log(`[Executor] Engaging account: ${engagingAccountId}`);
-        console.log(`[Executor] Action type: ${actionType}`);
+        console.log(`[Executor] Action: ${actionType} | Target: ${targetType || 'post'} | Platform: ${platform}`);
 
-        if (!userId || !targetPostUrn || !engagingAccountId) {
+        if (!postId || !platform || !engagingAccountId) {
             console.warn(`[Executor] Skipping invalid action ${scheduleId}: missing required fields.`);
             await this.markActionDone(scheduleId);
             return;
         }
 
-        // 1. Load user and find the engaging connected account
-        const user = await userDb.getUserById(userId);
-        if (!user || !user.connected_accounts) {
-            console.warn(`[Executor] User ${userId} not found or has no connected accounts.`);
+        // Resolve which user owns the engaging account
+        // engagingUserId is set by the scanner for cross-user engagements; fall back to action.userId
+        const engagingOwnerId = engagingUserId || userId;
+
+        const engagingUser = await userDb.getUserById(engagingOwnerId);
+        if (!engagingUser || !engagingUser.connected_accounts) {
+            console.warn(`[Executor] Engaging user ${engagingOwnerId} not found or has no connected accounts.`);
             await this.markActionDone(scheduleId);
             return;
         }
 
-        const engagingConnection = user.connected_accounts.find(
-            (c: ConnectedAccount) => c.account_id === engagingAccountId && c.platform === 'linkedin'
+        const engagingConnection = engagingUser.connected_accounts.find(
+            (c: ConnectedAccount) => c.account_id === engagingAccountId && c.platform === platform
         );
 
         if (!engagingConnection) {
-            console.warn(`[Executor] Engaging account ${engagingAccountId} not found in connected LinkedIn accounts for user ${userId}.`);
-            console.warn(`[Executor] Available accounts: ${user.connected_accounts.filter((c: ConnectedAccount) => c.platform === 'linkedin').map((c: ConnectedAccount) => c.account_id).join(', ')}`);
+            console.warn(`[Executor] Engaging account ${engagingAccountId} not found for user ${engagingOwnerId}.`);
             await this.markActionDone(scheduleId);
             return;
         }
 
-        console.log(`[Executor] Found engaging connection: "${engagingConnection.account_name}" (${engagingAccountId})`);
+        console.log(`[Executor] Engaging as: "${engagingConnection.account_name}" (${engagingAccountId})`);
 
-        // 2. Find the owner account connection to fetch post content
-        //    Fall back to the engaging account if owner account not found
-        const ownerConnection = ownerAccountId
-            ? user.connected_accounts.find(
-                (c: ConnectedAccount) => c.account_id === ownerAccountId && c.platform === 'linkedin'
-            ) || engagingConnection
-            : engagingConnection;
+        const adapter = getLinkedInAdapter();
+        let success = false;
+        let errorMsg: string | undefined;
 
-        console.log(`[Executor] Fetching post content via account: "${ownerConnection.account_name}"`);
-
-        // 3. Fetch the target post to give Emma context
-        let postContent = '[Post content unavailable]';
         try {
-            const adapter = new LinkedInAdapter();
-            const posts = await adapter.listPosts(ownerConnection, { limit: 20 }, userId);
-            const post = posts.find((p: any) => (p.id || p.urn) === targetPostUrn);
-            if (post) {
-                postContent = post.commentary || post.content || post.text || '[No text content]';
-                console.log(`[Executor] Found post – content preview: "${postContent.slice(0, 100)}..."`);
+            if (targetType === 'comment') {
+                await this.executeCommentAction(
+                    adapter, engagingConnection, engagingOwnerId, postId, commentId, actionType
+                );
             } else {
-                console.warn(`[Executor] Could not find post ${targetPostUrn} in the last ${posts.length} posts. Proceeding without post text.`);
+                // Default: post engagement
+                await this.executePostAction(
+                    adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType
+                );
             }
-        } catch (error) {
-            console.warn(`[Executor] Could not fetch post content for ${targetPostUrn}:`, error);
+            success = true;
+            console.log(`[Executor] Action ${scheduleId} completed successfully.`);
+        } catch (err: any) {
+            errorMsg = err?.message || String(err);
+            console.error(`[Executor] Action ${scheduleId} failed:`, errorMsg);
         }
 
-        // 4. Build the Emma prompt based on actionType
-        const engagingName = engagingConnection.account_name || engagingAccountId;
-        const doComment = actionType === 'comment_and_like' || actionType === 'comment';
-        const doLike = actionType === 'comment_and_like' || actionType === 'like';
-
-        let taskLines: string[] = [];
-        if (doComment) {
-            taskLines.push(`- Write a professional, thoughtful 1-2 sentence comment that adds genuine value. Avoid clichés like "Great post!" or "Absolutely!". The comment should feel natural and insightful based on the post content.`);
-            taskLines.push(`- Post the comment on the post (URN: ${targetPostUrn}) using account "${engagingAccountId}".`);
-        }
-        if (doLike) {
-            taskLines.push(`- "LIKE" the post (URN: ${targetPostUrn}) using account "${engagingAccountId}".`);
-        }
-
-        const prompt = `You are an automated social engagement assistant. Your job is to engage with a LinkedIn post using the account "${engagingName}" (account_id: "${engagingAccountId}").
-
-Here is the LinkedIn post to engage with:
-
-POST URN: ${targetPostUrn}
-CONTENT:
-${postContent}
-
-Task:
-${taskLines.join('\n')}
-
-Do this now without asking for confirmation.`;
-
-        console.log(`[Executor] Action: ${actionType.toUpperCase()}`);
-        console.log(`[Executor] Prompt preview:\n${prompt.slice(0, 300)}...`);
-
-        // 5. Fire it as a scheduled chat using the existing infrastructure
-        const scheduleForEmma = {
-            ...action,
-            type: 'scheduled_chat',
-            startingMessage: prompt,
-            scheduleName: `Social Engagement – ${targetPostUrn.slice(-12)} via ${engagingName}`,
-            taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
-            variables: [],
-            variableValues: {},
-            requiredFunctionCalls: [],
-            keywords: [],
-        };
-
-        console.log(`[Executor] ▶ Handing off to Emma (runScheduledChat)...`);
-        const { runScheduledChat } = await import('../controllers/agentModeController') as any;
-        const result = await runScheduledChat(scheduleForEmma, userId, false);
-
-        // 6. Log full result for debugging
-        console.log(`[Executor] ◀ Emma finished.`);
-        console.log(`[Executor] ── Session ID: ${result?.sessionId || '(none)'}`);
-        console.log(`[Executor] ── Status: ${result?.status}`);
-        console.log(`[Executor] ── Passed: ${result?.passed}`);
-        console.log(`[Executor] ── Attempts: ${result?.attempt}`);
-        console.log(`[Executor] ── Tool calls made: [${(result?.actualFunctionCalls || []).join(', ')}]`);
-        if (result?.functionCallMisses?.length > 0) {
-            console.warn(`[Executor] ── Missing expected tool calls: [${result.functionCallMisses.join(', ')}]`);
-        }
-        if (!result?.passed && result?.actualResponse) {
-            console.warn(`[Executor] ── Emma response (first 500 chars): ${result.actualResponse?.slice(0, 500)}`);
+        // Record engagement outcome
+        const trackingId = targetType === 'comment' ? commentId : postId;
+        if (trackingId) {
+            try {
+                await socialEngagementTrackingDb.recordEngagement({
+                    userId,
+                    postId: trackingId,
+                    platform,
+                    ownerAccountId: ownerAccountId || '',
+                    engagingAccountId,
+                    actionType,
+                    scheduleId,
+                    status: success ? 'completed' : 'failed',
+                    executedAt: new Date().toISOString(),
+                });
+            } catch (trackErr) {
+                console.warn(`[Executor] Could not record engagement tracking:`, trackErr);
+            }
         }
 
-        // 7. Mark the action as done
         await this.markActionDone(scheduleId);
-        console.log(`[Executor] ════ Action ${scheduleId} complete ════\n`);
+        console.log(`[Executor] ════ Action ${scheduleId} done ════\n`);
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // POST ENGAGEMENT
+    // ────────────────────────────────────────────────────────────────────────────
+
+    private async executePostAction(
+        adapter: LinkedInAdapter,
+        engagingConnection: ConnectedAccount,
+        engagingUserId: string,
+        ownerAccountId: string | undefined,
+        ownerUserId: string,
+        postId: string,
+        actionType: string
+    ) {
+        const doLike = actionType === 'like' || actionType === 'comment_and_like';
+        const doComment = actionType === 'comment' || actionType === 'comment_and_like';
+
+        if (doComment) {
+            const postContent = await this.fetchPostContent(adapter, engagingConnection, engagingUserId, ownerAccountId, ownerUserId, postId);
+            const commentText = await this.generatePostComment(postContent);
+            console.log(`[Executor] Generated comment: "${commentText.slice(0, 100)}..."`);
+            await adapter.createComment(engagingConnection, postId, commentText, engagingUserId);
+            console.log(`[Executor] Comment posted on post ${postId}`);
+        }
+
+        if (doLike) {
+            await adapter.createReaction(engagingConnection, postId, 'LIKE', engagingUserId);
+            console.log(`[Executor] Liked post ${postId}`);
+        }
+    }
+
+    private async fetchPostContent(
+        adapter: LinkedInAdapter,
+        engagingConnection: ConnectedAccount,
+        engagingUserId: string,
+        ownerAccountId: string | undefined,
+        ownerUserId: string,
+        postId: string
+    ): Promise<string> {
+        try {
+            // Try to fetch with owner's account if available, otherwise use engager
+            let fetchConnection = engagingConnection;
+            if (ownerAccountId && ownerAccountId !== engagingConnection.account_id) {
+                const ownerUser = await userDb.getUserById(ownerUserId);
+                const ownerConn = ownerUser?.connected_accounts?.find(
+                    (c: ConnectedAccount) => c.account_id === ownerAccountId
+                );
+                if (ownerConn) fetchConnection = ownerConn;
+            }
+
+            const posts = await adapter.listPosts(fetchConnection, { limit: 20 }, engagingUserId);
+            const post = posts.find((p: any) => (p.id || p.urn) === postId);
+            if (post) {
+                return post.commentary || post.content || post.text || '[No text content]';
+            }
+        } catch (err) {
+            console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
+        }
+        return '[Post content unavailable]';
+    }
+
+    private async generatePostComment(postContent: string): Promise<string> {
+        try {
+            const geminiClient = await agentModeService.getGeminiClient();
+            const completion = await geminiClient.chat.completions.create({
+                model: COMMENT_MODEL,
+                messages: [
+                    { role: 'system', content: POST_COMMENT_SYSTEM_PROMPT },
+                    { role: 'user', content: `Post content: ${postContent}` },
+                ],
+                temperature: 0.8,
+            });
+            const text = completion.choices[0]?.message?.content?.trim();
+            if (text) return text;
+        } catch (err) {
+            console.warn(`[Executor] LLM comment generation failed:`, err);
+        }
+        return 'Great insights! Thanks for sharing.';
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // COMMENT ENGAGEMENT
+    // ────────────────────────────────────────────────────────────────────────────
+
+    private async executeCommentAction(
+        adapter: LinkedInAdapter,
+        engagingConnection: ConnectedAccount,
+        engagingUserId: string,
+        postId: string,
+        commentId: string | undefined,
+        actionType: string
+    ) {
+        if (!commentId) {
+            throw new Error('commentId is required for comment engagement actions');
+        }
+
+        const doLike = actionType === 'like_comment' || actionType === 'like_and_reply_comment';
+        const doReply = actionType === 'reply_comment' || actionType === 'like_and_reply_comment';
+
+        if (doReply) {
+            const replyText = await this.generateCommentReply(commentId);
+            console.log(`[Executor] Generated reply: "${replyText.slice(0, 100)}..."`);
+            // createComment with parentCommentUrn posts a reply
+            await adapter.createComment(engagingConnection, postId, replyText, engagingUserId, commentId);
+            console.log(`[Executor] Reply posted on comment ${commentId}`);
+        }
+
+        if (doLike) {
+            await adapter.createReaction(engagingConnection, commentId, 'LIKE', engagingUserId);
+            console.log(`[Executor] Liked comment ${commentId}`);
+        }
+    }
+
+    private async generateCommentReply(commentUrn: string): Promise<string> {
+        try {
+            const geminiClient = await agentModeService.getGeminiClient();
+            const completion = await geminiClient.chat.completions.create({
+                model: COMMENT_MODEL,
+                messages: [
+                    { role: 'system', content: COMMENT_REPLY_SYSTEM_PROMPT },
+                    { role: 'user', content: `Comment URN to reply to: ${commentUrn}` },
+                ],
+                temperature: 0.8,
+            });
+            const text = completion.choices[0]?.message?.content?.trim();
+            if (text) return text;
+        } catch (err) {
+            console.warn(`[Executor] LLM reply generation failed:`, err);
+        }
+        return 'Thank you for your perspective!';
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
 
     private async markActionDone(scheduleId: string) {
         try {

@@ -55,7 +55,8 @@ router.get('/social-posts/config', authenticateToken, async (req: Request, res: 
 });
 
 // ─── PUT save engagement settings for a single account ──────────────────────────────────────────
-// Body: { accountId: string, engagementSettings: { autoEngagement, preferredActions, maxLikesPerPost, maxCommentsPerPost, engagementWindowMinutes } }
+// Body: { accountId: string, engagementSettings: { ... } }
+// Backward compat: if body contains autoEngagement: true, treat as enablePostDiscovery + enableAsPostEngager = true
 router.put('/social-posts/config', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as AuthenticatedRequest).user?.userId;
@@ -71,28 +72,58 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
       return res.status(400).json({ error: 'engagementSettings is required' });
     }
 
-    const { autoEngagement, preferredActions, maxLikesPerPost, maxCommentsPerPost, engagementWindowMinutes } = engagementSettings;
-
-    // Validate preferredActions
-    if (!Array.isArray(preferredActions) || preferredActions.length === 0) {
-      return res.status(400).json({ error: 'preferredActions must be a non-empty array of "like" and/or "comment"' });
-    }
-    const validActions = ['like', 'comment'];
-    const invalidActions = preferredActions.filter((a: any) => !validActions.includes(a));
-    if (invalidActions.length > 0) {
-      return res.status(400).json({ error: `Invalid preferredActions values: ${invalidActions.join(', ')}` });
+    // Backward compat: legacy autoEngagement boolean
+    let normalised = { ...engagementSettings };
+    if (typeof normalised.autoEngagement === 'boolean') {
+      if (normalised.autoEngagement) {
+        normalised.enablePostDiscovery = true;
+        normalised.enableAsPostEngager = true;
+      }
+      delete normalised.autoEngagement;
     }
 
-    // Validate numeric fields
-    if (typeof maxLikesPerPost !== 'number' || maxLikesPerPost < 0) {
-      return res.status(400).json({ error: 'maxLikesPerPost must be a non-negative number' });
+    const {
+      enablePostDiscovery,
+      preferredActions,
+      maxLikesPerPost,
+      maxCommentsPerPost,
+      engagementWindowMinutes,
+      enableAsPostEngager,
+      enableCommentDiscovery,
+      commentPreferredActions,
+      maxCommentLikesPerPost,
+      maxCommentRepliesPerPost,
+      commentEngagementWindowMinutes,
+      enableAsCommentEngager,
+    } = normalised;
+
+    // Validate post preferredActions (required when enabling post discovery)
+    const resolvedPreferredActions = Array.isArray(preferredActions) && preferredActions.length > 0
+      ? preferredActions
+      : ['like'];
+    const validPostActions = ['like', 'comment'];
+    const invalidPostActions = resolvedPreferredActions.filter((a: any) => !validPostActions.includes(a));
+    if (invalidPostActions.length > 0) {
+      return res.status(400).json({ error: `Invalid preferredActions values: ${invalidPostActions.join(', ')}` });
     }
-    if (typeof maxCommentsPerPost !== 'number' || maxCommentsPerPost < 0) {
-      return res.status(400).json({ error: 'maxCommentsPerPost must be a non-negative number' });
+
+    // Validate comment preferredActions
+    const resolvedCommentActions = Array.isArray(commentPreferredActions) && commentPreferredActions.length > 0
+      ? commentPreferredActions
+      : ['like'];
+    const validCommentActions = ['like', 'reply'];
+    const invalidCommentActions = resolvedCommentActions.filter((a: any) => !validCommentActions.includes(a));
+    if (invalidCommentActions.length > 0) {
+      return res.status(400).json({ error: `Invalid commentPreferredActions values: ${invalidCommentActions.join(', ')}` });
     }
-    if (typeof engagementWindowMinutes !== 'number' || engagementWindowMinutes < 1) {
-      return res.status(400).json({ error: 'engagementWindowMinutes must be at least 1' });
-    }
+
+    // Validate numeric fields (default to safe values if not provided)
+    const resolvedMaxLikes = typeof maxLikesPerPost === 'number' && maxLikesPerPost >= 0 ? maxLikesPerPost : 5;
+    const resolvedMaxComments = typeof maxCommentsPerPost === 'number' && maxCommentsPerPost >= 0 ? maxCommentsPerPost : 3;
+    const resolvedWindow = typeof engagementWindowMinutes === 'number' && engagementWindowMinutes >= 1 ? engagementWindowMinutes : 60;
+    const resolvedMaxCommentLikes = typeof maxCommentLikesPerPost === 'number' && maxCommentLikesPerPost >= 0 ? maxCommentLikesPerPost : 3;
+    const resolvedMaxCommentReplies = typeof maxCommentRepliesPerPost === 'number' && maxCommentRepliesPerPost >= 0 ? maxCommentRepliesPerPost : 2;
+    const resolvedCommentWindow = typeof commentEngagementWindowMinutes === 'number' && commentEngagementWindowMinutes >= 1 ? commentEngagementWindowMinutes : 60;
 
     // Load user to find the account and update it in-place
     const user = await userDb.getUserById(userId);
@@ -110,13 +141,18 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
       return {
         ...a,
         engagementSettings: {
-          autoEngagement: !!autoEngagement,
-          preferredActions,
-          maxLikesPerPost,
-          // Store maxCommentsPerPost even if not used (easier to preserve);
-          // scanner ignores it when 'comment' not in preferredActions
-          maxCommentsPerPost,
-          engagementWindowMinutes,
+          enablePostDiscovery: !!enablePostDiscovery,
+          preferredActions: resolvedPreferredActions,
+          maxLikesPerPost: resolvedMaxLikes,
+          maxCommentsPerPost: resolvedMaxComments,
+          engagementWindowMinutes: resolvedWindow,
+          enableAsPostEngager: !!enableAsPostEngager,
+          enableCommentDiscovery: !!enableCommentDiscovery,
+          commentPreferredActions: resolvedCommentActions,
+          maxCommentLikesPerPost: resolvedMaxCommentLikes,
+          maxCommentRepliesPerPost: resolvedMaxCommentReplies,
+          commentEngagementWindowMinutes: resolvedCommentWindow,
+          enableAsCommentEngager: !!enableAsCommentEngager,
         },
       };
     });

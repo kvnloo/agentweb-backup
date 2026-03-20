@@ -1545,11 +1545,32 @@ const createSocialEngagementTrackingTable = async () => {
     TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
     AttributeDefinitions: [
       { AttributeName: 'userId', AttributeType: 'S' },
-      { AttributeName: 'targetPostUrn_booster', AttributeType: 'S' }
+      { AttributeName: 'postId_engagingAccountId', AttributeType: 'S' },
+      { AttributeName: 'engagingAccountId', AttributeType: 'S' },
+      { AttributeName: 'postId', AttributeType: 'S' },
+      { AttributeName: 'executedAt', AttributeType: 'S' }
     ],
     KeySchema: [
       { AttributeName: 'userId', KeyType: 'HASH' },
-      { AttributeName: 'targetPostUrn_booster', KeyType: 'RANGE' }
+      { AttributeName: 'postId_engagingAccountId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'EngagingAccountIndex',
+        KeySchema: [
+          { AttributeName: 'engagingAccountId', KeyType: 'HASH' },
+          { AttributeName: 'executedAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      },
+      {
+        IndexName: 'PostEngagementIndex',
+        KeySchema: [
+          { AttributeName: 'postId', KeyType: 'HASH' },
+          { AttributeName: 'executedAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      }
     ],
     BillingMode: 'PAY_PER_REQUEST'
   };
