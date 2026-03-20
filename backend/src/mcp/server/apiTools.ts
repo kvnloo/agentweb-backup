@@ -1179,7 +1179,7 @@ mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
-    description: 'Edit a specific file in a deployed landing page\'s GitHub repository. Use this when the user wants to change copy, styling, or functionality after deployment. Changes auto-deploy via Vercel within ~30 seconds.',
+    description: '[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1204,7 +1204,7 @@ mcpToolRegistry.register({
   name: 'list_landing_page_files',
   definition: {
     name: 'list_landing_page_files',
-    description: 'List all files in a deployed landing page\'s GitHub repository. Use this BEFORE edit_landing_page_file to see what files exist and find the right file to edit.',
+    description: 'List all files in a deployed landing page\'s GitHub repository. Use this to see what files exist. Note: for code edits, prefer using coding_agent which handles file listing internally.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1225,7 +1225,7 @@ mcpToolRegistry.register({
   name: 'read_landing_page_file',
   definition: {
     name: 'read_landing_page_file',
-    description: 'Read the contents of a specific file in a deployed landing page\'s GitHub repository. Use this to see the current code before making edits with edit_landing_page_file.',
+    description: 'Read the contents of a specific file in a deployed landing page\'s GitHub repository. Note: for code edits, prefer using coding_agent which handles file reading and editing internally.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1247,7 +1247,7 @@ mcpToolRegistry.register({
   name: 'get_deployment_status',
   definition: {
     name: 'get_deployment_status',
-    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. If the build failed, returns the error details so you can fix the code via edit_landing_page_file and the build will automatically retry.',
+    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits.',
     inputSchema: {
       type: 'object',
       properties: {

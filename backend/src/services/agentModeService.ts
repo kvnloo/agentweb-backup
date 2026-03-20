@@ -2144,7 +2144,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
     // Meeting Intelligence (Fathom)
     'fathom_get_meetings',
-    'fathom_get_transcript'
+    'fathom_get_transcript',
+
+    // Coding Agent (sub-agent for code editing tasks)
+    'coding_agent'
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.

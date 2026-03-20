@@ -10,6 +10,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-20',
     changes: [
+      'Feature: Emma — Coding Agent for Landing Page Editing',
+      '- Emma now delegates code editing tasks to a specialized coding agent that runs autonomously',
+      '- The coding agent uses diff-based editing (search/replace) instead of full file rewrites, solving the issue where large files (35KB+) could not be edited',
+      '- Workflow: reads files, makes incremental edits, checks Vercel deployment status, and iterates on build errors automatically',
+      '- Always uses Claude Opus 4.6 for maximum code quality regardless of the chat model selected',
+      '- Includes safety protections: 10-minute timeout, context window trimming, and tool result truncation',
+      '- The old edit_landing_page_file tool is deprecated in favor of the new coding agent',
       'Fix: Scheduled Chats — Configured Model Now Respected',
       '- Scheduled chats with an explicitly configured AI model (e.g. Claude) no longer get overridden by task-type defaults (e.g. the image generation default model)',
       '- Previously, if a scheduled chat required generate_image, update_html_file, or generate_video, the system would silently switch to the task-type default model, ignoring the user\'s configured model',
