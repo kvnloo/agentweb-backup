@@ -246,6 +246,16 @@ export class AgentModeService {
   public async initializeMcp() {
     if ((AgentModeService as any).mcpInitialized) {
       console.log('[MCP-DEBUG] MCP already initialized, skipping');
+      // Still register MCP tools in this instance's toolRegistry
+      // (the MCP client was initialized by a prior instance)
+      if ((AgentModeService as any).sharedMcpClientService) {
+        const mcpTools = (AgentModeService as any).sharedMcpClientService.getTools();
+        for (const tool of mcpTools) {
+          if (!this.toolRegistry.getTool(tool.name)) {
+            this.toolRegistry.register(tool);
+          }
+        }
+      }
       return;
     }
     (AgentModeService as any).mcpInitialized = true;
@@ -253,6 +263,7 @@ export class AgentModeService {
     try {
       console.log('[MCP-DEBUG] Initializing MCP client service...');
       await this.mcpClientService.initialize();
+      (AgentModeService as any).sharedMcpClientService = this.mcpClientService;
       const mcpTools = this.mcpClientService.getTools();
       for (const tool of mcpTools) {
         this.toolRegistry.register(tool);

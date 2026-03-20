@@ -3544,6 +3544,7 @@ export async function generateChatResponse(
           'read_page_source',
           'get_visual_context',
           'enrich_leads_preview', 'enrich_leads_execute',
+          'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
         ];
 
         // Page-aware tool injection based on the current page URL

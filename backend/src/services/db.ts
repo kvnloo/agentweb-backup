@@ -4649,6 +4649,55 @@ type MemoryCategory = typeof VALID_MEMORY_CATEGORIES[number];
 
 const ACCOUNT_MEMORY_TABLE = `${TABLE_PREFIX}AW-AccountMemory`;
 
+// Browser Cookies table
+const BROWSER_COOKIES_TABLE = `${TABLE_PREFIX}AW-BrowserCookies`;
+
+export const browserCookieDb = {
+  async saveCookies(userId: string, cookies: any[]): Promise<void> {
+    const now = new Date().toISOString();
+    try {
+      await dynamodb.put({
+        TableName: BROWSER_COOKIES_TABLE,
+        Item: {
+          userId,
+          domain: '__all__',
+          cookies,
+          updatedAt: now,
+          createdAt: now,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'saveBrowserCookies');
+      throw error;
+    }
+  },
+
+  async getCookies(userId: string): Promise<any[] | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain: '__all__' },
+      }).promise();
+      return result.Item?.cookies || null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getBrowserCookies');
+      throw error;
+    }
+  },
+
+  async deleteAllCookies(userId: string): Promise<void> {
+    try {
+      await dynamodb.delete({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain: '__all__' },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteAllBrowserCookies');
+      throw error;
+    }
+  },
+};
+
 export const accountMemoryDb = {
   async addMemory(
     userId: string,
