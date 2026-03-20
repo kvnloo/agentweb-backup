@@ -747,6 +747,16 @@ describe('CRM Routes', () => {
       r.route?.path === '/lists/:listId/leads/enrich-web' && r.route?.methods?.post
     );
 
+    const mockPreview = jest.fn();
+    const mockExecute = jest.fn();
+
+    jest.mock('../services/crmEnrichmentService', () => ({
+      CrmEnrichmentService: jest.fn().mockImplementation(() => ({
+        preview: mockPreview,
+        execute: mockExecute,
+      })),
+    }));
+
     it('should return preview counts', async () => {
       const mockList = {
         listId: 'list1',
@@ -755,13 +765,12 @@ describe('CRM Routes', () => {
       };
 
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
-      (crmDb.getLeadsByListId as jest.Mock).mockResolvedValue({
-        items: [
-          { leadId: 'lead1', company: 'Acme', customFields: {} },
-          { leadId: 'lead2', company: 'Beta', customFields: { web_company_info: 'Existing info' } },
-          { leadId: 'lead3', company: '' },
-        ],
-        lastEvaluatedKey: null,
+
+      mockPreview.mockResolvedValue({
+        totalLeads: 3,
+        leadsToProcess: 1,
+        alreadyEnriched: 1,
+        samples: [{ leadId: 'lead1', lead: { email: 'a@test.com' }, enrichedFields: { web_company_info: 'Info' } }],
       });
 
       mockRequest.params = { listId: 'list1' };
@@ -776,14 +785,12 @@ describe('CRM Routes', () => {
       expect(mockResponse.json).toHaveBeenCalledWith(expect.objectContaining({
         success: true,
         totalLeads: 3,
-        leadsWithCompany: 2,
-        alreadyEnrichedLeads: 1,
-        couldBeEnrichedLeads: 1,
         leadsToProcess: 1,
+        alreadyEnrichedCount: 1,
       }));
     });
 
-    it('should delegate to CrmEnrichmentService.enrichWebCompat for enrich mode', async () => {
+    it('should delegate to CrmEnrichmentService.execute for enrich mode', async () => {
       const mockList = {
         listId: 'list1',
         name: 'Test List',
@@ -792,17 +799,12 @@ describe('CRM Routes', () => {
 
       (crmDb.getLeadListById as jest.Mock).mockResolvedValue(mockList);
 
-      // Mock the dynamic import of CrmEnrichmentService
-      jest.mock('../services/crmEnrichmentService', () => ({
-        CrmEnrichmentService: {
-          enrichWebCompat: jest.fn().mockResolvedValue({
-            processedCount: 3,
-            failedCount: 1,
-            totalToProcess: 4,
-            failureBreakdown: { searchWebFailed: 1, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },
-          }),
-        },
-      }));
+      mockExecute.mockResolvedValue({
+        processedCount: 3,
+        failedCount: 1,
+        totalToProcess: 4,
+        failureBreakdown: { searchWebFailed: 1, linkedinFailed: 0, llmOrParseFailed: 0, updateFailed: 0 },
+      });
 
       mockRequest.params = { listId: 'list1' };
       mockRequest.query = { mode: 'enrich' };
