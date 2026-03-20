@@ -31,6 +31,7 @@ import Release from './pages/Release';
 import Guide from './pages/Guide';
 import Templates from './pages/Templates';
 import Skills from './pages/Skills';
+import ClientHealth from './pages/ClientHealth';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
 import { useEffect } from 'react';
@@ -99,6 +100,14 @@ export default function App() {
                       element={
                         <AdminRoute>
                           <GTMPlans />
+                        </AdminRoute>
+                      }
+                    />
+                    <Route
+                      path="client-health"
+                      element={
+                        <AdminRoute>
+                          <ClientHealth />
                         </AdminRoute>
                       }
                     />
