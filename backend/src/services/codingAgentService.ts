@@ -34,6 +34,8 @@ type CallLLMFn = (model: string, messages: any[], options?: any) => Promise<any>
 
 const DEFAULT_MAX_ITERATIONS = 30;
 const CODING_AGENT_MODEL = 'anthropic.claude-opus-4-6-v1';
+const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
+const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
@@ -347,13 +349,53 @@ async function executeTool(
   }
 }
 
+// ─── Context Management ─────────────────────────────────────────────────────
+
+/**
+ * Truncate a tool result to prevent context window bloat.
+ * Preserves the beginning and end of the content with a truncation notice.
+ */
+function truncateToolResult(content: string): string {
+  if (content.length <= MAX_TOOL_RESULT_CHARS) return content;
+  const keepChars = Math.floor(MAX_TOOL_RESULT_CHARS / 2);
+  return (
+    content.substring(0, keepChars) +
+    `\n\n... [TRUNCATED: ${content.length} chars total, showing first and last ${keepChars} chars] ...\n\n` +
+    content.substring(content.length - keepChars)
+  );
+}
+
+/**
+ * Trim older tool results in the message history to keep context manageable.
+ * Keeps the last 3 tool results at full size, truncates older ones to 2000 chars.
+ */
+function trimMessageHistory(messages: any[]): void {
+  const toolIndices: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === 'tool') toolIndices.push(i);
+  }
+
+  // Keep last 3 tool results intact, truncate older ones aggressively
+  const preserveCount = 3;
+  const truncateLimit = 2000;
+  if (toolIndices.length > preserveCount) {
+    const toTruncate = toolIndices.slice(0, toolIndices.length - preserveCount);
+    for (const idx of toTruncate) {
+      const content = messages[idx].content;
+      if (typeof content === 'string' && content.length > truncateLimit) {
+        messages[idx].content = content.substring(0, truncateLimit) + `\n... [trimmed from ${content.length} chars]`;
+      }
+    }
+  }
+}
+
 // ─── Main Agent Loop ────────────────────────────────────────────────────────
 
-export async function runCodingAgent(
+async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
   callLLM: CallLLMFn,
-  maxIterations: number = DEFAULT_MAX_ITERATIONS
+  maxIterations: number
 ): Promise<{ success: boolean; message: string; iterations: number }> {
 
   const messages: any[] = [
@@ -367,6 +409,11 @@ export async function runCodingAgent(
   try {
     while (iteration < maxIterations) {
       iteration++;
+
+      // Trim older messages every 5 iterations to prevent context bloat
+      if (iteration > 1 && iteration % 5 === 0) {
+        trimMessageHistory(messages);
+      }
 
       // Emit progress
       if (context.socketEmit) {
@@ -440,11 +487,11 @@ export async function runCodingAgent(
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
-        // Add tool result to message history
+        // Truncate large tool results and add to message history
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
-          content: toolResult
+          content: truncateToolResult(toolResult)
         });
       }
     }
@@ -463,4 +510,31 @@ export async function runCodingAgent(
       iterations: iteration
     };
   }
+}
+
+/**
+ * Run the coding agent with a timeout wrapper.
+ * Ensures the agent doesn't run indefinitely if tools hang.
+ */
+export async function runCodingAgent(
+  taskDescription: string,
+  context: CodingAgentContext,
+  callLLM: CallLLMFn,
+  maxIterations: number = DEFAULT_MAX_ITERATIONS
+): Promise<{ success: boolean; message: string; iterations: number }> {
+
+  const timeoutPromise = new Promise<{ success: boolean; message: string; iterations: number }>((resolve) => {
+    setTimeout(() => {
+      resolve({
+        success: false,
+        message: 'Coding agent timed out after 10 minutes. The task may be partially complete — check the deployment for any changes that were made.',
+        iterations: -1
+      });
+    }, AGENT_TIMEOUT_MS);
+  });
+
+  return Promise.race([
+    runCodingAgentInternal(taskDescription, context, callLLM, maxIterations),
+    timeoutPromise
+  ]);
 }
