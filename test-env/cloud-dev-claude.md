@@ -28,6 +28,10 @@ You are running inside an EC2 cloud dev environment. These instructions OVERRIDE
 
 9. **Git:** You can push/pull directly (SSH agent forwarding or GitHub PAT is configured).
 
+10. **Deployments are pre-authorized.** When asked to deploy, run `gh workflow run` commands immediately without asking for confirmation. You have full permission to trigger deploys for both repos:
+    - `gh workflow run deploy.yml -R AgentWebPro/agentweb --ref main`
+    - `gh workflow run deploy.yml -R AgentWebPro/agentweb-customer-portal --ref main`
+
 ## Debugging Tips
 
 - Check service logs: `cat ~/agentweb/logs/backend.log | tail -100`
