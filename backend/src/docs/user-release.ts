@@ -27,6 +27,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improvement: Password Privacy Protection',
       '- Chat messages containing passwords are now automatically masked (displayed as ****) in the UI',
       '- Protects user privacy when credentials are shared in agent mode conversations',
+      'Feature: Emma — Live User Guide Search via Notion',
+      '- Emma now answers user guide questions by fetching the latest content directly from Notion in real time, replacing the old static knowledge base',
+      '- The user guide is always up to date — edits in Notion are immediately reflected in Emma\'s answers without any deployment',
+      '- Admin users can ask Emma to update, append to, or delete sections of the user guide using new admin-only tools',
+      '- The User Guide page in the customer portal now loads the Notion page ID dynamically from the backend instead of a hardcoded URL',
     ],
   },
   {
