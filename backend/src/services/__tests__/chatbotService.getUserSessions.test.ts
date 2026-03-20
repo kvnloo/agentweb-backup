@@ -494,13 +494,20 @@ describe('ChatbotDB.getUserSessions - Message Loading from Messages Table', () =
       messages: [],
     };
 
-    // Mock query for sessions
+    // Mock query for sessions - first page returns one session with a pagination key
     (mockDocClient.query as jest.Mock)
     // @ts-expect-error - jest.Mock typing issue
       .mockReturnValueOnce({
         promise: jest.fn().mockResolvedValue({
           Items: [mockSession],
           LastEvaluatedKey: { sessionId: 'session-2', createdAt: '2024-01-02T00:00:00Z' },
+        }),
+      } as any)
+      // Second page - no more sessions (loop ends)
+    // @ts-expect-error - jest.Mock typing issue
+      .mockReturnValueOnce({
+        promise: jest.fn().mockResolvedValue({
+          Items: [],
         }),
       } as any)
       // Mock query for messages
@@ -514,6 +521,7 @@ describe('ChatbotDB.getUserSessions - Message Loading from Messages Table', () =
     const result = await chatbotDb.getUserSessions(userId, 'agent', 50, true, lastEvaluatedKey);
 
     expect(result.sessions).toHaveLength(1);
-    expect(result.lastEvaluatedKey).toBeDefined();
+    // After exhausting all pages, lastEvaluatedKey should be undefined
+    expect(result.lastEvaluatedKey).toBeUndefined();
   });
 });
