@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-20',
+    changes: [
+      'Fix: Scheduled Chats — Configured Model Now Respected',
+      '- Scheduled chats with an explicitly configured AI model (e.g. Claude) no longer get overridden by task-type defaults (e.g. the image generation default model)',
+      '- Previously, if a scheduled chat required generate_image, update_html_file, or generate_video, the system would silently switch to the task-type default model, ignoring the user\'s configured model',
+      '- The configured model on the schedule now takes priority over task-type defaults',
+    ],
+  },
+  {
     date: '2026-03-19',
     changes: [
       'Feature: Agent Mode — Token Usage & Cost Tracking',
