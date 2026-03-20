@@ -166,13 +166,21 @@ export default function Layout() {
                       >
                         Skills
                       </Button>
-                      <Button 
-                        color="primary" 
-                        component={RouterLink} 
+                      <Button
+                        color="primary"
+                        component={RouterLink}
                         to="/gtm-ops"
                         variant={isActivePath('/gtm-ops') ? 'contained' : 'text'}
                       >
                         GTM Tracker
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
+                        to="/client-health"
+                        variant={isActivePath('/client-health') ? 'contained' : 'text'}
+                      >
+                        Client Health
                       </Button>
                     </>
                   )}
