@@ -10,6 +10,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-20',
     changes: [
+      'Fix: Meta Ads Destination URL Updates Now Work Correctly',
+      '- Previously, asking Emma to update an ad\'s destination URL (link_url) via AD UPDATE silently failed because destination URLs live in the Ad Creative, not the Ad itself',
+      '- Emma now automatically detects destination/creative content changes and performs a creative swap: fetches the current creative, creates a new one with the updated URL, and swaps it into the ad',
+      '- Supports image, video, and carousel ad creatives',
       'Feature: Emma — Coding Agent for Landing Page Editing',
       '- Emma now delegates code editing tasks to a specialized coding agent that runs autonomously',
       '- The coding agent uses diff-based editing (search/replace) instead of full file rewrites, solving the issue where large files (35KB+) could not be edited',
