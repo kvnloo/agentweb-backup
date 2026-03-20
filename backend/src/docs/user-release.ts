@@ -49,6 +49,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Ad details include brand name, ad copy, headlines, CTAs, format, platform, creative targeting, product category, running duration, and video transcriptions',
       '- DCO (Dynamic Creative Optimization) carousel ads are fully supported with per-card content extraction',
       '- Use Foreplay ads as seed ads when asking Emma to create new ad copy or analyze competitor creative strategies',
+      'Fix: User Guide Page Not Loading',
+      '- Fixed the User Guide page showing "This content is blocked" by adding notion.site to the Content Security Policy frame-src directive',
+      '- Added proper error handling so the page shows a clear error message instead of loading indefinitely when the backend configuration is unavailable',
     ],
   },
   {
