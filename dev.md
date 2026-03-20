@@ -1,3 +1,60 @@
+# March 20, 2026: Investigation — AgentWeb.pro Lead Gen Path Broken
+
+## Context
+
+The lead generation process from AgentWeb.pro (our Webflow landing site) was broken for weeks without detection. Investigated the full lead capture flow using browser testing to identify all issues.
+
+## Critical Finding: Nav Menu "Get Started" Links to Job Application Form
+
+The hamburger menu's **"Get Started"** button links to a **job application form** on Surface:
+- **Menu CTA URL:** `https://forms.withsurface.com/s/cmhlafdiv0001js0bfy1qaxhh` → "AgentWeb Job Application" (asks about work authorization, what you've built, etc.)
+- **Correct URL (used by hero + bottom CTAs):** `https://forms.withsurface.com/s/cmdzs6o9i007rky04xg1157yk` → "Train Emma" lead capture form (asks for work email, name, company, phone)
+
+**Impact:** On mobile, the hamburger menu is the primary navigation. Any visitor clicking "Get Started" from the nav menu was sent to a hiring form instead of becoming a lead. They likely bounced immediately. This silently killed lead conversion with no visible error.
+
+## Other Issues Found
+
+### Cloudflare Turnstile Error (600010)
+- Console repeatedly logs `[Cloudflare Turnstile] Error: 600010` and `Failed to load resource` errors on all pages
+- Turnstile is the bot-protection widget likely guarding the newsletter signup form
+- The `failure_retry` path also fails, so it doesn't recover
+- May allow spam submissions or block legitimate users in certain browsers
+
+### No Lead Capture CTA on Content Pages
+- `/case-studies` page lists 5 case studies but has no "Get Started" CTA in main content
+- Same for `/blog` pages — only the footer newsletter form is available
+- Visitors reading about results (e.g., "417 demo requests", "328 add to carts") have no obvious path to the lead form
+
+### /build Page Skips Lead Capture
+- "Start Free Trial" goes directly to Stripe checkout ($199/mo after 7-day trial)
+- No email capture before the paywall — visitors who aren't ready to pay leave with zero data captured
+
+### rankai.ai External Script
+- Every page loads `https://rankai.ai/apply.js` which rewrites alt text, anchor titles, Open Graph meta tags, and injects schema markup after page load
+- This external dependency modifies the DOM — worth verifying it's not interfering with lead capture elements or causing the Turnstile issue
+
+## Lead Capture Paths Summary
+
+| Location | CTA Text | Destination | Status |
+|---|---|---|---|
+| Homepage hero | "Get Started" | Surface lead form | OK |
+| Homepage bottom | "Get Started" | Surface lead form | OK |
+| **Nav menu** | **"Get Started"** | **Surface JOB APPLICATION** | **BROKEN** |
+| /build hero | "Start Free Trial" | Stripe checkout | OK (no lead capture) |
+| Footer (all pages) | Newsletter "Submit" | Webflow newsletter | OK (with Turnstile errors) |
+| Nav menu | "Log In" | app.agentweb.pro/login | OK |
+| Nav menu | "Contact" | mailto:founders@agentweb.pro | OK |
+
+## Fix Required
+
+These fixes must be made in the **Webflow editor** (not in this codebase):
+1. **P0:** Fix nav menu "Get Started" link to point to `cmdzs6o9i007rky04xg1157yk` (the lead form, not the job application)
+2. **P1:** Investigate and fix Cloudflare Turnstile error 600010
+3. **P2:** Add "Get Started" CTAs to case studies and blog pages
+4. **P3:** Update copyright year from 2025 to 2026
+
+---
+
 # March 19, 2026: Investigation — X/Twitter Outreach via Unipile
 
 ## Context
