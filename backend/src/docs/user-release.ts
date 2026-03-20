@@ -8,6 +8,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-21',
+    changes: [
+      'Fix: User Guide Page Now Loads Correctly',
+      '- The /guide page was blocked by the browser\'s Content Security Policy — Notion iframe embedding is now allowed',
+      '- Added proper error handling when the guide fails to load instead of showing "Loading..." indefinitely',
+    ],
+  },
+  {
     date: '2026-03-20',
     changes: [
       'Fix: Meta Ads Destination URL Updates Now Work Correctly',
