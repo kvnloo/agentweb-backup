@@ -24,13 +24,21 @@ jest.mock('aws-sdk', () => {
     })),
   }));
 
+  const S3 = jest.fn().mockImplementation(() => ({
+    getObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    putObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    deleteObject: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+  }));
+
   return {
     __esModule: true,
     default: {
       DynamoDB: { DocumentClient },
+      S3,
       config: { update: jest.fn() },
     },
     DynamoDB: { DocumentClient },
+    S3,
     config: { update: jest.fn() },
   };
 });

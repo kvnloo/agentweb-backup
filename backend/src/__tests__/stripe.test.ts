@@ -54,6 +54,29 @@ jest.mock('../services/waitlistDb', () => ({
   },
 }));
 
+// Mock settingsService so subscriptionService doesn't try to create a real DynamoDB DocumentClient
+const mockSubscriptionTypes = [
+  { name: 'Free', allowedPages: ['/', '/agent-mode', '/settings', '/guide'], allowedSkills: [] },
+  { name: 'Basic', allowedPages: ['/', '/agent-mode', '/settings', '/guide', '/brand-guidelines', '/market-strategy', '/knowledge-base', '/email-templates', '/tasks', '/research-reports'], allowedSkills: ['*'] },
+  { name: 'Super Premium', allowedPages: ['*'], allowedSkills: ['*'] },
+];
+
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn().mockImplementation((key: string) => {
+      if (key === 'subscription_types') {
+        return Promise.resolve({
+          settingName: 'subscription_types',
+          settingValue: JSON.stringify(mockSubscriptionTypes),
+          updatedAt: new Date().toISOString(),
+          updatedBy: 'test',
+        });
+      }
+      return Promise.resolve(null);
+    }),
+  },
+}));
+
 import { stripeService } from '../services/stripeService';
 import { userDb } from '../services/db';
 
