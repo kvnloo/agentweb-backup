@@ -12,12 +12,39 @@ export interface SubscriptionType {
 
 // Default pages that are always available regardless of subscription type
 // These match the routes in customer-portal/src/App.tsx
-const DEFAULT_PAGES = [
+export const DEFAULT_PAGES = [
   "/", // Agent Mode home
   "/agent-mode", // Agent Mode
   "/settings", // Settings page
   "/guide", // User Guide
 ];
+
+// ─── Tier Fallback ──────────────────────────────────────────────────────
+// The canonical tier definitions now live in DynamoDB (admin-managed via
+// the "subscription_types" setting).  getSubscriptionTypeConfig() reads
+// them.  The constant below is only used as a last-resort fallback when
+// the DB config cannot be reached (e.g. during initial bootstrap).
+
+const FREE_TIER_FALLBACK: SubscriptionType = {
+  name: "Free",
+  allowedPages: [...DEFAULT_PAGES],
+  allowedSkills: [], // No premium skills on Free tier
+};
+
+/**
+ * Get tier configuration by name — reads from DynamoDB first, falls back
+ * to a minimal Free config if the DB is unreachable or the tier is not
+ * defined.  Replaces the old hardcoded TIER_CONFIGS / getDefaultTierConfig.
+ */
+export async function getTierConfig(tierName: string): Promise<SubscriptionType | null> {
+  const dbConfig = await getSubscriptionTypeConfig(tierName);
+  if (dbConfig) return dbConfig;
+
+  // Graceful fallback: only Free tier has a built-in fallback
+  if (tierName === "Free") return { ...FREE_TIER_FALLBACK };
+
+  return null;
+}
 
 /**
  * Get subscription type for a user (defaults to "Basic" if not set)

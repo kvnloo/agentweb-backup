@@ -114,8 +114,67 @@ export class AgentModeService {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
 
+    // Ensure built-in skills exist in the database
+    await this.ensureBuiltInSkills();
+
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
+  }
+
+  /**
+   * Built-in skill definitions that are auto-created if missing.
+   * Each entry is keyed by a stable identifier used to find existing skills by name.
+   */
+  public static readonly BUILT_IN_SKILLS: ReadonlyArray<{
+    name: string;
+    description: string;
+    toolNames: string[];
+    category?: string;
+  }> = [
+    {
+      name: 'Meeting Intelligence',
+      description:
+        'Access meeting recordings, transcripts, and action items from Fathom. ' +
+        'Requires a connected Fathom account (Settings → Connected Accounts).',
+      toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+      category: 'tool_bundle',
+    },
+  ];
+
+  /**
+   * Ensure all built-in skills exist in the database.
+   * Idempotent — skips skills that already exist (matched by name).
+   */
+  public async ensureBuiltInSkills(): Promise<void> {
+    try {
+      const existingSkills = await skillService.getAllSkills();
+      const existingNames = new Set(existingSkills.map(s => s.name));
+
+      for (const builtin of AgentModeService.BUILT_IN_SKILLS) {
+        if (existingNames.has(builtin.name)) {
+          continue;
+        }
+
+        const skill = await skillService.createSkill(
+          builtin.name,
+          builtin.description,
+          builtin.toolNames,
+          undefined, // systemPrompt
+          true       // isPublished — available immediately
+        );
+
+        // Mark as built-in if supported
+        if (skill) {
+          skill.isBuiltIn = true;
+          skill.category = builtin.category as any;
+          await skillService.updateSkill(skill);
+          console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
+        }
+      }
+    } catch (error) {
+      console.error('AgentMode: Error ensuring built-in skills:', error);
+      // Non-fatal — the foundation tools fallback still grants access
+    }
   }
 
   public async shutdown() {
@@ -238,6 +297,8 @@ export class AgentModeService {
         // Dynamic import to avoid circular dependencies
         await import('../emma/registry');
         await import('../emma/tools');
+        await import('../emma/fathomTools');
+        await import('../emma/meetingActionRouter');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -2067,7 +2128,11 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'manage_scheduled_chat',
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
-    'submit_scheduled_chat_variables'
+    'submit_scheduled_chat_variables',
+
+    // Meeting Intelligence (Fathom)
+    'fathom_get_meetings',
+    'fathom_get_transcript'
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
