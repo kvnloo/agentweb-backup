@@ -1,3 +1,49 @@
+# March 20, 2026: Investigation — UseHaven.ai Meta Marketing Connected Account Issue
+
+## Problem
+
+Two issues reported by UseHaven.ai (usehaven.ai) when connecting Meta Marketing accounts:
+
+1. **Matt (existing user):** When connecting Meta Marketing, Facebook asks him to reconnect because he previously connected with a different account.
+2. **Harsha (new user):** When attempting to connect, sees an "App does not exist" error.
+
+## Investigation Findings
+
+### Architecture Overview
+
+- Meta OAuth flow: `metaAuth.ts` handles init → Facebook Login popup → callback → finalize (token exchange) → connect-ad-accounts
+- Credentials stored in AWS Secrets Manager at `prod/AgentWeb/MetaApp` (contains `clientId`, `clientSecret`, `instagramClientId`, `instagramClientSecret`)
+- Connected accounts stored in DynamoDB `AW-Users` table under `connected_accounts` array
+- Token sessions stored in-memory with 10-minute TTL
+
+### Root Cause: App in Development Mode
+
+The "App does not exist" error for Harsha is caused by the **Meta/Facebook App being in Development Mode**. In Development Mode, only users listed as App Admins, Developers, or Testers in the Facebook App settings can use the OAuth flow. All other users see "App does not exist."
+
+Matt could connect because he was likely added as a tester/developer on the app. The "reconnect" prompt is standard Facebook behavior when a user re-authorizes an app — Facebook remembers the prior authorization and asks to confirm.
+
+### Actions Taken
+
+1. **Made the app Live** — switched from Development to Live mode in Meta Developer Console
+2. **Completed Data Use Checkup** — required for Live mode compliance
+3. **Harshit submitted for App Review** — required for advanced permissions (ads_management, ads_read, pages_show_list)
+
+### Key Files
+
+- `backend/src/routes/metaAuth.ts` — OAuth init, callback, finalize, connect endpoints
+- `backend/src/routes/metaV2.ts` — Ad creation API using connected account tokens
+- `backend/src/config/integrations.ts` — OAuth URLs, scopes, redirect URIs
+- `backend/src/utils/secretsManager.ts` — `getMetaCredentials()` and `getInstagramCredentials()`
+- `backend/src/services/connectedAccountsDb.ts` — Account storage (createAccount, updateAccountTokens)
+- `customer-portal/src/pages/MetaOAuthCallback.tsx` — Frontend OAuth callback handler
+- `customer-portal/src/pages/Settings.tsx` — `startMetaOAuth()` initiates the flow
+
+### Status
+
+Pending App Review approval from Meta. Will revisit once review is complete. After approval, all users should be able to connect Meta Marketing accounts without the "app does not exist" error.
+
+---
+
 # March 20, 2026: Proposal — Token Limits Per Subscription Tier
 
 ## Context
