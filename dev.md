@@ -1,3 +1,136 @@
+# March 20, 2026: Proposal — Token Limits Per Subscription Tier
+
+## Context
+
+We have four subscription tiers (Free, Starter, Pro, Enterprise) but no token usage limits. All tiers currently allow unlimited Agent Mode token consumption. With $0 in cloud credits (AWS, Google Cloud, Azure), every token is a direct cost. We need per-tier limits that:
+- **Free:** Let users see enough value to convert, but cap usage to incentivize upgrades
+- **Starter/Pro:** Be generous enough to retain paying users while maintaining healthy margins
+- **Enterprise:** Unlimited or custom-negotiated
+
+## Current State
+
+- Token usage is tracked **per message** in `ChatSession.messages[].usage` (prompt_tokens, completion_tokens, total_tokens, estimated_cost)
+- No aggregate monthly tracking per user exists
+- No enforcement or limits exist — all tiers have unlimited consumption
+- Internal tiers: Free, Basic (Starter), Super Premium (Pro). Enterprise not yet in code.
+
+## LLM Cost Reference (per 1M tokens)
+
+| Model | Input | Output | Blended* | Provider |
+|-------|------:|-------:|---------:|----------|
+| Claude Sonnet 4.5/4.6 | $3 | $15 | $10.20 | AWS Bedrock |
+| Claude Opus 4.6 | $15 | $75 | $51.00 | AWS Bedrock |
+| GPT-5 | $2.50 | $10 | $7.00 | Azure |
+| GPT-5.2 | $3 | $12 | $8.40 | Azure |
+| Gemini 3 Pro | $1.25 | $10 | $6.50 | Google |
+| Gemini 3 Flash | $0.15 | $0.60 | $0.42 | Google |
+| Gemini 3.1 Flash Lite | $0.075 | $0.30 | $0.21 | Google |
+
+*Blended = weighted avg assuming ~40% input, ~60% output tokens (typical agent conversations)*
+
+Default model: GPT-5 (`gpt-5-chat-2`), blended cost ~$7/1M tokens.
+
+## Typical Session Token Usage
+
+| Session Type | Tokens/Session | Examples |
+|-------------|---------------:|---------|
+| Simple Q&A | 30K–50K | Quick marketing question, 2-3 turns |
+| Content creation | 80K–150K | Blog post, social posts, with revisions |
+| Research/analysis | 100K–200K | Market analysis, competitor research |
+| Complex workflow | 200K–500K | Multi-step task with tool calls |
+| Scheduled chat | 50K–150K | Automated recurring tasks |
+
+**Median session: ~100K tokens**
+
+## Proposed Token Limits
+
+| Tier | Price | Monthly Token Limit | ~Sessions/Month | Our Blended Cost (GPT-5) | Gross Margin |
+|------|------:|--------------------:|----------------:|-------------------------:|-------------:|
+| **Free** | $0 | **1M** | ~10–15 | ~$7 | -$7 (acquisition cost) |
+| **Starter** | $199 | **15M** | ~100–150 | ~$105 | ~$94 (47%) |
+| **Pro** | $499 | **50M** | ~300–500 | ~$350 | ~$149 (30%) |
+| **Enterprise** | Custom | **Unlimited** | Unlimited | Negotiated | Negotiated |
+
+### Free Tier Rationale ($0/mo → 1M tokens)
+- Enough for ~10–15 meaningful sessions (blog post, social content, brand strategy)
+- Users see value within first few days but hit the wall within the first week of active use
+- At ~$7/user/month cost, even a 5% conversion rate to Starter ($199) is profitable after ~3–5 free users per paid conversion
+
+### Starter Tier Rationale ($199/mo → 15M tokens)
+- ~5–7 sessions/day on weekdays — comfortable for SMB marketing teams
+- 47% gross margin at GPT-5 blended rates; 23% margin if users primarily use Sonnet
+- Power users may hit the limit in week 3–4, creating natural upsell to Pro
+
+### Pro Tier Rationale ($499/mo → 50M tokens)
+- ~15–20 sessions/day — heavy automation, scheduled chats, multi-step workflows
+- 30% margin at GPT-5; margin is thin/negative if users predominantly use Opus
+- Rarely hit limit unless running Opus-heavy workloads
+
+### Enterprise Rationale (Custom → Unlimited)
+- Custom pricing presumably $1,000+/mo
+- Internal soft alert at 100M tokens/month for monitoring
+- SLA-backed with negotiated terms
+
+## Model Cost Multiplier (Recommended)
+
+To protect margins across tiers, apply a multiplier so expensive models consume more of the budget:
+
+| Model Tier | Multiplier | Rationale |
+|-----------|----------:|-----------|
+| Gemini Flash / Flash Lite | 0.1x | 10–50x cheaper than baseline |
+| GPT-5 / Gemini Pro | 1x (baseline) | ~$7/1M blended |
+| GPT-5.2 | 1.2x | Slightly more expensive |
+| Claude Sonnet 4.5/4.6 | 1.5x | ~50% more expensive than GPT-5 |
+| Claude Opus 4.6 | 7x | ~7x more expensive than GPT-5 |
+
+Example: A 50K-token Opus session counts as 350K "weighted tokens" toward the monthly limit.
+
+**Alternative (simpler):** No multiplier, but restrict model availability per tier:
+- Free/Starter: GPT-5, Gemini models, Claude Sonnet only
+- Pro: All models including Opus
+- Enterprise: All models
+
+## Overage Behavior (Recommended)
+
+1. **Warning at 80%** — In-app banner: "You've used 80% of your monthly token budget"
+2. **Soft block at 100%** — New sessions blocked, but current in-progress session allowed to finish
+3. **Grace period** — Allow up to 5% overage to avoid mid-session cutoffs
+4. **Reset** — Monthly, aligned to Stripe billing period (`current_period_end`)
+
+## Implementation Plan
+
+### Phase 1: Tracking Infrastructure
+1. Add `tokenUsage` fields to `AW-Users` table:
+   - `tokenUsage.currentMonth.year`, `tokenUsage.currentMonth.month`
+   - `tokenUsage.currentMonth.totalTokensUsed` (weighted)
+   - `tokenUsage.currentMonth.rawTokensUsed` (unweighted)
+   - `tokenUsage.currentMonth.estimatedCostUSD`
+   - `tokenUsage.currentMonth.resetDate` (ISO)
+2. Update `agentModeService.ts` to increment user token usage after each LLM call
+3. Add monthly reset logic (check on each request if month has rolled over)
+
+### Phase 2: Limit Enforcement
+4. Add `monthlyTokenLimit` to tier configs in `AW-Settings` → `subscription_types`
+5. Add pre-check in Agent Mode: reject new sessions if user is at/over limit
+6. Add 80% warning emission via Socket.IO
+7. Allow in-progress sessions to complete (grace overage up to 5%)
+
+### Phase 3: User-Facing
+8. Add token usage display to customer portal Settings page
+9. Add usage bar/indicator in Agent Mode sidebar
+10. Add upgrade prompts when approaching/hitting limits
+
+### Files to Modify
+- `backend/src/services/agentModeService.ts` — token tracking, limit checks, model multiplier
+- `backend/src/services/chatbotService.ts` — add `tokenUsage` to User interface
+- `backend/src/services/db.ts` — add `updateUserTokenUsage()`, `getUserTokenUsage()`
+- `backend/src/services/subscriptionService.ts` — add `monthlyTokenLimit` to tier configs
+- `backend/src/controllers/agentModeController.ts` — pre-session limit check
+- `customer-portal/src/pages/Settings.tsx` — usage display
+- `customer-portal/src/components/AgentMode/` — usage bar, warning banner
+
+---
+
 # March 20, 2026: Investigation — AgentWeb.pro Lead Gen Path Broken
 
 ## Context
