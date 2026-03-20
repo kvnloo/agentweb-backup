@@ -3,6 +3,9 @@ import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
 
+// Register browser cookie persistence tools
+import './browserCookieTools';
+
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {

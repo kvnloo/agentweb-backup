@@ -4649,6 +4649,83 @@ type MemoryCategory = typeof VALID_MEMORY_CATEGORIES[number];
 
 const ACCOUNT_MEMORY_TABLE = `${TABLE_PREFIX}AW-AccountMemory`;
 
+// Browser Cookies table
+const BROWSER_COOKIES_TABLE = `${TABLE_PREFIX}AW-BrowserCookies`;
+
+export const browserCookieDb = {
+  async saveCookies(userId: string, domain: string, cookies: any[]): Promise<void> {
+    const now = new Date().toISOString();
+    try {
+      await dynamodb.put({
+        TableName: BROWSER_COOKIES_TABLE,
+        Item: {
+          userId,
+          domain,
+          cookies,
+          updatedAt: now,
+          createdAt: now,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'saveBrowserCookies');
+      throw error;
+    }
+  },
+
+  async getCookies(userId: string, domain: string): Promise<any[] | null> {
+    try {
+      const result = await dynamodb.get({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+      }).promise();
+      return result.Item?.cookies || null;
+    } catch (error) {
+      handleDynamoDbError(error, 'getBrowserCookies');
+      throw error;
+    }
+  },
+
+  async listDomains(userId: string): Promise<string[]> {
+    try {
+      const result = await dynamodb.query({
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+        ProjectionExpression: '#d, updatedAt',
+        ExpressionAttributeNames: { '#d': 'domain' },
+      }).promise();
+      return (result.Items || []).map((item: any) => item.domain);
+    } catch (error) {
+      handleDynamoDbError(error, 'listBrowserCookieDomains');
+      throw error;
+    }
+  },
+
+  async deleteCookies(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.delete({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteBrowserCookies');
+      throw error;
+    }
+  },
+
+  async deleteAllCookies(userId: string): Promise<void> {
+    try {
+      const domains = await this.listDomains(userId);
+      for (const domain of domains) {
+        await this.deleteCookies(userId, domain);
+      }
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteAllBrowserCookies');
+      throw error;
+    }
+  },
+};
+
 export const accountMemoryDb = {
   async addMemory(
     userId: string,
