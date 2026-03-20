@@ -4853,22 +4853,26 @@ export const socialEngagementTrackingDb = {
   async recordEngagement(tracker: {
     userId: string;
     postId: string;
+    commentId?: string;        // comment URN for auto-reply actions; undefined for post engagement
     platform: string;
     ownerAccountId: string;
     engagingAccountId: string;
     actionType: string;
     scheduleId: string;
-    status: 'completed' | 'failed';
-    executedAt: string;
-    commentText?: string;
+    status: 'queued' | 'completed' | 'failed';
+    executedAt?: string;
+    generatedText?: string;    // generated comment or reply text
+    reactionType?: string;     // LLM-selected reaction type
   }) {
     try {
+      // Dedup key: use commentId for comment actions, postId for post actions
+      const dedupId = tracker.commentId || tracker.postId;
       const params = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         Item: {
           ...tracker,
-          // Composite sort key: unique per (post, engager) — used for dedup check
-          postId_engagingAccountId: `${tracker.postId}#${tracker.engagingAccountId}`,
+          // Composite sort key: unique per (post/comment, engager) — used for dedup check
+          postId_engagingAccountId: `${dedupId}#${tracker.engagingAccountId}`,
           createdAt: new Date().toISOString()
         },
       };

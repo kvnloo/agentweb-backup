@@ -3,7 +3,7 @@ import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { agentModeService } from '../services/agentModeService';
 
-const COMMENT_MODEL = 'gemini-2.0-flash';
+const COMMENT_MODEL = 'gemini-3.1-flash-lite-preview';
 
 const POST_COMMENT_SYSTEM_PROMPT = `You are a professional social media engagement assistant.
 Write a thoughtful, genuine 1-2 sentence comment on the following LinkedIn post.
@@ -14,6 +14,18 @@ const COMMENT_REPLY_SYSTEM_PROMPT = `You are a professional social media engagem
 Write a genuine, concise reply to the following comment on a LinkedIn post.
 The reply should add value or acknowledge the comment naturally.
 Return ONLY the reply text, no quotes or explanation.`;
+
+const REACTION_SYSTEM_PROMPT = `You are a LinkedIn engagement assistant. Based on the content provided, choose the single most appropriate LinkedIn reaction.
+Reply with EXACTLY one of these values (no other text):
+- LIKE      → general positive content, news, updates
+- PRAISE    → achievements, milestones, congratulations, launches
+- EMPATHY   → support, struggles, challenges, mental health, loss
+- INTEREST  → insights, data, learning, thought-provoking ideas
+- APPRECIATION → gratitude, teamwork, community, support
+- ENTERTAINMENT → funny, humorous, lighthearted content`;
+
+type LinkedInReaction = 'LIKE' | 'PRAISE' | 'EMPATHY' | 'INTEREST' | 'APPRECIATION' | 'ENTERTAINMENT';
+const VALID_REACTIONS: LinkedInReaction[] = ['LIKE', 'PRAISE', 'EMPATHY', 'INTEREST', 'APPRECIATION', 'ENTERTAINMENT'];
 
 function getLinkedInAdapter(): LinkedInAdapter {
     return new LinkedInAdapter();
@@ -43,6 +55,8 @@ export class SocialEngagementExecutor {
                 } catch (error) {
                     console.error(`[SocialEngagementExecutor] Failed to process action ${action.scheduleId}:`, error);
                 }
+                // 4-second pause between actions to avoid LinkedIn per-minute burst throttling
+                await new Promise(resolve => setTimeout(resolve, 4000));
             }
         } catch (error) {
             console.error('[SocialEngagementExecutor] Critical error:', error);
@@ -51,7 +65,7 @@ export class SocialEngagementExecutor {
 
     private async processAction(action: any) {
         const { userId, variableValues, scheduleId } = action;
-        const { postId, commentId, platform, ownerAccountId, engagingAccountId, engagingUserId, actionType, targetType } = variableValues || {};
+        const { postId, commentId, commentText, platform, ownerAccountId, engagingAccountId, actionType, targetType } = variableValues || {};
 
         console.log(`\n[Executor] ════ Processing action ${scheduleId} ════`);
         console.log(`[Executor] Action: ${actionType} | Target: ${targetType || 'post'} | Platform: ${platform}`);
@@ -62,9 +76,7 @@ export class SocialEngagementExecutor {
             return;
         }
 
-        // Resolve which user owns the engaging account
-        // engagingUserId is set by the scanner for cross-user engagements; fall back to action.userId
-        const engagingOwnerId = engagingUserId || userId;
+        const engagingOwnerId = userId;
 
         const engagingUser = await userDb.getUserById(engagingOwnerId);
         if (!engagingUser || !engagingUser.connected_accounts) {
@@ -89,14 +101,16 @@ export class SocialEngagementExecutor {
         let success = false;
         let errorMsg: string | undefined;
 
+        let retryable = false;
+        let generated: { generatedText?: string; reactionType?: string } = {};
         try {
             if (targetType === 'comment') {
-                await this.executeCommentAction(
-                    adapter, engagingConnection, engagingOwnerId, postId, commentId, actionType
+                generated = await this.executeCommentAction(
+                    adapter, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType
                 );
             } else {
                 // Default: post engagement
-                await this.executePostAction(
+                generated = await this.executePostAction(
                     adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType
                 );
             }
@@ -105,15 +119,17 @@ export class SocialEngagementExecutor {
         } catch (err: any) {
             errorMsg = err?.message || String(err);
             console.error(`[Executor] Action ${scheduleId} failed:`, errorMsg);
+            // Rate limit is transient — retry in 30 minutes; all other errors are permanent
+            retryable = (err?.response?.status === 429) || (errorMsg?.includes('rate limit') ?? false);
         }
 
-        // Record engagement outcome
-        const trackingId = targetType === 'comment' ? commentId : postId;
-        if (trackingId) {
+        // Record engagement outcome — postId is always the post URN, commentId for reply actions
+        if (postId) {
             try {
                 await socialEngagementTrackingDb.recordEngagement({
                     userId,
-                    postId: trackingId,
+                    postId,
+                    commentId: targetType === 'comment' ? commentId : undefined,
                     platform,
                     ownerAccountId: ownerAccountId || '',
                     engagingAccountId,
@@ -121,13 +137,22 @@ export class SocialEngagementExecutor {
                     scheduleId,
                     status: success ? 'completed' : 'failed',
                     executedAt: new Date().toISOString(),
+                    generatedText: generated.generatedText,
+                    reactionType: generated.reactionType,
                 });
             } catch (trackErr) {
                 console.warn(`[Executor] Could not record engagement tracking:`, trackErr);
             }
         }
 
-        await this.markActionDone(scheduleId);
+        if (retryable) {
+            // Reschedule 30 minutes from now — don't mark done
+            const retryTime = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+            await scheduleDb.updateSchedule(scheduleId, { nextRunTime: retryTime });
+            console.log(`[Executor] Action ${scheduleId} will retry at ${retryTime}`);
+        } else {
+            await this.markActionDone(scheduleId);
+        }
         console.log(`[Executor] ════ Action ${scheduleId} done ════\n`);
     }
 
@@ -143,22 +168,30 @@ export class SocialEngagementExecutor {
         ownerUserId: string,
         postId: string,
         actionType: string
-    ) {
+    ): Promise<{ generatedText?: string; reactionType?: string }> {
         const doLike = actionType === 'like' || actionType === 'comment_and_like';
         const doComment = actionType === 'comment' || actionType === 'comment_and_like';
 
+        // Fetch post content once — used for both comment generation and reaction selection
+        const postContent = await this.fetchPostContent(adapter, engagingConnection, engagingUserId, ownerAccountId, ownerUserId, postId);
+
+        let generatedText: string | undefined;
+        let reactionType: string | undefined;
+
         if (doComment) {
-            const postContent = await this.fetchPostContent(adapter, engagingConnection, engagingUserId, ownerAccountId, ownerUserId, postId);
-            const commentText = await this.generatePostComment(postContent);
-            console.log(`[Executor] Generated comment: "${commentText.slice(0, 100)}..."`);
-            await adapter.createComment(engagingConnection, postId, commentText, engagingUserId);
+            generatedText = await this.generatePostComment(postContent);
+            console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
+            await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
             console.log(`[Executor] Comment posted on post ${postId}`);
         }
 
         if (doLike) {
-            await adapter.createReaction(engagingConnection, postId, 'LIKE', engagingUserId);
-            console.log(`[Executor] Liked post ${postId}`);
+            reactionType = await this.generateReactionType(postContent);
+            await adapter.createReaction(engagingConnection, postId, reactionType, engagingUserId);
+            console.log(`[Executor] Reacted "${reactionType}" on post ${postId}`);
         }
+
+        return { generatedText, reactionType };
     }
 
     private async fetchPostContent(
@@ -210,6 +243,26 @@ export class SocialEngagementExecutor {
         return 'Great insights! Thanks for sharing.';
     }
 
+    private async generateReactionType(content: string): Promise<LinkedInReaction> {
+        try {
+            const geminiClient = await agentModeService.getGeminiClient();
+            const completion = await geminiClient.chat.completions.create({
+                model: COMMENT_MODEL,
+                messages: [
+                    { role: 'system', content: REACTION_SYSTEM_PROMPT },
+                    { role: 'user', content: content || '[No content available]' },
+                ],
+                temperature: 0.1,
+            });
+            const raw = completion.choices[0]?.message?.content?.trim().toUpperCase() as LinkedInReaction;
+            if (VALID_REACTIONS.includes(raw)) return raw;
+            console.warn(`[Executor] LLM returned invalid reaction "${raw}", defaulting to LIKE`);
+        } catch (err) {
+            console.warn(`[Executor] LLM reaction generation failed:`, err);
+        }
+        return 'LIKE';
+    }
+
     // ────────────────────────────────────────────────────────────────────────────
     // COMMENT ENGAGEMENT
     // ────────────────────────────────────────────────────────────────────────────
@@ -220,8 +273,9 @@ export class SocialEngagementExecutor {
         engagingUserId: string,
         postId: string,
         commentId: string | undefined,
+        commentText: string | undefined,
         actionType: string
-    ) {
+    ): Promise<{ generatedText?: string; reactionType?: string }> {
         if (!commentId) {
             throw new Error('commentId is required for comment engagement actions');
         }
@@ -229,28 +283,33 @@ export class SocialEngagementExecutor {
         const doLike = actionType === 'like_comment' || actionType === 'like_and_reply_comment';
         const doReply = actionType === 'reply_comment' || actionType === 'like_and_reply_comment';
 
+        let generatedText: string | undefined;
+        let reactionType: string | undefined;
+
         if (doReply) {
-            const replyText = await this.generateCommentReply(commentId);
-            console.log(`[Executor] Generated reply: "${replyText.slice(0, 100)}..."`);
-            // createComment with parentCommentUrn posts a reply
-            await adapter.createComment(engagingConnection, postId, replyText, engagingUserId, commentId);
+            generatedText = await this.generateCommentReply(commentText || '');
+            console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
+            await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
             console.log(`[Executor] Reply posted on comment ${commentId}`);
         }
 
         if (doLike) {
-            await adapter.createReaction(engagingConnection, commentId, 'LIKE', engagingUserId);
-            console.log(`[Executor] Liked comment ${commentId}`);
+            reactionType = await this.generateReactionType(commentText || '');
+            await adapter.createReaction(engagingConnection, commentId, reactionType, engagingUserId);
+            console.log(`[Executor] Reacted "${reactionType}" on comment ${commentId}`);
         }
+
+        return { generatedText, reactionType };
     }
 
-    private async generateCommentReply(commentUrn: string): Promise<string> {
+    private async generateCommentReply(commentText: string): Promise<string> {
         try {
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
                 model: COMMENT_MODEL,
                 messages: [
                     { role: 'system', content: COMMENT_REPLY_SYSTEM_PROMPT },
-                    { role: 'user', content: `Comment URN to reply to: ${commentUrn}` },
+                    { role: 'user', content: `Comment: ${commentText}` },
                 ],
                 temperature: 0.8,
             });

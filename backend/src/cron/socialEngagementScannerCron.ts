@@ -13,67 +13,52 @@ function getSocialAdapter(platform: string): LinkedInAdapter | null {
 /**
  * Scans all users for social engagement opportunities.
  *
- * Role-based model:
- *   - POST OWNER:    accounts with enablePostDiscovery = true  → their posts can receive engagement
- *   - POST ENGAGER:  accounts with enableAsPostEngager = true  → they engage on others' posts
- *   - COMMENT OWNER: accounts with enableCommentDiscovery = true → comments on their posts can receive engagement
- *   - COMMENT ENGAGER: accounts with enableAsCommentEngager = true → they engage on others' post comments
+ * All engagement is scoped per user — no cross-user engagement.
  *
- * Cross-user engagement is supported: engagers from any user can engage with owners from any other user
- * on the same platform.
+ * POST ENGAGEMENT:
+ *   - POST OWNER (enablePostDiscovery=true): their posts get liked/commented by other accounts of the same user
+ *   - POST ENGAGER (enableAsPostEngager=true): engages on other accounts' posts within the same user
+ *
+ * COMMENT AUTO-REPLY:
+ *   - COMMENT OWNER (enableCommentDiscovery=true): this account auto-replies/likes comments on its OWN posts
+ *     — the reply comes from the same account, not from other accounts
  */
 export class SocialEngagementScanner {
     public async runScanner() {
         console.log('[SocialEngagementScanner] Starting discovery scan...');
         try {
             const allUsers = await userDb.getAllUsers();
-
-            // Collect all connected accounts across all users, annotated with userId
-            const allAccounts: any[] = [];
             for (const user of allUsers) {
-                for (const acc of (user.connected_accounts || [])) {
-                    allAccounts.push({ ...acc, userId: user.userId });
-                }
-            }
-
-            // Role slices
-            const postOwners = allAccounts.filter(
-                (a) => a.engagementSettings?.enablePostDiscovery === true
-            );
-            const postEngagers = allAccounts.filter(
-                (a) => a.engagementSettings?.enableAsPostEngager === true
-            );
-            const commentOwners = allAccounts.filter(
-                (a) => a.engagementSettings?.enableCommentDiscovery === true
-            );
-            const commentEngagers = allAccounts.filter(
-                (a) => a.engagementSettings?.enableAsCommentEngager === true
-            );
-
-            console.log(`[SocialEngagementScanner] Post owners: ${postOwners.length}, Post engagers: ${postEngagers.length}`);
-            console.log(`[SocialEngagementScanner] Comment owners: ${commentOwners.length}, Comment engagers: ${commentEngagers.length}`);
-
-            // ── POST ENGAGEMENT ──────────────────────────────────────────────
-            for (const owner of postOwners) {
-                const eligibleEngagers = postEngagers.filter(
-                    (e) => e.account_id !== owner.account_id && e.platform === owner.platform
-                );
-                if (eligibleEngagers.length === 0) continue;
-                await this.scanOwnerPostsForEngagement(owner, eligibleEngagers);
-            }
-
-            // ── COMMENT ENGAGEMENT ───────────────────────────────────────────
-            for (const owner of commentOwners) {
-                const eligibleEngagers = commentEngagers.filter(
-                    (e) => e.account_id !== owner.account_id && e.platform === owner.platform
-                );
-                if (eligibleEngagers.length === 0) continue;
-                await this.scanOwnerPostsForCommentEngagement(owner, eligibleEngagers);
+                await this.processUser(user);
             }
         } catch (error) {
             console.error('[SocialEngagementScanner] Critical error:', error);
         }
         console.log('[SocialEngagementScanner] Scan complete.');
+    }
+
+    private async processUser(user: any) {
+        const accounts = (user.connected_accounts || []).map((a: any) => ({ ...a, userId: user.userId }));
+
+        const postOwners = accounts.filter((a: any) => a.engagementSettings?.enablePostDiscovery === true);
+        const postEngagers = accounts.filter((a: any) => a.engagementSettings?.enableAsPostEngager === true);
+        const commentOwners = accounts.filter((a: any) => a.engagementSettings?.enableCommentDiscovery === true);
+
+        console.log(`[SocialEngagementScanner] User ${user.userId}: post owners: ${postOwners.length}, post engagers: ${postEngagers.length}, comment auto-reply: ${commentOwners.length}`);
+
+        // ── POST ENGAGEMENT ──────────────────────────────────────────────
+        for (const owner of postOwners) {
+            const eligibleEngagers = postEngagers.filter(
+                (e: any) => e.account_id !== owner.account_id && e.platform === owner.platform
+            );
+            if (eligibleEngagers.length === 0) continue;
+            await this.scanOwnerPostsForEngagement(owner, eligibleEngagers);
+        }
+
+        // ── COMMENT AUTO-REPLY (self-account) ────────────────────────────
+        for (const account of commentOwners) {
+            await this.scanAccountPostsForCommentReply(account);
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -151,8 +136,9 @@ export class SocialEngagementScanner {
             const delayMs = Math.floor(Math.random() * windowMs);
             const executionTime = new Date(Date.now() + delayMs).toISOString();
 
+            const scheduleId = uuidv4();
             await scheduleDb.createSchedule({
-                scheduleId: uuidv4(),
+                scheduleId,
                 taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
                 userId: ownerAccount.userId,
                 frequency: 'once',
@@ -167,10 +153,21 @@ export class SocialEngagementScanner {
                     platform,
                     ownerAccountId: ownerAccount.account_id,
                     engagingAccountId: engager.account_id,
-                    engagingUserId: engager.userId,
                     actionType,
                     targetType: 'post',
                 },
+            });
+
+            // Mark as queued immediately so subsequent scanner runs don't schedule it again
+            await socialEngagementTrackingDb.recordEngagement({
+                userId: ownerAccount.userId,
+                postId,
+                platform,
+                ownerAccountId: ownerAccount.account_id,
+                engagingAccountId: engager.account_id,
+                actionType,
+                scheduleId,
+                status: 'queued',
             });
 
             console.log(`[Scanner/Posts] Scheduled "${actionType}" on post ${postId} by ${engager.account_name} at ${executionTime}`);
@@ -178,19 +175,19 @@ export class SocialEngagementScanner {
     }
 
     // ────────────────────────────────────────────────────────────────────────────
-    // COMMENT ENGAGEMENT
+    // COMMENT AUTO-REPLY (self-account replies/likes its own post's comments)
     // ────────────────────────────────────────────────────────────────────────────
 
-    private async scanOwnerPostsForCommentEngagement(ownerAccount: any, potentialEngagers: any[]) {
-        const ownerSettings = ownerAccount.engagementSettings;
-        const platform: string = ownerAccount.platform;
+    private async scanAccountPostsForCommentReply(account: any) {
+        const settings = account.engagementSettings;
+        const platform: string = account.platform;
 
-        console.log(`[Scanner/Comments] Fetching posts for ${ownerAccount.account_name} to scan comments`);
+        console.log(`[Scanner/CommentReply] Scanning posts for ${account.account_name} (${account.account_id})`);
         try {
             const adapter = getSocialAdapter(platform);
             if (!adapter) return;
 
-            const posts = await adapter.listPosts(ownerAccount as ConnectedAccount, { limit: 10 }, ownerAccount.userId);
+            const posts = await adapter.listPosts(account as ConnectedAccount, { limit: 10 }, account.userId);
             const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
             const recentPosts = posts.filter((p: any) => {
                 const ts = p.createdAt || p.publishedAt || p.created?.time || p.timestamp || 0;
@@ -203,94 +200,111 @@ export class SocialEngagementScanner {
 
                 let comments: Array<{ commentUrn: string; actorUrn: string; text: string; createdAt: number }> = [];
                 try {
-                    comments = await adapter.getComments(ownerAccount as ConnectedAccount, postId, ownerAccount.userId);
+                    comments = await adapter.getComments(account as ConnectedAccount, postId, account.userId);
                 } catch (err) {
-                    console.warn(`[Scanner/Comments] Could not fetch comments for post ${postId}:`, err);
+                    console.warn(`[Scanner/CommentReply] Could not fetch comments for post ${postId}:`, err);
                     continue;
                 }
 
                 const recentComments = comments.filter((c) => c.createdAt >= cutoff);
-                console.log(`[Scanner/Comments] Post ${postId}: ${recentComments.length} recent comment(s)`);
+                console.log(`[Scanner/CommentReply] Post ${postId}: ${recentComments.length} recent comment(s)`);
 
-                for (const comment of recentComments) {
-                    await this.scheduleCommentEngagers(
-                        ownerAccount, ownerSettings, postId, comment.commentUrn, platform, potentialEngagers
-                    );
-                }
+                if (recentComments.length === 0) continue;
+                await this.scheduleCommentReplies(account, settings, postId, platform, recentComments);
             }
         } catch (error) {
-            console.error(`[Scanner/Comments] Failed to process ${ownerAccount.account_id}:`, error);
+            console.error(`[Scanner/CommentReply] Failed to process ${account.account_id}:`, error);
         }
     }
 
-    private async scheduleCommentEngagers(
-        ownerAccount: any,
-        ownerSettings: any,
+    private async scheduleCommentReplies(
+        account: any,
+        settings: any,
         postId: string,
-        commentUrn: string,
         platform: string,
-        potentialEngagers: any[]
+        comments: Array<{ commentUrn: string; actorUrn: string; text: string; createdAt: number }>
     ) {
-        const preferredActions: ('like' | 'reply')[] = ownerSettings.commentPreferredActions || ['like'];
+        const preferredActions: ('like' | 'reply')[] = settings.commentPreferredActions || ['reply'];
         const wantsLike = preferredActions.includes('like');
         const wantsReply = preferredActions.includes('reply');
-        const maxLikes = wantsLike ? (ownerSettings.maxCommentLikesPerPost || 0) : 0;
-        const maxReplies = wantsReply ? (ownerSettings.maxCommentRepliesPerPost || 0) : 0;
-        const windowMs = (ownerSettings.commentEngagementWindowMinutes || 60) * 60 * 1000;
+        const maxLikes = wantsLike ? (settings.maxCommentLikesPerPost || 0) : 0;
+        const maxReplies = wantsReply ? (settings.maxCommentRepliesPerPost || 0) : 0;
+        const windowMs = (settings.commentEngagementWindowMinutes || 60) * 60 * 1000;
 
-        const availableEngagers: any[] = [];
-        for (const engager of potentialEngagers) {
-            const alreadyQueued = await socialEngagementTrackingDb.hasEngaged(
-                ownerAccount.userId, commentUrn, engager.account_id
+        if (maxLikes === 0 && maxReplies === 0) return;
+
+        // Filter out comments already acted on by this account
+        const unhandled: typeof comments = [];
+        for (const comment of comments) {
+            const already = await socialEngagementTrackingDb.hasEngaged(
+                account.userId, comment.commentUrn, account.account_id
             );
-            if (!alreadyQueued) availableEngagers.push(engager);
+            if (!already) unhandled.push(comment);
         }
 
-        if (availableEngagers.length === 0) return;
+        if (unhandled.length === 0) return;
 
-        let likeCount = 0;
-        let replyCount = 0;
+        // Shuffle for random selection
+        const shuffled = [...unhandled].sort(() => Math.random() - 0.5);
 
-        for (const engager of availableEngagers) {
-            const canLike = wantsLike && likeCount < maxLikes;
-            const canReply = wantsReply && replyCount < maxReplies;
-            if (!canLike && !canReply) break;
+        // Select up to max for each action independently
+        const replyTargets = new Set(shuffled.slice(0, maxReplies).map((c) => c.commentUrn));
+        const likeTargets = new Set(shuffled.slice(0, maxLikes).map((c) => c.commentUrn));
+
+        // Union of all comments needing any action
+        const allTargetUrns = new Set([...replyTargets, ...likeTargets]);
+
+        for (const commentUrn of allTargetUrns) {
+            const comment = unhandled.find((c) => c.commentUrn === commentUrn)!;
+            const doReply = replyTargets.has(commentUrn);
+            const doLike = likeTargets.has(commentUrn);
 
             const actionType: 'like_comment' | 'reply_comment' | 'like_and_reply_comment' =
-                canLike && canReply ? 'like_and_reply_comment'
-                    : canReply ? 'reply_comment'
+                doLike && doReply ? 'like_and_reply_comment'
+                    : doReply ? 'reply_comment'
                         : 'like_comment';
-
-            if (canLike) likeCount++;
-            if (canReply) replyCount++;
 
             const delayMs = Math.floor(Math.random() * windowMs);
             const executionTime = new Date(Date.now() + delayMs).toISOString();
 
+            const scheduleId = uuidv4();
             await scheduleDb.createSchedule({
-                scheduleId: uuidv4(),
+                scheduleId,
                 taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
-                userId: ownerAccount.userId,
+                userId: account.userId,
                 frequency: 'once',
                 runCount: 1,
                 nextRunTime: executionTime,
                 status: 'active',
                 createdAt: new Date().toISOString(),
                 type: 'social_engagement_action',
-                description: `Engage comment ${commentUrn} as ${engager.account_name} on ${platform}`,
+                description: `Auto-reply to comment on post ${postId} as ${account.account_name}`,
                 variableValues: {
                     postId,
                     commentId: commentUrn,
+                    commentText: comment.text,
                     platform,
-                    ownerAccountId: ownerAccount.account_id,
-                    engagingAccountId: engager.account_id,
-                    engagingUserId: engager.userId,
+                    ownerAccountId: account.account_id,
+                    engagingAccountId: account.account_id, // self-reply: same account
                     actionType,
                     targetType: 'comment',
                 },
             });
 
-            console.log(`[Scanner/Comments] Scheduled "${actionType}" on comment ${commentUrn} by ${engager.account_name} at ${executionTime}`);
+            // Mark as queued immediately so subsequent scanner runs don't schedule it again
+            await socialEngagementTrackingDb.recordEngagement({
+                userId: account.userId,
+                postId,
+                commentId: commentUrn,
+                platform,
+                ownerAccountId: account.account_id,
+                engagingAccountId: account.account_id,
+                actionType,
+                scheduleId,
+                status: 'queued',
+            });
+
+            console.log(`[Scanner/CommentReply] Scheduled "${actionType}" on comment ${commentUrn} as ${account.account_name} at ${executionTime}`);
         }
     }
 }

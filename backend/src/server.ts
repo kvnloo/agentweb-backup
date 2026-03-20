@@ -260,10 +260,10 @@ createTestAccount().then(async () => {
       .catch((error) => console.error('Failed to initialize Agent Mode Tools:', error));
 
     // Social Engagement Automation polling
-    // Scanner: finds new posts and queues engagements — runs every 15 minutes
-    // Executor: processes due queued engagement actions — runs every 5 minutes
-    const SCANNER_INTERVAL_MS = 15 * 60 * 1000;   // 15 minutes
-    const EXECUTOR_INTERVAL_MS = 5 * 60 * 1000;    // 5 minutes
+    // Scanner: finds new posts and queues engagements — runs every 30 minutes (read-only, lenient limits)
+    // Executor: processes due queued engagement actions — runs every 10 minutes (write calls, needs breathing room)
+    const SCANNER_INTERVAL_MS = 60 * 60 * 1000;   // 60 minutes
+    const EXECUTOR_INTERVAL_MS = 30 * 60 * 1000;   // 30 minutes
 
     setTimeout(async () => {
       try {
