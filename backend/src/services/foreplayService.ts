@@ -1,0 +1,369 @@
+import axios from 'axios';
+import { userDb } from './db';
+import { decryptPassword } from '../utils/crypto';
+
+const FOREPLAY_API = 'https://public.api.foreplay.co';
+
+export interface ForeplayBoard {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+export interface ForeplayAdCard {
+  ctaText: string;
+  description: string;
+  headline: string;
+  image: string;
+  video: string;
+  title: string;
+  type: string;
+  transcription: string;
+}
+
+export interface ForeplayAd {
+  id: string;
+  adId: string;
+  name: string;
+  brandName: string;
+  brandId: string;
+  description: string;
+  headline: string;
+  ctaTitle: string;
+  ctaType: string;
+  displayFormat: string;
+  publisherPlatform: string[];
+  linkUrl: string;
+  live: boolean;
+  categories: string[];
+  niches: string[];
+  languages: string[];
+  marketTarget: string;
+  creativeTargeting: string;
+  productCategory: string;
+  startedRunning: number | string;
+  runningDuration: { days: number; hours: number; minutes: number };
+  thumbnail: string;
+  video: string;
+  image: string;
+  avatar: string;
+  transcription: string;
+  cards: ForeplayAdCard[];
+  savedAt?: string;
+}
+
+export interface ForeplayUsage {
+  creditsUsed: number;
+  creditsRemaining: number;
+  plan: string;
+}
+
+/**
+ * Get the decrypted Foreplay API token for a user.
+ * Returns null if no token is stored or decryption fails.
+ */
+export async function getAccessToken(userId: string): Promise<string | null> {
+  const user = await userDb.getUserById(userId);
+  const secrets = (user?.secrets as Record<string, string>) || {};
+  if (!secrets.foreplay_api_token) return null;
+  try {
+    const decrypted = decryptPassword(secrets.foreplay_api_token);
+    return decrypted.password;
+  } catch {
+    return null;
+  }
+}
+
+function authHeaders(token: string) {
+  return { Authorization: `Bearer ${token}` };
+}
+
+function mapCard(card: any): ForeplayAdCard {
+  return {
+    ctaText: card.cta_text || '',
+    description: card.description || '',
+    headline: card.headline || card.title || '',
+    image: card.image || '',
+    video: card.video || '',
+    title: card.title || '',
+    type: card.type || '',
+    transcription: card.full_transcription || '',
+  };
+}
+
+function mapAd(ad: any): ForeplayAd {
+  const cards = (ad.cards || []).map(mapCard);
+  // For DCO ads, top-level description/headline may be null — pull from first card
+  const firstCard = cards[0];
+  const description = ad.description || firstCard?.description || '';
+  const headline = ad.headline || firstCard?.headline || '';
+
+  return {
+    id: ad.id || '',
+    adId: ad.ad_id || '',
+    name: ad.name || '',
+    brandName: ad.name || '',
+    brandId: ad.brand_id || '',
+    description,
+    headline,
+    ctaTitle: ad.cta_title || firstCard?.ctaText || '',
+    ctaType: ad.cta_type || '',
+    displayFormat: ad.display_format || '',
+    publisherPlatform: ad.publisher_platform || [],
+    linkUrl: ad.link_url || '',
+    live: ad.live || false,
+    categories: ad.categories || [],
+    niches: ad.niches || [],
+    languages: ad.languages || [],
+    marketTarget: ad.market_target || '',
+    creativeTargeting: ad.creative_targeting || '',
+    productCategory: ad.product_category || '',
+    startedRunning: ad.started_running || '',
+    runningDuration: ad.running_duration || { days: 0, hours: 0, minutes: 0 },
+    thumbnail: ad.thumbnail || '',
+    video: ad.video || firstCard?.video || '',
+    image: ad.image || firstCard?.image || '',
+    avatar: ad.avatar || '',
+    transcription: ad.full_transcription || firstCard?.transcription || '',
+    cards,
+    savedAt: ad.saved_at || undefined,
+  };
+}
+
+/**
+ * Check API usage / credits remaining.
+ */
+export async function getUsage(token: string): Promise<ForeplayUsage> {
+  const response = await axios.get<any>(`${FOREPLAY_API}/api/usage`, {
+    headers: authHeaders(token),
+  });
+  const data = response.data?.data || response.data;
+  return {
+    creditsUsed: data.credits_used || 0,
+    creditsRemaining: data.credits_remaining || 0,
+    plan: data.plan || '',
+  };
+}
+
+/**
+ * List user's boards (collections).
+ */
+export async function listBoards(token: string): Promise<ForeplayBoard[]> {
+  const response = await axios.get<any>(`${FOREPLAY_API}/api/boards`, {
+    headers: authHeaders(token),
+  });
+  const boards = response.data?.data || response.data || [];
+  return (Array.isArray(boards) ? boards : []).map((b: any) => ({
+    id: b.id || b._id || '',
+    name: b.name || '',
+    description: b.description || undefined,
+  }));
+}
+
+/**
+ * Get ads in a board (paginated with cursor).
+ */
+export async function getBoardAds(
+  token: string,
+  boardId: string,
+  options: { limit?: number; cursor?: string } = {}
+): Promise<{ ads: ForeplayAd[]; cursor?: string }> {
+  const params: Record<string, string> = {};
+  if (options.limit) params.limit = String(options.limit);
+  if (options.cursor) params.cursor = options.cursor;
+  params.board_id = boardId;
+
+  const response = await axios.get<any>(`${FOREPLAY_API}/api/board/ads`, {
+    headers: authHeaders(token),
+    params,
+  });
+  const data = response.data;
+  const ads = (data?.data || []).map(mapAd);
+  const nextCursor = data?.metadata?.cursor || undefined;
+  return { ads, cursor: nextCursor };
+}
+
+/**
+ * Get all ads in a board (auto-paginate).
+ */
+export async function getAllBoardAds(token: string, boardId: string): Promise<ForeplayAd[]> {
+  const allAds: ForeplayAd[] = [];
+  let cursor: string | undefined;
+  do {
+    const result = await getBoardAds(token, boardId, { limit: 250, cursor });
+    allAds.push(...result.ads);
+    cursor = result.cursor;
+  } while (cursor);
+  return allAds;
+}
+
+/**
+ * Get user's personal swipefile ads (paginated with cursor).
+ */
+export async function getSwipefileAds(
+  token: string,
+  options: { limit?: number; cursor?: string } = {}
+): Promise<{ ads: ForeplayAd[]; cursor?: string }> {
+  const params: Record<string, string> = {};
+  if (options.limit) params.limit = String(options.limit);
+  if (options.cursor) params.cursor = options.cursor;
+
+  const response = await axios.get<any>(`${FOREPLAY_API}/api/swipefile/ads`, {
+    headers: authHeaders(token),
+    params,
+  });
+  const data = response.data;
+  const ads = (data?.data || []).map(mapAd);
+  const nextCursor = data?.metadata?.cursor || undefined;
+  return { ads, cursor: nextCursor };
+}
+
+/**
+ * Search the global ad discovery database.
+ * Note: costs 1 credit per ad returned.
+ */
+export async function searchDiscoveryAds(
+  token: string,
+  options: {
+    query?: string;
+    limit?: number;
+    cursor?: string;
+    format?: string[];
+    platform?: string[];
+    niche?: string[];
+    language?: string[];
+    market?: string;
+    live?: boolean;
+    sort?: string;
+  } = {}
+): Promise<{ ads: ForeplayAd[]; cursor?: string }> {
+  const params: Record<string, string> = {};
+  if (options.query) params.query = options.query;
+  if (options.limit) params.limit = String(options.limit);
+  if (options.cursor) params.cursor = options.cursor;
+  if (options.format?.length) params.format = options.format.join(',');
+  if (options.platform?.length) params.platform = options.platform.join(',');
+  if (options.niche?.length) params.niche = options.niche.join(',');
+  if (options.language?.length) params.language = options.language.join(',');
+  if (options.market) params.market = options.market;
+  if (options.live !== undefined) params.live = String(options.live);
+  if (options.sort) params.sort = options.sort;
+
+  const response = await axios.get<any>(`${FOREPLAY_API}/api/discovery/ads`, {
+    headers: authHeaders(token),
+    params,
+  });
+  const data = response.data;
+  const ads = (data?.data || []).map(mapAd);
+  const nextCursor = data?.metadata?.cursor || undefined;
+  return { ads, cursor: nextCursor };
+}
+
+/**
+ * Get a single ad by its Facebook ad_id (numeric) or Foreplay internal id.
+ * Tries path param first (ad_id), falls back to query param.
+ */
+export async function getAd(token: string, adId: string): Promise<ForeplayAd> {
+  try {
+    // Try as Facebook ad_id (path param)
+    const response = await axios.get<any>(`${FOREPLAY_API}/api/ad/${adId}`, {
+      headers: authHeaders(token),
+    });
+    const data = response.data?.data || response.data;
+    return mapAd(data);
+  } catch (err: any) {
+    if (err.response?.status === 404) {
+      // Try as query param (may work with internal ID)
+      const response = await axios.get<any>(`${FOREPLAY_API}/api/ad`, {
+        headers: authHeaders(token),
+        params: { ad_id: adId },
+      });
+      const data = response.data?.data || response.data;
+      return mapAd(data);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Format an ad as markdown for LLM consumption.
+ */
+export function formatAdAsMarkdown(ad: ForeplayAd): string {
+  const parts: string[] = [];
+  parts.push(`# ${ad.name || ad.headline || 'Untitled Ad'}`);
+  parts.push('');
+
+  if (ad.brandName || ad.name) parts.push(`**Brand:** ${ad.brandName || ad.name}`);
+  if (ad.displayFormat) parts.push(`**Format:** ${ad.displayFormat}`);
+  if (ad.publisherPlatform?.length) parts.push(`**Platform:** ${ad.publisherPlatform.join(', ')}`);
+  if (ad.live !== undefined) parts.push(`**Live:** ${ad.live ? 'Yes' : 'No'}`);
+  if (ad.startedRunning) {
+    const dateStr = typeof ad.startedRunning === 'number'
+      ? new Date(ad.startedRunning).toISOString().split('T')[0]
+      : ad.startedRunning;
+    parts.push(`**Started Running:** ${dateStr}`);
+  }
+  if (ad.runningDuration?.days) parts.push(`**Running Duration:** ${ad.runningDuration.days} days`);
+  if (ad.marketTarget) parts.push(`**Market:** ${ad.marketTarget}`);
+  if (ad.creativeTargeting) parts.push(`**Creative Targeting:** ${ad.creativeTargeting}`);
+  if (ad.productCategory) parts.push(`**Product Category:** ${ad.productCategory}`);
+  if (ad.niches?.length) parts.push(`**Niches:** ${ad.niches.join(', ')}`);
+  if (ad.categories?.length) parts.push(`**Categories:** ${ad.categories.join(', ')}`);
+  if (ad.languages?.length) parts.push(`**Languages:** ${ad.languages.join(', ')}`);
+
+  if (ad.headline) {
+    parts.push('');
+    parts.push('## Headline');
+    parts.push(ad.headline);
+  }
+
+  if (ad.description) {
+    parts.push('');
+    parts.push('## Description / Ad Copy');
+    parts.push(ad.description);
+  }
+
+  if (ad.ctaTitle) {
+    parts.push('');
+    parts.push(`**CTA:** ${ad.ctaTitle}${ad.ctaType ? ` (${ad.ctaType})` : ''}`);
+  }
+
+  if (ad.linkUrl) {
+    parts.push(`**Link:** ${ad.linkUrl}`);
+  }
+
+  if (ad.transcription) {
+    parts.push('');
+    parts.push('## Video Transcription');
+    parts.push(ad.transcription);
+  }
+
+  // Cards (DCO ads have multiple creatives)
+  if (ad.cards?.length > 1) {
+    parts.push('');
+    parts.push(`## Ad Variations (${ad.cards.length} cards)`);
+    ad.cards.forEach((card, i) => {
+      parts.push('');
+      parts.push(`### Card ${i + 1}${card.type ? ` (${card.type})` : ''}`);
+      if (card.headline) parts.push(`**Headline:** ${card.headline}`);
+      if (card.description) parts.push(`**Copy:** ${card.description}`);
+      if (card.ctaText) parts.push(`**CTA:** ${card.ctaText}`);
+      if (card.image) parts.push(`**Image:** ${card.image}`);
+      if (card.video) parts.push(`**Video:** ${card.video}`);
+      if (card.transcription) parts.push(`**Transcription:** ${card.transcription}`);
+    });
+  }
+
+  // Media references (top-level)
+  const media: string[] = [];
+  if (ad.image) media.push(`- Image: ${ad.image}`);
+  if (ad.video) media.push(`- Video: ${ad.video}`);
+  if (ad.thumbnail) media.push(`- Thumbnail: ${ad.thumbnail}`);
+  if (media.length) {
+    parts.push('');
+    parts.push('## Media');
+    parts.push(...media);
+  }
+
+  return parts.join('\n');
+}

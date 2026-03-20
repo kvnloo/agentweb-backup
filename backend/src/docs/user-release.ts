@@ -43,6 +43,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- The user guide is always up to date — edits in Notion are immediately reflected in Emma\'s answers without any deployment',
       '- Admin users can ask Emma to update, append to, or delete sections of the user guide using new admin-only tools',
       '- The User Guide page in the customer portal now loads the Notion page ID dynamically from the backend instead of a hardcoded URL',
+      'Feature: Foreplay Ad Library Integration',
+      '- Connect your Foreplay account in the Knowledge Base page to load your saved ads into Emma\'s knowledge base',
+      '- Emma can list, search, and read individual ads from your Foreplay Swipe File and boards',
+      '- Ad details include brand name, ad copy, headlines, CTAs, format, platform, creative targeting, product category, running duration, and video transcriptions',
+      '- DCO (Dynamic Creative Optimization) carousel ads are fully supported with per-card content extraction',
+      '- Use Foreplay ads as seed ads when asking Emma to create new ad copy or analyze competitor creative strategies',
     ],
   },
   {
