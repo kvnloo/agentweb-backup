@@ -4289,7 +4289,7 @@ emmaToolRegistry.register({
   name: 'get_seo_metrics',
   definition: {
     name: 'get_seo_metrics',
-    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). User must have SEO domains configured in their account settings.',
+    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). If the user has multiple domains configured, returns metrics for all domains unless a specific domain is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4297,6 +4297,10 @@ emmaToolRegistry.register({
           type: 'string',
           enum: ['7d', '14d', '30d', '90d'],
           description: 'Time period for metrics. Default: 30d'
+        },
+        domain: {
+          type: 'string',
+          description: 'Specific domain to fetch metrics for (e.g. "example.com"). If omitted, returns metrics for all configured domains.'
         }
       },
       required: []
@@ -4307,7 +4311,7 @@ emmaToolRegistry.register({
     if (!userId) throw new Error('Authentication required');
 
     const { fetchSearchConsoleMetrics } = await import('../services/seoService');
-    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
+    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d', args.domain);
   }
 });
 
@@ -4315,7 +4319,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. User must have a Google Analytics Property ID configured in their account settings.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4323,6 +4327,10 @@ emmaToolRegistry.register({
           type: 'string',
           enum: ['7d', '14d', '30d', '90d'],
           description: 'Time period for analytics. Default: 30d'
+        },
+        property_id: {
+          type: 'string',
+          description: 'Specific GA4 property ID to fetch analytics for (e.g. "123456789"). If omitted, returns analytics for all configured properties.'
         }
       },
       required: []
@@ -4333,7 +4341,32 @@ emmaToolRegistry.register({
     if (!userId) throw new Error('Authentication required');
 
     const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
-    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
+    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d', args.property_id);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_clarity_metrics',
+  definition: {
+    name: 'get_clarity_metrics',
+    description: 'Get Microsoft Clarity project information and dashboard links for the user\'s configured projects. Returns project IDs, labels, and direct links to Clarity dashboards. If the user has multiple Clarity projects, returns info for all unless a specific project is requested.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: {
+          type: 'string',
+          description: 'Specific Clarity project ID to get info for. If omitted, returns info for all configured projects.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchClarityProjectInfo } = await import('../services/seoService');
+    return await fetchClarityProjectInfo(userId, args.project_id);
   }
 });
 
