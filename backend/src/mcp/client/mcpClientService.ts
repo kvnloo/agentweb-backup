@@ -264,13 +264,14 @@ export class McpClientService {
 
   /**
    * Get or create a client for a specific chat session.
-   * For servers with per-user secret placeholders, uses userId to create
-   * user-specific pool keys so different users get different processes/tokens.
+   * Uses userId as pool key so the same user shares MCP clients (e.g. browser)
+   * across chat sessions, avoiding "browser in use" lock conflicts.
+   * Different users still get separate clients for security isolation.
    */
   private async getSessionClient(serverName: string, chatSessionId: string, userId?: string): Promise<Client> {
-    const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
-    // For servers with secret placeholders, use user-specific pool key
-    const poolKey = needsUserSecrets && userId ? `${chatSessionId}_${userId}` : chatSessionId;
+    // Pool by userId so same user shares one browser/MCP process across sessions.
+    // Fall back to chatSessionId if userId not available.
+    const poolKey = userId || chatSessionId;
 
     // Touch session to update last activity
     this.touchSession(poolKey);
