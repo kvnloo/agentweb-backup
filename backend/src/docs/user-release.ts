@@ -41,6 +41,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Links use our own domain (/asset/<hash>) instead of raw S3 URLs, which are blocked by WeChat and other messaging platforms',
       '- Visit tracking with best-effort IP dedup counts unique viewers per report',
       '- Stats endpoint available at /asset/<hash>/stats to check visit counts',
+      'Feature: Emma — Multi-Domain & Multi-Property Site Traffic Tools',
+      '- Emma\'s SEO metrics tool now returns data for all configured Google Search Console domains (previously only fetched all without the ability to focus on one)',
+      '- Added optional "domain" parameter to get_seo_metrics — ask Emma about a specific domain or get all at once',
+      '- Emma\'s website analytics tool now returns data for all configured GA4 properties in parallel (previously only used the first property)',
+      '- Added optional "property_id" parameter to get_website_analytics — ask Emma about a specific GA4 property or get all at once',
+      '- New get_clarity_metrics tool — Emma can now show Microsoft Clarity project info and dashboard links for all configured projects',
+      '- All three tools support optional filtering to a specific domain/property/project when the user asks about one in particular',
     ],
   },
   {

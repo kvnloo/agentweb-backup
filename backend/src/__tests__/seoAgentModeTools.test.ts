@@ -1,5 +1,5 @@
 /**
- * Tests for SEO/Analytics Agent Mode tools (get_seo_metrics, get_website_analytics)
+ * Tests for SEO/Analytics Agent Mode tools (get_seo_metrics, get_website_analytics, get_clarity_metrics)
  * Tests both the seoService functions and the tool registrations in emma/tools.ts.
  */
 
@@ -101,10 +101,17 @@ describe('SEO Agent Mode Tools', () => {
       expect(tool?.definition?.name).toBe('get_website_analytics');
     });
 
+    it('should register get_clarity_metrics tool', () => {
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      expect(tool).toBeDefined();
+      expect(tool?.definition?.name).toBe('get_clarity_metrics');
+    });
+
     it('should have correct input schema for get_seo_metrics', () => {
       const tool = emmaToolRegistry.getTool('get_seo_metrics');
       const schema = tool?.definition?.inputSchema;
       expect(schema?.properties?.timeframe?.enum).toEqual(['7d', '14d', '30d', '90d']);
+      expect(schema?.properties?.domain?.type).toBe('string');
       expect(schema?.required).toEqual([]);
     });
 
@@ -112,6 +119,14 @@ describe('SEO Agent Mode Tools', () => {
       const tool = emmaToolRegistry.getTool('get_website_analytics');
       const schema = tool?.definition?.inputSchema;
       expect(schema?.properties?.timeframe?.enum).toEqual(['7d', '14d', '30d', '90d']);
+      expect(schema?.properties?.property_id?.type).toBe('string');
+      expect(schema?.required).toEqual([]);
+    });
+
+    it('should have correct input schema for get_clarity_metrics', () => {
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const schema = tool?.definition?.inputSchema;
+      expect(schema?.properties?.project_id?.type).toBe('string');
       expect(schema?.required).toEqual([]);
     });
   });
@@ -235,6 +250,36 @@ describe('SEO Agent Mode Tools', () => {
 
       expect(result.timeframe).toBe('30d');
     });
+
+    it('should filter to a specific domain when domain param is provided', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        seoDomains: ['example.com', 'blog.example.com', 'other.com'],
+      });
+
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: async () => ({ rows: [] })
+      });
+
+      const tool = emmaToolRegistry.getTool('get_seo_metrics');
+      const result = await tool!.execute({ domain: 'blog.example.com' }, { userId: 'test-user' });
+
+      expect(result.metrics).toHaveLength(1);
+      expect(result.metrics[0].domain).toBe('blog.example.com');
+    });
+
+    it('should return error when filtered domain not found in configured domains', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        seoDomains: ['example.com'],
+      });
+
+      const tool = emmaToolRegistry.getTool('get_seo_metrics');
+      const result = await tool!.execute({ domain: 'notfound.com' }, { userId: 'test-user' });
+
+      expect(result.error).toContain('not found in configured domains');
+    });
   });
 
   describe('get_website_analytics', () => {
@@ -261,7 +306,67 @@ describe('SEO Agent Mode Tools', () => {
       expect(result.error).toContain('User not found');
     });
 
-    it('should return analytics data when GA is configured', async () => {
+    it('should return analytics data for all configured properties', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        googleAnalyticsProperties: [
+          { propertyId: '111111', label: 'Main Site' },
+          { propertyId: '222222', label: 'Blog' },
+        ],
+        seoDomains: ['example.com'],
+      });
+
+      // Use mockImplementation to handle parallel calls (Promise.all makes order non-deterministic)
+      mockRunReport.mockImplementation((params: any) => {
+        const prop = params.property;
+        // Overall metrics call (no dimensions)
+        if (!params.dimensions) {
+          if (prop === 'properties/111111') {
+            return [{
+              rows: [{
+                metricValues: [
+                  { value: '1000' },
+                  { value: '800' },
+                  { value: '3000' },
+                  { value: '120.5' },
+                  { value: '0.35' },
+                ]
+              }]
+            }];
+          } else {
+            return [{
+              rows: [{
+                metricValues: [
+                  { value: '200' },
+                  { value: '150' },
+                  { value: '500' },
+                  { value: '60.0' },
+                  { value: '0.45' },
+                ]
+              }]
+            }];
+          }
+        }
+        // All dimension-based calls return empty
+        return [{ rows: [] }];
+      });
+
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({ timeframe: '30d' }, { userId: 'test-user' });
+
+      expect(result.metrics).toBeDefined();
+      expect(result.metrics).toHaveLength(2);
+      // Results may be in any order due to Promise.all, so find by propertyId
+      const mainSite = result.metrics.find((m: any) => m.propertyId === '111111');
+      const blog = result.metrics.find((m: any) => m.propertyId === '222222');
+      expect(mainSite.label).toBe('Main Site');
+      expect(mainSite.sessions).toBe(1000);
+      expect(blog.label).toBe('Blog');
+      expect(blog.sessions).toBe(200);
+      expect(result.timeframe).toBe('30d');
+    });
+
+    it('should return analytics for legacy single-property config', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue({
         userId: 'test-user',
         googleAnalyticsPropertyId: '123456',
@@ -273,58 +378,58 @@ describe('SEO Agent Mode Tools', () => {
         .mockResolvedValueOnce([{
           rows: [{
             metricValues: [
-              { value: '1000' },  // sessions
-              { value: '800' },   // activeUsers
-              { value: '3000' },  // screenPageViews
-              { value: '120.5' }, // averageSessionDuration
-              { value: '0.35' },  // bounceRate
+              { value: '1000' },
+              { value: '800' },
+              { value: '3000' },
+              { value: '120.5' },
+              { value: '0.35' },
             ]
           }]
         }])
-        .mockResolvedValueOnce([{
-          rows: [{
-            dimensionValues: [{ value: '/page1' }, { value: 'example.com' }],
-            metricValues: [
-              { value: '500' },  // sessions
-              { value: '0.8' },  // engagementRate
-              { value: '300' },  // userEngagementDuration
-              { value: '1200' }, // eventCount
-            ]
-          }]
-        }])
-        .mockResolvedValueOnce([{
-          rows: [{
-            dimensionValues: [{ value: '20260301' }],
-            metricValues: [
-              { value: '100' }, // sessions
-              { value: '80' },  // activeUsers
-              { value: '300' }, // screenPageViews
-            ]
-          }]
-        }])
-        .mockResolvedValueOnce([{
-          rows: [{
-            dimensionValues: [{ value: 'google' }, { value: 'organic' }],
-            metricValues: [
-              { value: '500' },  // sessions
-              { value: '400' },  // activeUsers
-              { value: '1500' }, // screenPageViews
-              { value: '90.0' }, // averageSessionDuration
-            ]
-          }]
-        }]);
+        .mockResolvedValueOnce([{ rows: [] }])
+        .mockResolvedValueOnce([{ rows: [] }])
+        .mockResolvedValueOnce([{ rows: [] }]);
 
       const tool = emmaToolRegistry.getTool('get_website_analytics');
       const result = await tool!.execute({ timeframe: '30d' }, { userId: 'test-user' });
 
-      expect(result.sessions).toBe(1000);
-      expect(result.users).toBe(800);
-      expect(result.pageViews).toBe(3000);
-      expect(result.bounceRate).toBe(35);
-      expect(result.dailyData).toHaveLength(1);
-      expect(result.trafficSources).toHaveLength(1);
-      expect(result.trafficSources[0].source).toBe('google');
-      expect(result.topPagesByEngagement).toHaveLength(1);
+      expect(result.metrics).toHaveLength(1);
+      expect(result.metrics[0].propertyId).toBe('123456');
+      expect(result.metrics[0].label).toBe('Main Property');
+      expect(result.metrics[0].sessions).toBe(1000);
+    });
+
+    it('should filter to a specific property when property_id is provided', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        googleAnalyticsProperties: [
+          { propertyId: '111111', label: 'Main Site' },
+          { propertyId: '222222', label: 'Blog' },
+        ],
+      });
+
+      mockRunReport.mockResolvedValue([{ rows: [] }]);
+
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({ property_id: '222222' }, { userId: 'test-user' });
+
+      expect(result.metrics).toHaveLength(1);
+      expect(result.metrics[0].propertyId).toBe('222222');
+      expect(result.metrics[0].label).toBe('Blog');
+    });
+
+    it('should return error when filtered property_id not found', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        googleAnalyticsProperties: [
+          { propertyId: '111111', label: 'Main Site' },
+        ],
+      });
+
+      const tool = emmaToolRegistry.getTool('get_website_analytics');
+      const result = await tool!.execute({ property_id: '999999' }, { userId: 'test-user' });
+
+      expect(result.error).toContain('not found in configured properties');
     });
 
     it('should default to 30d timeframe when not specified', async () => {
@@ -359,6 +464,97 @@ describe('SEO Agent Mode Tools', () => {
       expect(firstCall.dimensionFilter).toBeDefined();
       expect(firstCall.dimensionFilter.andGroup.expressions).toHaveLength(1);
       expect(firstCall.dimensionFilter.andGroup.expressions[0].notExpression.filter.stringFilter.value).toBe('staging.example.com');
+    });
+  });
+
+  describe('get_clarity_metrics', () => {
+    it('should return error when no userId provided', async () => {
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      await expect(tool!.execute({}, {})).rejects.toThrow('Authentication required');
+    });
+
+    it('should return error when user not found', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue(null);
+
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const result = await tool!.execute({}, { userId: 'nonexistent-user' });
+      expect(result.error).toContain('User not found');
+    });
+
+    it('should return helpful message when no Clarity projects configured', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+      });
+
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const result = await tool!.execute({}, { userId: 'test-user' });
+      expect(result.message).toContain('No Microsoft Clarity projects configured');
+    });
+
+    it('should return info for all configured Clarity projects', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        clarityProjects: [
+          { projectId: 'abc123', label: 'Main Site' },
+          { projectId: 'def456', label: 'Blog' },
+        ],
+      });
+
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const result = await tool!.execute({}, { userId: 'test-user' });
+
+      expect(result.projects).toHaveLength(2);
+      expect(result.projects[0].projectId).toBe('abc123');
+      expect(result.projects[0].label).toBe('Main Site');
+      expect(result.projects[0].dashboardUrl).toContain('abc123');
+      expect(result.projects[0].recordingsUrl).toContain('abc123');
+      expect(result.projects[0].heatmapsUrl).toContain('abc123');
+      expect(result.projects[1].projectId).toBe('def456');
+    });
+
+    it('should support legacy single clarityProjectId', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        clarityProjectId: 'legacy123',
+      });
+
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const result = await tool!.execute({}, { userId: 'test-user' });
+
+      expect(result.projects).toHaveLength(1);
+      expect(result.projects[0].projectId).toBe('legacy123');
+      expect(result.projects[0].label).toBe('Main Project');
+    });
+
+    it('should filter to a specific project when project_id is provided', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        clarityProjects: [
+          { projectId: 'abc123', label: 'Main Site' },
+          { projectId: 'def456', label: 'Blog' },
+        ],
+      });
+
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const result = await tool!.execute({ project_id: 'def456' }, { userId: 'test-user' });
+
+      expect(result.projects).toHaveLength(1);
+      expect(result.projects[0].projectId).toBe('def456');
+      expect(result.projects[0].label).toBe('Blog');
+    });
+
+    it('should return error when filtered project_id not found', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        userId: 'test-user',
+        clarityProjects: [
+          { projectId: 'abc123', label: 'Main Site' },
+        ],
+      });
+
+      const tool = emmaToolRegistry.getTool('get_clarity_metrics');
+      const result = await tool!.execute({ project_id: 'notfound' }, { userId: 'test-user' });
+
+      expect(result.error).toContain('not found in configured projects');
     });
   });
 });
