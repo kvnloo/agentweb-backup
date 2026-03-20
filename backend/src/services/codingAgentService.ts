@@ -33,6 +33,7 @@ interface ApplyResult {
 type CallLLMFn = (model: string, messages: any[], options?: any) => Promise<any>;
 
 const DEFAULT_MAX_ITERATIONS = 30;
+const CODING_AGENT_MODEL = 'anthropic.claude-opus-4-6-v1';
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
@@ -377,7 +378,7 @@ export async function runCodingAgent(
       }
 
       // Call LLM
-      const response = await callLLM(context.llmModel, messages, {
+      const response = await callLLM(CODING_AGENT_MODEL, messages, {
         tools,
         tool_choice: 'auto',
         max_completion_tokens: 16384,
