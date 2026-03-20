@@ -7,6 +7,7 @@ import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
+import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -1653,7 +1654,8 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, ClickUp tasks (with attachments), and Foreplay ad library (saved ads and boards). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Foreplay Ad Library**: When creating new ads or looking for ad inspiration, search the knowledge base for Foreplay ads. Foreplay boards and swipefile ads appear as knowledge base entries with identifiers like "foreplay-board:BOARD_ID" and "foreplay-swipefile". Read individual ads to get full ad copy, headlines, CTAs, formats, and video transcriptions that can serve as seed ads.
 - **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
@@ -11540,6 +11542,72 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Search Foreplay ads (swipefile + boards — name/description/headline match)
+      if (userId) {
+        try {
+          const foreplayToken = await getForeplayAccessToken(userId);
+          if (foreplayToken) {
+            const queryLower = query.toLowerCase();
+            let foreplayResultCount = 0;
+
+            // Search swipefile ads
+            try {
+              const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+              for (const ad of swipeResult.ads) {
+                if (foreplayResultCount >= limitedMaxResults) break;
+                const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+                const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+                const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+                const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+                if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                  const content = formatForeplayAdAsMarkdown(ad);
+                  results.push({
+                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                    source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                  });
+                  foreplayResultCount++;
+                }
+              }
+            } catch (swipeErr) {
+              console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+            }
+
+            // Search board ads
+            try {
+              const boards = await listForeplayBoards(foreplayToken);
+              for (const board of boards) {
+                if (foreplayResultCount >= limitedMaxResults) break;
+                try {
+                  const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+                  for (const ad of boardAds) {
+                    if (foreplayResultCount >= limitedMaxResults) break;
+                    const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+                    const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+                    const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+                    const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+                    if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                      const content = formatForeplayAdAsMarkdown(ad);
+                      results.push({
+                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                        source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                      });
+                      foreplayResultCount++;
+                    }
+                  }
+                } catch (boardErr) {
+                  console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
+                }
+              }
+            } catch (boardsErr) {
+              console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+            }
+          }
+        } catch (foreplayError) {
+          console.log('AgentMode: Error searching Foreplay ads:', foreplayError);
+          // Don't fail the whole search if Foreplay search fails
+        }
+      }
+
       if (results.length === 0) {
         return {
           success: true,
@@ -11731,6 +11799,72 @@ Format the response as JSON with this structure:
         console.error('AgentMode: Error listing ClickUp tasks:', clickUpError);
       }
 
+      // Include Foreplay boards and swipefile
+      try {
+        const foreplayToken = await getForeplayAccessToken(userId);
+        if (foreplayToken) {
+          // Add swipefile
+          try {
+            const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+            if (swipeResult.ads.length > 0) {
+              const swipeFiles = swipeResult.ads.map(ad => ({
+                fileName: ad.name || ad.headline || ad.id,
+                fileSize: 0,
+                adId: ad.id,
+                brandName: ad.brandName,
+                displayFormat: ad.displayFormat,
+                publisherPlatform: ad.publisherPlatform,
+                live: ad.live,
+                savedAt: ad.savedAt,
+              }));
+
+              knowledgeBases.push({
+                identifier: 'foreplay-swipefile',
+                name: 'Foreplay - Swipe File',
+                type: 'foreplay-swipefile',
+                updatedAt: undefined,
+                files: swipeFiles,
+              });
+            }
+          } catch (swipeErr) {
+            console.log('AgentMode: Error listing Foreplay swipefile:', swipeErr);
+          }
+
+          // Add boards
+          try {
+            const boards = await listForeplayBoards(foreplayToken);
+            for (const board of boards) {
+              try {
+                const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+                const boardFiles = boardAds.map(ad => ({
+                  fileName: ad.name || ad.headline || ad.id,
+                  fileSize: 0,
+                  adId: ad.id,
+                  brandName: ad.brandName,
+                  displayFormat: ad.displayFormat,
+                  publisherPlatform: ad.publisherPlatform,
+                  live: ad.live,
+                }));
+
+                knowledgeBases.push({
+                  identifier: `foreplay-board:${board.id}`,
+                  name: `Foreplay Board - ${board.name}`,
+                  type: 'foreplay-board',
+                  updatedAt: undefined,
+                  files: boardFiles,
+                });
+              } catch (boardErr) {
+                console.log(`AgentMode: Error listing Foreplay board ${board.name}:`, boardErr);
+              }
+            }
+          } catch (boardsErr) {
+            console.log('AgentMode: Error listing Foreplay boards:', boardsErr);
+          }
+        }
+      } catch (foreplayError) {
+        console.error('AgentMode: Error listing Foreplay ads:', foreplayError);
+      }
+
       const totalFiles = knowledgeBases.reduce(
         (sum: number, kb: any) => sum + (kb.files?.length || 0),
         0
@@ -11748,7 +11882,7 @@ Format the response as JSON with this structure:
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles
@@ -11893,6 +12027,11 @@ Format the response as JSON with this structure:
     // Handle ClickUp docs (identifier starts with "clickup:")
     if (kbIdentifier.startsWith('clickup:')) {
       return await this.readClickUpSharedDoc(kbIdentifier, fileName, userId);
+    }
+
+    // Handle Foreplay ads (identifier starts with "foreplay-board:" or "foreplay-swipefile")
+    if (kbIdentifier.startsWith('foreplay-board:') || kbIdentifier === 'foreplay-swipefile') {
+      return await this.readForeplayAd(kbIdentifier, fileName, userId);
     }
 
     // Get the task
@@ -12177,6 +12316,63 @@ Format the response as JSON with this structure:
       return {
         success: false,
         message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Helper: read a Foreplay ad from swipefile or a board
+  private async readForeplayAd(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    try {
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return { success: false, message: 'Foreplay not connected' };
+      }
+
+      let ads: ForeplayAd[] = [];
+      let sourceName = '';
+
+      if (kbIdentifier === 'foreplay-swipefile') {
+        const result = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+        ads = result.ads;
+        sourceName = 'Swipe File';
+      } else if (kbIdentifier.startsWith('foreplay-board:')) {
+        const boardId = kbIdentifier.replace('foreplay-board:', '');
+        ads = await getAllForeplayBoardAds(foreplayToken, boardId);
+        sourceName = `Board ${boardId}`;
+      }
+
+      // Find the ad by name, headline, or ID
+      const ad = ads.find(a =>
+        (a.name && a.name === fileName) ||
+        (a.headline && a.headline === fileName) ||
+        a.id === fileName
+      );
+
+      if (!ad) {
+        return { success: false, message: `Ad "${fileName}" not found in Foreplay ${sourceName}` };
+      }
+
+      const content = formatForeplayAdAsMarkdown(ad);
+      const maxContentLength = 50000;
+      const truncated = content.length > maxContentLength
+        ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : content;
+
+      return {
+        success: true,
+        message: `Successfully read Foreplay ad "${fileName}"`,
+        kb_identifier: kbIdentifier,
+        file_name: fileName,
+        name: ad.brandName || 'Unknown Brand',
+        content: truncated,
+        size: content.length,
+        type: kbIdentifier === 'foreplay-swipefile' ? 'foreplay-swipefile' : 'foreplay-board',
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading Foreplay ad:', error);
+      return {
+        success: false,
+        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }
