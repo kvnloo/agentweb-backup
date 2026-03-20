@@ -9632,9 +9632,26 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Keys that indicate a destination/creative content change rather than an ad-level change.
+   * When these are present in params, we need to create a new creative and swap it.
+   */
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type'];
+
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      // Detect if params contain creative content keys that require a creative swap
+      const creativeKeys = Object.keys(params).filter(k =>
+        AgentModeService.CREATIVE_CONTENT_KEYS.includes(k)
+      );
+
+      if (creativeKeys.length > 0) {
+        return await this.updateAdViaCreativeSwap(accessToken, accountId, adId, params, creativeKeys);
+      }
+
+      // Standard ad-level update (status, name, etc.)
       await metaService.updateAd(accessToken, adId, params);
       return {
         success: true,
@@ -9644,10 +9661,150 @@ Format the response as JSON with this structure:
       console.error('AgentMode: Error updating Meta ad:', error);
       return {
         success: false,
-        message: error.message || 'Failed to update Meta ad.',
+        message: this.enrichMetaError(error, 'update Meta ad'),
         error: error.message
       };
     }
+  }
+
+  /**
+   * Updates an ad's creative content (destination URL, copy, images, etc.) by:
+   * 1. Fetching the ad to get its current creative_id
+   * 2. Fetching the creative to get its object_story_spec
+   * 3. Creating a new creative with the updated fields
+   * 4. Updating the ad to reference the new creative
+   */
+  private async updateAdViaCreativeSwap(
+    accessToken: string,
+    accountId: string,
+    adId: string,
+    params: any,
+    creativeKeys: string[]
+  ): Promise<any> {
+    console.log(`AgentMode: Detected creative content update for ad ${adId}. Keys: ${creativeKeys.join(', ')}. Using creative swap approach.`);
+
+    // Step 1: Fetch the ad to get its creative_id
+    const adData = await metaService.getAd(accessToken, adId);
+    const oldCreativeId = adData?.creative?.creative_id || adData?.creative?.id;
+    if (!oldCreativeId) {
+      return {
+        success: false,
+        message: 'Could not determine the current creative for this ad. The ad may not have a creative assigned.',
+        error: 'MISSING_CREATIVE'
+      };
+    }
+    console.log(`AgentMode: Ad ${adId} currently uses creative ${oldCreativeId}`);
+
+    // Step 2: Fetch the creative's full details
+    const creativeData = await metaService.getAdCreative(accessToken, oldCreativeId);
+    if (!creativeData?.object_story_spec) {
+      return {
+        success: false,
+        message: 'Could not read the current creative details. The creative may have been deleted or is in an unsupported format.',
+        error: 'MISSING_OBJECT_STORY_SPEC'
+      };
+    }
+
+    // Step 3: Build new creative params from existing creative + updated fields
+    const existingSpec = creativeData.object_story_spec;
+    const pageId = existingSpec.page_id;
+
+    // Normalize destination param names → link_url
+    const newLinkUrl = params.link_url || params.destination || params.url;
+
+    // Determine current creative type and extract existing fields
+    let newCreativeParams: any;
+
+    if (existingSpec.video_data) {
+      // Video creative
+      const vd = existingSpec.video_data;
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (updated)`,
+        page_id: pageId,
+        video_id: params.video_id || vd.video_id,
+        image_hash: params.image_hash || vd.image_hash,
+        image_url: params.image_url || vd.image_url,
+        body: params.body || vd.message || creativeData.body || '',
+        title: params.title || vd.title || creativeData.title || '',
+        link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
+        call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+      };
+    } else if (existingSpec.link_data?.child_attachments) {
+      // Carousel creative – update the main link and optionally per-card links
+      const ld = existingSpec.link_data;
+      const updatedCards = ld.child_attachments.map((card: any) => ({
+        image_hash: card.image_hash,
+        image_url: card.picture || card.image_url,
+        video_id: card.video_id,
+        title: card.name || card.title,
+        description: card.description,
+        link_url: newLinkUrl || card.link,
+      }));
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (updated)`,
+        page_id: pageId,
+        body: params.body || ld.message || creativeData.body || '',
+        title: params.title || '',
+        link_url: newLinkUrl || ld.link || '',
+        carousel_cards: updatedCards,
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+      };
+    } else if (existingSpec.link_data) {
+      // Single image creative
+      const ld = existingSpec.link_data;
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (updated)`,
+        page_id: pageId,
+        image_hash: params.image_hash || ld.image_hash,
+        image_url: params.image_url || ld.picture || ld.image_url,
+        body: params.body || ld.message || creativeData.body || '',
+        title: params.title || ld.name || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+      };
+    } else {
+      return {
+        success: false,
+        message: 'Unsupported creative type. Cannot determine the creative structure from object_story_spec.',
+        error: 'UNSUPPORTED_CREATIVE_TYPE'
+      };
+    }
+
+    console.log(`AgentMode: Creating new creative with updated fields for ad ${adId}:`, newCreativeParams);
+
+    // Create the new creative
+    const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);
+    const newCreativeId = newCreative?.id;
+    if (!newCreativeId) {
+      return {
+        success: false,
+        message: 'Failed to create updated creative. The Meta API did not return a creative ID.',
+        error: 'CREATIVE_CREATE_FAILED'
+      };
+    }
+
+    console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
+
+    // Step 4: Update the ad to use the new creative
+    await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+
+    // Also apply any ad-level params (status, name) that were provided alongside creative content
+    const adLevelParams: any = {};
+    for (const key of Object.keys(params)) {
+      if (!AgentModeService.CREATIVE_CONTENT_KEYS.includes(key) && key !== 'name') {
+        adLevelParams[key] = params[key];
+      }
+    }
+    if (Object.keys(adLevelParams).length > 0) {
+      await metaService.updateAd(accessToken, adId, adLevelParams);
+    }
+
+    return {
+      success: true,
+      message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} and swapped it in for the old creative (${oldCreativeId}).`,
+      old_creative_id: oldCreativeId,
+      new_creative_id: newCreativeId,
+    };
   }
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {

@@ -744,6 +744,41 @@ export class MetaService {
   }
 
   /**
+   * Get a single ad with its creative reference
+   */
+  public async getAd(accessToken: string, adId: string) {
+    try {
+      this.initApi(accessToken);
+      const ad = new Ad(adId);
+      const fields = ['id', 'name', 'status', 'adset_id', 'campaign_id', 'creative'];
+      this.log(`Fetching ad: ${adId}`);
+      const result = await ad.get(fields);
+      return result._data;
+    } catch (error) {
+      return this.handleError(error, 'getAd');
+    }
+  }
+
+  /**
+   * Get a single ad creative with full details including object_story_spec
+   */
+  public async getAdCreative(accessToken: string, creativeId: string) {
+    try {
+      this.initApi(accessToken);
+      const creative = new AdCreative(creativeId);
+      const fields = [
+        'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
+        'object_type', 'object_story_spec', 'url_tags'
+      ];
+      this.log(`Fetching ad creative: ${creativeId}`);
+      const result = await creative.get(fields);
+      return result._data;
+    } catch (error) {
+      return this.handleError(error, 'getAdCreative');
+    }
+  }
+
+  /**
    * Update ad
    */
   public async updateAd(accessToken: string, adId: string, params: any) {
