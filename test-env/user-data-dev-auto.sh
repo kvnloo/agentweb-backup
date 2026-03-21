@@ -343,7 +343,7 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
-OUTPUT=$(claude -p --permission-mode auto "$(cat .claude-prompt)" 2>&1)
+OUTPUT=$(claude --model opus --permission-mode auto -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
