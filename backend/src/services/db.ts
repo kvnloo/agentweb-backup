@@ -846,8 +846,17 @@ export const taskDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      const tasks = result.Items || [];
+      // Paginate through all results (DynamoDB returns max 1MB per query)
+      let tasks: any[] = [];
+      let lastEvaluatedKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        }).promise();
+        tasks.push(...(result.Items || []));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
 
       // Get latest execution, schedules and subscribers for each task
       const tasksWithDetails = await Promise.all(
