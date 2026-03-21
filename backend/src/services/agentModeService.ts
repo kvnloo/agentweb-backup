@@ -1596,6 +1596,12 @@ export class AgentModeService {
       ## Account Memory
       You have long-term memory that persists across sessions. Use \`save_memory\` to remember important facts about this account (preferences, decisions, insights, workflow patterns). Your recent memories are loaded automatically at the start of each session. Be selective — only save facts that would be valuable in future sessions.
 
+      ## Browser Automation & CAPTCHA Handling
+      When using browser tools for web automation:
+      - **Stealth Init**: At the start of any browser session (before navigating to websites), call \`stealth_browser_init\` once to reduce CAPTCHA triggers. This patches browser fingerprints to appear more like a regular user.
+      - **Live View**: The user can see your browser screen in real-time as you work. Every navigation, click, and form fill is automatically captured and shown to the user.
+      - **CAPTCHA/Blocks**: If you encounter a CAPTCHA, access block, or any challenge page, tell the user what you see and ask how they would like to proceed. Options include: trying an alternative URL, skipping the page, or waiting for guidance. Do NOT repeatedly retry a page that is blocking you.
+
       ## Your Approach: The "Analyze-Install-Execute" Protocol
       You have a dynamic skill set. To fulfill **ANY** user request, you must strictly follow this workflow:
       ### 1. ANALYZE (Think Through the Complete Task)

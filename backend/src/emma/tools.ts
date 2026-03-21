@@ -6,6 +6,9 @@ import { getAccountSummary } from '../services/accountSummaryService';
 // Register browser cookie persistence tools
 import './browserCookieTools';
 
+// Register browser stealth and CAPTCHA tools
+import './captchaTools';
+
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {

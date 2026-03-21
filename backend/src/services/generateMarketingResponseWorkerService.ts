@@ -142,9 +142,11 @@ export class GenerateMarketingResponseWorkerService {
       if (message.type === 'socketEmit') {
         try {
           const { io } = require('../server');
+          const room = io.sockets.adapter.rooms.get(message.room);
+          console.log(`[Parent-IPC] socketEmit received: event=${message.event}, room=${message.room}, roomExists=${!!room}, roomSize=${room?.size || 0}, payloadKeys=${Object.keys(message.payload || {}).join(',')}`);
           io.to(message.room).emit(message.event, message.payload);
-        } catch {
-          // Socket.IO not available (shouldn't happen in main process)
+        } catch (err: any) {
+          console.error(`[Parent-IPC] socketEmit error:`, err.message);
         }
         return;
       }

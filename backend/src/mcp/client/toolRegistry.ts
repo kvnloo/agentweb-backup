@@ -7,7 +7,9 @@ export interface ToolContext {
    * Reference to the AgentModeService to access its helper methods
    * during the transition period.
    */
-  service: any; 
+  service: any;
+  /** Socket.IO emit function for real-time events (browser viewport updates, etc.) */
+  socketEmit?: (room: string, event: string, payload: any) => void;
 }
 
 export interface AgentTool {

@@ -11,6 +11,24 @@ import { internalMcpServers } from "./mcp_config";
 import * as fs from "fs";
 import * as path from "path";
 
+// Browser tools that visually change the page — auto-screenshot after these
+const BROWSER_VISUAL_TOOLS = new Set([
+  'browser_navigate',
+  'browser_navigate_back',
+  'browser_click',
+  'browser_fill_form',
+  'browser_type',
+  'browser_press_key',
+  'browser_select_option',
+  'browser_hover',
+  'browser_drag',
+  'browser_file_upload',
+  'browser_handle_dialog',
+  'browser_run_code',
+  'browser_evaluate',
+  'browser_wait_for',
+]);
+
 // SSE transport configuration
 export interface SseTransportConfig {
   transport: "sse";
@@ -826,6 +844,16 @@ export class McpClientService {
               .map((c: any) => c.text)
               .join('\n');
 
+            // Auto-screenshot: after visual browser actions, capture screenshot and emit to client
+            const isVisualTool = BROWSER_VISUAL_TOOLS.has(originalToolName);
+            console.log(`MCP: Tool ${originalToolName} completed. isVisualTool=${isVisualTool}, hasSocketEmit=${!!context.socketEmit}`);
+            if (isVisualTool && context.socketEmit) {
+              console.log(`MCP: Triggering auto-screenshot after ${originalToolName}`);
+              this.emitBrowserScreenshot(sessionClient, context).catch(err => {
+                console.warn(`MCP: Auto-screenshot failed after ${originalToolName}:`, err.message);
+              });
+            }
+
             return {
               content,
               raw: result
@@ -838,6 +866,59 @@ export class McpClientService {
       };
 
       this.mcpTools.push(agentTool);
+    }
+  }
+
+  /**
+   * Auto-captures a screenshot after a browser action and emits it to the client via Socket.IO.
+   * Runs async (fire-and-forget) to avoid slowing down tool execution.
+   */
+  private async emitBrowserScreenshot(sessionClient: Client, context: ToolContext): Promise<void> {
+    const userRoom = `user:${context.userId}`;
+    console.log(`MCP: emitBrowserScreenshot called for room ${userRoom}, session ${context.sessionId}`);
+    const result = await sessionClient.callTool(
+      { name: 'browser_take_screenshot', arguments: {} },
+      undefined,
+      { timeout: 10000 }
+    );
+
+    const contentArray = (result.content as any[]) || [];
+    console.log(`MCP: Screenshot result content types: ${contentArray.map((c: any) => c.type).join(', ')}`);
+
+    // Look for base64 image data in the response
+    const imageBlock = contentArray.find((c: any) => c.type === 'image');
+    if (imageBlock && context.socketEmit) {
+      console.log(`MCP: Emitting browser-viewport-update with image block (${imageBlock.data?.length || 0} chars base64)`);
+      context.socketEmit(userRoom, 'browser-viewport-update', {
+        sessionId: context.sessionId,
+        imageData: `data:${imageBlock.mimeType || 'image/png'};base64,${imageBlock.data}`,
+        timestamp: Date.now()
+      });
+      return;
+    }
+
+    // Fallback: check if screenshot was saved to output dir and referenced in text
+    const textBlock = contentArray.find((c: any) => c.type === 'text');
+    if (textBlock?.text && context.socketEmit) {
+      console.log(`MCP: Screenshot text content: ${textBlock.text.substring(0, 200)}`);
+      // Playwright MCP may save to --output-dir and reference the path
+      const pathMatch = textBlock.text.match(/\/tmp\/playwright-screenshots\/[^\s"')]+/);
+      if (pathMatch) {
+        console.log(`MCP: Found screenshot file path: ${pathMatch[0]}`);
+        try {
+          const fs = await import('fs');
+          const data = fs.readFileSync(pathMatch[0]);
+          const base64 = data.toString('base64');
+          console.log(`MCP: Emitting browser-viewport-update from file (${base64.length} chars base64)`);
+          context.socketEmit(userRoom, 'browser-viewport-update', {
+            sessionId: context.sessionId,
+            imageData: `data:image/png;base64,${base64}`,
+            timestamp: Date.now()
+          });
+        } catch (err) {
+          console.warn(`MCP: Failed to read screenshot file: ${err}`);
+        }
+      }
     }
   }
 
