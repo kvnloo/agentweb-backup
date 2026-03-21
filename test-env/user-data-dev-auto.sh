@@ -343,7 +343,7 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
-OUTPUT=$(claude -p "$(cat .claude-prompt)" 2>&1)
+OUTPUT=$(claude -p --permission-mode auto "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
@@ -360,7 +360,7 @@ with open('/tmp/.claude-output.txt', 'r', errors='replace') as f:
     text = f.read()
 if len(text) > 9900:
     text = text[:9900] + '\n\n...(truncated)'
-chunks = [{'text': {'content': text[i:i+2000]}} for i in range(0, len(text), 2000)]
+chunks = [{'text': {'content': text[i:i+1900]}} for i in range(0, len(text), 1900)]
 if not chunks:
     chunks = [{'text': {'content': '(no output)'}}]
 print(json.dumps({'parent': {'page_id': sys.argv[1]}, 'rich_text': chunks}))

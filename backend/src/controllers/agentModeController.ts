@@ -489,32 +489,38 @@ export async function runVerifiedChat(
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
   let sessionModel = sessionForModel?.llmModel;
   const normalizedStartingMessage = startingMessage.toLowerCase();
-  const shouldUseReportGenerationModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content' || reqFunc.functionName === 'create_blog_article'
-  ));
-  const shouldUseImageGenerationModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'generate_image'
-  ));
-  const shouldUseVideoGenerationModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'generate_video'
-  ));
-  if (shouldUseReportGenerationModel) {
-    const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
-    if (sessionModel !== reportGenModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel);
-      sessionModel = reportGenModel;
-    }
-  } else if (shouldUseImageGenerationModel) {
-    const imageGenModel = await agentModeService.getImageGenerationDefaultModel();
-    if (sessionModel !== imageGenModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel);
-      sessionModel = imageGenModel;
-    }
-  } else if (shouldUseVideoGenerationModel) {
-    const videoGenModel = await agentModeService.getVideoGenerationDefaultModel();
-    if (sessionModel !== videoGenModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel);
-      sessionModel = videoGenModel;
+
+  // Only apply task-type model overrides when no explicit model was provided.
+  // When params.llmModel is set (e.g. from a scheduled chat's configured model),
+  // respect the caller's choice instead of overriding based on required functions.
+  if (!params.llmModel) {
+    const shouldUseReportGenerationModel = requiredFunctions.some((reqFunc) => (
+      reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content' || reqFunc.functionName === 'create_blog_article'
+    ));
+    const shouldUseImageGenerationModel = requiredFunctions.some((reqFunc) => (
+      reqFunc.functionName === 'generate_image'
+    ));
+    const shouldUseVideoGenerationModel = requiredFunctions.some((reqFunc) => (
+      reqFunc.functionName === 'generate_video'
+    ));
+    if (shouldUseReportGenerationModel) {
+      const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
+      if (sessionModel !== reportGenModel) {
+        await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel);
+        sessionModel = reportGenModel;
+      }
+    } else if (shouldUseImageGenerationModel) {
+      const imageGenModel = await agentModeService.getImageGenerationDefaultModel();
+      if (sessionModel !== imageGenModel) {
+        await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel);
+        sessionModel = imageGenModel;
+      }
+    } else if (shouldUseVideoGenerationModel) {
+      const videoGenModel = await agentModeService.getVideoGenerationDefaultModel();
+      if (sessionModel !== videoGenModel) {
+        await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel);
+        sessionModel = videoGenModel;
+      }
     }
   }
   const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();

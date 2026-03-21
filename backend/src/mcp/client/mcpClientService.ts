@@ -264,13 +264,15 @@ export class McpClientService {
 
   /**
    * Get or create a client for a specific chat session.
-   * For servers with per-user secret placeholders, uses userId to create
-   * user-specific pool keys so different users get different processes/tokens.
+   * Uses userId as pool key so the same user shares MCP clients (e.g. browser)
+   * across chat sessions, avoiding "browser in use" lock conflicts.
+   * Different users still get separate clients for security isolation.
    */
   private async getSessionClient(serverName: string, chatSessionId: string, userId?: string): Promise<Client> {
     const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
-    // For servers with secret placeholders, use user-specific pool key
-    const poolKey = needsUserSecrets && userId ? `${chatSessionId}_${userId}` : chatSessionId;
+    // Pool by userId so same user shares one browser/MCP process across sessions.
+    // Fall back to chatSessionId if userId not available.
+    const poolKey = userId || chatSessionId;
 
     // Touch session to update last activity
     this.touchSession(poolKey);
@@ -348,7 +350,7 @@ export class McpClientService {
       }
     }
 
-    const transport = await this.createTransport(serverName, configForTransport);
+    const transport = await this.createTransport(serverName, configForTransport, poolKey);
     const client = new Client(
       {
         name: "AgentWeb-Backend",
@@ -487,12 +489,12 @@ export class McpClientService {
   /**
    * Creates the appropriate transport based on configuration
    */
-  public async createTransport(name: string, config: McpServerConfig): Promise<Transport> {
+  public async createTransport(name: string, config: McpServerConfig, poolKey?: string): Promise<Transport> {
     const transportType = getTransportType(config);
 
     switch (transportType) {
       case "stdio":
-        return this.createStdioTransport(name, config as StdioTransportConfig);
+        return this.createStdioTransport(name, config as StdioTransportConfig, poolKey);
       
       case "streamable-http":
         return this.createStreamableHttpTransport(name, config as StreamableHttpTransportConfig);
@@ -552,7 +554,7 @@ export class McpClientService {
   /**
    * Creates Stdio transport (for local subprocess MCP servers)
    */
-  private createStdioTransport(name: string, config: StdioTransportConfig): Transport {
+  private createStdioTransport(name: string, config: StdioTransportConfig, poolKey?: string): Transport {
     const resolvedCommand = resolveEnvPlaceholders(config.command);
     const resolvedArgs = config.args?.map(arg => resolveEnvPlaceholders(arg)) || [];
 
@@ -565,7 +567,12 @@ export class McpClientService {
       if (!resolvedArgs.includes('--no-sandbox')) {
         resolvedArgs.push('--no-sandbox');
       }
-      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox for ${name}`);
+      // Give each user a separate browser profile to avoid "browser already in use" conflicts
+      if (poolKey && !resolvedArgs.some(arg => arg.startsWith('--user-data-dir'))) {
+        const userDataDir = `/tmp/playwright-users/${poolKey}`;
+        resolvedArgs.push(`--user-data-dir=${userDataDir}`);
+      }
+      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox for ${name}${poolKey ? ` (user data dir: /tmp/playwright-users/${poolKey.substring(0, 8)}...)` : ''}`);
     }
 
     // Resolve environment variables in the env config

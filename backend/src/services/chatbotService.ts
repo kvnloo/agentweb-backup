@@ -6,7 +6,6 @@ import path from "path";
 import { getGuide } from "../controllers/guide";
 import { getReleases } from "../controllers/release";
 import { getApiDocs } from "../controllers/api";
-import { getUserGuide } from "../controllers/user-guide";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
 import { EngineServiceClient } from '@google-cloud/discoveryengine';
@@ -2766,7 +2765,6 @@ async function loadKnowledgeBase(): Promise<void> {
     { controller: getGuide, source: "guide" },
     { controller: getReleases, source: "release" },
     { controller: getApiDocs, source: "api" },
-    { controller: getUserGuide, source: "user-guide" },
     { controller: getUserReleaseNotes, source: "user-release" },
   ];
 
@@ -2810,22 +2808,6 @@ async function loadKnowledgeBase(): Promise<void> {
         let content = "";
 
         if (endpoint.source === "guide" || endpoint.source === "api") {
-          for (const section of mockResponse.data.data) {
-            content += `${section.title}\n`;
-            for (const paragraph of section.content) {
-              content += `${paragraph}\n`;
-            }
-            if (section.subsections) {
-              for (const subsection of section.subsections) {
-                content += `${subsection.title}\n`;
-                for (const paragraph of subsection.content) {
-                  content += `${paragraph}\n`;
-                }
-              }
-            }
-            content += "\n";
-          }
-        } else if (endpoint.source === "user-guide") {
           for (const section of mockResponse.data.data) {
             content += `${section.title}\n`;
             for (const paragraph of section.content) {
@@ -2990,7 +2972,7 @@ Use this to give SPECIFIC UI guidance. Example: "Click the 'Save Brand Colors' b
 
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
-I will provide you with relevant information from the Customer Portal User Guide to help answer questions. Please use this information when responding to user queries.
+When users ask about how to use the portal, need help with features, or have questions about functionality, use the **search_user_guide** tool to look up the relevant information from the user guide. This fetches the latest content directly from the Notion-based user guide.
 
 When appropriate, you can suggest users explore specific features of the portal mentioned in the guide.
 
@@ -3461,10 +3443,9 @@ export async function generateChatResponse(
     if (portalType === "customer") {
       activeKnowledgeBase = knowledgeBase.filter(
         (chunk) =>
-          chunk.metadata.source === "user-guide" ||
           chunk.metadata.source === "user-release"
       );
-      // Combine user-guide and user-release chunks with page chunks
+      // Combine user-release chunks with page chunks
       combinedChunks = [...pageChunksResult, ...activeKnowledgeBase];
     } else {
       // Partner portal (or default)
@@ -3560,6 +3541,8 @@ export async function generateChatResponse(
           'read_page_source',
           'get_visual_context',
           'enrich_leads_preview', 'enrich_leads_execute',
+          'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
+          'search_user_guide',
         ];
 
         // Page-aware tool injection based on the current page URL

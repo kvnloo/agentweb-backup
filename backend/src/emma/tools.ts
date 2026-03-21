@@ -3,6 +3,9 @@ import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
 
+// Register browser cookie persistence tools
+import './browserCookieTools';
+
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
@@ -4565,6 +4568,48 @@ for (const toolName of bridgedToolNames) {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }
+
+// ─── Coding Agent tool (sub-agent for code editing tasks) ───────────────────
+emmaToolRegistry.register({
+  name: 'coding_agent',
+  definition: {
+    name: 'coding_agent',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent can read files, make precise diff-based edits, check deployment status, and iterate on build errors autonomously. Use this for ANY task that involves modifying landing page code (HTML, CSS, JS/TSX, config files). The agent runs autonomously and returns results when done. Do NOT use edit_landing_page_file directly — use this tool instead for all code changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: {
+          type: 'string',
+          description: 'The landing page ID to edit'
+        },
+        task_description: {
+          type: 'string',
+          description: 'Detailed description of what code changes to make. Include specific requirements, file paths if known, and any context about the desired outcome. Be as specific as possible.'
+        }
+      },
+      required: ['page_id', 'task_description']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const { runCodingAgent } = await import('../services/codingAgentService');
+    const result = await runCodingAgent(
+      args.task_description,
+      {
+        pageId: args.page_id,
+        userId: context?.userId,
+        sessionId: context?.sessionId,
+        llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
+        socketEmit: context?.socketEmit,
+      },
+      context?.service?.callLLM?.bind(context.service)
+    );
+    if (result.success) {
+      return { success: true, message: result.message, iterations: result.iterations };
+    } else {
+      return { success: false, error: result.message, iterations: result.iterations };
+    }
+  }
+});
 
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);

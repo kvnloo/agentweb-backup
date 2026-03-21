@@ -1922,6 +1922,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
     const mode = (req.query.mode as string || 'preview').toLowerCase();
     const socketId = req.body.socketId;
     const forceRematch = req.body.forceRematch === true;
+    const leadIds: string[] | undefined = Array.isArray(req.body.leadIds) ? req.body.leadIds : undefined;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -1976,21 +1977,26 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       lastKey = result.lastEvaluatedKey;
     } while (lastKey);
 
+    // Filter by specific leadIds if provided
+    const leadPool = leadIds && leadIds.length > 0
+      ? allLeads.filter(lead => leadIds.includes(lead.leadId))
+      : allLeads;
+
     // Filter leads based on forceRematch flag
     const leadsToProcess = forceRematch
-      ? allLeads // Process all leads if force rematch
-      : allLeads.filter(lead => !lead.icpMatch); // Only unmatched leads by default
+      ? leadPool // Process all leads if force rematch
+      : leadPool.filter(lead => !lead.icpMatch); // Only unmatched leads by default
 
-    const unmatchedLeads = allLeads.filter(lead => !lead.icpMatch);
+    const unmatchedLeads = leadPool.filter(lead => !lead.icpMatch);
 
     console.log(`[ICP Match] Found ${leadsToProcess.length} leads to process (forceRematch: ${forceRematch}). ${unmatchedLeads.length} unmatched, ${allLeads.length - unmatchedLeads.length} already matched.`);
 
     if (mode === 'preview') {
       return res.json({
         success: true,
-        totalLeads: allLeads.length,
+        totalLeads: leadPool.length,
         unmatchedLeads: unmatchedLeads.length,
-        matchedLeads: allLeads.length - unmatchedLeads.length,
+        matchedLeads: leadPool.length - unmatchedLeads.length,
         leadsToProcess: leadsToProcess.length,
         forceRematch,
       });
@@ -2181,6 +2187,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     const mode = (req.query.mode as string || 'preview').toLowerCase();
     const socketId = req.body.socketId;
     const forceEnrich = req.body.forceEnrich === true;
+    const leadIds: string[] | undefined = Array.isArray(req.body.leadIds) ? req.body.leadIds : undefined;
 
     if (!userId) {
       return res.status(401).json({ message: 'Unauthorized' });
@@ -2195,39 +2202,69 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       return res.status(403).json({ message: 'Access denied' });
     }
 
+    if (mode === 'suggest') {
+      const goal = typeof req.body.goal === 'string' ? req.body.goal.trim() : '';
+      if (!goal) {
+        return res.status(400).json({ message: 'goal is required' });
+      }
+      try {
+        const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+        const result = await CrmEnrichmentService.suggestEnrichment(goal);
+        return res.json({ success: true, instruction: result.instruction, outputFields: result.outputFields });
+      } catch (err: any) {
+        console.error('[CRM] suggestEnrichment failed:', err.message);
+        return res.status(502).json({ message: 'AI suggestion failed. Please try again.' });
+      }
+    }
+
+    const defaultInstruction = 'Write a 3-6 sentence company profile covering what they do, their industry, products, and notable context. If no good company information is available, return "Company information not found".';
+    const instruction: string = typeof req.body.instruction === 'string' && req.body.instruction.trim()
+      ? req.body.instruction.trim()
+      : defaultInstruction;
+    const outputFields: string[] = Array.isArray(req.body.outputFields) && req.body.outputFields.length > 0
+      ? req.body.outputFields
+      : ['web_company_info'];
+    const sources: ('web_search' | 'linkedin' | 'existing_data')[] =
+      Array.isArray(req.body.sources) && req.body.sources.length > 0
+        ? req.body.sources
+        : ['web_search'];
+
+    const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
+
     if (mode === 'preview') {
-      // Keep original preview response format for backward compatibility
-      const allLeads: any[] = [];
-      let lastKey: any = undefined;
-      do {
-        const result = await crmDb.getLeadsByListId(listId, undefined, lastKey);
-        allLeads.push(...(result.items || []));
-        lastKey = result.lastEvaluatedKey;
-      } while (lastKey);
-
-      const hasCompany = (lead: any) => typeof lead.company === 'string' && lead.company.trim().length > 0;
-      const hasWebCompanyInfo = (lead: any) => {
-        const value = lead?.customFields?.web_company_info;
-        return typeof value === 'string' && value.trim().length > 0;
-      };
-
-      const leadsWithCompany = allLeads.filter(hasCompany);
-      const alreadyEnrichedLeads = leadsWithCompany.filter(hasWebCompanyInfo);
-      const notEnrichedLeads = leadsWithCompany.filter((lead) => !hasWebCompanyInfo(lead));
-      const leadsToProcess = forceEnrich ? leadsWithCompany : notEnrichedLeads;
+      const service = new CrmEnrichmentService();
+      const result = await service.preview({
+        listId,
+        userId,
+        instruction,
+        outputFields,
+        sources,
+        forceOverwrite: forceEnrich,
+        leadIds,
+      });
 
       return res.json({
         success: true,
-        totalLeads: allLeads.length,
-        leadsWithCompany: leadsWithCompany.length,
-        alreadyEnrichedLeads: alreadyEnrichedLeads.length,
-        couldBeEnrichedLeads: notEnrichedLeads.length,
-        leadsToProcess: leadsToProcess.length,
-        forceEnrich,
+        totalLeads: result.totalLeads,
+        leadsToProcess: result.leadsToProcess,
+        alreadyEnrichedCount: result.alreadyEnriched,
+        sampleResults: result.samples.map(s => ({
+          leadId: s.leadId,
+          leadName: [s.lead.firstName, s.lead.lastName].filter(Boolean).join(' ') || s.lead.email || s.leadId,
+          fieldResults: s.enrichedFields,
+        })),
       });
     } else if (mode === 'enrich') {
-      const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
-      const result = await CrmEnrichmentService.enrichWebCompat(listId, userId, socketId, forceEnrich);
+      const service = new CrmEnrichmentService();
+      const result = await service.execute({
+        listId,
+        userId,
+        instruction,
+        outputFields,
+        sources,
+        forceOverwrite: forceEnrich,
+        leadIds,
+      }, socketId);
 
       return res.json({
         success: true,

@@ -33,6 +33,7 @@ export interface EnrichmentJobSpec {
   sources: ('web_search' | 'linkedin' | 'existing_data')[];
   filters?: { field: string; operator: string; value?: any }[];
   forceOverwrite?: boolean;
+  leadIds?: string[];
 }
 
 interface EnrichmentPreviewResult {
@@ -58,7 +59,7 @@ interface EnrichmentExecuteResult {
 }
 
 export class CrmEnrichmentService {
-  private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<{ allLeads: any[]; leadsToProcess: any[]; alreadyEnriched: number }> {
+  private async loadAndFilterLeads(spec: EnrichmentJobSpec): Promise<{ allLeads: any[]; leadsToProcess: any[]; alreadyEnriched: number; filteredTotal: number }> {
     const list = await crmDb.getLeadListById(spec.listId);
     if (!list) {
       throw new Error('Lead list not found');
@@ -73,10 +74,14 @@ export class CrmEnrichmentService {
       lastKey = result.lastEvaluatedKey;
     } while (lastKey);
 
+    // Filter by specific leadIds if provided
+    let filtered = spec.leadIds && spec.leadIds.length > 0
+      ? allLeads.filter(lead => spec.leadIds!.includes(lead.leadId))
+      : allLeads;
+
     // Apply filters
-    let filtered = allLeads;
     if (spec.filters && spec.filters.length > 0) {
-      filtered = allLeads.filter(lead => {
+      filtered = filtered.filter(lead => {
         return spec.filters!.every(filter => {
           const value = lead[filter.field] ?? lead?.customFields?.[filter.field];
           switch (filter.operator) {
@@ -103,7 +108,7 @@ export class CrmEnrichmentService {
       ? filtered
       : filtered.filter(lead => !hasAllFields(lead));
 
-    return { allLeads, leadsToProcess, alreadyEnriched };
+    return { allLeads, leadsToProcess, alreadyEnriched, filteredTotal: filtered.length };
   }
 
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
@@ -114,6 +119,30 @@ export class CrmEnrichmentService {
   }
 
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
+
+  private static buildFieldGuidance(outputFields: string[]): string {
+    const lines: string[] = [];
+    for (const field of outputFields) {
+      const fl = field.toLowerCase();
+      if (/employee|headcount|team_size|staff|workforce/.test(fl)) {
+        lines.push(`- "${field}": Prefer an exact number if found. A LinkedIn range (e.g. "11-50 employees") is also acceptable. If no explicit count is found, estimate a range based on how the company is described (solo/boutique → "1-10", early-stage startup → "11-50", growth-stage → "51-200", mid-market → "201-1000"). Only return "Unknown" if the company itself cannot be identified at all.`);
+      } else if (/funding|invest|raised|series|venture|round/.test(fl)) {
+        lines.push(`- "${field}": Look for VC rounds, grants, or angel investment mentions. If found, state the stage and amount (e.g. "Seed - $1.5M", "Series A - $8M"). If no funding info is found anywhere, return "Bootstrapped / Not publicly funded". Only return "Unknown" if the company cannot be confirmed to exist.`);
+      } else if (/revenue|arr|mrr|income|sales/.test(fl)) {
+        lines.push(`- "${field}": Look for revenue or ARR/MRR figures. If not publicly available, return "Not publicly disclosed".`);
+      } else if (/tech_stack|technology/.test(fl)) {
+        lines.push(`- "${field}": Look for technology mentions in search results or job postings. If not explicit, infer from product category. Return "Not publicly disclosed" if no signals found.`);
+      } else if (/industry|sector|vertical/.test(fl)) {
+        lines.push(`- "${field}": Always infer from the company description — never return "Unknown" for industry.`);
+      } else {
+        lines.push(`- "${field}": If not found directly, use the best available context to infer a reasonable value. Return "Unknown" only if no inference is possible.`);
+      }
+    }
+    if (lines.length === 0) {
+      return 'If you cannot determine a field\'s value from the provided data, use "Unknown" as the value.';
+    }
+    return `Field-specific guidance (follow these rules strictly):\n${lines.join('\n')}`;
+  }
 
   private async enrichLead(
     lead: any,
@@ -126,10 +155,12 @@ export class CrmEnrichmentService {
     // 1. Web search source
     if (spec.sources.includes('web_search')) {
       const companyName = String(lead.company || '').trim();
-      if (companyName) {
-        const webResult = await agentModeService.searchWeb(`${companyName} company overview`, 5);
+      const emailDomain = lead.email ? (String(lead.email).split('@')[1] || '').trim() : '';
+      const searchTerm = companyName || emailDomain;
+      if (searchTerm) {
+        const webResult = await agentModeService.searchWeb(`${searchTerm} company overview`, 5);
         if (webResult?.success && Array.isArray(webResult.results) && webResult.results.length > 0) {
-          webContext = `\nWeb search results for "${companyName}":\n${JSON.stringify(webResult.results, null, 2)}`;
+          webContext = `\nWeb search results for "${searchTerm}":\n${JSON.stringify(webResult.results, null, 2)}`;
         } else if (!webResult?.success) {
           const msg = webResult?.error || webResult?.message || '';
           if (!msg.toLowerCase().includes('no search results found')) {
@@ -210,7 +241,7 @@ JSON formatting rules (mandatory):
 - Do not wrap output in markdown or code fences
 - Do not include any text before or after the JSON object
 
-If you cannot determine a field's value from the provided data, use "Unknown" as the value.`;
+${CrmEnrichmentService.buildFieldGuidance(spec.outputFields)}`;
 
     const userPrompt = `Lead context:
 ${JSON.stringify(leadContext, null, 2)}
@@ -282,8 +313,52 @@ Valid example:
     return { fields };
   }
 
+  // Map of output field name patterns to standard lead field names
+  private static readonly STANDARD_FIELD_MAP: Record<string, string> = {
+    email: 'email',
+    first_name: 'firstName',
+    firstname: 'firstName',
+    first: 'firstName',
+    last_name: 'lastName',
+    lastname: 'lastName',
+    last: 'lastName',
+    company: 'company',
+    company_name: 'company',
+    phone: 'phone',
+    phone_number: 'phone',
+    title: 'title',
+    job_title: 'title',
+    linkedin: 'linkedin',
+    linkedin_url: 'linkedin',
+    notes: 'notes',
+  };
+
+  /**
+   * Split enriched fields into standard lead field updates and custom field updates.
+   * If an output field name matches a known standard field, it goes to the standard update;
+   * otherwise it goes to customFields.
+   */
+  private static splitFields(fields: Record<string, string>): {
+    standardUpdates: Record<string, string>;
+    customUpdates: Record<string, string>;
+  } {
+    const standardUpdates: Record<string, string> = {};
+    const customUpdates: Record<string, string> = {};
+
+    for (const [key, value] of Object.entries(fields)) {
+      const mapped = CrmEnrichmentService.STANDARD_FIELD_MAP[key.toLowerCase()];
+      if (mapped) {
+        standardUpdates[mapped] = value;
+      } else {
+        customUpdates[key] = value;
+      }
+    }
+
+    return { standardUpdates, customUpdates };
+  }
+
   async preview(spec: EnrichmentJobSpec): Promise<EnrichmentPreviewResult> {
-    const { allLeads, leadsToProcess, alreadyEnriched } = await this.loadAndFilterLeads(spec);
+    const { allLeads, leadsToProcess, alreadyEnriched, filteredTotal } = await this.loadAndFilterLeads(spec);
 
     // Process up to 2 samples
     const samples: EnrichmentPreviewResult['samples'] = [];
@@ -307,7 +382,7 @@ Valid example:
     }
 
     return {
-      totalLeads: allLeads.length,
+      totalLeads: spec.leadIds ? filteredTotal : allLeads.length,
       leadsToProcess: leadsToProcess.length,
       alreadyEnriched,
       samples,
@@ -387,11 +462,13 @@ Valid example:
       for (const lead of chunk) {
         try {
           const { fields } = await this.enrichLead(lead, spec, linkedInAccountId);
+          const { standardUpdates, customUpdates } = CrmEnrichmentService.splitFields(fields);
 
           await crmDb.updateLead(spec.listId, lead.leadId, {
+            ...standardUpdates,
             customFields: {
               ...(lead.customFields || {}),
-              ...fields,
+              ...customUpdates,
             },
           });
 
@@ -456,6 +533,53 @@ Valid example:
       outputFields: spec.outputFields,
       failureBreakdown,
       warnings: warnings.length > 0 ? warnings : undefined,
+    };
+  }
+
+  static async suggestEnrichment(goal: string): Promise<{ instruction: string; outputFields: string[] }> {
+    const systemPrompt = `You are a data enrichment specialist for a B2B CRM system.
+
+Given a user's enrichment goal or instruction, produce:
+
+1. An improved extraction instruction. Apply these rules:
+   - SHORT / VAGUE input (under ~80 words, no specific criteria or definitions): rewrite it into a precise 2-4 sentence extraction instruction.
+   - DETAILED input (contains specific criteria, named categories, thresholds, persona definitions, or examples): preserve the FULL content verbatim — do NOT summarize, shorten, or remove any criteria. You may lightly fix grammar or formatting, but every specific rule, definition, and threshold must remain in the output instruction exactly as given. NEVER replace specific definitions with vague phrases like "based on the provided criteria" — that loses the actual criteria.
+
+2. A list of output field names in snake_case — one field per distinct data point. Rules:
+   - Numeric values (employee count, revenue, dates, amounts) → always its own separate field
+   - Categorical / label values (funding stage, ICP category, industry, tier) → always its own separate field
+   - Prose summaries (profile, description, overview) → one field
+   - Never merge different data types — "a profile including industry and employee count" → THREE fields: company_profile + industry + employee_count
+   - Capture every distinct data point mentioned, including ones embedded inside a prose request (e.g. "last funding date" inside a funding description → last_funding_date field)
+
+Return ONLY valid JSON: { "instruction": "...", "outputFields": ["field1", "field2", ...] }
+No markdown, no backticks, no extra text.`;
+
+    const geminiClient = await agentModeService.getGeminiClient();
+    const completion = await geminiClient.chat.completions.create({
+      model: CrmEnrichmentService.ENRICH_MODEL,
+      temperature: 1,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Enrichment goal or instruction:\n${goal}` },
+      ],
+      response_format: { type: 'json_object' },
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || '';
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      console.warn('[CrmEnrichment] suggestEnrichment: failed to parse LLM response, falling back to original goal');
+      return { instruction: goal, outputFields: [] };
+    }
+
+    return {
+      instruction: typeof parsed.instruction === 'string' ? parsed.instruction.trim() : goal,
+      outputFields: Array.isArray(parsed.outputFields)
+        ? parsed.outputFields.filter((f: any) => typeof f === 'string' && f.trim())
+        : [],
     };
   }
 
