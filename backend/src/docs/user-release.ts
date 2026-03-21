@@ -10,6 +10,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-21',
     changes: [
+      'Fix: Landing Page Sub-Pages Now Verify Deployment Before Reporting Success',
+      '- When generating additional landing pages (e.g. ABM variants) into an existing site, the system now polls Vercel to verify the build succeeds before marking the page as "deployed"',
+      '- Previously, sub-pages were marked as "deployed" immediately after pushing code to GitHub, even if the Vercel build failed — resulting in broken URLs showing unformatted text or 404 errors',
+      '- If a build fails, the page now shows a "failed" status with the actual Vercel build error, making it easier to diagnose and fix',
       'Fix: Knowledge Base Files Not Visible in UI',
       '- Knowledge bases created via Emma (using attach_knowledge_base_files or update_knowledge_base_file) were not appearing on the Knowledge Base page',
       '- Root cause: the page only showed knowledge bases with main content size > 0, but file-only knowledge bases had size 0',
