@@ -93,6 +93,42 @@ For frontend and other changes, follow the existing testing strategy section bel
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
 
+### Rule 6: Worktrees for Net New Work
+
+**All net new work MUST be done in a git worktree**, never on the main working copy.
+
+1. If the repo has a remote, create a worktree before making changes
+2. Branch from `harsha/dev` (or the current development branch)
+3. Use descriptive worktree names: `fix/chat-history-limit`, `feat/auto-test-env`
+4. This prevents conflicts with other agents working in parallel
+5. After PR is merged, the worktree can be cleaned up
+
+### Rule 7: Auto Test Environment & Testing Plan on PR
+
+**After creating a PR**, the agent MUST:
+
+1. **Sync the test environment** (if one is active):
+   ```bash
+   ./test-env/test-env.sh status  # Check if test env is running
+   ./test-env/test-env.sh sync    # Sync the PR branch code
+   ```
+   If no test env is running and the changes require manual verification:
+   ```bash
+   ./test-env/test-env.sh launch --dev  # Launch a new one
+   ./test-env/test-env.sh sync          # Sync the code
+   ```
+
+2. **A testing plan is auto-generated** by the `test-env-pr.yml` GitHub Actions workflow and posted as a PR comment. This includes:
+   - Test environment URLs (staging + dev test env if applicable)
+   - Feature-specific manual verification checklists
+   - Regression checks
+   - The testing plan updates automatically when the PR is updated
+
+3. **The goal**: When the user returns, they should find:
+   - A PR with CI status
+   - A test environment ready with the PR code deployed
+   - A detailed testing plan comment telling them exactly what to verify
+
 ## CRITICAL: Working Directory Rule
 
 **NEVER navigate outside or reference files outside the current working directory.** The user has multiple clones of the same repo locally. Always use the working directory from the environment (shown in `<env>`) as the base path for ALL file operations. Do not hardcode or assume paths like `/Users/ruiwang/Documents/GitHub/agentweb/` — always use the actual working directory (e.g. `/Users/ruiwang/Documents/GitHub/agentweb3/`). Referencing the wrong clone will silently edit the wrong files.

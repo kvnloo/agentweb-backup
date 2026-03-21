@@ -1,0 +1,132 @@
+name: Test Environment & Testing Plan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  STAGING_BACKEND_URL: https://api-stage.agentweb.pro
+  STAGING_PARTNER_URL: https://partner-stage.agentweb.pro
+  STAGING_CUSTOMER_URL: https://app-stage.agentweb.pro
+
+jobs:
+  testing-plan:
+    name: Generate testing plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.event.pull_request.base.ref }} --depth=50
+
+      - name: Generate testing plan
+        id: plan
+        run: |
+          chmod +x scripts/generate-testing-plan.sh
+          PLAN=$(./scripts/generate-testing-plan.sh "origin/${{ github.event.pull_request.base.ref }}" "HEAD")
+
+          # Write to file for the comment step (handles multi-line)
+          echo "$PLAN" > /tmp/testing-plan.md
+
+      - name: Detect change areas
+        id: areas
+        run: |
+          CHANGED=$(git diff --name-only "origin/${{ github.event.pull_request.base.ref }}...HEAD")
+
+          HAS_BACKEND=false
+          HAS_CUSTOMER=false
+          HAS_PARTNER=false
+
+          echo "$CHANGED" | grep -q "^backend/" && HAS_BACKEND=true || true
+          echo "$CHANGED" | grep -q "^customer-portal/" && HAS_CUSTOMER=true || true
+          echo "$CHANGED" | grep -q "^partner-portal/" && HAS_PARTNER=true || true
+
+          echo "has_backend=$HAS_BACKEND" >> "$GITHUB_OUTPUT"
+          echo "has_customer=$HAS_CUSTOMER" >> "$GITHUB_OUTPUT"
+          echo "has_partner=$HAS_PARTNER" >> "$GITHUB_OUTPUT"
+
+      - name: Post testing plan comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('/tmp/testing-plan.md', 'utf8');
+            const hasBackend = '${{ steps.areas.outputs.has_backend }}' === 'true';
+            const hasCustomer = '${{ steps.areas.outputs.has_customer }}' === 'true';
+            const hasPartner = '${{ steps.areas.outputs.has_partner }}' === 'true';
+
+            // Build environment URLs section
+            let envSection = '## 🌐 Test Environment\n\n';
+
+            if (hasBackend) {
+              envSection += '**Backend auto-deploys to staging** after tests pass.\n\n';
+            }
+
+            envSection += '| Service | URL | Status |\n';
+            envSection += '|---------|-----|--------|\n';
+
+            if (hasBackend) {
+              envSection += `| Backend API | ${{ env.STAGING_BACKEND_URL }} | 🚀 Auto-deployed on PR |\n`;
+            }
+            if (hasCustomer) {
+              envSection += `| Customer Portal | ${{ env.STAGING_CUSTOMER_URL }} | ⚠️ Needs manual deploy or test-env sync |\n`;
+            }
+            if (hasPartner) {
+              envSection += `| Partner Portal | ${{ env.STAGING_PARTNER_URL }} | ⚠️ Needs manual deploy or test-env sync |\n`;
+            }
+
+            envSection += '\n';
+
+            // If a dev test-env is needed (frontend changes), add instructions
+            if (hasCustomer || hasPartner) {
+              envSection += '### Dev Test Environment (for frontend changes)\n\n';
+              envSection += 'Frontend changes need a dev test-env or manual staging deploy.\n';
+              envSection += 'To launch a dev test-env with this PR\'s code:\n\n';
+              envSection += '```bash\n';
+              envSection += `git checkout ${{ github.event.pull_request.head.ref }}\n`;
+              envSection += './test-env/test-env.sh launch --dev\n';
+              envSection += './test-env/test-env.sh sync\n';
+              envSection += '```\n\n';
+              envSection += 'Or if a test-env is already running:\n\n';
+              envSection += '```bash\n';
+              envSection += `git checkout ${{ github.event.pull_request.head.ref }}\n`;
+              envSection += './test-env/test-env.sh sync\n';
+              envSection += '```\n\n';
+            }
+
+            const fullBody = envSection + '\n---\n\n' + plan;
+
+            // Find existing testing plan comment (upsert)
+            const marker = '## 🌐 Test Environment';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+              console.log(`Updated testing plan comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+              console.log('Created new testing plan comment');
+            }
