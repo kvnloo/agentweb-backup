@@ -10,7 +10,7 @@ import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
-import { scoreSessionIfNeeded } from "../services/sessionScoringService";
+import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
@@ -4370,6 +4370,65 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
   } catch (error: any) {
     console.error("Error overriding satisfaction score:", error);
     res.status(500).json({ message: "Failed to update satisfaction score" });
+  }
+});
+
+// Score sessions with a custom judge
+router.post("/chat-sessions/judge-score", async (req, res) => {
+  try {
+    const { sessionIds, judgeId } = req.body;
+
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return res.status(400).json({ message: "sessionIds must be a non-empty array" });
+    }
+    if (sessionIds.length > 5) {
+      return res.status(400).json({ message: "Maximum 5 sessionIds per request" });
+    }
+    if (!judgeId || typeof judgeId !== "string") {
+      return res.status(400).json({ message: "judgeId is required" });
+    }
+
+    // Fetch judge config from settings
+    const setting = await settingsService.getSetting("scoring-judges");
+    if (!setting || !setting.settingValue) {
+      return res.status(404).json({ message: "No scoring judges configured" });
+    }
+
+    let judges: ScoringJudge[];
+    try {
+      judges = JSON.parse(setting.settingValue);
+    } catch {
+      return res.status(500).json({ message: "Invalid scoring judges configuration" });
+    }
+
+    const judge = judges.find((j) => j.id === judgeId);
+    if (!judge) {
+      return res.status(404).json({ message: "Judge not found" });
+    }
+
+    const results = await Promise.allSettled(
+      sessionIds.map(async (sessionId: string) => {
+        const session = await chatbotDb.getChatSession(sessionId);
+        if (!session) return { sessionId, score: null };
+        const score = await scoreSessionWithJudgeIfNeeded(session, judge);
+        return { sessionId, score };
+      })
+    );
+
+    const scores: Record<string, any> = {};
+    const failed: string[] = [];
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        scores[result.value.sessionId] = result.value.score;
+      } else {
+        failed.push(sessionIds[i]);
+      }
+    });
+
+    res.json({ scores, failed });
+  } catch (error: any) {
+    console.error("Error scoring chat sessions with judge:", error);
+    res.status(500).json({ message: "Failed to score chat sessions with judge" });
   }
 });
 

@@ -53,6 +53,7 @@ import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
+import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -180,6 +181,13 @@ interface AdminChatSession {
     evaluatedMessageIndex: number;
     adminOverride?: boolean;
   };
+  judgeScores?: Record<string, {
+    score: number;
+    reason: string;
+    evaluatedAt: string;
+    evaluatedMessageIndex: number;
+    judgeName: string;
+  }>;
 }
 
 interface User {
@@ -641,6 +649,7 @@ export default function AdminDashboard() {
     'mcp-servers': 13,
     'result-endpoints': 14,
     'emma-settings': 15,
+    'scoring-judges': 16,
   };
   
   // Get initial tab value from URL or default to Users
@@ -686,6 +695,8 @@ export default function AdminDashboard() {
   const [chatDialogOpen, setChatDialogOpen] = useState(false);
   const [scoringSessionIds, setScoringSessionIds] = useState<Set<string>>(new Set());
   const [failedScoringIds, setFailedScoringIds] = useState<Set<string>>(new Set());
+  const [scoringJudges, setScoringJudges] = useState<Array<{ id: string; name: string; systemPrompt: string }>>([]);
+  const [selectedJudgeId, setSelectedJudgeId] = useState<string>("");
   const [scoreOverrideAnchor, setScoreOverrideAnchor] = useState<HTMLElement | null>(null);
   const [scoreOverrideSession, setScoreOverrideSession] = useState<AdminChatSession | null>(null);
   const [scoreOverrideValue, setScoreOverrideValue] = useState<number>(3);
@@ -992,6 +1003,14 @@ export default function AdminDashboard() {
   useEffect(() => {
     if (tabValue === 6 && !chatSessionsInitialized) {
       loadChatSessions({ reset: true });
+    }
+    // Fetch scoring judges when chat history tab is loaded
+    if (tabValue === 6 && token && scoringJudges.length === 0) {
+      axios.get(buildApiUrl('/api/settings/scoring-judges'), {
+        headers: { Authorization: `Bearer ${token}` },
+      }).then((res) => {
+        setScoringJudges(res.data.judges || []);
+      }).catch(() => {});
     }
   }, [tabValue, chatSessionsInitialized, loadChatSessions]);
 
@@ -2547,6 +2566,7 @@ export default function AdminDashboard() {
             <Tab label="MCP Servers" {...a11yProps(13)} />
             <Tab label="Result Endpoints" {...a11yProps(14)} />
             <Tab label="Emma Chat Settings" {...a11yProps(15)} />
+            <Tab label="Scoring Judges" {...a11yProps(16)} />
           </Tabs>
         </Box>
 
@@ -4748,6 +4768,83 @@ export default function AdminDashboard() {
               {error}
             </Alert>
           )}
+          {scoringJudges.length > 0 && (
+            <Box sx={{ display: 'flex', gap: 2, mb: 2, alignItems: 'center' }}>
+              <FormControl size="small" sx={{ minWidth: 200 }}>
+                <InputLabel>Judge</InputLabel>
+                <Select
+                  value={selectedJudgeId}
+                  label="Judge"
+                  onChange={(e) => setSelectedJudgeId(e.target.value)}
+                >
+                  {scoringJudges.map((j) => (
+                    <MenuItem key={j.id} value={j.id}>{j.name}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <Button
+                variant="outlined"
+                size="small"
+                disabled={!selectedJudgeId || chatSessions.length === 0}
+                onClick={async () => {
+                  if (!selectedJudgeId || !token) return;
+                  const sessionsToScore = chatSessions.filter((s) => {
+                    const msgCount = s.messageCount ?? s.messages?.length ?? 0;
+                    if (msgCount < 2) return false;
+                    const existing = s.judgeScores?.[selectedJudgeId];
+                    if (existing && existing.evaluatedMessageIndex >= msgCount) return false;
+                    return true;
+                  });
+                  if (sessionsToScore.length === 0) return;
+                  const batches: string[][] = [];
+                  for (let i = 0; i < sessionsToScore.length; i += 5) {
+                    batches.push(sessionsToScore.slice(i, i + 5).map((s) => s.sessionId));
+                  }
+                  setScoringSessionIds((prev) => {
+                    const next = new Set(prev);
+                    sessionsToScore.forEach((s) => next.add(s.sessionId));
+                    return next;
+                  });
+                  for (const batch of batches) {
+                    try {
+                      const response = await axios.post(
+                        buildApiUrl("/api/admin/chat-sessions/judge-score"),
+                        { sessionIds: batch, judgeId: selectedJudgeId },
+                        { headers: { Authorization: `Bearer ${token}` }, timeout: 60000 }
+                      );
+                      const { scores } = response.data;
+                      const judge = scoringJudges.find((j) => j.id === selectedJudgeId);
+                      setChatSessions((prev) =>
+                        prev.map((s) => {
+                          const newScore = scores[s.sessionId];
+                          if (newScore) {
+                            return {
+                              ...s,
+                              judgeScores: {
+                                ...s.judgeScores,
+                                [selectedJudgeId]: { ...newScore, judgeName: judge?.name || selectedJudgeId },
+                              },
+                            };
+                          }
+                          return s;
+                        })
+                      );
+                    } catch (err) {
+                      console.error("Error scoring with judge:", err);
+                    } finally {
+                      setScoringSessionIds((prev) => {
+                        const next = new Set(prev);
+                        batch.forEach((id) => next.delete(id));
+                        return next;
+                      });
+                    }
+                  }
+                }}
+              >
+                Score All with Judge
+              </Button>
+            </Box>
+          )}
           <TableContainer component={Paper}>
             <Table>
               <TableHead>
@@ -5039,27 +5136,50 @@ export default function AdminDashboard() {
                                 </Tooltip>
                               );
                             }
-                            if (!sat) {
+                            if (!sat && (!session.judgeScores || Object.keys(session.judgeScores).length === 0)) {
                               return <span style={{ color: '#999' }}>-</span>;
                             }
-                            const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
+                            const chips: React.ReactNode[] = [];
+                            if (sat) {
+                              const color = sat.score <= 2 ? 'error' : sat.score === 3 ? 'warning' : 'success';
+                              chips.push(
+                                <Tooltip key="default" title={`Default: ${sat.reason}${sat.adminOverride ? ' (admin override)' : ''}`}>
+                                  <Chip
+                                    label={`Default: ${sat.score}`}
+                                    size="small"
+                                    color={color}
+                                    variant={sat.adminOverride ? 'filled' : 'outlined'}
+                                    icon={sat.adminOverride ? <EditIcon sx={{ fontSize: '0.8rem' }} /> : undefined}
+                                    onClick={(e) => {
+                                      setScoreOverrideAnchor(e.currentTarget);
+                                      setScoreOverrideSession(session);
+                                      setScoreOverrideValue(sat.score);
+                                      setScoreOverrideReason(sat.reason);
+                                    }}
+                                    sx={{ cursor: 'pointer' }}
+                                  />
+                                </Tooltip>
+                              );
+                            }
+                            if (session.judgeScores) {
+                              Object.entries(session.judgeScores).forEach(([jId, jScore]) => {
+                                const jColor = jScore.score <= 2 ? 'error' : jScore.score === 3 ? 'warning' : 'success';
+                                chips.push(
+                                  <Tooltip key={jId} title={`${jScore.judgeName}: ${jScore.reason}`}>
+                                    <Chip
+                                      label={`${jScore.judgeName}: ${jScore.score}`}
+                                      size="small"
+                                      color={jColor as any}
+                                      variant="outlined"
+                                    />
+                                  </Tooltip>
+                                );
+                              });
+                            }
                             return (
-                              <Tooltip title={`${sat.reason}${sat.adminOverride ? ' (admin override)' : ''}`}>
-                                <Chip
-                                  label={sat.score}
-                                  size="small"
-                                  color={color}
-                                  variant={sat.adminOverride ? 'filled' : 'outlined'}
-                                  icon={sat.adminOverride ? <EditIcon sx={{ fontSize: '0.8rem' }} /> : undefined}
-                                  onClick={(e) => {
-                                    setScoreOverrideAnchor(e.currentTarget);
-                                    setScoreOverrideSession(session);
-                                    setScoreOverrideValue(sat.score);
-                                    setScoreOverrideReason(sat.reason);
-                                  }}
-                                  sx={{ cursor: 'pointer' }}
-                                />
-                              </Tooltip>
+                              <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                                {chips}
+                              </Box>
                             );
                           })()}
                         </TableCell>
@@ -5377,6 +5497,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={15}>
           <EmmaSettings />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={16}>
+          <ScoringJudgesTab />
         </TabPanel>
       </Paper>
 
