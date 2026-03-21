@@ -1550,12 +1550,13 @@ export const taskDb = {
         return [];
       }
 
-      // Filter tasks with non-empty knowledge base
+      // Filter tasks with non-empty knowledge base (either main content OR files)
       const tasksWithKnowledgeBase = tasks.filter((task: any) => {
-        const size = typeof task.knowledgeBaseSize === 'string' 
-          ? parseInt(task.knowledgeBaseSize) 
+        const size = typeof task.knowledgeBaseSize === 'string'
+          ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
-        return size > 0;
+        const hasFiles = task.knowledgeBaseFiles && task.knowledgeBaseFiles.length > 0;
+        return size > 0 || hasFiles;
       });
 
       // Map to return standardized fields
