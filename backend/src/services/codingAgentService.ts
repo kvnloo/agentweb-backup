@@ -2,11 +2,13 @@
  * Coding Agent Service
  *
  * A sub-agent that Emma delegates to for code editing tasks.
- * Runs its own agentic loop with diff-based editing tools,
- * reads files before editing, checks deployment after changes,
- * and iterates on build errors.
+ * Uses the Anthropic SDK with AWS Bedrock for the agentic loop.
+ * Runs with diff-based editing tools, reads files before editing,
+ * checks deployment after changes, and iterates on build errors.
  */
 
+import AnthropicBedrock from '@anthropic-ai/bedrock-sdk';
+import Anthropic from '@anthropic-ai/sdk';
 import { mcpFetch } from '../mcp/server/httpClient';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -17,6 +19,7 @@ export interface CodingAgentContext {
   sessionId: string;
   llmModel: string;
   socketEmit?: (room: string, event: string, payload: any) => void;
+  executeMcpTool?: (toolName: string, args: any) => Promise<any>;
 }
 
 interface SearchReplaceEdit {
@@ -30,16 +33,15 @@ interface ApplyResult {
   errors: string[];
 }
 
-type CallLLMFn = (model: string, messages: any[], options?: any) => Promise<any>;
-
 const DEFAULT_MAX_ITERATIONS = 30;
-const CODING_AGENT_MODEL = 'anthropic.claude-opus-4-6-v1';
+const CODING_AGENT_MODEL = 'us.anthropic.claude-opus-4-6-v1';
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
+const MAX_RETRIES = 2;
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
-const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editing landing page code. You have direct access to files in a GitHub repository that auto-deploys to Vercel.
+const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editing landing page code. You have direct access to files in a GitHub repository that auto-deploys to Vercel. You also have browser tools to verify your changes visually.
 
 ## Rules
 1. ALWAYS read a file before editing it. Understand the code first.
@@ -47,10 +49,12 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editin
 3. The "search" string must match the existing code EXACTLY (including whitespace and indentation).
 4. After making edits, use check_deployment to verify the build succeeds.
 5. If the build fails, read the error, fix it, and check again.
-6. When finished, call report_to_user with a summary of all changes made.
-7. Do NOT make changes the user did not ask for. Stay focused on the task.
-8. For large changes, break them into multiple edit_file calls.
-9. If you need to add a new file or completely rewrite a file, use edit_file with a search that covers the entire file content (read it first to get the exact content).
+6. After deployment succeeds, use browse_page to verify the changes look correct on the live site.
+7. When finished, call report_to_user with a summary of all changes made.
+8. Do NOT make changes the user did not ask for. Stay focused on the task.
+9. For large changes, break them into multiple edit_file calls.
+10. NEVER attempt to rewrite an entire file or replace more than a small section at once. Only make targeted edits to specific sections. If a file is too large to edit safely, report the limitation to the user.
+11. For large files (>20KB), read the file to understand structure, then make focused edits to only the specific lines that need changing. Do NOT restructure or reorganize code beyond what was requested.
 
 ## Workflow
 1. list_files to see the project structure
@@ -58,7 +62,9 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editin
 3. edit_file with precise search/replace diffs
 4. check_deployment to verify the build
 5. If build fails: read error → fix → check again
-6. report_to_user when done`;
+6. browse_page to verify changes visually on the deployed site
+7. If something looks wrong: fix → redeploy → verify again
+8. report_to_user when done (include verification results)`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -144,110 +150,123 @@ export function applySearchReplace(content: string, edits: SearchReplaceEdit[]):
   return { result, appliedCount, errors };
 }
 
-// ─── Tool Definitions (OpenAI function calling format) ──────────────────────
+// ─── Tool Definitions (Anthropic native format) ─────────────────────────────
 
-function getToolDefinitions() {
+function getToolDefinitions(): Anthropic.Tool[] {
   return [
     {
-      type: 'function' as const,
-      function: {
-        name: 'list_files',
-        description: 'List all files in the landing page repository. Returns file paths and sizes.',
-        parameters: {
-          type: 'object',
-          properties: {},
-          required: []
-        }
+      name: 'list_files',
+      description: 'List all files in the landing page repository. Returns file paths and sizes.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {},
+        required: []
       }
     },
     {
-      type: 'function' as const,
-      function: {
-        name: 'read_file',
-        description: 'Read the contents of a file from the repository.',
-        parameters: {
-          type: 'object',
-          properties: {
-            file_path: {
-              type: 'string',
-              description: 'Path to the file (e.g., "app/page.tsx", "app/globals.css")'
-            }
+      name: 'read_file',
+      description: 'Read the contents of a file from the repository.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Path to the file (e.g., "app/page.tsx", "app/globals.css")'
+          }
+        },
+        required: ['file_path']
+      }
+    },
+    {
+      name: 'edit_file',
+      description: 'Edit a file using search-and-replace diffs. Each edit specifies an exact string to find and its replacement. The search string must match the existing code exactly (including whitespace). Use read_file first to see the current content.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Path to the file to edit'
           },
-          required: ['file_path']
-        }
-      }
-    },
-    {
-      type: 'function' as const,
-      function: {
-        name: 'edit_file',
-        description: 'Edit a file using search-and-replace diffs. Each edit specifies an exact string to find and its replacement. The search string must match the existing code exactly (including whitespace). Use read_file first to see the current content.',
-        parameters: {
-          type: 'object',
-          properties: {
-            file_path: {
-              type: 'string',
-              description: 'Path to the file to edit'
-            },
-            edits: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  search: {
-                    type: 'string',
-                    description: 'Exact string to find in the file (must match exactly once)'
-                  },
-                  replace: {
-                    type: 'string',
-                    description: 'Replacement string'
-                  }
+          edits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                search: {
+                  type: 'string',
+                  description: 'Exact string to find in the file (must match exactly once)'
                 },
-                required: ['search', 'replace']
+                replace: {
+                  type: 'string',
+                  description: 'Replacement string'
+                }
               },
-              description: 'Array of search/replace edits to apply sequentially'
+              required: ['search', 'replace']
             },
-            commit_message: {
-              type: 'string',
-              description: 'Git commit message describing the changes'
-            }
+            description: 'Array of search/replace edits to apply sequentially'
           },
-          required: ['file_path', 'edits']
-        }
+          commit_message: {
+            type: 'string',
+            description: 'Git commit message describing the changes'
+          }
+        },
+        required: ['file_path', 'edits']
       }
     },
     {
-      type: 'function' as const,
-      function: {
-        name: 'check_deployment',
-        description: 'Check the Vercel deployment status. Use this after editing files to verify the build succeeded.',
-        parameters: {
-          type: 'object',
-          properties: {},
-          required: []
-        }
+      name: 'check_deployment',
+      description: 'Check the Vercel deployment status. Use this after editing files to verify the build succeeded.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {},
+        required: []
       }
     },
     {
-      type: 'function' as const,
-      function: {
-        name: 'report_to_user',
-        description: 'Return a final report to the user. This ends the coding session. Include a summary of all changes made, files modified, and deployment status.',
-        parameters: {
-          type: 'object',
-          properties: {
-            message: {
-              type: 'string',
-              description: 'Summary message to show the user'
-            },
-            status: {
-              type: 'string',
-              enum: ['success', 'error', 'partial'],
-              description: 'Overall status of the coding task'
-            }
+      name: 'report_to_user',
+      description: 'Return a final report to the user. This ends the coding session. Include a summary of all changes made, files modified, and deployment status.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          message: {
+            type: 'string',
+            description: 'Summary message to show the user'
           },
-          required: ['message', 'status']
-        }
+          status: {
+            type: 'string',
+            enum: ['success', 'error', 'partial'],
+            description: 'Overall status of the coding task'
+          }
+        },
+        required: ['message', 'status']
+      }
+    },
+    {
+      name: 'browse_page',
+      description: 'Navigate to a URL and get a text snapshot of the page content (accessibility tree). Use this to verify your edits are visible on the deployed site. Returns a structured description of all visible elements on the page.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          url: {
+            type: 'string',
+            description: 'The URL to navigate to (e.g., the Vercel deployment URL)'
+          }
+        },
+        required: ['url']
+      }
+    },
+    {
+      name: 'take_screenshot',
+      description: 'Take a screenshot of the current browser page. Use after browse_page to capture a visual snapshot. Returns a description of the screenshot.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          full_page: {
+            type: 'boolean',
+            description: 'Whether to capture the full scrollable page (true) or just the visible viewport (false). Defaults to false.'
+          }
+        },
+        required: []
       }
     }
   ];
@@ -344,6 +363,28 @@ async function executeTool(
       return args.message || 'Done.';
     }
 
+    case 'browse_page': {
+      if (!context.executeMcpTool) {
+        return 'Error: Browser tools are not available in this context.';
+      }
+      // Navigate to the URL
+      await context.executeMcpTool('playwright_browser_navigate', { url: args.url });
+      // Get accessibility snapshot (text representation of page)
+      const snapshot = await context.executeMcpTool('playwright_browser_snapshot', {});
+      return typeof snapshot?.content === 'string' ? snapshot.content : JSON.stringify(snapshot);
+    }
+
+    case 'take_screenshot': {
+      if (!context.executeMcpTool) {
+        return 'Error: Browser tools are not available in this context.';
+      }
+      const result = await context.executeMcpTool('playwright_browser_take_screenshot', {
+        type: 'jpeg',
+        fullPage: args.full_page || false
+      });
+      return typeof result?.content === 'string' ? result.content : 'Screenshot taken successfully.';
+    }
+
     default:
       return `Unknown tool: ${toolName}`;
   }
@@ -367,26 +408,82 @@ function truncateToolResult(content: string): string {
 
 /**
  * Trim older tool results in the message history to keep context manageable.
- * Keeps the last 3 tool results at full size, truncates older ones to 2000 chars.
+ * Keeps the last 3 tool_result blocks at full size, truncates older ones to 2000 chars.
+ * Works with Anthropic message format where tool results are in user messages.
  */
-function trimMessageHistory(messages: any[]): void {
-  const toolIndices: number[] = [];
+function trimMessageHistory(messages: Anthropic.MessageParam[]): void {
+  // Find all user messages that contain tool_result blocks
+  const toolResultLocations: { msgIdx: number; blockIdx: number }[] = [];
+
   for (let i = 0; i < messages.length; i++) {
-    if (messages[i].role === 'tool') toolIndices.push(i);
+    const msg = messages[i];
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (let j = 0; j < msg.content.length; j++) {
+        const block = msg.content[j];
+        if (typeof block === 'object' && 'type' in block && block.type === 'tool_result') {
+          toolResultLocations.push({ msgIdx: i, blockIdx: j });
+        }
+      }
+    }
   }
 
   // Keep last 3 tool results intact, truncate older ones aggressively
   const preserveCount = 3;
   const truncateLimit = 2000;
-  if (toolIndices.length > preserveCount) {
-    const toTruncate = toolIndices.slice(0, toolIndices.length - preserveCount);
-    for (const idx of toTruncate) {
-      const content = messages[idx].content;
-      if (typeof content === 'string' && content.length > truncateLimit) {
-        messages[idx].content = content.substring(0, truncateLimit) + `\n... [trimmed from ${content.length} chars]`;
+  if (toolResultLocations.length > preserveCount) {
+    const toTruncate = toolResultLocations.slice(0, toolResultLocations.length - preserveCount);
+    for (const loc of toTruncate) {
+      const msg = messages[loc.msgIdx];
+      if (msg.role === 'user' && Array.isArray(msg.content)) {
+        const block = msg.content[loc.blockIdx] as any;
+        if (block.type === 'tool_result' && typeof block.content === 'string' && block.content.length > truncateLimit) {
+          block.content = block.content.substring(0, truncateLimit) + `\n... [trimmed from ${block.content.length} chars]`;
+        }
       }
     }
   }
+}
+
+// ─── Bedrock Client ─────────────────────────────────────────────────────────
+
+let bedrockClient: AnthropicBedrock | null = null;
+
+function getBedrockClient(): AnthropicBedrock {
+  if (!bedrockClient) {
+    bedrockClient = new AnthropicBedrock({
+      awsRegion: 'us-west-2',
+    });
+  }
+  return bedrockClient;
+}
+
+// Exported for testing (allows mock injection)
+export function _setBedrockClientForTest(client: AnthropicBedrock | null): void {
+  bedrockClient = client;
+}
+
+/**
+ * Call the Anthropic Messages API with retry logic for transient errors.
+ */
+async function callWithRetry(
+  client: AnthropicBedrock,
+  params: Anthropic.MessageCreateParamsNonStreaming
+): Promise<Anthropic.Message> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await client.messages.create(params);
+    } catch (error) {
+      if (error instanceof Anthropic.APIError && (error.status === 429 || (error.status && error.status >= 500))) {
+        lastError = error;
+        // Exponential backoff: 1s, 2s
+        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+        continue;
+      }
+      throw error; // Non-retryable error
+    }
+  }
+  throw lastError!;
 }
 
 // ─── Main Agent Loop ────────────────────────────────────────────────────────
@@ -394,16 +491,16 @@ function trimMessageHistory(messages: any[]): void {
 async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
-  callLLM: CallLLMFn,
   maxIterations: number
 ): Promise<{ success: boolean; message: string; iterations: number }> {
 
-  const messages: any[] = [
-    { role: 'system', content: CODING_AGENT_SYSTEM_PROMPT },
+  const client = getBedrockClient();
+  const tools = getToolDefinitions();
+
+  const messages: Anthropic.MessageParam[] = [
     { role: 'user', content: taskDescription }
   ];
 
-  const tools = getToolDefinitions();
   let iteration = 0;
 
   try {
@@ -424,40 +521,37 @@ async function runCodingAgentInternal(
         });
       }
 
-      // Call LLM
-      const response = await callLLM(CODING_AGENT_MODEL, messages, {
+      // Call Anthropic Messages API
+      const response = await callWithRetry(client, {
+        model: CODING_AGENT_MODEL,
+        max_tokens: 16384,
+        system: CODING_AGENT_SYSTEM_PROMPT,
         tools,
-        tool_choice: 'auto',
-        max_completion_tokens: 16384,
-        temperature: 0.1
+        messages,
       });
 
-      const responseMessage = response.choices?.[0]?.message;
-      if (!responseMessage) {
-        return { success: false, message: 'No response from LLM.', iterations: iteration };
-      }
-
       // Add assistant message to history
-      messages.push(responseMessage);
+      messages.push({ role: 'assistant', content: response.content });
 
-      // If no tool calls, the LLM is done — return its text
-      if (!responseMessage.tool_calls || responseMessage.tool_calls.length === 0) {
+      // If no tool use, the LLM is done — return its text
+      if (response.stop_reason === 'end_turn' || response.stop_reason !== 'tool_use') {
+        const textBlock = response.content.find(b => b.type === 'text');
         return {
           success: true,
-          message: responseMessage.content || 'Coding agent completed without a report.',
+          message: textBlock && 'text' in textBlock ? textBlock.text : 'Coding agent completed without a report.',
           iterations: iteration
         };
       }
 
-      // Execute tool calls
-      for (const toolCall of responseMessage.tool_calls) {
-        const fnName = toolCall.function.name;
-        let fnArgs: any;
-        try {
-          fnArgs = JSON.parse(toolCall.function.arguments || '{}');
-        } catch {
-          fnArgs = {};
-        }
+      // Extract tool_use blocks
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+      for (const block of toolUseBlocks) {
+        if (block.type !== 'tool_use') continue;
+
+        const fnName = block.name;
+        const fnArgs = block.input as any;
 
         // Check for terminal tool
         if (fnName === 'report_to_user') {
@@ -487,13 +581,15 @@ async function runCodingAgentInternal(
           toolResult = `Error executing ${fnName}: ${error instanceof Error ? error.message : String(error)}`;
         }
 
-        // Truncate large tool results and add to message history
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
           content: truncateToolResult(toolResult)
         });
       }
+
+      // Add tool results as a user message
+      messages.push({ role: 'user', content: toolResults });
     }
 
     // Max iterations reached
@@ -519,7 +615,6 @@ async function runCodingAgentInternal(
 export async function runCodingAgent(
   taskDescription: string,
   context: CodingAgentContext,
-  callLLM: CallLLMFn,
   maxIterations: number = DEFAULT_MAX_ITERATIONS
 ): Promise<{ success: boolean; message: string; iterations: number }> {
 
@@ -534,7 +629,7 @@ export async function runCodingAgent(
   });
 
   return Promise.race([
-    runCodingAgentInternal(taskDescription, context, callLLM, maxIterations),
+    runCodingAgentInternal(taskDescription, context, maxIterations),
     timeoutPromise
   ]);
 }

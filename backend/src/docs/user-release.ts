@@ -45,6 +45,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Each judge can independently score sessions, with results shown alongside the default score in the Chat History Satisfaction column',
       '- The default judge\'s system prompt is now visible and editable in the new Scoring Judges admin tab',
       '- Judge scores are included in the get_chat_history admin tool response',
+      'Improvement: Safer Landing Page Editing via Coding Agent',
+      '- Emma no longer directly edits landing page files — all code changes are delegated to a specialized coding agent that makes precise, diff-based edits',
+      '- The coding agent now uses the Anthropic SDK natively for more reliable tool-use interactions',
+      '- After deploying changes, the coding agent automatically browses the live site to visually verify edits before reporting back',
+      '- These changes prevent the file truncation and full-rewrite issues that could destroy large landing pages during small edits',
     ],
   },
   {
