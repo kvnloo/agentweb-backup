@@ -13,6 +13,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: User Guide Page Now Loads Correctly',
       '- The /guide page was blocked by the browser\'s Content Security Policy — Notion iframe embedding is now allowed',
       '- Added proper error handling when the guide fails to load instead of showing "Loading..." indefinitely',
+      'Feature: Admin Tool — PR Digest',
+      '- New get_pr_digest admin tool lets Emma fetch merged pull requests from GitHub across both repositories (agentweb and customer-portal) within a configurable time range',
+      '- Defaults to the past 24 hours; supports custom since/until ISO timestamps',
+      '- Returns a formatted summary with PR titles, authors, file change stats, and body excerpts — ideal for daily team notifications via scheduled chats',
     ],
   },
   {
