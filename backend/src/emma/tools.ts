@@ -4554,6 +4554,7 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
+  'get_pr_digest',
 ];
 
 for (const toolName of bridgedToolNames) {

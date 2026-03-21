@@ -846,8 +846,17 @@ export const taskDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      const tasks = result.Items || [];
+      // Paginate through all results (DynamoDB returns max 1MB per query)
+      let tasks: any[] = [];
+      let lastEvaluatedKey: any = undefined;
+      do {
+        const result = await dynamodb.query({
+          ...params,
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        }).promise();
+        tasks.push(...(result.Items || []));
+        lastEvaluatedKey = result.LastEvaluatedKey;
+      } while (lastEvaluatedKey);
 
       // Get latest execution, schedules and subscribers for each task
       const tasksWithDetails = await Promise.all(
@@ -1541,12 +1550,13 @@ export const taskDb = {
         return [];
       }
 
-      // Filter tasks with non-empty knowledge base
+      // Filter tasks with non-empty knowledge base (either main content OR files)
       const tasksWithKnowledgeBase = tasks.filter((task: any) => {
-        const size = typeof task.knowledgeBaseSize === 'string' 
-          ? parseInt(task.knowledgeBaseSize) 
+        const size = typeof task.knowledgeBaseSize === 'string'
+          ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
-        return size > 0;
+        const hasFiles = task.knowledgeBaseFiles && task.knowledgeBaseFiles.length > 0;
+        return size > 0 || hasFiles;
       });
 
       // Map to return standardized fields

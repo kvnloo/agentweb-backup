@@ -23,7 +23,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -8044,8 +8044,11 @@ Format the response as JSON with this structure:
         } else {
           kbFiles.push(fileEntry);
         }
+        // Calculate total size from all files
+        const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
         await taskDb.updateTask(taskId, {
           knowledgeBaseFiles: kbFiles,
+          knowledgeBaseSize: totalSize,
           knowledgeBaseUpdatedAt: now
         });
       }
@@ -8181,9 +8184,11 @@ Format the response as JSON with this structure:
         uploadedFiles.push({ name: f.name, size, url });
       }
 
-      // 5. Update DynamoDB
+      // 5. Calculate total size and update DynamoDB
+      const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
       await taskDb.updateTask(taskId, {
         knowledgeBaseFiles: kbFiles,
+        knowledgeBaseSize: totalSize,
         knowledgeBaseUpdatedAt: new Date().toISOString()
       });
 

@@ -10,9 +10,21 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-21',
     changes: [
+      'Fix: Knowledge Base Files Not Visible in UI',
+      '- Knowledge bases created via Emma (using attach_knowledge_base_files or update_knowledge_base_file) were not appearing on the Knowledge Base page',
+      '- Root cause: the page only showed knowledge bases with main content size > 0, but file-only knowledge bases had size 0',
+      '- Knowledge bases with attached files now correctly appear in the UI even when there is no main content',
+      'Fix: Knowledge Base and Tasks Not Showing for Users with Many Tasks',
+      '- Users with a large number of tasks (300+) could see some tasks and knowledge bases missing from the UI',
+      '- Root cause: DynamoDB queries return a maximum of 1MB per request, and the backend was not paginating through all results',
+      '- The backend now correctly paginates through all DynamoDB pages when loading user tasks',
       'Fix: User Guide Page Now Loads Correctly',
       '- The /guide page was blocked by the browser\'s Content Security Policy — Notion iframe embedding is now allowed',
       '- Added proper error handling when the guide fails to load instead of showing "Loading..." indefinitely',
+      'Feature: Admin Tool — PR Digest',
+      '- New get_pr_digest admin tool lets Emma fetch merged pull requests from GitHub across both repositories (agentweb and customer-portal) within a configurable time range',
+      '- Defaults to the past 24 hours; supports custom since/until ISO timestamps',
+      '- Returns a formatted summary with PR titles, authors, file change stats, and body excerpts — ideal for daily team notifications via scheduled chats',
     ],
   },
   {
