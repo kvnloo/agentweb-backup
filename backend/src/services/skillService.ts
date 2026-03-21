@@ -2,6 +2,7 @@ import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
+import { paginatedScan } from "../utils/dynamoPagination";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -146,9 +147,8 @@ export class SkillService {
     };
 
     try {
-      // Note: for large datasets, scan is inefficient, but for <100 skills it's fine
-      const result = await dynamodb.scan(params).promise();
-      return (result.Items?.map(item => this.normalizeSkill(item)) as Skill[]) || [];
+      const items = await paginatedScan(dynamodb, params);
+      return (items.map(item => this.normalizeSkill(item)) as Skill[]) || [];
     } catch (error) {
        // If table doesn't exist yet, return empty array
        if ((error as any).code === 'ResourceNotFoundException') {
@@ -170,8 +170,8 @@ export class SkillService {
     };
 
     try {
-      const result = await dynamodb.scan(params).promise();
-      return (result.Items?.map(item => this.normalizeSkill(item)) as Skill[]) || [];
+      const items = await paginatedScan(dynamodb, params);
+      return (items.map(item => this.normalizeSkill(item)) as Skill[]) || [];
     } catch (error) {
       if ((error as any).code === 'ResourceNotFoundException') {
         return [];
@@ -281,13 +281,13 @@ export class SkillService {
 
   async getSyncStatus(): Promise<Record<string, SkillSyncInfo>> {
     try {
-      const [prodResult, devResult] = await Promise.all([
-        dynamodb.scan({ TableName: 'AW-Skills' }).promise(),
-        dynamodb.scan({ TableName: 'Dev-AW-Skills' }).promise(),
+      const [prodItems, devItems] = await Promise.all([
+        paginatedScan(dynamodb, { TableName: 'AW-Skills' }),
+        paginatedScan(dynamodb, { TableName: 'Dev-AW-Skills' }),
       ]);
 
-      const prodSkills = (prodResult.Items || []).map(item => this.normalizeSkill(item));
-      const devSkills = (devResult.Items || []).map(item => this.normalizeSkill(item));
+      const prodSkills = prodItems.map(item => this.normalizeSkill(item));
+      const devSkills = devItems.map(item => this.normalizeSkill(item));
 
       const prodMap = new Map(prodSkills.map(s => [s.skillId, s]));
       const devMap = new Map(devSkills.map(s => [s.skillId, s]));

@@ -13,6 +13,7 @@ import OpenAI from 'openai';
 import axios from 'axios';
 import AWS from 'aws-sdk';
 import { dynamodb } from '../config/aws';
+import { paginatedQuery } from '../utils/dynamoPagination';
 import { TABLE_PREFIX } from '../config/constants';
 import { ChatbotDB, ChatSession } from '../services/chatbotService';
 import { MAX_FILE_SIZE } from '../config';
@@ -1808,8 +1809,8 @@ router.get("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
       }
     };
 
-    const result = await dynamodb.query(params).promise();
-    res.json({ records: result.Items || [] });
+    const records = await paginatedQuery(dynamodb, params);
+    res.json({ records });
   } catch (error) {
     console.error('Error in getTaskLeadList:', error);
     res.status(500).json({ message: 'Error fetching lead list' });
@@ -1855,8 +1856,7 @@ router.put("/:taskId/lead-list", authenticateToken, async (req: AuthRequest, res
       }
     };
 
-    const existingResult = await dynamodb.query(existingParams).promise();
-    const existingRecords = existingResult.Items || [];
+    const existingRecords = await paginatedQuery(dynamodb, existingParams);
 
     // Create a map of existing records by identifier for easy lookup
     const existingRecordsMap = new Map(

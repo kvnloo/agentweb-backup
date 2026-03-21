@@ -6,6 +6,7 @@ import path from "path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
 import { settingsService } from "./settingsService";
+import { paginatedQuery } from "../utils/dynamoPagination";
 
 // v0 code generation can take several minutes — extend Node's default fetch timeouts.
 // Node 20's built-in undici has headersTimeout=300s which is too short for v0.
@@ -1460,21 +1461,17 @@ export async function getLandingPage(
 export async function listLandingPages(
   userId: string
 ): Promise<GeneratedLandingPage[]> {
-  const result = await dynamodb
-    .query({
-      TableName: TABLE_NAME,
-      IndexName: "UserIdIndex",
-      KeyConditionExpression: "userId = :userId",
-      FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
-      ExpressionAttributeValues: {
-        ":userId": userId,
-        ":archivedFalse": false,
-      },
-      ScanIndexForward: false, // newest first
-    })
-    .promise();
-
-  return (result.Items || []) as GeneratedLandingPage[];
+  return await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :userId",
+    FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
+    ExpressionAttributeValues: {
+      ":userId": userId,
+      ":archivedFalse": false,
+    },
+    ScanIndexForward: false, // newest first
+  });
 }
 
 /**
@@ -1483,16 +1480,12 @@ export async function listLandingPages(
  * Also auto-marks the site record as isRootPage if not already set.
  */
 async function findUserSiteRecord(userId: string): Promise<GeneratedLandingPage | null> {
-  const result = await dynamodb
-    .query({
-      TableName: TABLE_NAME,
-      IndexName: "UserIdIndex",
-      KeyConditionExpression: "userId = :userId",
-      ExpressionAttributeValues: { ":userId": userId },
-    })
-    .promise();
-
-  const pages = (result.Items || []) as GeneratedLandingPage[];
+  const pages = await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :userId",
+    ExpressionAttributeValues: { ":userId": userId },
+  });
 
   // Prefer: 1) explicit root page, 2) page with v0ChatId (original v0 page), 3) any with githubRepoUrl
   const siteRecord =
