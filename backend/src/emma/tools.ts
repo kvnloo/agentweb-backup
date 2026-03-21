@@ -4531,7 +4531,7 @@ const bridgedToolNames = [
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
-  // Landing Page tools (v0 generation + GitHub editing)
+  // Landing Page tools (v0 generation + management — file editing delegated to coding_agent)
   'generate_landing_page',
   'deploy_landing_page',
   'list_landing_pages',
@@ -4539,9 +4539,6 @@ const bridgedToolNames = [
   'delete_landing_page',
   'enable_lead_list_public_access',
   'duplicate_landing_page',
-  'edit_landing_page_file',
-  'list_landing_page_files',
-  'read_landing_page_file',
   'get_deployment_status',
 ];
 
@@ -4575,7 +4572,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent can read files, make precise diff-based edits, check deployment status, and iterate on build errors autonomously. Use this for ANY task that involves modifying landing page code (HTML, CSS, JS/TSX, config files). The agent runs autonomously and returns results when done. Do NOT use edit_landing_page_file directly — use this tool instead for all code changes.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent reads files, makes precise diff-based edits, checks deployment status, verifies changes in the browser, and iterates on build errors autonomously. Use this for ANY task that involves modifying landing page code (HTML, CSS, JS/TSX, config files). The agent runs autonomously, verifies its own work visually, and returns results when done.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4593,6 +4590,18 @@ emmaToolRegistry.register({
   },
   execute: async (args: any, context?: any) => {
     const { runCodingAgent } = await import('../services/codingAgentService');
+    const executeMcpTool = context?.service
+      ? async (toolName: string, toolArgs: any) => {
+          return context.service.executeTool(
+            context.llmModel || 'anthropic.claude-sonnet-4-6',
+            toolName,
+            toolArgs,
+            context.userId,
+            context.sessionId
+          );
+        }
+      : undefined;
+
     const result = await runCodingAgent(
       args.task_description,
       {
@@ -4601,8 +4610,8 @@ emmaToolRegistry.register({
         sessionId: context?.sessionId,
         llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
         socketEmit: context?.socketEmit,
-      },
-      context?.service?.callLLM?.bind(context.service)
+        executeMcpTool,
+      }
     );
     if (result.success) {
       return { success: true, message: result.message, iterations: result.iterations };
