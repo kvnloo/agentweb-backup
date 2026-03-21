@@ -447,7 +447,7 @@ function runClaude(prompt) {
     const escaped = prompt.replace(/'/g, "'\\''");
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && script -qc "claude --continue --model opus -p '${escaped}'" /dev/null`],
+      ["-lc", `cd /home/ec2-user/agentweb && script -qc "claude --continue --model opus --permission-mode auto -p '${escaped}'" /dev/null`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
