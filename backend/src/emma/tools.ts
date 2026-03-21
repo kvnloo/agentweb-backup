@@ -601,6 +601,69 @@ emmaToolRegistry.register({
 });
 
 emmaToolRegistry.register({
+  name: 'search_competitor_ads',
+  definition: {
+    name: 'search_competitor_ads',
+    description:
+      `Search the Meta Ad Library for competitor ads. Returns public ad data including creative text, platforms, audience size, and spend estimates.
+Does NOT require a connected Meta account — uses app-level access.
+
+USE CASES:
+  - Research what ads competitors are running
+  - Analyze competitor ad copy, CTAs, and creative strategies
+  - Find active vs inactive ads for a brand
+  - Discover which platforms competitors advertise on
+
+SEARCH OPTIONS (provide at least one):
+  - search_terms: Brand/company name or keywords (e.g., "Nike", "running shoes")
+  - search_page_ids: Specific Facebook Page IDs to search
+
+FILTERS:
+  - ad_reached_countries: Countries where ads were shown (default: ["US"])
+  - ad_active_status: ALL, ACTIVE, or INACTIVE (default: ALL)
+  - media_type: ALL, IMAGE, VIDEO, MEME, or NONE
+  - limit: Max results 1-50 (default: 10)`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        search_terms: {
+          type: 'string',
+          description: 'Search query — brand name, company name, or keywords to search for in the Ad Library.'
+        },
+        search_page_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of Facebook Page IDs to search ads for. Use this for exact page matching.'
+        },
+        ad_reached_countries: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'ISO country codes where ads were shown (e.g., ["US", "CA"]). Default: ["US"].'
+        },
+        ad_active_status: {
+          type: 'string',
+          enum: ['ALL', 'ACTIVE', 'INACTIVE'],
+          description: 'Filter by ad delivery status. Default: ALL.'
+        },
+        media_type: {
+          type: 'string',
+          enum: ['ALL', 'IMAGE', 'VIDEO', 'MEME', 'NONE'],
+          description: 'Filter by media type of the ad creative.'
+        },
+        limit: {
+          type: 'number',
+          description: 'Max number of ads to return (1-50). Default: 10.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.searchCompetitorAds(context.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
   name: 'get_post_analytics',
   definition: {
     name: 'get_post_analytics',

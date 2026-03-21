@@ -10080,6 +10080,59 @@ Format the response as JSON with this structure:
   }
 
   /**
+   * Search Meta Ad Library for competitor ads.
+   * Uses the user's connected Meta OAuth token (has ads_read scope).
+   * Falls back to app-level token if no connected account.
+   */
+  public async searchCompetitorAds(userId: string, params: {
+    search_terms?: string;
+    search_page_ids?: string[];
+    ad_reached_countries?: string[];
+    ad_active_status?: 'ALL' | 'ACTIVE' | 'INACTIVE';
+    media_type?: 'ALL' | 'IMAGE' | 'MEME' | 'VIDEO' | 'NONE';
+    limit?: number;
+  }): Promise<any> {
+    try {
+      const { metaService } = await import('./metaService');
+
+      // Try user's connected Meta account first (has ads_read scope)
+      let accessToken: string;
+      try {
+        const creds = await this.getMetaCredentials(userId);
+        accessToken = creds.accessToken;
+        console.log(`[AgentMode] searchCompetitorAds: Using user OAuth token for user ${userId}`);
+      } catch {
+        // Fall back to app-level token
+        const { getMetaCredentials } = await import('../utils/secretsManager');
+        const appCreds = await getMetaCredentials();
+        accessToken = `${appCreds.clientId}|${appCreds.clientSecret}`;
+        console.log(`[AgentMode] searchCompetitorAds: No connected Meta account, falling back to app token`);
+      }
+
+      const result = await metaService.searchAdLibrary({
+        search_terms: params.search_terms,
+        search_page_ids: params.search_page_ids,
+        ad_reached_countries: params.ad_reached_countries || ['US'],
+        ad_active_status: params.ad_active_status,
+        media_type: params.media_type,
+        limit: params.limit,
+      }, accessToken);
+
+      return {
+        success: true,
+        ...result,
+      };
+    } catch (error: any) {
+      console.error('AgentMode: searchCompetitorAds error:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to search Meta Ad Library',
+        error: error.message,
+      };
+    }
+  }
+
+  /**
    * Manage Custom Audiences (Custom, Lookalike, Website)
    */
   public async manageMetaCustomAudiences(

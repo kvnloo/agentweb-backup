@@ -1,5 +1,36 @@
 import { FacebookAdsApi, User, AdAccount, Campaign, AdSet, AdCreative, Ad, CustomAudience } from 'facebook-nodejs-business-sdk';
 import { MetaAdAccount, MetaPage } from '../types/meta';
+import { fetchWithRetry } from '../utils/metaApiFetch';
+
+export interface AdLibrarySearchParams {
+  search_terms?: string;
+  search_page_ids?: string[];
+  ad_reached_countries: string[];
+  ad_type?: 'ALL' | 'POLITICAL_AND_ISSUE_ADS';
+  ad_active_status?: 'ALL' | 'ACTIVE' | 'INACTIVE';
+  limit?: number;
+  media_type?: 'ALL' | 'IMAGE' | 'MEME' | 'VIDEO' | 'NONE';
+}
+
+export interface AdLibraryResult {
+  id: string;
+  ad_creation_time?: string;
+  ad_delivery_start_time?: string;
+  ad_delivery_stop_time?: string;
+  ad_creative_bodies?: string[];
+  ad_creative_link_captions?: string[];
+  ad_creative_link_titles?: string[];
+  ad_creative_link_descriptions?: string[];
+  ad_snapshot_url?: string;
+  page_id?: string;
+  page_name?: string;
+  publisher_platforms?: string[];
+  estimated_audience_size?: { lower_bound: number; upper_bound: number };
+  impressions?: { lower_bound: number; upper_bound: number };
+  spend?: { lower_bound: number; upper_bound: number };
+  currency?: string;
+  languages?: string[];
+}
 
 export interface MetaAdsCampaignParams {
   name: string;
@@ -977,6 +1008,83 @@ export class MetaService {
     } catch (error) {
       return this.handleError(error, 'getInsights');
     }
+  }
+
+  /**
+   * Search the Meta Ad Library for competitor ads.
+   * Accepts an explicit access token (user OAuth token or app-level token).
+   */
+  public async searchAdLibrary(params: AdLibrarySearchParams, accessToken: string): Promise<{ ads: AdLibraryResult[]; summary: string }> {
+    if (!params.search_terms && (!params.search_page_ids || params.search_page_ids.length === 0)) {
+      throw new Error('Either search_terms or search_page_ids is required.');
+    }
+
+    if (!params.ad_reached_countries || params.ad_reached_countries.length === 0) {
+      throw new Error('ad_reached_countries is required (e.g., ["US"]).');
+    }
+
+    const apiVersion = process.env.META_API_VERSION || 'v22.0';
+    const limit = Math.min(params.limit || 10, 50);
+
+    const fields = [
+      'id',
+      'ad_creation_time',
+      'ad_delivery_start_time',
+      'ad_delivery_stop_time',
+      'ad_creative_bodies',
+      'ad_creative_link_captions',
+      'ad_creative_link_titles',
+      'ad_creative_link_descriptions',
+      'ad_snapshot_url',
+      'page_id',
+      'page_name',
+      'publisher_platforms',
+      'estimated_audience_size',
+      'impressions',
+      'spend',
+      'currency',
+      'languages',
+    ].join(',');
+
+    const queryParams = new URLSearchParams({
+      access_token: accessToken,
+      fields,
+      ad_reached_countries: JSON.stringify(params.ad_reached_countries),
+      ad_type: params.ad_type || 'ALL',
+      limit: String(limit),
+    });
+
+    if (params.search_terms) {
+      queryParams.set('search_terms', params.search_terms);
+    }
+    if (params.search_page_ids && params.search_page_ids.length > 0) {
+      queryParams.set('search_page_ids', JSON.stringify(params.search_page_ids));
+    }
+    if (params.ad_active_status) {
+      queryParams.set('ad_active_status', params.ad_active_status);
+    }
+    if (params.media_type) {
+      queryParams.set('media_type', params.media_type);
+    }
+
+    const url = `https://graph.facebook.com/${apiVersion}/ads_archive?${queryParams.toString()}`;
+    this.log('Searching Ad Library', { search_terms: params.search_terms, search_page_ids: params.search_page_ids, countries: params.ad_reached_countries });
+
+    const response = await fetchWithRetry(url);
+    const data = await response.json();
+
+    if (data.error) {
+      throw new Error(`Meta Ad Library API error: ${data.error.message} (code ${data.error.code})`);
+    }
+
+    const ads: AdLibraryResult[] = data.data || [];
+
+    const summary = ads.length === 0
+      ? `No ads found for "${params.search_terms || params.search_page_ids?.join(', ')}" in ${params.ad_reached_countries.join(', ')}.`
+      : `Found ${ads.length} ad(s) for "${params.search_terms || 'specified pages'}" in ${params.ad_reached_countries.join(', ')}. ` +
+        `${ads.filter(a => a.ad_delivery_stop_time === undefined).length} currently active.`;
+
+    return { ads, summary };
   }
 }
 
