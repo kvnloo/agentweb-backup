@@ -220,6 +220,13 @@ export interface ChatSession {
     evaluatedMessageIndex: number; // messageIndex up to which we evaluated
     adminOverride?: boolean;    // When true, auto-scoring skips this session
   };
+  judgeScores?: Record<string, {  // keyed by judge ID
+    score: number;
+    reason: string;
+    evaluatedAt: string;
+    evaluatedMessageIndex: number;
+    judgeName: string;
+  }>;
   gtmWorkItem?: {
     planId: string;
     phaseId: string;
@@ -1959,6 +1966,48 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session satisfaction score:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionJudgeScore(
+    sessionId: string,
+    judgeId: string,
+    judgeScore: NonNullable<ChatSession["judgeScores"]>[string]
+  ): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET #js.#jid = :score",
+      ExpressionAttributeNames: {
+        "#js": "judgeScores",
+        "#jid": judgeId,
+      },
+      ExpressionAttributeValues: {
+        ":score": judgeScore,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error: any) {
+      // If judgeScores map doesn't exist yet, initialize it
+      if (error.code === "ValidationException") {
+        const initParams = {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "SET judgeScores = :scores",
+          ExpressionAttributeValues: {
+            ":scores": { [judgeId]: judgeScore },
+          },
+          ReturnValues: "ALL_NEW",
+        };
+        const result = await dynamodb.update(initParams).promise();
+        return result.Attributes as ChatSession;
+      }
+      console.error("Error updating session judge score:", error);
       throw error;
     }
   }

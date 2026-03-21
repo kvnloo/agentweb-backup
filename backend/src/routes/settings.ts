@@ -88,6 +88,144 @@ const extractVariables = (htmlContent: string, subject?: string): { variables: s
   return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
 };
 
+// ---- Scoring Judges CRUD (admin-only) ----
+
+// Get default scoring prompt
+router.get('/scoring-judges/default-prompt', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting('default-scoring-prompt');
+    const { DEFAULT_SCORING_SYSTEM_PROMPT } = await import('../services/sessionScoringService');
+    res.json({
+      systemPrompt: setting?.settingValue || DEFAULT_SCORING_SYSTEM_PROMPT,
+      isCustom: !!setting?.settingValue,
+    });
+  } catch (error) {
+    console.error('Error getting default scoring prompt:', error);
+    res.status(500).json({ error: 'Failed to get default scoring prompt' });
+  }
+});
+
+// Update default scoring prompt
+router.put('/scoring-judges/default-prompt', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { systemPrompt } = req.body;
+    if (!systemPrompt) {
+      return res.status(400).json({ error: 'systemPrompt is required' });
+    }
+    await settingsService.setSetting('default-scoring-prompt', systemPrompt.trim(), 'Default scoring judge system prompt', req.user?.email);
+    res.json({ systemPrompt: systemPrompt.trim() });
+  } catch (error) {
+    console.error('Error updating default scoring prompt:', error);
+    res.status(500).json({ error: 'Failed to update default scoring prompt' });
+  }
+});
+
+// Reset default scoring prompt to hardcoded default
+router.delete('/scoring-judges/default-prompt', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    await settingsService.deleteSetting('default-scoring-prompt');
+    const { DEFAULT_SCORING_SYSTEM_PROMPT } = await import('../services/sessionScoringService');
+    res.json({ systemPrompt: DEFAULT_SCORING_SYSTEM_PROMPT });
+  } catch (error) {
+    console.error('Error resetting default scoring prompt:', error);
+    res.status(500).json({ error: 'Failed to reset default scoring prompt' });
+  }
+});
+
+// Get all scoring judges
+router.get('/scoring-judges', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting('scoring-judges');
+    const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+    res.json({ judges });
+  } catch (error) {
+    console.error('Error getting scoring judges:', error);
+    res.status(500).json({ error: 'Failed to get scoring judges' });
+  }
+});
+
+// Create a scoring judge
+router.post('/scoring-judges', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, systemPrompt } = req.body;
+    if (!name || !systemPrompt) {
+      return res.status(400).json({ error: 'name and systemPrompt are required' });
+    }
+
+    const setting = await settingsService.getSetting('scoring-judges');
+    const judges = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+
+    const now = new Date().toISOString();
+    const newJudge = {
+      id: `judge_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      name: name.trim(),
+      systemPrompt: systemPrompt.trim(),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    judges.push(newJudge);
+    await settingsService.setSetting('scoring-judges', JSON.stringify(judges), 'Custom scoring judges', req.user?.email);
+    res.json({ judge: newJudge });
+  } catch (error) {
+    console.error('Error creating scoring judge:', error);
+    res.status(500).json({ error: 'Failed to create scoring judge' });
+  }
+});
+
+// Update a scoring judge
+router.put('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { judgeId } = req.params;
+    const { name, systemPrompt } = req.body;
+
+    const setting = await settingsService.getSetting('scoring-judges');
+    if (!setting?.settingValue) {
+      return res.status(404).json({ error: 'No scoring judges found' });
+    }
+
+    const judges = JSON.parse(setting.settingValue);
+    const index = judges.findIndex((j: any) => j.id === judgeId);
+    if (index === -1) {
+      return res.status(404).json({ error: 'Judge not found' });
+    }
+
+    if (name) judges[index].name = name.trim();
+    if (systemPrompt) judges[index].systemPrompt = systemPrompt.trim();
+    judges[index].updatedAt = new Date().toISOString();
+
+    await settingsService.setSetting('scoring-judges', JSON.stringify(judges), 'Custom scoring judges', req.user?.email);
+    res.json({ judge: judges[index] });
+  } catch (error) {
+    console.error('Error updating scoring judge:', error);
+    res.status(500).json({ error: 'Failed to update scoring judge' });
+  }
+});
+
+// Delete a scoring judge
+router.delete('/scoring-judges/:judgeId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { judgeId } = req.params;
+
+    const setting = await settingsService.getSetting('scoring-judges');
+    if (!setting?.settingValue) {
+      return res.status(404).json({ error: 'No scoring judges found' });
+    }
+
+    const judges = JSON.parse(setting.settingValue);
+    const filtered = judges.filter((j: any) => j.id !== judgeId);
+    if (filtered.length === judges.length) {
+      return res.status(404).json({ error: 'Judge not found' });
+    }
+
+    await settingsService.setSetting('scoring-judges', JSON.stringify(filtered), 'Custom scoring judges', req.user?.email);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting scoring judge:', error);
+    res.status(500).json({ error: 'Failed to delete scoring judge' });
+  }
+});
+
 // Get all settings
 router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
