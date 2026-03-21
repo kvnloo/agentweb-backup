@@ -31,6 +31,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- New get_pr_digest admin tool lets Emma fetch merged pull requests from GitHub across both repositories (agentweb and customer-portal) within a configurable time range',
       '- Defaults to the past 24 hours; supports custom since/until ISO timestamps',
       '- Returns a formatted summary with PR titles, authors, file change stats, and body excerpts — ideal for daily team notifications via scheduled chats',
+      'Feature: Custom Scoring Judges',
+      '- Admins can now define multiple scoring judges with custom system prompts to evaluate chat session satisfaction from different perspectives',
+      '- Each judge can independently score sessions, with results shown alongside the default score in the Chat History Satisfaction column',
+      '- The default judge\'s system prompt is now visible and editable in the new Scoring Judges admin tab',
+      '- Judge scores are included in the get_chat_history admin tool response',
     ],
   },
   {
