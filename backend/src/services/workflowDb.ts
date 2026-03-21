@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { TABLE_PREFIX } from '../config/constants';
 import { taskDb } from './db';
 import yaml from 'js-yaml';
+import { paginatedQuery, paginatedScan } from '../utils/dynamoPagination';
 
 export interface Workflow {
   workflowId: string;
@@ -117,16 +118,14 @@ export class WorkflowService {
   }
 
   async listUserWorkflows(userId: string): Promise<Workflow[]> {
-    const result = await this.dynamodb.query({
+    return await paginatedQuery<Workflow>(this.dynamodb, {
       TableName: `${TABLE_PREFIX}AW-Workflows`,
       IndexName: 'UserWorkflowsIndex',
       KeyConditionExpression: 'userId = :userId',
       ExpressionAttributeValues: {
         ':userId': userId
       }
-    }).promise();
-
-    return result.Items as Workflow[];
+    });
   }
 
   // Workflow Executions operations
@@ -163,7 +162,7 @@ export class WorkflowService {
   }
 
   async getWorkflowExecutions(workflowId: string): Promise<WorkflowExecution[]> {
-    const result = await this.dynamodb.query({
+    return await paginatedQuery<WorkflowExecution>(this.dynamodb, {
       TableName: `${TABLE_PREFIX}AW-WorkflowExecutions`,
       IndexName: 'WorkflowExecutionsIndex',
       KeyConditionExpression: 'workflowId = :workflowId',
@@ -171,9 +170,7 @@ export class WorkflowService {
         ':workflowId': workflowId
       },
       ScanIndexForward: false // Get latest executions first
-    }).promise();
-
-    return result.Items as WorkflowExecution[];
+    });
   }
 
   async getWorkflowExecution(executionId: string): Promise<WorkflowExecution | null> {
@@ -250,11 +247,9 @@ export class WorkflowService {
   }
 
   async getAllWorkflows(): Promise<Workflow[]> {
-    const result = await this.dynamodb.scan({
+    return await paginatedScan<Workflow>(this.dynamodb, {
       TableName: `${TABLE_PREFIX}AW-Workflows`,
-    }).promise();
-
-    return (result.Items as Workflow[]) || [];
+    });
   }
 }
 

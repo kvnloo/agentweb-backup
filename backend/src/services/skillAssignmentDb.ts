@@ -2,6 +2,7 @@ import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
+import { paginatedQuery } from "../utils/dynamoPagination";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -122,8 +123,7 @@ export class SkillAssignmentDb {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      return (result.Items as SkillAssignment[]) || [];
+      return await paginatedQuery<SkillAssignment>(dynamodb, params);
     } catch (error) {
       console.error(`Error getting assignments for user ${userId}:`, error);
       throw error;
@@ -141,8 +141,7 @@ export class SkillAssignmentDb {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      return (result.Items as SkillAssignment[]) || [];
+      return await paginatedQuery<SkillAssignment>(dynamodb, params);
     } catch (error) {
       console.error(`Error getting assignments for skill ${skillId}:`, error);
       throw error;
@@ -165,8 +164,7 @@ export class SkillAssignmentDb {
     };
 
     try {
-      const result = await dynamodb.query(params).promise();
-      return (result.Items as SkillAssignment[]) || [];
+      return await paginatedQuery<SkillAssignment>(dynamodb, params);
     } catch (error) {
       console.error("Error getting assignments ready to run:", error);
       throw error;

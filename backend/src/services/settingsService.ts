@@ -1,6 +1,7 @@
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
 import path from "path";
+import { paginatedScan } from "../utils/dynamoPagination";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -106,8 +107,7 @@ export class SettingsService {
         TableName: this.tableName
       };
 
-      const result = await dynamodb.scan(params).promise();
-      return result.Items as Setting[] || [];
+      return await paginatedScan<Setting>(dynamodb, params);
     } catch (error) {
       console.error('Error getting all settings:', error);
       throw error;

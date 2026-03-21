@@ -13,6 +13,7 @@ import { chatbotDb, ChatSession } from "../services/chatbotService";
 import { scoreSessionIfNeeded } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
+import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
 import multer from "multer";
@@ -2824,11 +2825,9 @@ router.get("/analytics/gtm", async (req, res) => {
     const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
-    const result = await dynamodb.scan({
+    const plans = await paginatedScan(dynamodb, {
       TableName: TABLE_NAME,
-    }).promise();
-
-    const plans = result.Items || [];
+    });
 
     let totalItems = 0;
     let completedItems = 0;
@@ -2966,11 +2965,9 @@ router.get("/gtm-plans", async (req, res) => {
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Scan all GTM plans (admin can see all)
-    const result = await dynamodb.scan({
+    const plans = await paginatedScan(dynamodb, {
       TableName: TABLE_NAME,
-    }).promise();
-
-    const plans = result.Items || [];
+    });
 
     // Get user information for each plan
     const plansWithUsers = await Promise.all(
