@@ -6,6 +6,7 @@ import path from "path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
 import { settingsService } from "./settingsService";
+import { paginatedQuery } from "../utils/dynamoPagination";
 
 // v0 code generation can take several minutes — extend Node's default fetch timeouts.
 // Node 20's built-in undici has headersTimeout=300s which is too short for v0.
@@ -28,6 +29,16 @@ let v0PollIntervalsMs = [0, 15_000, 30_000, 45_000, 60_000];
 /** Override poll intervals (for testing) */
 export function setV0PollIntervals(intervals: number[]) {
   v0PollIntervalsMs = intervals;
+}
+
+// Vercel deployment polling config
+let vercelPollIntervalMs = 5_000;
+let vercelPollMaxAttempts = 60;
+
+/** Override Vercel polling config (for testing) */
+export function setVercelPollConfig(intervalMs: number, maxAttempts: number) {
+  vercelPollIntervalMs = intervalMs;
+  vercelPollMaxAttempts = maxAttempts;
 }
 
 export async function withRetry<T>(
@@ -453,8 +464,8 @@ async function generateFirstPage(
 
 /**
  * Add a new page route to an existing deployed landing page's GitHub repo.
- * Creates app/<slug>/page.tsx via the GitHub Contents API. Vercel auto-redeploys.
- * No v0 call — the new page content is generated from the prompt + template HTML.
+ * Calls v0 to generate a full-quality page, extracts files, and commits them
+ * under app/<slug>/ in the existing repo. Vercel auto-redeploys.
  */
 async function addPageToExistingRepo(
   existingPage: GeneratedLandingPage,
@@ -475,24 +486,20 @@ async function addPageToExistingRepo(
     .replace(/^-|-$/g, "")
     .slice(0, 30);
 
-  const match = existingPage.githubRepoUrl!.match(/github\.com\/([^\/]+)\/([^\/]+)/);
-  if (!match) throw new Error("Invalid GitHub repo URL on existing page");
-  const [, owner, repo] = match;
+  const repoMatch = existingPage.githubRepoUrl!.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+  if (!repoMatch) throw new Error("Invalid GitHub repo URL on existing page");
+  const [, owner, repo] = repoMatch;
   const repoName = repo.replace(".git", "");
+  const repoFullName = `${owner}/${repoName}`;
 
-  console.log(`[GITHUB] Adding new page /${slug} to existing repo ${owner}/${repoName}`);
+  console.log(`[V0 SERVICE] Adding new page /${slug} to existing repo ${repoFullName} via v0 generation`);
 
-  // Build the page content — a simple React component from the template/prompt
-  const pageContent = buildNewPageContent(name, prompt, brandContext, leadListId, templateHtml);
-
-  // Use the existing page's deployed URL as the base — Vercel truncates long project
-  // names so the domain often differs from the GitHub repo name.
-  // Extract just the origin (scheme + host) from the root page's URL.
+  // Use the existing page's deployed URL as the base
   let baseUrl = `https://${repoName}.vercel.app`;
   if (existingPage.deployedUrl) {
     try {
       const parsed = new URL(existingPage.deployedUrl);
-      baseUrl = parsed.origin; // e.g. "https://lp-calculate-your-360-savi.vercel.app"
+      baseUrl = parsed.origin;
     } catch {
       // URL parse failed — fall back to repo-name-based URL
     }
@@ -503,7 +510,7 @@ async function addPageToExistingRepo(
     userId,
     name,
     prompt,
-    status: "deploying",
+    status: "generating",
     iterations: 0,
     slug,
     githubRepoUrl: existingPage.githubRepoUrl,
@@ -519,26 +526,220 @@ async function addPageToExistingRepo(
   await dynamodb.put({ TableName: TABLE_NAME, Item: record }).promise();
 
   try {
+    // ── Step 1: Call v0 to generate proper page content ──
+    const enrichedPrompt = buildBrandEnrichedPrompt(prompt, brandContext, leadListId, templateHtml);
+    const v0 = await getV0Client();
+
+    console.log(`[V0 SERVICE] Creating v0 chat for additional page /${slug}...`);
+    const chatResponse = await withRetry(
+      () => v0.chats.create({ message: enrichedPrompt }),
+      "v0 chat creation (additional page)"
+    );
+
+    if (!("id" in chatResponse) || !chatResponse.id) {
+      throw new Error("v0 chat creation did not return a ChatDetail with an id");
+    }
+    const chatId = chatResponse.id;
+
+    // Save v0ChatId so the record can be retried/iterated later
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET v0ChatId = :chatId, updatedAt = :updatedAt",
+        ExpressionAttributeValues: {
+          ":chatId": chatId,
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    // ── Step 2: Poll for v0 version completion ──
+    const V0_POLL_INTERVALS_MS = v0PollIntervalsMs;
+    let versionId: string | undefined;
+
+    for (let pollAttempt = 0; pollAttempt < V0_POLL_INTERVALS_MS.length; pollAttempt++) {
+      if (V0_POLL_INTERVALS_MS[pollAttempt] > 0) {
+        console.log(`[V0 SERVICE] v0 generation not ready yet for /${slug}, waiting ${V0_POLL_INTERVALS_MS[pollAttempt] / 1000}s (attempt ${pollAttempt + 1}/${V0_POLL_INTERVALS_MS.length})...`);
+        await new Promise(resolve => setTimeout(resolve, V0_POLL_INTERVALS_MS[pollAttempt]));
+      }
+
+      const chat = await withRetry(
+        () => v0.chats.getById({ chatId }),
+        "v0 chat fetch (additional page)"
+      );
+      versionId = chat.latestVersion?.id;
+
+      if (versionId) {
+        console.log(`[V0 SERVICE] v0 version found for /${slug}: ${versionId} (poll attempt ${pollAttempt + 1})`);
+        break;
+      }
+    }
+
+    if (!versionId) {
+      throw new Error("No version found in v0 chat after polling — generation may have failed");
+    }
+
+    // ── Step 3: Download and validate v0 output ──
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: "SET #status = :status, updatedAt = :updatedAt",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":status": "deploying",
+          ":updatedAt": new Date().toISOString(),
+        },
+      })
+      .promise();
+
+    const V0_VALIDATION_MAX_RETRIES = 2;
+    let zipBuffer: any;
+
+    for (let validationAttempt = 0; validationAttempt <= V0_VALIDATION_MAX_RETRIES; validationAttempt++) {
+      console.log(`[V0 SERVICE] Downloading v0 files for /${slug} (version ${versionId}, attempt ${validationAttempt + 1})`);
+      zipBuffer = await withRetry(
+        () => v0.chats.downloadVersion({
+          chatId,
+          versionId: versionId!,
+          // @ts-ignore — SDK types may not include these yet
+          format: "zip",
+          includeDefaultFiles: true,
+        }),
+        "v0 zip download (additional page)"
+      );
+
+      const previewFiles = await unzipBuffer(zipBuffer);
+      autoFixV0Files(previewFiles);
+
+      try {
+        validateV0Output(previewFiles);
+        break;
+      } catch (valErr: any) {
+        if (valErr instanceof V0OutputValidationError && validationAttempt < V0_VALIDATION_MAX_RETRIES) {
+          console.warn(`[V0 SERVICE] v0 output validation failed for /${slug} (attempt ${validationAttempt + 1}): ${valErr.reason}`);
+
+          await withRetry(
+            () => v0.chats.sendMessage({
+              chatId,
+              message:
+                "The previous output was not valid code. Please generate actual React/Next.js code — " +
+                "not markdown, not a prompt description, not empty files. " +
+                "Output must include .tsx files with real React components using export and function/const. " +
+                `Issue: ${valErr.reason}`,
+            }),
+            "v0 correction message (additional page)"
+          );
+
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+
+          const updatedChat = await withRetry(
+            () => v0.chats.getById({ chatId }),
+            "v0 chat re-fetch (additional page)"
+          );
+          versionId = updatedChat.latestVersion?.id;
+          if (!versionId) throw new Error("No version found after correction message");
+
+          continue;
+        }
+        throw valErr;
+      }
+    }
+
+    // ── Step 4: Extract and remap files for the new page route ──
+    const allFiles = await unzipBuffer(zipBuffer);
+    autoFixV0Files(allFiles);
+    const filesToCommit = remapFilesForSubPage(allFiles, slug);
+
+    console.log(`[V0 SERVICE] Extracted ${filesToCommit.length} files for /${slug}: ${filesToCommit.map(f => f.path).join(", ")}`);
+
+    // ── Step 5: Commit files to existing repo using Git Trees API ──
     const { token: ghToken } = await getGitHubOrgToken();
     const ghHeaders = {
       Authorization: `Bearer ${ghToken}`,
       Accept: "application/vnd.github.v3+json",
     };
 
-    // Create the new page file: app/<slug>/page.tsx
-    const filePath = `app/${slug}/page.tsx`;
-    const encoded = Buffer.from(pageContent, "utf-8").toString("base64");
+    // Get latest commit SHA
+    const refRes = await axios.get<any>(
+      `https://api.github.com/repos/${repoFullName}/git/ref/heads/main`,
+      { headers: ghHeaders }
+    );
+    const latestCommitSha = refRes.data.object.sha;
 
-    await axios.put(
-      `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+    // Create blobs for each file
+    const blobPromises = filesToCommit.map(async (file) => {
+      const blobRes = await axios.post<any>(
+        `https://api.github.com/repos/${repoFullName}/git/blobs`,
+        {
+          content: file.content.toString("base64"),
+          encoding: "base64",
+        },
+        { headers: ghHeaders }
+      );
+      return {
+        path: file.path,
+        mode: "100644" as const,
+        type: "blob" as const,
+        sha: blobRes.data.sha,
+      };
+    });
+    const treeItems = await Promise.all(blobPromises);
+
+    // Create tree → commit → update ref
+    const treeRes = await axios.post<any>(
+      `https://api.github.com/repos/${repoFullName}/git/trees`,
+      { base_tree: latestCommitSha, tree: treeItems },
+      { headers: ghHeaders }
+    );
+
+    const commitRes = await axios.post<any>(
+      `https://api.github.com/repos/${repoFullName}/git/commits`,
       {
         message: `Add new page: ${name} (/${slug})`,
-        content: encoded,
+        tree: treeRes.data.sha,
+        parents: [latestCommitSha],
       },
       { headers: ghHeaders }
     );
 
-    console.log(`[GITHUB] Created ${filePath} in ${owner}/${repoName} — Vercel will auto-redeploy`);
+    await axios.patch<any>(
+      `https://api.github.com/repos/${repoFullName}/git/refs/heads/main`,
+      { sha: commitRes.data.sha },
+      { headers: ghHeaders }
+    );
+
+    console.log(`[V0 SERVICE] Pushed ${filesToCommit.length} files for /${slug} to ${repoFullName} — polling Vercel for build status`);
+
+    // Poll Vercel deployment to verify the build succeeds before marking as deployed
+    const vercelToken = await getVercelToken();
+    const deploymentResult = await pollVercelDeployment(existingPage.vercelProjectId!, vercelToken);
+
+    if (deploymentResult.buildStatus === "error" || deploymentResult.buildStatus === "timeout") {
+      const errorMsg = `Vercel build failed for /${slug}: ${deploymentResult.buildError || "Unknown build error"}`;
+      console.error(`[V0 SERVICE] ${errorMsg}`);
+
+      await dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id },
+          UpdateExpression: "SET #status = :status, errorMessage = :error, updatedAt = :updatedAt",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":status": "failed",
+            ":error": errorMsg,
+            ":updatedAt": new Date().toISOString(),
+          },
+        })
+        .promise();
+
+      return {
+        ...record,
+        status: "failed" as const,
+        errorMessage: errorMsg,
+      };
+    }
 
     // Update record to deployed
     await dynamodb
@@ -560,7 +761,7 @@ async function addPageToExistingRepo(
       updatedAt: new Date().toISOString(),
     };
   } catch (error: any) {
-    console.error("[GITHUB] Failed to add page to repo:", error);
+    console.error("[V0 SERVICE] Failed to add page to repo:", error);
 
     await dynamodb
       .update({
@@ -586,52 +787,93 @@ async function addPageToExistingRepo(
 }
 
 /**
- * Build a simple React page component from prompt + brand context.
- * Used when adding new pages to an existing repo (no v0 needed).
+ * Remap files from a v0 zip for a sub-page route.
+ * - app/page.tsx → app/<slug>/page.tsx
+ * - components/*.tsx → app/<slug>/_components/*.tsx (avoids conflicts with root page)
+ * - app/api/* → app/api/* (shared API routes, kept as-is)
+ * - Config files, layout.tsx, globals.css → skipped (use existing project's)
+ *
+ * Also rewrites import paths in the page file to point to the relocated components.
  */
-function buildNewPageContent(
-  name: string,
-  prompt: string,
-  brandContext: BrandContext,
-  leadListId?: string,
-  templateHtml?: string
-): string {
-  // If template HTML is provided, wrap it in a React component with dangerouslySetInnerHTML
-  if (templateHtml) {
-    // Escape backticks in the HTML for the template literal
-    const escapedHtml = templateHtml.replace(/`/g, "\\`").replace(/\$/g, "\\$");
-    return `export default function ${name.replace(/[^a-zA-Z0-9]/g, "")}Page() {
-  return (
-    <div dangerouslySetInnerHTML={{ __html: \`${escapedHtml}\` }} />
-  );
-}
-`;
+export function remapFilesForSubPage(
+  files: Array<{ path: string; content: Buffer }>,
+  slug: string
+): Array<{ path: string; content: Buffer }> {
+  // Files to skip — the existing project already has these
+  const skipPatterns = [
+    /^package\.json$/,
+    /^package-lock\.json$/,
+    /^tsconfig\.json$/,
+    /^next\.config\.(ts|js|mjs)$/,
+    /^next-env\.d\.ts$/,
+    /^tailwind\.config\.(ts|js)$/,
+    /^postcss\.config\.(ts|js|mjs|cjs)$/,
+    /^\.gitignore$/,
+    /^README\.md$/,
+    /^app\/layout\.tsx$/,
+    /^app\/globals\.css$/,
+    /^lib\/utils\.ts$/,
+    /^components\/ui\//,   // shadcn UI primitives — already in root project
+  ];
+
+  const result: Array<{ path: string; content: Buffer }> = [];
+  const componentRenames = new Map<string, string>(); // old import path → new import path
+
+  for (const file of files) {
+    // Skip config and shared files
+    if (skipPatterns.some((p) => p.test(file.path))) continue;
+
+    if (file.path === "app/page.tsx") {
+      // Main page → sub-route page
+      result.push({ path: `app/${slug}/page.tsx`, content: file.content });
+    } else if (file.path.startsWith("components/") && !file.path.startsWith("components/ui/")) {
+      // Custom components → namespaced under the sub-route to avoid conflicts
+      const relativeName = file.path.replace("components/", "");
+      const newPath = `app/${slug}/_components/${relativeName}`;
+      result.push({ path: newPath, content: file.content });
+      // Track rename: @/components/foo → ./_components/foo (relative from app/<slug>/)
+      const oldImport = `@/components/${relativeName.replace(/\.tsx$/, "")}`;
+      const newImport = `./_components/${relativeName.replace(/\.tsx$/, "")}`;
+      componentRenames.set(oldImport, newImport);
+    } else if (file.path.startsWith("app/api/")) {
+      // API routes (e.g. lead capture) — keep in place, shared across pages
+      result.push({ path: file.path, content: file.content });
+    } else if (file.path.startsWith("app/") && file.path !== "app/page.tsx") {
+      // Other app files (e.g. app/loading.tsx) → namespace under slug
+      const relativeName = file.path.replace("app/", "");
+      result.push({ path: `app/${slug}/${relativeName}`, content: file.content });
+    }
+    // Skip everything else (public/, lib/, etc.) — root project already has them
   }
 
-  // Otherwise, generate a minimal page from the prompt context
-  const brandName = brandContext.brandName || name;
-  const primaryColor = brandContext.primaryColor || "#007AFF";
-  const tagline = brandContext.tagline || prompt.slice(0, 100);
+  // Rewrite imports in all committed .tsx/.ts files
+  if (componentRenames.size > 0) {
+    for (const file of result) {
+      if (!file.path.endsWith(".tsx") && !file.path.endsWith(".ts")) continue;
+      let content = file.content.toString("utf-8");
+      let changed = false;
 
-  return `export default function ${name.replace(/[^a-zA-Z0-9]/g, "")}Page() {
-  return (
-    <main className="min-h-screen bg-white">
-      <section className="max-w-4xl mx-auto px-6 py-20 text-center">
-        <h1 className="text-4xl font-bold mb-4" style={{ color: "${primaryColor}" }}>
-          ${brandName}
-        </h1>
-        <p className="text-xl text-gray-600 mb-8">
-          ${tagline}
-        </p>
-        <p className="text-gray-500">
-          ${prompt.replace(/'/g, "\\'")}
-        </p>
-      </section>
-    </main>
-  );
+      for (const [oldImport, newImport] of componentRenames) {
+        // Match: import ... from "@/components/foo" or '@/components/foo'
+        const regex = new RegExp(
+          `(from\\s+['"])${oldImport.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(['"])`,
+          "g"
+        );
+        if (regex.test(content)) {
+          content = content.replace(regex, `$1${newImport}$2`);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        file.content = Buffer.from(content);
+      }
+    }
+  }
+
+  return result;
 }
-`;
-}
+
 
 /**
  * Deploy a generated landing page: download from v0 → create GitHub repo → connect to Vercel.
@@ -1258,10 +1500,8 @@ async function pollVercelDeployment(
   vercelToken: string
 ): Promise<{ buildStatus: string; buildError?: string }> {
   const headers = { Authorization: `Bearer ${vercelToken}` };
-  const maxAttempts = 30; // 30 * 10s = 5 minutes
-  const pollInterval = 10000;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  for (let attempt = 0; attempt < vercelPollMaxAttempts; attempt++) {
     try {
       // List deployments for this project
       const deploymentsRes = await axios.get<any>(
@@ -1272,7 +1512,7 @@ async function pollVercelDeployment(
       const deployment = deploymentsRes.data?.deployments?.[0];
       if (!deployment) {
         console.log(`[V0 SERVICE] No deployment found yet (attempt ${attempt + 1})`);
-        await new Promise(r => setTimeout(r, pollInterval));
+        await new Promise(r => setTimeout(r, vercelPollIntervalMs));
         continue;
       }
 
@@ -1293,10 +1533,10 @@ async function pollVercelDeployment(
       }
 
       // Still building (QUEUED, BUILDING, INITIALIZING) — wait and retry
-      await new Promise(r => setTimeout(r, pollInterval));
+      await new Promise(r => setTimeout(r, vercelPollIntervalMs));
     } catch (err: any) {
       console.error(`[V0 SERVICE] Error polling deployment (attempt ${attempt + 1}):`, err.message);
-      await new Promise(r => setTimeout(r, pollInterval));
+      await new Promise(r => setTimeout(r, vercelPollIntervalMs));
     }
   }
 
@@ -1460,21 +1700,17 @@ export async function getLandingPage(
 export async function listLandingPages(
   userId: string
 ): Promise<GeneratedLandingPage[]> {
-  const result = await dynamodb
-    .query({
-      TableName: TABLE_NAME,
-      IndexName: "UserIdIndex",
-      KeyConditionExpression: "userId = :userId",
-      FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
-      ExpressionAttributeValues: {
-        ":userId": userId,
-        ":archivedFalse": false,
-      },
-      ScanIndexForward: false, // newest first
-    })
-    .promise();
-
-  return (result.Items || []) as GeneratedLandingPage[];
+  return await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :userId",
+    FilterExpression: "attribute_not_exists(archived) OR archived = :archivedFalse",
+    ExpressionAttributeValues: {
+      ":userId": userId,
+      ":archivedFalse": false,
+    },
+    ScanIndexForward: false, // newest first
+  });
 }
 
 /**
@@ -1483,16 +1719,12 @@ export async function listLandingPages(
  * Also auto-marks the site record as isRootPage if not already set.
  */
 async function findUserSiteRecord(userId: string): Promise<GeneratedLandingPage | null> {
-  const result = await dynamodb
-    .query({
-      TableName: TABLE_NAME,
-      IndexName: "UserIdIndex",
-      KeyConditionExpression: "userId = :userId",
-      ExpressionAttributeValues: { ":userId": userId },
-    })
-    .promise();
-
-  const pages = (result.Items || []) as GeneratedLandingPage[];
+  const pages = await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :userId",
+    ExpressionAttributeValues: { ":userId": userId },
+  });
 
   // Prefer: 1) explicit root page, 2) page with v0ChatId (original v0 page), 3) any with githubRepoUrl
   const siteRecord =

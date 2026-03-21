@@ -78,6 +78,22 @@ jest.mock("v0-sdk", () => ({
   }),
 }));
 
+// Mock axios for GitHub/Vercel API calls
+const mockAxiosGet = jest.fn();
+const mockAxiosPost = jest.fn();
+const mockAxiosPatch = jest.fn();
+jest.mock("axios", () => ({
+  __esModule: true,
+  default: {
+    get: (...args: any[]) => mockAxiosGet(...args),
+    post: (...args: any[]) => mockAxiosPost(...args),
+    patch: (...args: any[]) => mockAxiosPatch(...args),
+  },
+  get: (...args: any[]) => mockAxiosGet(...args),
+  post: (...args: any[]) => mockAxiosPost(...args),
+  patch: (...args: any[]) => mockAxiosPatch(...args),
+}));
+
 // Mock uuid
 jest.mock("uuid", () => ({
   v4: () => "test-uuid-1234",
@@ -94,15 +110,17 @@ import {
   validateV0Output,
   V0OutputValidationError,
   BrandContext,
+  remapFilesForSubPage,
 } from "../services/v0Service";
 
-import { setV0PollIntervals } from "../services/v0Service";
+import { setV0PollIntervals, setVercelPollConfig } from "../services/v0Service";
 
 beforeEach(() => {
   jest.clearAllMocks();
   mockGetV0ApiKey.mockResolvedValue("test-v0-api-key");
   // Use zero-delay poll intervals in tests to avoid waiting ~2.5 min
   setV0PollIntervals([0, 0, 0, 0, 0]);
+  setVercelPollConfig(0, 30);
 });
 
 // =============================================================================
@@ -720,5 +738,276 @@ describe("V0OutputValidationError", () => {
     expect(err.name).toBe("V0OutputValidationError");
     expect(err.reason).toBe("test reason");
     expect(err.message).toContain("test reason");
+  });
+});
+
+// =============================================================================
+// remapFilesForSubPage
+// =============================================================================
+describe("v0Service - remapFilesForSubPage", () => {
+  const buf = (s: string) => Buffer.from(s);
+
+  it("remaps app/page.tsx to app/<slug>/page.tsx", () => {
+    const files = [
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div>Hello</div>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "my-page");
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("app/my-page/page.tsx");
+  });
+
+  it("skips config and shared files", () => {
+    const files = [
+      { path: "package.json", content: buf('{}') },
+      { path: "tsconfig.json", content: buf('{}') },
+      { path: "next.config.ts", content: buf('export default {}') },
+      { path: "app/layout.tsx", content: buf('export default function Layout() {}') },
+      { path: "app/globals.css", content: buf('body {}') },
+      { path: "lib/utils.ts", content: buf('export function cn() {}') },
+      { path: "components/ui/button.tsx", content: buf('export function Button() {}') },
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "test");
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("app/test/page.tsx");
+  });
+
+  it("moves custom components to app/<slug>/_components/ and rewrites imports", () => {
+    const pageContent = `import { Hero } from "@/components/hero";\nimport { Footer } from "@/components/footer";\nexport default function Page() { return <><Hero/><Footer/></>; }`;
+    const files = [
+      { path: "app/page.tsx", content: buf(pageContent) },
+      { path: "components/hero.tsx", content: buf('export function Hero() { return <div>Hero</div>; }') },
+      { path: "components/footer.tsx", content: buf('export function Footer() { return <div>Footer</div>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "abm-startups");
+
+    expect(result).toHaveLength(3);
+
+    const page = result.find(f => f.path === "app/abm-startups/page.tsx");
+    expect(page).toBeDefined();
+    // Imports should be rewritten to relative _components paths
+    const pageStr = page!.content.toString("utf-8");
+    expect(pageStr).toContain('from "./_components/hero"');
+    expect(pageStr).toContain('from "./_components/footer"');
+    expect(pageStr).not.toContain("@/components/hero");
+    expect(pageStr).not.toContain("@/components/footer");
+
+    expect(result.find(f => f.path === "app/abm-startups/_components/hero.tsx")).toBeDefined();
+    expect(result.find(f => f.path === "app/abm-startups/_components/footer.tsx")).toBeDefined();
+  });
+
+  it("keeps app/api/ routes in place (shared across pages)", () => {
+    const files = [
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+      { path: "app/api/capture/route.ts", content: buf('export async function POST() {}') },
+    ];
+    const result = remapFilesForSubPage(files, "pricing");
+
+    expect(result).toHaveLength(2);
+    expect(result.find(f => f.path === "app/api/capture/route.ts")).toBeDefined();
+    expect(result.find(f => f.path === "app/pricing/page.tsx")).toBeDefined();
+  });
+
+  it("namespaces other app files under slug", () => {
+    const files = [
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+      { path: "app/loading.tsx", content: buf('export default function Loading() { return <div>Loading...</div>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "demo");
+
+    expect(result).toHaveLength(2);
+    expect(result.find(f => f.path === "app/demo/page.tsx")).toBeDefined();
+    expect(result.find(f => f.path === "app/demo/loading.tsx")).toBeDefined();
+  });
+
+  it("handles empty files array", () => {
+    const result = remapFilesForSubPage([], "test");
+    expect(result).toHaveLength(0);
+  });
+});
+
+// =============================================================================
+// addPageToExistingRepo (via generateLandingPage when site record exists)
+// =============================================================================
+describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => {
+  // Helper: create a minimal valid zip buffer with a page.tsx file
+  const createTestZip = async () => {
+    const AdmZip = (await import("adm-zip")).default;
+    const zip = new AdmZip();
+    zip.addFile(
+      "app/page.tsx",
+      Buffer.from('export default function Page() { return <div>Hello</div>; }')
+    );
+    return zip.toBuffer();
+  };
+
+  // Site record returned by findUserSiteRecord (via query)
+  const existingSiteRecord = {
+    id: "existing-site-id",
+    userId: "user-1",
+    name: "Main Page",
+    prompt: "main page",
+    status: "deployed",
+    iterations: 0,
+    isRootPage: true,
+    githubRepoUrl: "https://github.com/AgentWebPro/lp-test-repo",
+    vercelProjectId: "prj_test123",
+    deployedUrl: "https://lp-test-repo.vercel.app",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+
+  // Setup: mock findUserSiteRecord to return the existing site record
+  const setupSiteRecordMock = () => {
+    mockQuery.mockReturnValueOnce({
+      promise: () => Promise.resolve({ Items: [existingSiteRecord] }),
+    });
+  };
+
+  // Setup: mock v0 chat creation, polling, and zip download
+  const setupV0Mocks = async () => {
+    const zipBuffer = await createTestZip();
+    mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+    mockChatsGetById.mockResolvedValueOnce({
+      latestVersion: { id: "version_new" },
+    });
+    mockChatsDownloadVersion.mockResolvedValueOnce(zipBuffer);
+    return zipBuffer;
+  };
+
+  // Setup: mock GitHub API (ref, blob, tree, commit, patch)
+  const setupGitHubMocks = () => {
+    // GET ref/heads/main
+    mockAxiosGet.mockResolvedValueOnce({
+      data: { object: { sha: "abc123" } },
+    });
+    // POST blob
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { sha: "blob_sha" },
+    });
+    // POST tree
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { sha: "tree_sha" },
+    });
+    // POST commit
+    mockAxiosPost.mockResolvedValueOnce({
+      data: { sha: "commit_sha" },
+    });
+    // PATCH ref
+    mockAxiosPatch.mockResolvedValueOnce({ data: {} });
+  };
+
+  // Setup: mock Vercel deployment polling (success)
+  const setupVercelDeploySuccessMock = () => {
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [{ uid: "dpl_123", readyState: "READY" }],
+      },
+    });
+  };
+
+  // Setup: mock Vercel deployment polling (build error)
+  const setupVercelDeployErrorMock = () => {
+    // First poll: deployment in ERROR state
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [{ uid: "dpl_fail", readyState: "ERROR" }],
+      },
+    });
+    // Fetch build error logs
+    mockAxiosGet.mockResolvedValueOnce({
+      data: [
+        { type: "stderr", payload: { text: "Module not found: @/components/missing" } },
+      ],
+    });
+  };
+
+  it("FAIL: Vercel build fails → record status set to failed with build error", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks();
+    setupVercelDeployErrorMock();
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create ABM page for startups",
+      "ABM Startups",
+      {}
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toBeDefined();
+    expect(result.errorMessage).toContain("Vercel build failed");
+  });
+
+  it("FAIL: Vercel deployment times out → record status set to failed", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks();
+    // Mock all polling attempts returning BUILDING
+    for (let i = 0; i < 30; i++) {
+      mockAxiosGet.mockResolvedValueOnce({
+        data: {
+          deployments: [{ uid: "dpl_slow", readyState: "BUILDING" }],
+        },
+      });
+    }
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create ABM page",
+      "ABM Page",
+      {}
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("timed out");
+  });
+
+  it("SUCCESS: Vercel build succeeds → record status set to deployed", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks();
+    setupVercelDeploySuccessMock();
+
+    const result = await generateLandingPage(
+      "user-1",
+      "Create ABM page for startups",
+      "ABM Startups",
+      {}
+    );
+
+    expect(result.status).toBe("deployed");
+    expect(result.slug).toBe("abm-startups");
+    expect(result.deployedUrl).toContain("/abm-startups");
+  });
+
+  it("SUCCESS: polls multiple times before deployment becomes ready", async () => {
+    setupSiteRecordMock();
+    await setupV0Mocks();
+    setupGitHubMocks();
+    // First poll: still BUILDING
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [{ uid: "dpl_123", readyState: "BUILDING" }],
+      },
+    });
+    // Second poll: READY
+    mockAxiosGet.mockResolvedValueOnce({
+      data: {
+        deployments: [{ uid: "dpl_123", readyState: "READY" }],
+      },
+    });
+
+    const result = await generateLandingPage(
+      "user-1",
+      "ABM page",
+      "ABM Ecommerce",
+      {}
+    );
+
+    expect(result.status).toBe("deployed");
+    // At least 2 Vercel polling calls after the GitHub GET ref call
+    expect(mockAxiosGet).toHaveBeenCalledTimes(3); // 1 GitHub ref + 2 Vercel polls
   });
 });
