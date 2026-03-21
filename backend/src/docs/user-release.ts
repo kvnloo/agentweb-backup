@@ -8,6 +8,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-22',
+    changes: [
+      'Fix: Scheduled Chat Now Uses Configured Default Model',
+      '- When creating a new scheduled chat, the AI Model field no longer pre-selects the first model from the list (which was the agent mode default)',
+      '- Instead, the model field defaults to unselected, so the backend uses whichever default model is configured for scheduled chats in the admin settings',
+      '- This ensures new scheduled chats use the intended scheduled chat default rather than inheriting the live chat default',
+    ],
+  },
+  {
     date: '2026-03-21',
     changes: [
       'Fix: Landing Page Sub-Pages Now Verify Deployment Before Reporting Success',
