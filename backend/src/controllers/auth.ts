@@ -258,7 +258,8 @@ export const googleCallback = async (
         const finalDisplayName =
           profile.displayName || waitlistEntry?.fullName || email.split("@")[0];
 
-        const roles: ("partner" | "customer" | "free")[] = ["free"];
+        const roles: ("partner" | "customer" | "free")[] =
+          portalOrigin === "customer" ? ["customer"] : ["free"];
 
         user = await userDb.createUser(
           email,

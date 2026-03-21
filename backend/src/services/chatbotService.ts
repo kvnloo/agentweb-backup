@@ -1480,20 +1480,36 @@ export class ChatbotDB {
     // Note: DynamoDB UserIdIndex doesn't support sorting by updatedAt, so we'll sort in memory
     params.ScanIndexForward = false; // Always get in consistent order
 
-    // Add lastEvaluatedKey if provided for pagination
-    if (lastEvaluatedKey) {
-      try {
-        params.ExclusiveStartKey = JSON.parse(lastEvaluatedKey);
-      } catch (error) {
-        console.error("Invalid lastEvaluatedKey format:", error);
-        throw new Error("Invalid pagination key");
-      }
-    }
-
     try {
-      const result = await dynamodb.query(params).promise();
-      let sessions = (result.Items as ChatSession[]) || [];
-      
+      // Paginate internally until we have enough filtered results.
+      // DynamoDB's Limit caps items *scanned*, not items *returned* after
+      // FilterExpression is applied, so a single query may return far fewer
+      // results than requested when many items are filtered out.
+      const collected: ChatSession[] = [];
+      let paginationKey: any = undefined;
+      if (lastEvaluatedKey) {
+        try {
+          paginationKey = JSON.parse(lastEvaluatedKey);
+        } catch (error) {
+          console.error("Invalid lastEvaluatedKey format:", error);
+          throw new Error("Invalid pagination key");
+        }
+      }
+
+      const targetCount = limit || 200; // sensible upper bound when no limit set
+
+      do {
+        if (paginationKey) {
+          params.ExclusiveStartKey = paginationKey;
+        }
+        const result = await dynamodb.query(params).promise();
+        const items = (result.Items as ChatSession[]) || [];
+        collected.push(...items);
+        paginationKey = result.LastEvaluatedKey;
+      } while (paginationKey && collected.length < targetCount);
+
+      let sessions = collected;
+
       console.log(
         `Found ${sessions.length} chat sessions for user: ${userId}`
       );
@@ -1555,7 +1571,7 @@ export class ChatbotDB {
 
       return {
         sessions: sessionsWithMessages,
-        lastEvaluatedKey: result.LastEvaluatedKey
+        lastEvaluatedKey: paginationKey
       };
     } catch (error) {
       console.error("Error getting user chat sessions:", error);
