@@ -10,6 +10,7 @@
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1713,6 +1714,47 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
       context: ctx(context)
     });
     return jsonResult(data);
+  }
+});
+
+// ─── PR Digest (admin-only) ─────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'get_pr_digest',
+  definition: {
+    name: 'get_pr_digest',
+    description: 'Fetch merged pull requests from GitHub repositories (agentweb and agentweb-customer-portal) within a time range and return a formatted summary. Defaults to the past 24 hours. Admin-only. Use this to generate daily change digests to send to the team.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: {
+          type: 'string',
+          description: 'Start time in ISO 8601 format (e.g., "2026-03-19T00:00:00Z"). Defaults to 24 hours ago.'
+        },
+        until: {
+          type: 'string',
+          description: 'End time in ISO 8601 format (e.g., "2026-03-20T00:00:00Z"). Defaults to now.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (_args: any) => {
+    const now = new Date();
+    const defaultSince = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const since = _args.since || defaultSince.toISOString();
+    const until = _args.until || now.toISOString();
+
+    const results = await fetchMergedPRs(since, until);
+    const totalPRs = results.reduce((sum, r) => sum + r.prs.length, 0);
+
+    return jsonResult({
+      totalPRs,
+      since,
+      until,
+      text: formatDigestText(results),
+      results,
+    });
   }
 });
 
