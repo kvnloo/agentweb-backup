@@ -8044,8 +8044,11 @@ Format the response as JSON with this structure:
         } else {
           kbFiles.push(fileEntry);
         }
+        // Calculate total size from all files
+        const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
         await taskDb.updateTask(taskId, {
           knowledgeBaseFiles: kbFiles,
+          knowledgeBaseSize: totalSize,
           knowledgeBaseUpdatedAt: now
         });
       }
@@ -8181,9 +8184,11 @@ Format the response as JSON with this structure:
         uploadedFiles.push({ name: f.name, size, url });
       }
 
-      // 5. Update DynamoDB
+      // 5. Calculate total size and update DynamoDB
+      const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
       await taskDb.updateTask(taskId, {
         knowledgeBaseFiles: kbFiles,
+        knowledgeBaseSize: totalSize,
         knowledgeBaseUpdatedAt: new Date().toISOString()
       });
 
