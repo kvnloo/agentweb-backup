@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
+import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -795,8 +796,7 @@ export const taskDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getTaskSchedules");
     }
@@ -814,8 +814,7 @@ export const taskDb = {
         Select: "COUNT",
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Count || 0;
+      return await paginatedCount(dynamodb, params);
     } catch (error) {
       console.error("Error getting task count:", error);
       return 0;
@@ -1173,8 +1172,7 @@ export const taskDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items;
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getPendingTaskExecutions");
     }
@@ -1192,8 +1190,7 @@ export const taskDb = {
         ScanIndexForward: false, // Get latest executions first
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getTaskExecutions");
     }
@@ -1611,14 +1608,14 @@ export const taskDb = {
         ScanIndexForward: false // Sort by knowledgeBaseUpdatedAt descending (most recent first)
       };
 
-      const result = await dynamodb.query(params).promise();
+      const items = await paginatedQuery(dynamodb, params);
 
-      if (!result.Items || result.Items.length === 0) {
+      if (items.length === 0) {
         return [];
       }
 
       // Map to return standardized fields
-      const knowledgeBaseTasks = result.Items.map((task: any) => {
+      const knowledgeBaseTasks = items.map((task: any) => {
         const size = typeof task.knowledgeBaseSize === 'string'
           ? parseInt(task.knowledgeBaseSize)
           : task.knowledgeBaseSize || 0;
@@ -1756,8 +1753,7 @@ export const scheduleDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByTaskId");
     }
@@ -1903,8 +1899,7 @@ export const scheduleDb = {
               },
             };
 
-            const result = await dynamodb.query(params).promise();
-            return result.Items || [];
+            return await paginatedQuery(dynamodb, params);
           } catch (error) {
             handleDynamoDbError(error, "getSchedulesReadyToRun");
             return [];
@@ -2038,8 +2033,7 @@ export const scheduleDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getPendingSchedules");
     }
@@ -2056,8 +2050,7 @@ export const scheduleDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesByUserId");
     }
@@ -2179,8 +2172,7 @@ export const subscriberDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getTaskSubscribers");
     }
@@ -2196,8 +2188,7 @@ export const subscriberDb = {
         },
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Items || [];
+      return await paginatedQuery(dynamodb, params);
     } catch (error) {
       handleDynamoDbError(error, "getAllTaskSubscribers");
     }
@@ -2433,8 +2424,7 @@ export const workflowDb = {
         Select: "COUNT",
       };
 
-      const result = await dynamodb.query(params).promise();
-      return result.Count || 0;
+      return await paginatedCount(dynamodb, params);
     } catch (error) {
       console.error("Error getting workflow count:", error);
       return 0;
@@ -2477,8 +2467,7 @@ class TaskTemplateDB {
     };
 
     try {
-      const result = await this.docClient.query(params).promise();
-      return result.Items as TaskTemplate[];
+      return await paginatedQuery<TaskTemplate>(this.docClient, params);
     } catch (error) {
       handleDynamoDbError(error, "getTemplatesByUserId");
       throw error;
@@ -2491,8 +2480,7 @@ class TaskTemplateDB {
     };
 
     try {
-      const result = await this.docClient.scan(params).promise();
-      return result.Items as TaskTemplate[];
+      return await paginatedScan<TaskTemplate>(this.docClient, params);
     } catch (error) {
       handleDynamoDbError(error, "getAllTemplates");
       throw error;
@@ -2509,8 +2497,7 @@ class TaskTemplateDB {
     };
 
     try {
-      const result = await this.docClient.scan(params).promise();
-      return result.Items as TaskTemplate[];
+      return await paginatedScan<TaskTemplate>(this.docClient, params);
     } catch (error) {
       handleDynamoDbError(error, "getPublishedTemplates");
       throw error;

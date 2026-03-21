@@ -18,6 +18,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Users with a large number of tasks (300+) could see some tasks and knowledge bases missing from the UI',
       '- Root cause: DynamoDB queries return a maximum of 1MB per request, and the backend was not paginating through all results',
       '- The backend now correctly paginates through all DynamoDB pages when loading user tasks',
+      '- Extended fix to 30+ additional database functions across tasks, schedules, templates, workflows, skills, subscribers, and admin pages',
+      '- Created reusable pagination helpers (paginatedQuery, paginatedScan, paginatedCount) to prevent this class of bug from recurring',
       'Fix: User Guide Page Now Loads Correctly',
       '- The /guide page was blocked by the browser\'s Content Security Policy — Notion iframe embedding is now allowed',
       '- Added proper error handling when the guide fails to load instead of showing "Loading..." indefinitely',

@@ -2,6 +2,7 @@ import { DynamoDB } from 'aws-sdk';
 import { handleDynamoError } from '../utils/errorHandler';
 import { TABLE_PREFIX } from '../config/constants';
 import { taskDb } from './db';
+import { paginatedQuery } from '../utils/dynamoPagination';
 
 const dynamodb = new DynamoDB.DocumentClient();
 
@@ -185,8 +186,7 @@ export const workflowDb = {
         ScanIndexForward: false
       };
 
-      const result = await dynamodb.query(params).promise();
-      return (result.Items || []) as WorkflowExecution[];
+      return await paginatedQuery<WorkflowExecution>(dynamodb, params);
     } catch (error) {
       console.error('Error in getWorkflowExecutions:', error);
       throw error;
@@ -207,8 +207,7 @@ export const workflowDb = {
         }
       };
 
-      const result = await dynamodb.query(params).promise();
-      return (result.Items || []) as WorkflowExecution[];
+      return await paginatedQuery<WorkflowExecution>(dynamodb, params);
     } catch (error) {
       console.error('Error in getPendingWorkflowExecutions:', error);
       throw error;
