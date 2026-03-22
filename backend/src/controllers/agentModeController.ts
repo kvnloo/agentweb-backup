@@ -4532,49 +4532,62 @@ export const agentModeController = {
 
       // Fire-and-forget: send starting message after response is returned
       if (startingMessage && typeof startingMessage === 'string' && startingMessage.trim()) {
-        generateSessionResponse(
-          session.sessionId,
-          startingMessage.trim(),
-          userId,
-          selectedModel
-        ).catch(async (err: any) => {
-          console.error('AgentMode: Error sending starting message for session', session.sessionId, err);
+        const trimmedMessage = startingMessage.trim();
+        const sessionId = session.sessionId;
 
-          // Persist error message to session so the user sees something went wrong
-          try {
-            const errorMessage: ChatMessage = {
-              role: 'assistant',
-              content: 'I encountered an error while processing your request. Please try sending your message again or start a new session.',
-              timestamp: new Date().toISOString(),
-              metadata: {
-                timestamp: new Date().toISOString(),
-                isErrorMessage: true
-              }
-            };
-            await chatbotDb.addMessageToSession(session.sessionId, errorMessage);
-          } catch (saveErr) {
-            console.error('AgentMode: Failed to save error message to session', session.sessionId, saveErr);
-          }
+        generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel)
+          .catch(async (firstErr: any) => {
+            // Retry once after a short delay — handles transient failures like worker
+            // not ready after a restart or temporary LLM API errors
+            console.warn(`AgentMode: First attempt failed for session ${sessionId}, retrying in 5s...`, firstErr?.message);
 
-          // Emit progress complete so the frontend stops showing the loading state and refreshes
-          emitProgress(session.sessionId, { iteration: 0, status: 'complete' });
+            await new Promise(resolve => setTimeout(resolve, 5000));
 
-          // Send oncall alert so the team is notified
-          sendAgentModeOncallAlert({
-            subject: `Work Plan Session Failed: ${session.sessionId}`,
-            message: `A predefined work plan session failed during fire-and-forget response generation.\n\nError: ${err?.message || 'Unknown error'}`,
-            sessionId: session.sessionId,
-            context: {
-              'Session ID': session.sessionId,
-              'User ID': userId,
-              'Plan Title': workPlanWithWelcome?.title || 'Unknown',
-              'LLM Model': selectedModel,
-              'Error Message': err?.message || 'Unknown error',
-              'Error Stack': err?.stack || 'No stack trace',
-              'Timestamp': new Date().toISOString()
+            try {
+              await generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel);
+              console.log(`AgentMode: Retry succeeded for session ${sessionId}`);
+              return; // Retry succeeded — done
+            } catch (retryErr: any) {
+              console.error(`AgentMode: Retry also failed for session ${sessionId}`, retryErr);
             }
-          }).catch(alertErr => console.error('Failed to send oncall alert for work plan session error:', alertErr));
-        });
+
+            // Both attempts failed — persist error message and alert
+
+            // Persist error message to session so the user sees something went wrong
+            try {
+              const errorMessage: ChatMessage = {
+                role: 'assistant',
+                content: 'I encountered an error while processing your request. Please try sending your message again or start a new session.',
+                timestamp: new Date().toISOString(),
+                metadata: {
+                  timestamp: new Date().toISOString(),
+                  isErrorMessage: true
+                }
+              };
+              await chatbotDb.addMessageToSession(sessionId, errorMessage);
+            } catch (saveErr) {
+              console.error('AgentMode: Failed to save error message to session', sessionId, saveErr);
+            }
+
+            // Emit progress complete so the frontend stops showing the loading state and refreshes
+            emitProgress(sessionId, { iteration: 0, status: 'complete' });
+
+            // Send oncall alert so the team is notified
+            sendAgentModeOncallAlert({
+              subject: `Work Plan Session Failed: ${sessionId}`,
+              message: `A predefined work plan session failed after retry.\n\nFirst error: ${firstErr?.message || 'Unknown'}\n\nRetry error: (see above)`,
+              sessionId,
+              context: {
+                'Session ID': sessionId,
+                'User ID': userId,
+                'Plan Title': workPlanWithWelcome?.title || 'Unknown',
+                'LLM Model': selectedModel,
+                'Error Message': firstErr?.message || 'Unknown error',
+                'Error Stack': firstErr?.stack || 'No stack trace',
+                'Timestamp': new Date().toISOString()
+              }
+            }).catch(alertErr => console.error('Failed to send oncall alert for work plan session error:', alertErr));
+          });
       }
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);
