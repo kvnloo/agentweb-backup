@@ -329,6 +329,170 @@ describe('runCodingAgent', () => {
     expect(result.iterations).toBeGreaterThanOrEqual(1);
   });
 
+  test('list_commits tool returns formatted commit history', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'list_commits', input: { file_path: 'app/page.tsx' } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Found commits.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({
+      commits: [
+        { sha: 'abc1234567890', message: 'Update heading', date: '2026-03-20T10:00:00Z', author: 'Emma' },
+        { sha: 'def4567890123', message: 'Initial commit', date: '2026-03-19T10:00:00Z', author: 'v0' }
+      ]
+    });
+
+    const result = await runCodingAgent('list commits', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(mockedMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'GET',
+      path: expect.stringContaining('/commits'),
+      queryParams: { path: 'app/page.tsx' }
+    }));
+  });
+
+  test('list_commits without file_path passes empty queryParams', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'list_commits', input: {} }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Done.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    mockedMcpFetch.mockResolvedValueOnce({ commits: [] });
+
+    const result = await runCodingAgent('list all commits', mockContext);
+
+    expect(result.success).toBe(true);
+    expect(mockedMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'GET',
+      path: expect.stringContaining('/commits'),
+      queryParams: {}
+    }));
+  });
+
+  test('revert_file reads old version and writes it back', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'revert_file', input: {
+            file_path: 'app/page.tsx',
+            commit_sha: 'abc1234',
+            commit_message: 'Revert to pre-edit state'
+          }}
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Reverted successfully.', status: 'success' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // First call: GET file-at-commit
+    mockedMcpFetch.mockResolvedValueOnce({
+      path: 'app/page.tsx',
+      content: '<h1>Original Content</h1>',
+      sha: 'oldsha',
+      commit_ref: 'abc1234'
+    });
+    // Second call: PUT github-edit
+    mockedMcpFetch.mockResolvedValueOnce({
+      success: true,
+      commit_url: 'https://github.com/test/repo/commit/newsha',
+      deployed_url: 'https://test.vercel.app'
+    });
+
+    const result = await runCodingAgent('revert the file', mockContext);
+
+    expect(result.success).toBe(true);
+    // Verify file-at-commit was called
+    expect(mockedMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'GET',
+      path: expect.stringContaining('/file-at-commit'),
+      queryParams: { path: 'app/page.tsx', ref: 'abc1234' }
+    }));
+    // Verify github-edit was called with old content
+    expect(mockedMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+      method: 'PUT',
+      path: expect.stringContaining('/github-edit'),
+      body: expect.objectContaining({
+        file_path: 'app/page.tsx',
+        content: '<h1>Original Content</h1>',
+        commit_message: 'Revert to pre-edit state'
+      })
+    }));
+  });
+
+  test('revert_file returns error when file_path or commit_sha is missing', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'revert_file', input: { file_path: 'app/page.tsx' } }
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'Missing params.', status: 'error' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    const result = await runCodingAgent('revert without sha', mockContext);
+
+    // Should have completed (agent handles the error from tool)
+    expect(result.iterations).toBeGreaterThanOrEqual(1);
+    // mcpFetch should NOT have been called since validation fails early
+    expect(mockedMcpFetch).not.toHaveBeenCalled();
+  });
+
+  test('revert_file handles file not found at commit', async () => {
+    mockCreate
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'revert_file', input: {
+            file_path: 'app/missing.tsx',
+            commit_sha: 'abc1234'
+          }}
+        ],
+        stop_reason: 'tool_use'
+      })
+      .mockResolvedValueOnce({
+        content: [
+          { type: 'tool_use', id: 'tu_2', name: 'report_to_user', input: { message: 'File not found.', status: 'error' } }
+        ],
+        stop_reason: 'tool_use'
+      });
+
+    // file-at-commit returns no content
+    mockedMcpFetch.mockResolvedValueOnce({ path: 'app/missing.tsx' });
+
+    const result = await runCodingAgent('revert missing file', mockContext);
+
+    expect(result.iterations).toBeGreaterThanOrEqual(1);
+    // Should only have called GET, not PUT (since content was empty)
+    expect(mockedMcpFetch).toHaveBeenCalledTimes(1);
+  });
+
   test('list_files tool returns file listing', async () => {
     // LLM calls list_files then report_to_user
     mockCreate
