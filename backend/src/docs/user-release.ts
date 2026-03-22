@@ -10,6 +10,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-22',
     changes: [
+      'Enhancement: Anti-Bot Detection for Emma Browser Browsing',
+      '- Emma\'s Playwright browser now includes anti-headless detection flags when browsing websites',
+      '- Adds --disable-blink-features=AutomationControlled to prevent navigator.webdriver from being set to true',
+      '- Reduces the chance of websites blocking Emma\'s browser as a bot during browsing tasks',
+      '- No impact on Emma\'s ability to control the browser — only affects how the browser identifies itself to websites',
+    ],
+  },
+  {
+    date: '2026-03-22',
+    changes: [
       'Fix: Scheduled Chat Now Uses Configured Default Model',
       '- When creating a new scheduled chat, the AI Model field no longer pre-selects the first model from the list (which was the agent mode default)',
       '- Instead, the model field defaults to unselected, so the backend uses whichever default model is configured for scheduled chats in the admin settings',
