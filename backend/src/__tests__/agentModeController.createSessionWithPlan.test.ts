@@ -16,6 +16,8 @@ jest.mock('../services/chatbotService', () => ({
     updateSessionLlmModel: jest.fn(),
     getChatSession: jest.fn(),
     addChatMessage: jest.fn(),
+    addMessageToSession: jest.fn().mockResolvedValue({}),
+    createOrReuseInteractiveShare: jest.fn().mockResolvedValue('https://example.com/ishare'),
   }
 }));
 
@@ -45,6 +47,16 @@ jest.mock('crypto', () => ({
   randomBytes: jest.fn(() => ({
     toString: jest.fn(() => 'mock-conversable-token-123')
   }))
+}));
+
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({
+  generateMarketingResponseWorkerService: {
+    restartWorker: jest.fn().mockResolvedValue(undefined),
+    runInWorker: jest.fn(),
+    cancelSession: jest.fn(),
+    ensureWorkerReady: jest.fn().mockResolvedValue(undefined),
+    isWorkerHealthy: jest.fn().mockResolvedValue(true),
+  }
 }));
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -838,7 +850,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should handle generateSessionResponse failure gracefully', async () => {
       // Make getChatSession throw to simulate generateSessionResponse failure
       mockChatbotDb.getChatSession = jest.fn().mockRejectedValue(new Error('Session not found'));
-      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
       const req = mockRequest(mockPlanTitle, {}, { startingMessage: 'firstName is Rui' });
       const res = mockResponse();
@@ -850,18 +863,22 @@ describe('AgentModeController - createSessionWithPlan', () => {
         sessionId: 'test-session-123'
       }));
 
-      // Wait for the fire-and-forget to execute and fail
-      await new Promise(resolve => setTimeout(resolve, 50));
+      // Wait for the fire-and-forget to execute, fail, restart worker, wait 3s, and retry
+      await new Promise(resolve => setTimeout(resolve, 4000));
 
-      // Error should be logged, not thrown
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining('Error sending starting message'),
-        'test-session-123',
-        expect.any(Error)
+      // First failure should be logged as warning
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('First attempt failed for session test-session-123')
       );
 
-      consoleSpy.mockRestore();
-    });
+      // Retry failure should be logged as error
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Retry also failed for session test-session-123')
+      );
+
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }, 10000);
 
     it('should handle missing req.body gracefully', async () => {
       // Create request without body property
