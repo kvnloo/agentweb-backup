@@ -10,6 +10,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-22',
     changes: [
+      'Fix: Scheduled Chat List Could Crash Sessions for Users with Large Run History',
+      '- When Emma listed scheduled chats, the response included full run history for every schedule',
+      '- For users with many schedules and accumulated run results, this could exceed DynamoDB\'s 400KB item size limit when stored as a chat message',
+      '- The scheduled chats list now excludes run history data, keeping the response compact',
+    ],
+  },
+  {
+    date: '2026-03-22',
+    changes: [
       'Fix: Scheduled Chat Updates No Longer Fail When Only Changing Some Fields',
       '- When Emma tried to update a scheduled chat (e.g. just change the description), the update would fail because the API required all fields to be sent every time',
       '- The update endpoint now supports partial updates — only the fields you want to change need to be included',
