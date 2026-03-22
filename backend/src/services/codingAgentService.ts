@@ -55,16 +55,19 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editin
 9. For large changes, break them into multiple edit_file calls.
 10. NEVER attempt to rewrite an entire file or replace more than a small section at once. Only make targeted edits to specific sections. If a file is too large to edit safely, report the limitation to the user.
 11. For large files (>20KB), read the file to understand structure, then make focused edits to only the specific lines that need changing. Do NOT restructure or reorganize code beyond what was requested.
+12. BEFORE making any edits, use list_commits to record the current commit SHA. This is your safety bookmark.
+13. If your edits break the build and you cannot fix them within 2 attempts, use revert_file to restore the file to the pre-edit commit SHA. Do NOT keep trying broken fixes.
 
 ## Workflow
 1. list_files to see the project structure
-2. read_file to understand the current code
-3. edit_file with precise search/replace diffs
-4. check_deployment to verify the build
-5. If build fails: read error → fix → check again
-6. browse_page to verify changes visually on the deployed site
-7. If something looks wrong: fix → redeploy → verify again
-8. report_to_user when done (include verification results)`;
+2. list_commits (optionally filtered by the file you plan to edit) to record the current commit SHA as a rollback point
+3. read_file to understand the current code
+4. edit_file with precise search/replace diffs
+5. check_deployment to verify the build
+6. If build fails: read error → fix → check again. If still failing after 2 fix attempts, revert_file to the pre-edit commit SHA.
+7. browse_page to verify changes visually on the deployed site
+8. If something looks wrong: fix → redeploy → verify again. If unable to fix, revert_file.
+9. report_to_user when done (include verification results and whether any reverts were needed)`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -242,6 +245,42 @@ function getToolDefinitions(): Anthropic.Tool[] {
       }
     },
     {
+      name: 'list_commits',
+      description: 'List recent commits in the repository. Optionally filter by file path. Use this before making changes to record the current commit SHA, so you can revert if something goes wrong.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Optional file path to filter commits (e.g., "app/page.tsx"). If omitted, lists all recent commits.'
+          }
+        },
+        required: []
+      }
+    },
+    {
+      name: 'revert_file',
+      description: 'Revert a file to its state at a previous commit. Use this to undo changes that broke the build or damaged the page. Provide the commit SHA from list_commits.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Path to the file to revert (e.g., "app/page.tsx")'
+          },
+          commit_sha: {
+            type: 'string',
+            description: 'The commit SHA to revert to (from list_commits output)'
+          },
+          commit_message: {
+            type: 'string',
+            description: 'Git commit message for the revert (e.g., "Revert app/page.tsx to pre-edit state")'
+          }
+        },
+        required: ['file_path', 'commit_sha']
+      }
+    },
+    {
       name: 'browse_page',
       description: 'Navigate to a URL and get a text snapshot of the page content (accessibility tree). Use this to verify your edits are visible on the deployed site. Returns a structured description of all visible elements on the page.',
       input_schema: {
@@ -345,6 +384,61 @@ async function executeTool(
       }
       if (errors.length > 0) {
         response += `\nWarnings (${errors.length} edits skipped):\n${errors.join('\n')}`;
+      }
+      return response;
+    }
+
+    case 'list_commits': {
+      const queryParams: Record<string, string> = {};
+      if (args.file_path) queryParams.path = args.file_path;
+      const data = await mcpFetch({
+        method: 'GET',
+        path: `${basePath}/commits`,
+        queryParams,
+        context: { userId: context.userId }
+      });
+      const commits = data.commits || [];
+      if (commits.length === 0) return 'No commits found.';
+      return commits.map((c: any) =>
+        `${c.sha.substring(0, 7)} | ${c.date} | ${c.message.split('\n')[0]}`
+      ).join('\n');
+    }
+
+    case 'revert_file': {
+      if (!args.file_path || !args.commit_sha) {
+        return 'Error: file_path and commit_sha are required.';
+      }
+
+      // Step 1: Read file content at the target commit
+      const oldFileData = await mcpFetch({
+        method: 'GET',
+        path: `${basePath}/file-at-commit`,
+        queryParams: { path: args.file_path, ref: args.commit_sha },
+        context: { userId: context.userId }
+      });
+
+      if (!oldFileData.content) {
+        return `Error: Could not read ${args.file_path} at commit ${args.commit_sha}. The file may not exist at that commit.`;
+      }
+
+      // Step 2: Write it back via the existing github-edit endpoint
+      const writeResult = await mcpFetch({
+        method: 'PUT',
+        path: `${basePath}/github-edit`,
+        body: {
+          file_path: args.file_path,
+          content: oldFileData.content,
+          commit_message: args.commit_message || `Revert ${args.file_path} to commit ${args.commit_sha.substring(0, 7)}`
+        },
+        context: { userId: context.userId }
+      });
+
+      let response = `Reverted ${args.file_path} to commit ${args.commit_sha.substring(0, 7)}.`;
+      if (writeResult.deployed_url) {
+        response += ` Changes will auto-deploy to ${writeResult.deployed_url}.`;
+      }
+      if (writeResult.commit_url) {
+        response += ` Commit: ${writeResult.commit_url}`;
       }
       return response;
     }
