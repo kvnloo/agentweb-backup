@@ -344,28 +344,70 @@ cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 source ~/.bashrc
 cd ~/agentweb
 
-OUTPUT=$(claude --model opus --permission-mode auto -p "$(cat .claude-prompt)" 2>&1)
+RAW=$(claude --model opus --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
 NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
-  if [[ $EXIT_CODE -ne 0 ]]; then
-    OUTPUT="Claude Code exited with code $EXIT_CODE:
-$OUTPUT"
-  fi
-  printf '%s' "$OUTPUT" > /tmp/.claude-output.txt
-  BODY=$(python3 -c "
+  # Extract text result and usage from JSON output
+  printf '%s' "$RAW" > /tmp/.claude-raw.json
+  python3 -c "
 import json, sys
-with open('/tmp/.claude-output.txt', 'r', errors='replace') as f:
-    text = f.read()
+
+with open('/tmp/.claude-raw.json', 'r', errors='replace') as f:
+    raw = f.read()
+
+# Parse JSON output; fall back to raw text if parsing fails
+try:
+    data = json.loads(raw)
+    text = data.get('result', raw)
+    cost = data.get('total_cost_usd', 0)
+    usage = data.get('usage', {})
+    duration_ms = data.get('duration_ms', 0)
+    input_tok = usage.get('input_tokens', 0)
+    output_tok = usage.get('output_tokens', 0)
+    cache_read = usage.get('cache_read_input_tokens', 0)
+    cache_create = usage.get('cache_creation_input_tokens', 0)
+
+    # Build usage summary
+    parts = []
+    parts.append(f'Cost: \${cost:.4f}')
+    cache_parts = []
+    if cache_read:
+        cache_parts.append(f'{cache_read:,} cache-read')
+    if cache_create:
+        cache_parts.append(f'{cache_create:,} cache-write')
+    tok_detail = f'{input_tok:,} in + {output_tok:,} out'
+    if cache_parts:
+        tok_detail += f' ({", ".join(cache_parts)})'
+    parts.append(f'Tokens: {tok_detail}')
+    if duration_ms:
+        parts.append(f'Duration: {duration_ms / 1000:.0f}s')
+    # Model names from modelUsage keys
+    models = list(data.get('modelUsage', {}).keys())
+    if models:
+        parts.append(f'Model: {", ".join(models)}')
+    usage_line = ' | '.join(parts)
+except Exception:
+    text = raw
+    usage_line = ''
+
+exit_code = int(sys.argv[2])
+if exit_code != 0:
+    text = f'Claude Code exited with code {exit_code}:\n{text}'
+
+if usage_line:
+    text += f'\n\n---\n{usage_line}'
+
 if len(text) > 9900:
     text = text[:9900] + '\n\n...(truncated)'
 chunks = [{'text': {'content': text[i:i+1900]}} for i in range(0, len(text), 1900)]
 if not chunks:
     chunks = [{'text': {'content': '(no output)'}}]
 print(json.dumps({'parent': {'page_id': sys.argv[1]}, 'rich_text': chunks}))
-" "$NOTION_PAGE_ID")
+" "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
+  BODY=$(cat /tmp/.claude-comment.json)
   if [[ -n "$BODY" ]]; then
     curl -s -X POST "https://api.notion.com/v1/comments" \
       -H "Authorization: Bearer $NOTION_TOKEN" \
@@ -373,7 +415,7 @@ print(json.dumps({'parent': {'page_id': sys.argv[1]}, 'rich_text': chunks}))
       -H "Content-Type: application/json" \
       -d "$BODY"
   fi
-  rm -f /tmp/.claude-output.txt
+  rm -f /tmp/.claude-raw.json /tmp/.claude-comment.json
 fi
 exec bash
 RUNEOF
