@@ -75,7 +75,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     service = new McpClientService();
   });
 
-  it('should inject --headless and --no-sandbox for Playwright MCP server', async () => {
+  it('should inject --headless, --no-sandbox, and anti-detection args for Playwright MCP server', async () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
@@ -91,6 +91,11 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     expect(callArgs.args).toContain('@playwright/mcp@latest');
     expect(callArgs.args).toContain('--headless');
     expect(callArgs.args).toContain('--no-sandbox');
+    // Anti-headless detection args
+    expect(callArgs.args).toContain('--launch-options');
+    const launchOptionsIdx = callArgs.args.indexOf('--launch-options');
+    const launchOptions = JSON.parse(callArgs.args[launchOptionsIdx + 1]);
+    expect(launchOptions.args).toContain('--disable-blink-features=AutomationControlled');
   });
 
   it('should NOT inject flags for non-Playwright MCP servers', async () => {
@@ -125,5 +130,25 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     const noSandboxCount = callArgs.args.filter((a: string) => a === '--no-sandbox').length;
     expect(headlessCount).toBe(1);
     expect(noSandboxCount).toBe(1);
+  });
+
+  it('should NOT inject --launch-options if already provided', async () => {
+    const customOptions = JSON.stringify({ args: ['--custom-flag'] });
+    (internalMcpServers as any)['playwright'] = {
+      transport: 'stdio',
+      command: 'npx',
+      args: ['@playwright/mcp@latest', '--launch-options', customOptions],
+      isInternal: false,
+    };
+
+    await service.initialize();
+
+    expect(mockStdioConstructor).toHaveBeenCalledTimes(1);
+    const callArgs = mockStdioConstructor.mock.calls[0][0];
+    const launchOptionsCount = callArgs.args.filter((a: string) => a === '--launch-options').length;
+    expect(launchOptionsCount).toBe(1);
+    // Should keep the custom options, not override
+    const launchOptionsIdx = callArgs.args.indexOf('--launch-options');
+    expect(callArgs.args[launchOptionsIdx + 1]).toBe(customOptions);
   });
 });

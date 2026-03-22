@@ -572,7 +572,18 @@ export class McpClientService {
         const userDataDir = `/tmp/playwright-users/${poolKey}`;
         resolvedArgs.push(`--user-data-dir=${userDataDir}`);
       }
-      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox for ${name}${poolKey ? ` (user data dir: /tmp/playwright-users/${poolKey.substring(0, 8)}...)` : ''}`);
+      // Anti-headless detection: pass Chromium args that prevent bot detection
+      // These flags only affect how the browser identifies itself to websites,
+      // they do NOT reduce Playwright's automation capabilities.
+      if (!resolvedArgs.some(arg => arg.startsWith('--launch-options'))) {
+        const launchOptions = {
+          args: [
+            '--disable-blink-features=AutomationControlled',
+          ]
+        };
+        resolvedArgs.push('--launch-options', JSON.stringify(launchOptions));
+      }
+      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox and anti-detection args for ${name}${poolKey ? ` (user data dir: /tmp/playwright-users/${poolKey.substring(0, 8)}...)` : ''}`);
     }
 
     // Resolve environment variables in the env config
