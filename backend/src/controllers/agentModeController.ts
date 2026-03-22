@@ -4535,20 +4535,30 @@ export const agentModeController = {
         const trimmedMessage = startingMessage.trim();
         const sessionId = session.sessionId;
 
+        console.log(`AgentMode: Fire-and-forget starting for session ${sessionId}, model=${selectedModel}`);
         generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel)
+          .then(() => {
+            console.log(`AgentMode: Fire-and-forget completed successfully for session ${sessionId}`);
+          })
           .catch(async (firstErr: any) => {
-            // Retry once after a short delay — handles transient failures like worker
-            // not ready after a restart or temporary LLM API errors
-            console.warn(`AgentMode: First attempt failed for session ${sessionId}, retrying in 5s...`, firstErr?.message);
+            console.warn(`AgentMode: First attempt failed for session ${sessionId}: ${firstErr?.message}`);
 
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            // Restart the worker before retrying — the current worker may be unresponsive
+            try {
+              await generateMarketingResponseWorkerService.restartWorker();
+            } catch (restartErr) {
+              console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 3000));
 
             try {
+              console.log(`AgentMode: Retrying fire-and-forget for session ${sessionId}`);
               await generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel);
               console.log(`AgentMode: Retry succeeded for session ${sessionId}`);
               return; // Retry succeeded — done
             } catch (retryErr: any) {
-              console.error(`AgentMode: Retry also failed for session ${sessionId}`, retryErr);
+              console.error(`AgentMode: Retry also failed for session ${sessionId}: ${retryErr?.message}`);
             }
 
             // Both attempts failed — persist error message and alert
