@@ -122,6 +122,7 @@ cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
       "Bash(sed *)",
       "Bash(sort *)",
       "Bash(tmux *)",
+      "Bash(chmod *)",
       "Bash(~/agentweb/test-env/*)",
       "mcp__playwright__browser_navigate",
       "mcp__playwright__browser_snapshot",
