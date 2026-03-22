@@ -10,6 +10,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-22',
     changes: [
+      'Feature: Git Revert Ability for Coding Agent',
+      '- Emma\'s coding agent can now view git commit history and revert files to previous versions when edits go wrong',
+      '- Before making changes, the agent records the current commit SHA as a safety bookmark',
+      '- If edits break the build and can\'t be fixed within 2 attempts, the agent automatically reverts to the pre-edit state',
+      '- Previously, bad edits required manual git commands to undo — now Emma can handle recovery herself',
+    ],
+  },
+  {
+    date: '2026-03-22',
+    changes: [
       'Enhancement: Anti-Bot Detection for Emma Browser Browsing',
       '- Emma\'s Playwright browser now includes anti-headless detection flags when browsing websites',
       '- Adds --disable-blink-features=AutomationControlled to prevent navigator.webdriver from being set to true',
