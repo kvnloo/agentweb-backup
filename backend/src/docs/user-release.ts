@@ -10,6 +10,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-22',
     changes: [
+      'Fix: Scheduled Chat Updates No Longer Fail When Only Changing Some Fields',
+      '- When Emma tried to update a scheduled chat (e.g. just change the description), the update would fail because the API required all fields to be sent every time',
+      '- The update endpoint now supports partial updates — only the fields you want to change need to be included',
+      '- Emma now receives schedule context in scheduled chat sessions, so she knows which schedule created the session and can update it more reliably',
+    ],
+  },
+  {
+    date: '2026-03-22',
+    changes: [
       'Fix: Browser Tools Not Working in Emma Chat',
       '- Emma\'s browser automation tools (navigate, click, fill, etc.) were failing because the Playwright MCP server could not start',
       '- Root cause: the upstream @playwright/mcp package removed the --launch-options CLI flag in v0.0.68, breaking our auto-configuration',
