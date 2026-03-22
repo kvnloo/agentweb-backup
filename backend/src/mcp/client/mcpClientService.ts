@@ -8,6 +8,8 @@ import { settingsService } from "../../services/settingsService";
 import { userDb } from "../../services/db";
 import { decryptPassword } from "../../utils/crypto";
 import { internalMcpServers } from "./mcp_config";
+import * as fs from "fs";
+import * as path from "path";
 
 // SSE transport configuration
 export interface SseTransportConfig {
@@ -572,18 +574,29 @@ export class McpClientService {
         const userDataDir = `/tmp/playwright-users/${poolKey}`;
         resolvedArgs.push(`--user-data-dir=${userDataDir}`);
       }
-      // Anti-headless detection: pass Chromium args that prevent bot detection
-      // These flags only affect how the browser identifies itself to websites,
-      // they do NOT reduce Playwright's automation capabilities.
-      if (!resolvedArgs.some(arg => arg.startsWith('--launch-options'))) {
-        const launchOptions = {
-          args: [
-            '--disable-blink-features=AutomationControlled',
-          ]
+      // Anti-headless detection: pass Chromium args that prevent bot detection via config file.
+      // The --launch-options CLI flag was removed in @playwright/mcp@0.0.68+, so we write
+      // a config file and pass --config instead.
+      if (!resolvedArgs.some(arg => arg.startsWith('--config'))) {
+        const configDir = '/tmp/playwright-mcp-configs';
+        if (!fs.existsSync(configDir)) {
+          fs.mkdirSync(configDir, { recursive: true });
+        }
+        const configKey = poolKey ? poolKey.replace(/[^a-zA-Z0-9-_]/g, '_') : name;
+        const configPath = path.join(configDir, `${configKey}.json`);
+        const config = {
+          browser: {
+            launchOptions: {
+              args: [
+                '--disable-blink-features=AutomationControlled',
+              ]
+            }
+          }
         };
-        resolvedArgs.push('--launch-options', JSON.stringify(launchOptions));
+        fs.writeFileSync(configPath, JSON.stringify(config));
+        resolvedArgs.push('--config', configPath);
       }
-      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox and anti-detection args for ${name}${poolKey ? ` (user data dir: /tmp/playwright-users/${poolKey.substring(0, 8)}...)` : ''}`);
+      console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox and --config for ${name}${poolKey ? ` (user data dir: /tmp/playwright-users/${poolKey.substring(0, 8)}...)` : ''}`);
     }
 
     // Resolve environment variables in the env config
