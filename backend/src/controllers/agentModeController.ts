@@ -3202,7 +3202,11 @@ export const agentModeController = {
         return dateB - dateA;
       });
 
-      res.json(scheduledChats);
+      // Exclude runResults to keep response size manageable (run history is
+      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint)
+      const scheduledChatsWithoutRunResults = scheduledChats.map(({ runResults, ...rest }: any) => rest);
+
+      res.json(scheduledChatsWithoutRunResults);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
