@@ -495,12 +495,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.testScheduledChat(mockReq, mockRes);
 
-      // Should create session with test title
+      // Should create session with pageIdentifier including scheduleId
       expect(mockChatbotDb.createChatSession).toHaveBeenCalledWith(
         mockUserId,
         undefined,
         'agent',
-        'Test: Test Schedule',
+        `Test: Test Schedule|scheduleId:${mockScheduleId}`,
         undefined,
         undefined,
         undefined,
@@ -538,7 +538,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         mockUserId,
         undefined,
         'agent',
-        'Test: Test Schedule',
+        `Test: Test Schedule|scheduleId:${mockScheduleId}`,
         undefined,
         undefined,
         undefined,
@@ -576,7 +576,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         mockUserId,
         undefined,
         'agent',
-        'Test: Test Schedule',
+        `Test: Test Schedule|scheduleId:${mockScheduleId}`,
         undefined,
         undefined,
         undefined,
@@ -1639,13 +1639,13 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(mockRes.json).toHaveBeenCalledWith({ error: 'Scheduled chat not found' });
     });
 
-    it('should return 400 if required fields are missing', async () => {
+    it('should support partial updates by merging with existing schedule values', async () => {
+      // Only send description — scheduleName, startingMessage, scheduleFrequency should come from existing
       const mockReq = {
         user: { userId: mockUserId },
         params: { scheduleId: mockScheduleId },
         body: {
-          scheduleName: 'Test',
-          // Missing startingMessage and scheduleFrequency
+          description: 'Only updating the description',
         },
       } as unknown as Request;
 
@@ -1656,8 +1656,55 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       await agentModeController.updateScheduledChat(mockReq, mockRes);
 
-      expect(mockRes.status).toHaveBeenCalledWith(400);
-      expect(mockRes.json).toHaveBeenCalledWith({ error: 'Missing required fields' });
+      // Should succeed (not 400)
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+        message: 'Scheduled chat updated successfully',
+      }));
+
+      // Verify existing values were preserved
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          scheduleName: existingSchedule.scheduleName,
+          startingMessage: existingSchedule.startingMessage,
+          frequency: existingSchedule.frequency,
+          description: 'Only updating the description',
+          keywords: existingSchedule.keywords,
+          requiredFunctionCalls: existingSchedule.requiredFunctionCalls,
+          functionCallMinCalls: existingSchedule.functionCallMinCalls,
+          emailNotifications: existingSchedule.emailNotifications,
+        })
+      );
+    });
+
+    it('should allow updating just the starting message without other required fields', async () => {
+      const mockReq = {
+        user: { userId: mockUserId },
+        params: { scheduleId: mockScheduleId },
+        body: {
+          startingMessage: 'New starting message with a note about the redirect being fine',
+        },
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.updateScheduledChat(mockReq, mockRes);
+
+      expect(mockRes.json).toHaveBeenCalledWith(expect.objectContaining({
+        message: 'Scheduled chat updated successfully',
+      }));
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({
+          scheduleName: existingSchedule.scheduleName,
+          startingMessage: 'New starting message with a note about the redirect being fine',
+          frequency: existingSchedule.frequency,
+        })
+      );
     });
 
     it('should handle dailyDigest setting correctly for hourly schedules', async () => {

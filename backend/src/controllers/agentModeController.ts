@@ -904,11 +904,12 @@ async function runScheduledChat(
 
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
+    const pageIdentifier = `${sessionTitle}|scheduleId:${schedule.scheduleId}`;
     const testSession = await chatbotDb.createChatSession(
       userId,
       undefined,
       "agent",
-      sessionTitle,
+      pageIdentifier,
       undefined,
       undefined,
       undefined,
@@ -1285,7 +1286,16 @@ export async function generateSessionResponse(
   if (isFirstMessage) {
     try {
       // Get the current system prompt version
-      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      let systemPrompt = await agentModeService.getMarketingSystemPrompt();
+
+      // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
+      if (session.sessionType === 'scheduled' && session.pageIdentifier) {
+        const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+        if (scheduleIdMatch) {
+          systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+        }
+      }
+
       const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
 
       // Add system message with version info (hash only in metadata)
@@ -3223,13 +3233,25 @@ export const agentModeController = {
         frequencyIntervalDays
       } = req.body;
 
-      if (!scheduleName || !startingMessage || !scheduleFrequency) {
+      // Verify schedule exists and belongs to user (before validation so we can merge)
+      const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!existingSchedule || existingSchedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // Support partial updates: fall back to existing values for missing required fields
+      const effectiveScheduleName = scheduleName || existingSchedule.scheduleName;
+      const effectiveStartingMessage = startingMessage !== undefined ? startingMessage : existingSchedule.startingMessage;
+      const effectiveScheduleFrequency = scheduleFrequency || existingSchedule.frequency;
+
+      if (!effectiveScheduleName || !effectiveStartingMessage || !effectiveScheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency
-      if (scheduleFrequency === 'every_n_days') {
-        if (frequencyIntervalDays === undefined || !Number.isInteger(frequencyIntervalDays) || frequencyIntervalDays < 1) {
+      const effectiveFrequencyIntervalDays = frequencyIntervalDays !== undefined ? frequencyIntervalDays : existingSchedule.frequencyIntervalDays;
+      if (effectiveScheduleFrequency === 'every_n_days') {
+        if (effectiveFrequencyIntervalDays === undefined || !Number.isInteger(effectiveFrequencyIntervalDays) || effectiveFrequencyIntervalDays < 1) {
           return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer when frequency is every_n_days' });
         }
       }
@@ -3239,12 +3261,6 @@ export const agentModeController = {
         if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
           return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
         }
-      }
-
-      // Verify schedule exists and belongs to user
-      const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
-      if (!existingSchedule || existingSchedule.userId !== user.userId) {
-        return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
       const now = new Date();
@@ -3261,25 +3277,25 @@ export const agentModeController = {
         shouldUpdateNextRunTime = true;
       }
 
-      // Update the schedule
+      // Update the schedule (merge with existing values for partial updates)
       const updates: any = {
-        scheduleName,
-        description: description || '',
-        startingMessage,
-        frequency: scheduleFrequency,
-        ...(scheduleFrequency === 'every_n_days' && { frequencyIntervalDays }),
-        keywords: keywords || [],
-        requiredFunctionCalls: requiredFunctionCalls || [],
-        functionCallMinCalls: functionCallMinCalls || {},
-        emailNotifications: emailNotifications || [],
-        dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
+        scheduleName: effectiveScheduleName,
+        description: description !== undefined ? description : (existingSchedule.description || ''),
+        startingMessage: effectiveStartingMessage,
+        frequency: effectiveScheduleFrequency,
+        ...(effectiveScheduleFrequency === 'every_n_days' && { frequencyIntervalDays: effectiveFrequencyIntervalDays }),
+        keywords: keywords !== undefined ? keywords : (existingSchedule.keywords || []),
+        requiredFunctionCalls: requiredFunctionCalls !== undefined ? requiredFunctionCalls : (existingSchedule.requiredFunctionCalls || []),
+        functionCallMinCalls: functionCallMinCalls !== undefined ? functionCallMinCalls : (existingSchedule.functionCallMinCalls || {}),
+        emailNotifications: emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || []),
+        dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         updatedAt: now.toISOString(),
-        emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || '', // Empty means "use default at runtime"
+        emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
+        llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
       };
 
       const { variables: normalizedVariables, error: variableError } =
-        validateAndBuildScheduledChatVariables(startingMessage, variables, existingSchedule.variables || []);
+        validateAndBuildScheduledChatVariables(effectiveStartingMessage, variables, existingSchedule.variables || []);
       if (variableError) {
         return res.status(400).json({ error: variableError });
       }
