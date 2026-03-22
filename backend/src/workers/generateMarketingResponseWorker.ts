@@ -48,6 +48,11 @@ const cancelledRequestIds = new Set<string>();
 
 // Listen for messages from parent process
 process.on('message', async (message: any) => {
+  if (message.type === 'ping') {
+    process.send!({ type: 'pong', pingId: message.pingId });
+    return;
+  }
+
   if (message.type === 'cancel') {
     cancelledRequestIds.add(message.requestId);
     return;
