@@ -35,6 +35,8 @@ export class GenerateMarketingResponseWorkerService {
   private requestIdCounter = 0;
   private workerReady = false;
   private workerInitPromise: Promise<void> | null = null;
+  private pingIdCounter = 0;
+  private pendingPings: Map<string, (alive: boolean) => void> = new Map();
 
   /**
    * Initialize and start the worker process
@@ -115,6 +117,15 @@ export class GenerateMarketingResponseWorkerService {
         if (!this.workerReady && readyResolve) {
           console.log('[Worker] Worker ready and initialized');
           readyResolve();
+        }
+        return;
+      }
+
+      if (message.type === 'pong') {
+        const callback = this.pendingPings.get(message.pingId);
+        if (callback) {
+          this.pendingPings.delete(message.pingId);
+          callback(true);
         }
         return;
       }
@@ -231,6 +242,53 @@ export class GenerateMarketingResponseWorkerService {
       pending.reject(new Error('Worker shutdown'));
     }
     this.pendingRequests.clear();
+  }
+
+  /**
+   * Check if the worker process is alive and responsive via ping/pong.
+   * Returns true if the worker responds within the timeout.
+   */
+  async isWorkerHealthy(timeoutMs = 5000): Promise<boolean> {
+    if (!this.worker || this.worker.killed || !this.workerReady) {
+      return false;
+    }
+
+    const pingId = `ping_${++this.pingIdCounter}_${Date.now()}`;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingPings.delete(pingId);
+        resolve(false);
+      }, timeoutMs);
+
+      this.pendingPings.set(pingId, (alive) => {
+        clearTimeout(timer);
+        resolve(alive);
+      });
+
+      try {
+        this.worker!.send({ type: 'ping', pingId });
+      } catch {
+        clearTimeout(timer);
+        this.pendingPings.delete(pingId);
+        resolve(false);
+      }
+    });
+  }
+
+  /**
+   * Kill the current worker and start a fresh one.
+   * Used when the worker is detected as unresponsive.
+   */
+  async restartWorker(): Promise<void> {
+    console.log('[Worker] Restarting worker process...');
+    if (this.worker && !this.worker.killed) {
+      this.worker.kill('SIGKILL');
+    }
+    this.worker = null;
+    this.workerReady = false;
+    this.workerInitPromise = null;
+    await this.ensureWorker();
+    console.log('[Worker] Worker process restarted successfully');
   }
 
   /**
