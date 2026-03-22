@@ -1,3 +1,28 @@
+# March 22, 2026: Investigation — Scheduled Chat "Lead Auto-Enrichment" Not Completing
+
+## Problem
+
+User reported that the "Lead Auto-Enrichment" scheduled chat (scheduleId: `35b7c3eb-9cf2-4a61-b259-5b12040a302e`) was "not completing the requested ask" for three days in a row.
+
+## Investigation Findings
+
+The schedule was actually completing successfully — all three runs (March 20 attempt 1, March 20 attempt 2, March 21 attempt 2) had `status: "success"` and `passed: true` with all work plan steps completed.
+
+The user's concern was that lead enrichment "didn't happen." Root cause: **enriched fields were written to custom fields** in the CRM, not the standard fields the user was checking. The enrichment was working correctly, but the results were in a different place than expected.
+
+### Schedule Details
+
+- **Prompt:** Enrich leads from 6 CRM lists, recommend top 10 for LinkedIn outreach, draft 2 post-connection messages
+- **Model:** `anthropic.claude-opus-4-6-v1`
+- **Validation:** `functionCallMinCalls: { linkedin_outreach: 1 }` — note: this requirement exists but the prompt only asks to "draft" messages, not send them. All runs passed validation regardless.
+- **Runs examined:** 3 sessions, all enriching 214-221 leads with 0 failures
+
+### Resolution
+
+No code change needed. User confusion about where enriched data appears in the CRM (custom fields vs standard fields).
+
+---
+
 # March 20, 2026: Investigation — UseHaven.ai Meta Marketing Connected Account Issue
 
 ## Problem
