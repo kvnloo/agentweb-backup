@@ -10,6 +10,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-22',
     changes: [
+      'Fix: Improved Reliability for AI Audit Reports',
+      '- Audit sessions that fail due to transient errors (worker crash, temporary API issues) now automatically retry once with a fresh worker process',
+      '- If both attempts fail, the session saves an error message so the frontend can detect the failure and show a retry button instead of timing out silently',
+      '- Added structured logging for the full fire-and-forget lifecycle to aid debugging',
+      '- Added worker health check (ping/pong) and restart capability to recover from unresponsive worker processes',
+    ],
+  },
+  {
+    date: '2026-03-22',
+    changes: [
       'Feature: Git Revert Ability for Coding Agent',
       '- Emma\'s coding agent can now view git commit history and revert files to previous versions when edits go wrong',
       '- Before making changes, the agent records the current commit SHA as a safety bookmark',
