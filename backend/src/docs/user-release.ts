@@ -10,6 +10,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-22',
     changes: [
+      'Fix: Browser Tools Not Working in Emma Chat',
+      '- Emma\'s browser automation tools (navigate, click, fill, etc.) were failing because the Playwright MCP server could not start',
+      '- Root cause: the upstream @playwright/mcp package removed the --launch-options CLI flag in v0.0.68, breaking our auto-configuration',
+      '- Fix: switched to the new --config file approach for passing browser launch options',
+    ],
+  },
+  {
+    date: '2026-03-22',
+    changes: [
       'Fix: Improved Reliability for AI Audit Reports',
       '- Audit sessions that fail due to transient errors (worker crash, temporary API issues) now automatically retry once with a fresh worker process',
       '- If both attempts fail, the session saves an error message so the frontend can detect the failure and show a retry button instead of timing out silently',
