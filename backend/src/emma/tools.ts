@@ -4540,6 +4540,9 @@ const bridgedToolNames = [
   'enable_lead_list_public_access',
   'duplicate_landing_page',
   'get_deployment_status',
+  'list_landing_page_files',
+  'get_landing_page_preview_url',
+  'publish_landing_page_changes',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
