@@ -806,3 +806,174 @@ export async function sendLeadNotification(
   }
 }
 
+/**
+ * Convert markdown to Slack mrkdwn format
+ */
+function markdownToMrkdwn(markdown: string): string {
+  let text = markdown;
+
+  // Strip HTML tags but preserve content
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+  text = text.replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n');
+  text = text.replace(/<(p|div|h[1-6]|ul|ol|table|thead|tbody)(\s[^>]*)?>/gi, '');
+  text = text.replace(/<li(\s[^>]*)?>/gi, '- ');
+  text = text.replace(/<a\s+[^>]*href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/gi, '<$1|$2>');
+  text = text.replace(/<(strong|b)(\s[^>]*)?>/gi, '*');
+  text = text.replace(/<\/(strong|b)>/gi, '*');
+  text = text.replace(/<(em|i)(\s[^>]*)?>/gi, '_');
+  text = text.replace(/<\/(em|i)>/gi, '_');
+  text = text.replace(/<code(\s[^>]*)?>/gi, '`');
+  text = text.replace(/<\/code>/gi, '`');
+  text = text.replace(/<[^>]+>/g, '');
+  // Decode HTML entities
+  text = text.replace(/&amp;/g, '&');
+  text = text.replace(/&lt;/g, '<');
+  text = text.replace(/&gt;/g, '>');
+  text = text.replace(/&quot;/g, '"');
+  text = text.replace(/&#39;/g, "'");
+  text = text.replace(/&nbsp;/g, ' ');
+
+  // Convert markdown bold: **text** -> *text*
+  text = text.replace(/\*\*(.+?)\*\*/g, '*$1*');
+  // Convert markdown links: [text](url) -> <url|text>
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>');
+  // Convert headers: ### text -> *text*
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, '*$1*');
+
+  // Clean up excessive newlines
+  text = text.replace(/\n{3,}/g, '\n\n');
+  text = text.trim();
+
+  return text;
+}
+
+const SLACK_MESSAGE_LIMIT = 3900; // Leave room for safety margin under 4000 char limit
+
+/**
+ * Post Emma's response to a Slack thread, splitting long messages if needed
+ */
+export async function postThreadResponse(
+  channel: string,
+  threadTs: string,
+  markdownContent: string
+): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const mrkdwnContent = markdownToMrkdwn(markdownContent);
+
+  // Split into chunks if too long
+  const chunks: string[] = [];
+  let remaining = mrkdwnContent;
+  while (remaining.length > 0) {
+    if (remaining.length <= SLACK_MESSAGE_LIMIT) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to split at a newline near the limit
+    let splitIndex = remaining.lastIndexOf('\n', SLACK_MESSAGE_LIMIT);
+    if (splitIndex < SLACK_MESSAGE_LIMIT * 0.5) {
+      // No good newline found, split at space
+      splitIndex = remaining.lastIndexOf(' ', SLACK_MESSAGE_LIMIT);
+    }
+    if (splitIndex <= 0) {
+      splitIndex = SLACK_MESSAGE_LIMIT;
+    }
+    chunks.push(remaining.substring(0, splitIndex));
+    remaining = remaining.substring(splitIndex).trimStart();
+  }
+
+  for (const chunk of chunks) {
+    await slackClient.chat.postMessage({
+      channel,
+      text: chunk,
+      thread_ts: threadTs,
+    });
+  }
+}
+
+/**
+ * Get a Slack user's display name
+ */
+export async function getSlackUserDisplayName(slackUserId: string): Promise<string> {
+  if (!slackClient) {
+    return slackUserId;
+  }
+
+  try {
+    const result = await slackClient.users.info({ user: slackUserId });
+    if (result.ok && result.user) {
+      return (result.user as any).profile?.display_name
+        || (result.user as any).profile?.real_name
+        || (result.user as any).real_name
+        || slackUserId;
+    }
+  } catch (error) {
+    console.error(`Failed to get Slack user display name for ${slackUserId}:`, error);
+  }
+  return slackUserId;
+}
+
+/**
+ * Post a temporary "thinking" message to a Slack thread
+ * Returns the message timestamp so it can be updated/deleted later
+ */
+export async function postThinkingMessage(
+  channel: string,
+  threadTs: string
+): Promise<string | undefined> {
+  if (!slackClient) {
+    return undefined;
+  }
+
+  try {
+    const result = await slackClient.chat.postMessage({
+      channel,
+      text: ':hourglass_flowing_sand: Thinking...',
+      thread_ts: threadTs,
+    });
+    return result.ts;
+  } catch (error) {
+    console.error('Failed to post thinking message:', error);
+    return undefined;
+  }
+}
+
+/**
+ * Delete a Slack message (used to remove "thinking" message after response is ready)
+ */
+export async function deleteSlackMessage(
+  channel: string,
+  messageTs: string
+): Promise<void> {
+  if (!slackClient) return;
+
+  try {
+    await slackClient.chat.delete({ channel, ts: messageTs });
+  } catch (error) {
+    console.error('Failed to delete Slack message:', error);
+  }
+}
+
+/**
+ * Download a file from Slack using the bot token for auth
+ * Returns the file content as a Buffer
+ */
+export async function downloadSlackFile(urlPrivate: string): Promise<Buffer> {
+  if (!process.env.SLACK_BOT_TOKEN) {
+    throw new Error('SLACK_BOT_TOKEN not set');
+  }
+
+  const response = await fetch(urlPrivate, {
+    headers: {
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to download Slack file: ${response.status} ${response.statusText}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}

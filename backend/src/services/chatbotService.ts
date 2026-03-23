@@ -198,6 +198,10 @@ export interface ChatSession {
       sentAt: string;
     }>;
   };
+  slackThread?: {
+    channel: string;
+    threadTs: string;
+  }; // Slack thread association for in-thread Q&A
   llmModel?: string; // Selected LLM model for this session
   delegateInfo?: {
     adminUserId: string;
@@ -1911,6 +1915,35 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating page content:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionSlackThread(
+    sessionId: string,
+    slackThread: { channel: string; threadTs: string }
+  ): Promise<ChatSession> {
+    const timestamp = new Date().toISOString();
+
+    const params = {
+      TableName: this.tableName,
+      Key: {
+        sessionId,
+      },
+      UpdateExpression:
+        "SET slackThread = :slackThread, updatedAt = :updatedAt",
+      ExpressionAttributeValues: {
+        ":slackThread": slackThread,
+        ":updatedAt": timestamp,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      console.error("Error updating session slackThread:", error);
       throw error;
     }
   }
