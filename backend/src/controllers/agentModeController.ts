@@ -489,32 +489,38 @@ export async function runVerifiedChat(
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
   let sessionModel = sessionForModel?.llmModel;
   const normalizedStartingMessage = startingMessage.toLowerCase();
-  const shouldUseReportGenerationModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content' || reqFunc.functionName === 'create_blog_article'
-  ));
-  const shouldUseImageGenerationModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'generate_image'
-  ));
-  const shouldUseVideoGenerationModel = requiredFunctions.some((reqFunc) => (
-    reqFunc.functionName === 'generate_video'
-  ));
-  if (shouldUseReportGenerationModel) {
-    const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
-    if (sessionModel !== reportGenModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel);
-      sessionModel = reportGenModel;
-    }
-  } else if (shouldUseImageGenerationModel) {
-    const imageGenModel = await agentModeService.getImageGenerationDefaultModel();
-    if (sessionModel !== imageGenModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel);
-      sessionModel = imageGenModel;
-    }
-  } else if (shouldUseVideoGenerationModel) {
-    const videoGenModel = await agentModeService.getVideoGenerationDefaultModel();
-    if (sessionModel !== videoGenModel) {
-      await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel);
-      sessionModel = videoGenModel;
+
+  // Only apply task-type model overrides when no explicit model was provided.
+  // When params.llmModel is set (e.g. from a scheduled chat's configured model),
+  // respect the caller's choice instead of overriding based on required functions.
+  if (!params.llmModel) {
+    const shouldUseReportGenerationModel = requiredFunctions.some((reqFunc) => (
+      reqFunc.functionName === 'update_html_file' || reqFunc.functionName === 'read_file_content' || reqFunc.functionName === 'create_blog_article'
+    ));
+    const shouldUseImageGenerationModel = requiredFunctions.some((reqFunc) => (
+      reqFunc.functionName === 'generate_image'
+    ));
+    const shouldUseVideoGenerationModel = requiredFunctions.some((reqFunc) => (
+      reqFunc.functionName === 'generate_video'
+    ));
+    if (shouldUseReportGenerationModel) {
+      const reportGenModel = await agentModeService.getReportGenerationDefaultModel();
+      if (sessionModel !== reportGenModel) {
+        await chatbotDb.updateSessionLlmModel(sessionId, reportGenModel);
+        sessionModel = reportGenModel;
+      }
+    } else if (shouldUseImageGenerationModel) {
+      const imageGenModel = await agentModeService.getImageGenerationDefaultModel();
+      if (sessionModel !== imageGenModel) {
+        await chatbotDb.updateSessionLlmModel(sessionId, imageGenModel);
+        sessionModel = imageGenModel;
+      }
+    } else if (shouldUseVideoGenerationModel) {
+      const videoGenModel = await agentModeService.getVideoGenerationDefaultModel();
+      if (sessionModel !== videoGenModel) {
+        await chatbotDb.updateSessionLlmModel(sessionId, videoGenModel);
+        sessionModel = videoGenModel;
+      }
     }
   }
   const defaultModel = params.llmModel || sessionModel || await agentModeService.getDefaultModel();
@@ -898,11 +904,12 @@ export async function runScheduledChat(
 
     // Create a session for the run
     const sessionTitle = isTest ? `Test: ${schedule.scheduleName}` : `Scheduled: ${schedule.scheduleName}`;
+    const pageIdentifier = `${sessionTitle}|scheduleId:${schedule.scheduleId}`;
     const testSession = await chatbotDb.createChatSession(
       userId,
       undefined,
       "agent",
-      sessionTitle,
+      pageIdentifier,
       undefined,
       undefined,
       undefined,
@@ -1279,7 +1286,16 @@ export async function generateSessionResponse(
   if (isFirstMessage) {
     try {
       // Get the current system prompt version
-      const systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      let systemPrompt = await agentModeService.getMarketingSystemPrompt();
+
+      // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
+      if (session.sessionType === 'scheduled' && session.pageIdentifier) {
+        const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+        if (scheduleIdMatch) {
+          systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+        }
+      }
+
       const systemPromptHash = require('crypto').createHash('md5').update(systemPrompt).digest('hex').substring(0, 8);
 
       // Add system message with version info (hash only in metadata)
@@ -3186,7 +3202,11 @@ export const agentModeController = {
         return dateB - dateA;
       });
 
-      res.json(scheduledChats);
+      // Exclude runResults to keep response size manageable (run history is
+      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint)
+      const scheduledChatsWithoutRunResults = scheduledChats.map(({ runResults, ...rest }: any) => rest);
+
+      res.json(scheduledChatsWithoutRunResults);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
@@ -3217,13 +3237,25 @@ export const agentModeController = {
         frequencyIntervalDays
       } = req.body;
 
-      if (!scheduleName || !startingMessage || !scheduleFrequency) {
+      // Verify schedule exists and belongs to user (before validation so we can merge)
+      const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!existingSchedule || existingSchedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // Support partial updates: fall back to existing values for missing required fields
+      const effectiveScheduleName = scheduleName || existingSchedule.scheduleName;
+      const effectiveStartingMessage = startingMessage !== undefined ? startingMessage : existingSchedule.startingMessage;
+      const effectiveScheduleFrequency = scheduleFrequency || existingSchedule.frequency;
+
+      if (!effectiveScheduleName || !effectiveStartingMessage || !effectiveScheduleFrequency) {
         return res.status(400).json({ error: 'Missing required fields' });
       }
 
       // Validate frequencyIntervalDays for every_n_days frequency
-      if (scheduleFrequency === 'every_n_days') {
-        if (frequencyIntervalDays === undefined || !Number.isInteger(frequencyIntervalDays) || frequencyIntervalDays < 1) {
+      const effectiveFrequencyIntervalDays = frequencyIntervalDays !== undefined ? frequencyIntervalDays : existingSchedule.frequencyIntervalDays;
+      if (effectiveScheduleFrequency === 'every_n_days') {
+        if (effectiveFrequencyIntervalDays === undefined || !Number.isInteger(effectiveFrequencyIntervalDays) || effectiveFrequencyIntervalDays < 1) {
           return res.status(400).json({ error: 'frequencyIntervalDays must be a positive integer when frequency is every_n_days' });
         }
       }
@@ -3233,12 +3265,6 @@ export const agentModeController = {
         if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
           return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
         }
-      }
-
-      // Verify schedule exists and belongs to user
-      const existingSchedule = await scheduleDb.getScheduleById(scheduleId);
-      if (!existingSchedule || existingSchedule.userId !== user.userId) {
-        return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
       const now = new Date();
@@ -3255,25 +3281,25 @@ export const agentModeController = {
         shouldUpdateNextRunTime = true;
       }
 
-      // Update the schedule
+      // Update the schedule (merge with existing values for partial updates)
       const updates: any = {
-        scheduleName,
-        description: description || '',
-        startingMessage,
-        frequency: scheduleFrequency,
-        ...(scheduleFrequency === 'every_n_days' && { frequencyIntervalDays }),
-        keywords: keywords || [],
-        requiredFunctionCalls: requiredFunctionCalls || [],
-        functionCallMinCalls: functionCallMinCalls || {},
-        emailNotifications: emailNotifications || [],
-        dailyDigest: scheduleFrequency === 'hourly' ? (dailyDigest || false) : false, // Only allow daily digest for hourly schedules
+        scheduleName: effectiveScheduleName,
+        description: description !== undefined ? description : (existingSchedule.description || ''),
+        startingMessage: effectiveStartingMessage,
+        frequency: effectiveScheduleFrequency,
+        ...(effectiveScheduleFrequency === 'every_n_days' && { frequencyIntervalDays: effectiveFrequencyIntervalDays }),
+        keywords: keywords !== undefined ? keywords : (existingSchedule.keywords || []),
+        requiredFunctionCalls: requiredFunctionCalls !== undefined ? requiredFunctionCalls : (existingSchedule.requiredFunctionCalls || []),
+        functionCallMinCalls: functionCallMinCalls !== undefined ? functionCallMinCalls : (existingSchedule.functionCallMinCalls || {}),
+        emailNotifications: emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || []),
+        dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         updatedAt: now.toISOString(),
-        emailCampaignTaskId: emailCampaignTaskId || null,
-        llmModel: llmModel || '', // Empty means "use default at runtime"
+        emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
+        llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
       };
 
       const { variables: normalizedVariables, error: variableError } =
-        validateAndBuildScheduledChatVariables(startingMessage, variables, existingSchedule.variables || []);
+        validateAndBuildScheduledChatVariables(effectiveStartingMessage, variables, existingSchedule.variables || []);
       if (variableError) {
         return res.status(400).json({ error: variableError });
       }
@@ -4526,49 +4552,72 @@ export const agentModeController = {
 
       // Fire-and-forget: send starting message after response is returned
       if (startingMessage && typeof startingMessage === 'string' && startingMessage.trim()) {
-        generateSessionResponse(
-          session.sessionId,
-          startingMessage.trim(),
-          userId,
-          selectedModel
-        ).catch(async (err: any) => {
-          console.error('AgentMode: Error sending starting message for session', session.sessionId, err);
+        const trimmedMessage = startingMessage.trim();
+        const sessionId = session.sessionId;
 
-          // Persist error message to session so the user sees something went wrong
-          try {
-            const errorMessage: ChatMessage = {
-              role: 'assistant',
-              content: 'I encountered an error while processing your request. Please try sending your message again or start a new session.',
-              timestamp: new Date().toISOString(),
-              metadata: {
-                timestamp: new Date().toISOString(),
-                isErrorMessage: true
-              }
-            };
-            await chatbotDb.addMessageToSession(session.sessionId, errorMessage);
-          } catch (saveErr) {
-            console.error('AgentMode: Failed to save error message to session', session.sessionId, saveErr);
-          }
+        console.log(`AgentMode: Fire-and-forget starting for session ${sessionId}, model=${selectedModel}`);
+        generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel)
+          .then(() => {
+            console.log(`AgentMode: Fire-and-forget completed successfully for session ${sessionId}`);
+          })
+          .catch(async (firstErr: any) => {
+            console.warn(`AgentMode: First attempt failed for session ${sessionId}: ${firstErr?.message}`);
 
-          // Emit progress complete so the frontend stops showing the loading state and refreshes
-          emitProgress(session.sessionId, { iteration: 0, status: 'complete' });
-
-          // Send oncall alert so the team is notified
-          sendAgentModeOncallAlert({
-            subject: `Work Plan Session Failed: ${session.sessionId}`,
-            message: `A predefined work plan session failed during fire-and-forget response generation.\n\nError: ${err?.message || 'Unknown error'}`,
-            sessionId: session.sessionId,
-            context: {
-              'Session ID': session.sessionId,
-              'User ID': userId,
-              'Plan Title': workPlanWithWelcome?.title || 'Unknown',
-              'LLM Model': selectedModel,
-              'Error Message': err?.message || 'Unknown error',
-              'Error Stack': err?.stack || 'No stack trace',
-              'Timestamp': new Date().toISOString()
+            // Restart the worker before retrying — the current worker may be unresponsive
+            try {
+              await generateMarketingResponseWorkerService.restartWorker();
+            } catch (restartErr) {
+              console.error(`AgentMode: Worker restart failed for session ${sessionId}:`, restartErr);
             }
-          }).catch(alertErr => console.error('Failed to send oncall alert for work plan session error:', alertErr));
-        });
+
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            try {
+              console.log(`AgentMode: Retrying fire-and-forget for session ${sessionId}`);
+              await generateSessionResponse(sessionId, trimmedMessage, userId, selectedModel);
+              console.log(`AgentMode: Retry succeeded for session ${sessionId}`);
+              return; // Retry succeeded — done
+            } catch (retryErr: any) {
+              console.error(`AgentMode: Retry also failed for session ${sessionId}: ${retryErr?.message}`);
+            }
+
+            // Both attempts failed — persist error message and alert
+
+            // Persist error message to session so the user sees something went wrong
+            try {
+              const errorMessage: ChatMessage = {
+                role: 'assistant',
+                content: 'I encountered an error while processing your request. Please try sending your message again or start a new session.',
+                timestamp: new Date().toISOString(),
+                metadata: {
+                  timestamp: new Date().toISOString(),
+                  isErrorMessage: true
+                }
+              };
+              await chatbotDb.addMessageToSession(sessionId, errorMessage);
+            } catch (saveErr) {
+              console.error('AgentMode: Failed to save error message to session', sessionId, saveErr);
+            }
+
+            // Emit progress complete so the frontend stops showing the loading state and refreshes
+            emitProgress(sessionId, { iteration: 0, status: 'complete' });
+
+            // Send oncall alert so the team is notified
+            sendAgentModeOncallAlert({
+              subject: `Work Plan Session Failed: ${sessionId}`,
+              message: `A predefined work plan session failed after retry.\n\nFirst error: ${firstErr?.message || 'Unknown'}\n\nRetry error: (see above)`,
+              sessionId,
+              context: {
+                'Session ID': sessionId,
+                'User ID': userId,
+                'Plan Title': workPlanWithWelcome?.title || 'Unknown',
+                'LLM Model': selectedModel,
+                'Error Message': firstErr?.message || 'Unknown error',
+                'Error Stack': firstErr?.stack || 'No stack trace',
+                'Timestamp': new Date().toISOString()
+              }
+            }).catch(alertErr => console.error('Failed to send oncall alert for work plan session error:', alertErr));
+          });
       }
     } catch (error) {
       console.error('AgentMode: Create session with plan error:', error);

@@ -1,3 +1,365 @@
+# March 22, 2026: Investigation — Scheduled Chat "Lead Auto-Enrichment" Not Completing
+
+## Problem
+
+User reported that the "Lead Auto-Enrichment" scheduled chat (scheduleId: `35b7c3eb-9cf2-4a61-b259-5b12040a302e`) was "not completing the requested ask" for three days in a row.
+
+## Investigation Findings
+
+The schedule was actually completing successfully — all three runs (March 20 attempt 1, March 20 attempt 2, March 21 attempt 2) had `status: "success"` and `passed: true` with all work plan steps completed.
+
+The user's concern was that lead enrichment "didn't happen." Root cause: **enriched fields were written to custom fields** in the CRM, not the standard fields the user was checking. The enrichment was working correctly, but the results were in a different place than expected.
+
+### Schedule Details
+
+- **Prompt:** Enrich leads from 6 CRM lists, recommend top 10 for LinkedIn outreach, draft 2 post-connection messages
+- **Model:** `anthropic.claude-opus-4-6-v1`
+- **Validation:** `functionCallMinCalls: { linkedin_outreach: 1 }` — note: this requirement exists but the prompt only asks to "draft" messages, not send them. All runs passed validation regardless.
+- **Runs examined:** 3 sessions, all enriching 214-221 leads with 0 failures
+
+### Resolution
+
+No code change needed. User confusion about where enriched data appears in the CRM (custom fields vs standard fields).
+
+---
+
+# March 20, 2026: Investigation — UseHaven.ai Meta Marketing Connected Account Issue
+
+## Problem
+
+Two issues reported by UseHaven.ai (usehaven.ai) when connecting Meta Marketing accounts:
+
+1. **Matt (existing user):** When connecting Meta Marketing, Facebook asks him to reconnect because he previously connected with a different account.
+2. **Harsha (new user):** When attempting to connect, sees an "App does not exist" error.
+
+## Investigation Findings
+
+### Architecture Overview
+
+- Meta OAuth flow: `metaAuth.ts` handles init → Facebook Login popup → callback → finalize (token exchange) → connect-ad-accounts
+- Credentials stored in AWS Secrets Manager at `prod/AgentWeb/MetaApp` (contains `clientId`, `clientSecret`, `instagramClientId`, `instagramClientSecret`)
+- Connected accounts stored in DynamoDB `AW-Users` table under `connected_accounts` array
+- Token sessions stored in-memory with 10-minute TTL
+
+### Root Cause: App in Development Mode
+
+The "App does not exist" error for Harsha is caused by the **Meta/Facebook App being in Development Mode**. In Development Mode, only users listed as App Admins, Developers, or Testers in the Facebook App settings can use the OAuth flow. All other users see "App does not exist."
+
+Matt could connect because he was likely added as a tester/developer on the app. The "reconnect" prompt is standard Facebook behavior when a user re-authorizes an app — Facebook remembers the prior authorization and asks to confirm.
+
+### Actions Taken
+
+1. **Made the app Live** — switched from Development to Live mode in Meta Developer Console
+2. **Completed Data Use Checkup** — required for Live mode compliance
+3. **Harshit submitted for App Review** — required for advanced permissions (ads_management, ads_read, pages_show_list)
+
+### Key Files
+
+- `backend/src/routes/metaAuth.ts` — OAuth init, callback, finalize, connect endpoints
+- `backend/src/routes/metaV2.ts` — Ad creation API using connected account tokens
+- `backend/src/config/integrations.ts` — OAuth URLs, scopes, redirect URIs
+- `backend/src/utils/secretsManager.ts` — `getMetaCredentials()` and `getInstagramCredentials()`
+- `backend/src/services/connectedAccountsDb.ts` — Account storage (createAccount, updateAccountTokens)
+- `customer-portal/src/pages/MetaOAuthCallback.tsx` — Frontend OAuth callback handler
+- `customer-portal/src/pages/Settings.tsx` — `startMetaOAuth()` initiates the flow
+
+### Status
+
+Pending App Review approval from Meta. Will revisit once review is complete. After approval, all users should be able to connect Meta Marketing accounts without the "app does not exist" error.
+
+---
+
+# March 20, 2026: Proposal — Token Limits Per Subscription Tier
+
+## Context
+
+We have four subscription tiers (Free, Starter, Pro, Enterprise) but no token usage limits. All tiers currently allow unlimited Agent Mode token consumption. With $0 in cloud credits (AWS, Google Cloud, Azure), every token is a direct cost. We need per-tier limits that:
+- **Free:** Let users see enough value to convert, but cap usage to incentivize upgrades
+- **Starter/Pro:** Be generous enough to retain paying users while maintaining healthy margins
+- **Enterprise:** Unlimited or custom-negotiated
+
+## Current State
+
+- Token usage is tracked **per message** in `ChatSession.messages[].usage` (prompt_tokens, completion_tokens, total_tokens, estimated_cost)
+- No aggregate monthly tracking per user exists
+- No enforcement or limits exist — all tiers have unlimited consumption
+- Internal tiers: Free, Basic (Starter), Super Premium (Pro). Enterprise not yet in code.
+
+## LLM Cost Reference (per 1M tokens)
+
+| Model | Input | Output | Blended* | Provider |
+|-------|------:|-------:|---------:|----------|
+| Claude Sonnet 4.5/4.6 | $3 | $15 | $10.20 | AWS Bedrock |
+| Claude Opus 4.6 | $15 | $75 | $51.00 | AWS Bedrock |
+| GPT-5 | $2.50 | $10 | $7.00 | Azure |
+| GPT-5.2 | $3 | $12 | $8.40 | Azure |
+| Gemini 3 Pro | $1.25 | $10 | $6.50 | Google |
+| Gemini 3 Flash | $0.15 | $0.60 | $0.42 | Google |
+| Gemini 3.1 Flash Lite | $0.075 | $0.30 | $0.21 | Google |
+
+*Blended = weighted avg assuming ~40% input, ~60% output tokens (typical agent conversations)*
+
+Default model: GPT-5 (`gpt-5-chat-2`), blended cost ~$7/1M tokens.
+
+## Typical Session Token Usage
+
+| Session Type | Tokens/Session | Examples |
+|-------------|---------------:|---------|
+| Simple Q&A | 30K–50K | Quick marketing question, 2-3 turns |
+| Content creation | 80K–150K | Blog post, social posts, with revisions |
+| Research/analysis | 100K–200K | Market analysis, competitor research |
+| Complex workflow | 200K–500K | Multi-step task with tool calls |
+| Scheduled chat | 50K–150K | Automated recurring tasks |
+
+**Median session: ~100K tokens**
+
+## Proposed Token Limits
+
+| Tier | Price | Monthly Token Limit | ~Sessions/Month | Our Blended Cost (GPT-5) | Gross Margin |
+|------|------:|--------------------:|----------------:|-------------------------:|-------------:|
+| **Free** | $0 | **1M** | ~10–15 | ~$7 | -$7 (acquisition cost) |
+| **Starter** | $199 | **15M** | ~100–150 | ~$105 | ~$94 (47%) |
+| **Pro** | $499 | **50M** | ~300–500 | ~$350 | ~$149 (30%) |
+| **Enterprise** | Custom | **Unlimited** | Unlimited | Negotiated | Negotiated |
+
+### Free Tier Rationale ($0/mo → 1M tokens)
+- Enough for ~10–15 meaningful sessions (blog post, social content, brand strategy)
+- Users see value within first few days but hit the wall within the first week of active use
+- At ~$7/user/month cost, even a 5% conversion rate to Starter ($199) is profitable after ~3–5 free users per paid conversion
+
+### Starter Tier Rationale ($199/mo → 15M tokens)
+- ~5–7 sessions/day on weekdays — comfortable for SMB marketing teams
+- 47% gross margin at GPT-5 blended rates; 23% margin if users primarily use Sonnet
+- Power users may hit the limit in week 3–4, creating natural upsell to Pro
+
+### Pro Tier Rationale ($499/mo → 50M tokens)
+- ~15–20 sessions/day — heavy automation, scheduled chats, multi-step workflows
+- 30% margin at GPT-5; margin is thin/negative if users predominantly use Opus
+- Rarely hit limit unless running Opus-heavy workloads
+
+### Enterprise Rationale (Custom → Unlimited)
+- Custom pricing presumably $1,000+/mo
+- Internal soft alert at 100M tokens/month for monitoring
+- SLA-backed with negotiated terms
+
+## Model Cost Multiplier (Recommended)
+
+To protect margins across tiers, apply a multiplier so expensive models consume more of the budget:
+
+| Model Tier | Multiplier | Rationale |
+|-----------|----------:|-----------|
+| Gemini Flash / Flash Lite | 0.1x | 10–50x cheaper than baseline |
+| GPT-5 / Gemini Pro | 1x (baseline) | ~$7/1M blended |
+| GPT-5.2 | 1.2x | Slightly more expensive |
+| Claude Sonnet 4.5/4.6 | 1.5x | ~50% more expensive than GPT-5 |
+| Claude Opus 4.6 | 7x | ~7x more expensive than GPT-5 |
+
+Example: A 50K-token Opus session counts as 350K "weighted tokens" toward the monthly limit.
+
+**Alternative (simpler):** No multiplier, but restrict model availability per tier:
+- Free/Starter: GPT-5, Gemini models, Claude Sonnet only
+- Pro: All models including Opus
+- Enterprise: All models
+
+## Overage Behavior (Recommended)
+
+1. **Warning at 80%** — In-app banner: "You've used 80% of your monthly token budget"
+2. **Soft block at 100%** — New sessions blocked, but current in-progress session allowed to finish
+3. **Grace period** — Allow up to 5% overage to avoid mid-session cutoffs
+4. **Reset** — Monthly, aligned to Stripe billing period (`current_period_end`)
+
+## Implementation Plan
+
+### Phase 1: Tracking Infrastructure
+1. Add `tokenUsage` fields to `AW-Users` table:
+   - `tokenUsage.currentMonth.year`, `tokenUsage.currentMonth.month`
+   - `tokenUsage.currentMonth.totalTokensUsed` (weighted)
+   - `tokenUsage.currentMonth.rawTokensUsed` (unweighted)
+   - `tokenUsage.currentMonth.estimatedCostUSD`
+   - `tokenUsage.currentMonth.resetDate` (ISO)
+2. Update `agentModeService.ts` to increment user token usage after each LLM call
+3. Add monthly reset logic (check on each request if month has rolled over)
+
+### Phase 2: Limit Enforcement
+4. Add `monthlyTokenLimit` to tier configs in `AW-Settings` → `subscription_types`
+5. Add pre-check in Agent Mode: reject new sessions if user is at/over limit
+6. Add 80% warning emission via Socket.IO
+7. Allow in-progress sessions to complete (grace overage up to 5%)
+
+### Phase 3: User-Facing
+8. Add token usage display to customer portal Settings page
+9. Add usage bar/indicator in Agent Mode sidebar
+10. Add upgrade prompts when approaching/hitting limits
+
+### Files to Modify
+- `backend/src/services/agentModeService.ts` — token tracking, limit checks, model multiplier
+- `backend/src/services/chatbotService.ts` — add `tokenUsage` to User interface
+- `backend/src/services/db.ts` — add `updateUserTokenUsage()`, `getUserTokenUsage()`
+- `backend/src/services/subscriptionService.ts` — add `monthlyTokenLimit` to tier configs
+- `backend/src/controllers/agentModeController.ts` — pre-session limit check
+- `customer-portal/src/pages/Settings.tsx` — usage display
+- `customer-portal/src/components/AgentMode/` — usage bar, warning banner
+
+---
+
+# March 20, 2026: Investigation — AgentWeb.pro Lead Gen Path Broken
+
+## Context
+
+The lead generation process from AgentWeb.pro (our Webflow landing site) was broken for weeks without detection. Investigated the full lead capture flow using browser testing to identify all issues.
+
+## Critical Finding: Nav Menu "Get Started" Links to Job Application Form
+
+The hamburger menu's **"Get Started"** button links to a **job application form** on Surface:
+- **Menu CTA URL:** `https://forms.withsurface.com/s/cmhlafdiv0001js0bfy1qaxhh` → "AgentWeb Job Application" (asks about work authorization, what you've built, etc.)
+- **Correct URL (used by hero + bottom CTAs):** `https://forms.withsurface.com/s/cmdzs6o9i007rky04xg1157yk` → "Train Emma" lead capture form (asks for work email, name, company, phone)
+
+**Impact:** On mobile, the hamburger menu is the primary navigation. Any visitor clicking "Get Started" from the nav menu was sent to a hiring form instead of becoming a lead. They likely bounced immediately. This silently killed lead conversion with no visible error.
+
+## Other Issues Found
+
+### Cloudflare Turnstile Error (600010)
+- Console repeatedly logs `[Cloudflare Turnstile] Error: 600010` and `Failed to load resource` errors on all pages
+- Turnstile is the bot-protection widget likely guarding the newsletter signup form
+- The `failure_retry` path also fails, so it doesn't recover
+- May allow spam submissions or block legitimate users in certain browsers
+
+### No Lead Capture CTA on Content Pages
+- `/case-studies` page lists 5 case studies but has no "Get Started" CTA in main content
+- Same for `/blog` pages — only the footer newsletter form is available
+- Visitors reading about results (e.g., "417 demo requests", "328 add to carts") have no obvious path to the lead form
+
+### /build Page Skips Lead Capture
+- "Start Free Trial" goes directly to Stripe checkout ($199/mo after 7-day trial)
+- No email capture before the paywall — visitors who aren't ready to pay leave with zero data captured
+
+### rankai.ai External Script
+- Every page loads `https://rankai.ai/apply.js` which rewrites alt text, anchor titles, Open Graph meta tags, and injects schema markup after page load
+- This external dependency modifies the DOM — worth verifying it's not interfering with lead capture elements or causing the Turnstile issue
+
+## Lead Capture Paths Summary
+
+| Location | CTA Text | Destination | Status |
+|---|---|---|---|
+| Homepage hero | "Get Started" | Surface lead form | OK |
+| Homepage bottom | "Get Started" | Surface lead form | OK |
+| **Nav menu** | **"Get Started"** | **Surface JOB APPLICATION** | **BROKEN** |
+| /build hero | "Start Free Trial" | Stripe checkout | OK (no lead capture) |
+| Footer (all pages) | Newsletter "Submit" | Webflow newsletter | OK (with Turnstile errors) |
+| Nav menu | "Log In" | app.agentweb.pro/login | OK |
+| Nav menu | "Contact" | mailto:founders@agentweb.pro | OK |
+
+## Fix Required
+
+These fixes must be made in the **Webflow editor** (not in this codebase):
+1. **P0:** Fix nav menu "Get Started" link to point to `cmdzs6o9i007rky04xg1157yk` (the lead form, not the job application)
+2. **P1:** Investigate and fix Cloudflare Turnstile error 600010
+3. **P2:** Add "Get Started" CTAs to case studies and blog pages
+4. **P3:** Update copyright year from 2025 to 2026
+
+---
+
+# March 19, 2026: Investigation — X/Twitter Outreach via Unipile
+
+## Context
+
+Investigated adding X/Twitter outreach support via Unipile, mirroring our existing LinkedIn outreach integration. Unipile's SDK includes `TWITTER` as a supported provider (`AvailableAccountProvider` union), and the hosted auth link API accepts `providers: ['TWITTER']`.
+
+## Findings
+
+### Unipile SDK Support
+
+- The `unipile-node-sdk` package lists `TWITTER` as a valid provider alongside `LINKEDIN`, `WHATSAPP`, `INSTAGRAM`, `MESSENGER`, `TELEGRAM`, `MAIL`, `GOOGLE`, `OUTLOOK`, and `IMAP`.
+- Account creation types (`accounts-create.types.d.ts`) include Twitter-specific schemas.
+- The messaging API (`messaging.startNewChat`, `messaging.sendMessage`) is provider-agnostic and would work for Twitter DMs.
+- The users API (`users.sendInvitation`, `users.getAllRelations`) maps to follow/following on Twitter.
+
+### Implementation Plan (Designed but Not Built)
+
+The plan was to mirror the LinkedIn outreach pattern:
+- New platform type `'unipile_twitter'` in `connectedAccountsDb.ts`
+- New service `xTwitterOutreachService.ts` reusing the shared Unipile client
+- New auth route `xTwitterOutreachAuth.ts` with `providers: ['TWITTER']`
+- New emma tool `x_twitter_outreach` with actions: `send-dm`, `get-profile`, `follow`, `search-users`, `list-following`, `get-posts`
+- Frontend: callback page, Settings platform card, ConnectedAccountsList section
+
+### Blocker: Unipile Twitter Support Suspended
+
+Per Unipile's website and support team (March 2026): **Twitter/X integration is no longer actively maintained.** Their support indicated it may return in a few months. The SDK types still include `TWITTER` but the backend service may reject connections.
+
+### Unipile Actively Maintained Integrations (as of March 2026)
+
+Per Unipile support, the following providers are currently actively maintained:
+- **Emails** (MAIL, GOOGLE, OUTLOOK, IMAP)
+- **WhatsApp**
+- **LinkedIn**
+- **Telegram**
+- **Instagram**
+
+Twitter/X and Messenger are not on the active list.
+
+## Decision
+
+Paused implementation. Will revisit when Unipile confirms Twitter support is restored. The implementation design is documented above and in `.claude/plans/whimsical-conjuring-stroustrup.md` for when we're ready to proceed.
+
+---
+
+# March 19, 2026: Investigation — Sessions with 0 Messages
+
+## Context
+
+Production data shows a high ratio of sessions with 0 messages. For example, in a 24-hour window there were ~54 sessions but only ~22 had messages. This investigation identifies the root cause.
+
+## Findings
+
+### Session Creation Flow
+
+1. **Frontend** (`customer-portal/src/pages/AgentMode.tsx:2176-2253`): `createNewSession()` calls `POST /api/agent-mode/sessions` eagerly — on page load when no sessionId is in the URL, or when the user clicks "New Chat".
+
+2. **Backend controller** (`backend/src/controllers/agentModeController.ts:1529-1568`): Creates the session record immediately with `portalType: 'agent'`.
+
+3. **Database layer** (`backend/src/services/chatbotService.ts:455-550`): For Agent Mode sessions (`portalType === "agent"`), the system message is `null`, so the session is created with **`messages: []`** (empty array). Messages are only added later when the user actually sends a message, and they go into the separate `AW-ChatMessages` table.
+
+### Why So Many Empty Sessions
+
+The primary cause is **eager session creation on page load**. Every time a user navigates to `/agent-mode` (or `/agent-mode/new`), a new session is created before they type anything. Common scenarios that produce empty sessions:
+
+- **Page refresh**: User refreshes the Agent Mode page → new session created, old one abandoned
+- **Navigation bounce**: User opens Agent Mode, then navigates away without sending a message
+- **Multiple tabs**: Each tab/window opening Agent Mode creates its own session
+- **URL routing**: When no sessionId is in the URL, the frontend routes to `/agent-mode/new` which triggers `createNewSession()`
+
+Additional creation points that may produce empty sessions:
+- **Admin/GTM Plan** (`backend/src/routes/admin.ts:3558`): Creates sessions for GTM work items
+- **GTM Plan Route** (`backend/src/routes/gtmPlan.ts:1309`): Creates sessions during GTM plan operations
+- **Slack Bot** (`backend/src/routes/slack.ts:230`): Creates sessions on Slack events
+
+### Key Data Points
+
+- `messageCount` on the session record reflects the count of messages in the `AW-ChatMessages` table (separate from the legacy `messages` array on the session itself)
+- Sessions with `messageCount = 0` never had any user or assistant messages sent
+- This is not a data integrity issue — the sessions genuinely have no messages
+
+## Recommended Fix: Lazy Session Creation
+
+**Approach**: Don't create a session until the user sends their first message.
+
+### Frontend Changes (`customer-portal/src/pages/AgentMode.tsx`)
+
+1. When navigating to `/agent-mode/new`, show an empty chat UI without calling `createNewSession()`
+2. On first message send, call `createNewSession()` first, then send the message
+3. The "New Chat" button should reset the UI state locally without creating a backend session
+
+### Backend Changes (minimal)
+
+No backend changes needed — the `POST /api/agent-mode/sessions` endpoint works fine. The change is purely about **when** the frontend calls it.
+
+### Expected Impact
+
+This should reduce empty sessions by ~60% (the ratio seen in production). Sessions created by admin/GTM/Slack flows would still exist but are a much smaller volume.
+
+---
+
 # March 19, 2026: storywithai.info Blog Publishing — GoDaddy Website Builder Investigation
 
 ## Context
@@ -1045,6 +1407,55 @@ It could be due to auth related code was changed and the change would require re
 # prod deployment on AWS Beanstalk
 June 03, 2025: a deployment to backend failed and it failed to revert back to previous version. Restarting the app server and rebuilt the environemnt not worked. To resolve the issue, we had to clone the environment and then pointed the dns record in route 53 to the new environment.
 
+# March 23, 2026: Path Traversal Attack Investigation
+
+## Problem
+
+Production nginx logs showed a high volume of suspicious requests probing for common web vulnerabilities (PHP, Java, .env files, path traversal). Investigation needed to determine if any attacks were successful and whether the codebase is vulnerable.
+
+## Attack Evidence from Production Logs
+
+**1,114 malicious requests** across Mar 19–23 from automated vulnerability scanners. **All returned 404** — no successful exploitation.
+
+### Attack Types (by volume)
+| Type | Count | Description |
+|------|-------|-------------|
+| PHPUnit/eval-stdin | 949 | Probing for exposed PHP test suites (`/vendor/phpunit/.../eval-stdin.php`) |
+| .env probe | 67 | Attempting to read environment variables (`GET /.env`) |
+| Path traversal (LFI) | 47 | PHP Local File Inclusion via `index.php?lang=../../../../usr/local/lib/php/pearcmd` |
+| Spring actuator | 7 | Probing for Java Spring endpoints (`/actuator/health`) |
+| Other | 44 | Mixed scanner fingerprinting (`/webui/`, `/developmentserver/metadatauploader`, etc.) |
+
+### Scanner Fingerprints
+- `libredtail-http` — automated vulnerability scanner
+- `Mozilla/5.0 zgrab/0.x` — zgrab network scanner
+- Spoofed Chrome/Firefox user-agents for .env probes
+
+### Key Attacker IPs
+`110.35.80.116`, `75.119.137.153`, `82.24.64.32`, `118.196.74.89`, `165.154.232.244`, `34.158.79.105`, `145.223.47.104`, `45.39.7.12`, `20.163.2.150`, `20.64.106.28`, `65.49.1.142`, `48.214.144.34`
+
+## Code Audit Findings
+
+### No Filesystem Path Traversal Vulnerabilities
+1. **No `express.static` serving** — backend doesn't serve static files from the filesystem
+2. **No `res.sendFile` / `res.download`** — no file download endpoints using filesystem paths
+3. **No user-input in `path.join`** — all `fs.readFileSync` calls use hardcoded paths (`docs/AGENT_API.md`, `docs/skill.md`, font files, UUID-generated temp files)
+4. **Asset serving via S3** — `/asset/:assetHash` decodes a hash to S3 bucket/key, not filesystem paths
+5. **File uploads go to S3** — no local filesystem storage of user uploads
+
+### Landing Page GitHub File Endpoints — Low Risk
+4 endpoints in `landingPageGeneration.ts` accept user-supplied file paths passed to GitHub API. They have `..` checks but could be hardened:
+- `GET /api/landing-pages/v0/generated/:id/file-content` (line 629)
+- `PUT /api/landing-pages/v0/generated/:id/github-edit` (line 415)
+- `GET /api/landing-pages/v0/generated/:id/commits` (line 681)
+- `GET /api/landing-pages/v0/generated/:id/file-at-commit` (line 726)
+
+Risk is low: paths go to GitHub API (not filesystem), require auth + ownership, and Express's `qs` parser auto-decodes `%2e%2e` preventing URL-encoded bypasses.
+
+## Conclusion
+
+All attacks are **automated internet background noise** targeting PHP/Java/Python stacks. The Node.js/Express backend with no filesystem file serving is not vulnerable. All attack requests correctly return 404. Consider AWS WAF and nginx rate limiting for defense-in-depth.
+
 June 04, 2025: another outage of the backend. To resolve the issue and improve reliability, updated the environment to use t3-small instead of t3-micro as first option and t3-medium as second option. It was t3-micro then t3-small.
 
 June 16, 2025:
@@ -1774,3 +2185,106 @@ Investigated session `b34576c1-70f9-40da-a628-6fc8f9a3b129` ("Test: Weekly Compe
 - The `runVerifiedChat` retry prompt (lines 583-618 of `agentModeController.ts`) intentionally avoids re-requesting tools that already ran. When all required functions have been called but the work plan isn't complete, it sends generic "complete pending steps" messages. This means retries don't force the LLM to use different search parameters.
 - 229 sessions use `perform_deep_research`. Overall 84% succeed at producing blog articles. `gemini-3-pro-preview` has a 23% failure rate vs 1% for `gemini-3.1-pro-preview`.
 - 42 sessions show durations >2 hours (stuck/zombie sessions), likely due to long-running deep research polls that don't properly clean up.
+
+## Message Limit & Context Window Investigation (2026-03-19)
+
+### Current State
+
+Agent Mode sessions are capped at **300 messages** (`MAX_MESSAGE_SIZE_PER_SESSION` in `backend/src/config.ts`). Raised from 150 in a previous release.
+
+### Bug Found: 10-User-Message Sliding Window
+
+**`buildMarketingContext()`** (agentModeService.ts:1785) currently slices conversation history to only the **last 10 user messages** + associated assistant/tool responses. This means the LLM is blind to most of the conversation history in any session with more than ~10 exchanges. This is a bug — context from earlier messages is silently dropped.
+
+**Code location:** Lines 1801-1813 in `buildMarketingContext()`:
+```
+let userCount = 0;
+let startIdx = 1;
+for (let i = filteredHistory.length - 1; i >= 0; i--) {
+  if (filteredHistory[i].role === 'user') {
+    userCount++;
+    if (userCount === 10) { startIdx = i; break; }
+  }
+}
+const sliced = filteredHistory.slice(startIdx);
+```
+
+**Fix:** Remove this sliding window entirely. All messages should be included in context.
+
+### How Context is Built Today
+
+```
+1. System prompt
+2. Skills context (available + installed skills)
+3. Account memory (cross-session facts)
+4. Last 10 user messages + their assistant/tool responses  <-- BUG: should be ALL messages
+5. Task statuses
+6. Work plan (if active)
+7. Current user message
+   |
+trimToolMessagesForContext()  (truncate old tool outputs to 8000 chars)
+   |
+callLLM()
+```
+
+**Key files:**
+- `agentModeService.ts:774` — `generateMarketingResponse()` main entry
+- `agentModeService.ts:1785` — `buildMarketingContext()` slices to last 10 user msgs
+- `agentModeService.ts:12015` — `trimToolMessagesForContext()` truncates old tool results
+- `chatbotService.ts:806` — `getMessagesFromMessagesTable()` loads from DynamoDB
+- `config.ts:4` — `MAX_MESSAGE_SIZE_PER_SESSION = 300`
+
+### Proposed Solution: Summarization + `query_message_details` Tool
+
+Two complementary mechanisms that together enable **unlimited messages**:
+
+1. **Periodic Summarization:** Every 200 messages, generate a summary using Gemini Flash Lite and inject it as a system-level context message. Original messages are preserved in DB but replaced by summaries in the LLM context.
+
+2. **`query_message_details` Tool:** A foundation tool that lets the LLM retrieve specific details from older messages on-demand. Uses Gemini Flash Lite (~$0.01/query, 1-2s latency) to answer questions against the full message history.
+
+**Why this works:**
+- Summaries give the LLM a high-level map of the full conversation
+- The tool lets the LLM drill into details when needed (the LLM decides when)
+- Gemini Flash Lite has ~1M token context window — can read hundreds of messages cheaply
+- No new infrastructure needed — just another tool + cheap LLM call
+- Scales infinitely — only summaries accumulate (~500 tokens each)
+
+**Architecture:**
+```
+Messages 1-200:     [Summary A injected as system message]
+Messages 201-400:   [Summary B injected as system message]
+Messages 401-600:   [Summary C injected as system message]
+Messages 601-700:   [Full detail messages in context]
+
+System prompt says: "Use query_message_details to look up specific details
+from earlier in the conversation when needed."
+
+When LLM needs detail -> calls query_message_details("what was the blog URL?")
+  -> Gemini Flash Lite reads relevant messages, answers the question
+  -> Result returned as tool response
+```
+
+**Cost for a 1000-message session:** ~$0.18 extra (4 summaries + ~10 detail queries).
+
+### Implementation Plan
+
+**Phase 1: Core Changes**
+1. Remove the 10-user-message sliding window in `buildMarketingContext()`
+2. Add `generateConversationSummary()` method using Gemini Flash Lite
+3. Add `query_message_details` foundation tool + `handleQueryMessageDetails()` handler
+4. Inject summaries into context via `buildMarketingContext(summaries)` parameter
+5. Store summaries on session record (`ChatSession.summaries[]`)
+6. Add `updateSessionSummaries()` to `ChatbotDB`
+7. Raise `MAX_MESSAGE_SIZE_PER_SESSION` to 10,000
+8. Update system prompt with "Long Conversation Support" guidance
+
+**Phase 2: Polish**
+- Frontend: show "Conversation summarized up to message X" indicator
+- Admin controls: summarization interval, enable/disable
+- Smart triggers: summarize based on token count, not just message count
+
+### Files to Modify
+- `backend/src/config.ts` — raise message limit
+- `backend/src/services/agentModeService.ts` — remove window, add summarization, add tool handler, add to foundation tools
+- `backend/src/services/chatbotService.ts` — add `summaries` to ChatSession, add `updateSessionSummaries()`
+- `backend/src/emma/tools.ts` — register `query_message_details` tool

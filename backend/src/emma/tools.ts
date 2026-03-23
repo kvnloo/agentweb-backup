@@ -3,6 +3,9 @@ import { emmaToolRegistry } from './registry';
 import { accountMemoryDb } from '../services/db';
 import { getAccountSummary } from '../services/accountSummaryService';
 
+// Register browser cookie persistence tools
+import './browserCookieTools';
+
 emmaToolRegistry.register({
   name: 'install_skills',
   definition: {
@@ -138,13 +141,14 @@ emmaToolRegistry.register({
       const { userDb } = await import('../services/db');
       const currentUser = await userDb.getUserById(userId);
       if (currentUser?.isAdmin === true) {
-        const adminToolNames = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill'];
+        const { agentModeService } = await import('../services/agentModeService');
+        const adminToolNamesList = agentModeService.getAdminToolNames();
         availableSkills.push({
           skillId: '__admin_tools__',
           name: 'Admin Tools',
-          description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-          toolNames: adminToolNames,
-          toolCount: adminToolNames.length
+          description: 'Admin-only tools: manage predefined work plans, skill definitions, chat history, and client health assessment. WARNING: These tools modify production configuration — use with extra care.',
+          toolNames: adminToolNamesList,
+          toolCount: adminToolNamesList.length
         });
       }
     } catch {
@@ -4257,69 +4261,6 @@ emmaToolRegistry.register({
   }
 });
 
-// --- Client Health Assessment (admin-only) ---
-
-emmaToolRegistry.register({
-  name: 'assess_client_health',
-  definition: {
-    name: 'assess_client_health',
-    description: `Assess the health of a specific client account across three layers: ads, landing pages, and lead quality. Admin-only tool.
-
-Returns a structured health assessment with:
-- **Ads layer**: Meta ad account connectivity, active campaigns
-- **Lander layer**: Landing page / website presence (productDomain, seoDomains)
-- **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
-- **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
-- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
-
-Use this to quickly diagnose a client's marketing funnel completeness.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        client_name_or_email: {
-          type: 'string',
-          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
-        }
-      },
-      required: ['client_name_or_email']
-    }
-  },
-  execute: async (args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    return await agentModeService.assessClientHealth(userId, args.client_name_or_email);
-  }
-});
-
-emmaToolRegistry.register({
-  name: 'list_all_clients',
-  definition: {
-    name: 'list_all_clients',
-    description: `List all non-admin client accounts with quick health indicators. Admin-only tool.
-
-Returns for each client:
-- Name, email, roles
-- has_ads: whether they have a Meta ad account connected
-- has_lander: whether they have landing pages (productDomain or seoDomains)
-- has_crm: whether they have CRM integrations (email domain, LinkedIn)
-- last_activity: last login timestamp
-
-Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      required: []
-    }
-  },
-  execute: async (_args: any, context?: any) => {
-    const userId = context?.userId || context?.agentUserId;
-    if (!userId) throw new Error('Authentication required');
-
-    return await agentModeService.listAllClients(userId);
-  }
-});
-
 emmaToolRegistry.register({
   name: 'account_summary',
   definition: {
@@ -4351,7 +4292,7 @@ emmaToolRegistry.register({
   name: 'get_seo_metrics',
   definition: {
     name: 'get_seo_metrics',
-    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). User must have SEO domains configured in their account settings.',
+    description: 'Get SEO metrics for the user\'s configured domains. Returns Google Search Console data (clicks, impressions, CTR, average position, top queries, top pages, daily trends) and technical SEO score (PageSpeed). If the user has multiple domains configured, returns metrics for all domains unless a specific domain is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4359,6 +4300,10 @@ emmaToolRegistry.register({
           type: 'string',
           enum: ['7d', '14d', '30d', '90d'],
           description: 'Time period for metrics. Default: 30d'
+        },
+        domain: {
+          type: 'string',
+          description: 'Specific domain to fetch metrics for (e.g. "example.com"). If omitted, returns metrics for all configured domains.'
         }
       },
       required: []
@@ -4369,7 +4314,7 @@ emmaToolRegistry.register({
     if (!userId) throw new Error('Authentication required');
 
     const { fetchSearchConsoleMetrics } = await import('../services/seoService');
-    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d');
+    return await fetchSearchConsoleMetrics(userId, args.timeframe || '30d', args.domain);
   }
 });
 
@@ -4377,7 +4322,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. User must have a Google Analytics Property ID configured in their account settings.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources, top pages by engagement, and daily trends. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4385,6 +4330,10 @@ emmaToolRegistry.register({
           type: 'string',
           enum: ['7d', '14d', '30d', '90d'],
           description: 'Time period for analytics. Default: 30d'
+        },
+        property_id: {
+          type: 'string',
+          description: 'Specific GA4 property ID to fetch analytics for (e.g. "123456789"). If omitted, returns analytics for all configured properties.'
         }
       },
       required: []
@@ -4395,7 +4344,32 @@ emmaToolRegistry.register({
     if (!userId) throw new Error('Authentication required');
 
     const { fetchGoogleAnalyticsMetrics } = await import('../services/seoService');
-    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d');
+    return await fetchGoogleAnalyticsMetrics(userId, args.timeframe || '30d', args.property_id);
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'get_clarity_metrics',
+  definition: {
+    name: 'get_clarity_metrics',
+    description: 'Get Microsoft Clarity project information and dashboard links for the user\'s configured projects. Returns project IDs, labels, and direct links to Clarity dashboards. If the user has multiple Clarity projects, returns info for all unless a specific project is requested.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: {
+          type: 'string',
+          description: 'Specific Clarity project ID to get info for. If omitted, returns info for all configured projects.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+
+    const { fetchClarityProjectInfo } = await import('../services/seoService');
+    return await fetchClarityProjectInfo(userId, args.project_id);
   }
 });
 
@@ -4557,7 +4531,7 @@ const bridgedToolNames = [
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
-  // Landing Page tools (v0 generation + GitHub editing)
+  // Landing Page tools (v0 generation + management — file editing delegated to coding_agent)
   'generate_landing_page',
   'deploy_landing_page',
   'list_landing_pages',
@@ -4565,9 +4539,6 @@ const bridgedToolNames = [
   'delete_landing_page',
   'enable_lead_list_public_access',
   'duplicate_landing_page',
-  'edit_landing_page_file',
-  'list_landing_page_files',
-  'read_landing_page_file',
   'get_deployment_status',
 ];
 
@@ -4578,6 +4549,9 @@ const adminToolNames = [
   'list_skills',
   'manage_skill',
   'get_chat_history',
+  'list_all_clients',
+  'assess_client_health',
+  'get_pr_digest',
 ];
 
 for (const toolName of bridgedToolNames) {
@@ -4592,6 +4566,60 @@ for (const toolName of bridgedToolNames) {
     console.warn(`[emma/tools] Failed to bridge tool "${toolName}" — not found in mcpToolRegistry`);
   }
 }
+
+// ─── Coding Agent tool (sub-agent for code editing tasks) ───────────────────
+emmaToolRegistry.register({
+  name: 'coding_agent',
+  definition: {
+    name: 'coding_agent',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent reads files, makes precise diff-based edits, checks deployment status, verifies changes in the browser, and iterates on build errors autonomously. Use this for ANY task that involves modifying landing page code (HTML, CSS, JS/TSX, config files). The agent runs autonomously, verifies its own work visually, and returns results when done.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: {
+          type: 'string',
+          description: 'The landing page ID to edit'
+        },
+        task_description: {
+          type: 'string',
+          description: 'Detailed description of what code changes to make. Include specific requirements, file paths if known, and any context about the desired outcome. Be as specific as possible.'
+        }
+      },
+      required: ['page_id', 'task_description']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const { runCodingAgent } = await import('../services/codingAgentService');
+    const executeMcpTool = context?.service
+      ? async (toolName: string, toolArgs: any) => {
+          return context.service.executeTool(
+            context.llmModel || 'anthropic.claude-sonnet-4-6',
+            toolName,
+            toolArgs,
+            context.userId,
+            context.sessionId
+          );
+        }
+      : undefined;
+
+    const result = await runCodingAgent(
+      args.task_description,
+      {
+        pageId: args.page_id,
+        userId: context?.userId,
+        sessionId: context?.sessionId,
+        llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
+        socketEmit: context?.socketEmit,
+        executeMcpTool,
+      }
+    );
+    if (result.success) {
+      return { success: true, message: result.message, iterations: result.iterations };
+    } else {
+      return { success: false, error: result.message, iterations: result.iterations };
+    }
+  }
+});
 
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);

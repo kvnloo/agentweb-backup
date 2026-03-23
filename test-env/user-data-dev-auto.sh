@@ -88,21 +88,84 @@ chown -R ec2-user:ec2-user "$APP_DIR"
 
 cd "$APP_DIR" && sudo -u ec2-user npm install @playwright/test --no-save 2>/dev/null && cd /
 
-# Add Playwright browser_install to Claude settings
-SETTINGS_FILE="$APP_DIR/.claude/settings.local.json"
-if [[ -f "$SETTINGS_FILE" ]]; then
-  python3 -c "
-import json
-with open('$SETTINGS_FILE') as f:
-    s = json.load(f)
-tool = 'mcp__playwright__browser_install'
-if tool not in s.get('permissions',{}).get('allow',[]):
-    s.setdefault('permissions',{}).setdefault('allow',[]).append(tool)
-    with open('$SETTINGS_FILE','w') as f:
-        json.dump(s, f, indent=2)
-        f.write('\n')
-"
-fi
+# Create Claude Code project settings with pre-approved tool permissions
+# This goes in the user-level project settings directory (not the repo .claude/)
+CLAUDE_PROJECT_DIR="/home/ec2-user/.claude/projects/-home-ec2-user-agentweb"
+mkdir -p "$CLAUDE_PROJECT_DIR"
+cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm test*)",
+      "Bash(npx tsc*)",
+      "Bash(npx vite*)",
+      "Bash(npx ts-node*)",
+      "Bash(npx playwright*)",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(curl *)",
+      "Bash(cd *)",
+      "Bash(aws *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(rm *)",
+      "Bash(echo *)",
+      "Bash(tail *)",
+      "Bash(head *)",
+      "Bash(wc *)",
+      "Bash(diff *)",
+      "Bash(sed *)",
+      "Bash(sort *)",
+      "Bash(tmux *)",
+      "Bash(chmod *)",
+      "Bash(~/agentweb/test-env/*)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_click",
+      "mcp__playwright__browser_type",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_file_upload",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_press_key",
+      "mcp__playwright__browser_select_option",
+      "mcp__playwright__browser_hover",
+      "mcp__playwright__browser_wait_for",
+      "mcp__playwright__browser_tabs",
+      "mcp__playwright__browser_navigate_back",
+      "mcp__playwright__browser_console_messages",
+      "mcp__playwright__browser_network_requests",
+      "mcp__playwright__browser_handle_dialog",
+      "mcp__playwright__browser_drag",
+      "mcp__playwright__browser_evaluate",
+      "mcp__playwright__browser_run_code",
+      "mcp__playwright__browser_resize",
+      "mcp__playwright__browser_close",
+      "mcp__playwright__browser_install",
+      "mcp__notion__API-post-search",
+      "mcp__notion__API-retrieve-a-page",
+      "mcp__notion__API-retrieve-a-comment",
+      "mcp__notion__API-create-a-comment",
+      "mcp__notion__API-patch-page",
+      "mcp__notion__API-get-block-children",
+      "mcp__notion__API-retrieve-a-database",
+      "mcp__notion__API-query-data-source"
+    ],
+    "deny": []
+  }
+}
+CLSEOF
+chown -R ec2-user:ec2-user /home/ec2-user/.claude
+
+# 3b. Preload Claude Code memory files (engineering knowledge)
+CLAUDE_MEMORY_DIR="$CLAUDE_PROJECT_DIR/memory"
+mkdir -p "$CLAUDE_MEMORY_DIR"
+cp "$APP_DIR/test-env/claude-memory/"*.md "$CLAUDE_MEMORY_DIR/"
+chown -R ec2-user:ec2-user /home/ec2-user/.claude
 
 sudo -u ec2-user git config --global user.name "Rui Wang"
 sudo -u ec2-user git config --global user.email "52230987+john-the-dev@users.noreply.github.com"
@@ -282,33 +345,90 @@ fi
 echo "$CLAUDE_PROMPT" > "$APP_DIR/.claude-prompt"
 chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
 
+cat > "$APP_DIR/.claude-comment.py" <<'PYEOF'
+import json, sys, os
+
+COST_FILE = os.path.expanduser("~/agentweb/.claude-total-cost")
+
+with open("/tmp/.claude-raw.json", "r", errors="replace") as f:
+    raw = f.read()
+
+try:
+    data = json.loads(raw)
+    text = data.get("result", raw)
+    cost = data.get("total_cost_usd", 0)
+    usage = data.get("usage", {})
+    duration_ms = data.get("duration_ms", 0)
+    input_tok = usage.get("input_tokens", 0)
+    output_tok = usage.get("output_tokens", 0)
+    cache_read = usage.get("cache_read_input_tokens", 0)
+    cache_create = usage.get("cache_creation_input_tokens", 0)
+
+    # Read previous total and accumulate
+    prev_total = 0
+    try:
+        with open(COST_FILE, "r") as cf:
+            prev_total = float(cf.read().strip())
+    except Exception:
+        pass
+    total = prev_total + cost
+    try:
+        with open(COST_FILE, "w") as cf:
+            cf.write(f"{total:.6f}")
+    except Exception:
+        pass
+
+    parts = []
+    parts.append(f"Cost: ${cost:.4f} (Total: ${total:.4f})")
+    cache_parts = []
+    if cache_read:
+        cache_parts.append(f"{cache_read:,} cache-read")
+    if cache_create:
+        cache_parts.append(f"{cache_create:,} cache-write")
+    tok_detail = f"{input_tok:,} in + {output_tok:,} out"
+    if cache_parts:
+        tok_detail += " (" + ", ".join(cache_parts) + ")"
+    parts.append(f"Tokens: {tok_detail}")
+    if duration_ms:
+        parts.append(f"Duration: {duration_ms / 1000:.0f}s")
+    models = list(data.get("modelUsage", {}).keys())
+    if models:
+        parts.append("Model: " + ", ".join(models))
+    usage_line = " | ".join(parts)
+except Exception:
+    text = raw
+    usage_line = ""
+
+exit_code = int(sys.argv[2])
+if exit_code != 0:
+    text = f"Claude Code exited with code {exit_code}:\n{text}"
+
+if usage_line:
+    text += f"\n\n---\n{usage_line}"
+
+if len(text) > 9900:
+    text = text[:9900] + "\n\n...(truncated)"
+chunks = [{"text": {"content": text[i:i+1900]}} for i in range(0, len(text), 1900)]
+if not chunks:
+    chunks = [{"text": {"content": "(no output)"}}]
+print(json.dumps({"parent": {"page_id": sys.argv[1]}, "rich_text": chunks}))
+PYEOF
+chown ec2-user:ec2-user "$APP_DIR/.claude-comment.py"
+
 cat > "$APP_DIR/.claude-run.sh" <<'RUNEOF'
 #!/bin/bash
 source ~/.bashrc
 cd ~/agentweb
 
-OUTPUT=$(claude -p "$(cat .claude-prompt)" 2>&1)
+RAW=$(claude --model opus --permission-mode auto --output-format json -p "$(cat .claude-prompt)" 2>&1)
 EXIT_CODE=$?
 
 NOTION_PAGE_ID=$(cat .notion-page-id 2>/dev/null)
 NOTION_TOKEN=$(cat .notion-token 2>/dev/null)
 if [[ -n "$NOTION_PAGE_ID" && -n "$NOTION_TOKEN" ]]; then
-  if [[ $EXIT_CODE -ne 0 ]]; then
-    OUTPUT="Claude Code exited with code $EXIT_CODE:
-$OUTPUT"
-  fi
-  printf '%s' "$OUTPUT" > /tmp/.claude-output.txt
-  BODY=$(python3 -c "
-import json, sys
-with open('/tmp/.claude-output.txt', 'r', errors='replace') as f:
-    text = f.read()
-if len(text) > 9900:
-    text = text[:9900] + '\n\n...(truncated)'
-chunks = [{'text': {'content': text[i:i+2000]}} for i in range(0, len(text), 2000)]
-if not chunks:
-    chunks = [{'text': {'content': '(no output)'}}]
-print(json.dumps({'parent': {'page_id': sys.argv[1]}, 'rich_text': chunks}))
-" "$NOTION_PAGE_ID")
+  printf '%s' "$RAW" > /tmp/.claude-raw.json
+  python3 ~/agentweb/.claude-comment.py "$NOTION_PAGE_ID" "$EXIT_CODE" > /tmp/.claude-comment.json
+  BODY=$(cat /tmp/.claude-comment.json)
   if [[ -n "$BODY" ]]; then
     curl -s -X POST "https://api.notion.com/v1/comments" \
       -H "Authorization: Bearer $NOTION_TOKEN" \
@@ -316,7 +436,7 @@ print(json.dumps({'parent': {'page_id': sys.argv[1]}, 'rich_text': chunks}))
       -H "Content-Type: application/json" \
       -d "$BODY"
   fi
-  rm -f /tmp/.claude-output.txt
+  rm -f /tmp/.claude-raw.json /tmp/.claude-comment.json
 fi
 exec bash
 RUNEOF

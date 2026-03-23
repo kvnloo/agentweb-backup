@@ -40,7 +40,7 @@ describe('EmailService - sendOncallAlert', () => {
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
     expect(callArgs.to).toEqual(['ruiw@agentweb.pro']);
-    expect(callArgs.subject).toBe('[URGENT] Test Alert');
+    expect(callArgs.subject).toBe('[TEST] Test Alert');
     expect(callArgs.text).toContain('Test Alert');
     expect(callArgs.text).toContain('This is a test alert message');
     expect(callArgs.html).toContain('Test Alert');
@@ -61,7 +61,7 @@ describe('EmailService - sendOncallAlert', () => {
     expect(mockSendMail).toHaveBeenCalled();
     const callArgs = mockSendMail.mock.calls[0][0];
     expect(callArgs.to).toEqual(['oncall1@example.com', 'oncall2@example.com']);
-    expect(callArgs.subject).toBe('[URGENT] Critical Error');
+    expect(callArgs.subject).toBe('[TEST] Critical Error');
   });
 
   it('should include context in HTML format', async () => {

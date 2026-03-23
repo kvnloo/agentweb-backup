@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { userDb } from './db';
+import { getTierConfig, DEFAULT_PAGES } from './subscriptionService';
 
 dotenv.config();
 
@@ -125,12 +126,15 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
 
   // Derive subscription tier from the price ID in the checkout session
   const subscriptionType = deriveSubscriptionType(session);
+  const tierConfig = await getTierConfig(subscriptionType);
 
   await userDb.updateUser(user.userId, {
     stripe_customer_id: stripeCustomerId,
     stripe_subscription_id: stripeSubscriptionId,
     subscriptionType,
     subscription_status: 'active',
+    allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+    allowedSkills: tierConfig?.allowedSkills ?? ['*'],
   });
 
   console.log(
@@ -175,19 +179,24 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
     return;
   }
 
+  const freeTierConfig = await getTierConfig('Free');
+
   await userDb.updateUser(user.userId, {
     subscription_status: 'canceled',
-    subscriptionType: null,
+    subscriptionType: 'Free',
+    allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+    allowedSkills: freeTierConfig?.allowedSkills ?? [],
   });
 
-  console.log(`Subscription deleted: user ${user.userId} → canceled`);
+  console.log(`Subscription deleted: user ${user.userId} → downgraded to Free tier`);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
  * Derive the subscription type from the checkout session's line items price ID.
- * Falls back to 'pro' if the price cannot be determined.
+ * Maps: Starter plan → "Basic", Pro/Complete plan → "Super Premium".
+ * Falls back to "Super Premium" if the price cannot be determined.
  */
 function deriveSubscriptionType(session: any): string {
   const priceId = session.line_items?.data?.[0]?.price?.id
@@ -195,14 +204,14 @@ function deriveSubscriptionType(session: any): string {
 
   if (priceId) {
     if (priceId === process.env.STRIPE_STARTER_PRICE_ID) {
-      return 'starter';
+      return 'Basic';
     }
     if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) {
-      return 'pro';
+      return 'Super Premium';
     }
   }
 
-  return 'pro';
+  return 'Super Premium';
 }
 
 /**

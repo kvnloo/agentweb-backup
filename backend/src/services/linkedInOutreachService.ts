@@ -2,6 +2,9 @@ import { UnipileClient } from 'unipile-node-sdk';
 import { getUnipileCredentials } from '../utils/secretsManager';
 import { userDb } from './db';
 
+// NOTE: Unipile actively maintains: Emails, WhatsApp, LinkedIn, Telegram, Instagram (as of March 2026).
+// Twitter/X support is suspended — see dev.md for details.
+
 export class LinkedInOutreachService {
   private client: UnipileClient | null = null;
   // Cached to avoid a Secrets Manager round-trip on every method call

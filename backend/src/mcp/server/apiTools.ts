@@ -10,6 +10,7 @@
 
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
+import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1179,7 +1180,7 @@ mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
-    description: 'Edit a specific file in a deployed landing page\'s GitHub repository. Use this when the user wants to change copy, styling, or functionality after deployment. Changes auto-deploy via Vercel within ~30 seconds.',
+    description: '[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1204,7 +1205,7 @@ mcpToolRegistry.register({
   name: 'list_landing_page_files',
   definition: {
     name: 'list_landing_page_files',
-    description: 'List all files in a deployed landing page\'s GitHub repository. Use this BEFORE edit_landing_page_file to see what files exist and find the right file to edit.',
+    description: 'List all files in a deployed landing page\'s GitHub repository. Use this to see what files exist. Note: for code edits, prefer using coding_agent which handles file listing internally.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1225,7 +1226,7 @@ mcpToolRegistry.register({
   name: 'read_landing_page_file',
   definition: {
     name: 'read_landing_page_file',
-    description: 'Read the contents of a specific file in a deployed landing page\'s GitHub repository. Use this to see the current code before making edits with edit_landing_page_file.',
+    description: 'Read the contents of a specific file in a deployed landing page\'s GitHub repository. Note: for code edits, prefer using coding_agent which handles file reading and editing internally.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1247,7 +1248,7 @@ mcpToolRegistry.register({
   name: 'get_deployment_status',
   definition: {
     name: 'get_deployment_status',
-    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. If the build failed, returns the error details so you can fix the code via edit_landing_page_file and the build will automatically retry.',
+    description: 'Check the Vercel build/deployment status of a landing page. Use this after deploy_landing_page to verify the build succeeded. Note: for code edits, prefer using coding_agent which checks deployment status automatically after edits.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1636,6 +1637,9 @@ mcpToolRegistry.register({
       sessionType: session.sessionType,
       messageCount: session.messages?.length || 0,
       satisfactionScore: session.satisfactionScore,
+      judgeScores: session.judgeScores || null,
+      totalTokens: session.totalTokens || null,
+      totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
     }));
 
     return jsonResult({
@@ -1643,6 +1647,114 @@ mcpToolRegistry.register({
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+    });
+  }
+});
+
+// ─── Client Health Assessment (admin-only) ──────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'list_all_clients',
+  definition: {
+    name: 'list_all_clients',
+    description: `List all client accounts (including admins) with quick health indicators. Admin-only tool.
+
+Returns for each client:
+- Name, email, roles
+- has_ads: whether they have a Meta ad account connected
+- has_lander: whether they have landing pages (productDomain or seoDomains)
+- has_crm: whether they have CRM integrations (email domain, LinkedIn)
+- last_activity: last login timestamp
+
+Use this for a quick overview of all clients before diving into individual health assessments with assess_client_health.`,
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: '/api/client-health',
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'assess_client_health',
+  definition: {
+    name: 'assess_client_health',
+    description: `Assess the health of a specific client account across three layers: ads, landing pages, and lead quality. Admin-only tool.
+
+Returns a structured health assessment with:
+- **Ads layer**: Meta ad account connectivity, active campaigns
+- **Lander layer**: Landing page / website presence (productDomain, seoDomains)
+- **Lead quality layer**: CRM / lead capture integrations (email domain, LinkedIn)
+- **Creative variety**: Distinct creatives, cannibalization warnings, fatigue indicators
+- **Overall status**: healthy / mediocre / at-risk / blocked with reasons
+
+Use this to quickly diagnose a client's marketing funnel completeness.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        client_name_or_email: {
+          type: 'string',
+          description: 'The client\'s email address or display name. Email lookup is tried first, then name matching.'
+        }
+      },
+      required: ['client_name_or_email']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/client-health/${encodeURIComponent(args.client_name_or_email)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+// ─── PR Digest (admin-only) ─────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'get_pr_digest',
+  definition: {
+    name: 'get_pr_digest',
+    description: 'Fetch merged pull requests from GitHub repositories (agentweb and agentweb-customer-portal) within a time range and return a formatted summary. Defaults to the past 24 hours. Admin-only. Use this to generate daily change digests to send to the team.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: {
+          type: 'string',
+          description: 'Start time in ISO 8601 format (e.g., "2026-03-19T00:00:00Z"). Defaults to 24 hours ago.'
+        },
+        until: {
+          type: 'string',
+          description: 'End time in ISO 8601 format (e.g., "2026-03-20T00:00:00Z"). Defaults to now.'
+        }
+      },
+      required: []
+    }
+  },
+  execute: async (_args: any) => {
+    const now = new Date();
+    const defaultSince = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const since = _args.since || defaultSince.toISOString();
+    const until = _args.until || now.toISOString();
+
+    const results = await fetchMergedPRs(since, until);
+    const totalPRs = results.reduce((sum, r) => sum + r.prs.length, 0);
+
+    return jsonResult({
+      totalPRs,
+      since,
+      until,
+      text: formatDigestText(results),
+      results,
     });
   }
 });

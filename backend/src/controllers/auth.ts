@@ -7,6 +7,7 @@ import { waitlistDb } from "../services/waitlistDb";
 import { v4 as uuidv4 } from "uuid";
 import { emailService } from "../services/emailService";
 import crypto from "crypto";
+import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -76,6 +77,14 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist // from waitlist
     );
+
+    // Set Free tier defaults for new registrations (subscription upgrades happen via Stripe checkout)
+    const freeTierConfig = await getTierConfig("Free");
+    await userDb.updateUser(userId, {
+      subscriptionType: "Free",
+      allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+      allowedSkills: freeTierConfig?.allowedSkills ?? [],
+    });
 
     // JWT includes roles array
     const token = jwt.sign(
@@ -228,6 +237,14 @@ export const googleCallback = async (
             null
           );
         }
+
+        // Set Free tier defaults for OAuth registrations
+        const freeTierConfig = await getTierConfig("Free");
+        await userDb.updateUser(user.userId, {
+          subscriptionType: "Free",
+          allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
+          allowedSkills: freeTierConfig?.allowedSkills ?? [],
+        });
       } else {
         // For other portals, look up waitlist for bonus data (no gate)
         const waitlistEntry = await waitlistDb.getByEmail(email);
@@ -241,7 +258,8 @@ export const googleCallback = async (
         const finalDisplayName =
           profile.displayName || waitlistEntry?.fullName || email.split("@")[0];
 
-        const roles: ("partner" | "customer" | "free")[] = ["free"];
+        const roles: ("partner" | "customer" | "free")[] =
+          portalOrigin === "customer" ? ["customer"] : ["free"];
 
         user = await userDb.createUser(
           email,
@@ -268,6 +286,14 @@ export const googleCallback = async (
             null
           );
         }
+
+        // Set Free tier defaults for OAuth registrations
+        const freeTierConfigOAuth = await getTierConfig("Free");
+        await userDb.updateUser(user.userId, {
+          subscriptionType: "Free",
+          allowedPages: freeTierConfigOAuth?.allowedPages ?? [...DEFAULT_PAGES],
+          allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
+        });
       }
     }
 

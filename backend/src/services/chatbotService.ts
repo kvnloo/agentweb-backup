@@ -6,7 +6,6 @@ import path from "path";
 import { getGuide } from "../controllers/guide";
 import { getReleases } from "../controllers/release";
 import { getApiDocs } from "../controllers/api";
-import { getUserGuide } from "../controllers/user-guide";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
 import { EngineServiceClient } from '@google-cloud/discoveryengine';
@@ -221,11 +220,25 @@ export interface ChatSession {
     evaluatedMessageIndex: number; // messageIndex up to which we evaluated
     adminOverride?: boolean;    // When true, auto-scoring skips this session
   };
+  judgeScores?: Record<string, {  // keyed by judge ID
+    score: number;
+    reason: string;
+    evaluatedAt: string;
+    evaluatedMessageIndex: number;
+    judgeName: string;
+  }>;
   gtmWorkItem?: {
     planId: string;
     phaseId: string;
     workItemId: string;
   };
+  // Incremental token usage and cost tracking for the session
+  totalTokens?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  totalCost?: number; // Total estimated cost in USD
 }
 
 // Interface for context chunks
@@ -619,6 +632,72 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Atomically increment totalTokens and totalCost on the session record.
+   * Extracts usage from messages that have a usage field.
+   */
+  async incrementTokenUsage(sessionId: string, messages: ChatMessage[]): Promise<void> {
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let totalTokens = 0;
+    let cost = 0;
+    for (const msg of messages) {
+      if (msg.usage) {
+        promptTokens += msg.usage.prompt_tokens || 0;
+        completionTokens += msg.usage.completion_tokens || 0;
+        totalTokens += msg.usage.total_tokens || 0;
+        cost += msg.usage.estimated_cost || 0;
+      }
+    }
+    if (totalTokens === 0) return;
+
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { sessionId },
+        UpdateExpression: `
+          ADD totalCost :cost,
+              #tt.prompt_tokens :pt,
+              #tt.completion_tokens :ct,
+              #tt.total_tokens :tot
+        `,
+        ExpressionAttributeNames: {
+          '#tt': 'totalTokens',
+        },
+        ExpressionAttributeValues: {
+          ':cost': cost,
+          ':pt': promptTokens,
+          ':ct': completionTokens,
+          ':tot': totalTokens,
+        },
+      }).promise();
+    } catch (error) {
+      // If totalTokens map doesn't exist yet, initialize it
+      if ((error as any).code === 'ValidationException') {
+        try {
+          await dynamodb.update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: 'SET totalTokens = :tokens, totalCost = if_not_exists(totalCost, :zero) + :cost',
+            ExpressionAttributeValues: {
+              ':tokens': {
+                prompt_tokens: promptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: totalTokens,
+              },
+              ':cost': cost,
+              ':zero': 0,
+            },
+          }).promise();
+        } catch (initError) {
+          console.error(`Error initializing token usage for session ${sessionId}:`, initError);
+        }
+      } else {
+        console.error(`Error incrementing token usage for session ${sessionId}:`, error);
+      }
+    }
+  }
+
   async addMessageToSession(
     sessionId: string,
     message: ChatMessage
@@ -645,6 +724,9 @@ export class ChatbotDB {
 
     // Atomically increment messageCount on the session record for asset cache tracking
     await this.incrementMessageCount(sessionId, 1);
+
+    // Incrementally update token usage on the session
+    await this.incrementTokenUsage(sessionId, [message]);
 
     // Return session with updated messages (no need to update session table)
     return {
@@ -684,6 +766,9 @@ export class ChatbotDB {
 
     // Atomically increment messageCount on the session record for asset cache tracking
     await this.incrementMessageCount(sessionId, messages.length);
+
+    // Incrementally update token usage on the session
+    await this.incrementTokenUsage(sessionId, messages);
 
     // Return session with updated messages (no need to update session table)
     return {
@@ -1402,20 +1487,36 @@ export class ChatbotDB {
     // Note: DynamoDB UserIdIndex doesn't support sorting by updatedAt, so we'll sort in memory
     params.ScanIndexForward = false; // Always get in consistent order
 
-    // Add lastEvaluatedKey if provided for pagination
-    if (lastEvaluatedKey) {
-      try {
-        params.ExclusiveStartKey = JSON.parse(lastEvaluatedKey);
-      } catch (error) {
-        console.error("Invalid lastEvaluatedKey format:", error);
-        throw new Error("Invalid pagination key");
-      }
-    }
-
     try {
-      const result = await dynamodb.query(params).promise();
-      let sessions = (result.Items as ChatSession[]) || [];
-      
+      // Paginate internally until we have enough filtered results.
+      // DynamoDB's Limit caps items *scanned*, not items *returned* after
+      // FilterExpression is applied, so a single query may return far fewer
+      // results than requested when many items are filtered out.
+      const collected: ChatSession[] = [];
+      let paginationKey: any = undefined;
+      if (lastEvaluatedKey) {
+        try {
+          paginationKey = JSON.parse(lastEvaluatedKey);
+        } catch (error) {
+          console.error("Invalid lastEvaluatedKey format:", error);
+          throw new Error("Invalid pagination key");
+        }
+      }
+
+      const targetCount = limit || 200; // sensible upper bound when no limit set
+
+      do {
+        if (paginationKey) {
+          params.ExclusiveStartKey = paginationKey;
+        }
+        const result = await dynamodb.query(params).promise();
+        const items = (result.Items as ChatSession[]) || [];
+        collected.push(...items);
+        paginationKey = result.LastEvaluatedKey;
+      } while (paginationKey && collected.length < targetCount);
+
+      let sessions = collected;
+
       console.log(
         `Found ${sessions.length} chat sessions for user: ${userId}`
       );
@@ -1477,7 +1578,7 @@ export class ChatbotDB {
 
       return {
         sessions: sessionsWithMessages,
-        lastEvaluatedKey: result.LastEvaluatedKey
+        lastEvaluatedKey: paginationKey
       };
     } catch (error) {
       console.error("Error getting user chat sessions:", error);
@@ -1865,6 +1966,48 @@ export class ChatbotDB {
       return result.Attributes as ChatSession;
     } catch (error) {
       console.error("Error updating session satisfaction score:", error);
+      throw error;
+    }
+  }
+
+  async updateSessionJudgeScore(
+    sessionId: string,
+    judgeId: string,
+    judgeScore: NonNullable<ChatSession["judgeScores"]>[string]
+  ): Promise<ChatSession> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "SET #js.#jid = :score",
+      ExpressionAttributeNames: {
+        "#js": "judgeScores",
+        "#jid": judgeId,
+      },
+      ExpressionAttributeValues: {
+        ":score": judgeScore,
+      },
+      ReturnValues: "ALL_NEW",
+    };
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error: any) {
+      // If judgeScores map doesn't exist yet, initialize it
+      if (error.code === "ValidationException") {
+        const initParams = {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "SET judgeScores = :scores",
+          ExpressionAttributeValues: {
+            ":scores": { [judgeId]: judgeScore },
+          },
+          ReturnValues: "ALL_NEW",
+        };
+        const result = await dynamodb.update(initParams).promise();
+        return result.Attributes as ChatSession;
+      }
+      console.error("Error updating session judge score:", error);
       throw error;
     }
   }
@@ -2671,7 +2814,6 @@ async function loadKnowledgeBase(): Promise<void> {
     { controller: getGuide, source: "guide" },
     { controller: getReleases, source: "release" },
     { controller: getApiDocs, source: "api" },
-    { controller: getUserGuide, source: "user-guide" },
     { controller: getUserReleaseNotes, source: "user-release" },
   ];
 
@@ -2715,22 +2857,6 @@ async function loadKnowledgeBase(): Promise<void> {
         let content = "";
 
         if (endpoint.source === "guide" || endpoint.source === "api") {
-          for (const section of mockResponse.data.data) {
-            content += `${section.title}\n`;
-            for (const paragraph of section.content) {
-              content += `${paragraph}\n`;
-            }
-            if (section.subsections) {
-              for (const subsection of section.subsections) {
-                content += `${subsection.title}\n`;
-                for (const paragraph of subsection.content) {
-                  content += `${paragraph}\n`;
-                }
-              }
-            }
-            content += "\n";
-          }
-        } else if (endpoint.source === "user-guide") {
           for (const section of mockResponse.data.data) {
             content += `${section.title}\n`;
             for (const paragraph of section.content) {
@@ -2895,7 +3021,7 @@ Use this to give SPECIFIC UI guidance. Example: "Click the 'Save Brand Colors' b
 
 Today's date is ${new Date().toISOString().split("T")[0]}.
 
-I will provide you with relevant information from the Customer Portal User Guide to help answer questions. Please use this information when responding to user queries.
+When users ask about how to use the portal, need help with features, or have questions about functionality, use the **search_user_guide** tool to look up the relevant information from the user guide. This fetches the latest content directly from the Notion-based user guide.
 
 When appropriate, you can suggest users explore specific features of the portal mentioned in the guide.
 
@@ -3366,10 +3492,9 @@ export async function generateChatResponse(
     if (portalType === "customer") {
       activeKnowledgeBase = knowledgeBase.filter(
         (chunk) =>
-          chunk.metadata.source === "user-guide" ||
           chunk.metadata.source === "user-release"
       );
-      // Combine user-guide and user-release chunks with page chunks
+      // Combine user-release chunks with page chunks
       combinedChunks = [...pageChunksResult, ...activeKnowledgeBase];
     } else {
       // Partner portal (or default)
@@ -3465,6 +3590,8 @@ export async function generateChatResponse(
           'read_page_source',
           'get_visual_context',
           'enrich_leads_preview', 'enrich_leads_execute',
+          'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
+          'search_user_guide',
         ];
 
         // Page-aware tool injection based on the current page URL
@@ -3488,7 +3615,7 @@ export async function generateChatResponse(
           'research-reports': ['perform_deep_research', 'search_web'],
           'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
           'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file'],
-          'seo':              ['get_seo_metrics', 'get_website_analytics'],
+          'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],
           'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article'],
           'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
         };

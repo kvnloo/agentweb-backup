@@ -205,4 +205,80 @@ describe('runVerifiedChat model selection', () => {
     expect(mockAgentModeService.getVideoGenerationDefaultModel).toHaveBeenCalled();
     expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenCalledWith('session-1', 'video-gen-model');
   });
+
+  it('does not override model when llmModel is explicitly provided (generate_image)', async () => {
+    mockWorkerService.runInWorker.mockResolvedValueOnce({
+      content: 'Done',
+      toolCalls: [{ name: 'generate_image', result: { success: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+
+    await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Generate an image.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'generate_image', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+      llmModel: 'anthropic.claude-sonnet-4-6',
+    });
+
+    expect(mockAgentModeService.getImageGenerationDefaultModel).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ llmModel: 'anthropic.claude-sonnet-4-6' }),
+      expect.any(Function)
+    );
+  });
+
+  it('does not override model when llmModel is explicitly provided (update_html_file)', async () => {
+    await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Please revise this report.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'update_html_file', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+      llmModel: 'anthropic.claude-sonnet-4-6',
+    });
+
+    expect(mockAgentModeService.getReportGenerationDefaultModel).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ llmModel: 'anthropic.claude-sonnet-4-6' }),
+      expect.any(Function)
+    );
+  });
+
+  it('does not override model when llmModel is explicitly provided (generate_video)', async () => {
+    mockWorkerService.runInWorker.mockResolvedValueOnce({
+      content: 'Done',
+      toolCalls: [{ name: 'generate_video', result: { success: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+
+    await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Generate a video.',
+      keywords: [],
+      requiredFunctions: [{ functionName: 'generate_video', minCount: 1 }],
+      maxAttempts: 1,
+      attachments: [],
+      llmModel: 'anthropic.claude-sonnet-4-6',
+    });
+
+    expect(mockAgentModeService.getVideoGenerationDefaultModel).not.toHaveBeenCalled();
+    expect(mockChatbotDb.updateSessionLlmModel).not.toHaveBeenCalled();
+    expect(mockWorkerService.runInWorker).toHaveBeenCalledWith(
+      expect.objectContaining({ llmModel: 'anthropic.claude-sonnet-4-6' }),
+      expect.any(Function)
+    );
+  });
 });

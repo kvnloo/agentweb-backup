@@ -36,10 +36,12 @@ import linkedinAuthRoutes from "./routes/linkedinAuth";
 import gmailAuthRoutes from "./routes/gmailAuth";
 import metaAuthRoutes from "./routes/metaAuth";
 import clickupAuthRoutes from "./routes/clickupAuth";
+import foreplayAuthRoutes from "./routes/foreplayAuth";
 import connectedAccountsRoutes from "./routes/connectedAccounts";
 import linkedInOutreachAuthRoutes from "./routes/linkedInOutreachAuth";
 import youtubeAuthRoutes from "./routes/youtubeAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
+import fathomWebhookRoutes from "./routes/fathomWebhook";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
 import supportRoutes from "./routes/support";
@@ -66,6 +68,7 @@ import {
   getPresignedFileUrl,
   batchPresignUrls,
 } from "./controllers/filesController";
+import { serveAsset, getAssetStats } from "./controllers/assetController";
 
 const app = express();
 
@@ -198,6 +201,7 @@ app.use("/api/agent-mode", agentModeRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
+app.use("/api/webhooks/fathom", fathomWebhookRoutes);
 app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
@@ -214,9 +218,8 @@ app.use("/api/oauth/meta", metaAuthRoutes);
 app.use("/api/oauth/instagram", metaAuthRoutes);
 app.use("/api/oauth/youtube", youtubeAuthRoutes);
 app.use("/api/oauth/fathom", fathomAuthRoutes);
-// Fathom's registered redirect URI uses /api/oauth/callback/fathom
-app.use("/api/oauth/callback/fathom", fathomAuthRoutes);
 app.use("/api/oauth/clickup", clickupAuthRoutes);
+app.use("/api/oauth/foreplay", foreplayAuthRoutes);
 app.use("/api/oauth", connectedAccountsRoutes);
 app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
@@ -228,6 +231,8 @@ app.use("/api/emma", emmaApiRoutes);
 app.use("/api/memory", memoryRoutes);
 app.use("/api", socialPostsRoutes);
 app.use("/r", resultEndpointsRoutes);
+app.get("/asset/:assetHash/stats", getAssetStats);
+app.get("/asset/:assetHash", serveAsset);
 app.use("/review", reviewRouter);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 

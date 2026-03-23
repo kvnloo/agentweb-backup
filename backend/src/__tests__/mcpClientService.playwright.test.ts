@@ -1,11 +1,13 @@
 /**
  * Unit tests for Playwright MCP auto-configuration in mcpClientService.
- * Verifies that --headless and --no-sandbox flags are automatically injected
- * for Playwright MCP servers in createStdioTransport.
+ * Verifies that --headless, --no-sandbox, and --config flags are automatically
+ * injected for Playwright MCP servers in createStdioTransport.
  */
 
 // Set env before any imports
 process.env.JWT_SECRET = 'test-jwt-secret-for-testing';
+
+import * as fs from 'fs';
 
 // Capture StdioClientTransport constructor calls
 const mockStdioConstructor = jest.fn().mockImplementation(() => ({
@@ -75,7 +77,7 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     service = new McpClientService();
   });
 
-  it('should inject --headless and --no-sandbox for Playwright MCP server', async () => {
+  it('should inject --headless, --no-sandbox, and --config for Playwright MCP server', async () => {
     (internalMcpServers as any)['playwright'] = {
       transport: 'stdio',
       command: 'npx',
@@ -91,6 +93,13 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     expect(callArgs.args).toContain('@playwright/mcp@latest');
     expect(callArgs.args).toContain('--headless');
     expect(callArgs.args).toContain('--no-sandbox');
+    // Anti-headless detection args via config file
+    expect(callArgs.args).toContain('--config');
+    const configIdx = callArgs.args.indexOf('--config');
+    const configPath = callArgs.args[configIdx + 1];
+    expect(configPath).toMatch(/\/tmp\/playwright-mcp-configs\//);
+    const configContent = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(configContent.browser.launchOptions.args).toContain('--disable-blink-features=AutomationControlled');
   });
 
   it('should NOT inject flags for non-Playwright MCP servers', async () => {
@@ -125,5 +134,24 @@ describe('McpClientService - Playwright MCP auto-configuration', () => {
     const noSandboxCount = callArgs.args.filter((a: string) => a === '--no-sandbox').length;
     expect(headlessCount).toBe(1);
     expect(noSandboxCount).toBe(1);
+  });
+
+  it('should NOT inject --config if already provided', async () => {
+    (internalMcpServers as any)['playwright'] = {
+      transport: 'stdio',
+      command: 'npx',
+      args: ['@playwright/mcp@latest', '--config', '/custom/config.json'],
+      isInternal: false,
+    };
+
+    await service.initialize();
+
+    expect(mockStdioConstructor).toHaveBeenCalledTimes(1);
+    const callArgs = mockStdioConstructor.mock.calls[0][0];
+    const configCount = callArgs.args.filter((a: string) => a === '--config').length;
+    expect(configCount).toBe(1);
+    // Should keep the custom config path, not override
+    const configIdx = callArgs.args.indexOf('--config');
+    expect(callArgs.args[configIdx + 1]).toBe('/custom/config.json');
   });
 });

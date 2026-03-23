@@ -7,6 +7,7 @@ import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
 import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotService';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc } from './clickupService';
+import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb } from './db';
 import { settingsService } from './settingsService';
 import { getSecret, getGCSPPrivateKey } from '../utils/secretsManager';
@@ -22,7 +23,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
-const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history'];
+const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -114,8 +115,67 @@ export class AgentModeService {
       console.log('AgentMode: Skipping MCP initialization in server mode');
     }
 
+    // Ensure built-in skills exist in the database
+    await this.ensureBuiltInSkills();
+
     // Start periodic file cache cleanup
     this.startFileCacheCleanup();
+  }
+
+  /**
+   * Built-in skill definitions that are auto-created if missing.
+   * Each entry is keyed by a stable identifier used to find existing skills by name.
+   */
+  public static readonly BUILT_IN_SKILLS: ReadonlyArray<{
+    name: string;
+    description: string;
+    toolNames: string[];
+    category?: string;
+  }> = [
+    {
+      name: 'Meeting Intelligence',
+      description:
+        'Access meeting recordings, transcripts, and action items from Fathom. ' +
+        'Requires a connected Fathom account (Settings → Connected Accounts).',
+      toolNames: ['fathom_get_meetings', 'fathom_get_transcript'],
+      category: 'tool_bundle',
+    },
+  ];
+
+  /**
+   * Ensure all built-in skills exist in the database.
+   * Idempotent — skips skills that already exist (matched by name).
+   */
+  public async ensureBuiltInSkills(): Promise<void> {
+    try {
+      const existingSkills = await skillService.getAllSkills();
+      const existingNames = new Set(existingSkills.map(s => s.name));
+
+      for (const builtin of AgentModeService.BUILT_IN_SKILLS) {
+        if (existingNames.has(builtin.name)) {
+          continue;
+        }
+
+        const skill = await skillService.createSkill(
+          builtin.name,
+          builtin.description,
+          builtin.toolNames,
+          undefined, // systemPrompt
+          true       // isPublished — available immediately
+        );
+
+        // Mark as built-in if supported
+        if (skill) {
+          skill.isBuiltIn = true;
+          skill.category = builtin.category as any;
+          await skillService.updateSkill(skill);
+          console.log(`AgentMode: Created built-in skill "${builtin.name}" (${skill.skillId})`);
+        }
+      }
+    } catch (error) {
+      console.error('AgentMode: Error ensuring built-in skills:', error);
+      // Non-fatal — the foundation tools fallback still grants access
+    }
   }
 
   public async shutdown() {
@@ -187,6 +247,16 @@ export class AgentModeService {
   public async initializeMcp() {
     if ((AgentModeService as any).mcpInitialized) {
       console.log('[MCP-DEBUG] MCP already initialized, skipping');
+      // Still register MCP tools in this instance's toolRegistry
+      // (the MCP client was initialized by a prior instance)
+      if ((AgentModeService as any).sharedMcpClientService) {
+        const mcpTools = (AgentModeService as any).sharedMcpClientService.getTools();
+        for (const tool of mcpTools) {
+          if (!this.toolRegistry.getTool(tool.name)) {
+            this.toolRegistry.register(tool);
+          }
+        }
+      }
       return;
     }
     (AgentModeService as any).mcpInitialized = true;
@@ -194,6 +264,7 @@ export class AgentModeService {
     try {
       console.log('[MCP-DEBUG] Initializing MCP client service...');
       await this.mcpClientService.initialize();
+      (AgentModeService as any).sharedMcpClientService = this.mcpClientService;
       const mcpTools = this.mcpClientService.getTools();
       for (const tool of mcpTools) {
         this.toolRegistry.register(tool);
@@ -238,6 +309,9 @@ export class AgentModeService {
         // Dynamic import to avoid circular dependencies
         await import('../emma/registry');
         await import('../emma/tools');
+        await import('../emma/fathomTools');
+        await import('../emma/meetingActionRouter');
+        await import('../emma/notionGuideTools');
 
         AgentModeService.toolsRegistered = true;
       } catch (error) {
@@ -576,9 +650,10 @@ export class AgentModeService {
             const nativeStopReason: string = response.response_metadata?.stopReason || '';
 
             // Extract usage information
+            // response_metadata.usage uses camelCase (inputTokens), usage_metadata uses snake_case (input_tokens)
             const usage = response.response_metadata?.usage || response.usage_metadata || {};
-            const inputTokens = usage.input_tokens || usage.prompt_tokens || 0;
-            const outputTokens = usage.output_tokens || usage.completion_tokens || 0;
+            const inputTokens = usage.inputTokens || usage.input_tokens || usage.prompt_tokens || 0;
+            const outputTokens = usage.outputTokens || usage.output_tokens || usage.completion_tokens || 0;
 
             // Extract text content - handle both string and array formats (Anthropic returns array)
             let messageContent: string = '';
@@ -768,6 +843,27 @@ export class AgentModeService {
 
     // Unreachable, but TypeScript needs it
     throw new Error('callLLM: unexpected code path');
+  }
+
+  /**
+   * Estimate cost in USD for an LLM call based on model pricing.
+   * Prices are per 1M tokens (input/output).
+   */
+  private estimateCost(model: string, inputTokens: number, outputTokens: number): number {
+    // Pricing per 1M tokens: [input, output]
+    const pricing: Record<string, [number, number]> = {
+      'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
+      'anthropic.claude-sonnet-4-6': [3, 15],
+      'anthropic.claude-opus-4-6-v1': [15, 75],
+      'gpt-5-chat-2': [2.5, 10],
+      'gpt-5.2-chat': [3, 12],
+      'gemini-3-pro-preview': [1.25, 10],
+      'gemini-3-flash-preview': [0.15, 0.6],
+      'gemini-3.1-pro-preview': [1.25, 10],
+      'gemini-3.1-flash-lite-preview': [0.075, 0.3],
+    };
+    const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
+    return (inputTokens * inputPrice + outputTokens * outputPrice) / 1_000_000;
   }
 
   // Generate AI response for marketing conversation
@@ -1064,6 +1160,17 @@ export class AgentModeService {
 
         // Add LLM model to the response message
         responseMessage.llm = llmModel;
+
+        // Attach token usage from the LLM response to the message
+        const responseUsage = response.usage;
+        if (responseUsage) {
+          responseMessage.usage = {
+            prompt_tokens: responseUsage.prompt_tokens || 0,
+            completion_tokens: responseUsage.completion_tokens || 0,
+            total_tokens: responseUsage.total_tokens || 0,
+            estimated_cost: this.estimateCost(llmModel, responseUsage.prompt_tokens || 0, responseUsage.completion_tokens || 0),
+          };
+        }
 
         // Append the model's message to conversation before handling tool calls
         (messages as any[]).push(responseMessage);
@@ -1547,7 +1654,8 @@ export class AgentModeService {
 - **Integration**: Incorporate search results into your analysis and recommendations to provide data-driven insights
 - **Search result presentation**: Always provide a tailored summary of search results that directly answers the user's question
 - **Synthesize findings**: Analyze and synthesize search results to provide actionable insights relevant to the user's specific needs
-- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, and ClickUp tasks (with attachments). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Knowledge Base Search**: Use 'search_knowledge_base' to find information stored in the knowledge base. The knowledge base contains private knowledge (user-specific), public knowledge (shared by all users and the platform), Google Drive shared folders, ClickUp docs, ClickUp tasks (with attachments), and Foreplay ad library (saved ads and boards). This is complementary to web search - use knowledge base for stored information and web search for information from the internet
+- **Foreplay Ad Library**: When creating new ads or looking for ad inspiration, search the knowledge base for Foreplay ads. Foreplay boards and swipefile ads appear as knowledge base entries with identifiers like "foreplay-board:BOARD_ID" and "foreplay-swipefile". Read individual ads to get full ad copy, headlines, CTAs, formats, and video transcriptions that can serve as seed ads.
 - **Write to ClickUp**: To create ClickUp docs, first install the "Knowledge Base" skill using install_skills (it contains write_clickup_doc). Then use list_knowledge_base_files to get the workspace ID (from ClickUp entries like "clickup:WORKSPACE_ID"), and call write_clickup_doc with the workspace_id, name, and content.
 - **When to use knowledge base**: Search the knowledge base when you need stored information that may have been added manually by users or captured from past work
 - **Knowledge base vs web search**: Use knowledge base search for stored information (private or public), and web search for information from the internet
@@ -2034,7 +2142,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'manage_scheduled_chat',
     'test_scheduled_chat',
     'get_scheduled_chat_test_history',
-    'submit_scheduled_chat_variables'
+    'submit_scheduled_chat_variables',
+
+    // Meeting Intelligence (Fathom)
+    'fathom_get_meetings',
+    'fathom_get_transcript',
+
+    // Coding Agent (sub-agent for code editing tasks)
+    'coding_agent'
   ];
 
   // Mutable runtime set — loaded from DB on init, falls back to DEFAULT_FOUNDATION_TOOLS.
@@ -7929,8 +8044,11 @@ Format the response as JSON with this structure:
         } else {
           kbFiles.push(fileEntry);
         }
+        // Calculate total size from all files
+        const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
         await taskDb.updateTask(taskId, {
           knowledgeBaseFiles: kbFiles,
+          knowledgeBaseSize: totalSize,
           knowledgeBaseUpdatedAt: now
         });
       }
@@ -8066,9 +8184,11 @@ Format the response as JSON with this structure:
         uploadedFiles.push({ name: f.name, size, url });
       }
 
-      // 5. Update DynamoDB
+      // 5. Calculate total size and update DynamoDB
+      const totalSize = kbFiles.reduce((sum: number, f: any) => sum + (f.size || 0), 0);
       await taskDb.updateTask(taskId, {
         knowledgeBaseFiles: kbFiles,
+        knowledgeBaseSize: totalSize,
         knowledgeBaseUpdatedAt: new Date().toISOString()
       });
 
@@ -9519,9 +9639,26 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Keys that indicate a destination/creative content change rather than an ad-level change.
+   * When these are present in params, we need to create a new creative and swap it.
+   */
+  private static CREATIVE_CONTENT_KEYS = ['link_url', 'destination', 'url', 'body', 'title', 'image_hash', 'image_url', 'video_id', 'call_to_action_type'];
+
   public async updateMetaAdsAd(userId: string, adId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      // Detect if params contain creative content keys that require a creative swap
+      const creativeKeys = Object.keys(params).filter(k =>
+        AgentModeService.CREATIVE_CONTENT_KEYS.includes(k)
+      );
+
+      if (creativeKeys.length > 0) {
+        return await this.updateAdViaCreativeSwap(accessToken, accountId, adId, params, creativeKeys);
+      }
+
+      // Standard ad-level update (status, name, etc.)
       await metaService.updateAd(accessToken, adId, params);
       return {
         success: true,
@@ -9531,10 +9668,150 @@ Format the response as JSON with this structure:
       console.error('AgentMode: Error updating Meta ad:', error);
       return {
         success: false,
-        message: error.message || 'Failed to update Meta ad.',
+        message: this.enrichMetaError(error, 'update Meta ad'),
         error: error.message
       };
     }
+  }
+
+  /**
+   * Updates an ad's creative content (destination URL, copy, images, etc.) by:
+   * 1. Fetching the ad to get its current creative_id
+   * 2. Fetching the creative to get its object_story_spec
+   * 3. Creating a new creative with the updated fields
+   * 4. Updating the ad to reference the new creative
+   */
+  private async updateAdViaCreativeSwap(
+    accessToken: string,
+    accountId: string,
+    adId: string,
+    params: any,
+    creativeKeys: string[]
+  ): Promise<any> {
+    console.log(`AgentMode: Detected creative content update for ad ${adId}. Keys: ${creativeKeys.join(', ')}. Using creative swap approach.`);
+
+    // Step 1: Fetch the ad to get its creative_id
+    const adData = await metaService.getAd(accessToken, adId);
+    const oldCreativeId = adData?.creative?.creative_id || adData?.creative?.id;
+    if (!oldCreativeId) {
+      return {
+        success: false,
+        message: 'Could not determine the current creative for this ad. The ad may not have a creative assigned.',
+        error: 'MISSING_CREATIVE'
+      };
+    }
+    console.log(`AgentMode: Ad ${adId} currently uses creative ${oldCreativeId}`);
+
+    // Step 2: Fetch the creative's full details
+    const creativeData = await metaService.getAdCreative(accessToken, oldCreativeId);
+    if (!creativeData?.object_story_spec) {
+      return {
+        success: false,
+        message: 'Could not read the current creative details. The creative may have been deleted or is in an unsupported format.',
+        error: 'MISSING_OBJECT_STORY_SPEC'
+      };
+    }
+
+    // Step 3: Build new creative params from existing creative + updated fields
+    const existingSpec = creativeData.object_story_spec;
+    const pageId = existingSpec.page_id;
+
+    // Normalize destination param names → link_url
+    const newLinkUrl = params.link_url || params.destination || params.url;
+
+    // Determine current creative type and extract existing fields
+    let newCreativeParams: any;
+
+    if (existingSpec.video_data) {
+      // Video creative
+      const vd = existingSpec.video_data;
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (updated)`,
+        page_id: pageId,
+        video_id: params.video_id || vd.video_id,
+        image_hash: params.image_hash || vd.image_hash,
+        image_url: params.image_url || vd.image_url,
+        body: params.body || vd.message || creativeData.body || '',
+        title: params.title || vd.title || creativeData.title || '',
+        link_url: newLinkUrl || vd.call_to_action?.value?.link || '',
+        call_to_action_type: params.call_to_action_type || vd.call_to_action?.type,
+      };
+    } else if (existingSpec.link_data?.child_attachments) {
+      // Carousel creative – update the main link and optionally per-card links
+      const ld = existingSpec.link_data;
+      const updatedCards = ld.child_attachments.map((card: any) => ({
+        image_hash: card.image_hash,
+        image_url: card.picture || card.image_url,
+        video_id: card.video_id,
+        title: card.name || card.title,
+        description: card.description,
+        link_url: newLinkUrl || card.link,
+      }));
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (updated)`,
+        page_id: pageId,
+        body: params.body || ld.message || creativeData.body || '',
+        title: params.title || '',
+        link_url: newLinkUrl || ld.link || '',
+        carousel_cards: updatedCards,
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+      };
+    } else if (existingSpec.link_data) {
+      // Single image creative
+      const ld = existingSpec.link_data;
+      newCreativeParams = {
+        name: params.name || `${creativeData.name || 'Creative'} (updated)`,
+        page_id: pageId,
+        image_hash: params.image_hash || ld.image_hash,
+        image_url: params.image_url || ld.picture || ld.image_url,
+        body: params.body || ld.message || creativeData.body || '',
+        title: params.title || ld.name || creativeData.title || '',
+        link_url: newLinkUrl || ld.link || '',
+        call_to_action_type: params.call_to_action_type || ld.call_to_action?.type,
+      };
+    } else {
+      return {
+        success: false,
+        message: 'Unsupported creative type. Cannot determine the creative structure from object_story_spec.',
+        error: 'UNSUPPORTED_CREATIVE_TYPE'
+      };
+    }
+
+    console.log(`AgentMode: Creating new creative with updated fields for ad ${adId}:`, newCreativeParams);
+
+    // Create the new creative
+    const newCreative = await metaService.createAdCreative(accountId, accessToken, newCreativeParams);
+    const newCreativeId = newCreative?.id;
+    if (!newCreativeId) {
+      return {
+        success: false,
+        message: 'Failed to create updated creative. The Meta API did not return a creative ID.',
+        error: 'CREATIVE_CREATE_FAILED'
+      };
+    }
+
+    console.log(`AgentMode: New creative ${newCreativeId} created. Updating ad ${adId} to use it.`);
+
+    // Step 4: Update the ad to use the new creative
+    await metaService.updateAd(accessToken, adId, { creative: { creative_id: newCreativeId } });
+
+    // Also apply any ad-level params (status, name) that were provided alongside creative content
+    const adLevelParams: any = {};
+    for (const key of Object.keys(params)) {
+      if (!AgentModeService.CREATIVE_CONTENT_KEYS.includes(key) && key !== 'name') {
+        adLevelParams[key] = params[key];
+      }
+    }
+    if (Object.keys(adLevelParams).length > 0) {
+      await metaService.updateAd(accessToken, adId, adLevelParams);
+    }
+
+    return {
+      success: true,
+      message: `Ad updated successfully. Created new creative (${newCreativeId}) with updated ${creativeKeys.join(', ')} and swapped it in for the old creative (${oldCreativeId}).`,
+      old_creative_id: oldCreativeId,
+      new_creative_id: newCreativeId,
+    };
   }
 
   public async deleteMetaAdsAd(userId: string, adId: string, account_id?: string): Promise<any> {
@@ -11270,6 +11547,72 @@ Format the response as JSON with this structure:
         }
       }
 
+      // Search Foreplay ads (swipefile + boards — name/description/headline match)
+      if (userId) {
+        try {
+          const foreplayToken = await getForeplayAccessToken(userId);
+          if (foreplayToken) {
+            const queryLower = query.toLowerCase();
+            let foreplayResultCount = 0;
+
+            // Search swipefile ads
+            try {
+              const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+              for (const ad of swipeResult.ads) {
+                if (foreplayResultCount >= limitedMaxResults) break;
+                const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+                const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+                const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+                const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+                if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                  const content = formatForeplayAdAsMarkdown(ad);
+                  results.push({
+                    content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                    source: `foreplay-swipefile/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                  });
+                  foreplayResultCount++;
+                }
+              }
+            } catch (swipeErr) {
+              console.log('AgentMode: Error searching Foreplay swipefile:', swipeErr);
+            }
+
+            // Search board ads
+            try {
+              const boards = await listForeplayBoards(foreplayToken);
+              for (const board of boards) {
+                if (foreplayResultCount >= limitedMaxResults) break;
+                try {
+                  const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+                  for (const ad of boardAds) {
+                    if (foreplayResultCount >= limitedMaxResults) break;
+                    const nameMatch = (ad.name || '').toLowerCase().includes(queryLower);
+                    const descMatch = (ad.description || '').toLowerCase().includes(queryLower);
+                    const headlineMatch = (ad.headline || '').toLowerCase().includes(queryLower);
+                    const brandMatch = (ad.brandName || '').toLowerCase().includes(queryLower);
+                    if (nameMatch || descMatch || headlineMatch || brandMatch) {
+                      const content = formatForeplayAdAsMarkdown(ad);
+                      results.push({
+                        content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
+                        source: `foreplay-board/${board.name}/${ad.brandName || 'Unknown'}/${ad.name || ad.headline || ad.id}`
+                      });
+                      foreplayResultCount++;
+                    }
+                  }
+                } catch (boardErr) {
+                  console.log(`AgentMode: Error searching Foreplay board ${board.name}:`, boardErr);
+                }
+              }
+            } catch (boardsErr) {
+              console.log('AgentMode: Error listing Foreplay boards for search:', boardsErr);
+            }
+          }
+        } catch (foreplayError) {
+          console.log('AgentMode: Error searching Foreplay ads:', foreplayError);
+          // Don't fail the whole search if Foreplay search fails
+        }
+      }
+
       if (results.length === 0) {
         return {
           success: true,
@@ -11461,6 +11804,72 @@ Format the response as JSON with this structure:
         console.error('AgentMode: Error listing ClickUp tasks:', clickUpError);
       }
 
+      // Include Foreplay boards and swipefile
+      try {
+        const foreplayToken = await getForeplayAccessToken(userId);
+        if (foreplayToken) {
+          // Add swipefile
+          try {
+            const swipeResult = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+            if (swipeResult.ads.length > 0) {
+              const swipeFiles = swipeResult.ads.map(ad => ({
+                fileName: ad.name || ad.headline || ad.id,
+                fileSize: 0,
+                adId: ad.id,
+                brandName: ad.brandName,
+                displayFormat: ad.displayFormat,
+                publisherPlatform: ad.publisherPlatform,
+                live: ad.live,
+                savedAt: ad.savedAt,
+              }));
+
+              knowledgeBases.push({
+                identifier: 'foreplay-swipefile',
+                name: 'Foreplay - Swipe File',
+                type: 'foreplay-swipefile',
+                updatedAt: undefined,
+                files: swipeFiles,
+              });
+            }
+          } catch (swipeErr) {
+            console.log('AgentMode: Error listing Foreplay swipefile:', swipeErr);
+          }
+
+          // Add boards
+          try {
+            const boards = await listForeplayBoards(foreplayToken);
+            for (const board of boards) {
+              try {
+                const boardAds = await getAllForeplayBoardAds(foreplayToken, board.id);
+                const boardFiles = boardAds.map(ad => ({
+                  fileName: ad.name || ad.headline || ad.id,
+                  fileSize: 0,
+                  adId: ad.id,
+                  brandName: ad.brandName,
+                  displayFormat: ad.displayFormat,
+                  publisherPlatform: ad.publisherPlatform,
+                  live: ad.live,
+                }));
+
+                knowledgeBases.push({
+                  identifier: `foreplay-board:${board.id}`,
+                  name: `Foreplay Board - ${board.name}`,
+                  type: 'foreplay-board',
+                  updatedAt: undefined,
+                  files: boardFiles,
+                });
+              } catch (boardErr) {
+                console.log(`AgentMode: Error listing Foreplay board ${board.name}:`, boardErr);
+              }
+            }
+          } catch (boardsErr) {
+            console.log('AgentMode: Error listing Foreplay boards:', boardsErr);
+          }
+        }
+      } catch (foreplayError) {
+        console.error('AgentMode: Error listing Foreplay ads:', foreplayError);
+      }
+
       const totalFiles = knowledgeBases.reduce(
         (sum: number, kb: any) => sum + (kb.files?.length || 0),
         0
@@ -11478,7 +11887,7 @@ Format the response as JSON with this structure:
 
       return {
         success: true,
-        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them.`,
+        message: `Found ${knowledgeBases.length} knowledge base(s) with ${totalFiles} file(s). For Google Drive files, use kb_identifier starting with "gdrive:" and the file name to read them. For ClickUp docs, use kb_identifier starting with "clickup:" and the doc name to read them. For ClickUp tasks, use kb_identifier starting with "clickup-tasks:" and the task name to read them. For Foreplay ads, use kb_identifier "foreplay-swipefile" or "foreplay-board:BOARD_ID" and the ad name to read them.`,
         knowledge_bases: knowledgeBases,
         totalKnowledgeBases: knowledgeBases.length,
         totalFiles
@@ -11623,6 +12032,11 @@ Format the response as JSON with this structure:
     // Handle ClickUp docs (identifier starts with "clickup:")
     if (kbIdentifier.startsWith('clickup:')) {
       return await this.readClickUpSharedDoc(kbIdentifier, fileName, userId);
+    }
+
+    // Handle Foreplay ads (identifier starts with "foreplay-board:" or "foreplay-swipefile")
+    if (kbIdentifier.startsWith('foreplay-board:') || kbIdentifier === 'foreplay-swipefile') {
+      return await this.readForeplayAd(kbIdentifier, fileName, userId);
     }
 
     // Get the task
@@ -11907,6 +12321,63 @@ Format the response as JSON with this structure:
       return {
         success: false,
         message: `Failed to create ClickUp document "${name}": ${error instanceof Error ? error.message : 'Unknown error'}`
+      };
+    }
+  }
+
+  // Helper: read a Foreplay ad from swipefile or a board
+  private async readForeplayAd(kbIdentifier: string, fileName: string, userId: string): Promise<any> {
+    try {
+      const foreplayToken = await getForeplayAccessToken(userId);
+      if (!foreplayToken) {
+        return { success: false, message: 'Foreplay not connected' };
+      }
+
+      let ads: ForeplayAd[] = [];
+      let sourceName = '';
+
+      if (kbIdentifier === 'foreplay-swipefile') {
+        const result = await getForeplaySwipefileAds(foreplayToken, { limit: 250 });
+        ads = result.ads;
+        sourceName = 'Swipe File';
+      } else if (kbIdentifier.startsWith('foreplay-board:')) {
+        const boardId = kbIdentifier.replace('foreplay-board:', '');
+        ads = await getAllForeplayBoardAds(foreplayToken, boardId);
+        sourceName = `Board ${boardId}`;
+      }
+
+      // Find the ad by name, headline, or ID
+      const ad = ads.find(a =>
+        (a.name && a.name === fileName) ||
+        (a.headline && a.headline === fileName) ||
+        a.id === fileName
+      );
+
+      if (!ad) {
+        return { success: false, message: `Ad "${fileName}" not found in Foreplay ${sourceName}` };
+      }
+
+      const content = formatForeplayAdAsMarkdown(ad);
+      const maxContentLength = 50000;
+      const truncated = content.length > maxContentLength
+        ? content.substring(0, maxContentLength) + '\n\n[Content truncated due to size limit]'
+        : content;
+
+      return {
+        success: true,
+        message: `Successfully read Foreplay ad "${fileName}"`,
+        kb_identifier: kbIdentifier,
+        file_name: fileName,
+        name: ad.brandName || 'Unknown Brand',
+        content: truncated,
+        size: content.length,
+        type: kbIdentifier === 'foreplay-swipefile' ? 'foreplay-swipefile' : 'foreplay-board',
+      };
+    } catch (error) {
+      console.error('AgentMode: Error reading Foreplay ad:', error);
+      return {
+        success: false,
+        message: `Failed to read Foreplay ad "${fileName}": ${error instanceof Error ? error.message : 'Unknown error'}`
       };
     }
   }

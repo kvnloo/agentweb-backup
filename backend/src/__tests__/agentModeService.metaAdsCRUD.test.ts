@@ -17,6 +17,8 @@ jest.mock('../services/metaService', () => ({
     createAdCreative: jest.fn(),
     listAds: jest.fn(),
     createAd: jest.fn(),
+    getAd: jest.fn(),
+    getAdCreative: jest.fn(),
     updateAd: jest.fn(),
     deleteAd: jest.fn()
   }
@@ -255,8 +257,8 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
     });
 
     describe('updateMetaAdsAd', () => {
-      it('should successfully update an ad', async () => {
-        const params = { name: 'Updated Ad Name', status: 'ACTIVE' };
+      it('should do a standard update for ad-level params (status, name)', async () => {
+        const params = { status: 'ACTIVE' };
 
         (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
         (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
@@ -265,6 +267,193 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Ad updated successfully');
+        expect(metaService.updateAd).toHaveBeenCalledWith('mock-access-token', 'ad_123', params);
+        // Should NOT call getAd or getAdCreative for ad-level updates
+        expect(metaService.getAd).not.toHaveBeenCalled();
+        expect(metaService.getAdCreative).not.toHaveBeenCalled();
+      });
+
+      it('should use creative swap when link_url is in params', async () => {
+        const params = { link_url: 'https://new-landing-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_creative_123' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          body: 'Check this out!',
+          title: 'Great Product',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: {
+              message: 'Check this out!',
+              link: 'https://old-page.com',
+              name: 'Great Product',
+              image_hash: 'abc123',
+              call_to_action: { type: 'LEARN_MORE', value: { link: 'https://old-page.com' } }
+            }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_456' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(result.old_creative_id).toBe('old_creative_123');
+        expect(result.new_creative_id).toBe('new_creative_456');
+        // Should create a new creative with updated link_url
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            page_id: 'page_123',
+            link_url: 'https://new-landing-page.com',
+            body: 'Check this out!',
+            image_hash: 'abc123'
+          })
+        );
+        // Should update ad with new creative_id
+        expect(metaService.updateAd).toHaveBeenCalledWith(
+          'mock-access-token',
+          'ad_123',
+          { creative: { creative_id: 'new_creative_456' } }
+        );
+      });
+
+      it('should use creative swap when destination param is used', async () => {
+        const params = { destination: 'https://new-landing-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'old_creative_123' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'old_creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: {
+              message: 'Hello',
+              link: 'https://old-page.com',
+              name: 'Title',
+              image_hash: 'abc123'
+            }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_creative_789' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            link_url: 'https://new-landing-page.com'
+          })
+        );
+      });
+
+      it('should handle video creative swap with link_url update', async () => {
+        const params = { link_url: 'https://new-video-landing.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'video_creative_123' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'video_creative_123',
+          name: 'Video Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            video_data: {
+              video_id: 'vid_456',
+              image_hash: 'thumb_abc',
+              message: 'Watch this!',
+              title: 'Video Title',
+              call_to_action: { type: 'SHOP_NOW', value: { link: 'https://old-video-page.com' } }
+            }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({ id: 'new_video_creative_789' });
+        (metaService.updateAd as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(true);
+        expect(metaService.createAdCreative).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          expect.objectContaining({
+            page_id: 'page_123',
+            video_id: 'vid_456',
+            image_hash: 'thumb_abc',
+            link_url: 'https://new-video-landing.com',
+            call_to_action_type: 'SHOP_NOW'
+          })
+        );
+      });
+
+      it('should return error when ad has no creative', async () => {
+        const params = { link_url: 'https://new-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({ id: 'ad_123' });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('MISSING_CREATIVE');
+      });
+
+      it('should return error when creative has no object_story_spec', async () => {
+        const params = { link_url: 'https://new-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'creative_123' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_123',
+          name: 'My Creative'
+        });
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('MISSING_OBJECT_STORY_SPEC');
+      });
+
+      it('should return error when new creative creation fails', async () => {
+        const params = { link_url: 'https://new-page.com' };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getAd as jest.Mock).mockResolvedValue({
+          id: 'ad_123',
+          creative: { creative_id: 'creative_123' }
+        });
+        (metaService.getAdCreative as jest.Mock).mockResolvedValue({
+          id: 'creative_123',
+          name: 'My Creative',
+          object_story_spec: {
+            page_id: 'page_123',
+            link_data: { message: 'Hello', link: 'https://old.com', name: 'Title', image_hash: 'abc' }
+          }
+        });
+        (metaService.createAdCreative as jest.Mock).mockResolvedValue({});
+
+        const result = await agentModeService.updateMetaAdsAd('user123', 'ad_123', params);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('CREATIVE_CREATE_FAILED');
       });
     });
 

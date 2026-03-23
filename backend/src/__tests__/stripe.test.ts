@@ -54,6 +54,29 @@ jest.mock('../services/waitlistDb', () => ({
   },
 }));
 
+// Mock settingsService so subscriptionService doesn't try to create a real DynamoDB DocumentClient
+const mockSubscriptionTypes = [
+  { name: 'Free', allowedPages: ['/', '/agent-mode', '/settings', '/guide'], allowedSkills: [] },
+  { name: 'Basic', allowedPages: ['/', '/agent-mode', '/settings', '/guide', '/brand-guidelines', '/market-strategy', '/knowledge-base', '/email-templates', '/tasks', '/research-reports'], allowedSkills: ['*'] },
+  { name: 'Super Premium', allowedPages: ['*'], allowedSkills: ['*'] },
+];
+
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn().mockImplementation((key: string) => {
+      if (key === 'subscription_types') {
+        return Promise.resolve({
+          settingName: 'subscription_types',
+          settingValue: JSON.stringify(mockSubscriptionTypes),
+          updatedAt: new Date().toISOString(),
+          updatedBy: 'test',
+        });
+      }
+      return Promise.resolve(null);
+    }),
+  },
+}));
+
 import { stripeService } from '../services/stripeService';
 import { userDb } from '../services/db';
 
@@ -220,12 +243,14 @@ describe('Stripe Backend Integration', () => {
         customer_details: { email: 'test@example.com' },
       });
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('user-123', {
+      expect(userDb.updateUser).toHaveBeenCalledWith('user-123', expect.objectContaining({
         stripe_customer_id: 'cus_stripe_123',
         stripe_subscription_id: 'sub_stripe_456',
-        subscriptionType: 'pro',
+        subscriptionType: 'Super Premium',
         subscription_status: 'active',
-      });
+        allowedPages: ['*'],
+        allowedSkills: ['*'],
+      }));
     });
 
     it('should find user by email when metadata.userId is missing', async () => {
@@ -241,7 +266,7 @@ describe('Stripe Backend Integration', () => {
         ...mockUser,
         stripe_customer_id: 'cus_stripe_789',
         stripe_subscription_id: 'sub_stripe_abc',
-        subscriptionType: 'pro',
+        subscriptionType: 'Super Premium',
         subscription_status: 'active',
       });
 
@@ -255,12 +280,14 @@ describe('Stripe Backend Integration', () => {
       });
 
       expect(userDb.getUserByEmail).toHaveBeenCalledWith('fallback@example.com');
-      expect(userDb.updateUser).toHaveBeenCalledWith('user-456', {
+      expect(userDb.updateUser).toHaveBeenCalledWith('user-456', expect.objectContaining({
         stripe_customer_id: 'cus_stripe_789',
         stripe_subscription_id: 'sub_stripe_abc',
-        subscriptionType: 'pro',
+        subscriptionType: 'Super Premium',
         subscription_status: 'active',
-      });
+        allowedPages: ['*'],
+        allowedSkills: ['*'],
+      }));
     });
 
     it('should log warning when no user found for checkout session', async () => {
@@ -317,12 +344,12 @@ describe('Stripe Backend Integration', () => {
   });
 
   describe('Webhook Handler - customer.subscription.deleted', () => {
-    it('should set canceled status and remove subscriptionType', async () => {
+    it('should downgrade to Free tier on subscription deletion', async () => {
       const mockUser = {
         userId: 'user-123',
         email: 'test@example.com',
         stripe_customer_id: 'cus_123',
-        subscriptionType: 'pro',
+        subscriptionType: 'Super Premium',
         subscription_status: 'active',
       };
 
@@ -330,7 +357,7 @@ describe('Stripe Backend Integration', () => {
       (userDb.updateUser as jest.Mock).mockResolvedValue({
         ...mockUser,
         subscription_status: 'canceled',
-        subscriptionType: null,
+        subscriptionType: 'Free',
       });
 
       const { handleSubscriptionDeleted } = await import('../services/stripeService');
@@ -341,10 +368,11 @@ describe('Stripe Backend Integration', () => {
         metadata: {},
       });
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('user-123', {
+      expect(userDb.updateUser).toHaveBeenCalledWith('user-123', expect.objectContaining({
         subscription_status: 'canceled',
-        subscriptionType: null,
-      });
+        subscriptionType: 'Free',
+        allowedPages: ['/', '/agent-mode', '/settings', '/guide'],
+      }));
     });
   });
 
@@ -375,7 +403,7 @@ describe('Stripe Backend Integration', () => {
         ...mockUser,
         stripe_customer_id: 'cus_lifecycle',
         stripe_subscription_id: 'sub_lifecycle',
-        subscriptionType: 'pro',
+        subscriptionType: 'Super Premium',
         subscription_status: 'active',
       });
 
@@ -388,12 +416,14 @@ describe('Stripe Backend Integration', () => {
         customer_details: { email: 'lifecycle@example.com' },
       });
 
-      expect(userDb.updateUser).toHaveBeenCalledWith('user-lifecycle', {
+      expect(userDb.updateUser).toHaveBeenCalledWith('user-lifecycle', expect.objectContaining({
         stripe_customer_id: 'cus_lifecycle',
         stripe_subscription_id: 'sub_lifecycle',
-        subscriptionType: 'pro',
+        subscriptionType: 'Super Premium',
         subscription_status: 'active',
-      });
+        allowedPages: ['*'],
+        allowedSkills: ['*'],
+      }));
 
       // Step 3: User accesses billing portal
       mockBillingPortalSessionsCreate.mockResolvedValue({

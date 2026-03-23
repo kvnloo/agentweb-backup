@@ -5,6 +5,9 @@ import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusRe
 import { settingsService } from "../services/settingsService";
 import { chatbotDb } from "../services/chatbotService";
 import { agentModeService } from "../services/agentModeService";
+import multer from "multer";
+import { uploadFileToS3, presignS3Url } from "../utils/s3Utils";
+import { MAX_FILE_SIZE } from "../config";
 // generateSessionResponse and io are imported dynamically inside handlers
 // to avoid loading server.ts → app.ts → templates.ts chain at import time
 
@@ -23,6 +26,10 @@ const dynamodb = new DynamoDB.DocumentClient({
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_SIZE },
+});
 
 // Get GTM common items (read-only for customers) - MUST be before /:planId routes
 router.get("/common-items", authenticateToken, async (req, res) => {
@@ -1255,6 +1262,139 @@ router.post("/:planId/add-common-items", authenticateToken, async (req, res) => 
   }
 });
 
+// Upload an attachment to a work item
+router.post("/:planId/phases/:phaseId/work-items/:workItemId/attachments", authenticateToken, upload.single("file"), async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId, workItemId } = req.params;
+    const file = (req as any).file;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    if (!file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    // Get existing plan
+    const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    // Upload to S3
+    const uploadResult = await uploadFileToS3(file.buffer, file.originalname, userId, file.mimetype);
+    if (!uploadResult.success) {
+      return res.status(500).json({ error: "Failed to upload file to S3" });
+    }
+
+    const attachment = {
+      id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      filename: file.originalname,
+      size: file.size,
+      contentType: file.mimetype,
+      url: uploadResult.url,
+      uploadedAt: new Date().toISOString(),
+    };
+
+    // Append to work item's attachments
+    const workItem = workItems[workItemIndex];
+    const attachments = workItem.attachments || [];
+    attachments.push(attachment);
+    workItems[workItemIndex] = { ...workItem, attachments };
+    phases[phaseIndex] = { ...phase, workItems };
+
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { planId },
+      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: { "#phases": "phases", "#updatedAt": "updatedAt" },
+      ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+    }).promise();
+
+    return res.json({ success: true, data: attachment });
+  } catch (error: any) {
+    console.error("Error uploading work item attachment:", error);
+    return res.status(500).json({ success: false, error: error?.message || "Internal server error" });
+  }
+});
+
+// Delete an attachment from a work item
+router.delete("/:planId/phases/:phaseId/work-items/:workItemId/attachments/:attachmentId", authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    const { planId, phaseId, workItemId, attachmentId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "User ID not provided" });
+    }
+
+    const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+    if (getResult.Item.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    const workItem = workItems[workItemIndex];
+    const attachments = workItem.attachments || [];
+    const attachmentIndex = attachments.findIndex((a: any) => a.id === attachmentId);
+    if (attachmentIndex === -1) {
+      return res.status(404).json({ error: "Attachment not found" });
+    }
+
+    attachments.splice(attachmentIndex, 1);
+    workItems[workItemIndex] = { ...workItem, attachments };
+    phases[phaseIndex] = { ...phase, workItems };
+
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { planId },
+      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: { "#phases": "phases", "#updatedAt": "updatedAt" },
+      ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+    }).promise();
+
+    return res.json({ success: true, message: "Attachment deleted" });
+  } catch (error: any) {
+    console.error("Error deleting work item attachment:", error);
+    return res.status(500).json({ success: false, error: error?.message || "Internal server error" });
+  }
+});
+
 // Start an Agent Mode session from a GTM work item
 router.post("/:planId/phases/:phaseId/work-items/:workItemId/start-session", authenticateToken, async (req, res) => {
   try {
@@ -1329,13 +1469,25 @@ router.post("/:planId/phases/:phaseId/work-items/:workItemId/start-session", aut
       ? `${workItem.title}\n\n${workItem.description}`
       : workItem.title;
 
+    // Convert work item attachments to the format expected by generateSessionResponse
+    const workItemAttachments = (workItem.attachments || []).map((att: any) => {
+      const presignedUrl = presignS3Url(att.url);
+      return {
+        url: presignedUrl || att.url,
+        filename: att.filename,
+        size: att.size,
+        mimetype: att.contentType,
+        uploadedAt: att.uploadedAt,
+      };
+    });
+
     // Fire-and-forget: trigger AI response generation in the background
     // generateSessionResponse handles adding the user message + generating the AI response
     // It also syncs GTM work item status (agent_in_progress → pending_review) via session.gtmWorkItem
     // Dynamic imports to avoid loading server.ts → app.ts chain at module load time
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const { io } = await import('../server');
-    generateSessionResponse(session.sessionId, initialMessage, userId, modelToUse)
+    generateSessionResponse(session.sessionId, initialMessage, userId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined)
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated`);
         io.to(`user:${userId}`).emit("gtm-session-ready", {

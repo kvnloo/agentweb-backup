@@ -112,6 +112,11 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'Project documentation from the AgentWebPro organization'
   },
   {
+    path: '/linkedin-content',
+    label: 'LinkedIn Preview',
+    description: 'Preview how LinkedIn posts will look before publishing'
+  },
+  {
     path: '/social-posts',
     label: 'Social Posts',
     description: 'View and track social media posts and engagement metrics'

@@ -319,7 +319,7 @@ export async function assessClientHealth(
 }
 
 /**
- * List all non-admin clients with quick health indicators. Admin-only.
+ * List all clients (including admins) with quick health indicators. Admin-only.
  */
 export async function listAllClients(callerUserId: string): Promise<any> {
   try {
@@ -334,10 +334,9 @@ export async function listAllClients(callerUserId: string): Promise<any> {
     }
 
     const allUsers = await userDb.getAllUsers();
-    const nonAdminUsers = allUsers.filter((u: any) => !u.isAdmin);
 
     const clients: ClientSummary[] = await Promise.all(
-      nonAdminUsers.map(async (user: any) => {
+      allUsers.map(async (user: any) => {
         const accounts = await getAccountsByUserId(user.userId);
 
         const hasAds = !!(

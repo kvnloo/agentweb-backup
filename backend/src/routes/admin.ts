@@ -10,13 +10,21 @@ import { emailService } from "../services/emailService";
 import { resendService } from "../services/resendService";
 import { sendGTMPlanUpdateNotifications, sendPhaseStatusReport, sendPlanStatusReport } from "../services/gtmPlanNotificationService";
 import { chatbotDb, ChatSession } from "../services/chatbotService";
-import { scoreSessionIfNeeded } from "../services/sessionScoringService";
+import { scoreSessionIfNeeded, scoreSessionWithJudgeIfNeeded, ScoringJudge } from "../services/sessionScoringService";
 import { DynamoDB } from "aws-sdk";
 import { workflowDb } from "../services/workflowDb";
+import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import multer from "multer";
+import { MAX_FILE_SIZE } from "../config";
 
 const router = express.Router();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_SIZE },
+});
 const CRM_SYNC_SOURCES = new Set(["users", "waitlist"]);
 const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
 
@@ -2817,11 +2825,9 @@ router.get("/analytics/gtm", async (req, res) => {
     const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
-    const result = await dynamodb.scan({
+    const plans = await paginatedScan(dynamodb, {
       TableName: TABLE_NAME,
-    }).promise();
-
-    const plans = result.Items || [];
+    });
 
     let totalItems = 0;
     let completedItems = 0;
@@ -2959,11 +2965,9 @@ router.get("/gtm-plans", async (req, res) => {
     const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
 
     // Scan all GTM plans (admin can see all)
-    const result = await dynamodb.scan({
+    const plans = await paginatedScan(dynamodb, {
       TableName: TABLE_NAME,
-    }).promise();
-
-    const plans = result.Items || [];
+    });
 
     // Get user information for each plan
     const plansWithUsers = await Promise.all(
@@ -3504,6 +3508,148 @@ router.post("/gtm-plans/:planId/send-status-report", async (req, res) => {
   }
 });
 
+// Upload attachment to a GTM work item (admin)
+router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachments", upload.single("file"), async (req, res) => {
+  try {
+    const { planId, phaseId, workItemId } = req.params;
+    const file = (req as any).file;
+
+    if (!file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    // Upload to S3 using the plan owner's userId
+    const { uploadFileToS3 } = await import("../utils/s3Utils");
+    const uploadResult = await uploadFileToS3(file.buffer, file.originalname, plan.userId, file.mimetype);
+    if (!uploadResult.success) {
+      return res.status(500).json({ error: "Failed to upload file to S3" });
+    }
+
+    const attachment = {
+      id: `att-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+      filename: file.originalname,
+      size: file.size,
+      contentType: file.mimetype,
+      url: uploadResult.url,
+      uploadedAt: new Date().toISOString(),
+    };
+
+    const workItem = workItems[workItemIndex];
+    const attachments = workItem.attachments || [];
+    attachments.push(attachment);
+    workItems[workItemIndex] = { ...workItem, attachments };
+    phases[phaseIndex] = { ...phase, workItems };
+
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { planId },
+      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: { "#phases": "phases", "#updatedAt": "updatedAt" },
+      ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+    }).promise();
+
+    return res.json({ success: true, data: attachment });
+  } catch (error: any) {
+    console.error("Error uploading work item attachment (admin):", error);
+    return res.status(500).json({ success: false, error: error?.message || "Internal server error" });
+  }
+});
+
+// Delete an attachment from a GTM work item (admin)
+router.delete("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/attachments/:attachmentId", async (req, res) => {
+  try {
+    const { planId, phaseId, workItemId, attachmentId } = req.params;
+
+    const dynamodb = new DynamoDB.DocumentClient({
+      region: process.env.AWS_REGION || "us-west-2",
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        },
+      }),
+    });
+
+    const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
+    const TABLE_NAME = `${TABLE_PREFIX}AW-GTMPlan`;
+
+    const getResult = await dynamodb.get({ TableName: TABLE_NAME, Key: { planId } }).promise();
+    if (!getResult.Item) {
+      return res.status(404).json({ error: "GTM Plan not found" });
+    }
+
+    const plan = getResult.Item;
+    const phases = plan.phases || [];
+    const phaseIndex = phases.findIndex((p: any) => p.id === phaseId);
+    if (phaseIndex === -1) {
+      return res.status(404).json({ error: "Phase not found" });
+    }
+
+    const phase = phases[phaseIndex];
+    const workItems = phase.workItems || [];
+    const workItemIndex = workItems.findIndex((item: any) => item.id === workItemId);
+    if (workItemIndex === -1) {
+      return res.status(404).json({ error: "Work item not found" });
+    }
+
+    const workItem = workItems[workItemIndex];
+    const attachments = workItem.attachments || [];
+    const attachmentIndex = attachments.findIndex((a: any) => a.id === attachmentId);
+    if (attachmentIndex === -1) {
+      return res.status(404).json({ error: "Attachment not found" });
+    }
+
+    attachments.splice(attachmentIndex, 1);
+    workItems[workItemIndex] = { ...workItem, attachments };
+    phases[phaseIndex] = { ...phase, workItems };
+
+    await dynamodb.update({
+      TableName: TABLE_NAME,
+      Key: { planId },
+      UpdateExpression: "SET #phases = :phases, #updatedAt = :updatedAt",
+      ExpressionAttributeNames: { "#phases": "phases", "#updatedAt": "updatedAt" },
+      ExpressionAttributeValues: { ":phases": phases, ":updatedAt": new Date().toISOString() },
+    }).promise();
+
+    return res.json({ success: true, message: "Attachment deleted" });
+  } catch (error: any) {
+    console.error("Error deleting work item attachment (admin):", error);
+    return res.status(500).json({ success: false, error: error?.message || "Internal server error" });
+  }
+});
+
 // Start an Agent Mode session from a GTM work item (admin)
 router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-session", async (req, res) => {
   try {
@@ -3577,12 +3723,25 @@ router.post("/gtm-plans/:planId/phases/:phaseId/work-items/:workItemId/start-ses
       ? `${workItem.title}\n\n${workItem.description}`
       : workItem.title;
 
+    // Convert work item attachments to the format expected by generateSessionResponse
+    const { presignS3Url } = await import("../utils/s3Utils");
+    const workItemAttachments = (workItem.attachments || []).map((att: any) => {
+      const presignedUrl = presignS3Url(att.url);
+      return {
+        url: presignedUrl || att.url,
+        filename: att.filename,
+        size: att.size,
+        mimetype: att.contentType,
+        uploadedAt: att.uploadedAt,
+      };
+    });
+
     // Fire-and-forget: trigger AI response generation in the background
     // generateSessionResponse syncs GTM work item status via session.gtmWorkItem
     const planUserId = plan.userId;
     const { generateSessionResponse } = await import('../controllers/agentModeController');
     const { io } = await import('../server');
-    generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse)
+    generateSessionResponse(session.sessionId, initialMessage, planUserId, modelToUse, workItemAttachments.length > 0 ? workItemAttachments : undefined)
       .then(() => {
         console.log(`GTM work item session ${session.sessionId}: AI response generated (admin)`);
         io.to(`user:${planUserId}`).emit("gtm-session-ready", {
@@ -4211,6 +4370,65 @@ router.put("/chat-sessions/:sessionId/score", async (req, res) => {
   } catch (error: any) {
     console.error("Error overriding satisfaction score:", error);
     res.status(500).json({ message: "Failed to update satisfaction score" });
+  }
+});
+
+// Score sessions with a custom judge
+router.post("/chat-sessions/judge-score", async (req, res) => {
+  try {
+    const { sessionIds, judgeId } = req.body;
+
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return res.status(400).json({ message: "sessionIds must be a non-empty array" });
+    }
+    if (sessionIds.length > 5) {
+      return res.status(400).json({ message: "Maximum 5 sessionIds per request" });
+    }
+    if (!judgeId || typeof judgeId !== "string") {
+      return res.status(400).json({ message: "judgeId is required" });
+    }
+
+    // Fetch judge config from settings
+    const setting = await settingsService.getSetting("scoring-judges");
+    if (!setting || !setting.settingValue) {
+      return res.status(404).json({ message: "No scoring judges configured" });
+    }
+
+    let judges: ScoringJudge[];
+    try {
+      judges = JSON.parse(setting.settingValue);
+    } catch {
+      return res.status(500).json({ message: "Invalid scoring judges configuration" });
+    }
+
+    const judge = judges.find((j) => j.id === judgeId);
+    if (!judge) {
+      return res.status(404).json({ message: "Judge not found" });
+    }
+
+    const results = await Promise.allSettled(
+      sessionIds.map(async (sessionId: string) => {
+        const session = await chatbotDb.getChatSession(sessionId);
+        if (!session) return { sessionId, score: null };
+        const score = await scoreSessionWithJudgeIfNeeded(session, judge);
+        return { sessionId, score };
+      })
+    );
+
+    const scores: Record<string, any> = {};
+    const failed: string[] = [];
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        scores[result.value.sessionId] = result.value.score;
+      } else {
+        failed.push(sessionIds[i]);
+      }
+    });
+
+    res.json({ scores, failed });
+  } catch (error: any) {
+    console.error("Error scoring chat sessions with judge:", error);
+    res.status(500).json({ message: "Failed to score chat sessions with judge" });
   }
 });
 

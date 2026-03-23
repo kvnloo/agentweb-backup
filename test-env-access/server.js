@@ -441,13 +441,55 @@ function stripAnsiAndControlCodes(text) {
     .trim();
 }
 
+const COST_FILE = "/home/ec2-user/agentweb/.claude-total-cost";
+
+function formatUsageLine(data) {
+  try {
+    const cost = data.total_cost_usd || 0;
+    const usage = data.usage || {};
+    const durationMs = data.duration_ms || 0;
+    const inputTok = usage.input_tokens || 0;
+    const outputTok = usage.output_tokens || 0;
+    const cacheRead = usage.cache_read_input_tokens || 0;
+    const cacheCreate = usage.cache_creation_input_tokens || 0;
+
+    // Read previous total and accumulate
+    let prevTotal = 0;
+    try {
+      prevTotal = parseFloat(fs.readFileSync(COST_FILE, "utf-8").trim()) || 0;
+    } catch {
+      // file doesn't exist yet
+    }
+    const total = prevTotal + cost;
+    try {
+      fs.writeFileSync(COST_FILE, total.toFixed(6));
+    } catch {
+      // ignore write errors
+    }
+
+    const parts = [`Cost: $${cost.toFixed(4)} (Total: $${total.toFixed(4)})`];
+    const cacheParts = [];
+    if (cacheRead) cacheParts.push(`${cacheRead.toLocaleString()} cache-read`);
+    if (cacheCreate) cacheParts.push(`${cacheCreate.toLocaleString()} cache-write`);
+    let tokDetail = `${inputTok.toLocaleString()} in + ${outputTok.toLocaleString()} out`;
+    if (cacheParts.length) tokDetail += ` (${cacheParts.join(", ")})`;
+    parts.push(`Tokens: ${tokDetail}`);
+    if (durationMs) parts.push(`Duration: ${Math.round(durationMs / 1000)}s`);
+    const models = Object.keys(data.modelUsage || {});
+    if (models.length) parts.push(`Model: ${models.join(", ")}`);
+    return parts.join(" | ");
+  } catch {
+    return "";
+  }
+}
+
 function runClaude(prompt) {
   return new Promise((resolve, reject) => {
     // Escape single quotes in prompt for shell
     const escaped = prompt.replace(/'/g, "'\\''");
     const child = spawn(
       "bash",
-      ["-lc", `cd /home/ec2-user/agentweb && script -qc "claude --continue --model opus -p '${escaped}'" /dev/null`],
+      ["-lc", `cd /home/ec2-user/agentweb && claude --continue --model opus --permission-mode auto --output-format json -p '${escaped}'`],
       {
         uid: 1000, // ec2-user UID
         gid: 1000,
@@ -463,12 +505,21 @@ function runClaude(prompt) {
     child.stderr.on("data", (data) => { stderr += data.toString(); });
 
     child.on("close", (code) => {
-      // Strip terminal escape codes from script(1) PTY wrapper
-      const cleaned = stripAnsiAndControlCodes(stdout);
-      if (code === 0) {
-        resolve(cleaned || "(no output)");
-      } else {
-        reject(new Error(`Claude exited with code ${code}: ${stderr.slice(0, 500)}`));
+      // Try to parse JSON output for result text + usage
+      try {
+        const data = JSON.parse(stdout);
+        let text = data.result || "(no output)";
+        const usageLine = formatUsageLine(data);
+        if (usageLine) text += `\n\n---\n${usageLine}`;
+        resolve(text);
+      } catch {
+        // Fallback: strip ANSI codes from raw output
+        const cleaned = stripAnsiAndControlCodes(stdout);
+        if (code === 0) {
+          resolve(cleaned || "(no output)");
+        } else {
+          reject(new Error(`Claude exited with code ${code}: ${stderr.slice(0, 500)}`));
+        }
       }
     });
 

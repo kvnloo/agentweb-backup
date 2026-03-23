@@ -655,4 +655,111 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
   }
 });
 
+/**
+ * GET /api/landing-pages/v0/generated/:id/commits
+ * List recent commits for the landing page's GitHub repo.
+ * Optional query param: ?path=app/page.tsx to filter by file.
+ */
+router.get("/generated/:id/commits", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
+
+    const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+
+    const [, owner, repo] = repoMatch;
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+
+    const params: Record<string, string> = { per_page: "20" };
+    const filePath = req.query.path as string | undefined;
+    if (filePath) {
+      if (filePath.includes('..') || filePath.startsWith('.github/') || filePath.startsWith('.github\\')) {
+        return res.status(400).json({ error: "Invalid file path" });
+      }
+      params.path = filePath;
+    }
+
+    const commitsRes = await axios.get<any>(
+      `https://api.github.com/repos/${owner}/${repoName}/commits`,
+      {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" },
+        params,
+        timeout: 30_000,
+      }
+    );
+
+    const commits = commitsRes.data.map((c: any) => ({
+      sha: c.sha,
+      message: c.commit.message,
+      date: c.commit.committer?.date || c.commit.author?.date,
+      author: c.commit.author?.name || "unknown",
+    }));
+
+    res.json({ commits });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error listing commits:", error);
+    res.status(500).json({ error: "Failed to list commits" });
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/file-at-commit
+ * Read a file at a specific commit from the landing page's GitHub repo.
+ * Query params: ?path=app/page.tsx&ref=abc123
+ */
+router.get("/generated/:id/file-at-commit", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
+
+    const filePath = req.query.path as string;
+    const ref = req.query.ref as string;
+    if (!filePath) return res.status(400).json({ error: "path query parameter is required" });
+    if (!ref) return res.status(400).json({ error: "ref query parameter is required" });
+
+    if (filePath.includes('..') || filePath.startsWith('.github/') || filePath.startsWith('.github\\')) {
+      return res.status(400).json({ error: "Invalid file path" });
+    }
+
+    // Validate ref is a hex SHA prefix (7-40 chars) to prevent injection
+    if (!/^[0-9a-f]{7,40}$/i.test(ref)) {
+      return res.status(400).json({ error: "Invalid commit ref — must be a SHA hash" });
+    }
+
+    const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+
+    const [, owner, repo] = repoMatch;
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+
+    const fileRes = await axios.get<any>(
+      `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}?ref=${ref}`,
+      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" }, timeout: 30_000 }
+    );
+
+    const content = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
+    res.json({ path: filePath, content, sha: fileRes.data.sha, commit_ref: ref });
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error reading file at commit:", error);
+    const ghStatus = error.response?.status;
+    if (ghStatus === 404) {
+      return res.status(404).json({ error: "File not found at the specified commit" });
+    }
+    res.status(500).json({ error: "Failed to read file at commit" });
+  }
+});
+
 export default router;
