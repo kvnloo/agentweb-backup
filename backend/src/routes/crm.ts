@@ -2572,6 +2572,199 @@ router.post('/sender-emails', async (req: Request, res: Response) => {
 });
 
 /**
+ * @route POST /api/crm/email-domain
+ * @desc Create (register) an email domain in Resend for the authenticated user
+ * @access Private
+ */
+router.post('/email-domain', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { domain } = req.body;
+
+    if (!domain || typeof domain !== 'string') {
+      return res.status(400).json({ message: 'Domain is required' });
+    }
+
+    const normalizedDomain = domain.trim().toLowerCase();
+
+    // Validate domain format
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(normalizedDomain)) {
+      return res.status(400).json({ message: 'Invalid domain format' });
+    }
+
+    // Check if another user already has this domain
+    const usersWithDomain = await userDb.getUsersByEmailDomain(normalizedDomain);
+    const otherUserWithDomain = usersWithDomain.find(u => u.userId !== userId);
+    if (otherUserWithDomain) {
+      return res.status(409).json({ message: 'This domain is already in use by another account' });
+    }
+
+    // Check if domain already exists in Resend
+    const existingDomains = await resendService.listDomains();
+    const existingDomain = existingDomains.find(d => d.name === normalizedDomain);
+
+    if (existingDomain) {
+      // Domain already exists in Resend — return its current status and records
+      const domainDetails = await resendService.getDomain(existingDomain.id);
+      if (!domainDetails) {
+        return res.status(500).json({ message: 'Failed to retrieve existing domain details' });
+      }
+
+      // Save the resend domain ID and domain to the user record
+      await userDb.updateUser(userId, {
+        emailDomain: normalizedDomain,
+        resendDomainId: existingDomain.id,
+      });
+
+      return res.json({
+        message: 'Domain already registered in Resend',
+        domain: domainDetails,
+        alreadyExists: true,
+      });
+    }
+
+    // Create new domain in Resend
+    const result = await resendService.createDomain(normalizedDomain);
+    if (!result) {
+      return res.status(500).json({ message: 'Failed to create domain in Resend' });
+    }
+
+    // Save the resend domain ID and domain to the user record
+    await userDb.updateUser(userId, {
+      emailDomain: normalizedDomain,
+      resendDomainId: result.id,
+    });
+
+    res.json({
+      message: 'Domain created successfully. Add the DNS records below to verify.',
+      domain: result,
+    });
+  } catch (error: any) {
+    console.error('Error creating email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to create email domain' });
+  }
+});
+
+/**
+ * @route DELETE /api/crm/email-domain
+ * @desc Reset (clear) the user's email domain so they can register a different one
+ * @access Private
+ */
+router.delete('/email-domain', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user?.resendDomainId && !user?.emailDomain) {
+      return res.status(400).json({ message: 'No domain configured to reset' });
+    }
+
+    // Clear domain fields from user record (don't delete from Resend — may be shared or reused)
+    await userDb.updateUser(userId, {
+      emailDomain: '',
+      resendDomainId: '',
+    });
+
+    res.json({ message: 'Email domain reset. You can now register a different domain.' });
+  } catch (error: any) {
+    console.error('Error resetting email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to reset email domain' });
+  }
+});
+
+/**
+ * @route POST /api/crm/email-domain/verify
+ * @desc Trigger domain verification in Resend
+ * @access Private
+ */
+router.post('/email-domain/verify', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user?.resendDomainId) {
+      return res.status(400).json({ message: 'No domain configured. Please add a domain first.' });
+    }
+
+    // Trigger verification
+    await resendService.verifyDomain(user.resendDomainId);
+
+    // Fetch updated domain status
+    const domainDetails = await resendService.getDomain(user.resendDomainId);
+    if (!domainDetails) {
+      return res.status(500).json({ message: 'Failed to retrieve domain status after verification' });
+    }
+
+    res.json({
+      message: domainDetails.status === 'verified'
+        ? 'Domain verified successfully!'
+        : 'Verification triggered. DNS records may take a few minutes to propagate.',
+      domain: domainDetails,
+    });
+  } catch (error: any) {
+    console.error('Error verifying email domain:', error);
+    res.status(500).json({ message: error.message || 'Failed to verify email domain' });
+  }
+});
+
+/**
+ * @route GET /api/crm/email-domain/status
+ * @desc Get email domain status and DNS records for the authenticated user
+ * @access Private
+ */
+router.get('/email-domain/status', async (req: Request, res: Response) => {
+  try {
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await userDb.getUserById(userId);
+
+    if (!user?.resendDomainId) {
+      return res.json({
+        hasEmailDomain: !!user?.emailDomain,
+        emailDomain: user?.emailDomain || null,
+        resendDomainId: null,
+        domainStatus: null,
+        records: [],
+      });
+    }
+
+    const domainDetails = await resendService.getDomain(user.resendDomainId);
+
+    res.json({
+      hasEmailDomain: true,
+      emailDomain: user.emailDomain,
+      resendDomainId: user.resendDomainId,
+      domainStatus: domainDetails?.status || null,
+      records: domainDetails?.records || [],
+    });
+  } catch (error: any) {
+    console.error('Error fetching email domain status:', error);
+    res.status(500).json({ message: error.message || 'Failed to fetch email domain status' });
+  }
+});
+
+/**
  * @route POST /api/crm/lists/:listId/leads/:leadId/send-email
  * @desc Send email draft to a lead using Resend
  * @access Private

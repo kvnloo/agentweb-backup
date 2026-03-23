@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-23',
     changes: [
+      'New: Self-Serve Email Domain Setup in CRM',
+      '- You can now set up your email sending domain directly from the Email Sender configuration dialog — no admin involvement needed',
+      '- Enter your domain, add the provided DNS records at your registrar, and verify — all from within the CRM page',
+      '- Suggests using a subdomain (e.g. mail.yourcompany.com) to avoid conflicts with existing email, while still allowing the main domain',
+      '- Shows DNS record status and allows re-verification or switching to a different domain',
+      '- Duplicate domain detection prevents conflicts across accounts',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
       'Feature: GTM Tracker - My Queue View & Dashboard',
       '- New "My Queue" tab shows all work items across all clients in a single, filterable table',
       '- Filter by status, assignee (ours / unassigned / specific person), and free-text search',
