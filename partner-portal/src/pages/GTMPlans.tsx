@@ -60,6 +60,9 @@ import {
   AttachFile as AttachFileIcon,
   InsertDriveFile as InsertDriveFileIcon,
   Close as CloseIcon,
+  FilterList as FilterListIcon,
+  Sort as SortIcon,
+  RateReview as RateReviewIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { format } from "date-fns";
@@ -225,6 +228,21 @@ export default function GTMPlans() {
     notifyPhasePoc: false,
   });
   const [sendingStatusReport, setSendingStatusReport] = useState(false);
+
+  // My Queue state
+  const [queueFilter, setQueueFilter] = useState<"all" | "pending" | "in_progress" | "agent_in_progress" | "pending_review">("all");
+  const [queuePocFilter, setQueuePocFilter] = useState<string>("all");
+  const [queueSort, setQueueSort] = useState<"due_date" | "status" | "client">("due_date");
+  const [queueSearch, setQueueSearch] = useState("");
+  // Inline editing state for queue
+  const [inlineEditingId, setInlineEditingId] = useState<string | null>(null);
+  const [inlineEditField, setInlineEditField] = useState<"status" | "dri" | "notes" | null>(null);
+  const [inlineEditValue, setInlineEditValue] = useState("");
+  const [inlineEditNotes, setInlineEditNotes] = useState("");
+  const [inlineEditStatus, setInlineEditStatus] = useState("");
+  const [inlineSaving, setInlineSaving] = useState(false);
+  // Summary bar filter
+  const [summaryFilter, setSummaryFilter] = useState<string | null>(null);
 
   // Common Items state
   const [commonCategories, setCommonCategories] = useState<GTMCommonCategory[]>([]);
@@ -1316,6 +1334,221 @@ export default function GTMPlans() {
     return undefined;
   };
 
+  // Flatten all work items across all plans for the queue view
+  interface QueueItem {
+    workItem: WorkItem;
+    phase: Phase;
+    plan: GTMPlan;
+    clientName: string;
+  }
+
+  const getAllWorkItems = (): QueueItem[] => {
+    const items: QueueItem[] = [];
+    plans.forEach((plan) => {
+      const clientName = plan.supportNote || plan.userName || plan.userEmail || "Unknown";
+      plan.phases?.forEach((phase) => {
+        phase.workItems?.forEach((workItem) => {
+          items.push({ workItem, phase, plan, clientName });
+        });
+      });
+    });
+    return items;
+  };
+
+  const getFilteredQueueItems = (): QueueItem[] => {
+    let items = getAllWorkItems();
+
+    // Apply summary bar filter
+    if (summaryFilter) {
+      switch (summaryFilter) {
+        case "overdue":
+          items = items.filter((i) => {
+            const status = getDueDateStatus(i.workItem.dueDate, i.workItem.status, "workItem");
+            return status === "overdue" && i.workItem.status !== "completed" && i.workItem.status !== "skipped";
+          });
+          break;
+        case "due_soon":
+          items = items.filter((i) => {
+            const status = getDueDateStatus(i.workItem.dueDate, i.workItem.status, "workItem");
+            return status === "warning" && i.workItem.status !== "completed" && i.workItem.status !== "skipped";
+          });
+          break;
+        case "pending":
+          items = items.filter((i) => i.workItem.status === "pending");
+          break;
+        case "ours":
+          items = items.filter((i) => i.workItem.status === "pending" && i.workItem.dri?.toLowerCase().endsWith("@agentweb.pro"));
+          break;
+        case "agent_running":
+          items = items.filter((i) => i.workItem.status === "agent_in_progress");
+          break;
+        case "pending_review":
+          items = items.filter((i) => i.workItem.status === "pending_review");
+          break;
+      }
+    } else {
+      // Apply regular filters
+      if (!showDone) {
+        items = items.filter((i) => i.workItem.status !== "completed" && i.workItem.status !== "skipped");
+      }
+      if (queueFilter !== "all") {
+        items = items.filter((i) => i.workItem.status === queueFilter);
+      }
+      if (queuePocFilter !== "all") {
+        if (queuePocFilter === "unassigned") {
+          items = items.filter((i) => !i.workItem.dri || i.workItem.dri.trim() === "");
+        } else if (queuePocFilter === "@agentweb") {
+          items = items.filter((i) => i.workItem.dri?.toLowerCase().endsWith("@agentweb.pro"));
+        } else {
+          items = items.filter((i) => i.workItem.dri?.toLowerCase() === queuePocFilter.toLowerCase());
+        }
+      }
+    }
+
+    // Apply search
+    if (queueSearch.trim()) {
+      const search = queueSearch.toLowerCase();
+      items = items.filter((i) =>
+        i.workItem.title.toLowerCase().includes(search) ||
+        i.clientName.toLowerCase().includes(search) ||
+        i.plan.title.toLowerCase().includes(search) ||
+        i.phase.title.toLowerCase().includes(search) ||
+        (i.workItem.dri || "").toLowerCase().includes(search)
+      );
+    }
+
+    // Sort
+    items.sort((a, b) => {
+      if (queueSort === "due_date") {
+        // Items with no due date go last
+        if (!a.workItem.dueDate && !b.workItem.dueDate) return 0;
+        if (!a.workItem.dueDate) return 1;
+        if (!b.workItem.dueDate) return -1;
+        return a.workItem.dueDate.localeCompare(b.workItem.dueDate);
+      } else if (queueSort === "status") {
+        const statusOrder: Record<string, number> = {
+          pending_review: 0,
+          agent_in_progress: 1,
+          pending: 2,
+          in_progress: 3,
+          completed: 4,
+          skipped: 5,
+        };
+        return (statusOrder[a.workItem.status] || 99) - (statusOrder[b.workItem.status] || 99);
+      } else {
+        return a.clientName.localeCompare(b.clientName);
+      }
+    });
+
+    return items;
+  };
+
+  // Collect all unique PoCs for filter dropdown
+  const getAllPocs = (): string[] => {
+    const pocs = new Set<string>();
+    plans.forEach((plan) => {
+      plan.phases?.forEach((phase) => {
+        phase.workItems?.forEach((item) => {
+          if (item.dri && item.dri.trim()) pocs.add(item.dri.toLowerCase());
+        });
+      });
+    });
+    return Array.from(pocs).sort();
+  };
+
+  // Summary stats across all plans
+  const getSummaryStats = () => {
+    const allItems = getAllWorkItems();
+    let overdue = 0;
+    let dueSoon = 0;
+    let pending = 0;
+    let ours = 0;
+    let agentRunning = 0;
+    let pendingReview = 0;
+
+    allItems.forEach((i) => {
+      const dueDateStatus = getDueDateStatus(i.workItem.dueDate, i.workItem.status, "workItem");
+      if (dueDateStatus === "overdue") overdue++;
+      if (dueDateStatus === "warning") dueSoon++;
+      if (i.workItem.status === "pending") {
+        pending++;
+        if (i.workItem.dri?.toLowerCase().endsWith("@agentweb.pro")) ours++;
+      }
+      if (i.workItem.status === "agent_in_progress") agentRunning++;
+      if (i.workItem.status === "pending_review") pendingReview++;
+    });
+
+    return { overdue, dueSoon, pending, ours, agentRunning, pendingReview };
+  };
+
+  // Inline edit handlers for queue
+  const handleInlineEditStart = (itemId: string, field: "status" | "dri" | "notes", currentValue: string, currentStatus?: string, currentNotes?: string) => {
+    setInlineEditingId(itemId);
+    setInlineEditField(field);
+    if (field === "status") {
+      setInlineEditStatus(currentValue);
+      setInlineEditNotes(currentNotes || "");
+    } else if (field === "dri") {
+      setInlineEditValue(currentValue);
+    } else {
+      setInlineEditValue(currentValue);
+    }
+  };
+
+  const handleInlineEditCancel = () => {
+    setInlineEditingId(null);
+    setInlineEditField(null);
+    setInlineEditValue("");
+    setInlineEditStatus("");
+    setInlineEditNotes("");
+  };
+
+  const handleInlineEditSave = async (planId: string, phaseId: string, workItemId: string) => {
+    if (!token || inlineSaving) return;
+    setInlineSaving(true);
+
+    try {
+      let updateData: any = {};
+      if (inlineEditField === "status") {
+        updateData = { status: inlineEditStatus, notes: inlineEditNotes || null };
+      } else if (inlineEditField === "dri") {
+        updateData = { dri: inlineEditValue || null };
+      } else if (inlineEditField === "notes") {
+        updateData = { notes: inlineEditValue || null };
+      }
+
+      const updatePayload = {
+        ...updateData,
+        notifications: notificationOptions,
+      };
+
+      const response = await axios.put(
+        buildApiUrl(`/api/admin/gtm-plans/${planId}/phases/${phaseId}/work-items/${workItemId}`),
+        updatePayload,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (response.data.success && response.data.data) {
+        const updatedPlan = response.data.data;
+        setPlans((prevPlans) =>
+          prevPlans.map((plan) => {
+            if (plan.planId === planId) {
+              return { ...updatedPlan, userEmail: plan.userEmail, userName: plan.userName, supportNote: plan.supportNote };
+            }
+            return plan;
+          })
+        );
+      } else {
+        await fetchPlans();
+      }
+      handleInlineEditCancel();
+    } catch (err: any) {
+      setError(err.response?.data?.error || "Failed to update work item");
+    } finally {
+      setInlineSaving(false);
+    }
+  };
+
   const groupPlansByUser = (): UserStats[] => {
     const userMap = new Map<string, UserStats>();
 
@@ -1380,31 +1613,403 @@ export default function GTMPlans() {
       <Typography variant="h4" component="h1" gutterBottom>
         GTM Tracker
       </Typography>
+      {/* Summary Bar */}
+      {!loading && plans.length > 0 && (() => {
+        const stats = getSummaryStats();
+        return (
+          <Paper sx={{ p: 1.5, mb: 2, display: "flex", gap: 2, flexWrap: "wrap", alignItems: "center" }}>
+            {stats.overdue > 0 && (
+              <Chip
+                icon={<ErrorIcon />}
+                label={`${stats.overdue} overdue`}
+                color="error"
+                size="small"
+                variant={summaryFilter === "overdue" ? "filled" : "outlined"}
+                onClick={() => { setSummaryFilter(summaryFilter === "overdue" ? null : "overdue"); setTabValue(0); }}
+                sx={{ cursor: "pointer" }}
+              />
+            )}
+            {stats.dueSoon > 0 && (
+              <Chip
+                icon={<WarningIcon />}
+                label={`${stats.dueSoon} due this week`}
+                color="warning"
+                size="small"
+                variant={summaryFilter === "due_soon" ? "filled" : "outlined"}
+                onClick={() => { setSummaryFilter(summaryFilter === "due_soon" ? null : "due_soon"); setTabValue(0); }}
+                sx={{ cursor: "pointer" }}
+              />
+            )}
+            <Chip
+              label={`${stats.pending} pending${stats.ours > 0 ? ` (${stats.ours} ours)` : ""}`}
+              color="warning"
+              size="small"
+              variant={summaryFilter === "pending" ? "filled" : "outlined"}
+              onClick={() => { setSummaryFilter(summaryFilter === "pending" ? null : "pending"); setTabValue(0); }}
+              sx={{ cursor: "pointer" }}
+            />
+            {stats.ours > 0 && (
+              <Chip
+                icon={<PersonIcon />}
+                label={`${stats.ours} assigned to us`}
+                color="primary"
+                size="small"
+                variant={summaryFilter === "ours" ? "filled" : "outlined"}
+                onClick={() => { setSummaryFilter(summaryFilter === "ours" ? null : "ours"); setTabValue(0); }}
+                sx={{ cursor: "pointer" }}
+              />
+            )}
+            {stats.agentRunning > 0 && (
+              <Chip
+                icon={<SmartToyIcon />}
+                label={`${stats.agentRunning} agent running`}
+                color="info"
+                size="small"
+                variant={summaryFilter === "agent_running" ? "filled" : "outlined"}
+                onClick={() => { setSummaryFilter(summaryFilter === "agent_running" ? null : "agent_running"); setTabValue(0); }}
+                sx={{ cursor: "pointer" }}
+              />
+            )}
+            {stats.pendingReview > 0 && (
+              <Chip
+                icon={<RateReviewIcon />}
+                label={`${stats.pendingReview} pending review`}
+                color="secondary"
+                size="small"
+                variant={summaryFilter === "pending_review" ? "filled" : "outlined"}
+                onClick={() => { setSummaryFilter(summaryFilter === "pending_review" ? null : "pending_review"); setTabValue(0); }}
+                sx={{ cursor: "pointer" }}
+              />
+            )}
+            {summaryFilter && (
+              <Chip
+                label="Clear filter"
+                size="small"
+                onDelete={() => setSummaryFilter(null)}
+                sx={{ ml: "auto" }}
+              />
+            )}
+          </Paper>
+        );
+      })()}
+
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
-        <Typography variant="body1" color="text.secondary">
-          Track GTM plans from all users. Update status, notes, and assign PoC for plan items.
-        </Typography>
+        <Box sx={{ borderBottom: 1, borderColor: "divider", flex: 1 }}>
+          <Tabs value={tabValue} onChange={(_, v) => {
+            setTabValue(v);
+            if (v === 2 && commonCategories.length === 0) fetchCommonItems();
+            if (v !== 0) setSummaryFilter(null);
+          }}>
+            <Tab label="My Queue" />
+            <Tab label="Plans" />
+            <Tab label="Common Items" />
+          </Tabs>
+        </Box>
         <Button
           variant="outlined"
           size="small"
           startIcon={showDone ? <VisibilityOffIcon /> : <VisibilityIcon />}
           onClick={() => setShowDone(!showDone)}
+          sx={{ ml: 2, whiteSpace: "nowrap" }}
         >
           {showDone ? "Hide Done" : "Show Done"}
         </Button>
       </Box>
 
-      <Box sx={{ borderBottom: 1, borderColor: "divider", mb: 0 }}>
-        <Tabs value={tabValue} onChange={(_, v) => {
-          setTabValue(v);
-          if (v === 1 && commonCategories.length === 0) fetchCommonItems();
-        }}>
-          <Tab label="Plans" />
-          <Tab label="Common Items" />
-        </Tabs>
-      </Box>
-
+      {/* Tab 0: My Queue */}
       <TabPanel value={tabValue} index={0}>
+        {loading ? (
+          <Box display="flex" justifyContent="center" alignItems="center" minHeight="40vh">
+            <CircularProgress />
+          </Box>
+        ) : (
+          <>
+            {error && (
+              <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
+                {error}
+              </Alert>
+            )}
+            {successMessage && (
+              <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccessMessage(null)}>
+                {successMessage}
+              </Alert>
+            )}
+
+            {/* Filters row */}
+            <Box sx={{ display: "flex", gap: 2, mb: 2, flexWrap: "wrap", alignItems: "center" }}>
+              <TextField
+                size="small"
+                placeholder="Search items, clients, plans..."
+                value={queueSearch}
+                onChange={(e) => setQueueSearch(e.target.value)}
+                sx={{ minWidth: 250 }}
+              />
+              <FormControl size="small" sx={{ minWidth: 140 }}>
+                <InputLabel>Status</InputLabel>
+                <Select value={queueFilter} onChange={(e) => { setQueueFilter(e.target.value as any); setSummaryFilter(null); }} label="Status">
+                  <MenuItem value="all">All Statuses</MenuItem>
+                  <MenuItem value="pending">Pending</MenuItem>
+                  <MenuItem value="in_progress">In Progress</MenuItem>
+                  <MenuItem value="agent_in_progress">Agent Working</MenuItem>
+                  <MenuItem value="pending_review">Review Ready</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 160 }}>
+                <InputLabel>Assigned To</InputLabel>
+                <Select value={queuePocFilter} onChange={(e) => { setQueuePocFilter(e.target.value); setSummaryFilter(null); }} label="Assigned To">
+                  <MenuItem value="all">All Assignees</MenuItem>
+                  <MenuItem value="@agentweb">@agentweb.pro (ours)</MenuItem>
+                  <MenuItem value="unassigned">Unassigned</MenuItem>
+                  {getAllPocs().filter(p => !p.endsWith("@agentweb.pro")).map((poc) => (
+                    <MenuItem key={poc} value={poc}>{poc}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 120 }}>
+                <InputLabel>Sort By</InputLabel>
+                <Select value={queueSort} onChange={(e) => setQueueSort(e.target.value as any)} label="Sort By">
+                  <MenuItem value="due_date">Due Date</MenuItem>
+                  <MenuItem value="status">Status</MenuItem>
+                  <MenuItem value="client">Client</MenuItem>
+                </Select>
+              </FormControl>
+            </Box>
+
+            {/* Queue table */}
+            {(() => {
+              const queueItems = getFilteredQueueItems();
+              return queueItems.length === 0 ? (
+                <Paper sx={{ p: 3, textAlign: "center" }}>
+                  <Typography variant="body1" color="text.secondary">
+                    No work items match your filters.
+                  </Typography>
+                </Paper>
+              ) : (
+                <TableContainer component={Paper}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>Title</TableCell>
+                        <TableCell>Client</TableCell>
+                        <TableCell>Plan / Phase</TableCell>
+                        <TableCell>Status</TableCell>
+                        <TableCell>Due Date</TableCell>
+                        <TableCell>PoC</TableCell>
+                        <TableCell>Notes</TableCell>
+                        <TableCell align="right">Actions</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {queueItems.map((qi) => {
+                        const isEditing = inlineEditingId === qi.workItem.id;
+                        return (
+                          <TableRow
+                            key={`${qi.plan.planId}-${qi.phase.id}-${qi.workItem.id}`}
+                            sx={{
+                              bgcolor: qi.workItem.status === "pending_review" ? "action.hover" : undefined,
+                              "&:hover": { bgcolor: "action.hover" },
+                            }}
+                          >
+                            <TableCell sx={{ maxWidth: 280 }}>
+                              <Typography variant="body2" fontWeight="medium">
+                                {qi.workItem.title}
+                              </Typography>
+                              {qi.workItem.description && (
+                                <Typography variant="caption" color="text.secondary" display="block" sx={{ maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {qi.workItem.description}
+                                </Typography>
+                              )}
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="body2">{qi.clientName}</Typography>
+                            </TableCell>
+                            <TableCell>
+                              <Typography variant="caption" color="text.secondary" display="block">
+                                {qi.plan.title}
+                              </Typography>
+                              <Typography variant="caption" color="text.secondary">
+                                {qi.phase.title}
+                              </Typography>
+                            </TableCell>
+                            <TableCell>
+                              {isEditing && inlineEditField === "status" ? (
+                                <Box sx={{ display: "flex", flexDirection: "column", gap: 1, minWidth: 140 }}>
+                                  <Select
+                                    size="small"
+                                    value={inlineEditStatus}
+                                    onChange={(e) => setInlineEditStatus(e.target.value)}
+                                    sx={{ fontSize: "0.8rem" }}
+                                  >
+                                    <MenuItem value="pending">Pending</MenuItem>
+                                    <MenuItem value="in_progress">In Progress</MenuItem>
+                                    <MenuItem value="pending_review">Review Ready</MenuItem>
+                                    <MenuItem value="agent_in_progress">Agent Working</MenuItem>
+                                    <MenuItem value="completed">Completed</MenuItem>
+                                    <MenuItem value="skipped">Skipped</MenuItem>
+                                  </Select>
+                                  <TextField
+                                    size="small"
+                                    placeholder="Notes..."
+                                    value={inlineEditNotes}
+                                    onChange={(e) => setInlineEditNotes(e.target.value)}
+                                    multiline
+                                    maxRows={2}
+                                    sx={{ fontSize: "0.8rem" }}
+                                  />
+                                  <Box sx={{ display: "flex", gap: 0.5 }}>
+                                    <Button size="small" variant="contained" disabled={inlineSaving} onClick={() => handleInlineEditSave(qi.plan.planId, qi.phase.id, qi.workItem.id)}>
+                                      {inlineSaving ? <CircularProgress size={14} /> : "Save"}
+                                    </Button>
+                                    <Button size="small" onClick={handleInlineEditCancel} disabled={inlineSaving}>Cancel</Button>
+                                  </Box>
+                                </Box>
+                              ) : (
+                                <Chip
+                                  label={getStatusLabel(qi.workItem.status)}
+                                  color={getStatusColor(qi.workItem.status) as any}
+                                  size="small"
+                                  icon={qi.workItem.status === "agent_in_progress" ? <CircularProgress size={14} color="inherit" /> : undefined}
+                                  onClick={() => {
+                                    if (qi.workItem.agentSessionId && (qi.workItem.status === "agent_in_progress" || qi.workItem.status === "pending_review")) {
+                                      setChatDialogSessionId(qi.workItem.agentSessionId);
+                                      setChatDialogTitle(qi.workItem.title);
+                                      setChatDialogOpen(true);
+                                    } else {
+                                      handleInlineEditStart(qi.workItem.id, "status", qi.workItem.status, qi.workItem.status, qi.workItem.notes);
+                                    }
+                                  }}
+                                  sx={{ cursor: "pointer" }}
+                                />
+                              )}
+                            </TableCell>
+                            <TableCell>
+                              {qi.workItem.dueDate ? (() => {
+                                const [year, month, day] = qi.workItem.dueDate!.split('-').map(Number);
+                                const dueDateLocal = new Date(year, month - 1, day);
+                                const dueDateStatus = getDueDateStatus(qi.workItem.dueDate, qi.workItem.status, "workItem");
+                                return (
+                                  <Chip
+                                    {...(getDueDateIcon(qi.workItem.dueDate, qi.workItem.status, "workItem") && { icon: getDueDateIcon(qi.workItem.dueDate, qi.workItem.status, "workItem") })}
+                                    label={format(dueDateLocal, "MMM d")}
+                                    size="small"
+                                    variant="outlined"
+                                    color={dueDateStatus === "overdue" ? "error" : dueDateStatus === "warning" ? "warning" : "default"}
+                                  />
+                                );
+                              })() : (
+                                <Typography variant="body2" color="text.secondary">-</Typography>
+                              )}
+                            </TableCell>
+                            <TableCell>
+                              {isEditing && inlineEditField === "dri" ? (
+                                <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, minWidth: 160 }}>
+                                  <TextField
+                                    size="small"
+                                    value={inlineEditValue}
+                                    onChange={(e) => setInlineEditValue(e.target.value)}
+                                    placeholder="email@example.com"
+                                    sx={{ fontSize: "0.8rem" }}
+                                  />
+                                  <Box sx={{ display: "flex", gap: 0.5 }}>
+                                    <Button size="small" variant="contained" disabled={inlineSaving} onClick={() => handleInlineEditSave(qi.plan.planId, qi.phase.id, qi.workItem.id)}>
+                                      {inlineSaving ? <CircularProgress size={14} /> : "Save"}
+                                    </Button>
+                                    <Button size="small" onClick={handleInlineEditCancel} disabled={inlineSaving}>Cancel</Button>
+                                  </Box>
+                                </Box>
+                              ) : qi.workItem.dri ? (
+                                <Chip
+                                  icon={<PersonIcon />}
+                                  label={qi.workItem.dri.replace("@agentweb.pro", "")}
+                                  size="small"
+                                  variant="outlined"
+                                  onClick={() => handleInlineEditStart(qi.workItem.id, "dri", qi.workItem.dri || "")}
+                                  sx={{ cursor: "pointer", maxWidth: 150 }}
+                                />
+                              ) : (
+                                <Chip
+                                  label="Assign"
+                                  size="small"
+                                  variant="outlined"
+                                  color="default"
+                                  onClick={() => handleInlineEditStart(qi.workItem.id, "dri", "")}
+                                  sx={{ cursor: "pointer", opacity: 0.6 }}
+                                />
+                              )}
+                            </TableCell>
+                            <TableCell sx={{ maxWidth: 200 }}>
+                              {qi.workItem.notes ? (
+                                <Typography variant="caption" sx={{ display: "block", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {qi.workItem.notes}
+                                </Typography>
+                              ) : (
+                                <Typography variant="body2" color="text.secondary">-</Typography>
+                              )}
+                            </TableCell>
+                            <TableCell align="right">
+                              <Box sx={{ display: "flex", gap: 0.5, justifyContent: "flex-end" }}>
+                                {qi.workItem.status === "pending" && (
+                                  <Tooltip title="Start in Agent Mode">
+                                    <IconButton
+                                      size="small"
+                                      color="success"
+                                      disabled={startingSession === qi.workItem.id}
+                                      onClick={() => handleStartSession(qi.plan.planId, qi.phase.id, qi.workItem.id)}
+                                    >
+                                      {startingSession === qi.workItem.id ? (
+                                        <CircularProgress size={18} />
+                                      ) : (
+                                        <PlayArrowIcon fontSize="small" />
+                                      )}
+                                    </IconButton>
+                                  </Tooltip>
+                                )}
+                                <Tooltip title="Edit Status & Notes">
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => handleInlineEditStart(qi.workItem.id, "status", qi.workItem.status, qi.workItem.status, qi.workItem.notes)}
+                                  >
+                                    <CheckCircleIcon fontSize="small" />
+                                  </IconButton>
+                                </Tooltip>
+                                <Tooltip title="Set Due Date">
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => handleEditClick(qi.plan.planId, "workItem", "dueDate", qi.phase.id, qi.workItem.id, undefined, undefined, undefined, qi.workItem.dueDate)}
+                                  >
+                                    <CalendarTodayIcon fontSize="small" />
+                                  </IconButton>
+                                </Tooltip>
+                                {qi.workItem.agentSessionId && (
+                                  <Tooltip title="View Chat">
+                                    <IconButton
+                                      size="small"
+                                      onClick={() => {
+                                        setChatDialogSessionId(qi.workItem.agentSessionId!);
+                                        setChatDialogTitle(qi.workItem.title);
+                                        setChatDialogOpen(true);
+                                      }}
+                                    >
+                                      <SmartToyIcon fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                )}
+                              </Box>
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              );
+            })()}
+          </>
+        )}
+      </TabPanel>
+
+      {/* Tab 1: Plans */}
+      <TabPanel value={tabValue} index={1}>
       {loading ? (
         <Box display="flex" justifyContent="center" alignItems="center" minHeight="40vh">
           <CircularProgress />
@@ -2297,7 +2902,7 @@ export default function GTMPlans() {
       )}
       </TabPanel>
 
-      <TabPanel value={tabValue} index={1}>
+      <TabPanel value={tabValue} index={2}>
         {commonLoading ? (
           <Box display="flex" justifyContent="center" py={4}>
             <CircularProgress />

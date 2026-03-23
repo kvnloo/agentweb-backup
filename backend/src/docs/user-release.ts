@@ -11,6 +11,18 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-23',
     changes: [
+      'Feature: GTM Tracker - My Queue View & Dashboard',
+      '- New "My Queue" tab shows all work items across all clients in a single, filterable table',
+      '- Filter by status, assignee (ours / unassigned / specific person), and free-text search',
+      '- Sort by due date, status, or client for urgency-first workflow',
+      '- Dashboard summary bar at the top shows counts: overdue, due soon, pending, assigned to us, agent running, pending review',
+      '- Click any summary chip to instantly filter the queue to matching items',
+      '- Inline editing: click a status chip or PoC to edit directly in the table without opening dialogs',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
       'Fix: LinkedIn Company Pages Missing from Social Posts Page',
       '- Company pages with expired access tokens were silently dropped from the Social Posts page',
       '- Now automatically refreshes expired tokens before fetching posts (same as other operations)',
