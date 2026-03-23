@@ -28,6 +28,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-03-23',
+    changes: [
+      'Fix: LinkedIn Outreach Account Connection Reliability',
+      '- Fixed an issue where connecting a LinkedIn Outreach (Unipile) account could silently fail to save',
+      '- Added a localStorage fallback for the OAuth popup callback to handle cases where the browser blocks cross-origin postMessage',
+      '- Connected accounts now display their Account ID for easier identification',
+    ],
+  },
+  {
     date: '2026-03-22',
     changes: [
       'Fix: Scheduled Chat List Could Crash Sessions for Users with Large Run History',
