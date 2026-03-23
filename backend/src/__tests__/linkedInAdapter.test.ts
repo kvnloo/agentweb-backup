@@ -25,6 +25,7 @@ jest.mock('../services/linkedInPostsDb', () => ({
   createPost: jest.fn(),
   getPostsByAccount: jest.fn().mockResolvedValue([]),
   getPostByUrn: jest.fn(),
+  getPostById: jest.fn(),
   updatePostMetrics: jest.fn().mockResolvedValue(undefined),
 }));
 
@@ -46,6 +47,7 @@ import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { linkedInService } from '../services/linkedInService';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import * as linkedInPostsDb from '../services/linkedInPostsDb';
+const mockPostsDb = linkedInPostsDb as jest.Mocked<typeof linkedInPostsDb>;
 
 describe('LinkedInAdapter', () => {
   let adapter: LinkedInAdapter;
@@ -1107,6 +1109,68 @@ describe('LinkedInAdapter', () => {
         'EMPATHY'
       );
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('getPost', () => {
+    it('should return post content for personal account via DB lookup', async () => {
+      mockPostsDb.getPostById.mockResolvedValue({
+        postId: 'urn:li:share:123',
+        userId: 'user-1',
+        accountId: 'urn:li:person:abc123',
+        content: 'Hello from LinkedIn',
+        createdAt: new Date().toISOString(),
+      } as any);
+
+      const result = await adapter.getPost(mockPersonalAccount, 'urn:li:share:123', 'user-1');
+
+      expect(mockPostsDb.getPostById).toHaveBeenCalledWith('user-1', 'urn:li:share:123');
+      expect(result).toBe('Hello from LinkedIn');
+    });
+
+    it('should return null for personal account when post not found in DB', async () => {
+      mockPostsDb.getPostById.mockResolvedValue(null);
+
+      const result = await adapter.getPost(mockPersonalAccount, 'urn:li:share:missing', 'user-1');
+
+      expect(result).toBeNull();
+    });
+
+    it('should return null for personal account when DB throws', async () => {
+      mockPostsDb.getPostById.mockRejectedValue(new Error('DynamoDB error'));
+
+      const result = await adapter.getPost(mockPersonalAccount, 'urn:li:share:123', 'user-1');
+
+      expect(result).toBeNull();
+    });
+
+    it('should return post content for org account via listPosts scan', async () => {
+      jest.spyOn(adapter, 'listPosts').mockResolvedValue([
+        { id: 'urn:li:share:999', commentary: 'Org post content' } as any,
+        { id: 'urn:li:share:888', commentary: 'Other post' } as any,
+      ]);
+
+      const result = await adapter.getPost(mockCompanyAccount, 'urn:li:share:999', 'user-1');
+
+      expect(result).toBe('Org post content');
+    });
+
+    it('should return null for org account when post not found in listPosts results', async () => {
+      jest.spyOn(adapter, 'listPosts').mockResolvedValue([
+        { id: 'urn:li:share:888', commentary: 'Other post' } as any,
+      ]);
+
+      const result = await adapter.getPost(mockCompanyAccount, 'urn:li:share:not-there', 'user-1');
+
+      expect(result).toBeNull();
+    });
+
+    it('should return null for org account when listPosts throws', async () => {
+      jest.spyOn(adapter, 'listPosts').mockRejectedValue(new Error('LinkedIn API error'));
+
+      const result = await adapter.getPost(mockCompanyAccount, 'urn:li:share:123', 'user-1');
+
+      expect(result).toBeNull();
     });
   });
 });
