@@ -258,7 +258,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
 
     // Organization accounts: use LinkedIn API
-    const token = config.access_token;
+    const { token } = await this.getValidToken(account, userId);
     const authorUrn = account.account_id;
 
     const response = await linkedInService.listPosts(token, authorUrn, 0, limit);
@@ -511,7 +511,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       }
     }
 
-    const token = config.access_token;
+    const { token } = await this.getValidToken(account, userId);
     const authorUrn = account.account_id;
 
     const metrics = await linkedInService.getAggregatedMetrics(token, authorUrn);
