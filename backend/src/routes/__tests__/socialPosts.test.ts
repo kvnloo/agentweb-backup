@@ -416,7 +416,7 @@ describe('GET /api/social-posts/activity/post/:postId', () => {
       .get(`/api/social-posts/activity/post/${postId}`)
       .expect(200);
 
-    expect(mockTrackingDb.getEngagementsByPost).toHaveBeenCalledWith('urn:li:share:123');
+    expect(mockTrackingDb.getEngagementsByPost).toHaveBeenCalledWith('urn:li:share:123', { userId: expect.any(String) });
     expect(res.body.activities).toHaveLength(1);
     expect(res.body.activities[0].actionType).toBe('comment');
   });

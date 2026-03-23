@@ -367,7 +367,7 @@ describe('GET /social-posts/activity/post/:postId', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.activities).toHaveLength(1);
-    expect(mockEngagementDb.getEngagementsByPost).toHaveBeenCalledWith('urn:li:share:123');
+    expect(mockEngagementDb.getEngagementsByPost).toHaveBeenCalledWith('urn:li:share:123', { userId: expect.any(String) });
   });
 
   it('returns 500 on unexpected error', async () => {

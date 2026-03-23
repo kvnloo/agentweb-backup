@@ -5029,15 +5029,18 @@ export const socialEngagementTrackingDb = {
     }
   },
 
-  // Query all accounts that engaged with a specific post (post-wise view)
-  async getEngagementsByPost(postId: string, options: { from?: string; to?: string } = {}): Promise<any[]> {
+  // Query all accounts that engaged with a specific post (post-wise view).
+  // userId is required to scope results to the requesting user and prevent cross-user data leakage.
+  async getEngagementsByPost(postId: string, options: { from?: string; to?: string; userId: string }): Promise<any[]> {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         IndexName: 'PostEngagementIndex',
         KeyConditionExpression: 'postId = :postId' + (options.from ? ' AND executedAt >= :from' : ''),
+        FilterExpression: 'userId = :userId',
         ExpressionAttributeValues: {
           ':postId': postId,
+          ':userId': options.userId,
           ...(options.from && { ':from': options.from }),
         },
       };

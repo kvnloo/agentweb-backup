@@ -236,7 +236,7 @@ router.get('/social-posts/activity/post/:postId', authenticateToken, async (req:
     // postId is a URN (e.g. urn:li:share:123) — decode it from the URL
     const postId = decodeURIComponent(req.params.postId);
 
-    const records = await socialEngagementTrackingDb.getEngagementsByPost(postId);
+    const records = await socialEngagementTrackingDb.getEngagementsByPost(postId, { userId });
     const activities = await enrichActivities(records, userId);
 
     return res.json({ activities });
