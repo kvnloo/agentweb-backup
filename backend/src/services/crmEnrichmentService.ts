@@ -112,10 +112,29 @@ export class CrmEnrichmentService {
   }
 
   private async resolveLinkedInAccountId(userId: string): Promise<string | null> {
+    // 1. Try user's own Unipile account first
     const { getAccountsByUserId } = await import('./connectedAccountsDb');
     const accounts = await getAccountsByUserId(userId);
-    const unipileAccount = accounts.find((a: any) => a.platform === 'unipile');
-    return unipileAccount?.account_id || null;
+    const userAccount = accounts.find((a: any) => a.platform === 'unipile');
+    if (userAccount?.account_id) {
+      return userAccount.account_id;
+    }
+
+    // 2. Fall back to site-wide Unipile accounts
+    try {
+      const { settingsService } = await import('./settingsService');
+      const setting = await settingsService.getSetting('site-wide-unipile-accounts');
+      if (setting?.settingValue) {
+        const siteAccounts = JSON.parse(setting.settingValue);
+        const enabled = siteAccounts.filter((a: any) => a.enabled !== false);
+        if (enabled.length > 0) {
+          const selected = enabled[Math.floor(Math.random() * enabled.length)];
+          return selected.account_id;
+        }
+      }
+    } catch { /* ignore parse errors or settings fetch failures */ }
+
+    return null;
   }
 
   private static readonly ENRICH_MODEL = 'gemini-3.1-flash-lite-preview';
@@ -174,18 +193,21 @@ export class CrmEnrichmentService {
     if (spec.sources.includes('linkedin') && linkedInAccountId) {
       try {
         const linkedinUrl = lead.linkedin ? String(lead.linkedin).trim() : '';
+        const isValidLinkedInUrl = linkedinUrl && /\/in\//.test(linkedinUrl);
         let profileData: any = null;
 
-        if (linkedinUrl) {
-          // Direct profile lookup
+        if (isValidLinkedInUrl) {
+          // Direct profile lookup (URL contains /in/)
           const result = await agentModeService.linkedinOutreach(spec.userId, {
             action: 'get-profile',
             account_id: linkedInAccountId,
             profile_url: linkedinUrl,
           });
           if (result?.success) profileData = result.data;
-        } else {
-          // Search by name + company
+        }
+
+        if (!profileData) {
+          // Fall back to search by name + company
           const name = `${lead.firstName || ''} ${lead.lastName || ''}`.trim();
           const company = String(lead.company || '').trim();
           if (name && company) {
@@ -210,7 +232,8 @@ export class CrmEnrichmentService {
           linkedinContext = `\nLinkedIn profile data:\n${JSON.stringify(profileData, null, 2)}`;
         }
       } catch (err: any) {
-        throw Object.assign(new Error(`LinkedIn lookup failed: ${err.message}`), { step: 'linkedin' });
+        console.error(`[CrmEnrichment] LinkedIn lookup failed for lead ${lead?.leadId}: ${err.message}`);
+        // Non-fatal: continue enrichment with other sources
       }
     }
 

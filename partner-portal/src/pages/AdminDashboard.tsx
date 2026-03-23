@@ -54,6 +54,7 @@ import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
+import CrmTab from "../components/admin/CrmTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -650,6 +651,7 @@ export default function AdminDashboard() {
     'result-endpoints': 14,
     'emma-settings': 15,
     'scoring-judges': 16,
+    'crm': 17,
   };
   
   // Get initial tab value from URL or default to Users
@@ -2567,6 +2569,7 @@ export default function AdminDashboard() {
             <Tab label="Result Endpoints" {...a11yProps(14)} />
             <Tab label="Emma Chat Settings" {...a11yProps(15)} />
             <Tab label="Scoring Judges" {...a11yProps(16)} />
+            <Tab label="CRM" {...a11yProps(17)} />
           </Tabs>
         </Box>
 
@@ -5501,6 +5504,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={16}>
           <ScoringJudgesTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={17}>
+          <CrmTab />
         </TabPanel>
       </Paper>
 
