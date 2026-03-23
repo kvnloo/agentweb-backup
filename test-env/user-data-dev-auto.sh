@@ -340,7 +340,9 @@ echo "$CLAUDE_PROMPT" > "$APP_DIR/.claude-prompt"
 chown ec2-user:ec2-user "$APP_DIR/.claude-prompt"
 
 cat > "$APP_DIR/.claude-comment.py" <<'PYEOF'
-import json, sys
+import json, sys, os
+
+COST_FILE = os.path.expanduser("~/agentweb/.claude-total-cost")
 
 with open("/tmp/.claude-raw.json", "r", errors="replace") as f:
     raw = f.read()
@@ -356,8 +358,22 @@ try:
     cache_read = usage.get("cache_read_input_tokens", 0)
     cache_create = usage.get("cache_creation_input_tokens", 0)
 
+    # Read previous total and accumulate
+    prev_total = 0
+    try:
+        with open(COST_FILE, "r") as cf:
+            prev_total = float(cf.read().strip())
+    except Exception:
+        pass
+    total = prev_total + cost
+    try:
+        with open(COST_FILE, "w") as cf:
+            cf.write(f"{total:.6f}")
+    except Exception:
+        pass
+
     parts = []
-    parts.append(f"Cost: ${cost:.4f}")
+    parts.append(f"Cost: ${cost:.4f} (Total: ${total:.4f})")
     cache_parts = []
     if cache_read:
         cache_parts.append(f"{cache_read:,} cache-read")

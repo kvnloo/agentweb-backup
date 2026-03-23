@@ -441,6 +441,8 @@ function stripAnsiAndControlCodes(text) {
     .trim();
 }
 
+const COST_FILE = "/home/ec2-user/agentweb/.claude-total-cost";
+
 function formatUsageLine(data) {
   try {
     const cost = data.total_cost_usd || 0;
@@ -451,7 +453,21 @@ function formatUsageLine(data) {
     const cacheRead = usage.cache_read_input_tokens || 0;
     const cacheCreate = usage.cache_creation_input_tokens || 0;
 
-    const parts = [`Cost: $${cost.toFixed(4)}`];
+    // Read previous total and accumulate
+    let prevTotal = 0;
+    try {
+      prevTotal = parseFloat(fs.readFileSync(COST_FILE, "utf-8").trim()) || 0;
+    } catch {
+      // file doesn't exist yet
+    }
+    const total = prevTotal + cost;
+    try {
+      fs.writeFileSync(COST_FILE, total.toFixed(6));
+    } catch {
+      // ignore write errors
+    }
+
+    const parts = [`Cost: $${cost.toFixed(4)} (Total: $${total.toFixed(4)})`];
     const cacheParts = [];
     if (cacheRead) cacheParts.push(`${cacheRead.toLocaleString()} cache-read`);
     if (cacheCreate) cacheParts.push(`${cacheCreate.toLocaleString()} cache-write`);
