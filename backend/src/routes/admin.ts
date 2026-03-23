@@ -1007,8 +1007,8 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     const { cmsType } = req.body;
 
     // Validate cmsType
-    if (cmsType && cmsType !== "Basehub" && cmsType !== "Webflow") {
-      return res.status(400).json({ message: "cmsType must be either 'Basehub' or 'Webflow'" });
+    if (cmsType && cmsType !== "Basehub" && cmsType !== "Webflow" && cmsType !== "WordPress") {
+      return res.status(400).json({ message: "cmsType must be 'Basehub', 'Webflow', or 'WordPress'" });
     }
 
     // Check if user exists

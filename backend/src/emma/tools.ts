@@ -1301,15 +1301,21 @@ emmaToolRegistry.register({
       const user = await userDb.getUserById(userId);
       const cmsType = user?.cmsType;
 
-      if (cmsType !== 'Webflow') {
-        return { success: true, cmsType: cmsType || null, categories: [] };
+      if (cmsType === 'Webflow') {
+        const { getWebflowConfig } = await import('../controllers/blog');
+        const config = await getWebflowConfig(userId);
+        const categoryNames = config.categories ? Object.keys(config.categories) : [];
+        return { success: true, cmsType, categories: categoryNames };
       }
 
-      const { getWebflowConfig } = await import('../controllers/blog');
-      const config = await getWebflowConfig(userId);
-      const categoryNames = config.categories ? Object.keys(config.categories) : [];
+      if (cmsType === 'WordPress') {
+        const { getWordPressConfig } = await import('../controllers/blog');
+        const config = await getWordPressConfig(userId);
+        const categoryNames = config.categories ? Object.keys(config.categories) : [];
+        return { success: true, cmsType, categories: categoryNames };
+      }
 
-      return { success: true, cmsType, categories: categoryNames };
+      return { success: true, cmsType: cmsType || null, categories: [] };
     } catch (error: any) {
       return { success: false, message: 'Failed to fetch CMS categories', error: error.message };
     }
