@@ -7,6 +7,7 @@ on:
       - 'backend/**'
       - 'partner-portal/**'
       - 'test-env/**'
+      - 'test-env-access/**'
       - '.github/workflows/**'
 
 permissions:
