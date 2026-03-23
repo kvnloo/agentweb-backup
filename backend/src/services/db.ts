@@ -1929,13 +1929,12 @@ export const scheduleDb = {
         },
       };
 
-            const result = await dynamodb.query(params).promise();
-            return result.Items || [];
-          } catch (error) {
-            handleDynamoDbError(error, "getSchedulesReadyToRun");
-            return [];
-          }
-        },
+            return await paginatedQuery(dynamodb, params);
+    } catch (error) {
+      handleDynamoDbError(error, "getSchedulesReadyToRun");
+      return [];
+    }
+  },
 
   async getSocialEngagementActionsUpTo(windowEnd: string): Promise<any[]> {
     try {
