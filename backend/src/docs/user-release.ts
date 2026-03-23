@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-23',
     changes: [
+      'Fix: LinkedIn Company Pages Missing from Social Posts Page',
+      '- Company pages with expired access tokens were silently dropped from the Social Posts page',
+      '- Now automatically refreshes expired tokens before fetching posts (same as other operations)',
+      '- Accounts remain visible in the Social Posts page even when post loading fails temporarily',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
       'New: Slack Monitoring for Emma Q&A',
       '- Mention @Emma in a Slack channel to start a conversation — Emma replies directly in the thread',
       '- Follow-up messages in the same thread continue the same Agent Mode session',

@@ -83,7 +83,7 @@ export interface SocialPlatformAdapter {
    * List posts from the account
    * @throws Error if not supported by account type
    */
-  listPosts(account: ConnectedAccount, options?: { limit?: number }): Promise<any[]>;
+  listPosts(account: ConnectedAccount, options?: { limit?: number }, userId?: string): Promise<any[]>;
 
   /**
    * Get metrics for specific posts
@@ -94,7 +94,7 @@ export interface SocialPlatformAdapter {
    * Get overall account metrics (followers, page views, etc.)
    * @throws Error if not supported by account type
    */
-  getAccountMetrics(account: ConnectedAccount): Promise<AccountMetrics>;
+  getAccountMetrics(account: ConnectedAccount, userId?: string): Promise<AccountMetrics>;
 
   /**
    * Verify if the token is valid

@@ -64,7 +64,7 @@ export async function getPostsForUser(
   for (const account of accounts) {
     try {
       const adapter = socialPlatformService.getAdapter(account.platform);
-      let posts = await adapter.listPosts(account, { limit });
+      let posts = await adapter.listPosts(account, { limit }, userId);
 
       if (includeMetrics && posts.length > 0) {
         try {
@@ -139,6 +139,15 @@ export async function getPostsForUser(
       });
     } catch (error) {
       console.warn(`[SocialPosts] Failed to load posts for account ${account.account_id}:`, error);
+      // Still include the account in summaries so it remains visible on the page
+      const accountType = (account.config as any)?.account_type || 'unknown';
+      accountSummaries.push({
+        accountId: account.account_id,
+        accountName: account.account_name,
+        platform: account.platform,
+        accountType,
+        postCount: 0,
+      });
     }
   }
 

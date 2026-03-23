@@ -110,6 +110,45 @@ describe('Social Posts API', () => {
             expect(response.body.success).toBe(true);
             // Should still have posts from the good account
             expect(response.body.posts.length).toBe(1);
+            // Both accounts should appear in summaries (bad account with 0 posts)
+            expect(response.body.accounts).toHaveLength(2);
+            const badSummary = response.body.accounts.find((a: any) => a.accountId === 'urn:li:person:bad');
+            expect(badSummary).toBeDefined();
+            expect(badSummary.postCount).toBe(0);
+        });
+
+        it('includes account in summaries even when listPosts throws (account stays visible)', async () => {
+            const companyAccount = createMockAccount({
+                account_id: 'urn:li:organization:999',
+                account_name: 'My Company',
+                config: {
+                    account_type: 'company_page',
+                    access_token: 'expired-token',
+                    token_expires_at: Date.now() - 86400000,
+                } as any,
+            });
+            mockGetAccountsByUserId.mockResolvedValue([companyAccount]);
+
+            const failingAdapter = createMockAdapter();
+            failingAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired'));
+            (socialPlatformService.getAdapter as jest.Mock).mockReturnValue(failingAdapter);
+
+            const response = await request(app)
+                .get('/api/social-posts')
+                .set('Authorization', 'Bearer test-token');
+
+            expect(response.status).toBe(200);
+            expect(response.body.success).toBe(true);
+            expect(response.body.posts).toHaveLength(0);
+            // Account should still be in summaries with 0 posts
+            expect(response.body.accounts).toHaveLength(1);
+            expect(response.body.accounts[0]).toMatchObject({
+                accountId: 'urn:li:organization:999',
+                accountName: 'My Company',
+                platform: 'linkedin',
+                accountType: 'company_page',
+                postCount: 0,
+            });
         });
     });
 
