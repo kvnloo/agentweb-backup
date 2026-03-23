@@ -410,13 +410,23 @@ async function processQueue() {
       }
     } catch (err) {
       console.error(`[relay] Error processing prompt:`, err);
+      const errMsg = err.message || String(err);
       try {
         await postNotionComment(
           notionPageId,
-          `Claude Code error: ${err.message || err}`
+          `Claude Code error: ${errMsg}`
         );
       } catch (commentErr) {
         console.error(`[relay] Failed to post error comment:`, commentErr);
+      }
+
+      // If Claude crashed (exit code 143=SIGTERM, timeout, etc.), re-queue the
+      // prompt so the user's message isn't lost.  Post the error comment above
+      // so the user knows what happened, then retry after a short delay.
+      if (/exited with code (?!0\b)\d+/.test(errMsg)) {
+        console.log(`[relay] Re-queuing prompt after crash for page ${notionPageId}`);
+        await new Promise((r) => setTimeout(r, 5000)); // 5s cooldown
+        promptQueue.push({ prompt, notionPageId });
       }
     }
   }
