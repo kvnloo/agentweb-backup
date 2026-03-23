@@ -9,6 +9,25 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-23',
+    changes: [
+      'Feature: Site-Wide LinkedIn Enrichment Accounts',
+      '- Admins can now configure shared Unipile LinkedIn accounts for platform-wide lead enrichment',
+      '- When a user doesn\'t have their own LinkedIn account connected, enrichment automatically falls back to the shared account',
+      '- Multiple accounts can be added for redundancy — if one expires, others are used',
+      '- New CRM tab in the admin dashboard to manage site-wide enrichment accounts',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Fix: LinkedIn Enrichment No Longer Crashes on Invalid URLs',
+      '- Lead enrichment now validates LinkedIn URLs before direct profile lookup',
+      '- Falls back to search-by-name when URLs are invalid or direct lookup fails',
+      '- LinkedIn errors are non-fatal — enrichment continues with other data sources',
+    ],
+  },
+  {
     date: '2026-03-22',
     changes: [
       'Fix: Scheduled Chat List Could Crash Sessions for Users with Large Run History',
