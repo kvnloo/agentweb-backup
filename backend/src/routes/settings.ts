@@ -88,6 +88,107 @@ const extractVariables = (htmlContent: string, subject?: string): { variables: s
   return { variables: regularVariables, arrayVariables: Array.from(arrayVariableNames) };
 };
 
+// ---- Site-Wide Unipile Accounts CRUD (admin-only) ----
+
+const SITE_WIDE_UNIPILE_SETTING = 'site-wide-unipile-accounts';
+
+// Get all site-wide Unipile accounts
+router.get('/site-wide-unipile-accounts', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const setting = await settingsService.getSetting(SITE_WIDE_UNIPILE_SETTING);
+    const accounts = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+    res.json({ accounts });
+  } catch (error) {
+    console.error('Error getting site-wide Unipile accounts:', error);
+    res.status(500).json({ error: 'Failed to get site-wide Unipile accounts' });
+  }
+});
+
+// Add a site-wide Unipile account
+router.post('/site-wide-unipile-accounts', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { account_id, account_name, user_email } = req.body;
+    if (!account_id) {
+      return res.status(400).json({ error: 'account_id is required' });
+    }
+
+    const setting = await settingsService.getSetting(SITE_WIDE_UNIPILE_SETTING);
+    const accounts = setting?.settingValue ? JSON.parse(setting.settingValue) : [];
+
+    // Check for duplicate
+    if (accounts.some((a: any) => a.account_id === account_id)) {
+      return res.status(409).json({ error: 'Account already added as site-wide' });
+    }
+
+    const now = new Date().toISOString();
+    const newAccount = {
+      account_id,
+      account_name: account_name || account_id,
+      user_email: user_email || null,
+      added_by: req.user?.email,
+      added_at: now,
+      enabled: true,
+    };
+
+    accounts.push(newAccount);
+    await settingsService.setSetting(SITE_WIDE_UNIPILE_SETTING, JSON.stringify(accounts), 'Site-wide Unipile accounts for enrichment', req.user?.email);
+    res.json({ account: newAccount });
+  } catch (error) {
+    console.error('Error adding site-wide Unipile account:', error);
+    res.status(500).json({ error: 'Failed to add site-wide Unipile account' });
+  }
+});
+
+// Toggle enabled state of a site-wide Unipile account
+router.patch('/site-wide-unipile-accounts/:accountId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const { enabled } = req.body;
+
+    const setting = await settingsService.getSetting(SITE_WIDE_UNIPILE_SETTING);
+    if (!setting?.settingValue) {
+      return res.status(404).json({ error: 'No site-wide Unipile accounts found' });
+    }
+
+    const accounts = JSON.parse(setting.settingValue);
+    const index = accounts.findIndex((a: any) => a.account_id === accountId);
+    if (index === -1) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    accounts[index].enabled = enabled;
+    await settingsService.setSetting(SITE_WIDE_UNIPILE_SETTING, JSON.stringify(accounts), 'Site-wide Unipile accounts for enrichment', req.user?.email);
+    res.json({ account: accounts[index] });
+  } catch (error) {
+    console.error('Error updating site-wide Unipile account:', error);
+    res.status(500).json({ error: 'Failed to update site-wide Unipile account' });
+  }
+});
+
+// Remove a site-wide Unipile account
+router.delete('/site-wide-unipile-accounts/:accountId', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+
+    const setting = await settingsService.getSetting(SITE_WIDE_UNIPILE_SETTING);
+    if (!setting?.settingValue) {
+      return res.status(404).json({ error: 'No site-wide Unipile accounts found' });
+    }
+
+    const accounts = JSON.parse(setting.settingValue);
+    const filtered = accounts.filter((a: any) => a.account_id !== accountId);
+    if (filtered.length === accounts.length) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    await settingsService.setSetting(SITE_WIDE_UNIPILE_SETTING, JSON.stringify(filtered), 'Site-wide Unipile accounts for enrichment', req.user?.email);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error removing site-wide Unipile account:', error);
+    res.status(500).json({ error: 'Failed to remove site-wide Unipile account' });
+  }
+});
+
 // ---- Scoring Judges CRUD (admin-only) ----
 
 // Get default scoring prompt

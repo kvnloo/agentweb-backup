@@ -38,15 +38,23 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
 }));
 
+jest.mock('../services/settingsService', () => ({
+  settingsService: {
+    getSetting: jest.fn(),
+  },
+}));
+
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
+import { settingsService } from '../services/settingsService';
 import { io } from '../server';
 import { CrmEnrichmentService, EnrichmentJobSpec } from '../services/crmEnrichmentService';
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockGetAccountsByUserId = getAccountsByUserId as jest.MockedFunction<typeof getAccountsByUserId>;
+const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
 const mockIo = io as any;
 
 // Helper: mock a successful Gemini completion response
@@ -860,6 +868,155 @@ describe('CrmEnrichmentService', () => {
       expect(emitMock).toHaveBeenCalledWith(
         'crm-enrichment-progress',
         expect.objectContaining({ jobId: expect.any(String) })
+      );
+    });
+  });
+
+  // ─── SITE-WIDE UNIPILE ACCOUNT FALLBACK ─────────────────────────────────
+
+  describe('site-wide Unipile account fallback', () => {
+    it('should return null when no user account AND no site-wide setting', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockSettingsService.getSetting.mockResolvedValue(null);
+
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1', userId: 'user1',
+        instruction: 'Determine industry', outputFields: ['industry'],
+        sources: ['linkedin', 'existing_data'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.warnings).toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
+    });
+
+    it('should return null when all site-wide accounts are disabled', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: 'site-wide-unipile-accounts',
+        settingValue: JSON.stringify([{ account_id: 'sw1', enabled: false }]),
+        updatedAt: '', updatedBy: '',
+      });
+
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1', userId: 'user1',
+        instruction: 'Determine industry', outputFields: ['industry'],
+        sources: ['linkedin', 'existing_data'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.warnings).toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
+    });
+
+    it('should handle malformed site-wide settings JSON gracefully', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: 'site-wide-unipile-accounts',
+        settingValue: 'not-valid-json',
+        updatedAt: '', updatedBy: '',
+      });
+
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1', userId: 'user1',
+        instruction: 'Determine industry', outputFields: ['industry'],
+        sources: ['linkedin', 'existing_data'],
+      };
+
+      const result = await service.execute(spec);
+      expect(result.warnings).toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
+    });
+
+    it('should prefer user own account over site-wide', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([
+        { platform: 'unipile', account_id: 'user-acc', account_name: 'My LinkedIn', config: {} as any, created_at: '', updated_at: '' },
+      ]);
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: 'site-wide-unipile-accounts',
+        settingValue: JSON.stringify([{ account_id: 'sw-acc', enabled: true }]),
+        updatedAt: '', updatedBy: '',
+      });
+
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1', linkedin: 'https://linkedin.com/in/johndoe' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockAgentModeService.linkedinOutreach.mockResolvedValue({ success: true, data: { headline: 'CEO' } });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1', userId: 'user1',
+        instruction: 'Determine industry', outputFields: ['industry'],
+        sources: ['linkedin', 'existing_data'],
+      };
+
+      await service.execute(spec);
+      // Should use user's own account, not site-wide
+      expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+        'user1',
+        expect.objectContaining({ account_id: 'user-acc' }),
+      );
+    });
+
+    it('should fall back to site-wide account when user has no Unipile account', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([]);
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: 'site-wide-unipile-accounts',
+        settingValue: JSON.stringify([{ account_id: 'sw-acc', enabled: true }]),
+        updatedAt: '', updatedBy: '',
+      });
+
+      mockCrmDb.getLeadListById.mockResolvedValue({ listId: 'list1', userId: 'user1' });
+      mockCrmDb.getLeadsByListId.mockResolvedValue({
+        items: [createLead({ leadId: 'lead1', linkedin: 'https://linkedin.com/in/johndoe' })],
+        lastEvaluatedKey: null, hasMore: false,
+      });
+      mockAgentModeService.linkedinOutreach.mockResolvedValue({ success: true, data: { headline: 'CEO' } });
+      mockGeminiCreate.mockResolvedValue(geminiResponse({ industry: 'Tech' }));
+      mockCrmDb.updateLead.mockResolvedValue({} as any);
+      mockCrmDb.updateFieldNames.mockResolvedValue(undefined);
+
+      const spec: EnrichmentJobSpec = {
+        listId: 'list1', userId: 'user1',
+        instruction: 'Determine industry', outputFields: ['industry'],
+        sources: ['linkedin', 'existing_data'],
+      };
+
+      const result = await service.execute(spec);
+      // Should NOT have the warning since site-wide account is available
+      expect(result.warnings || []).not.toContain('No LinkedIn (Unipile) account connected — linkedin source skipped');
+      // Should have used the site-wide account
+      expect(mockAgentModeService.linkedinOutreach).toHaveBeenCalledWith(
+        'user1',
+        expect.objectContaining({ account_id: 'sw-acc' }),
       );
     });
   });
