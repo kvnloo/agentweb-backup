@@ -1407,6 +1407,55 @@ It could be due to auth related code was changed and the change would require re
 # prod deployment on AWS Beanstalk
 June 03, 2025: a deployment to backend failed and it failed to revert back to previous version. Restarting the app server and rebuilt the environemnt not worked. To resolve the issue, we had to clone the environment and then pointed the dns record in route 53 to the new environment.
 
+# March 23, 2026: Path Traversal Attack Investigation
+
+## Problem
+
+Production nginx logs showed a high volume of suspicious requests probing for common web vulnerabilities (PHP, Java, .env files, path traversal). Investigation needed to determine if any attacks were successful and whether the codebase is vulnerable.
+
+## Attack Evidence from Production Logs
+
+**1,114 malicious requests** across Mar 19–23 from automated vulnerability scanners. **All returned 404** — no successful exploitation.
+
+### Attack Types (by volume)
+| Type | Count | Description |
+|------|-------|-------------|
+| PHPUnit/eval-stdin | 949 | Probing for exposed PHP test suites (`/vendor/phpunit/.../eval-stdin.php`) |
+| .env probe | 67 | Attempting to read environment variables (`GET /.env`) |
+| Path traversal (LFI) | 47 | PHP Local File Inclusion via `index.php?lang=../../../../usr/local/lib/php/pearcmd` |
+| Spring actuator | 7 | Probing for Java Spring endpoints (`/actuator/health`) |
+| Other | 44 | Mixed scanner fingerprinting (`/webui/`, `/developmentserver/metadatauploader`, etc.) |
+
+### Scanner Fingerprints
+- `libredtail-http` — automated vulnerability scanner
+- `Mozilla/5.0 zgrab/0.x` — zgrab network scanner
+- Spoofed Chrome/Firefox user-agents for .env probes
+
+### Key Attacker IPs
+`110.35.80.116`, `75.119.137.153`, `82.24.64.32`, `118.196.74.89`, `165.154.232.244`, `34.158.79.105`, `145.223.47.104`, `45.39.7.12`, `20.163.2.150`, `20.64.106.28`, `65.49.1.142`, `48.214.144.34`
+
+## Code Audit Findings
+
+### No Filesystem Path Traversal Vulnerabilities
+1. **No `express.static` serving** — backend doesn't serve static files from the filesystem
+2. **No `res.sendFile` / `res.download`** — no file download endpoints using filesystem paths
+3. **No user-input in `path.join`** — all `fs.readFileSync` calls use hardcoded paths (`docs/AGENT_API.md`, `docs/skill.md`, font files, UUID-generated temp files)
+4. **Asset serving via S3** — `/asset/:assetHash` decodes a hash to S3 bucket/key, not filesystem paths
+5. **File uploads go to S3** — no local filesystem storage of user uploads
+
+### Landing Page GitHub File Endpoints — Low Risk
+4 endpoints in `landingPageGeneration.ts` accept user-supplied file paths passed to GitHub API. They have `..` checks but could be hardened:
+- `GET /api/landing-pages/v0/generated/:id/file-content` (line 629)
+- `PUT /api/landing-pages/v0/generated/:id/github-edit` (line 415)
+- `GET /api/landing-pages/v0/generated/:id/commits` (line 681)
+- `GET /api/landing-pages/v0/generated/:id/file-at-commit` (line 726)
+
+Risk is low: paths go to GitHub API (not filesystem), require auth + ownership, and Express's `qs` parser auto-decodes `%2e%2e` preventing URL-encoded bypasses.
+
+## Conclusion
+
+All attacks are **automated internet background noise** targeting PHP/Java/Python stacks. The Node.js/Express backend with no filesystem file serving is not vulnerable. All attack requests correctly return 404. Consider AWS WAF and nginx rate limiting for defense-in-depth.
+
 June 04, 2025: another outage of the backend. To resolve the issue and improve reliability, updated the environment to use t3-small instead of t3-micro as first option and t3-medium as second option. It was t3-micro then t3-small.
 
 June 16, 2025:
