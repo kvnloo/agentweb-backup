@@ -59,6 +59,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-03-23',
+    changes: [
+      'Feature: WordPress Blog Publishing Support',
+      '- Emma can now publish blog articles directly to WordPress sites via the REST API',
+      '- Supports image upload to the WordPress media library and automatic featured image assignment',
+      '- Category mapping lets Emma assign the right WordPress categories when publishing',
+      '- Self-service CMS configuration: users can set up their WordPress (or Webflow) credentials directly from the Reports page without admin involvement',
+      '- Admin-configured CMS settings are automatically visible in the self-config UI, so users can see and override what\'s already set up',
+    ],
+  },
+  {
     date: '2026-03-22',
     changes: [
       'Fix: Scheduled Chat List Could Crash Sessions for Users with Large Run History',

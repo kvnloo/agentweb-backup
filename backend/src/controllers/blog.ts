@@ -98,10 +98,25 @@ export async function getWebflowConfig(userId?: string): Promise<{
         configJson = await getSecret(userSecretName);
         console.log(`Using per-user Webflow config from Secrets Manager: ${userSecretName}`);
       } else {
-        console.log(
-          `Per-user Webflow config not found for user ${userId} at ${userSecretName}, using global secret ${baseSecretName}`,
-        );
-        configJson = await getSecret(baseSecretName);
+        // Try AW-Settings before falling back to global Secrets Manager
+        try {
+          const { settingsService } = await import('../services/settingsService');
+          const setting = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+          if (setting) {
+            const settingsConfig = JSON.parse(setting.settingValue);
+            if (settingsConfig.apiToken && settingsConfig.siteId && settingsConfig.collectionId) {
+              console.log(`Using Webflow config from AW-Settings for user ${userId}`);
+              configJson = setting.settingValue;
+            } else {
+              configJson = await getSecret(baseSecretName);
+            }
+          } else {
+            configJson = await getSecret(baseSecretName);
+          }
+        } catch (settingsError) {
+          console.log(`AW-Settings lookup failed for user ${userId}, using global secret`);
+          configJson = await getSecret(baseSecretName);
+        }
       }
     } else {
       console.log(
@@ -109,9 +124,9 @@ export async function getWebflowConfig(userId?: string): Promise<{
       );
       configJson = await getSecret(baseSecretName);
     }
-    
+
     const config = JSON.parse(configJson);
-    
+
     if (!config.apiToken || !config.siteId || !config.collectionId) {
       throw new Error("Webflow configuration missing required fields");
     }
@@ -158,6 +173,91 @@ export async function getWebflowConfig(userId?: string): Promise<{
       (typeof error === "string" ? error : JSON.stringify(error));
     throw new Error(
       `Failed to fetch Webflow configuration from Secrets Manager: ${details}`,
+    );
+  }
+}
+
+// Function to get WordPress configuration from Secrets Manager
+// Supports per-user secrets when userId is provided:
+// - Per-user secret: dev/AgentWeb/WordPress/<userId> or prod/AgentWeb/WordPress/<userId>
+// If the per-user secret does not exist, falls back to the global secret:
+// - Global secret:   dev/AgentWeb/WordPress or prod/AgentWeb/WordPress
+export async function getWordPressConfig(userId?: string): Promise<{
+  siteUrl: string;
+  username: string;
+  applicationPassword: string;
+  categories?: Record<string, number>; // category name -> WordPress category ID
+}> {
+  try {
+    const baseSecretName = process.env.NODE_ENV === "development"
+      ? "dev/AgentWeb/WordPress"
+      : "prod/AgentWeb/WordPress";
+
+    const { getSecret, secretExists } = await import("../utils/secretsManager");
+    let configJson: string;
+
+    if (userId) {
+      const userSecretName = `${baseSecretName}/${userId}`;
+      const hasUserSecret = await secretExists(userSecretName);
+      if (hasUserSecret) {
+        configJson = await getSecret(userSecretName);
+        console.log(`Using per-user WordPress config from Secrets Manager: ${userSecretName}`);
+      } else {
+        // Try AW-Settings before falling back to global Secrets Manager
+        try {
+          const { settingsService } = await import('../services/settingsService');
+          const setting = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+          if (setting) {
+            const settingsConfig = JSON.parse(setting.settingValue);
+            if (settingsConfig.siteUrl && settingsConfig.username && settingsConfig.applicationPassword) {
+              console.log(`Using WordPress config from AW-Settings for user ${userId}`);
+              configJson = setting.settingValue;
+            } else {
+              configJson = await getSecret(baseSecretName);
+            }
+          } else {
+            configJson = await getSecret(baseSecretName);
+          }
+        } catch (settingsError) {
+          console.log(`AW-Settings lookup failed for user ${userId}, using global secret`);
+          configJson = await getSecret(baseSecretName);
+        }
+      }
+    } else {
+      console.log(`No user ID provided, using global secret ${baseSecretName}`);
+      configJson = await getSecret(baseSecretName);
+    }
+
+    const config = JSON.parse(configJson);
+
+    if (!config.siteUrl || !config.username || !config.applicationPassword) {
+      throw new Error("WordPress configuration missing required fields (siteUrl, username, applicationPassword)");
+    }
+
+    // Handle categories mapping - it might be a string (JSON) or an object
+    let categories = config.categories;
+    if (typeof categories === 'string') {
+      try {
+        categories = JSON.parse(categories);
+      } catch (parseError) {
+        console.warn('Failed to parse WordPress categories as JSON string:', parseError);
+        categories = undefined;
+      }
+    }
+
+    return {
+      siteUrl: config.siteUrl.replace(/\/+$/, ''), // strip trailing slashes
+      username: config.username,
+      applicationPassword: config.applicationPassword,
+      categories: categories || undefined,
+    };
+  } catch (error: any) {
+    console.log("Error fetching WordPress configuration from Secrets Manager:", error);
+    const details =
+      (error && (error.code || error.message)) ||
+      (typeof error === "string" ? error : JSON.stringify(error));
+    throw new Error(
+      `Failed to fetch WordPress configuration from Secrets Manager: ${details}`,
     );
   }
 }
@@ -929,6 +1029,216 @@ export async function generateBlogHtml(
 </html>`;
 }
 
+// --- CMS Config self-service endpoints ---
+
+const CMS_CONFIG_KEY_PREFIX = 'cms_config_';
+const VALID_CMS_TYPES = ['Basehub', 'Webflow', 'WordPress'];
+
+function maskSecret(value: string): string {
+  if (!value || value.length <= 4) return '****';
+  return '****' + value.slice(-4);
+}
+
+/**
+ * GET /api/blog/cms-config
+ * Returns the user's CMS configuration with sensitive fields masked.
+ */
+export const getCmsConfig = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { userDb } = await import('../services/db');
+    const user = await userDb.getUserById(userId);
+    const cmsType = user?.cmsType || null;
+
+    const { settingsService } = await import('../services/settingsService');
+    const setting = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+
+    if (setting) {
+      const config = JSON.parse(setting.settingValue);
+
+      // Mask sensitive fields
+      if (config.applicationPassword) {
+        config.applicationPassword = maskSecret(config.applicationPassword);
+      }
+      if (config.apiToken) {
+        config.apiToken = maskSecret(config.apiToken);
+      }
+
+      return res.status(200).json({ success: true, cmsType, config, source: 'settings' });
+    }
+
+    // Fallback: check Secrets Manager for admin-configured credentials
+    if (cmsType === 'WordPress' || cmsType === 'Webflow') {
+      try {
+        let config: Record<string, any> = {};
+        if (cmsType === 'WordPress') {
+          const wpConfig = await getWordPressConfig(userId);
+          config = {
+            siteUrl: wpConfig.siteUrl,
+            username: wpConfig.username,
+            applicationPassword: maskSecret(wpConfig.applicationPassword),
+            categories: wpConfig.categories,
+          };
+        } else if (cmsType === 'Webflow') {
+          const wfConfig = await getWebflowConfig(userId);
+          config = {
+            apiToken: maskSecret(wfConfig.apiToken),
+            siteId: wfConfig.siteId,
+            collectionId: wfConfig.collectionId,
+            categories: wfConfig.categories,
+          };
+        }
+        return res.status(200).json({ success: true, cmsType, config, source: 'admin' });
+      } catch (secretsError) {
+        // No Secrets Manager config either — return empty
+        console.log(`No Secrets Manager config found for user ${userId} cmsType ${cmsType}`);
+      }
+    }
+
+    return res.status(200).json({ success: true, cmsType, config: {} });
+  } catch (error: any) {
+    console.error('Error getting CMS config:', error);
+    return res.status(500).json({ success: false, message: 'Failed to get CMS config', error: error.message });
+  }
+};
+
+/**
+ * PUT /api/blog/cms-config
+ * Saves the user's CMS configuration. Supports partial updates (omit password to keep existing).
+ */
+export const saveCmsConfig = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    const email = req.user?.email;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { cmsType, config } = req.body;
+
+    // Clearing CMS config
+    if (cmsType === null || cmsType === '') {
+      const { settingsService } = await import('../services/settingsService');
+      const { userDb } = await import('../services/db');
+      await settingsService.deleteSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+      await userDb.updateUser(userId, { cmsType: null as any });
+      return res.status(200).json({ success: true, message: 'CMS configuration cleared' });
+    }
+
+    // Validate cmsType
+    if (!VALID_CMS_TYPES.includes(cmsType)) {
+      return res.status(400).json({
+        message: `Invalid cmsType. Must be one of: ${VALID_CMS_TYPES.join(', ')}`,
+      });
+    }
+
+    // Validate required fields per CMS type
+    const configData = config || {};
+
+    if (cmsType === 'WordPress') {
+      const missing: string[] = [];
+      if (!configData.siteUrl) missing.push('siteUrl');
+      if (!configData.username) missing.push('username');
+      // applicationPassword can be omitted for partial updates
+      if (!configData.applicationPassword) {
+        // Check if there's an existing config with a password
+        const { settingsService } = await import('../services/settingsService');
+        const existing = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+        if (existing) {
+          const existingConfig = JSON.parse(existing.settingValue);
+          if (existingConfig.applicationPassword) {
+            configData.applicationPassword = existingConfig.applicationPassword;
+          } else {
+            missing.push('applicationPassword');
+          }
+        } else {
+          missing.push('applicationPassword');
+        }
+      }
+      if (missing.length > 0) {
+        return res.status(400).json({
+          message: `WordPress config missing required fields: ${missing.join(', ')}`,
+        });
+      }
+    } else if (cmsType === 'Webflow') {
+      const missing: string[] = [];
+      if (!configData.apiToken) {
+        // Check existing config for partial update
+        const { settingsService } = await import('../services/settingsService');
+        const existing = await settingsService.getSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+        if (existing) {
+          const existingConfig = JSON.parse(existing.settingValue);
+          if (existingConfig.apiToken) {
+            configData.apiToken = existingConfig.apiToken;
+          } else {
+            missing.push('apiToken');
+          }
+        } else {
+          missing.push('apiToken');
+        }
+      }
+      if (!configData.siteId) missing.push('siteId');
+      if (!configData.collectionId) missing.push('collectionId');
+      if (missing.length > 0) {
+        return res.status(400).json({
+          message: `Webflow config missing required fields: ${missing.join(', ')}`,
+        });
+      }
+    }
+
+    // Strip trailing slashes from siteUrl if present
+    if (configData.siteUrl) {
+      configData.siteUrl = configData.siteUrl.replace(/\/+$/, '');
+    }
+
+    // Save to AW-Settings
+    const { settingsService } = await import('../services/settingsService');
+    await settingsService.setSetting(
+      `${CMS_CONFIG_KEY_PREFIX}${userId}`,
+      JSON.stringify(configData),
+      'User CMS configuration',
+      email || 'system'
+    );
+
+    // Update user's cmsType
+    const { userDb } = await import('../services/db');
+    await userDb.updateUser(userId, { cmsType });
+
+    return res.status(200).json({ success: true, message: `CMS configuration saved (${cmsType})` });
+  } catch (error: any) {
+    console.error('Error saving CMS config:', error);
+    return res.status(500).json({ success: false, message: 'Failed to save CMS config', error: error.message });
+  }
+};
+
+/**
+ * DELETE /api/blog/cms-config
+ * Clears the user's CMS configuration.
+ */
+export const deleteCmsConfig = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const { settingsService } = await import('../services/settingsService');
+    const { userDb } = await import('../services/db');
+
+    await settingsService.deleteSetting(`${CMS_CONFIG_KEY_PREFIX}${userId}`);
+    await userDb.updateUser(userId, { cmsType: null as any });
+
+    return res.status(200).json({ success: true, message: 'CMS configuration cleared' });
+  } catch (error: any) {
+    console.error('Error deleting CMS config:', error);
+    return res.status(500).json({ success: false, message: 'Failed to delete CMS config', error: error.message });
+  }
+};
+
 export const generateBlogPost = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
@@ -1306,6 +1616,137 @@ async function publishToWebflow(
   }
 }
 
+// Function to publish to WordPress via REST API
+async function publishToWordPress(
+  title: string,
+  description: string,
+  content: string,
+  imageUrl: string | undefined,
+  userId: string,
+  status: string = 'draft',
+  categoryIds: number[] = []
+): Promise<any> {
+  console.log('publishToWordPress called with:', {
+    userId,
+    titleSnippet: title?.substring(0, 60),
+    hasImage: !!imageUrl,
+    status,
+    categoryIds,
+  });
+
+  const { siteUrl, username, applicationPassword } = await getWordPressConfig(userId);
+
+  // Convert markdown content to HTML
+  const { remark } = await import('remark');
+  const remarkHtml = (await import('remark-html')).default;
+  const remarkGfm = (await import('remark-gfm')).default;
+  const remarkBreaks = (await import('remark-breaks')).default;
+
+  const processor = remark()
+    .use(remarkGfm)
+    .use(remarkBreaks)
+    .use(remarkHtml, { sanitize: false });
+  const htmlContent = processor.processSync(content).toString();
+
+  // Build Basic Auth header
+  const authHeader = 'Basic ' + Buffer.from(`${username}:${applicationPassword}`).toString('base64');
+
+  // Upload featured image if provided
+  let featuredMediaId: number | undefined;
+  if (imageUrl) {
+    try {
+      console.log("Uploading featured image to WordPress...");
+      // Download the image
+      const imageResponse = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+      });
+
+      const imageBuffer = Buffer.from(imageResponse.data as ArrayBuffer);
+      const contentType = imageResponse.headers['content-type'] || 'image/png';
+      const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
+      const filename = `blog-hero-${Date.now()}.${ext}`;
+
+      const mediaResponse = await axios.post(
+        `${siteUrl}/wp-json/wp/v2/media`,
+        imageBuffer,
+        {
+          headers: {
+            Authorization: authHeader,
+            'Content-Type': contentType,
+            'Content-Disposition': `attachment; filename="${filename}"`,
+          },
+          timeout: 60000,
+        }
+      );
+
+      featuredMediaId = (mediaResponse.data as any).id;
+      console.log("Featured image uploaded, media ID:", featuredMediaId);
+    } catch (imgError: any) {
+      console.error("Failed to upload featured image to WordPress:", imgError.message);
+      // Continue without featured image rather than failing the whole publish
+    }
+  }
+
+  // Create the post
+  const wpStatus = status === 'published' ? 'publish' : 'draft';
+  const postData: any = {
+    title: title,
+    content: htmlContent,
+    excerpt: description,
+    status: wpStatus,
+  };
+
+  if (featuredMediaId) {
+    postData.featured_media = featuredMediaId;
+  }
+
+  if (categoryIds.length > 0) {
+    postData.categories = categoryIds;
+  }
+
+  console.log("Publishing to WordPress...");
+
+  try {
+    const response = await axios.post(
+      `${siteUrl}/wp-json/wp/v2/posts`,
+      postData,
+      {
+        headers: {
+          Authorization: authHeader,
+          'Content-Type': 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+
+    console.log("Blog post published successfully to WordPress");
+    return response.data;
+  } catch (error: any) {
+    const errorInfo: any = {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+    };
+
+    if (error.response?.data) {
+      const errorData = error.response.data;
+      errorInfo.message = errorData.message || errorData.error || error.message;
+      if (errorData.code) {
+        errorInfo.code = errorData.code;
+      }
+    } else {
+      errorInfo.message = error.message || 'Unknown error';
+    }
+
+    console.error(`WordPress API error (${errorInfo.status}): ${errorInfo.message}`);
+
+    const wpError = new Error(errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`);
+    (wpError as any).status = errorInfo.status;
+    (wpError as any).code = errorInfo.code;
+    throw wpError;
+  }
+}
+
 export const publishBlogPost = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
@@ -1477,10 +1918,14 @@ export const publishBlogPost = async (req: AuthRequest, res: Response) => {
       console.log("✅ Blog post published successfully to BaseHub");
       response = basehubResponse.data;
       publishedField = "publishedToBasehub";
+    } else if (cmsType === "WordPress") {
+      // Publish to WordPress
+      response = await publishToWordPress(title, description, content, imageUrl, userId);
+      publishedField = "publishedToWordPress";
     } else {
       return res.status(400).json({
         success: false,
-        message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub' and 'Webflow'.`,
+        message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub', 'Webflow', and 'WordPress'.`,
       });
     }
 
@@ -1589,22 +2034,31 @@ export const getCmsCategories = async (req: AuthRequest, res: Response) => {
     const user = await userDb.getUserById(userId);
     const cmsType = user?.cmsType;
 
-    // Only Webflow has categories configured via Secrets Manager
-    if (cmsType !== 'Webflow') {
+    // Webflow and WordPress have categories configured via Secrets Manager
+    if (cmsType === 'Webflow') {
+      const config = await getWebflowConfig(userId);
+      const categoryNames = config.categories ? Object.keys(config.categories) : [];
       return res.status(200).json({
         success: true,
-        cmsType: cmsType || null,
-        categories: [],
+        cmsType,
+        categories: categoryNames,
       });
     }
 
-    const config = await getWebflowConfig(userId);
-    const categoryNames = config.categories ? Object.keys(config.categories) : [];
+    if (cmsType === 'WordPress') {
+      const config = await getWordPressConfig(userId);
+      const categoryNames = config.categories ? Object.keys(config.categories) : [];
+      return res.status(200).json({
+        success: true,
+        cmsType,
+        categories: categoryNames,
+      });
+    }
 
     return res.status(200).json({
       success: true,
-      cmsType,
-      categories: categoryNames,
+      cmsType: cmsType || null,
+      categories: [],
     });
   } catch (error: any) {
     console.error("❌ Error fetching CMS categories:", error);

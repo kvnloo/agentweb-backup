@@ -92,7 +92,7 @@ export interface User {
     }>;
   }; // User journey funnel configuration for SEO analytics
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folder IDs
-  cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
+  cmsType?: "Basehub" | "Webflow" | "WordPress"; // CMS Type for blog publishing
   companyName?: string;
   memoryEnabled?: boolean; // Whether Emma's long-term memory is enabled (default: true)
   useCaseCategories?: string[];

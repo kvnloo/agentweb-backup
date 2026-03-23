@@ -14172,6 +14172,129 @@ Format the response as JSON with this structure:
             repairSuggested: errorInfo.repairSuggested || false
           };
         }
+      } else if (cmsType === 'WordPress') {
+        const { getWordPressConfig } = await import('../controllers/blog');
+        const wpConfig = await getWordPressConfig(userId);
+
+        const authHeader = 'Basic ' + Buffer.from(`${wpConfig.username}:${wpConfig.applicationPassword}`).toString('base64');
+
+        // Upload featured image if provided
+        let featuredMediaId: number | undefined;
+        if (heroImageUrl) {
+          try {
+            console.log('AgentMode: Uploading featured image to WordPress...');
+            const imgResponse = await axios.get(heroImageUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000,
+            });
+            const imageBuffer = Buffer.from(imgResponse.data as ArrayBuffer);
+            const contentType = imgResponse.headers['content-type'] || 'image/png';
+            const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
+            const filename = `blog-hero-${Date.now()}.${ext}`;
+
+            const mediaResponse = await axios.post(
+              `${wpConfig.siteUrl}/wp-json/wp/v2/media`,
+              imageBuffer,
+              {
+                headers: {
+                  Authorization: authHeader,
+                  'Content-Type': contentType,
+                  'Content-Disposition': `attachment; filename="${filename}"`,
+                },
+                timeout: 60000,
+              }
+            );
+            featuredMediaId = (mediaResponse.data as any).id;
+            console.log('AgentMode: Featured image uploaded, media ID:', featuredMediaId);
+          } catch (imgError: any) {
+            console.error('AgentMode: Failed to upload featured image to WordPress:', imgError.message);
+          }
+        }
+
+        // Map category names to WordPress category IDs
+        let wpCategoryIds: number[] = [];
+        const invalidCategories: string[] = [];
+        if (categories && categories.length > 0 && wpConfig.categories) {
+          for (const name of categories) {
+            const id = wpConfig.categories[name];
+            if (id) {
+              wpCategoryIds.push(id);
+            } else {
+              invalidCategories.push(name);
+            }
+          }
+        }
+
+        const wpStatus = status === 'published' ? 'publish' : 'draft';
+        const postData: any = {
+          title: title,
+          content: bodyHtml,
+          excerpt: description,
+          status: wpStatus,
+        };
+
+        if (featuredMediaId) {
+          postData.featured_media = featuredMediaId;
+        }
+
+        if (wpCategoryIds.length > 0) {
+          postData.categories = wpCategoryIds;
+        }
+
+        console.log(`AgentMode: Publishing to WordPress as ${wpStatus}...`);
+
+        try {
+          const response = await axios.post(
+            `${wpConfig.siteUrl}/wp-json/wp/v2/posts`,
+            postData,
+            {
+              headers: {
+                Authorization: authHeader,
+                'Content-Type': 'application/json',
+              },
+              timeout: 30000,
+            }
+          );
+
+          const responseData = response.data as any;
+          console.log(`AgentMode: Blog article published successfully to WordPress as ${wpStatus}`);
+
+          return {
+            success: true,
+            message: `Blog article published successfully to WordPress as ${status}`,
+            data: {
+              title,
+              status,
+              cmsType: 'WordPress',
+              postId: responseData.id,
+              postUrl: responseData.link,
+              ...(invalidCategories.length > 0 ? {
+                warning: `Some categories were not found: ${invalidCategories.join(', ')}`,
+                availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
+              } : {})
+            }
+          };
+        } catch (wpError: any) {
+          const errorInfo: any = {
+            status: wpError.response?.status,
+            statusText: wpError.response?.statusText,
+          };
+          if (wpError.response?.data) {
+            errorInfo.message = wpError.response.data.message || wpError.message;
+            errorInfo.code = wpError.response.data.code;
+          } else {
+            errorInfo.message = wpError.message;
+          }
+
+          console.error(`AgentMode: WordPress API error (${errorInfo.status}): ${errorInfo.message}`);
+
+          return {
+            success: false,
+            message: errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`,
+            error: 'WordPress API error',
+            availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
+          };
+        }
       } else if (cmsType === 'Basehub') {
         return {
           success: false,
@@ -14181,7 +14304,7 @@ Format the response as JSON with this structure:
       } else {
         return {
           success: false,
-          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub' and 'Webflow'.`,
+          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub', 'Webflow', and 'WordPress'.`,
           error: 'Unsupported CMS Type'
         };
       }
