@@ -1636,12 +1636,33 @@ export async function getPreviewDeploymentUrl(
 
   // Ensure Vercel Authentication is disabled so preview URLs are publicly accessible
   try {
-    await axios.patch(
+    // First, check current project settings
+    const projRes = await axios.get<any>(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
-      { vercelAuthentication: { deploymentType: "none" } },
       { headers }
     );
-  } catch (_) { /* non-fatal */ }
+    console.log(`[V0 SERVICE] Project ${vercelProjectId} protection settings:`, JSON.stringify({
+      ssoProtection: projRes.data?.ssoProtection,
+      vercelAuthentication: projRes.data?.vercelAuthentication,
+      passwordProtection: projRes.data?.passwordProtection,
+      trustedIps: projRes.data?.trustedIps,
+      protectionBypass: projRes.data?.protectionBypass,
+    }));
+
+    // Disable all protection types
+    const patchRes = await axios.patch(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      {
+        ssoProtection: null,
+        vercelAuthentication: { deploymentType: "none" },
+        passwordProtection: null,
+      },
+      { headers }
+    );
+    console.log(`[V0 SERVICE] Disabled Vercel Authentication for project ${vercelProjectId}: ${patchRes.status}`);
+  } catch (authErr: any) {
+    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication for ${vercelProjectId}: ${authErr.response?.status} ${authErr.response?.data?.error?.message || authErr.message}`);
+  }
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)
   const deploymentsRes = await axios.get<any>(
