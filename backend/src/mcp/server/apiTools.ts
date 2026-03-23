@@ -1180,14 +1180,15 @@ mcpToolRegistry.register({
   name: 'edit_landing_page_file',
   definition: {
     name: 'edit_landing_page_file',
-    description: '[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors.',
+    description: '[DEPRECATED — use coding_agent instead] Direct file edit requiring full file content. This tool is deprecated because it requires you to provide the entire file content, which fails for large files. Use the coding_agent tool instead — it supports diff-based editing, reads files automatically, checks deployment status, and iterates on errors. If you must use this tool, pass a branch to stage changes (e.g. "draft/<session-id>") and use publish_landing_page_changes to go live.',
     inputSchema: {
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
         file_path: { type: 'string', description: 'Path to the file in the repo (e.g., "src/app/page.tsx")' },
         content: { type: 'string', description: 'The new file content' },
-        commit_message: { type: 'string', description: 'Git commit message (optional)' }
+        commit_message: { type: 'string', description: 'Git commit message (optional)' },
+        branch: { type: 'string', description: 'Target branch for staging (e.g. "draft/abc12345"). Defaults to "main" for backward compatibility.' }
       },
       required: ['page_id', 'file_path', 'content']
     }
@@ -1195,7 +1196,7 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'PUT', path: `/api/landing-pages/v0/generated/${args.page_id}/github-edit`, context: ctx(context),
-      body: { file_path: args.file_path, content: args.content, commit_message: args.commit_message }
+      body: { file_path: args.file_path, content: args.content, commit_message: args.commit_message, branch: args.branch }
     });
     return jsonResult(data);
   }
@@ -1260,6 +1261,56 @@ mcpToolRegistry.register({
   execute: async (args: any, context: any) => {
     const data = await mcpFetch({
       method: 'GET', path: `/api/landing-pages/v0/generated/${args.page_id}/deployment-status`, context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page_preview_url',
+  definition: {
+    name: 'get_landing_page_preview_url',
+    description: 'Get the Vercel preview URL for a landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        branch: { type: 'string', description: 'The draft branch name (e.g. "draft/abc12345")' }
+      },
+      required: ['page_id', 'branch']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/landing-pages/v0/generated/${args.page_id}/preview-url`,
+      queryParams: { branch: args.branch },
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'publish_landing_page_changes',
+  definition: {
+    name: 'publish_landing_page_changes',
+    description: 'Merge a draft branch into main to make landing page changes live. Use this after the user has reviewed the preview and approved the changes. This merges the draft branch, triggers a production deployment, and deletes the draft branch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page ID' },
+        branch: { type: 'string', description: 'The draft branch to merge (e.g. "draft/abc12345")' }
+      },
+      required: ['page_id', 'branch']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/landing-pages/v0/generated/${args.page_id}/publish`,
+      body: { branch: args.branch },
+      context: ctx(context)
     });
     return jsonResult(data);
   }

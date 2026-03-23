@@ -1611,6 +1611,50 @@ export async function getDeploymentStatus(
 }
 
 /**
+ * Get the Vercel preview deployment URL for a non-main branch.
+ * Vercel automatically creates preview deployments for branch pushes.
+ * Returns the preview URL and build status.
+ */
+export async function getPreviewDeploymentUrl(
+  vercelProjectId: string,
+  branch: string
+): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string }> {
+  const vercelToken = await getVercelToken();
+  const headers = { Authorization: `Bearer ${vercelToken}` };
+
+  // List recent deployments filtered by the branch (meta.githubCommitRef)
+  const deploymentsRes = await axios.get<any>(
+    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=5`,
+    { headers }
+  );
+
+  const deployments = deploymentsRes.data?.deployments || [];
+  // Find the most recent deployment for this branch
+  const branchDeployment = deployments.find((d: any) =>
+    d.meta?.githubCommitRef === branch
+  );
+
+  if (!branchDeployment) {
+    return { buildStatus: "pending", previewUrl: undefined };
+  }
+
+  const state = branchDeployment.readyState || branchDeployment.state;
+  const previewUrl = branchDeployment.url ? `https://${branchDeployment.url}` : undefined;
+
+  if (state === "READY") {
+    return { buildStatus: "success", previewUrl };
+  }
+
+  if (state === "ERROR" || state === "CANCELED") {
+    const buildError = await getVercelBuildErrors(branchDeployment.uid, vercelToken);
+    return { buildStatus: "error", buildError, previewUrl };
+  }
+
+  // Still building
+  return { buildStatus: state.toLowerCase(), previewUrl };
+}
+
+/**
  * Refine a landing page with follow-up instructions via v0 chat.
  */
 export async function iterateLandingPage(

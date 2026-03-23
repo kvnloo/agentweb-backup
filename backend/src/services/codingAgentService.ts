@@ -18,6 +18,8 @@ export interface CodingAgentContext {
   userId: string;
   sessionId: string;
   llmModel: string;
+  /** Draft branch name for staging edits (e.g. "draft/abc12345"). If unset, edits go to main. */
+  draftBranch?: string;
   socketEmit?: (room: string, event: string, payload: any) => void;
   executeMcpTool?: (toolName: string, args: any) => Promise<any>;
 }
@@ -41,16 +43,19 @@ const MAX_RETRIES = 2;
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
-const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editing landing page code. You have direct access to files in a GitHub repository that auto-deploys to Vercel. You also have browser tools to verify your changes visually.
+const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editing landing page code. You have direct access to files in a GitHub repository connected to Vercel. You also have browser tools to verify your changes visually.
+
+## Staging Workflow
+Your edits go to a draft branch (not main). This creates a Vercel preview deployment so the user can review before going live. The user will publish to production separately when satisfied.
 
 ## Rules
 1. ALWAYS read a file before editing it. Understand the code first.
 2. Make small, incremental edits. Each edit_file call should have 1-5 search/replace blocks.
 3. The "search" string must match the existing code EXACTLY (including whitespace and indentation).
-4. After making edits, use check_deployment to verify the build succeeds.
+4. After making edits, use check_deployment to verify the preview build succeeds.
 5. If the build fails, read the error, fix it, and check again.
-6. After deployment succeeds, use browse_page to verify the changes look correct on the live site.
-7. When finished, call report_to_user with a summary of all changes made.
+6. After deployment succeeds, use browse_page to verify the changes look correct on the preview site.
+7. When finished, call report_to_user with a summary of all changes made. Include the preview URL so the user can review.
 8. Do NOT make changes the user did not ask for. Stay focused on the task.
 9. For large changes, break them into multiple edit_file calls.
 10. NEVER attempt to rewrite an entire file or replace more than a small section at once. Only make targeted edits to specific sections. If a file is too large to edit safely, report the limitation to the user.
@@ -63,11 +68,11 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editin
 2. list_commits (optionally filtered by the file you plan to edit) to record the current commit SHA as a rollback point
 3. read_file to understand the current code
 4. edit_file with precise search/replace diffs
-5. check_deployment to verify the build
+5. check_deployment to verify the preview build
 6. If build fails: read error → fix → check again. If still failing after 2 fix attempts, revert_file to the pre-edit commit SHA.
-7. browse_page to verify changes visually on the deployed site
+7. browse_page to verify changes visually on the preview deployment
 8. If something looks wrong: fix → redeploy → verify again. If unable to fix, revert_file.
-9. report_to_user when done (include verification results and whether any reverts were needed)`;
+9. report_to_user when done (include the preview URL and verification results)`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -227,7 +232,7 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'report_to_user',
-      description: 'Return a final report to the user. This ends the coding session. Include a summary of all changes made, files modified, and deployment status.',
+      description: 'Return a final report to the user. This ends the coding session. Include a summary of all changes made, files modified, and deployment status. IMPORTANT: Always include the preview_url if you obtained one from check_deployment.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -239,6 +244,10 @@ function getToolDefinitions(): Anthropic.Tool[] {
             type: 'string',
             enum: ['success', 'error', 'partial'],
             description: 'Overall status of the coding task'
+          },
+          preview_url: {
+            type: 'string',
+            description: 'The Vercel preview deployment URL for the user to review changes before publishing'
           }
         },
         required: ['message', 'status']
@@ -319,12 +328,15 @@ async function executeTool(
   context: CodingAgentContext
 ): Promise<string> {
   const basePath = `/api/landing-pages/v0/generated/${context.pageId}`;
+  const branch = context.draftBranch || "main";
+  const branchQuery: Record<string, string> = branch !== "main" ? { branch } : {};
 
   switch (toolName) {
     case 'list_files': {
       const data = await mcpFetch({
         method: 'GET',
         path: `${basePath}/files`,
+        queryParams: branchQuery,
         context: { userId: context.userId }
       });
       const files = data.files || [];
@@ -335,7 +347,7 @@ async function executeTool(
       const data = await mcpFetch({
         method: 'GET',
         path: `${basePath}/file-content`,
-        queryParams: { path: args.file_path },
+        queryParams: { path: args.file_path, ...branchQuery },
         context: { userId: context.userId }
       });
       return data.content || '';
@@ -346,11 +358,11 @@ async function executeTool(
         return 'Error: edits array is required and must not be empty.';
       }
 
-      // Step 1: Read current file content
+      // Step 1: Read current file content (from draft branch if applicable)
       const fileData = await mcpFetch({
         method: 'GET',
         path: `${basePath}/file-content`,
-        queryParams: { path: args.file_path },
+        queryParams: { path: args.file_path, ...branchQuery },
         context: { userId: context.userId }
       });
 
@@ -370,13 +382,16 @@ async function executeTool(
         body: {
           file_path: args.file_path,
           content: newContent,
-          commit_message: args.commit_message || `Edit ${args.file_path}`
+          commit_message: args.commit_message || `Edit ${args.file_path}`,
+          ...(branch !== "main" ? { branch } : {}),
         },
         context: { userId: context.userId }
       });
 
       let response = `Applied ${appliedCount}/${args.edits.length} edits to ${args.file_path}.`;
-      if (writeResult.deployed_url) {
+      if (writeResult.is_staging) {
+        response += ` Changes pushed to draft branch ${branch}. A preview deployment is being created.`;
+      } else if (writeResult.deployed_url) {
         response += ` Changes will auto-deploy to ${writeResult.deployed_url}.`;
       }
       if (writeResult.commit_url) {
@@ -389,7 +404,7 @@ async function executeTool(
     }
 
     case 'list_commits': {
-      const queryParams: Record<string, string> = {};
+      const queryParams: Record<string, string> = { ...branchQuery };
       if (args.file_path) queryParams.path = args.file_path;
       const data = await mcpFetch({
         method: 'GET',
@@ -428,7 +443,8 @@ async function executeTool(
         body: {
           file_path: args.file_path,
           content: oldFileData.content,
-          commit_message: args.commit_message || `Revert ${args.file_path} to commit ${args.commit_sha.substring(0, 7)}`
+          commit_message: args.commit_message || `Revert ${args.file_path} to commit ${args.commit_sha.substring(0, 7)}`,
+          ...(branch !== "main" ? { branch } : {}),
         },
         context: { userId: context.userId }
       });
@@ -444,6 +460,16 @@ async function executeTool(
     }
 
     case 'check_deployment': {
+      if (branch !== "main") {
+        // For draft branches, check the preview deployment
+        const data = await mcpFetch({
+          method: 'GET',
+          path: `${basePath}/preview-url`,
+          queryParams: { branch },
+          context: { userId: context.userId }
+        });
+        return JSON.stringify(data, null, 2);
+      }
       const data = await mcpFetch({
         method: 'GET',
         path: `${basePath}/deployment-status`,
@@ -586,7 +612,7 @@ async function runCodingAgentInternal(
   taskDescription: string,
   context: CodingAgentContext,
   maxIterations: number
-): Promise<{ success: boolean; message: string; iterations: number }> {
+): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
   const client = getBedrockClient();
   const tools = getToolDefinitions();
@@ -653,7 +679,9 @@ async function runCodingAgentInternal(
           return {
             success: status !== 'error',
             message: fnArgs.message || 'Done.',
-            iterations: iteration
+            iterations: iteration,
+            previewUrl: fnArgs.preview_url,
+            branch: context.draftBranch,
           };
         }
 
@@ -710,9 +738,9 @@ export async function runCodingAgent(
   taskDescription: string,
   context: CodingAgentContext,
   maxIterations: number = DEFAULT_MAX_ITERATIONS
-): Promise<{ success: boolean; message: string; iterations: number }> {
+): Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }> {
 
-  const timeoutPromise = new Promise<{ success: boolean; message: string; iterations: number }>((resolve) => {
+  const timeoutPromise = new Promise<{ success: boolean; message: string; iterations: number; previewUrl?: string; branch?: string }>((resolve) => {
     setTimeout(() => {
       resolve({
         success: false,
