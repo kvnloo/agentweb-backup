@@ -12,6 +12,7 @@ import {
   BrandContext,
   getDeploymentStatus,
   getPreviewDeploymentUrl,
+  triggerVercelDeployment,
 } from "../services/v0Service";
 
 const router = Router();
@@ -941,11 +942,20 @@ router.post("/generated/:id/publish", async (req, res: Response) => {
       console.warn(`[LP GENERATION] Could not delete branch ${branch}: ${delErr.message}`);
     }
 
+    // Trigger a Vercel deployment — GitHub API merges don't always trigger the webhook
+    if (page.vercelProjectId) {
+      try {
+        await triggerVercelDeployment(page.vercelProjectId, `${owner}/${repoName}`);
+      } catch (deployErr: any) {
+        console.warn(`[LP GENERATION] Could not trigger Vercel deployment after publish: ${deployErr.message}`);
+      }
+    }
+
     res.json({
       success: true,
       merge_commit_sha: mergeRes.data.sha,
       deployed_url: page.deployedUrl,
-      message: `Changes from ${branch} have been published to main. Your site at ${page.deployedUrl} will update within ~30 seconds.`,
+      message: `Changes from ${branch} have been published to main. Your site at ${page.deployedUrl} will update shortly.`,
     });
   } catch (error: any) {
     const ghStatus = error.response?.status;

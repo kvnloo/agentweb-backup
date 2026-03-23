@@ -1439,6 +1439,18 @@ async function createVercelProject(
 
   console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl} (requested name: ${projectName})`);
 
+  // Disable Vercel Authentication so preview deployments are publicly accessible
+  try {
+    await axios.patch(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      { vercelAuthentication: { deploymentType: "none" } },
+      { headers }
+    );
+    console.log(`[V0 SERVICE] Disabled Vercel Authentication for ${projectName}`);
+  } catch (authErr: any) {
+    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication: ${authErr.message}`);
+  }
+
   // Manually trigger a deployment — Vercel doesn't always auto-deploy when linking to an existing repo
   const { token: ghToken } = await getGitHubOrgToken();
   const repoInfoRes = await axios.get<any>(`https://api.github.com/repos/${repoFullName}`, {
@@ -1620,7 +1632,16 @@ export async function getPreviewDeploymentUrl(
   branch: string
 ): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string }> {
   const vercelToken = await getVercelToken();
-  const headers = { Authorization: `Bearer ${vercelToken}` };
+  const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
+
+  // Ensure Vercel Authentication is disabled so preview URLs are publicly accessible
+  try {
+    await axios.patch(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      { vercelAuthentication: { deploymentType: "none" } },
+      { headers }
+    );
+  } catch (_) { /* non-fatal */ }
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)
   const deploymentsRes = await axios.get<any>(
@@ -1652,6 +1673,36 @@ export async function getPreviewDeploymentUrl(
 
   // Still building
   return { buildStatus: state.toLowerCase(), previewUrl };
+}
+
+/**
+ * Trigger a Vercel deployment for a project on a given branch (defaults to "main").
+ * Used after merging a draft branch to ensure Vercel picks up the changes.
+ */
+export async function triggerVercelDeployment(
+  vercelProjectId: string,
+  repoFullName: string,
+  ref: string = "main"
+): Promise<void> {
+  const vercelToken = await getVercelToken();
+  const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
+
+  const { token: ghToken } = await getGitHubOrgToken();
+  const repoInfoRes = await axios.get<any>(`https://api.github.com/repos/${repoFullName}`, {
+    headers: { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" },
+  });
+  const repoId = repoInfoRes.data.id;
+
+  await axios.post<any>(
+    "https://api.vercel.com/v13/deployments",
+    {
+      name: vercelProjectId,
+      project: vercelProjectId,
+      gitSource: { type: "github", repo: repoFullName, ref, repoId },
+    },
+    { headers }
+  );
+  console.log(`[V0 SERVICE] Triggered deployment for ${repoFullName} on ${ref}`);
 }
 
 /**
