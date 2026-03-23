@@ -104,6 +104,22 @@ export async function getPostsByAccount(
 }
 
 /**
+ * Get a single post by primary key (userId + postId). O(1) lookup.
+ */
+export async function getPostById(userId: string, postId: string): Promise<LinkedInPost | null> {
+    try {
+        const result = await dynamodb.get({
+            TableName: LINKEDIN_POSTS_TABLE,
+            Key: { userId, postId },
+        }).promise();
+        return (result.Item as LinkedInPost) || null;
+    } catch (error) {
+        handleDbError('getPostById', error);
+        return null;
+    }
+}
+
+/**
  * Get posts for a specific user, sorted by timestamp (newest first)
  * Uses the primary key (userId) for efficient querying.
  */

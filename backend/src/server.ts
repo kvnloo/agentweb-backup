@@ -259,11 +259,11 @@ createTestAccount().then(async () => {
       })
       .catch((error) => console.error('Failed to initialize Agent Mode Tools:', error));
 
-    // Social Engagement Automation polling
-    // Scanner: finds new posts and queues engagements — runs every 30 minutes (read-only, lenient limits)
-    // Executor: processes due queued engagement actions — runs every 10 minutes (write calls, needs breathing room)
-    const SCANNER_INTERVAL_MS = 60 * 60 * 1000;   // 60 minutes
-    const EXECUTOR_INTERVAL_MS = 30 * 60 * 1000;   // 30 minutes
+    // Social Engagement Automation
+    // Scanner: discovers posts and queues engagement actions — runs every 60 minutes
+    // TimerScheduler: every 5 min, registers precise setTimeout for actions due within 10 min
+    //   - replaces fixed executor poll; also handles crash recovery (overdue actions fire with delay=0)
+    const SCANNER_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
 
     setTimeout(async () => {
       try {
@@ -281,18 +281,13 @@ createTestAccount().then(async () => {
       }
 
       try {
-        const { SocialEngagementExecutor } = await import('./cron/socialEngagementExecutor');
+        const { SocialEngagementExecutor, SocialEngagementTimerScheduler } = await import('./cron/socialEngagementExecutor');
         const executor = new SocialEngagementExecutor();
-
-        console.log('[SocialEngagement] Executor initialized — running first pass...');
-        executor.processQueue().catch(e => console.error('[SocialEngagement] Executor error:', e));
-
-        setInterval(() => {
-          console.log('[SocialEngagement] Executor running...');
-          executor.processQueue().catch(e => console.error('[SocialEngagement] Executor error:', e));
-        }, EXECUTOR_INTERVAL_MS);
+        const timerScheduler = new SocialEngagementTimerScheduler(executor);
+        timerScheduler.start();
+        console.log('[SocialEngagement] TimerScheduler started.');
       } catch (error) {
-        console.error('[SocialEngagement] Failed to initialize executor:', error);
+        console.error('[SocialEngagement] Failed to initialize executor/timer scheduler:', error);
       }
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });

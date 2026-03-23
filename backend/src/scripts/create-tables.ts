@@ -1647,11 +1647,8 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
-<<<<<<< HEAD
     await createSocialEngagementTrackingTable();
-=======
     await createBrowserCookiesTable();
->>>>>>> origin/main
     console.log('All tables created successfully');
   } catch (error) {
     console.error('Error creating tables:', error);

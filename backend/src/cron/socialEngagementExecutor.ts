@@ -2,7 +2,9 @@ import { scheduleDb, userDb, socialEngagementTrackingDb } from '../services/db';
 import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { agentModeService } from '../services/agentModeService';
+import { v4 as uuidv4 } from 'uuid';
 
+const INSTANCE_ID = uuidv4();
 const COMMENT_MODEL = 'gemini-3.1-flash-lite-preview';
 
 const POST_COMMENT_SYSTEM_PROMPT = `You are a professional social media engagement assistant.
@@ -37,10 +39,18 @@ function getLinkedInAdapter(): LinkedInAdapter {
  * No Emma / runScheduledChat involved.
  */
 export class SocialEngagementExecutor {
+    private isProcessing = false;
+
     public async processQueue() {
+        if (this.isProcessing) {
+            console.log('[SocialEngagementExecutor] Already processing, skipping concurrent run.');
+            return;
+        }
+        this.isProcessing = true;
         console.log('[SocialEngagementExecutor] Checking for due engagements...');
         try {
-            const actions = await scheduleDb.getDueSocialEngagementActions();
+            const now = new Date().toISOString();
+            const actions = await scheduleDb.getSocialEngagementActionsUpTo(now);
 
             if (actions.length === 0) {
                 console.log('[SocialEngagementExecutor] No engagements due.');
@@ -60,6 +70,8 @@ export class SocialEngagementExecutor {
             }
         } catch (error) {
             console.error('[SocialEngagementExecutor] Critical error:', error);
+        } finally {
+            this.isProcessing = false;
         }
     }
 
@@ -69,6 +81,13 @@ export class SocialEngagementExecutor {
 
         console.log(`\n[Executor] ════ Processing action ${scheduleId} ════`);
         console.log(`[Executor] Action: ${actionType} | Target: ${targetType || 'post'} | Platform: ${platform}`);
+
+        // Atomically claim this action — prevents duplicate execution across instances
+        const claimed = await scheduleDb.claimAction(scheduleId, INSTANCE_ID);
+        if (!claimed) {
+            console.log(`[Executor] Action ${scheduleId} already claimed by another instance, skipping.`);
+            return;
+        }
 
         if (!postId || !platform || !engagingAccountId) {
             console.warn(`[Executor] Skipping invalid action ${scheduleId}: missing required fields.`);
@@ -203,21 +222,22 @@ export class SocialEngagementExecutor {
         postId: string
     ): Promise<string> {
         try {
-            // Try to fetch with owner's account if available, otherwise use engager
+            // Prefer fetching via the owner's account (has direct DB/API access to the post)
             let fetchConnection = engagingConnection;
+            let fetchUserId = engagingUserId;
             if (ownerAccountId && ownerAccountId !== engagingConnection.account_id) {
                 const ownerUser = await userDb.getUserById(ownerUserId);
                 const ownerConn = ownerUser?.connected_accounts?.find(
                     (c: ConnectedAccount) => c.account_id === ownerAccountId
                 );
-                if (ownerConn) fetchConnection = ownerConn;
+                if (ownerConn) {
+                    fetchConnection = ownerConn;
+                    fetchUserId = ownerUserId;
+                }
             }
 
-            const posts = await adapter.listPosts(fetchConnection, { limit: 20 }, engagingUserId);
-            const post = posts.find((p: any) => (p.id || p.urn) === postId);
-            if (post) {
-                return post.commentary || post.content || post.text || '[No text content]';
-            }
+            const content = await adapter.getPost(fetchConnection, postId, fetchUserId);
+            if (content) return content;
         } catch (err) {
             console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
         }
@@ -333,6 +353,70 @@ export class SocialEngagementExecutor {
             );
         } catch (error) {
             console.error(`[Executor] Failed to mark action ${scheduleId} as done:`, error);
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TIMER SCHEDULER
+// ────────────────────────────────────────────────────────────────────────────
+
+const TIMER_LOOKAHEAD_MS = 10 * 60 * 1000;  // register timers for actions due within 10 min
+const TIMER_CHECK_INTERVAL_MS = 5 * 60 * 1000;  // check every 5 min
+
+/**
+ * Polls DB every 5 minutes for social engagement actions due within the next 10 minutes
+ * and registers a precise setTimeout for each. Replaces the fixed-interval executor poll:
+ *
+ * - No long-lived timers: only actions within a 10-min rolling window are in memory
+ * - Crash recovery built-in: overdue actions (nextRunTime < now) are picked up on the
+ *   next 5-min check with delay=0 (fires immediately)
+ * - Multi-instance safety: the claimAction guard in the executor prevents duplicate execution
+ */
+export class SocialEngagementTimerScheduler {
+    private pendingTimers = new Set<string>();
+
+    constructor(private executor: SocialEngagementExecutor) {}
+
+    public start() {
+        console.log('[TimerScheduler] Starting — first pass in 1s...');
+        // Small delay on startup so the executor is fully initialised first
+        setTimeout(() => this.scheduleUpcoming(), 1000);
+        setInterval(() => this.scheduleUpcoming(), TIMER_CHECK_INTERVAL_MS);
+    }
+
+    private async scheduleUpcoming() {
+        try {
+            const windowEnd = new Date(Date.now() + TIMER_LOOKAHEAD_MS).toISOString();
+            const actions = await scheduleDb.getSocialEngagementActionsUpTo(windowEnd);
+
+            let registered = 0;
+            for (const action of actions) {
+                const { scheduleId, nextRunTime } = action;
+                if (this.pendingTimers.has(scheduleId)) continue;
+
+                const delay = Math.max(0, new Date(nextRunTime).getTime() - Date.now());
+                setTimeout(() => {
+                    this.pendingTimers.delete(scheduleId);
+                    this.executor.processQueue().catch(e =>
+                        console.error('[TimerScheduler] processQueue error:', e)
+                    );
+                }, delay);
+                this.pendingTimers.add(scheduleId);
+                registered++;
+
+                if (delay === 0) {
+                    console.log(`[TimerScheduler] Overdue action ${scheduleId} — firing immediately`);
+                } else {
+                    console.log(`[TimerScheduler] Registered timer for ${scheduleId} — fires in ${Math.round(delay / 1000)}s`);
+                }
+            }
+
+            if (registered > 0) {
+                console.log(`[TimerScheduler] Registered ${registered} new timer(s). Pending: ${this.pendingTimers.size}`);
+            }
+        } catch (error) {
+            console.error('[TimerScheduler] Error during scheduled check:', error);
         }
     }
 }

@@ -265,6 +265,36 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     return response.elements || [];
   }
 
+  /**
+   * Fetch a single post's text content by postId.
+   * For personal accounts: O(1) DynamoDB get by primary key.
+   * For org accounts: falls back to listPosts scan (LinkedIn API has no direct single-post fetch).
+   */
+  async getPost(account: ConnectedAccount, postId: string, userId?: string): Promise<string | null> {
+    const config = account.config as LinkedInConfig;
+
+    if (config.account_type === 'personal') {
+      try {
+        const { getPostById } = await import('../linkedInPostsDb');
+        const post = await getPostById(userId || '', postId);
+        return post ? post.content : null;
+      } catch (err) {
+        console.warn('[LinkedInAdapter] getPost DB lookup failed:', err);
+        return null;
+      }
+    }
+
+    // Org accounts: scan recent posts for the matching URN
+    try {
+      const posts = await this.listPosts(account, { limit: 20 }, userId);
+      const found = posts.find((p: any) => (p.id || p.urn) === postId);
+      return found ? (found.commentary || found.content || found.text || null) : null;
+    } catch (err) {
+      console.warn('[LinkedInAdapter] getPost listPosts fallback failed:', err);
+      return null;
+    }
+  }
+
   async getPostMetrics(account: ConnectedAccount, postIds: string[], userId?: string): Promise<PostMetric[]> {
     const config = account.config as LinkedInConfig;
 

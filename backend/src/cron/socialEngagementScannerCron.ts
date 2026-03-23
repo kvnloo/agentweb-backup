@@ -27,8 +27,13 @@ export class SocialEngagementScanner {
     public async runScanner() {
         console.log('[SocialEngagementScanner] Starting discovery scan...');
         try {
-            const allUsers = await userDb.getAllUsers();
-            for (const user of allUsers) {
+            // Only load users that have at least one connected account — skips the
+            // expensive per-user task/workflow/chat count queries done by getAllUsers().
+            const usersWithAccounts = await userDb.scanWithFilter(
+                'attribute_exists(connected_accounts)',
+                {}
+            );
+            for (const user of usersWithAccounts) {
                 await this.processUser(user);
             }
         } catch (error) {

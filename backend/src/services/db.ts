@@ -203,9 +203,6 @@ export interface User {
       /** Spread comment engagements randomly within this window (minutes) */
       commentEngagementWindowMinutes: number;
 
-      // COMMENT ENGAGEMENT — ENGAGER ROLE
-      /** Allow this account to engage on others' post comments */
-      enableAsCommentEngager: boolean;
     };
     created_at: string;
     updated_at: string;
@@ -1939,6 +1936,54 @@ export const scheduleDb = {
           }
         },
 
+  async getSocialEngagementActionsUpTo(windowEnd: string): Promise<any[]> {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        IndexName: 'StatusStartTimeIndex',
+        KeyConditionExpression: '#status = :status AND #nextRunTime <= :windowEnd',
+        FilterExpression: '#type = :type',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+          '#nextRunTime': 'nextRunTime',
+          '#type': 'type',
+        },
+        ExpressionAttributeValues: {
+          ':status': 'active',
+          ':windowEnd': windowEnd,
+          ':type': 'social_engagement_action',
+        },
+      };
+      const result = await dynamodb.query(params).promise();
+      return result.Items || [];
+    } catch (error) {
+      handleDynamoDbError(error, 'getSocialEngagementActionsUpTo');
+      return [];
+    }
+  },
+
+  async claimAction(scheduleId: string, instanceId: string): Promise<boolean> {
+    const staleThreshold = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'SET claimedAt = :now, claimedBy = :instanceId',
+        ConditionExpression: 'attribute_not_exists(claimedAt) OR claimedAt <= :staleThreshold',
+        ExpressionAttributeValues: {
+          ':now': new Date().toISOString(),
+          ':instanceId': instanceId,
+          ':staleThreshold': staleThreshold,
+        },
+      }).promise();
+      return true;
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(error, 'claimAction');
+      return false;
+    }
+  },
+
   async updateScheduleAfterRun(scheduleId: string, lastRunTime: string, nextRunTime: string, decrementRunCount: boolean = true) {
     try {
       // First, get the current schedule to check runCount
@@ -1987,7 +2032,7 @@ export const scheduleDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: { scheduleId },
-        UpdateExpression: `SET ${updateParts.join(', ')}`,
+        UpdateExpression: `SET ${updateParts.join(', ')} REMOVE claimedAt, claimedBy`,
         ExpressionAttributeNames: attributeNames,
         ExpressionAttributeValues: attributeValues,
         ReturnValues: 'ALL_NEW',

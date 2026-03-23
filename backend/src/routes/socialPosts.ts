@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { getPostsForUser } from '../services/socialPostsService';
-import { userDb } from '../services/db';
+import { userDb, scheduleDb, socialEngagementTrackingDb } from '../services/db';
 
 const router = Router();
 
@@ -94,7 +94,6 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
       maxCommentLikesPerPost,
       maxCommentRepliesPerPost,
       commentEngagementWindowMinutes,
-      enableAsCommentEngager,
     } = normalised;
 
     // Validate post preferredActions (required when enabling post discovery)
@@ -152,7 +151,6 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
           maxCommentLikesPerPost: resolvedMaxCommentLikes,
           maxCommentRepliesPerPost: resolvedMaxCommentReplies,
           commentEngagementWindowMinutes: resolvedCommentWindow,
-          enableAsCommentEngager: !!enableAsCommentEngager,
         },
       };
     });
@@ -167,6 +165,84 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
   } catch (error) {
     console.error('[SocialPosts/Config PUT] Error:', error);
     return res.status(500).json({ error: 'Failed to save config' });
+  }
+});
+
+// ─── Shared enrichment helper ────────────────────────────────────────────────
+async function enrichActivities(records: any[], userId: string): Promise<any[]> {
+  // Build accountId → name map from user's connected accounts
+  const user = await userDb.getUserById(userId);
+  const accountMap = new Map<string, string>(
+    (user?.connected_accounts || []).map((a: any) => [a.account_id, a.account_name])
+  );
+
+  // Batch-fetch nextRunTime for queued items
+  const queuedIds = records.filter((r) => r.status === 'queued').map((r) => r.scheduleId);
+  const scheduleMap = new Map<string, string>();
+  await Promise.all(
+    queuedIds.map(async (sid: string) => {
+      const schedule = await scheduleDb.getScheduleById(sid);
+      if (schedule?.nextRunTime) scheduleMap.set(sid, schedule.nextRunTime);
+    })
+  );
+
+  const enriched = records.map((r) => ({
+    ...r,
+    ownerAccountName: accountMap.get(r.ownerAccountId) || r.ownerAccountId,
+    engagingAccountName: accountMap.get(r.engagingAccountId) || r.engagingAccountId,
+    scheduledFor: r.status === 'queued' ? scheduleMap.get(r.scheduleId) : undefined,
+  }));
+
+  // Sort: queued (soonest first) then completed/failed (most recent first)
+  const queued = enriched
+    .filter((r) => r.status === 'queued')
+    .sort((a, b) => (a.scheduledFor || '').localeCompare(b.scheduledFor || ''));
+  const done = enriched
+    .filter((r) => r.status !== 'queued')
+    .sort((a, b) => (b.executedAt || b.createdAt || '').localeCompare(a.executedAt || a.createdAt || ''));
+
+  return [...queued, ...done];
+}
+
+// ─── GET activity for a specific account (as engaging account) ───────────────
+router.get('/social-posts/activity/account/:accountId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { accountId } = req.params;
+
+    // Verify the account belongs to this user
+    const user = await userDb.getUserById(userId);
+    const owns = (user?.connected_accounts || []).some((a: any) => a.account_id === accountId);
+    if (!owns) return res.status(403).json({ error: 'Account does not belong to this user' });
+
+    const records = await socialEngagementTrackingDb.getEngagementsByAccount(accountId);
+    const activities = await enrichActivities(records, userId);
+
+    return res.json({ activities });
+  } catch (error) {
+    console.error('[SocialPosts/Activity/Account] Error:', error);
+    return res.status(500).json({ error: 'Failed to fetch account activity' });
+  }
+});
+
+// ─── GET activity for a specific post ────────────────────────────────────────
+router.get('/social-posts/activity/post/:postId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    // postId is a URN (e.g. urn:li:share:123) — decode it from the URL
+    const postId = decodeURIComponent(req.params.postId);
+
+    const records = await socialEngagementTrackingDb.getEngagementsByPost(postId);
+    const activities = await enrichActivities(records, userId);
+
+    return res.json({ activities });
+  } catch (error) {
+    console.error('[SocialPosts/Activity/Post] Error:', error);
+    return res.status(500).json({ error: 'Failed to fetch post activity' });
   }
 });
 
