@@ -8,7 +8,7 @@ You are running inside an EC2 cloud dev environment. These instructions OVERRIDE
 
 2. **Services auto-reload.** The backend uses ts-node-dev (auto-restarts on .ts changes) and frontends use Vite HMR. After editing files, services reload automatically in most cases.
 
-3. **If a service is down, restart it yourself.** Do NOT ask the user to restart services. You have full access — just run `~/agentweb/test-env/dev-services.sh restart <service>` and verify it comes back up by checking the logs. If ts-node-dev stops auto-reloading (e.g. after a crash from syntax errors), restart the backend yourself immediately. Always verify services are healthy after making code changes by checking logs or hitting the health endpoint.
+3. **If a service is down, restart it yourself.** Do NOT ask the user to restart services. You have full access — just run `~/agentweb/test-env/dev-services.sh restart <service>` and verify it comes back up by checking the logs. If ts-node-dev stops auto-reloading (e.g. after a crash from syntax errors), restart the backend yourself immediately. Always verify services are healthy after making code changes by checking logs or hitting the health endpoint. **Do NOT use raw `kill` commands** — always use `dev-services.sh restart <service>` which handles tmux session cleanup and log rotation correctly.
 
 4. **Run services directly.** Unlike the project CLAUDE.md which says "Do NOT run locally", you CAN and SHOULD use the running services directly. They are already running in tmux sessions.
 
