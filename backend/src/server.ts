@@ -94,9 +94,9 @@ io.on('connection', (socket: Socket) => {
   });
 
   // Handle chat messages
-  socket.on('message', async (data: { 
-    sessionId: string; 
-    message: string; 
+  socket.on('message', async (data: {
+    sessionId: string;
+    message: string;
     currentUrl?: string;
     pageContent?: string;
     portal?: 'customer' | 'partner';
@@ -152,7 +152,7 @@ async function createTestAccount() {
 
     // Access the users object from the auth controller
     const users = (global as any).users || {};
-    
+
     // Check if test account already exists
     if (users[TEST_EMAIL]) {
       console.log('Test account already exists');
@@ -213,7 +213,7 @@ const gracefulShutdown = async (signal: string) => {
     } else {
       console.log('HTTP server closed');
     }
-    
+
     // Exit after cleanup
     process.exit(0);
   });
@@ -258,5 +258,39 @@ createTestAccount().then(async () => {
           .catch((error) => console.error('Failed to pre-start worker process:', error));
       })
       .catch((error) => console.error('Failed to initialize Agent Mode Tools:', error));
+
+    // Social Engagement Automation
+    // Scanner: discovers posts and queues engagement actions — runs every 60 minutes
+    // TimerScheduler: every 5 min, registers precise setTimeout for actions due within 10 min
+    //   - replaces fixed executor poll; also handles crash recovery (overdue actions fire with delay=0)
+    const SCANNER_INTERVAL_MS = 60 * 60 * 1000; // 60 minutes
+
+    setTimeout(async () => {
+      try {
+        const { SocialEngagementExecutor, SocialEngagementTimerScheduler } = await import('./cron/socialEngagementExecutor');
+        const executor = new SocialEngagementExecutor();
+        const timerScheduler = new SocialEngagementTimerScheduler(executor);
+        timerScheduler.start();
+        console.log('[SocialEngagement] TimerScheduler started.');
+
+        const { SocialEngagementScanner } = await import('./cron/socialEngagementScannerCron');
+        // Pass callback: when scanner schedules an action within 30 min, register a direct setTimeout
+        const scanner = new SocialEngagementScanner((delayMs) => {
+          setTimeout(() => {
+            executor.processQueue().catch(e => console.error('[SocialEngagement] Direct executor error:', e));
+          }, delayMs);
+        });
+
+        console.log('[SocialEngagement] Scanner initialized — running first pass...');
+        scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+
+        setInterval(() => {
+          scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
+        }, SCANNER_INTERVAL_MS);
+      } catch (error) {
+        console.error('[SocialEngagement] Failed to initialize scanner:', error);
+      }
+
+    }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

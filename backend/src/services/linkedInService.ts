@@ -778,7 +778,7 @@ export class LinkedInService {
 
       const elements = (response.data as any)?.elements || [];
       return elements.map((el: any) => ({
-        commentUrn: el.$URN || el.id || '',
+        commentUrn: el.$URN || (el.id ? `urn:li:comment:(${postUrn},${el.id})` : ''),
         actorUrn: el.actor || '',
         text: el.message?.text || '',
         createdAt: el.created?.time || 0

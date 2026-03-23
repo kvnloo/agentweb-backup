@@ -793,7 +793,7 @@ export async function runVerifiedChat(
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
-async function runScheduledChat(
+export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false

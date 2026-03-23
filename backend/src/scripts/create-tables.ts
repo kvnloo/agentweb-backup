@@ -1539,6 +1539,54 @@ const createAccountMemoryTable = async () => {
   }
 };
 
+// Create Social Engagement Tracking table
+const createSocialEngagementTrackingTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+    AttributeDefinitions: [
+      { AttributeName: 'userId', AttributeType: 'S' },
+      { AttributeName: 'postId_engagingAccountId', AttributeType: 'S' },
+      { AttributeName: 'engagingAccountId', AttributeType: 'S' },
+      { AttributeName: 'postId', AttributeType: 'S' },
+      { AttributeName: 'executedAt', AttributeType: 'S' }
+    ],
+    KeySchema: [
+      { AttributeName: 'userId', KeyType: 'HASH' },
+      { AttributeName: 'postId_engagingAccountId', KeyType: 'RANGE' }
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: 'EngagingAccountIndex',
+        KeySchema: [
+          { AttributeName: 'engagingAccountId', KeyType: 'HASH' },
+          { AttributeName: 'executedAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      },
+      {
+        IndexName: 'PostEngagementIndex',
+        KeySchema: [
+          { AttributeName: 'postId', KeyType: 'HASH' },
+          { AttributeName: 'executedAt', KeyType: 'RANGE' }
+        ],
+        Projection: { ProjectionType: 'ALL' }
+      }
+    ],
+    BillingMode: 'PAY_PER_REQUEST'
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 const createBrowserCookiesTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-BrowserCookies`,
@@ -1599,6 +1647,7 @@ const main = async () => {
     await createMcpOAuthTokensTable();
     await createLandingPagesTable();
     await createAccountMemoryTable();
+    await createSocialEngagementTrackingTable();
     await createBrowserCookiesTable();
     console.log('All tables created successfully');
   } catch (error) {
