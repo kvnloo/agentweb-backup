@@ -267,8 +267,19 @@ createTestAccount().then(async () => {
 
     setTimeout(async () => {
       try {
+        const { SocialEngagementExecutor, SocialEngagementTimerScheduler } = await import('./cron/socialEngagementExecutor');
+        const executor = new SocialEngagementExecutor();
+        const timerScheduler = new SocialEngagementTimerScheduler(executor);
+        timerScheduler.start();
+        console.log('[SocialEngagement] TimerScheduler started.');
+
         const { SocialEngagementScanner } = await import('./cron/socialEngagementScannerCron');
-        const scanner = new SocialEngagementScanner();
+        // Pass callback: when scanner schedules an action within 30 min, register a direct setTimeout
+        const scanner = new SocialEngagementScanner((delayMs) => {
+          setTimeout(() => {
+            executor.processQueue().catch(e => console.error('[SocialEngagement] Direct executor error:', e));
+          }, delayMs);
+        });
 
         console.log('[SocialEngagement] Scanner initialized — running first pass...');
         scanner.runScanner().catch(e => console.error('[SocialEngagement] Scanner error:', e));
@@ -280,15 +291,6 @@ createTestAccount().then(async () => {
         console.error('[SocialEngagement] Failed to initialize scanner:', error);
       }
 
-      try {
-        const { SocialEngagementExecutor, SocialEngagementTimerScheduler } = await import('./cron/socialEngagementExecutor');
-        const executor = new SocialEngagementExecutor();
-        const timerScheduler = new SocialEngagementTimerScheduler(executor);
-        timerScheduler.start();
-        console.log('[SocialEngagement] TimerScheduler started.');
-      } catch (error) {
-        console.error('[SocialEngagement] Failed to initialize executor/timer scheduler:', error);
-      }
     }, 30000); // Delay 30s after startup to allow Agent Mode to boot first
   });
 }); 

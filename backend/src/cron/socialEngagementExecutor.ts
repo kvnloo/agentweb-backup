@@ -146,19 +146,19 @@ export class SocialEngagementExecutor {
         if (postId) {
             try {
                 await socialEngagementTrackingDb.recordEngagement({
-                    userId,
-                    postId,
-                    commentId: targetType === 'comment' ? commentId : undefined,
-                    platform,
-                    ownerAccountId: ownerAccountId || '',
-                    engagingAccountId,
-                    actionType,
-                    scheduleId,
-                    status: success ? 'completed' : 'failed',
-                    executedAt: new Date().toISOString(),
-                    generatedText: generated.generatedText,
-                    reactionType: generated.reactionType,
-                });
+                        userId,
+                        postId,
+                        commentId: targetType === 'comment' ? commentId : undefined,
+                        platform,
+                        ownerAccountId: ownerAccountId || '',
+                        engagingAccountId,
+                        actionType,
+                        scheduleId,
+                        status: success ? 'completed' : 'failed',
+                        executedAt: new Date().toISOString(),
+                        generatedText: generated.generatedText,
+                        reactionType: generated.reactionType,
+                    });
             } catch (trackErr) {
                 console.warn(`[Executor] Could not record engagement tracking:`, trackErr);
             }
@@ -361,8 +361,8 @@ export class SocialEngagementExecutor {
 // TIMER SCHEDULER
 // ────────────────────────────────────────────────────────────────────────────
 
-const TIMER_LOOKAHEAD_MS = 10 * 60 * 1000;  // register timers for actions due within 10 min
-const TIMER_CHECK_INTERVAL_MS = 5 * 60 * 1000;  // check every 5 min
+const TIMER_LOOKAHEAD_MS = 30 * 60 * 1000;  // register timers for actions due within 10 min
+const TIMER_CHECK_INTERVAL_MS = 30 * 60 * 1000;  // check every 5 min
 
 /**
  * Polls DB every 5 minutes for social engagement actions due within the next 10 minutes

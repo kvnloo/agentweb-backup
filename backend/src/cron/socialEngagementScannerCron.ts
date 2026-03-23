@@ -3,6 +3,10 @@ import { LinkedInAdapter } from '../services/adapters/linkedInAdapter';
 import { ConnectedAccount } from '../services/connectedAccountsDb';
 import { v4 as uuidv4 } from 'uuid';
 
+// Actions scheduled within this window are fired directly via setTimeout by the scanner.
+// Actions beyond this window are left for the TimerScheduler to pick up on its next interval.
+const SCANNER_DIRECT_SCHEDULE_MS = 30 * 60 * 1000; // 30 minutes
+
 function getSocialAdapter(platform: string): LinkedInAdapter | null {
     switch (platform) {
         case 'linkedin': return new LinkedInAdapter();
@@ -24,6 +28,8 @@ function getSocialAdapter(platform: string): LinkedInAdapter | null {
  *     — the reply comes from the same account, not from other accounts
  */
 export class SocialEngagementScanner {
+    constructor(private onActionScheduled?: (delayMs: number) => void) {}
+
     public async runScanner() {
         console.log('[SocialEngagementScanner] Starting discovery scan...');
         try {
@@ -176,6 +182,11 @@ export class SocialEngagementScanner {
             });
 
             console.log(`[Scanner/Posts] Scheduled "${actionType}" on post ${postId} by ${engager.account_name} at ${executionTime}`);
+
+            // If within direct schedule window, fire executor via setTimeout instead of waiting for TimerScheduler
+            if (delayMs <= SCANNER_DIRECT_SCHEDULE_MS) {
+                this.onActionScheduled?.(delayMs);
+            }
         }
     }
 
@@ -249,12 +260,24 @@ export class SocialEngagementScanner {
 
         if (unhandled.length === 0) return;
 
+        // Enforce per-post lifetime cap — subtract already queued/completed counts
+        const { likedCount, repliedCount } = await socialEngagementTrackingDb
+            .getCommentEngagementCountsForPost(postId, account.account_id);
+
+        const remainingLikes = Math.max(0, maxLikes - likedCount);
+        const remainingReplies = Math.max(0, maxReplies - repliedCount);
+
+        if (remainingLikes === 0 && remainingReplies === 0) {
+            console.log(`[Scanner/CommentReply] Post ${postId}: lifetime cap reached (likes: ${likedCount}/${maxLikes}, replies: ${repliedCount}/${maxReplies}), skipping.`);
+            return;
+        }
+
         // Shuffle for random selection
         const shuffled = [...unhandled].sort(() => Math.random() - 0.5);
 
-        // Select up to max for each action independently
-        const replyTargets = new Set(shuffled.slice(0, maxReplies).map((c) => c.commentUrn));
-        const likeTargets = new Set(shuffled.slice(0, maxLikes).map((c) => c.commentUrn));
+        // Select up to remaining capacity for each action independently
+        const replyTargets = new Set(shuffled.slice(0, remainingReplies).map((c) => c.commentUrn));
+        const likeTargets = new Set(shuffled.slice(0, remainingLikes).map((c) => c.commentUrn));
 
         // Union of all comments needing any action
         const allTargetUrns = new Set([...replyTargets, ...likeTargets]);
@@ -310,6 +333,11 @@ export class SocialEngagementScanner {
             });
 
             console.log(`[Scanner/CommentReply] Scheduled "${actionType}" on comment ${commentUrn} as ${account.account_name} at ${executionTime}`);
+
+            // If within direct schedule window, fire executor via setTimeout instead of waiting for TimerScheduler
+            if (delayMs <= SCANNER_DIRECT_SCHEDULE_MS) {
+                this.onActionScheduled?.(delayMs);
+            }
         }
     }
 }

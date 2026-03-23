@@ -502,11 +502,12 @@ class UserDB {
     filterExpression: string,
     expressionAttributeValues: Record<string, any>,
   ): Promise<any[]> {
+    const hasValues = Object.keys(expressionAttributeValues).length > 0;
     const result = await this.docClient
       .scan({
         TableName: this.tableName,
         FilterExpression: filterExpression,
-        ExpressionAttributeValues: expressionAttributeValues,
+        ...(hasValues && { ExpressionAttributeValues: expressionAttributeValues }),
       })
       .promise();
     return result.Items || [];
@@ -4915,6 +4916,8 @@ export const accountMemoryDb = {
   },
 };
 
+const SOCIAL_ENGAGEMENT_MAX_RETRIES = 3;
+
 export const socialEngagementTrackingDb = {
   async recordEngagement(tracker: {
     userId: string;
@@ -4931,19 +4934,42 @@ export const socialEngagementTrackingDb = {
     reactionType?: string;     // LLM-selected reaction type
   }) {
     try {
-      // Dedup key: use commentId for comment actions, postId for post actions
       const dedupId = tracker.commentId || tracker.postId;
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
-        Item: {
-          ...tracker,
-          // Composite sort key: unique per (post/comment, engager) — used for dedup check
-          postId_engagingAccountId: `${dedupId}#${tracker.engagingAccountId}`,
-          createdAt: new Date().toISOString()
-        },
-      };
+      const key = `${dedupId}#${tracker.engagingAccountId}`;
 
-      await dynamodb.put(params).promise();
+      if (tracker.status === 'failed') {
+        // Use UPDATE + ADD to atomically increment failCount instead of overwriting it
+        const setFields: string[] = [
+          '#status = :status', '#platform = :platform',
+          'ownerAccountId = :ownerAccountId', 'actionType = :actionType', 'scheduleId = :scheduleId',
+        ];
+        const exprValues: Record<string, any> = {
+          ':status': 'failed',
+          ':platform': tracker.platform,
+          ':ownerAccountId': tracker.ownerAccountId,
+          ':actionType': tracker.actionType,
+          ':scheduleId': tracker.scheduleId,
+          ':one': 1,
+        };
+        if (tracker.executedAt)    { setFields.push('executedAt = :executedAt');       exprValues[':executedAt']    = tracker.executedAt; }
+        if (tracker.generatedText) { setFields.push('generatedText = :generatedText'); exprValues[':generatedText'] = tracker.generatedText; }
+        if (tracker.reactionType)  { setFields.push('reactionType = :reactionType');   exprValues[':reactionType']  = tracker.reactionType; }
+
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+          Key: { userId: tracker.userId, postId_engagingAccountId: key },
+          UpdateExpression: `SET ${setFields.join(', ')} ADD failCount :one`,
+          ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
+          ExpressionAttributeValues: exprValues,
+        }).promise();
+      } else {
+        // queued / completed — plain put (resets failCount is intentional on success)
+        await dynamodb.put({
+          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+          Item: { ...tracker, postId_engagingAccountId: key, createdAt: new Date().toISOString() },
+        }).promise();
+      }
+
       return tracker;
     } catch (error) {
       handleDynamoDbError(error, "recordEngagement");
@@ -4956,9 +4982,15 @@ export const socialEngagementTrackingDb = {
       const params = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         KeyConditionExpression: "userId = :userId AND postId_engagingAccountId = :postId_engagingAccountId",
+        // Block if already queued/completed, or if max retries reached
+        FilterExpression: "#status IN (:queued, :completed) OR failCount >= :maxRetries",
+        ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":userId": userId,
-          ":postId_engagingAccountId": `${postId}#${engagingAccountId}`
+          ":postId_engagingAccountId": `${postId}#${engagingAccountId}`,
+          ":queued": "queued",
+          ":completed": "completed",
+          ":maxRetries": SOCIAL_ENGAGEMENT_MAX_RETRIES,
         }
       };
 
@@ -5020,6 +5052,38 @@ export const socialEngagementTrackingDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'getEngagementsByPost');
+      throw error;
+    }
+  },
+
+  // Count comment like/reply actions already scheduled or completed for a post by a specific account.
+  // Used to enforce per-post lifetime caps on comment engagement.
+  async getCommentEngagementCountsForPost(postId: string, engagingAccountId: string): Promise<{ likedCount: number; repliedCount: number }> {
+    try {
+      const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        IndexName: 'PostEngagementIndex',
+        KeyConditionExpression: 'postId = :postId',
+        FilterExpression: 'engagingAccountId = :accountId AND attribute_exists(commentId)',
+        ExpressionAttributeValues: {
+          ':postId': postId,
+          ':accountId': engagingAccountId,
+        },
+      };
+
+      const result = await dynamodb.query(params).promise();
+      const items = result.Items || [];
+
+      const likedCount = items.filter((i: any) =>
+        i.actionType === 'like_comment' || i.actionType === 'like_and_reply_comment'
+      ).length;
+      const repliedCount = items.filter((i: any) =>
+        i.actionType === 'reply_comment' || i.actionType === 'like_and_reply_comment'
+      ).length;
+
+      return { likedCount, repliedCount };
+    } catch (error) {
+      handleDynamoDbError(error, 'getCommentEngagementCountsForPost');
       throw error;
     }
   },
