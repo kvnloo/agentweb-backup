@@ -48,6 +48,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
     ],
   },
   {
+    date: '2026-03-23',
+    changes: [
+      'New: Landing Page Staging & Preview Workflow',
+      '- When Emma edits your landing page code, changes now go to a staging branch instead of directly to production',
+      '- Emma provides a Vercel preview URL so you can review changes before they go live',
+      '- Say "publish" to Emma when you\'re happy with the changes, and she\'ll push them live',
+      '- Each chat session gets its own draft branch, so multiple sessions can work independently',
+      '- After publishing, a Vercel deployment is automatically triggered to ensure your live site updates promptly',
+    ],
+  },
+  {
     date: '2026-03-22',
     changes: [
       'Fix: Scheduled Chat List Could Crash Sessions for Users with Large Run History',

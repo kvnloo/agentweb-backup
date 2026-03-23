@@ -4540,6 +4540,9 @@ const bridgedToolNames = [
   'enable_lead_list_public_access',
   'duplicate_landing_page',
   'get_deployment_status',
+  'list_landing_page_files',
+  'get_landing_page_preview_url',
+  'publish_landing_page_changes',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -4572,7 +4575,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent reads files, makes precise diff-based edits, checks deployment status, verifies changes in the browser, and iterates on build errors autonomously. Use this for ANY task that involves modifying landing page code (HTML, CSS, JS/TSX, config files). The agent runs autonomously, verifies its own work visually, and returns results when done.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4602,19 +4605,34 @@ emmaToolRegistry.register({
         }
       : undefined;
 
+    // Use a draft branch for staging — derive from session ID
+    const sessionId = context?.sessionId || '';
+    const draftBranch = sessionId ? `draft/${sessionId.substring(0, 16)}` : undefined;
+
     const result = await runCodingAgent(
       args.task_description,
       {
         pageId: args.page_id,
         userId: context?.userId,
-        sessionId: context?.sessionId,
+        sessionId,
         llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
         socketEmit: context?.socketEmit,
         executeMcpTool,
+        draftBranch,
       }
     );
     if (result.success) {
-      return { success: true, message: result.message, iterations: result.iterations };
+      return {
+        success: true,
+        message: result.message,
+        iterations: result.iterations,
+        previewUrl: result.previewUrl,
+        branch: result.branch,
+        is_staging: !!result.branch && result.branch !== 'main',
+        note: result.branch && result.branch !== 'main'
+          ? `Changes are on staging branch "${result.branch}". The user must review the preview URL and ask to publish before changes go live.`
+          : undefined,
+      };
     } else {
       return { success: false, error: result.message, iterations: result.iterations };
     }

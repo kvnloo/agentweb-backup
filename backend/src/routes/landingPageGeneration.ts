@@ -11,6 +11,8 @@ import {
   deleteLandingPage,
   BrandContext,
   getDeploymentStatus,
+  getPreviewDeploymentUrl,
+  triggerVercelDeployment,
 } from "../services/v0Service";
 
 const router = Router();
@@ -27,6 +29,48 @@ const GENERATION_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 // Cheap operations (GitHub file edits) — just API calls, no credit cost
 const EDIT_RATE_LIMIT_MAX = 60;
 const EDIT_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+// Branch name must be draft/<id> where id is alphanumeric, dashes, underscores (8-64 chars)
+const VALID_BRANCH_RE = /^draft\/[a-zA-Z0-9_-]{8,64}$/;
+
+function validateBranchName(branch: string): boolean {
+  return branch === "main" || VALID_BRANCH_RE.test(branch);
+}
+
+/**
+ * Ensure a branch exists in the repo. Creates it from main's HEAD if missing.
+ * No-op if the branch already exists.
+ */
+async function ensureBranchExists(
+  repoBase: string,
+  branch: string,
+  ghHeaders: Record<string, string>,
+  timeoutMs: number
+): Promise<void> {
+  if (branch === "main") return;
+
+  try {
+    await axios.get<any>(`${repoBase}/git/ref/heads/${branch}`, {
+      headers: ghHeaders, timeout: timeoutMs,
+    });
+    // Branch exists
+  } catch (err: any) {
+    if (err.response?.status === 404) {
+      // Branch doesn't exist — create from main HEAD
+      const mainRef = await axios.get<any>(`${repoBase}/git/ref/heads/main`, {
+        headers: ghHeaders, timeout: timeoutMs,
+      });
+      const mainSha = mainRef.data.object.sha;
+      await axios.post<any>(`${repoBase}/git/refs`, {
+        ref: `refs/heads/${branch}`,
+        sha: mainSha,
+      }, { headers: ghHeaders, timeout: timeoutMs });
+      console.log(`[LP GENERATION] Created branch ${branch} from main (${mainSha.substring(0, 7)})`);
+    } else {
+      throw err;
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // In-memory per-user rate limiters
@@ -405,10 +449,15 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     }
 
     const [, owner, repo] = match;
-    const { file_path, content, commit_message } = req.body;
+    const { file_path, content, commit_message, branch: rawBranch } = req.body;
+    const branch: string = rawBranch || "main";
 
     if (!file_path || !content) {
       return res.status(400).json({ error: "file_path and content are required" });
+    }
+
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name. Must be 'main' or 'draft/<id>'." });
     }
 
     // Prevent path traversal attacks
@@ -426,6 +475,9 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     const GITHUB_TIMEOUT_MS = 30_000;
     const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
 
+    // Ensure the target branch exists (creates from main if needed)
+    await ensureBranchExists(repoBase, branch, ghHeaders, GITHUB_TIMEOUT_MS);
+
     const base64Content = Buffer.from(content, "utf-8").toString("base64");
     const contentSizeBytes = Buffer.byteLength(content, "utf-8");
     const CONTENTS_API_LIMIT = 1_000_000; // 1MB limit for Contents API
@@ -433,8 +485,9 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     // Helper: get current file SHA (needed for updates via Contents API)
     const getFileSha = async (): Promise<string | undefined> => {
       try {
+        const refParam = branch !== "main" ? `?ref=${branch}` : "";
         const fileRes = await axios.get<any>(
-          `${repoBase}/contents/${file_path}`,
+          `${repoBase}/contents/${file_path}${refParam}`,
           { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
         );
         return fileRes.data.sha;
@@ -451,6 +504,7 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
         content: base64Content,
       };
       if (sha) putBody.sha = sha;
+      if (branch !== "main") putBody.branch = branch;
 
       return axios.put<any>(
         `${repoBase}/contents/${file_path}`,
@@ -469,9 +523,9 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
       );
       const blobSha = blobRes.data.sha;
 
-      // 2. Get the latest commit SHA on the default branch
+      // 2. Get the latest commit SHA on the target branch
       const refRes = await axios.get<any>(
-        `${repoBase}/git/ref/heads/main`,
+        `${repoBase}/git/ref/heads/${branch}`,
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
       );
       const latestCommitSha = refRes.data.object.sha;
@@ -499,7 +553,7 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
 
       // 5. Update the ref
       await axios.patch<any>(
-        `${repoBase}/git/refs/heads/main`,
+        `${repoBase}/git/refs/heads/${branch}`,
         { sha: newCommitRes.data.sha },
         { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
       );
@@ -530,13 +584,18 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
       }
     }
 
+    const isStaging = branch !== "main";
     res.json({
       success: true,
       commit_url: commitRes.data.commit?.html_url || commitRes.data.html_url,
       file_path,
       page_id: page.id,
       deployed_url: page.deployedUrl,
-      message: `File "${file_path}" updated. Changes will auto-deploy to ${page.deployedUrl} within ~30 seconds.`,
+      branch,
+      is_staging: isStaging,
+      message: isStaging
+        ? `File "${file_path}" updated on branch ${branch}. A Vercel preview deployment will be created. Use get_preview_url to check the preview, then publish_landing_page_changes when ready to go live.`
+        : `File "${file_path}" updated. Changes will auto-deploy to ${page.deployedUrl} within ~30 seconds.`,
     });
   } catch (error: any) {
     const ghStatus = error.response?.status;
@@ -597,16 +656,36 @@ router.get("/generated/:id/files", async (req, res: Response) => {
     const { getGitHubOrgToken } = await import("../utils/secretsManager");
     const { token } = await getGitHubOrgToken();
 
-    const treeRes = await axios.get<any>(
-      `https://api.github.com/repos/${owner}/${repoName}/git/trees/main?recursive=1`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
-    );
+    const branch = (req.query.branch as string) || "main";
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name" });
+    }
+
+    let effectiveBranch = branch;
+    let treeRes;
+    try {
+      treeRes = await axios.get<any>(
+        `https://api.github.com/repos/${owner}/${repoName}/git/trees/${branch}?recursive=1`,
+        { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+      );
+    } catch (branchErr: any) {
+      // If draft branch doesn't exist yet, fall back to main
+      if (branch !== "main" && branchErr.response?.status === 404) {
+        effectiveBranch = "main";
+        treeRes = await axios.get<any>(
+          `https://api.github.com/repos/${owner}/${repoName}/git/trees/main?recursive=1`,
+          { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+        );
+      } else {
+        throw branchErr;
+      }
+    }
 
     const files = treeRes.data.tree
       .filter((item: any) => item.type === "blob")
       .map((item: any) => ({ path: item.path, size: item.size }));
 
-    res.json({ files, repo: `${owner}/${repoName}` });
+    res.json({ files, repo: `${owner}/${repoName}`, branch: effectiveBranch });
   } catch (error: any) {
     console.error("[LP GENERATION] Error listing files:", error);
     res.status(500).json({ error: "Failed to list files" });
@@ -629,6 +708,11 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
     const filePath = req.query.path as string;
     if (!filePath) return res.status(400).json({ error: "path query parameter is required" });
 
+    const branch = (req.query.branch as string) || "main";
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name" });
+    }
+
     // Prevent path traversal attacks
     if (filePath.includes('..') || filePath.startsWith('.github/') || filePath.startsWith('.github\\')) {
       return res.status(400).json({ error: "Invalid file path" });
@@ -642,10 +726,24 @@ router.get("/generated/:id/file-content", async (req, res: Response) => {
     const { getGitHubOrgToken } = await import("../utils/secretsManager");
     const { token } = await getGitHubOrgToken();
 
-    const fileRes = await axios.get<any>(
-      `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
-      { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
-    );
+    const refParam = branch !== "main" ? `?ref=${branch}` : "";
+    let fileRes;
+    try {
+      fileRes = await axios.get<any>(
+        `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}${refParam}`,
+        { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+      );
+    } catch (refErr: any) {
+      // If draft branch doesn't exist yet, fall back to main
+      if (branch !== "main" && refErr.response?.status === 404) {
+        fileRes = await axios.get<any>(
+          `https://api.github.com/repos/${owner}/${repoName}/contents/${filePath}`,
+          { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" } }
+        );
+      } else {
+        throw refErr;
+      }
+    }
 
     const content = Buffer.from(fileRes.data.content, "base64").toString("utf-8");
     res.json({ path: filePath, content, sha: fileRes.data.sha });
@@ -677,7 +775,12 @@ router.get("/generated/:id/commits", async (req, res: Response) => {
     const { getGitHubOrgToken } = await import("../utils/secretsManager");
     const { token } = await getGitHubOrgToken();
 
-    const params: Record<string, string> = { per_page: "20" };
+    const branch = (req.query.branch as string) || "main";
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name" });
+    }
+
+    const params: Record<string, string> = { per_page: "20", sha: branch };
     const filePath = req.query.path as string | undefined;
     if (filePath) {
       if (filePath.includes('..') || filePath.startsWith('.github/') || filePath.startsWith('.github\\')) {
@@ -686,14 +789,32 @@ router.get("/generated/:id/commits", async (req, res: Response) => {
       params.path = filePath;
     }
 
-    const commitsRes = await axios.get<any>(
-      `https://api.github.com/repos/${owner}/${repoName}/commits`,
-      {
-        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" },
-        params,
-        timeout: 30_000,
+    let commitsRes;
+    try {
+      commitsRes = await axios.get<any>(
+        `https://api.github.com/repos/${owner}/${repoName}/commits`,
+        {
+          headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" },
+          params,
+          timeout: 30_000,
+        }
+      );
+    } catch (commitErr: any) {
+      // If draft branch doesn't exist yet, fall back to main
+      if (branch !== "main" && commitErr.response?.status === 404) {
+        params.sha = "main";
+        commitsRes = await axios.get<any>(
+          `https://api.github.com/repos/${owner}/${repoName}/commits`,
+          {
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github.v3+json" },
+            params,
+            timeout: 30_000,
+          }
+        );
+      } else {
+        throw commitErr;
       }
-    );
+    }
 
     const commits = commitsRes.data.map((c: any) => ({
       sha: c.sha,
@@ -759,6 +880,124 @@ router.get("/generated/:id/file-at-commit", async (req, res: Response) => {
       return res.status(404).json({ error: "File not found at the specified commit" });
     }
     res.status(500).json({ error: "Failed to read file at commit" });
+  }
+});
+
+/**
+ * POST /api/landing-pages/v0/generated/:id/publish
+ * Merge a draft branch into main and delete the draft branch.
+ * This makes the staged changes live on the production Vercel deployment.
+ */
+router.post("/generated/:id/publish", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.githubRepoUrl) return res.status(400).json({ error: "No GitHub repository" });
+
+    const { branch } = req.body;
+    if (!branch || branch === "main") {
+      return res.status(400).json({ error: "A draft branch name is required (not 'main')" });
+    }
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name" });
+    }
+
+    const repoMatch = page.githubRepoUrl.match(/github\.com\/([^\/]+)\/([^\/]+)/);
+    if (!repoMatch) return res.status(400).json({ error: "Invalid GitHub repo URL" });
+
+    const [, owner, repo] = repoMatch;
+    const repoName = repo.replace('.git', '');
+    const { getGitHubOrgToken } = await import("../utils/secretsManager");
+    const { token } = await getGitHubOrgToken();
+    const ghHeaders = {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.v3+json",
+    };
+    const GITHUB_TIMEOUT_MS = 30_000;
+    const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
+
+    // Merge the draft branch into main
+    const mergeRes = await axios.post<any>(
+      `${repoBase}/merges`,
+      {
+        base: "main",
+        head: branch,
+        commit_message: `Publish landing page changes from ${branch}`,
+      },
+      { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+    );
+
+    console.log(`[LP GENERATION] Merged ${branch} into main: ${mergeRes.data.sha?.substring(0, 7)}`);
+
+    // Delete the draft branch
+    try {
+      await axios.delete(`${repoBase}/git/refs/heads/${branch}`, {
+        headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS,
+      });
+      console.log(`[LP GENERATION] Deleted branch ${branch}`);
+    } catch (delErr: any) {
+      console.warn(`[LP GENERATION] Could not delete branch ${branch}: ${delErr.message}`);
+    }
+
+    // Trigger a Vercel deployment — GitHub API merges don't always trigger the webhook
+    if (page.vercelProjectId) {
+      try {
+        await triggerVercelDeployment(page.vercelProjectId, `${owner}/${repoName}`);
+      } catch (deployErr: any) {
+        console.warn(`[LP GENERATION] Could not trigger Vercel deployment after publish: ${deployErr.message}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      merge_commit_sha: mergeRes.data.sha,
+      deployed_url: page.deployedUrl,
+      message: `Changes from ${branch} have been published to main. Your site at ${page.deployedUrl} will update shortly.`,
+    });
+  } catch (error: any) {
+    const ghStatus = error.response?.status;
+    const ghMessage = error.response?.data?.message || error.message;
+    console.error(`[LP GENERATION] Error publishing branch (HTTP ${ghStatus}):`, ghMessage);
+
+    if (ghStatus === 404) {
+      res.status(404).json({ error: "Branch not found. It may have already been merged or deleted." });
+    } else if (ghStatus === 409) {
+      res.status(409).json({ error: `Merge conflict: ${ghMessage}. Please resolve conflicts manually.` });
+    } else {
+      res.status(500).json({ error: `Failed to publish: ${ghMessage}` });
+    }
+  }
+});
+
+/**
+ * GET /api/landing-pages/v0/generated/:id/preview-url
+ * Get the Vercel preview deployment URL for a draft branch.
+ */
+router.get("/generated/:id/preview-url", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const page = await getLandingPage(req.params.id, userId);
+    if (!page) return res.status(404).json({ error: "Landing page not found" });
+    if (!page.vercelProjectId) return res.status(400).json({ error: "No Vercel project" });
+
+    const branch = req.query.branch as string;
+    if (!branch || branch === "main") {
+      return res.status(400).json({ error: "A draft branch name is required (not 'main')" });
+    }
+    if (!validateBranchName(branch)) {
+      return res.status(400).json({ error: "Invalid branch name" });
+    }
+
+    const result = await getPreviewDeploymentUrl(page.vercelProjectId, branch);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[LP GENERATION] Error getting preview URL:", error);
+    res.status(500).json({ error: error.message || "Failed to get preview URL" });
   }
 });
 
