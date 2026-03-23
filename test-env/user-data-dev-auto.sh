@@ -380,14 +380,14 @@ try:
         cache_parts.append(f'{cache_create:,} cache-write')
     tok_detail = f'{input_tok:,} in + {output_tok:,} out'
     if cache_parts:
-        tok_detail += f' ({", ".join(cache_parts)})'
+        tok_detail += ' (' + ', '.join(cache_parts) + ')'
     parts.append(f'Tokens: {tok_detail}')
     if duration_ms:
         parts.append(f'Duration: {duration_ms / 1000:.0f}s')
     # Model names from modelUsage keys
     models = list(data.get('modelUsage', {}).keys())
     if models:
-        parts.append(f'Model: {", ".join(models)}')
+        parts.append('Model: ' + ', '.join(models))
     usage_line = ' | '.join(parts)
 except Exception:
     text = raw
