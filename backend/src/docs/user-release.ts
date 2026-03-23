@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-23',
     changes: [
+      'New: Slack Monitoring for Emma Q&A',
+      '- Mention @Emma in a Slack channel to start a conversation — Emma replies directly in the thread',
+      '- Follow-up messages in the same thread continue the same Agent Mode session',
+      '- Multiple users can participate in the thread, with each message prefixed by the sender\'s name',
+      '- File attachments in Slack threads are forwarded to Emma for context',
+      '- A link to continue the conversation in the AgentWeb portal is included in the first reply',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
       'Feature: Site-Wide LinkedIn Enrichment Accounts',
       '- Admins can now configure shared Unipile LinkedIn accounts for platform-wide lead enrichment',
       '- When a user doesn\'t have their own LinkedIn account connected, enrichment automatically falls back to the shared account',
