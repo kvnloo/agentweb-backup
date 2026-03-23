@@ -1,14 +1,19 @@
 import express, { Request, Response } from "express";
 import { authenticateToken } from "../middleware/auth";
 import { AuthenticatedRequest } from "../middleware/auth";
-import { 
-  getSlackChannels, 
-  sendApprovalRequest, 
+import {
+  getSlackChannels,
+  sendApprovalRequest,
   sendApprovalRequestWithTracking,
   updateApprovalMessage,
   openFeedbackModal,
   openRejectModal,
-  openTestEmailModal
+  openTestEmailModal,
+  postThreadResponse,
+  postThinkingMessage,
+  deleteSlackMessage,
+  getSlackUserDisplayName,
+  downloadSlackFile
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
 import { taskDb, subscriberDb } from "../services/db";
@@ -151,6 +156,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
       // Acknowledge the event immediately (Slack requires response within 3 seconds)
       res.status(200).send();
 
+      // Import shared services for event handling
+      const { settingsService } = await import('../services/settingsService');
+
       // Handle app mention events
       if (event.type === 'app_mention') {
         const { text, user: slackUserId, channel, ts } = event;
@@ -163,7 +171,6 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
         try {
           // Find user by slack channel using AW-Settings cache
-          const { settingsService } = await import('../services/settingsService');
           const { userDb } = await import('../services/db');
 
           const mappingKey = `slack_channel_mapping_${channel}`;
@@ -209,9 +216,9 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           // Extract the user's message (remove the bot mention)
           const botMentionPattern = /<@[A-Z0-9]+>/g;
-          const userMessage = text.replace(botMentionPattern, '').trim();
+          const rawMessage = text.replace(botMentionPattern, '').trim();
 
-          if (!userMessage) {
+          if (!rawMessage) {
             console.log('❌ No message content after removing bot mention');
             const { WebClient } = await import('@slack/web-api');
             const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
@@ -222,6 +229,10 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             });
             return;
           }
+
+          // Prefix message with sender's display name
+          const displayName = await getSlackUserDisplayName(slackUserId);
+          const userMessage = `${displayName}: ${rawMessage}`;
 
           console.log('📝 Creating Agent Mode session for user:', user.userId);
 
@@ -242,57 +253,89 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
 
           console.log('✅ Agent Mode session created:', session.sessionId);
 
-          // Set session title based on user message
-          const sessionTitle = userMessage.length > 50
-            ? userMessage.substring(0, 47) + '...'
-            : userMessage;
+          // Set session title based on raw message (without username prefix)
+          const sessionTitle = rawMessage.length > 50
+            ? rawMessage.substring(0, 47) + '...'
+            : rawMessage;
           await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
 
-          // Create interactive share link (ishare)
+          // Associate the session with this Slack thread
+          const slackThread = { channel, threadTs: ts };
+          await chatbotDb.updateSessionSlackThread(session.sessionId, slackThread);
+
+          // Save thread-to-session mapping for future thread replies
+          const threadMappingKey = `slack_thread_${channel}_${ts}`;
+          await settingsService.setSetting(
+            threadMappingKey,
+            JSON.stringify({ sessionId: session.sessionId, userId: user.userId }),
+            `Slack thread to session mapping`,
+            'system'
+          );
+
+          // Create interactive share link so user can optionally continue in the portal
           const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
+          console.log('🔗 iShare link created for Slack session:', ishareLink);
 
-          console.log('🔗 iShare link created:', ishareLink);
+          console.log('🔗 Slack thread associated with session:', session.sessionId);
 
-          // Start the chat using the generate function
+          // Post a "thinking" message while we generate the response
+          const thinkingTs = await postThinkingMessage(channel, ts);
+
+          // Generate the response (await it so we can post back to Slack)
           const { generateSessionResponse } = await import('../controllers/agentModeController');
           const { agentModeService } = await import('../services/agentModeService');
-          const { emitProgress } = await import('../utils/sseProgress');
 
-          // Get the default LLM model
-          const llmModel = session.llmModel || agentModeService.default_model;
+          const llmModel = session.llmModel || await agentModeService.getDefaultModel();
 
-          // Emit initial progress to indicate generation has started
-          emitProgress(session.sessionId, {
-            iteration: 0,
-            status: 'thinking'
-          });
+          try {
+            const response = await generateSessionResponse(
+              session.sessionId,
+              userMessage,
+              user.userId,
+              llmModel,
+              [] // attachments
+            );
 
-          // Start generating response asynchronously (don't wait for it to complete)
-          generateSessionResponse(
-            session.sessionId,
-            userMessage,
-            user.userId,
-            llmModel,
-            [] // attachments
-          ).catch(error => {
-            console.error('❌ Error generating agent response for Slack session:', error);
-            // Emit error progress
-            emitProgress(session.sessionId, {
-              iteration: 1,
-              status: 'complete'
-            });
-          });
+            // Remove the thinking message
+            if (thinkingTs) {
+              await deleteSlackMessage(channel, thinkingTs);
+            }
 
-          console.log('✅ Started agent response generation for session:', session.sessionId);
+            // Post Emma's response to the Slack thread
+            if (response.content) {
+              await postThreadResponse(channel, ts, response.content);
+            }
 
-          // Send the ishare link back to Slack
-          const { WebClient } = await import('@slack/web-api');
-          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-          await slackClient.chat.postMessage({
-            channel,
-            text: `✨ I've started a conversation for you! Continue our chat here:\n\n${ishareLink}`,
-            thread_ts: ts
-          });
+            // Post iShare link as a separate follow-up message
+            console.log('🔗 About to post iShare link:', ishareLink);
+            if (ishareLink) {
+              const { WebClient } = await import('@slack/web-api');
+              const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+              await slackClient.chat.postMessage({
+                channel,
+                thread_ts: ts,
+                text: `Continue chat by simply reply or click to chat in AgentWeb portal: ${ishareLink}`,
+                blocks: [
+                  {
+                    type: 'context',
+                    elements: [
+                      {
+                        type: 'mrkdwn',
+                        text: `:speech_balloon: Continue chat by simply reply or <${ishareLink}|click to chat in AgentWeb portal>`
+                      }
+                    ]
+                  }
+                ]
+              });
+            }
+          } catch (genError) {
+            console.error('❌ Error generating agent response for Slack session:', genError);
+            // Remove thinking message and post error
+            if (thinkingTs) {
+              await deleteSlackMessage(channel, thinkingTs);
+            }
+            await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
+          }
 
           console.log('✅ Emma bot mention handled successfully');
         } catch (error) {
@@ -308,6 +351,101 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             });
           } catch (slackError) {
             console.error('❌ Error sending error message to Slack:', slackError);
+          }
+        }
+      }
+
+      // Handle message events in threads (follow-up messages to Emma sessions)
+      // Filter: must be a plain message in a thread, not a bot message or message_changed/deleted event
+      if (event.type === 'message' && event.thread_ts && !event.bot_id && !event.subtype) {
+        const { text, user: slackUserId, channel, thread_ts: threadTs, files } = event;
+
+        // Look up if this thread is associated with an Emma session
+        const threadMappingKey = `slack_thread_${channel}_${threadTs}`;
+        const mapping = await settingsService.getSetting(threadMappingKey);
+
+        if (mapping?.settingValue) {
+          console.log('💬 Thread reply in Emma session:', { channel, threadTs, slackUserId });
+
+          try {
+            const { sessionId, userId } = JSON.parse(mapping.settingValue);
+            const { chatbotDb } = await import('../services/chatbotService');
+            const { generateSessionResponse } = await import('../controllers/agentModeController');
+            const { agentModeService } = await import('../services/agentModeService');
+
+            // Get session to verify it exists
+            const session = await chatbotDb.getChatSession(sessionId);
+            if (!session) {
+              console.log('❌ Session not found for Slack thread:', sessionId);
+              return;
+            }
+
+            // Get the Slack user's display name
+            const displayName = await getSlackUserDisplayName(slackUserId);
+
+            // Format message with username prefix
+            const formattedMessage = `${displayName}: ${text || ''}`.trim();
+
+            // Handle file attachments from Slack
+            const attachments: any[] = [];
+            if (files && files.length > 0) {
+              for (const file of files) {
+                try {
+                  const fileBuffer = await downloadSlackFile(file.url_private);
+                  // Upload to S3 for the session
+                  const { uploadFileToS3 } = await import('../utils/s3Utils');
+                  const uploadResult = await uploadFileToS3(
+                    fileBuffer,
+                    file.name || 'attachment',
+                    userId,
+                    file.mimetype || 'application/octet-stream'
+                  );
+                  if (!uploadResult.success || !uploadResult.url) {
+                    console.error('❌ Failed to upload Slack file to S3');
+                    continue;
+                  }
+                  attachments.push({
+                    url: uploadResult.url,
+                    filename: file.name || 'attachment',
+                    size: file.size,
+                    mimetype: file.mimetype || 'application/octet-stream',
+                  });
+                } catch (fileError) {
+                  console.error('❌ Error downloading Slack file:', fileError);
+                }
+              }
+            }
+
+            // Post thinking message
+            const thinkingTs = await postThinkingMessage(channel, threadTs);
+
+            const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+
+            try {
+              const response = await generateSessionResponse(
+                sessionId,
+                formattedMessage,
+                userId,
+                llmModel,
+                attachments
+              );
+
+              if (thinkingTs) {
+                await deleteSlackMessage(channel, thinkingTs);
+              }
+
+              if (response.content) {
+                await postThreadResponse(channel, threadTs, response.content);
+              }
+            } catch (genError) {
+              console.error('❌ Error generating thread response:', genError);
+              if (thinkingTs) {
+                await deleteSlackMessage(channel, thinkingTs);
+              }
+              await postThreadResponse(channel, threadTs, 'Sorry, I encountered an error. Please try again.');
+            }
+          } catch (parseError) {
+            console.error('❌ Error processing thread reply:', parseError);
           }
         }
       }
