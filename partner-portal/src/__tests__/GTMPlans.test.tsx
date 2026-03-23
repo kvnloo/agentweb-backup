@@ -135,6 +135,25 @@ const toLocalDateString = (date: Date) => {
   return `${year}-${month}-${day}`;
 };
 
+// Helper: render the component and navigate to the Plans tab (My Queue is now the default tab)
+const renderAndGoToPlansTab = async () => {
+  render(
+    <BrowserRouter>
+      <AuthProvider>
+        <GTMPlans />
+      </AuthProvider>
+    </BrowserRouter>
+  );
+
+  // Wait for data to load
+  await waitFor(() => {
+    expect(screen.getByRole('tab', { name: 'Plans' })).toBeInTheDocument();
+  });
+
+  // Click the Plans tab (My Queue is now tab 0, Plans is tab 1)
+  fireEvent.click(screen.getByRole('tab', { name: 'Plans' }));
+};
+
 // Helper function to click on a user card to navigate to their plans
 const clickUserCard = async (user: any, userIdentifier: string) => {
   // Find the card by the text and then find the button within or closest to it
@@ -162,13 +181,7 @@ describe('GTMPlans - Two-Level View', () => {
   });
 
   it('shows user cards in Level 1 view', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       // Should show company names from supportNote
@@ -178,13 +191,7 @@ describe('GTMPlans - Two-Level View', () => {
   });
 
   it('displays user email on user cards', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('user1@example.com')).toBeInTheDocument();
@@ -193,13 +200,7 @@ describe('GTMPlans - Two-Level View', () => {
   });
 
   it('displays total plans count on user cards', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       const cards = screen.getAllByText(/Total Plans:/i);
@@ -208,13 +209,7 @@ describe('GTMPlans - Two-Level View', () => {
   });
 
   it('displays in-progress plans count on user cards', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       const inProgressLabels = screen.getAllByText(/In Progress:/i);
@@ -224,13 +219,7 @@ describe('GTMPlans - Two-Level View', () => {
 
   it('navigates to user plans when clicking a user card', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -249,13 +238,7 @@ describe('GTMPlans - Two-Level View', () => {
 
   it('navigates back to user cards when clicking Back button', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -302,13 +285,7 @@ describe('GTMPlans - Two-Level View', () => {
       data: { success: true, data: plansWithEmptyUser },
     });
 
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       // Should show all three companies
@@ -334,13 +311,7 @@ describe('GTMPlans - Two-Level View', () => {
       data: { success: true, data: [planWithNearDueDate] },
     });
 
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       // Should show the user card
@@ -365,13 +336,7 @@ describe('GTMPlans - Two-Level View', () => {
       data: { success: true, data: [planWithOverdueDate] },
     });
 
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       // Should show the user card
@@ -402,30 +367,18 @@ describe('GTMPlans - Basic Tests', () => {
   });
 
   it('renders the component without crashing', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
     
     await waitFor(() => {
-      // There may be multiple "GTM Plans" texts (heading and description), so use getAllByText
-      const gtmPlansTexts = screen.getAllByText(/GTM Plans/i);
-      expect(gtmPlansTexts.length).toBeGreaterThan(0);
+      // The heading is now "GTM Tracker"
+      const gtmTexts = screen.getAllByText(/GTM Tracker/i);
+      expect(gtmTexts.length).toBeGreaterThan(0);
     });
   });
 
   it('loads and displays GTM plans', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -440,13 +393,7 @@ describe('GTMPlans - Basic Tests', () => {
   });
 
   it('displays user information for each plan', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
     
     await waitFor(() => {
       expect(screen.getByText('user1@example.com')).toBeInTheDocument();
@@ -456,13 +403,7 @@ describe('GTMPlans - Basic Tests', () => {
 
   it('displays plan PoC when present', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -477,13 +418,7 @@ describe('GTMPlans - Basic Tests', () => {
 
   it('displays plan due date when present', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -514,13 +449,7 @@ describe('GTMPlans - Phase Expansion', () => {
 
   it('allows expanding a phase to view work items', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -545,13 +474,7 @@ describe('GTMPlans - Phase Expansion', () => {
 
   it('displays phase PoC when present', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -576,13 +499,7 @@ describe('GTMPlans - Phase Expansion', () => {
 
   it('displays phase due date when present', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -620,13 +537,7 @@ describe('GTMPlans - Work Item Display', () => {
 
   it('displays work item details in table', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -654,13 +565,7 @@ describe('GTMPlans - Work Item Display', () => {
 
   it('displays work item status badge', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -679,7 +584,8 @@ describe('GTMPlans - Work Item Display', () => {
     }
 
     await waitFor(() => {
-      expect(screen.getByText(/pending/i)).toBeInTheDocument();
+      const pendingElements = screen.getAllByText(/pending/i);
+      expect(pendingElements.length).toBeGreaterThan(0);
     });
   });
 });
@@ -715,13 +621,7 @@ describe('GTMPlans - Due Date Management', () => {
       data: { success: true, data: [planWithNearDueDate] },
     });
 
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
     
     await waitFor(() => {
       // Should show warning icon for due date within 3 days
@@ -745,13 +645,7 @@ describe('GTMPlans - Due Date Management', () => {
       data: { success: true, data: [planWithOverdueDate] },
     });
 
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
     
     await waitFor(() => {
       // Should show error icon for overdue dates
@@ -787,13 +681,7 @@ describe('GTMPlans - Due Date Management', () => {
     });
 
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -847,13 +735,7 @@ describe('GTMPlans - PoC Assignment', () => {
 
   it('allows assigning PoC to plan', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -908,13 +790,7 @@ describe('GTMPlans - PoC Assignment', () => {
 
   it('allows assigning PoC to phase', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -979,13 +855,7 @@ describe('GTMPlans - Due Date Updates', () => {
 
   it('allows setting due date for plan', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -1010,13 +880,7 @@ describe('GTMPlans - Due Date Updates', () => {
 
   it('shows constraint warning when due date violates hierarchy', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -1128,13 +992,7 @@ describe('GTMPlans - Status and Notes Updates', () => {
 
   it('allows updating work item status and notes', async () => {
     const user = userEvent.setup();
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Test Company 1')).toBeInTheDocument();
@@ -1274,13 +1132,7 @@ describe('GTMPlans - Pending AgentWeb Items', () => {
   });
 
   it('shows pending AgentWeb items section on cards that have them', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('AgentWeb Client')).toBeInTheDocument();
@@ -1289,13 +1141,7 @@ describe('GTMPlans - Pending AgentWeb Items', () => {
   });
 
   it('displays email breakdown with individual counts', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('alice@agentweb.pro')).toBeInTheDocument();
@@ -1304,13 +1150,7 @@ describe('GTMPlans - Pending AgentWeb Items', () => {
   });
 
   it('does not show pending items section for clients without @agentweb.pro pending items', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('No AgentWeb Client')).toBeInTheDocument();
@@ -1323,13 +1163,7 @@ describe('GTMPlans - Pending AgentWeb Items', () => {
   });
 
   it('does not count completed @agentweb.pro items', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('AgentWeb Client')).toBeInTheDocument();
@@ -1447,13 +1281,7 @@ describe('GTMPlans - Unassigned Pending Items', () => {
   });
 
   it('shows unassigned pending items count on cards that have them', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
@@ -1462,13 +1290,7 @@ describe('GTMPlans - Unassigned Pending Items', () => {
   });
 
   it('counts items with no dri, empty dri, and whitespace-only dri as unassigned', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
@@ -1486,13 +1308,7 @@ describe('GTMPlans - Unassigned Pending Items', () => {
   });
 
   it('does not show unassigned section for clients with all items assigned', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('All Assigned Client')).toBeInTheDocument();
@@ -1504,13 +1320,7 @@ describe('GTMPlans - Unassigned Pending Items', () => {
   });
 
   it('does not count completed items without dri as unassigned', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Unassigned Client')).toBeInTheDocument();
@@ -1525,13 +1335,7 @@ describe('GTMPlans - Unassigned Pending Items', () => {
   });
 
   it('shows both our pending items and unassigned pending on the same card', async () => {
-    render(
-      <BrowserRouter>
-        <AuthProvider>
-          <GTMPlans />
-        </AuthProvider>
-      </BrowserRouter>
-    );
+    await renderAndGoToPlansTab();
 
     await waitFor(() => {
       expect(screen.getByText('Unassigned Client')).toBeInTheDocument();

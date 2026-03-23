@@ -60,8 +60,6 @@ import {
   AttachFile as AttachFileIcon,
   InsertDriveFile as InsertDriveFileIcon,
   Close as CloseIcon,
-  FilterList as FilterListIcon,
-  Sort as SortIcon,
   RateReview as RateReviewIcon,
 } from "@mui/icons-material";
 import { DatePicker } from "@mui/x-date-pickers/DatePicker";
@@ -1482,7 +1480,7 @@ export default function GTMPlans() {
   };
 
   // Inline edit handlers for queue
-  const handleInlineEditStart = (itemId: string, field: "status" | "dri" | "notes", currentValue: string, currentStatus?: string, currentNotes?: string) => {
+  const handleInlineEditStart = (itemId: string, field: "status" | "dri" | "notes", currentValue: string, currentNotes?: string) => {
     setInlineEditingId(itemId);
     setInlineEditField(field);
     if (field === "status") {
@@ -1875,7 +1873,7 @@ export default function GTMPlans() {
                                       setChatDialogTitle(qi.workItem.title);
                                       setChatDialogOpen(true);
                                     } else {
-                                      handleInlineEditStart(qi.workItem.id, "status", qi.workItem.status, qi.workItem.status, qi.workItem.notes);
+                                      handleInlineEditStart(qi.workItem.id, "status", qi.workItem.status, qi.workItem.notes);
                                     }
                                   }}
                                   sx={{ cursor: "pointer" }}
@@ -1967,7 +1965,7 @@ export default function GTMPlans() {
                                 <Tooltip title="Edit Status & Notes">
                                   <IconButton
                                     size="small"
-                                    onClick={() => handleInlineEditStart(qi.workItem.id, "status", qi.workItem.status, qi.workItem.status, qi.workItem.notes)}
+                                    onClick={() => handleInlineEditStart(qi.workItem.id, "status", qi.workItem.status, qi.workItem.notes)}
                                   >
                                     <CheckCircleIcon fontSize="small" />
                                   </IconButton>
