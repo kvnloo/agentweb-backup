@@ -15313,6 +15313,11 @@ Format the response as JSON with this structure:
     sessionId: string
   ): Promise<any> {
     try {
+      // Handle CSS-selector-based operations
+      if (updateType === 'css') {
+        return await this.updateHtmlFileCss(fileUrl, replacementInstructions, userId, sessionId);
+      }
+
       // Validate update_type first (before fetching file)
       if (!updateType || !['part', 'full'].includes(updateType)) {
         return {
@@ -15756,6 +15761,126 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('Error uploading updated file:', error);
       throw new Error(`Failed to upload updated file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // CSS-selector-based HTML file editing
+  private async updateHtmlFileCss(
+    fileUrl: string,
+    operations: any[],
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Validate operations
+      if (!Array.isArray(operations) || operations.length === 0) {
+        return { success: false, message: 'At least one operation is required' };
+      }
+
+      const validActions = ['remove', 'replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter', 'setAttribute', 'removeAttribute'];
+      const actionsNeedingHtml = ['replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter'];
+
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i];
+        if (!op.action || !validActions.includes(op.action)) {
+          return { success: false, message: `Operation ${i + 1}: Invalid action "${op.action}". Valid actions: ${validActions.join(', ')}` };
+        }
+        if (!op.selector) {
+          return { success: false, message: `Operation ${i + 1}: selector is required` };
+        }
+        if (actionsNeedingHtml.includes(op.action) && (op.html === undefined || op.html === null)) {
+          return { success: false, message: `Operation ${i + 1}: html is required for action "${op.action}"` };
+        }
+        if (op.action === 'setAttribute' && (!op.attribute || op.value === undefined)) {
+          return { success: false, message: `Operation ${i + 1}: attribute and value are required for setAttribute` };
+        }
+        if (op.action === 'removeAttribute' && !op.attribute) {
+          return { success: false, message: `Operation ${i + 1}: attribute is required for removeAttribute` };
+        }
+      }
+
+      // Fetch current file content
+      const currentContent = await this.fetchFileContent(fileUrl);
+      console.log(`AgentMode: CSS edit - fetched file, length: ${currentContent.length}`);
+
+      // Load into cheerio
+      const cheerio = await import('cheerio');
+      const $ = cheerio.load(currentContent, { xml: false } as any);
+
+      // Apply operations sequentially
+      let operationsApplied = 0;
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i];
+        const matched = $(op.selector);
+
+        if (matched.length === 0) {
+          return {
+            success: false,
+            message: `Operation ${i + 1} (${op.action}): No elements matched selector "${op.selector}"`,
+            suggestion: 'Use read_file_content to inspect the current HTML structure and verify your CSS selector'
+          };
+        }
+
+        console.log(`AgentMode: CSS edit op ${i + 1}: ${op.action} on "${op.selector}" (${matched.length} matches)`);
+
+        switch (op.action) {
+          case 'remove':
+            matched.remove();
+            break;
+          case 'replace':
+            matched.replaceWith(op.html);
+            break;
+          case 'replaceInner':
+            matched.html(op.html);
+            break;
+          case 'append':
+            matched.append(op.html);
+            break;
+          case 'prepend':
+            matched.prepend(op.html);
+            break;
+          case 'insertBefore':
+            matched.before(op.html);
+            break;
+          case 'insertAfter':
+            matched.after(op.html);
+            break;
+          case 'setAttribute':
+            matched.attr(op.attribute, op.value);
+            break;
+          case 'removeAttribute':
+            matched.removeAttr(op.attribute);
+            break;
+        }
+        operationsApplied++;
+      }
+
+      // Serialize back to HTML
+      const updatedContent = $.html();
+      console.log(`AgentMode: CSS edit complete, ${operationsApplied} operations applied, new length: ${updatedContent.length}`);
+
+      // Upload
+      const versionedFilename = this.createVersionedFilename(fileUrl);
+      const originalPath = this.extractPathFromS3Url(fileUrl);
+      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
+
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        message: `File updated successfully with ${operationsApplied} CSS-selector operations`,
+        method: 'css_selector',
+        operations_applied: operationsApplied,
+        updatedContent, // included for verification
+        versioned_filename: versionedFilename
+      };
+    } catch (error) {
+      console.error('Error in CSS-selector HTML update:', error);
+      return {
+        success: false,
+        message: 'Failed to update HTML file',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'Check your CSS selectors and HTML content. Use read_file_content to inspect the current file structure.'
+      };
     }
   }
 

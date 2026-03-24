@@ -447,12 +447,13 @@ router.post('/create-html-template', async (req: Request, res: Response) => {
   }
 });
 
+// Supports CSS-selector, full, and legacy part modes
 router.post('/update-html-file', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
     const result = await svc.updateHtmlFile(
       req.body.file_url, req.body.update_type,
-      req.body.replacement_instructions,
+      req.body.operations || req.body.replacement_instructions,
       userId(req), req.body.session_id || ''
     );
     res.json(result);

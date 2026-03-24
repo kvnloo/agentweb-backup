@@ -769,7 +769,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   ];
                 } else if (originalApproval.assetType === 'html') {
                   // For HTML reports, use update_html_file function
-                  revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to get the current content and content_hash. Then use update_html_file to apply the requested changes based on the current content. Keep the HTML well-structured and production-ready.`;
+                  revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
                   requiredFunctions = [
                     {
                       functionName: 'update_html_file',
@@ -996,7 +996,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       ];
                     } else if (originalApproval.assetType === 'html') {
                       // For HTML reports, use update_html_file function
-                      revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to get the current content and content_hash. Then use update_html_file to apply the requested changes based on the current content. Keep the HTML well-structured and production-ready.`;
+                      revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
                       requiredFunctions = [
                         {
                           functionName: 'update_html_file',

@@ -1475,63 +1475,65 @@ emmaToolRegistry.register({
   name: 'update_html_file',
   definition: {
     name: 'update_html_file',
-    description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_content_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+    description: 'Update an HTML file using CSS selectors to target elements (preferred), or full file replacement with hash verification. ' +
+      'CSS mode (update_type="css"): Use CSS selectors to precisely target and modify HTML elements without needing to reproduce exact content. ' +
+      'Full mode (update_type="full"): Replace entire file content using hash verification.',
     inputSchema: {
       type: 'object',
       properties: {
         file_url: {
           type: 'string',
-          description: 'URL of the HTML file to update (S3 URL or file path)'
+          description: 'URL of the HTML file to update (S3 URL)'
         },
         update_type: {
           type: 'string',
-          enum: ['part', 'full'],
-          description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_content_hash'
+          enum: ['css', 'full'],
+          description: 'Type of update: "css" (recommended) for CSS-selector-based editing, "full" for entire file replacement with hash'
         },
-        replacement_json: {
+        operations_json: {
           type: 'string',
-          description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+          description: 'JSON string containing operations. ' +
+            'For CSS mode: [{"action": "remove", "selector": ".card[data-id=\\"123\\"]"}, ' +
+            '{"action": "replace", "selector": "h1.title", "html": "<h1 class=\\"title\\">New Title</h1>"}, ' +
+            '{"action": "replaceInner", "selector": ".bio", "html": "New bio text"}, ' +
+            '{"action": "append", "selector": "#grid", "html": "<div>New item</div>"}, ' +
+            '{"action": "prepend", "selector": "#grid", "html": "<div>First item</div>"}, ' +
+            '{"action": "insertBefore", "selector": ".item:last-child", "html": "<div>Before last</div>"}, ' +
+            '{"action": "insertAfter", "selector": ".item:first-child", "html": "<div>After first</div>"}, ' +
+            '{"action": "setAttribute", "selector": "img.hero", "attribute": "src", "value": "new.jpg"}, ' +
+            '{"action": "removeAttribute", "selector": "a", "attribute": "target"}]. ' +
+            'For full mode: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]'
         }
       },
-      required: ['file_url', 'update_type', 'replacement_json']
+      required: ['file_url', 'update_type', 'operations_json']
     }
   },
   execute: async (args: any, context?: any) => {
-    // Ensure we have the required parameters
     if (!args.file_url) {
-      return {
-        success: false,
-        message: 'file_url is required'
-      };
+      return { success: false, message: 'file_url is required' };
     }
-
     if (!args.update_type) {
-      return {
-        success: false,
-        message: 'update_type is required'
-      };
+      return { success: false, message: 'update_type is required' };
     }
 
-    if (!args.replacement_json) {
-      return {
-        success: false,
-        message: 'replacement_json is required'
-      };
+    // Accept both operations_json (new) and replacement_json (legacy) parameter names
+    const jsonStr = args.operations_json || args.replacement_json;
+    if (!jsonStr) {
+      return { success: false, message: 'operations_json is required' };
     }
 
-    // Parse replacement instructions
-    let replacementInstructions;
+    let operations;
     try {
-      replacementInstructions = JSON.parse(args.replacement_json);
+      operations = JSON.parse(jsonStr);
     } catch (error) {
       return {
         success: false,
-        message: 'Invalid JSON in replacement_json',
+        message: 'Invalid JSON in operations_json',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
 
-    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, context?.userId, context?.sessionId);
+    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, operations, context?.userId, context?.sessionId);
   }
 });
 
