@@ -45,6 +45,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Supports 9 operations: remove, replace, replaceInner, append, prepend, insertBefore, insertAfter, setAttribute, removeAttribute',
       '- Much more reliable — no more failures from whitespace mismatches or escaped characters in large HTML files',
       '- Full file replacement mode still available as a fallback',
+      '- Partial success: if some CSS operations fail to match, the successful ones still apply instead of aborting the entire edit',
+      '- Better selector guidance: Emma now uses :eq(n) positional selectors instead of :nth-of-type, fixing mismatches on mixed-sibling structures',
     ],
   },
   {
