@@ -801,4 +801,82 @@ describe('MetaService', () => {
             });
         });
     });
+
+    describe('Pixel & Dataset Operations', () => {
+        // These methods use dynamic import of fetchWithRetry, so we mock at global fetch level
+        let mockFetch: jest.SpyInstance;
+
+        beforeEach(() => {
+            mockFetch = jest.spyOn(global, 'fetch');
+        });
+
+        afterEach(() => {
+            mockFetch.mockRestore();
+        });
+
+        it('should list pixels for an ad account', async () => {
+            const mockPixels = [{ id: 'pixel_1', name: 'Pixel 1' }];
+            mockFetch.mockResolvedValue({
+                ok: true,
+                json: jest.fn().mockResolvedValue({ data: mockPixels })
+            });
+
+            const result = await service.listPixels(mockAdAccountId, mockAccessToken);
+            expect(result).toEqual(mockPixels);
+            expect(mockFetch).toHaveBeenCalledWith(
+                expect.stringContaining(`act_${mockAdAccountId}/adspixels`)
+            );
+        });
+
+        it('should list datasets for a pixel', async () => {
+            const mockDatasets = [{ id: 'ds_1', name: 'Dataset 1' }];
+            mockFetch.mockResolvedValue({
+                ok: true,
+                json: jest.fn().mockResolvedValue({ data: mockDatasets })
+            });
+
+            const result = await service.listDatasets('pixel_1', mockAccessToken);
+            expect(result).toEqual(mockDatasets);
+            expect(mockFetch).toHaveBeenCalledWith(
+                expect.stringContaining('pixel_1/datasets')
+            );
+        });
+
+        it('should get dataset event stats', async () => {
+            const mockStats = {
+                id: 'ds_1',
+                name: 'My Dataset',
+                event_stats: [{ event: 'Purchase', emq_score: 8.0 }]
+            };
+            mockFetch.mockResolvedValue({
+                ok: true,
+                json: jest.fn().mockResolvedValue(mockStats)
+            });
+
+            const result = await service.getDatasetEventStats('ds_1', mockAccessToken);
+            expect(result).toEqual(mockStats);
+            expect(mockFetch).toHaveBeenCalledWith(
+                expect.stringContaining('ds_1?fields=id,name,event_stats')
+            );
+        });
+
+        it('should handle API errors in listPixels', async () => {
+            mockFetch.mockResolvedValue({
+                ok: true,
+                json: jest.fn().mockResolvedValue({ error: { message: 'Permission denied' } })
+            });
+
+            await expect(service.listPixels(mockAdAccountId, mockAccessToken)).rejects.toThrow('Permission denied');
+        });
+
+        it('should return empty array when no pixel data', async () => {
+            mockFetch.mockResolvedValue({
+                ok: true,
+                json: jest.fn().mockResolvedValue({})
+            });
+
+            const result = await service.listPixels(mockAdAccountId, mockAccessToken);
+            expect(result).toEqual([]);
+        });
+    });
 });
