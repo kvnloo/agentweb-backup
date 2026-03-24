@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-24',
     changes: [
+      'Feature: Unified Emma Chat Sidebar',
+      '- Emma sidebar now uses the same Agent Mode engine as the main chat, providing consistent behavior across the platform',
+      '- All tools are available regardless of which page you are on — Emma decides what is relevant based on context',
+      '- Page updates now refresh automatically after Emma makes changes (e.g. updating brand guidelines)',
+      '- Emma sidebar is hidden on Agent Mode and Guide pages to avoid conflicts',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
       'New: Engagement Memory for Personalized Social Interactions',
       '- Each connected LinkedIn account now has an "Engagement Memory" — a persona profile that personalizes automated comments and replies',
       '- Click "Generate" to create the memory from your LinkedIn profile and recent posts using AI',
