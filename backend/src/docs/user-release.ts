@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-24',
     changes: [
+      'Fix: LinkedIn Engagement Being Too Aggressive',
+      '- Fixed race condition where overlapping scanner runs could schedule duplicate comments on the same post',
+      '- Added global "Pause All Engagement" toggle — one switch to stop all automated engagement across all accounts',
+      '- Added "Max accounts per post" setting to limit how many of your accounts engage on a single post (default: 2)',
+      '- Auto-reply now skips comments from your own connected accounts, preventing feedback loops',
+      '- Deduplication check now fails safe — on database errors, engagement is blocked rather than duplicated',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
       'Improvement: Smarter HTML File Editing with CSS Selectors',
       '- Emma now uses CSS-selector-based editing when updating HTML reports, replacing the old exact-string-matching approach',
       '- Supports 9 operations: remove, replace, replaceInner, append, prepend, insertBefore, insertAfter, setAttribute, removeAttribute',
