@@ -2,12 +2,29 @@ import request from "supertest";
 import express from "express";
 import adminRoutes from "../routes/admin";
 import { chatbotDb } from "../services/chatbotService";
+import { settingsService } from "../services/settingsService";
+import * as sessionScoringService from "../services/sessionScoringService";
 
 jest.mock("../services/chatbotService", () => ({
   chatbotDb: {
     getRecentSessionsPage: jest.fn(),
     getChatSession: jest.fn(),
+    updateSessionSatisfactionScore: jest.fn(),
+    updateSessionJudgeScore: jest.fn(),
   },
+}));
+
+jest.mock("../services/settingsService", () => ({
+  settingsService: {
+    getSetting: jest.fn(),
+    setSetting: jest.fn(),
+  },
+}));
+
+jest.mock("../services/sessionScoringService", () => ({
+  scoreSessionIfNeeded: jest.fn(),
+  scoreSessionWithJudgeIfNeeded: jest.fn(),
+  ScoringJudge: {},
 }));
 
 jest.mock("../middleware/auth", () => ({
@@ -19,6 +36,9 @@ jest.mock("../middleware/admin", () => ({
 }));
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
+const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
+const mockScoreSessionIfNeeded = sessionScoringService.scoreSessionIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionIfNeeded>;
+const mockScoreSessionWithJudgeIfNeeded = sessionScoringService.scoreSessionWithJudgeIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionWithJudgeIfNeeded>;
 
 const app = express();
 app.use(express.json());
@@ -159,5 +179,138 @@ describe("Admin chat sessions endpoint", () => {
     expect(mockChatbotDb.getRecentSessionsPage).toHaveBeenCalledWith(30, lastEvaluatedKey, undefined);
     expect(res.body.sessions).toHaveLength(0);
     expect(res.body.nextCursor).toBeNull();
+  });
+
+  describe("sync mode", () => {
+    const makeSession = (id: string) => ({
+      sessionId: id,
+      userId: "user-1",
+      createdAt: "2024-01-01T00:00:00Z",
+      updatedAt: "2024-01-01T00:00:00Z",
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+      ],
+    });
+
+    beforeEach(() => {
+      const session = makeSession("s1");
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: [session] as any,
+        lastEvaluatedKey: undefined,
+      });
+      mockChatbotDb.getChatSession.mockResolvedValue(session as any);
+      mockScoreSessionIfNeeded.mockResolvedValue(null);
+      mockScoreSessionWithJudgeIfNeeded.mockResolvedValue(null);
+    });
+
+    it("calls scoreSessionIfNeeded for each session when sync=true", async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      expect(mockScoreSessionIfNeeded).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not call scoring when sync is not set", async () => {
+      await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(mockScoreSessionIfNeeded).not.toHaveBeenCalled();
+    });
+
+    it("scores sessions with all configured judges when sync=true", async () => {
+      const judges = [
+        { id: "judge-1", name: "Fangfang", systemPrompt: "Rate quality", createdAt: "2024-01-01", updatedAt: "2024-01-01" },
+        { id: "judge-2", name: "Speed", systemPrompt: "Rate speed", createdAt: "2024-01-01", updatedAt: "2024-01-01" },
+      ];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: "scoring-judges",
+        settingValue: JSON.stringify(judges),
+      } as any);
+
+      await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      // Should score with both judges
+      expect(mockScoreSessionWithJudgeIfNeeded).toHaveBeenCalledTimes(2);
+      expect(mockScoreSessionWithJudgeIfNeeded).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "s1" }),
+        expect.objectContaining({ id: "judge-1" })
+      );
+      expect(mockScoreSessionWithJudgeIfNeeded).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "s1" }),
+        expect.objectContaining({ id: "judge-2" })
+      );
+    });
+
+    it("re-fetches sessions after judge scoring to include new scores", async () => {
+      const judges = [{ id: "j1", name: "Judge", systemPrompt: "p", createdAt: "2024-01-01", updatedAt: "2024-01-01" }];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: "scoring-judges",
+        settingValue: JSON.stringify(judges),
+      } as any);
+
+      // After scoring, getChatSession is called again to refresh
+      // First call is for hydration, second is for refresh after scoring
+      const refreshedSession = {
+        ...makeSession("s1"),
+        judgeScores: { j1: { score: 4, reason: "good", evaluatedAt: "2024-01-01", evaluatedMessageIndex: 2, judgeName: "Judge" } },
+      };
+      mockChatbotDb.getChatSession
+        .mockResolvedValueOnce(makeSession("s1") as any) // hydration
+        .mockResolvedValueOnce(refreshedSession as any); // refresh after scoring
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      // getChatSession called twice: once for hydration, once for refresh
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(2);
+      expect(res.body.sessions[0].judgeScores).toEqual(refreshedSession.judgeScores);
+    });
+
+    it("continues scoring other sessions if one judge scoring fails", async () => {
+      const sessions = [makeSession("s1"), makeSession("s2")];
+      mockChatbotDb.getRecentSessionsPage.mockResolvedValue({
+        sessions: sessions as any,
+        lastEvaluatedKey: undefined,
+      });
+      mockChatbotDb.getChatSession.mockImplementation(async (id: string) =>
+        sessions.find((s) => s.sessionId === id) as any
+      );
+
+      const judges = [{ id: "j1", name: "Judge", systemPrompt: "p", createdAt: "2024-01-01", updatedAt: "2024-01-01" }];
+      mockSettingsService.getSetting.mockResolvedValue({
+        settingName: "scoring-judges",
+        settingValue: JSON.stringify(judges),
+      } as any);
+
+      mockScoreSessionWithJudgeIfNeeded
+        .mockRejectedValueOnce(new Error("LLM timeout"))
+        .mockResolvedValueOnce(null);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      // Both sessions scored despite first failure
+      expect(mockScoreSessionWithJudgeIfNeeded).toHaveBeenCalledTimes(2);
+      expect(res.body.sessions).toHaveLength(2);
+    });
+
+    it("skips judge scoring when no judges are configured", async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      expect(mockScoreSessionWithJudgeIfNeeded).not.toHaveBeenCalled();
+      // Should not re-fetch since no judges
+      expect(mockChatbotDb.getChatSession).toHaveBeenCalledTimes(1); // only hydration
+    });
   });
 });
