@@ -1487,6 +1487,10 @@ emmaToolRegistry.register({
     name: 'update_html_file',
     description: 'Update an HTML file using CSS selectors to target elements (preferred), or full file replacement with hash verification. ' +
       'CSS mode (update_type="css"): Use CSS selectors to precisely target and modify HTML elements without needing to reproduce exact content. ' +
+      'jQuery-style selectors are supported: use :eq(n) (0-indexed) to select by position within matched set (e.g. ".step-block:eq(1)" for the 2nd .step-block), ' +
+      ':contains("text") to match by text content (e.g. "h3:contains(\\"Step 2\\")"), and :has() for parent matching. ' +
+      'IMPORTANT: Do NOT use :nth-of-type or :nth-child to target elements by class — these count by element type, not class. Use :eq(n) instead. ' +
+      'Operations that fail (no selector match) are skipped and reported; successful operations still apply. ' +
       'Full mode (update_type="full"): Replace entire file content using hash verification.',
     inputSchema: {
       type: 'object',
