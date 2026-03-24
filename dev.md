@@ -1,3 +1,58 @@
+# March 24, 2026: Investigation — NABE Chat Session Stuck in Empty Response Loop
+
+## Problem
+
+Session `d31f7f8c-d159-4270-95b4-254aafea4977` ("NABE Tech Topics") for user nabe (delegated by ftan@agentweb.pro) using `gemini-3.1-pro-preview` burned $5.57 (4.3M tokens, mostly prompt) producing empty assistant responses in a loop. Satisfaction score: 1/5. The user was trying to edit an HTML report (TEC2026 Planning Committee Briefing) and the model got stuck.
+
+## Root Causes
+
+### 1. `update_html_file` takes too many attempts to succeed
+
+The tool requires callers to provide a content hash for full replacements and exact `old_content` strings for partial replacements. In practice, LLMs frequently:
+- Pass placeholder hashes like `"dummy"` instead of reading the file first to get the real hash
+- Hallucinate `old_content` strings that don't exactly match the file (whitespace, escaping differences)
+- Retry with slightly different but still wrong arguments after each failure
+
+Each failed attempt consumes a full round-trip of tokens (the entire conversation context is resent). In this session, `update_html_file` was called 25 times with multiple failures, and `perform_data_analysis` was called 7 times (one returned no results). This is the primary token burn issue. **Fix:** `update_html_file` is being improved in a separate item to reduce failure rate.
+
+### 2. Gemini returns empty content with tool_calls
+
+Gemini sometimes returns `{content: null, tool_calls: [...]}`. The code normalizes `null` to `''` (line ~1128 in agentModeService.ts), but the loop only breaks when there are **no tool_calls** (line ~1182). So empty-content + tool_calls keeps the loop spinning. The user sees nothing while tokens burn.
+
+### 3. Weak loop detection
+
+The anti-loop detector (line ~1394) requires **3 consecutive identical tool call signatures** (same function name + same arguments). But the model varies arguments slightly each retry (different hash values, different old_content strings), so the detector never triggers. Even when it does, it only injects a warning message — it doesn't force a break.
+
+## Session Timeline (messages 195–211)
+
+| Msg | Role | What happened |
+|-----|------|---------------|
+| 195 | tool | `update_html_file` failed: hash mismatch (provided `dummy`) |
+| 196 | assistant | **Empty content**, calls `update_html_file` again |
+| 197 | tool | Success (v4 created) |
+| 198 | assistant | **Empty content**, calls `perform_data_analysis` |
+| 199 | tool | Analysis succeeded (extracted speaker cards) |
+| 200 | assistant | **Empty content**, calls `update_html_file` |
+| 201 | tool | Failed: old_content not found |
+| 202 | assistant | **Empty content**, calls `perform_data_analysis` |
+| 203 | tool | Failed: "No analysis results received from Gemini" |
+| 204 | assistant | **Empty content**, calls `update_html_file` |
+| 205 | tool | Failed: hash mismatch again |
+| 206 | assistant | **Empty content**, calls `update_html_file` |
+| 207 | tool | Success (v5 created) — but just replaced placeholder text |
+| 208 | assistant | **Empty content**, calls `perform_data_analysis` |
+| 209 | tool | Analysis succeeded |
+| 210 | assistant | **Empty content**, calls `update_html_file` |
+| 211 | tool | Failed: old_content not found — session ended |
+
+## Proposed Fixes
+
+1. **Improve `update_html_file` reliability** — Reduce the number of failed attempts by making the tool more forgiving (separate item, already in progress).
+2. **Consecutive empty response detection** — If the model produces N consecutive empty-content assistant messages (even with tool calls), break the loop and inform the user.
+3. **Consecutive tool failure detection** — If the same tool fails N times in a row (regardless of exact arguments), inject a stronger intervention or break the loop. The current detection requiring identical signatures is too strict.
+
+---
+
 # March 23, 2026: Investigation — Supporting Vendor Role in the System
 
 ## Background
