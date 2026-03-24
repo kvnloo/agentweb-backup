@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AuthenticatedRequest, getUserFromToken } from '../middleware/auth';
 import { agentModeService, AgentModeService } from '../services/agentModeService';
-import { chatbotDb, updateTaskExecutionStatus, ChatMessage } from '../services/chatbotService';
+import { chatbotDb, updateTaskExecutionStatus, ChatMessage, getEmmaSystemContext } from '../services/chatbotService';
 import { scheduleDb, userDb, taskDb } from '../services/db';
 import { User } from '../types/auth';
 import multer from 'multer';
@@ -1235,7 +1235,8 @@ export async function generateSessionResponse(
   userId: string,
   llmModel: string,
   attachments?: any[],
-  isInteractiveShare?: boolean
+  isInteractiveShare?: boolean,
+  pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string }
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -1266,15 +1267,21 @@ export async function generateSessionResponse(
     messageContent = `${userMessage}\n\n**Attached Files:**\n${attachmentUrls}`;
   }
 
+  // For emma-sidebar sessions, append current page URL so the LLM knows user context
+  if (pageContext?.currentUrl && session.portalType === 'emma-sidebar') {
+    messageContent += `\n\n[Current page: ${pageContext.currentUrl}]`;
+  }
+
   // Create user message object - store processed content with attachments
   const userMessageObj = {
     role: 'user' as const,
     content: userMessage, // Store original user message, not processed content
     timestamp: new Date().toISOString(),
     metadata: {
-      portalType: 'agent' as const,
+      portalType: (session.portalType || 'agent') as 'agent',
       timestamp: new Date().toISOString(),
-      attachments: attachments || []
+      attachments: attachments || [],
+      ...(pageContext?.currentUrl ? { currentUrl: pageContext.currentUrl } : {})
     }
   };
 
@@ -1285,14 +1292,36 @@ export async function generateSessionResponse(
   // If this is the first message, add system message with version info first
   if (isFirstMessage) {
     try {
-      // Get the current system prompt version
-      let systemPrompt = await agentModeService.getMarketingSystemPrompt();
+      let systemPrompt: string;
 
-      // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
-      if (session.sessionType === 'scheduled' && session.pageIdentifier) {
-        const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
-        if (scheduleIdMatch) {
-          systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+      if (session.portalType === 'emma-sidebar') {
+        // Emma sidebar uses the Emma system prompt with page context
+        systemPrompt = await getEmmaSystemContext();
+        if (pageContext?.currentUrl) {
+          systemPrompt += `\n\n[Page Context] The user is currently on the page: ${pageContext.currentUrl}. Help them with tasks relevant to this page.`;
+        }
+        if (pageContext?.structuredContext) {
+          try {
+            const parsed = JSON.parse(pageContext.structuredContext);
+            const contextParts: string[] = [];
+            if (parsed.headings?.length) contextParts.push(`Headings: ${parsed.headings.join(', ')}`);
+            if (parsed.buttons?.length) contextParts.push(`Buttons: ${parsed.buttons.join(', ')}`);
+            if (parsed.inputs?.length) contextParts.push(`Inputs: ${parsed.inputs.map((i: any) => i.label || i.placeholder).filter(Boolean).join(', ')}`);
+            if (contextParts.length) {
+              systemPrompt += `\n\n[Page UI Elements]\n${contextParts.join('\n')}`;
+            }
+          } catch { /* ignore parse errors */ }
+        }
+      } else {
+        // Regular Agent Mode system prompt
+        systemPrompt = await agentModeService.getMarketingSystemPrompt();
+
+        // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
+        if (session.sessionType === 'scheduled' && session.pageIdentifier) {
+          const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+          if (scheduleIdMatch) {
+            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+          }
         }
       }
 
@@ -1304,7 +1333,7 @@ export async function generateSessionResponse(
         content: systemPrompt,
         metadata: {
           timestamp: new Date().toISOString(),
-          portalType: 'agent' as const,
+          portalType: (session.portalType || 'agent') as 'agent',
           systemPromptVersion: systemPromptHash
         }
       };
@@ -1520,9 +1549,10 @@ export const agentModeController = {
       // Parse pagination parameters
       const lastEvaluatedKey = req.query.lastEvaluatedKey as string;
       const limit = Math.min(parseInt(req.query.limit as string) || 50, 100); // Max 100 per request
+      const portalType = (req.query.portalType as string) === 'emma-sidebar' ? 'emma-sidebar' as const : 'agent' as const;
 
       // Get sessions with pagination
-      const result = await chatbotDb.getUserSessions(user.userId, 'agent', limit, true, lastEvaluatedKey);
+      const result = await chatbotDb.getUserSessions(user.userId, portalType, limit, true, lastEvaluatedKey);
 
       // Filter out tool messages and assistant messages with tool calls for user display
       const filteredSessions = result.sessions.map(session => ({
@@ -1570,10 +1600,15 @@ export const agentModeController = {
       );
 
       // Set default model for new sessions
-      // Use reports model for report_generation sessions, otherwise use default model
-      const modelToUse = finalSessionType === 'report_generation'
-        ? await agentModeService.getReportsModel()
-        : await agentModeService.getDefaultModel();
+      // Use reports model for report_generation sessions, customer support model for emma-sidebar, otherwise use default model
+      let modelToUse: string;
+      if (finalSessionType === 'report_generation') {
+        modelToUse = await agentModeService.getReportsModel();
+      } else if (portalType === 'emma-sidebar') {
+        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
+      } else {
+        modelToUse = await agentModeService.getDefaultModel();
+      }
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
       res.status(201).json(sessionWithModel);
@@ -1668,7 +1703,7 @@ export const agentModeController = {
   async generateResponse(req: Request, res: Response) {
     try {
       const user = req.user as User;
-      const { sessionId, userMessage, llmModel, attachments } = req.body;
+      const { sessionId, userMessage, llmModel, attachments, currentUrl, structuredContext, screenshot } = req.body;
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });
@@ -1687,17 +1722,61 @@ export const agentModeController = {
       // Use llmModel from request, session, or default
       const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
 
+      // Build page context for emma-sidebar sessions
+      const pageContext = session.portalType === 'emma-sidebar'
+        ? { currentUrl, structuredContext, screenshot }
+        : undefined;
+
       // Generate AI response using common function
       const response = await generateSessionResponse(
         sessionId,
         userMessage,
         user.userId,
         modelToUse,
-        attachments
+        attachments,
+        undefined, // isInteractiveShare
+        pageContext
       );
 
       // Clear progress store after completion (keep connections open for future messages)
       progressStore.delete(sessionId);
+
+      // Compute page invalidations for emma-sidebar sessions so the frontend
+      // can refresh the underlying page after a mutating tool call.
+      let invalidations: string[] | undefined;
+      if (session.portalType === 'emma-sidebar' && response.toolCalls?.length) {
+        const PAGE_INVALIDATION_MAP: Record<string, string[]> = {
+          'update_brand_guidelines': ['brand-guidelines'],
+          'update_market_strategy': ['market-strategy'],
+          'update_gtm_plan': ['gtm-plan'],
+          'add_gtm_phase': ['gtm-plan'],
+          'add_gtm_work_items': ['gtm-plan'],
+          'update_gtm_work_item': ['gtm-plan'],
+          'update_gtm_phase': ['gtm-plan'],
+          'delete_gtm_items': ['gtm-plan'],
+          'create_gtm_plan': ['gtm-plan'],
+          'update_lead': ['crm'],
+          'create_lead_list': ['crm'],
+          'add_leads_to_list': ['crm'],
+          'delete_leads': ['crm'],
+          'update_lead_status': ['crm'],
+          'update_book_content': ['books'],
+          'create_book': ['books'],
+          'generate_book_content': ['books'],
+          'create_html_from_template': ['email-templates'],
+          'update_html_file': ['email-templates'],
+          'create_knowledge_base': ['knowledge-base'],
+          'update_knowledge_base_file': ['knowledge-base'],
+          'generate_image': ['images'],
+          'generate_video': ['videos'],
+        };
+        const all = [...new Set(
+          response.toolCalls
+            .filter((tc: any) => !tc.error)
+            .flatMap((tc: any) => PAGE_INVALIDATION_MAP[tc.name] || [])
+        )];
+        if (all.length > 0) invalidations = all;
+      }
 
       res.json({
         content: response.content,
@@ -1706,6 +1785,7 @@ export const agentModeController = {
         sources: response.sources,
         workPlan: response.workPlan,
         skills: response.skills,
+        ...(invalidations ? { invalidations } : {}),
         ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
       });
     } catch (error) {
