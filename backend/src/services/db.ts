@@ -4997,8 +4997,9 @@ export const socialEngagementTrackingDb = {
       const result = await dynamodb.query(params).promise();
       return (result.Items && result.Items.length > 0) ? true : false;
     } catch (error) {
+      // Fail safe: assume already engaged on error to prevent duplicate scheduling
       handleDynamoDbError(error, "hasEngaged");
-      return false;
+      return true;
     }
   },
 

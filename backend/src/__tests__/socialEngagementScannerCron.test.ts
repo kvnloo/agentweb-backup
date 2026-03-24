@@ -502,6 +502,198 @@ describe('SocialEngagementScanner', () => {
     });
   });
 
+  // ─── Concurrency guard ──────────────────────────────────────────────────────
+
+  describe('concurrency guard', () => {
+    it('should skip concurrent scanner runs', async () => {
+      // Make scanWithFilter block until we resolve it
+      let resolveFirst: (v: any) => void;
+      const firstCall = new Promise((resolve) => { resolveFirst = resolve; });
+      mockUserDb.scanWithFilter.mockImplementationOnce(() => firstCall as any);
+
+      // Start first run (will block)
+      const run1 = scanner.runScanner();
+
+      // Start second run while first is in progress — should skip
+      mockUserDb.scanWithFilter.mockResolvedValueOnce([]);
+      const run2 = scanner.runScanner();
+
+      // Only one scanWithFilter call so far (second run skipped)
+      expect(mockUserDb.scanWithFilter).toHaveBeenCalledTimes(1);
+
+      // Unblock first run
+      resolveFirst!([]);
+      await run1;
+      await run2;
+    });
+  });
+
+  // ─── Global engagement pause ──────────────────────────────────────────────
+
+  describe('global engagement pause', () => {
+    it('should skip users with engagementPaused=true', async () => {
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: { ...makeAccount().engagementSettings, enablePostDiscovery: true },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount], engagementPaused: true },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockAdapter.listPosts).not.toHaveBeenCalled();
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should process users with engagementPaused=false', async () => {
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: { ...makeAccount().engagementSettings, enablePostDiscovery: true, maxLikesPerPost: 1 },
+      });
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount], engagementPaused: false },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockAdapter.listPosts).toHaveBeenCalled();
+    });
+  });
+
+  // ─── Max engagers per post ────────────────────────────────────────────────
+
+  describe('maxEngagersPerPost', () => {
+    it('should limit the number of engager accounts per post', async () => {
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 5,
+          maxEngagersPerPost: 1, // only allow 1 engager
+        },
+      });
+      const engager1 = makeAccount({
+        account_id: 'acc-engager-1',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+      const engager2 = makeAccount({
+        account_id: 'acc-engager-2',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engager1, engager2] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Only 1 schedule created despite 2 available engagers
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(1);
+    });
+
+    it('should default to 2 engagers when maxEngagersPerPost is not set', async () => {
+      const ownerAccount = makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enablePostDiscovery: true,
+          maxLikesPerPost: 5,
+          // no maxEngagersPerPost — should default to 2
+        },
+      });
+      const engager1 = makeAccount({
+        account_id: 'acc-engager-1',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+      const engager2 = makeAccount({
+        account_id: 'acc-engager-2',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+      const engager3 = makeAccount({
+        account_id: 'acc-engager-3',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [ownerAccount, engager1, engager2, engager3] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Default max is 2 — only 2 schedules created despite 3 engagers
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── Self-comment filtering ───────────────────────────────────────────────
+
+  describe('self-comment filtering in auto-reply', () => {
+    function makeCommentOwnerForSelfFilter(overrides: Record<string, any> = {}) {
+      return makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enableCommentDiscovery: true,
+          commentPreferredActions: ['reply'],
+          maxCommentRepliesPerPost: 5,
+          maxCommentLikesPerPost: 0,
+          commentEngagementWindowMinutes: 1,
+        },
+        ...overrides,
+      });
+    }
+
+    it('should skip comments from users own accounts', async () => {
+      const commentOwner = makeCommentOwnerForSelfFilter();
+      const engagerAccount = makeAccount({
+        account_id: 'acc-engager',
+        engagementSettings: { ...makeAccount().engagementSettings, enableAsPostEngager: true },
+      });
+
+      // Comment from the engager account (same user) — should be filtered
+      mockAdapter.getComments.mockResolvedValue([
+        makeComment({ actorUrn: 'acc-engager', commentUrn: 'urn:li:comment:self' }),
+      ]);
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [commentOwner, engagerAccount] },
+      ]);
+
+      await scanner.runScanner();
+
+      // No schedule created because the only comment was from own account
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should keep comments from external users', async () => {
+      const commentOwner = makeCommentOwnerForSelfFilter();
+
+      mockAdapter.getComments.mockResolvedValue([
+        makeComment({ actorUrn: 'urn:li:person:external-999' }),
+      ]);
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [commentOwner] },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ─── Marks as queued immediately ─────────────────────────────────────────────
 
   describe('immediate queued marking', () => {
