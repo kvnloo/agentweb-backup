@@ -1013,6 +1013,63 @@ export class MetaService {
       return this.handleError(error, 'getInsights');
     }
   }
+
+  /**
+   * List ad pixels associated with an ad account
+   */
+  public async listPixels(adAccountId: string, accessToken: string) {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,is_created_by_business&access_token=${accessToken}`;
+      const { fetchWithRetry } = await import('../utils/metaApiFetch');
+      const response = await fetchWithRetry(url);
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'Failed to list pixels');
+      }
+      return data.data || [];
+    } catch (error) {
+      return this.handleError(error, 'listPixels');
+    }
+  }
+
+  /**
+   * List datasets (server event data sources) linked to a pixel
+   */
+  public async listDatasets(pixelId: string, accessToken: string) {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/datasets?fields=id,name&access_token=${accessToken}`;
+      const { fetchWithRetry } = await import('../utils/metaApiFetch');
+      const response = await fetchWithRetry(url);
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'Failed to list datasets');
+      }
+      return data.data || [];
+    } catch (error) {
+      return this.handleError(error, 'listDatasets');
+    }
+  }
+
+  /**
+   * Get event match quality (EMQ) scores for a dataset
+   */
+  public async getDatasetEventStats(datasetId: string, accessToken: string) {
+    try {
+      const apiVersion = process.env.META_API_VERSION || 'v18.0';
+      const url = `https://graph.facebook.com/${apiVersion}/${datasetId}?fields=id,name,event_stats&access_token=${accessToken}`;
+      const { fetchWithRetry } = await import('../utils/metaApiFetch');
+      const response = await fetchWithRetry(url);
+      const data = await response.json();
+      if (data.error) {
+        throw new Error(data.error.message || 'Failed to get dataset event stats');
+      }
+      return data;
+    } catch (error) {
+      return this.handleError(error, 'getDatasetEventStats');
+    }
+  }
 }
 
 export const metaService = MetaService.getInstance();

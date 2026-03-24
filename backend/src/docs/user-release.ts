@@ -11,6 +11,16 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-24',
     changes: [
+      'Feature: Meta Ads Event Match Quality (EMQ)',
+      '- You can now check data match quality scores for your Meta Conversions API (CAPI) datasets directly from the chat',
+      '- Use the Meta Marketing API tool with DATASET → LIST to discover your pixels and linked datasets',
+      '- Use DATASET → GET_MATCH_QUALITY to retrieve EMQ scores per event type (Purchase, Lead, etc.)',
+      '- Helps monitor how well your customer data matches Meta user profiles for better ad targeting',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
       'Fix: LinkedIn Engagement Being Too Aggressive',
       '- Fixed race condition where overlapping scanner runs could schedule duplicate comments on the same post',
       '- Added global "Pause All Engagement" toggle — one switch to stop all automated engagement across all accounts',

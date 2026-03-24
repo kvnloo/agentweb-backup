@@ -287,6 +287,13 @@ ACTION MATRIX (entity_type → supported actions):
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
+  DATASET       → LIST, GET_MATCH_QUALITY
+
+DATASET USAGE:
+  LIST              → Returns all pixels and their associated datasets (server event data sources) for the ad account
+  GET_MATCH_QUALITY → Returns Event Match Quality (EMQ) scores per event type for a specific dataset. Requires params.dataset_id.
+  WORKFLOW: First LIST to discover pixel/dataset IDs, then GET_MATCH_QUALITY with the dataset_id.
+  NOTE: Match quality data is only available if the advertiser has Conversions API (CAPI) set up.
 
 REQUIRED IDs PER ACTION:
   CAMPAIGN UPDATE/DELETE  → campaign_id required
@@ -336,12 +343,12 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
         properties: {
           entity_type: {
             type: "string",
-            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE"],
+            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE", "DATASET"],
             description: "The Meta Ads entity to operate on."
           },
           action: {
             type: "string",
-            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH"],
+            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
             description: "The operation to perform. Must be valid for the chosen entity_type."
           },
           account_id: {
@@ -423,7 +430,10 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
 
               // --- Targeting Search ---
               q:    { type: "string", description: "Search query for targeting search." },
-              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." }
+              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
+
+              // --- Dataset ---
+              dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
             }
           }
         },
