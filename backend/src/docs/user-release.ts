@@ -17,6 +17,42 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Edit the memory directly to fine-tune your engagement voice, key topics, and style preferences',
       '- Click "Sync" to merge the latest LinkedIn data while preserving your customizations',
       '- Automated engagement comments and replies now use the memory for more authentic, personalized interactions',
+      'Fix: Slack Chat Links Not Clickable',
+      '- Fixed an issue where links in Emma\'s Slack chat responses appeared as a doc icon but were not clickable',
+      '- Links are now properly rendered as clickable Slack links',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'Feature: Meta Ads Event Match Quality (EMQ)',
+      '- You can now check data match quality scores for your Meta Conversions API (CAPI) datasets directly from the chat',
+      '- Use the Meta Marketing API tool with DATASET → LIST to discover your pixels and linked datasets',
+      '- Use DATASET → GET_MATCH_QUALITY to retrieve EMQ scores per event type (Purchase, Lead, etc.)',
+      '- Helps monitor how well your customer data matches Meta user profiles for better ad targeting',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'Fix: LinkedIn Engagement Being Too Aggressive',
+      '- Fixed race condition where overlapping scanner runs could schedule duplicate comments on the same post',
+      '- Added global "Pause All Engagement" toggle — one switch to stop all automated engagement across all accounts',
+      '- Added "Max accounts per post" setting to limit how many of your accounts engage on a single post (default: 2)',
+      '- Auto-reply now skips comments from your own connected accounts, preventing feedback loops',
+      '- Deduplication check now fails safe — on database errors, engagement is blocked rather than duplicated',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'Improvement: Smarter HTML File Editing with CSS Selectors',
+      '- Emma now uses CSS-selector-based editing when updating HTML reports, replacing the old exact-string-matching approach',
+      '- Supports 9 operations: remove, replace, replaceInner, append, prepend, insertBefore, insertAfter, setAttribute, removeAttribute',
+      '- Much more reliable — no more failures from whitespace mismatches or escaped characters in large HTML files',
+      '- Full file replacement mode still available as a fallback',
+      '- Partial success: if some CSS operations fail to match, the successful ones still apply instead of aborting the entire edit',
+      '- Better selector guidance: Emma now uses :eq(n) positional selectors instead of :nth-of-type, fixing mismatches on mixed-sibling structures',
     ],
   },
   {

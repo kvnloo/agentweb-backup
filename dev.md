@@ -1,3 +1,28 @@
+# March 24, 2026: Investigation — Meta Pixel / CAPI Detection on Landing Pages
+
+## Problem
+
+Agent mode session `6219e856-e54a-45cb-b82f-2d14598957bc` (Your360.ai) generated a Meta Ads optimization report that flagged "No conversion tracking" as a critical blocker — the "Results" columns in Meta Ads Manager were empty, suggesting the Meta Pixel or Conversions API was not firing on lead form submissions.
+
+## Investigation Findings
+
+Double-checked Facebook Ads Manager directly. The **Event Match Quality score is 8.3** — pixel tracking is actually working correctly. The pixel is implemented through **PixelFlow** (a third-party pixel management tool), which is why it was not detected by our agent during the page inspection. PixelFlow loads the pixel asynchronously/indirectly, making it invisible to standard DOM-based pixel detection methods.
+
+### Root Cause
+
+Our agent's analysis relied on inspecting the landing page source for Meta Pixel base code (`fbq('init', ...)` or `connect.facebook.net/en_US/fbevents.js`). Since PixelFlow injects the pixel through its own loader, the standard detection approach missed it entirely, leading to a false-positive "no pixel installed" finding in the report.
+
+### Next Steps
+
+Enhance the Meta Ads API integration to support loading **Event Match Quality** scores directly from the Facebook Marketing API. This will allow future analyses to verify pixel health programmatically rather than relying solely on page source inspection. Key endpoints to integrate:
+
+- `GET /{pixel-id}?fields=data_use_setting,event_match_quality` — pixel-level match quality
+- `GET /{ad-account-id}/customconversions` — custom conversion event health
+
+This will make the agent's pixel/CAPI assessments more accurate and avoid false positives when third-party pixel managers (PixelFlow, Google Tag Manager, Segment, etc.) are used.
+
+---
+
 # March 23, 2026: Investigation — Supporting Vendor Role in the System
 
 ## Background

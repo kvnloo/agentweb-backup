@@ -824,7 +824,7 @@ function markdownToMrkdwn(markdown: string): string {
   text = text.replace(/<\/(em|i)>/gi, '_');
   text = text.replace(/<code(\s[^>]*)?>/gi, '`');
   text = text.replace(/<\/code>/gi, '`');
-  text = text.replace(/<[^>]+>/g, '');
+  text = text.replace(/<(?!https?:\/\/)[^>]+>/g, '');
   // Decode HTML entities
   text = text.replace(/&amp;/g, '&');
   text = text.replace(/&lt;/g, '<');

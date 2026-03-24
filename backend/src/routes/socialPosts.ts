@@ -48,10 +48,31 @@ router.get('/social-posts/config', authenticateToken, async (req: Request, res: 
       engagementSettings: a.engagementSettings || null,
     }));
 
-    return res.json({ accounts });
+    return res.json({ accounts, engagementPaused: !!user.engagementPaused });
   } catch (error) {
     console.error('[SocialPosts/Config GET] Error:', error);
     return res.status(500).json({ error: 'Failed to fetch config' });
+  }
+});
+
+// ─── PUT toggle global engagement pause ─────────────────────────────────────────────────────────
+// Body: { paused: boolean }
+router.put('/social-posts/config/global', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { paused } = req.body;
+    if (typeof paused !== 'boolean') {
+      return res.status(400).json({ error: 'paused (boolean) is required' });
+    }
+
+    await userDb.updateUser(userId, { engagementPaused: paused } as any);
+    console.log(`[SocialPosts/Config Global] User ${userId} set engagementPaused=${paused}`);
+    return res.json({ success: true, engagementPaused: paused });
+  } catch (error) {
+    console.error('[SocialPosts/Config Global PUT] Error:', error);
+    return res.status(500).json({ error: 'Failed to update global setting' });
   }
 });
 
@@ -88,6 +109,7 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
       preferredActions,
       maxLikesPerPost,
       maxCommentsPerPost,
+      maxEngagersPerPost,
       engagementWindowMinutes,
       enableAsPostEngager,
       enableCommentDiscovery,
@@ -120,6 +142,7 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
     // Validate numeric fields (default to safe values if not provided)
     const resolvedMaxLikes = typeof maxLikesPerPost === 'number' && maxLikesPerPost >= 0 ? maxLikesPerPost : 5;
     const resolvedMaxComments = typeof maxCommentsPerPost === 'number' && maxCommentsPerPost >= 0 ? maxCommentsPerPost : 3;
+    const resolvedMaxEngagers = typeof maxEngagersPerPost === 'number' && maxEngagersPerPost >= 1 ? maxEngagersPerPost : 2;
     const resolvedWindow = typeof engagementWindowMinutes === 'number' && engagementWindowMinutes >= 1 ? engagementWindowMinutes : 60;
     const resolvedMaxCommentLikes = typeof maxCommentLikesPerPost === 'number' && maxCommentLikesPerPost >= 0 ? maxCommentLikesPerPost : 3;
     const resolvedMaxCommentReplies = typeof maxCommentRepliesPerPost === 'number' && maxCommentRepliesPerPost >= 0 ? maxCommentRepliesPerPost : 2;
@@ -145,6 +168,7 @@ router.put('/social-posts/config', authenticateToken, async (req: Request, res: 
           preferredActions: resolvedPreferredActions,
           maxLikesPerPost: resolvedMaxLikes,
           maxCommentsPerPost: resolvedMaxComments,
+          maxEngagersPerPost: resolvedMaxEngagers,
           engagementWindowMinutes: resolvedWindow,
           enableAsPostEngager: !!enableAsPostEngager,
           enableCommentDiscovery: !!enableCommentDiscovery,

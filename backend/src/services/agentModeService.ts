@@ -9230,6 +9230,61 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Manage Meta Datasets — list pixels, list datasets, get event match quality
+   */
+  public async manageMetaDatasets(
+    userId: string,
+    action: 'LIST' | 'GET_MATCH_QUALITY',
+    account_id: string,
+    params: any = {}
+  ): Promise<MetaApiResult> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      switch (action) {
+        case 'LIST': {
+          // List all pixels, then list datasets for each pixel
+          const pixels = await metaService.listPixels(accountId, accessToken);
+          const results: any[] = [];
+          for (const pixel of pixels) {
+            const datasets = await metaService.listDatasets(pixel.id, accessToken);
+            results.push({
+              pixel_id: pixel.id,
+              pixel_name: pixel.name,
+              datasets: datasets
+            });
+          }
+          return {
+            success: true,
+            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            pixels: results
+          };
+        }
+        case 'GET_MATCH_QUALITY': {
+          const datasetId = params.dataset_id;
+          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          return {
+            success: true,
+            message: `Event match quality for dataset ${stats.name || datasetId}`,
+            dataset_id: stats.id,
+            dataset_name: stats.name,
+            event_stats: stats.event_stats
+          };
+        }
+        default:
+          throw new Error(`Invalid action "${action}" for DATASET. Supported: LIST, GET_MATCH_QUALITY.`);
+      }
+    } catch (error: any) {
+      console.error('AgentMode: Error managing Meta datasets:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to manage Meta datasets.',
+        error: error.message
+      };
+    }
+  }
+
   public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -10183,6 +10238,12 @@ Format the response as JSON with this structure:
           if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
         }
         break;
+
+      case 'DATASET':
+        if (action === 'GET_MATCH_QUALITY' && !params.dataset_id) {
+          throw new Error('DATASET GET_MATCH_QUALITY requires "params.dataset_id".');
+        }
+        break;
     }
   }
 
@@ -10192,7 +10253,7 @@ Format the response as JSON with this structure:
    */
   public async callMetaMarketingApi(
     userId: string,
-    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE',
+    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE' | 'DATASET',
     action: string,
     account_id: string,
     campaign_id?: string,
@@ -10240,6 +10301,9 @@ Format the response as JSON with this structure:
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
+
+      case 'DATASET':
+        return this.manageMetaDatasets(userId, action as any, account_id, params);
 
       default:
         throw new Error(`Invalid entity_type: ${entity_type}`);
@@ -15313,6 +15377,11 @@ Format the response as JSON with this structure:
     sessionId: string
   ): Promise<any> {
     try {
+      // Handle CSS-selector-based operations
+      if (updateType === 'css') {
+        return await this.updateHtmlFileCss(fileUrl, replacementInstructions, userId, sessionId);
+      }
+
       // Validate update_type first (before fetching file)
       if (!updateType || !['part', 'full'].includes(updateType)) {
         return {
@@ -15756,6 +15825,140 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('Error uploading updated file:', error);
       throw new Error(`Failed to upload updated file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // CSS-selector-based HTML file editing
+  private async updateHtmlFileCss(
+    fileUrl: string,
+    operations: any[],
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Validate operations
+      if (!Array.isArray(operations) || operations.length === 0) {
+        return { success: false, message: 'At least one operation is required' };
+      }
+
+      const validActions = ['remove', 'replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter', 'setAttribute', 'removeAttribute'];
+      const actionsNeedingHtml = ['replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter'];
+
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i];
+        if (!op.action || !validActions.includes(op.action)) {
+          return { success: false, message: `Operation ${i + 1}: Invalid action "${op.action}". Valid actions: ${validActions.join(', ')}` };
+        }
+        if (!op.selector) {
+          return { success: false, message: `Operation ${i + 1}: selector is required` };
+        }
+        if (actionsNeedingHtml.includes(op.action) && (op.html === undefined || op.html === null)) {
+          return { success: false, message: `Operation ${i + 1}: html is required for action "${op.action}"` };
+        }
+        if (op.action === 'setAttribute' && (!op.attribute || op.value === undefined)) {
+          return { success: false, message: `Operation ${i + 1}: attribute and value are required for setAttribute` };
+        }
+        if (op.action === 'removeAttribute' && !op.attribute) {
+          return { success: false, message: `Operation ${i + 1}: attribute is required for removeAttribute` };
+        }
+      }
+
+      // Fetch current file content
+      const currentContent = await this.fetchFileContent(fileUrl);
+      console.log(`AgentMode: CSS edit - fetched file, length: ${currentContent.length}`);
+
+      // Load into cheerio
+      const cheerio = await import('cheerio');
+      const $ = cheerio.load(currentContent, { xml: false } as any);
+
+      // Apply operations sequentially, collecting results for each
+      let operationsApplied = 0;
+      const operationResults: { index: number; action: string; selector: string; success: boolean; error?: string }[] = [];
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i];
+        const matched = $(op.selector);
+
+        if (matched.length === 0) {
+          console.warn(`AgentMode: CSS edit op ${i + 1}: no match for "${op.selector}"`);
+          operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: false, error: `No elements matched selector "${op.selector}"` });
+          continue;
+        }
+
+        console.log(`AgentMode: CSS edit op ${i + 1}: ${op.action} on "${op.selector}" (${matched.length} matches)`);
+
+        switch (op.action) {
+          case 'remove':
+            matched.remove();
+            break;
+          case 'replace':
+            matched.replaceWith(op.html);
+            break;
+          case 'replaceInner':
+            matched.html(op.html);
+            break;
+          case 'append':
+            matched.append(op.html);
+            break;
+          case 'prepend':
+            matched.prepend(op.html);
+            break;
+          case 'insertBefore':
+            matched.before(op.html);
+            break;
+          case 'insertAfter':
+            matched.after(op.html);
+            break;
+          case 'setAttribute':
+            matched.attr(op.attribute, op.value);
+            break;
+          case 'removeAttribute':
+            matched.removeAttr(op.attribute);
+            break;
+        }
+        operationsApplied++;
+        operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: true });
+      }
+
+      // If nothing was applied, return failure
+      if (operationsApplied === 0) {
+        return {
+          success: false,
+          message: `All ${operations.length} operations failed: no selectors matched`,
+          operations: operationResults,
+          suggestion: 'Use read_file_content to inspect the current HTML structure. Use :eq(n) (0-indexed) to select by position within matched set, e.g. ".step-block:eq(1)" for the 2nd .step-block.'
+        };
+      }
+
+      // Serialize back to HTML
+      const updatedContent = $.html();
+      const failedOps = operationResults.filter(r => !r.success);
+      console.log(`AgentMode: CSS edit complete, ${operationsApplied}/${operations.length} operations applied, new length: ${updatedContent.length}`);
+
+      // Upload
+      const versionedFilename = this.createVersionedFilename(fileUrl);
+      const originalPath = this.extractPathFromS3Url(fileUrl);
+      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
+
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        message: failedOps.length > 0
+          ? `File updated with ${operationsApplied}/${operations.length} operations (${failedOps.length} failed: ${failedOps.map(f => `op ${f.index} selector "${f.selector}"`).join(', ')})`
+          : `File updated successfully with ${operationsApplied} CSS-selector operations`,
+        method: 'css_selector',
+        operations_applied: operationsApplied,
+        operations: operationResults,
+        updatedContent,
+        versioned_filename: versionedFilename
+      };
+    } catch (error) {
+      console.error('Error in CSS-selector HTML update:', error);
+      return {
+        success: false,
+        message: 'Failed to update HTML file',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'Check your CSS selectors and HTML content. Use read_file_content to inspect the current file structure.'
+      };
     }
   }
 

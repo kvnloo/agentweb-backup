@@ -49,6 +49,10 @@ jest.mock('crypto', () => ({
   }))
 }));
 
+jest.mock('../utils/agentModeAlerts', () => ({
+  sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined)
+}));
+
 jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   generateMarketingResponseWorkerService: {
     restartWorker: jest.fn().mockResolvedValue(undefined),
