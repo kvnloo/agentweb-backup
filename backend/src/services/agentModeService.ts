@@ -9230,6 +9230,61 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Manage Meta Datasets — list pixels, list datasets, get event match quality
+   */
+  public async manageMetaDatasets(
+    userId: string,
+    action: 'LIST' | 'GET_MATCH_QUALITY',
+    account_id: string,
+    params: any = {}
+  ): Promise<MetaApiResult> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      switch (action) {
+        case 'LIST': {
+          // List all pixels, then list datasets for each pixel
+          const pixels = await metaService.listPixels(accountId, accessToken);
+          const results: any[] = [];
+          for (const pixel of pixels) {
+            const datasets = await metaService.listDatasets(pixel.id, accessToken);
+            results.push({
+              pixel_id: pixel.id,
+              pixel_name: pixel.name,
+              datasets: datasets
+            });
+          }
+          return {
+            success: true,
+            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            pixels: results
+          };
+        }
+        case 'GET_MATCH_QUALITY': {
+          const datasetId = params.dataset_id;
+          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          return {
+            success: true,
+            message: `Event match quality for dataset ${stats.name || datasetId}`,
+            dataset_id: stats.id,
+            dataset_name: stats.name,
+            event_stats: stats.event_stats
+          };
+        }
+        default:
+          throw new Error(`Invalid action "${action}" for DATASET. Supported: LIST, GET_MATCH_QUALITY.`);
+      }
+    } catch (error: any) {
+      console.error('AgentMode: Error managing Meta datasets:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to manage Meta datasets.',
+        error: error.message
+      };
+    }
+  }
+
   public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -10183,6 +10238,12 @@ Format the response as JSON with this structure:
           if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
         }
         break;
+
+      case 'DATASET':
+        if (action === 'GET_MATCH_QUALITY' && !params.dataset_id) {
+          throw new Error('DATASET GET_MATCH_QUALITY requires "params.dataset_id".');
+        }
+        break;
     }
   }
 
@@ -10192,7 +10253,7 @@ Format the response as JSON with this structure:
    */
   public async callMetaMarketingApi(
     userId: string,
-    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE',
+    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE' | 'DATASET',
     action: string,
     account_id: string,
     campaign_id?: string,
@@ -10240,6 +10301,9 @@ Format the response as JSON with this structure:
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
+
+      case 'DATASET':
+        return this.manageMetaDatasets(userId, action as any, account_id, params);
 
       default:
         throw new Error(`Invalid entity_type: ${entity_type}`);
