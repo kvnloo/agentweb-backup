@@ -15871,18 +15871,17 @@ Format the response as JSON with this structure:
       const cheerio = await import('cheerio');
       const $ = cheerio.load(currentContent, { xml: false } as any);
 
-      // Apply operations sequentially
+      // Apply operations sequentially, collecting results for each
       let operationsApplied = 0;
+      const operationResults: { index: number; action: string; selector: string; success: boolean; error?: string }[] = [];
       for (let i = 0; i < operations.length; i++) {
         const op = operations[i];
         const matched = $(op.selector);
 
         if (matched.length === 0) {
-          return {
-            success: false,
-            message: `Operation ${i + 1} (${op.action}): No elements matched selector "${op.selector}"`,
-            suggestion: 'Use read_file_content to inspect the current HTML structure and verify your CSS selector'
-          };
+          console.warn(`AgentMode: CSS edit op ${i + 1}: no match for "${op.selector}"`);
+          operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: false, error: `No elements matched selector "${op.selector}"` });
+          continue;
         }
 
         console.log(`AgentMode: CSS edit op ${i + 1}: ${op.action} on "${op.selector}" (${matched.length} matches)`);
@@ -15917,11 +15916,23 @@ Format the response as JSON with this structure:
             break;
         }
         operationsApplied++;
+        operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: true });
+      }
+
+      // If nothing was applied, return failure
+      if (operationsApplied === 0) {
+        return {
+          success: false,
+          message: `All ${operations.length} operations failed: no selectors matched`,
+          operations: operationResults,
+          suggestion: 'Use read_file_content to inspect the current HTML structure. Use :eq(n) (0-indexed) to select by position within matched set, e.g. ".step-block:eq(1)" for the 2nd .step-block.'
+        };
       }
 
       // Serialize back to HTML
       const updatedContent = $.html();
-      console.log(`AgentMode: CSS edit complete, ${operationsApplied} operations applied, new length: ${updatedContent.length}`);
+      const failedOps = operationResults.filter(r => !r.success);
+      console.log(`AgentMode: CSS edit complete, ${operationsApplied}/${operations.length} operations applied, new length: ${updatedContent.length}`);
 
       // Upload
       const versionedFilename = this.createVersionedFilename(fileUrl);
@@ -15931,10 +15942,13 @@ Format the response as JSON with this structure:
       return {
         success: true,
         s3_url: uploadResult.url,
-        message: `File updated successfully with ${operationsApplied} CSS-selector operations`,
+        message: failedOps.length > 0
+          ? `File updated with ${operationsApplied}/${operations.length} operations (${failedOps.length} failed: ${failedOps.map(f => `op ${f.index} selector "${f.selector}"`).join(', ')})`
+          : `File updated successfully with ${operationsApplied} CSS-selector operations`,
         method: 'css_selector',
         operations_applied: operationsApplied,
-        updatedContent, // included for verification
+        operations: operationResults,
+        updatedContent,
         versioned_filename: versionedFilename
       };
     } catch (error) {
