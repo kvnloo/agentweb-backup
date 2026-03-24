@@ -4935,7 +4935,12 @@ export const socialEngagementTrackingDb = {
   }) {
     try {
       const dedupId = tracker.commentId || tracker.postId;
-      const key = `${dedupId}#${tracker.engagingAccountId}`;
+      // Legacy compound types keep the old key format (no action suffix) for backward compat.
+      // New atomic types include the action type so like and reply can coexist on the same comment.
+      const isLegacyCompound = tracker.actionType === 'like_and_reply_comment' || tracker.actionType === 'comment_and_like';
+      const key = isLegacyCompound
+        ? `${dedupId}#${tracker.engagingAccountId}`
+        : `${dedupId}#${tracker.engagingAccountId}#${tracker.actionType}`;
 
       if (tracker.status === 'failed') {
         // Use UPDATE + ADD to atomically increment failCount instead of overwriting it
@@ -4962,8 +4967,38 @@ export const socialEngagementTrackingDb = {
           ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
           ExpressionAttributeValues: exprValues,
         }).promise();
+      } else if (tracker.status === 'queued') {
+        // Use UPDATE (not PUT) so failCount is preserved across retries.
+        // A PUT would wipe failCount, resetting it to 0 on every scanner re-queue
+        // and making the 3-retry cap impossible to reach.
+        // executedAt is set now so the item appears in GSIs (DynamoDB excludes items
+        // with missing GSI sort keys, which would break the per-post cap count).
+        const executedAt = tracker.executedAt ?? new Date().toISOString();
+        const setFields = [
+          '#status = :status', '#platform = :platform',
+          'ownerAccountId = :ownerAccountId', 'actionType = :actionType',
+          'scheduleId = :scheduleId', 'createdAt = :createdAt', 'executedAt = :executedAt',
+        ];
+        const exprValues: Record<string, any> = {
+          ':status': 'queued',
+          ':platform': tracker.platform,
+          ':ownerAccountId': tracker.ownerAccountId,
+          ':actionType': tracker.actionType,
+          ':scheduleId': tracker.scheduleId,
+          ':createdAt': new Date().toISOString(),
+          ':executedAt': executedAt,
+        };
+        if (tracker.commentId)    { setFields.push('commentId = :commentId');       exprValues[':commentId']    = tracker.commentId; }
+        if (tracker.postId)       { setFields.push('postId = :postId');             exprValues[':postId']       = tracker.postId; }
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+          Key: { userId: tracker.userId, postId_engagingAccountId: key },
+          UpdateExpression: `SET ${setFields.join(', ')}`,
+          ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
+          ExpressionAttributeValues: exprValues,
+        }).promise();
       } else {
-        // queued / completed — plain put (resets failCount is intentional on success)
+        // completed — plain PUT resets failCount intentionally on success
         await dynamodb.put({
           TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
           Item: { ...tracker, postId_engagingAccountId: key, createdAt: new Date().toISOString() },
@@ -4977,25 +5012,33 @@ export const socialEngagementTrackingDb = {
     }
   },
 
-  async hasEngaged(userId: string, postId: string, engagingAccountId: string): Promise<boolean> {
+  async hasEngaged(userId: string, postId: string, engagingAccountId: string, actionType?: string): Promise<boolean> {
     try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
-        KeyConditionExpression: "userId = :userId AND postId_engagingAccountId = :postId_engagingAccountId",
-        // Block if already queued/completed, or if max retries reached
-        FilterExpression: "#status IN (:queued, :completed) OR failCount >= :maxRetries",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":userId": userId,
-          ":postId_engagingAccountId": `${postId}#${engagingAccountId}`,
-          ":queued": "queued",
-          ":completed": "completed",
-          ":maxRetries": SOCIAL_ENGAGEMENT_MAX_RETRIES,
-        }
-      };
+      // For new atomic action types, check both the action-specific key (new format) and
+      // the legacy compound key (old format) so existing records still block reschedules.
+      const isLegacyCompound = !actionType || actionType === 'like_and_reply_comment' || actionType === 'comment_and_like';
+      const keysToCheck = isLegacyCompound
+        ? [`${postId}#${engagingAccountId}`]
+        : [`${postId}#${engagingAccountId}#${actionType}`, `${postId}#${engagingAccountId}`];
 
-      const result = await dynamodb.query(params).promise();
-      return (result.Items && result.Items.length > 0) ? true : false;
+      for (const key of keysToCheck) {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+          KeyConditionExpression: "userId = :userId AND postId_engagingAccountId = :postId_engagingAccountId",
+          // Block if already queued/completed, or if max retries reached
+          FilterExpression: "#status IN (:queued, :completed) OR failCount >= :maxRetries",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":userId": userId,
+            ":postId_engagingAccountId": key,
+            ":queued": "queued",
+            ":completed": "completed",
+            ":maxRetries": SOCIAL_ENGAGEMENT_MAX_RETRIES,
+          }
+        }).promise();
+        if (result.Items && result.Items.length > 0) return true;
+      }
+      return false;
     } catch (error) {
       handleDynamoDbError(error, "hasEngaged");
       return false;

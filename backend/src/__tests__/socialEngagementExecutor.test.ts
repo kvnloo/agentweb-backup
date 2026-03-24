@@ -131,6 +131,18 @@ describe('SocialEngagementExecutor', () => {
       expect(mockScheduleDb.claimAction).not.toHaveBeenCalled();
     });
 
+    it('should return false when DB fetch throws a critical error', async () => {
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      const result = await executor.processQueue();
+
+      expect(result).toBe(false);
+      // isProcessing must be reset so subsequent calls are not permanently blocked
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([]);
+      const result2 = await executor.processQueue();
+      expect(result2).toBe(true);
+    });
+
     it('should skip concurrent runs (isProcessing guard)', async () => {
       // First call blocks on a pending promise
       let resolveFirst!: () => void;
@@ -183,7 +195,7 @@ describe('SocialEngagementExecutor', () => {
   describe('processAction validation', () => {
     it('should mark action done when postId is missing', async () => {
       const action = makeAction();
-      action.variableValues.postId = undefined;
+      action.variableValues.postId = undefined as any;
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
@@ -199,7 +211,7 @@ describe('SocialEngagementExecutor', () => {
 
     it('should mark action done when user not found', async () => {
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
-      mockUserDb.getUserById.mockResolvedValue(null);
+      mockUserDb.getUserById.mockResolvedValue(null as any);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 
@@ -338,6 +350,51 @@ describe('SocialEngagementExecutor', () => {
         expect.any(Object), 'urn:li:share:123', 'INTEREST', 'user-1'
       );
     });
+
+    it('should mark completed (not failed) when comment succeeds but like fails — prevents duplicate comments on retry', async () => {
+      const action = makeAction({
+        variableValues: { ...makeAction().variableValues, actionType: 'comment_and_like' },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+
+      const geminiClient = {
+        chat: {
+          completions: {
+            create: jest.fn()
+              .mockResolvedValueOnce({ choices: [{ message: { content: 'Great post!' } }] })
+              .mockResolvedValueOnce({ choices: [{ message: { content: 'LIKE' } }] }),
+          },
+        },
+      };
+      mockAgentModeService.getGeminiClient.mockResolvedValue(geminiClient as any);
+      mockAdapter.createComment.mockResolvedValue(undefined as any);
+      mockAdapter.createReaction.mockRejectedValue(new Error('LinkedIn API error'));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      // Comment succeeded — must be marked completed, not failed
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' })
+      );
+      // Should not be retried (which would cause a duplicate comment)
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should mark failed when comment itself fails for comment_and_like', async () => {
+      const action = makeAction({
+        variableValues: { ...makeAction().variableValues, actionType: 'comment_and_like' },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('LIKE') as any);
+      mockAdapter.createComment.mockRejectedValue(new Error('LinkedIn API error'));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed' })
+      );
+    });
   });
 
   // ─── executeCommentAction ──────────────────────────────────────────────────
@@ -420,6 +477,59 @@ describe('SocialEngagementExecutor', () => {
         expect.objectContaining({ status: 'failed' })
       );
       expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+    });
+
+    it('should mark completed (not failed) when reply succeeds but like fails for like_and_reply_comment — prevents duplicate replies on retry', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: 'Nice work!',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'like_and_reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('Good reply!') as any);
+      mockAdapter.createComment.mockResolvedValue(undefined as any);
+      mockAdapter.createReaction.mockRejectedValue(new Error('LinkedIn API error'));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      // Reply succeeded — must be marked completed, not failed
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' })
+      );
+      // Should not be retried (which would cause a duplicate reply)
+      expect(mockScheduleDb.updateScheduleAfterRun).toHaveBeenCalled();
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+
+    it('should mark failed when reply itself fails for like_and_reply_comment', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: 'Nice work!',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'like_and_reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(makeMockGeminiClient('reply text') as any);
+      mockAdapter.createComment.mockRejectedValue(new Error('LinkedIn API error'));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed' })
+      );
     });
 
     it('should use fallback reply text when LLM fails', async () => {
@@ -574,7 +684,7 @@ describe('SocialEngagementTimerScheduler', () => {
     jest.clearAllMocks();
     jest.useFakeTimers();
     executor = new SocialEngagementExecutor();
-    jest.spyOn(executor, 'processQueue').mockResolvedValue(undefined);
+    jest.spyOn(executor, 'processQueue').mockResolvedValue(true);
     scheduler = new SocialEngagementTimerScheduler(executor);
   });
 
@@ -608,21 +718,22 @@ describe('SocialEngagementTimerScheduler', () => {
     expect(executor.processQueue).toHaveBeenCalled();
   });
 
-  it('should not register duplicate timers for the same scheduleId', async () => {
+  it('should not register duplicate timers for the same scheduleId within the same scheduling window', async () => {
+    // Action due in 35 min — startup poll (T=1s) registers it with ~34min59s delay.
+    // The 30-min interval fires at T=30min while the timer is still pending.
+    // pendingTimers must block re-registration, so processQueue fires exactly once at T=35min.
     const futureAction = {
       scheduleId: 'sched-dup',
-      nextRunTime: new Date(Date.now() + 10000).toISOString(),
+      nextRunTime: new Date(Date.now() + 35 * 60 * 1000).toISOString(),
     };
     mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([futureAction as any]);
 
     scheduler.start();
-    await jest.advanceTimersByTimeAsync(1000); // first poll
+    await jest.advanceTimersByTimeAsync(1000);           // T=1s: startup poll, sched-dup registered (~35min timer)
+    await jest.advanceTimersByTimeAsync(30 * 60 * 1000); // T=30min: interval fires, sched-dup still pending → skip
+    expect(executor.processQueue).not.toHaveBeenCalled();
 
-    // Advance to next poll interval (30 min)
-    await jest.advanceTimersByTimeAsync(30 * 60 * 1000);
-
-    // processQueue should only be registered once per unique scheduleId
-    await jest.advanceTimersByTimeAsync(10000);
+    await jest.advanceTimersByTimeAsync(5 * 60 * 1000);  // T=35min: 35-min timer fires
     expect(executor.processQueue).toHaveBeenCalledTimes(1);
   });
 
@@ -634,8 +745,10 @@ describe('SocialEngagementTimerScheduler', () => {
     mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([overdueAction as any]);
 
     scheduler.start();
-    await jest.advanceTimersByTimeAsync(1000); // startup delay
-    await jest.advanceTimersByTimeAsync(1);    // zero-delay timer fires
+    await jest.advanceTimersByTimeAsync(1000); // startup 1s timer fires → scheduleUpcoming() called (async)
+    // scheduleUpcoming awaits DB (microtask), then registers setTimeout(0).
+    // A second small advance fires that 0-delay timer.
+    await jest.advanceTimersByTimeAsync(100);
 
     expect(executor.processQueue).toHaveBeenCalled();
   });
