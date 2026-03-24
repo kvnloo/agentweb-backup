@@ -688,6 +688,25 @@ if (NOTION_PAGE_ID) {
   }, 5000);
 }
 
+// On startup, ensure all allowlisted IPs have SG rules (handles repo clone / new SG drift)
+async function enforceAllowlist() {
+  const allowlist = readAllowlist();
+  const subnets = new Set();
+  for (const entry of allowlist.ips) {
+    const cidr = entry.subnet || toSubnet24(entry.ip);
+    if (cidr.includes(".")) subnets.add(cidr); // skip non-IPv4 like ::1
+  }
+  if (subnets.size === 0) return;
+  console.log(`[allowlist] Enforcing SG rules for ${subnets.size} subnet(s)...`);
+  for (const cidr of subnets) {
+    await addSecurityGroupRules(cidr);
+  }
+  console.log("[allowlist] SG reconciliation complete.");
+}
+
 app.listen(PORT, () => {
   console.log(`IP allowlist service running on http://localhost:${PORT}`);
+  enforceAllowlist().catch((err) =>
+    console.error("[allowlist] Failed to enforce allowlist on startup:", err)
+  );
 });
