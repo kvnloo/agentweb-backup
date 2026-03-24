@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-24',
+    changes: [
+      'Improvement: Smarter HTML File Editing with CSS Selectors',
+      '- Emma now uses CSS-selector-based editing when updating HTML reports, replacing the old exact-string-matching approach',
+      '- Supports 9 operations: remove, replace, replaceInner, append, prepend, insertBefore, insertAfter, setAttribute, removeAttribute',
+      '- Much more reliable — no more failures from whitespace mismatches or escaped characters in large HTML files',
+      '- Full file replacement mode still available as a fallback',
+    ],
+  },
+  {
     date: '2026-03-23',
     changes: [
       'New: Self-Serve Email Domain Setup in CRM',
