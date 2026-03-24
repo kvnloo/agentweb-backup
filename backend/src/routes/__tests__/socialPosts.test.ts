@@ -134,7 +134,7 @@ describe('GET /api/social-posts/config', () => {
   });
 
   it('should return 404 when user not found', async () => {
-    mockUserDb.getUserById.mockResolvedValue(null);
+    mockUserDb.getUserById.mockResolvedValue(null as any);
 
     const res = await request(app).get('/api/social-posts/config').expect(404);
 
@@ -251,7 +251,7 @@ describe('PUT /api/social-posts/config', () => {
   });
 
   it('should return 404 when user not found', async () => {
-    mockUserDb.getUserById.mockResolvedValue(null);
+    mockUserDb.getUserById.mockResolvedValue(null as any);
 
     const res = await request(app)
       .put('/api/social-posts/config')
@@ -336,7 +336,7 @@ describe('GET /api/social-posts/activity/account/:accountId', () => {
   beforeEach(() => {
     mockUserDb.getUserById.mockResolvedValue(mockUser as any);
     mockTrackingDb.getEngagementsByAccount.mockResolvedValue(enrichedActivity as any);
-    mockScheduleDb.getScheduleById.mockResolvedValue(null);
+    mockScheduleDb.getScheduleById.mockResolvedValue(null as any);
   });
 
   it('should return activity records for an account the user owns', async () => {
@@ -407,7 +407,7 @@ describe('GET /api/social-posts/activity/post/:postId', () => {
   beforeEach(() => {
     mockUserDb.getUserById.mockResolvedValue(mockUser as any);
     mockTrackingDb.getEngagementsByPost.mockResolvedValue(activity as any);
-    mockScheduleDb.getScheduleById.mockResolvedValue(null);
+    mockScheduleDb.getScheduleById.mockResolvedValue(null as any);
   });
 
   it('should return activity records for a given post URN', async () => {
