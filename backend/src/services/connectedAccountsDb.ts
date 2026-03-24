@@ -132,6 +132,17 @@ export interface FathomConfig {
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | YouTubeConfig | FathomConfig; // | TwitterConfig
 
 /**
+ * Per-connection engagement memory: a persona profile generated from LinkedIn data
+ * and optionally edited by the user, used to personalize automated engagement comments.
+ */
+export interface EngagementMemory {
+  content: string;       // Markdown persona profile
+  lastSyncedAt: string;  // ISO timestamp of last LinkedIn data sync
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
  * Connected Account configuration stored in the User record
  */
 export interface ConnectedAccountConfig {
@@ -139,6 +150,7 @@ export interface ConnectedAccountConfig {
   account_id: string;
   account_name: string;
   config: PlatformConfig;
+  engagementMemory?: EngagementMemory;
   created_at: string;
   updated_at: string;
 }
@@ -151,6 +163,7 @@ export interface ConnectedAccount {
   account_id: string;
   account_name: string;
   config: PlatformConfig;
+  engagementMemory?: EngagementMemory;
   created_at: string;
   updated_at: string;
 }
@@ -474,4 +487,46 @@ export const isTokenValid = async (account: ConnectedAccount): Promise<boolean> 
 export const isTokenNotExpired = (account: ConnectedAccount): boolean => {
   const now = Date.now();
   return account.config.token_expires_at > now;
+};
+
+/**
+ * Get the engagement memory for a specific connected account
+ */
+export const getEngagementMemory = async (
+  userId: string,
+  accountId: string
+): Promise<EngagementMemory | null> => {
+  const user = await userDb.getUserById(userId);
+  if (!user) return null;
+
+  const accounts = normalizeAccounts((user as User).connected_accounts);
+  const account = accounts.find(acc => acc.account_id === accountId);
+  return account?.engagementMemory || null;
+};
+
+/**
+ * Save or update the engagement memory for a specific connected account
+ */
+export const saveEngagementMemory = async (
+  userId: string,
+  accountId: string,
+  memory: EngagementMemory
+): Promise<void> => {
+  const user = await userDb.getUserById(userId);
+  if (!user) throw new Error('User not found');
+
+  const accounts = normalizeAccounts((user as User).connected_accounts);
+  const accountIndex = accounts.findIndex(acc => acc.account_id === accountId);
+  if (accountIndex < 0) throw new Error('Connected account not found');
+
+  const updatedAccounts = [...accounts];
+  updatedAccounts[accountIndex] = {
+    ...updatedAccounts[accountIndex],
+    engagementMemory: memory,
+    updated_at: new Date().toISOString(),
+  };
+
+  await userDb.updateUser(userId, {
+    connected_accounts: updatedAccounts,
+  } as Partial<User>);
 };

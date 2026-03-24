@@ -1,8 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { AuthenticatedRequest } from '../middleware/auth';
-import { getPostsForUser } from '../services/socialPostsService';
+import { getPostsForUser, generateEngagementMemory } from '../services/socialPostsService';
 import { userDb, scheduleDb, socialEngagementTrackingDb } from '../services/db';
+import { getEngagementMemory, saveEngagementMemory, EngagementMemory } from '../services/connectedAccountsDb';
 
 const router = Router();
 
@@ -267,6 +268,89 @@ router.get('/social-posts/activity/post/:postId', authenticateToken, async (req:
   } catch (error) {
     console.error('[SocialPosts/Activity/Post] Error:', error);
     return res.status(500).json({ error: 'Failed to fetch post activity' });
+  }
+});
+
+// ─── GET engagement memory for a connected account ────────────────────────────
+router.get('/social-posts/memory/:accountId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { accountId } = req.params;
+
+    // Verify account belongs to user
+    const user = await userDb.getUserById(userId);
+    const account = (user?.connected_accounts || []).find((a: any) => a.account_id === accountId);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    const memory = await getEngagementMemory(userId, accountId);
+    return res.json({ memory });
+  } catch (error) {
+    console.error('[SocialPosts/Memory GET] Error:', error);
+    return res.status(500).json({ error: 'Failed to fetch engagement memory' });
+  }
+});
+
+// ─── PUT save user-edited engagement memory for a connected account ───────────
+router.put('/social-posts/memory/:accountId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { accountId } = req.params;
+    const { content } = req.body;
+
+    if (typeof content !== 'string') {
+      return res.status(400).json({ error: 'content is required and must be a string' });
+    }
+
+    // Verify account belongs to user
+    const user = await userDb.getUserById(userId);
+    const account = (user?.connected_accounts || []).find((a: any) => a.account_id === accountId);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    const existing = await getEngagementMemory(userId, accountId);
+    const now = new Date().toISOString();
+    const memory: EngagementMemory = {
+      content,
+      lastSyncedAt: existing?.lastSyncedAt || now,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    };
+
+    await saveEngagementMemory(userId, accountId, memory);
+    return res.json({ success: true, memory });
+  } catch (error) {
+    console.error('[SocialPosts/Memory PUT] Error:', error);
+    return res.status(500).json({ error: 'Failed to save engagement memory' });
+  }
+});
+
+// ─── POST generate/sync engagement memory from LinkedIn data ──────────────────
+router.post('/social-posts/memory/:accountId/sync', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { accountId } = req.params;
+
+    // Verify account belongs to user and is LinkedIn
+    const user = await userDb.getUserById(userId);
+    const account = (user?.connected_accounts || []).find((a: any) => a.account_id === accountId);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    if (account.platform !== 'linkedin') {
+      return res.status(400).json({ error: 'Memory sync is currently only supported for LinkedIn accounts' });
+    }
+
+    const existing = await getEngagementMemory(userId, accountId);
+    const memory = await generateEngagementMemory(userId, account, existing);
+
+    return res.json({ success: true, memory });
+  } catch (error) {
+    console.error('[SocialPosts/Memory Sync] Error:', error);
+    return res.status(500).json({ error: 'Failed to generate engagement memory' });
   }
 });
 

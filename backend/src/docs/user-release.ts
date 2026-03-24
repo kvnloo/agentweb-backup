@@ -11,6 +11,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-24',
     changes: [
+      'New: Engagement Memory for Personalized Social Interactions',
+      '- Each connected LinkedIn account now has an "Engagement Memory" — a persona profile that personalizes automated comments and replies',
+      '- Click "Generate" to create the memory from your LinkedIn profile and recent posts using AI',
+      '- Edit the memory directly to fine-tune your engagement voice, key topics, and style preferences',
+      '- Click "Sync" to merge the latest LinkedIn data while preserving your customizations',
+      '- Automated engagement comments and replies now use the memory for more authentic, personalized interactions',
       'Fix: Slack Chat Links Not Clickable',
       '- Fixed an issue where links in Emma\'s Slack chat responses appeared as a doc icon but were not clickable',
       '- Links are now properly rendered as clickable Slack links',
