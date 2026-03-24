@@ -130,7 +130,7 @@ describe('updateHtmlFile CSS-selector operations', () => {
         [{ action: 'remove', selector: '.nonexistent-class' }], 'u1', 's1'
       );
       expect(result.success).toBe(false);
-      expect(result.message).toContain('No elements matched');
+      expect(result.message).toContain('operations failed');
     });
 
     it('rejects replace without html parameter', async () => {
@@ -326,7 +326,7 @@ describe('updateHtmlFile CSS-selector operations', () => {
       expect(result.updatedContent).toContain('Updated Conference');
     });
 
-    it('fails mid-sequence if selector not found and does not upload', async () => {
+    it('applies successful ops and skips failed ones when selector not found mid-sequence', async () => {
       const result = await (svc as any).updateHtmlFile(
         'https://s3.amazonaws.com/bucket/file.html', 'css',
         [
@@ -334,9 +334,13 @@ describe('updateHtmlFile CSS-selector operations', () => {
           { action: 'remove', selector: '.nonexistent' },
         ], 'u1', 's1'
       );
-      expect(result.success).toBe(false);
-      expect(result.message).toContain('No elements matched');
-      expect((svc as any).uploadUpdatedFile).not.toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.operations_applied).toBe(1);
+      expect(result.operations).toHaveLength(2);
+      expect(result.operations[0].success).toBe(true);
+      expect(result.operations[1].success).toBe(false);
+      expect(result.message).toContain('1/2 operations');
+      expect(result.updatedContent).not.toContain('Patrick Bajari');
     });
   });
 
