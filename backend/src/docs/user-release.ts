@@ -11,6 +11,14 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-24',
     changes: [
+      'Fix: Slack Chat Links Not Clickable',
+      '- Fixed an issue where links in Emma\'s Slack chat responses appeared as a doc icon but were not clickable',
+      '- Links are now properly rendered as clickable Slack links',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
       'Feature: Meta Ads Event Match Quality (EMQ)',
       '- You can now check data match quality scores for your Meta Conversions API (CAPI) datasets directly from the chat',
       '- Use the Meta Marketing API tool with DATASET → LIST to discover your pixels and linked datasets',
