@@ -287,6 +287,13 @@ ACTION MATRIX (entity_type → supported actions):
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
+  DATASET       → LIST, GET_MATCH_QUALITY
+
+DATASET USAGE:
+  LIST              → Returns all pixels and their associated datasets (server event data sources) for the ad account
+  GET_MATCH_QUALITY → Returns Event Match Quality (EMQ) scores per event type for a specific dataset. Requires params.dataset_id.
+  WORKFLOW: First LIST to discover pixel/dataset IDs, then GET_MATCH_QUALITY with the dataset_id.
+  NOTE: Match quality data is only available if the advertiser has Conversions API (CAPI) set up.
 
 REQUIRED IDs PER ACTION:
   CAMPAIGN UPDATE/DELETE  → campaign_id required
@@ -336,12 +343,12 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
         properties: {
           entity_type: {
             type: "string",
-            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE"],
+            enum: ["CAMPAIGN", "AD_SET", "AD_CREATIVE", "AD", "CUSTOM_AUDIENCE", "TARGETING", "PAGE", "DATASET"],
             description: "The Meta Ads entity to operate on."
           },
           action: {
             type: "string",
-            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH"],
+            enum: ["LIST", "CREATE", "UPDATE", "DELETE", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
             description: "The operation to perform. Must be valid for the chosen entity_type."
           },
           account_id: {
@@ -423,7 +430,10 @@ OBJECTIVE → OPTIMIZATION GOAL COMPATIBILITY (common mappings):
 
               // --- Targeting Search ---
               q:    { type: "string", description: "Search query for targeting search." },
-              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." }
+              type: { type: "string", enum: ["adinterest", "adbehavior", "addemographics"], description: "Targeting category to search." },
+
+              // --- Dataset ---
+              dataset_id: { type: "string", description: "Dataset ID. Required for DATASET GET_MATCH_QUALITY." }
             }
           }
         },
@@ -1301,15 +1311,21 @@ emmaToolRegistry.register({
       const user = await userDb.getUserById(userId);
       const cmsType = user?.cmsType;
 
-      if (cmsType !== 'Webflow') {
-        return { success: true, cmsType: cmsType || null, categories: [] };
+      if (cmsType === 'Webflow') {
+        const { getWebflowConfig } = await import('../controllers/blog');
+        const config = await getWebflowConfig(userId);
+        const categoryNames = config.categories ? Object.keys(config.categories) : [];
+        return { success: true, cmsType, categories: categoryNames };
       }
 
-      const { getWebflowConfig } = await import('../controllers/blog');
-      const config = await getWebflowConfig(userId);
-      const categoryNames = config.categories ? Object.keys(config.categories) : [];
+      if (cmsType === 'WordPress') {
+        const { getWordPressConfig } = await import('../controllers/blog');
+        const config = await getWordPressConfig(userId);
+        const categoryNames = config.categories ? Object.keys(config.categories) : [];
+        return { success: true, cmsType, categories: categoryNames };
+      }
 
-      return { success: true, cmsType, categories: categoryNames };
+      return { success: true, cmsType: cmsType || null, categories: [] };
     } catch (error: any) {
       return { success: false, message: 'Failed to fetch CMS categories', error: error.message };
     }
@@ -1469,63 +1485,65 @@ emmaToolRegistry.register({
   name: 'update_html_file',
   definition: {
     name: 'update_html_file',
-    description: 'Update an HTML file by replacing specific content with new content. Use update_type="full" with old_content_hash for entire file replacement, or update_type="part" with old_content for partial replacements',
+    description: 'Update an HTML file using CSS selectors to target elements (preferred), or full file replacement with hash verification. ' +
+      'CSS mode (update_type="css"): Use CSS selectors to precisely target and modify HTML elements without needing to reproduce exact content. ' +
+      'Full mode (update_type="full"): Replace entire file content using hash verification.',
     inputSchema: {
       type: 'object',
       properties: {
         file_url: {
           type: 'string',
-          description: 'URL of the HTML file to update (S3 URL or file path)'
+          description: 'URL of the HTML file to update (S3 URL)'
         },
         update_type: {
           type: 'string',
-          enum: ['part', 'full'],
-          description: 'Type of update: "part" for partial content replacement using old_content, "full" for entire file replacement using old_content_hash'
+          enum: ['css', 'full'],
+          description: 'Type of update: "css" (recommended) for CSS-selector-based editing, "full" for entire file replacement with hash'
         },
-        replacement_json: {
+        operations_json: {
           type: 'string',
-          description: 'JSON string containing a list of replacement instructions. For full replacement: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]. For part replacement: [{"old_content": "<h1>Old Title</h1>", "new_content": "<h1>New Title</h1>", "expected_count": 1}]. Use empty string for new_content to delete the specified content.'
+          description: 'JSON string containing operations. ' +
+            'For CSS mode: [{"action": "remove", "selector": ".card[data-id=\\"123\\"]"}, ' +
+            '{"action": "replace", "selector": "h1.title", "html": "<h1 class=\\"title\\">New Title</h1>"}, ' +
+            '{"action": "replaceInner", "selector": ".bio", "html": "New bio text"}, ' +
+            '{"action": "append", "selector": "#grid", "html": "<div>New item</div>"}, ' +
+            '{"action": "prepend", "selector": "#grid", "html": "<div>First item</div>"}, ' +
+            '{"action": "insertBefore", "selector": ".item:last-child", "html": "<div>Before last</div>"}, ' +
+            '{"action": "insertAfter", "selector": ".item:first-child", "html": "<div>After first</div>"}, ' +
+            '{"action": "setAttribute", "selector": "img.hero", "attribute": "src", "value": "new.jpg"}, ' +
+            '{"action": "removeAttribute", "selector": "a", "attribute": "target"}]. ' +
+            'For full mode: [{"old_content_hash": "abc123...", "new_content": "<!DOCTYPE html>...", "expected_count": 1}]'
         }
       },
-      required: ['file_url', 'update_type', 'replacement_json']
+      required: ['file_url', 'update_type', 'operations_json']
     }
   },
   execute: async (args: any, context?: any) => {
-    // Ensure we have the required parameters
     if (!args.file_url) {
-      return {
-        success: false,
-        message: 'file_url is required'
-      };
+      return { success: false, message: 'file_url is required' };
     }
-
     if (!args.update_type) {
-      return {
-        success: false,
-        message: 'update_type is required'
-      };
+      return { success: false, message: 'update_type is required' };
     }
 
-    if (!args.replacement_json) {
-      return {
-        success: false,
-        message: 'replacement_json is required'
-      };
+    // Accept both operations_json (new) and replacement_json (legacy) parameter names
+    const jsonStr = args.operations_json || args.replacement_json;
+    if (!jsonStr) {
+      return { success: false, message: 'operations_json is required' };
     }
 
-    // Parse replacement instructions
-    let replacementInstructions;
+    let operations;
     try {
-      replacementInstructions = JSON.parse(args.replacement_json);
+      operations = JSON.parse(jsonStr);
     } catch (error) {
       return {
         success: false,
-        message: 'Invalid JSON in replacement_json',
+        message: 'Invalid JSON in operations_json',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
 
-    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, replacementInstructions, context?.userId, context?.sessionId);
+    return await agentModeService.updateHtmlFile(args.file_url, args.update_type, operations, context?.userId, context?.sessionId);
   }
 });
 
@@ -4540,6 +4558,9 @@ const bridgedToolNames = [
   'enable_lead_list_public_access',
   'duplicate_landing_page',
   'get_deployment_status',
+  'list_landing_page_files',
+  'get_landing_page_preview_url',
+  'publish_landing_page_changes',
 ];
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
@@ -4572,7 +4593,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent reads files, makes precise diff-based edits, checks deployment status, verifies changes in the browser, and iterates on build errors autonomously. Use this for ANY task that involves modifying landing page code (HTML, CSS, JS/TSX, config files). The agent runs autonomously, verifies its own work visually, and returns results when done.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4602,19 +4623,34 @@ emmaToolRegistry.register({
         }
       : undefined;
 
+    // Use a draft branch for staging — derive from session ID
+    const sessionId = context?.sessionId || '';
+    const draftBranch = sessionId ? `draft/${sessionId.substring(0, 16)}` : undefined;
+
     const result = await runCodingAgent(
       args.task_description,
       {
         pageId: args.page_id,
         userId: context?.userId,
-        sessionId: context?.sessionId,
+        sessionId,
         llmModel: context?.llmModel || 'anthropic.claude-sonnet-4-6',
         socketEmit: context?.socketEmit,
         executeMcpTool,
+        draftBranch,
       }
     );
     if (result.success) {
-      return { success: true, message: result.message, iterations: result.iterations };
+      return {
+        success: true,
+        message: result.message,
+        iterations: result.iterations,
+        previewUrl: result.previewUrl,
+        branch: result.branch,
+        is_staging: !!result.branch && result.branch !== 'main',
+        note: result.branch && result.branch !== 'main'
+          ? `Changes are on staging branch "${result.branch}". The user must review the preview URL and ask to publish before changes go live.`
+          : undefined,
+      };
     } else {
       return { success: false, error: result.message, iterations: result.iterations };
     }

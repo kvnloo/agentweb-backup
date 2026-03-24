@@ -155,7 +155,7 @@ describe("Admin CMS Type endpoint", () => {
       .expect(400);
 
     expect(res.body.message).toBe(
-      "cmsType must be either 'Basehub' or 'Webflow'"
+      "cmsType must be 'Basehub', 'Webflow', or 'WordPress'"
     );
     expect(mockUserDb.updateUser).not.toHaveBeenCalled();
   });

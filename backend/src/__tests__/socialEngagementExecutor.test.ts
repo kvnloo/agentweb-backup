@@ -195,7 +195,7 @@ describe('SocialEngagementExecutor', () => {
   describe('processAction validation', () => {
     it('should mark action done when postId is missing', async () => {
       const action = makeAction();
-      action.variableValues.postId = undefined as any;
+      (action.variableValues as Record<string, string | undefined>).postId = undefined;
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
@@ -211,7 +211,7 @@ describe('SocialEngagementExecutor', () => {
 
     it('should mark action done when user not found', async () => {
       mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([makeAction()]);
-      mockUserDb.getUserById.mockResolvedValue(null as any);
+      mockUserDb.getUserById.mockResolvedValue(undefined);
 
       const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
 

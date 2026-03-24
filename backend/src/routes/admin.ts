@@ -93,6 +93,33 @@ const isAfterLastSync = (recordTime: string | undefined, lastSyncAt: string | un
 router.use(authenticateToken);
 router.use(isAdmin);
 
+// Get all Unipile (LinkedIn outreach) accounts across all users
+router.get("/unipile-accounts", async (req, res) => {
+  try {
+    const users = await userDb.getAllUsers();
+    const accounts: any[] = [];
+    for (const user of users) {
+      const userAccounts = (user as any).connected_accounts || [];
+      for (const acc of userAccounts) {
+        if (acc.platform === 'unipile') {
+          accounts.push({
+            account_id: acc.account_id,
+            account_name: acc.account_name,
+            user_email: (user as any).email,
+            user_id: (user as any).userId,
+            created_at: acc.created_at,
+            updated_at: acc.updated_at,
+          });
+        }
+      }
+    }
+    res.json({ accounts });
+  } catch (error) {
+    console.error("Error fetching Unipile accounts:", error);
+    res.status(500).json({ message: "Failed to fetch Unipile accounts" });
+  }
+});
+
 // Get CRM sync configuration for admin Users/Waitlist sync
 router.get("/crm-sync/:source", async (req, res) => {
   try {
@@ -980,8 +1007,8 @@ router.put("/users/:userId/cms-type", async (req, res) => {
     const { cmsType } = req.body;
 
     // Validate cmsType
-    if (cmsType && cmsType !== "Basehub" && cmsType !== "Webflow") {
-      return res.status(400).json({ message: "cmsType must be either 'Basehub' or 'Webflow'" });
+    if (cmsType && cmsType !== "Basehub" && cmsType !== "Webflow" && cmsType !== "WordPress") {
+      return res.status(400).json({ message: "cmsType must be 'Basehub', 'Webflow', or 'WordPress'" });
     }
 
     // Check if user exists

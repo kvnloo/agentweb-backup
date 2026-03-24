@@ -9230,6 +9230,61 @@ Format the response as JSON with this structure:
     }
   }
 
+  /**
+   * Manage Meta Datasets — list pixels, list datasets, get event match quality
+   */
+  public async manageMetaDatasets(
+    userId: string,
+    action: 'LIST' | 'GET_MATCH_QUALITY',
+    account_id: string,
+    params: any = {}
+  ): Promise<MetaApiResult> {
+    try {
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+
+      switch (action) {
+        case 'LIST': {
+          // List all pixels, then list datasets for each pixel
+          const pixels = await metaService.listPixels(accountId, accessToken);
+          const results: any[] = [];
+          for (const pixel of pixels) {
+            const datasets = await metaService.listDatasets(pixel.id, accessToken);
+            results.push({
+              pixel_id: pixel.id,
+              pixel_name: pixel.name,
+              datasets: datasets
+            });
+          }
+          return {
+            success: true,
+            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            pixels: results
+          };
+        }
+        case 'GET_MATCH_QUALITY': {
+          const datasetId = params.dataset_id;
+          const stats = await metaService.getDatasetEventStats(datasetId, accessToken);
+          return {
+            success: true,
+            message: `Event match quality for dataset ${stats.name || datasetId}`,
+            dataset_id: stats.id,
+            dataset_name: stats.name,
+            event_stats: stats.event_stats
+          };
+        }
+        default:
+          throw new Error(`Invalid action "${action}" for DATASET. Supported: LIST, GET_MATCH_QUALITY.`);
+      }
+    } catch (error: any) {
+      console.error('AgentMode: Error managing Meta datasets:', error);
+      return {
+        success: false,
+        message: error.message || 'Failed to manage Meta datasets.',
+        error: error.message
+      };
+    }
+  }
+
   public async listMetaAdsCampaignsNew(userId: string, account_id?: string): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
@@ -10183,6 +10238,12 @@ Format the response as JSON with this structure:
           if (!params.type) throw new Error('TARGETING SEARCH requires "params.type" (adinterest | adbehavior | addemographics).');
         }
         break;
+
+      case 'DATASET':
+        if (action === 'GET_MATCH_QUALITY' && !params.dataset_id) {
+          throw new Error('DATASET GET_MATCH_QUALITY requires "params.dataset_id".');
+        }
+        break;
     }
   }
 
@@ -10192,7 +10253,7 @@ Format the response as JSON with this structure:
    */
   public async callMetaMarketingApi(
     userId: string,
-    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE',
+    entity_type: 'CAMPAIGN' | 'AD_SET' | 'AD_CREATIVE' | 'AD' | 'CUSTOM_AUDIENCE' | 'TARGETING' | 'PAGE' | 'DATASET',
     action: string,
     account_id: string,
     campaign_id?: string,
@@ -10240,6 +10301,9 @@ Format the response as JSON with this structure:
 
       case 'PAGE':
         return this.listMetaPages(userId, account_id);
+
+      case 'DATASET':
+        return this.manageMetaDatasets(userId, action as any, account_id, params);
 
       default:
         throw new Error(`Invalid entity_type: ${entity_type}`);
@@ -14172,6 +14236,129 @@ Format the response as JSON with this structure:
             repairSuggested: errorInfo.repairSuggested || false
           };
         }
+      } else if (cmsType === 'WordPress') {
+        const { getWordPressConfig } = await import('../controllers/blog');
+        const wpConfig = await getWordPressConfig(userId);
+
+        const authHeader = 'Basic ' + Buffer.from(`${wpConfig.username}:${wpConfig.applicationPassword}`).toString('base64');
+
+        // Upload featured image if provided
+        let featuredMediaId: number | undefined;
+        if (heroImageUrl) {
+          try {
+            console.log('AgentMode: Uploading featured image to WordPress...');
+            const imgResponse = await axios.get(heroImageUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000,
+            });
+            const imageBuffer = Buffer.from(imgResponse.data as ArrayBuffer);
+            const contentType = imgResponse.headers['content-type'] || 'image/png';
+            const ext = contentType.includes('jpeg') || contentType.includes('jpg') ? 'jpg' : 'png';
+            const filename = `blog-hero-${Date.now()}.${ext}`;
+
+            const mediaResponse = await axios.post(
+              `${wpConfig.siteUrl}/wp-json/wp/v2/media`,
+              imageBuffer,
+              {
+                headers: {
+                  Authorization: authHeader,
+                  'Content-Type': contentType,
+                  'Content-Disposition': `attachment; filename="${filename}"`,
+                },
+                timeout: 60000,
+              }
+            );
+            featuredMediaId = (mediaResponse.data as any).id;
+            console.log('AgentMode: Featured image uploaded, media ID:', featuredMediaId);
+          } catch (imgError: any) {
+            console.error('AgentMode: Failed to upload featured image to WordPress:', imgError.message);
+          }
+        }
+
+        // Map category names to WordPress category IDs
+        let wpCategoryIds: number[] = [];
+        const invalidCategories: string[] = [];
+        if (categories && categories.length > 0 && wpConfig.categories) {
+          for (const name of categories) {
+            const id = wpConfig.categories[name];
+            if (id) {
+              wpCategoryIds.push(id);
+            } else {
+              invalidCategories.push(name);
+            }
+          }
+        }
+
+        const wpStatus = status === 'published' ? 'publish' : 'draft';
+        const postData: any = {
+          title: title,
+          content: bodyHtml,
+          excerpt: description,
+          status: wpStatus,
+        };
+
+        if (featuredMediaId) {
+          postData.featured_media = featuredMediaId;
+        }
+
+        if (wpCategoryIds.length > 0) {
+          postData.categories = wpCategoryIds;
+        }
+
+        console.log(`AgentMode: Publishing to WordPress as ${wpStatus}...`);
+
+        try {
+          const response = await axios.post(
+            `${wpConfig.siteUrl}/wp-json/wp/v2/posts`,
+            postData,
+            {
+              headers: {
+                Authorization: authHeader,
+                'Content-Type': 'application/json',
+              },
+              timeout: 30000,
+            }
+          );
+
+          const responseData = response.data as any;
+          console.log(`AgentMode: Blog article published successfully to WordPress as ${wpStatus}`);
+
+          return {
+            success: true,
+            message: `Blog article published successfully to WordPress as ${status}`,
+            data: {
+              title,
+              status,
+              cmsType: 'WordPress',
+              postId: responseData.id,
+              postUrl: responseData.link,
+              ...(invalidCategories.length > 0 ? {
+                warning: `Some categories were not found: ${invalidCategories.join(', ')}`,
+                availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
+              } : {})
+            }
+          };
+        } catch (wpError: any) {
+          const errorInfo: any = {
+            status: wpError.response?.status,
+            statusText: wpError.response?.statusText,
+          };
+          if (wpError.response?.data) {
+            errorInfo.message = wpError.response.data.message || wpError.message;
+            errorInfo.code = wpError.response.data.code;
+          } else {
+            errorInfo.message = wpError.message;
+          }
+
+          console.error(`AgentMode: WordPress API error (${errorInfo.status}): ${errorInfo.message}`);
+
+          return {
+            success: false,
+            message: errorInfo.message || `WordPress API error: ${errorInfo.status} ${errorInfo.statusText}`,
+            error: 'WordPress API error',
+            availableCategories: wpConfig.categories ? Object.keys(wpConfig.categories) : []
+          };
+        }
       } else if (cmsType === 'Basehub') {
         return {
           success: false,
@@ -14181,7 +14368,7 @@ Format the response as JSON with this structure:
       } else {
         return {
           success: false,
-          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub' and 'Webflow'.`,
+          message: `Unsupported CMS Type: ${cmsType}. Supported types are 'Basehub', 'Webflow', and 'WordPress'.`,
           error: 'Unsupported CMS Type'
         };
       }
@@ -15190,6 +15377,11 @@ Format the response as JSON with this structure:
     sessionId: string
   ): Promise<any> {
     try {
+      // Handle CSS-selector-based operations
+      if (updateType === 'css') {
+        return await this.updateHtmlFileCss(fileUrl, replacementInstructions, userId, sessionId);
+      }
+
       // Validate update_type first (before fetching file)
       if (!updateType || !['part', 'full'].includes(updateType)) {
         return {
@@ -15633,6 +15825,126 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('Error uploading updated file:', error);
       throw new Error(`Failed to upload updated file: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  // CSS-selector-based HTML file editing
+  private async updateHtmlFileCss(
+    fileUrl: string,
+    operations: any[],
+    userId: string,
+    sessionId: string
+  ): Promise<any> {
+    try {
+      // Validate operations
+      if (!Array.isArray(operations) || operations.length === 0) {
+        return { success: false, message: 'At least one operation is required' };
+      }
+
+      const validActions = ['remove', 'replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter', 'setAttribute', 'removeAttribute'];
+      const actionsNeedingHtml = ['replace', 'replaceInner', 'append', 'prepend', 'insertBefore', 'insertAfter'];
+
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i];
+        if (!op.action || !validActions.includes(op.action)) {
+          return { success: false, message: `Operation ${i + 1}: Invalid action "${op.action}". Valid actions: ${validActions.join(', ')}` };
+        }
+        if (!op.selector) {
+          return { success: false, message: `Operation ${i + 1}: selector is required` };
+        }
+        if (actionsNeedingHtml.includes(op.action) && (op.html === undefined || op.html === null)) {
+          return { success: false, message: `Operation ${i + 1}: html is required for action "${op.action}"` };
+        }
+        if (op.action === 'setAttribute' && (!op.attribute || op.value === undefined)) {
+          return { success: false, message: `Operation ${i + 1}: attribute and value are required for setAttribute` };
+        }
+        if (op.action === 'removeAttribute' && !op.attribute) {
+          return { success: false, message: `Operation ${i + 1}: attribute is required for removeAttribute` };
+        }
+      }
+
+      // Fetch current file content
+      const currentContent = await this.fetchFileContent(fileUrl);
+      console.log(`AgentMode: CSS edit - fetched file, length: ${currentContent.length}`);
+
+      // Load into cheerio
+      const cheerio = await import('cheerio');
+      const $ = cheerio.load(currentContent, { xml: false } as any);
+
+      // Apply operations sequentially
+      let operationsApplied = 0;
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i];
+        const matched = $(op.selector);
+
+        if (matched.length === 0) {
+          return {
+            success: false,
+            message: `Operation ${i + 1} (${op.action}): No elements matched selector "${op.selector}"`,
+            suggestion: 'Use read_file_content to inspect the current HTML structure and verify your CSS selector'
+          };
+        }
+
+        console.log(`AgentMode: CSS edit op ${i + 1}: ${op.action} on "${op.selector}" (${matched.length} matches)`);
+
+        switch (op.action) {
+          case 'remove':
+            matched.remove();
+            break;
+          case 'replace':
+            matched.replaceWith(op.html);
+            break;
+          case 'replaceInner':
+            matched.html(op.html);
+            break;
+          case 'append':
+            matched.append(op.html);
+            break;
+          case 'prepend':
+            matched.prepend(op.html);
+            break;
+          case 'insertBefore':
+            matched.before(op.html);
+            break;
+          case 'insertAfter':
+            matched.after(op.html);
+            break;
+          case 'setAttribute':
+            matched.attr(op.attribute, op.value);
+            break;
+          case 'removeAttribute':
+            matched.removeAttr(op.attribute);
+            break;
+        }
+        operationsApplied++;
+      }
+
+      // Serialize back to HTML
+      const updatedContent = $.html();
+      console.log(`AgentMode: CSS edit complete, ${operationsApplied} operations applied, new length: ${updatedContent.length}`);
+
+      // Upload
+      const versionedFilename = this.createVersionedFilename(fileUrl);
+      const originalPath = this.extractPathFromS3Url(fileUrl);
+      const uploadResult = await this.uploadUpdatedFile(updatedContent, versionedFilename, originalPath);
+
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        message: `File updated successfully with ${operationsApplied} CSS-selector operations`,
+        method: 'css_selector',
+        operations_applied: operationsApplied,
+        updatedContent, // included for verification
+        versioned_filename: versionedFilename
+      };
+    } catch (error) {
+      console.error('Error in CSS-selector HTML update:', error);
+      return {
+        success: false,
+        message: 'Failed to update HTML file',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        suggestion: 'Check your CSS selectors and HTML content. Use read_file_content to inspect the current file structure.'
+      };
     }
   }
 

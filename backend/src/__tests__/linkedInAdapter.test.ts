@@ -229,6 +229,50 @@ describe('LinkedInAdapter', () => {
 
       expect(result).toEqual([]);
     });
+
+    it('should refresh expired token for company account before listing posts', async () => {
+      const expiredCompanyAccount: ConnectedAccount = {
+        ...mockCompanyAccount,
+        config: {
+          ...mockCompanyAccount.config,
+          token_expires_at: Date.now() - 1000, // Expired
+        },
+      };
+
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({
+        access_token: 'new-org-token',
+        expires_in: 3600,
+        refresh_token: 'new-org-refresh',
+      });
+      const mockPost = { id: 'post1', author: 'urn:li:organization:123456', commentary: 'Test', visibility: 'PUBLIC' as const, lifecycleState: 'PUBLISHED' as const };
+      mockLinkedInService.listPosts.mockResolvedValue({ elements: [mockPost] });
+
+      const result = await adapter.listPosts(expiredCompanyAccount, { limit: 5 }, 'user-123');
+
+      expect(mockLinkedInService.refreshAccessToken).toHaveBeenCalled();
+      expect(mockLinkedInService.listPosts).toHaveBeenCalledWith(
+        'new-org-token',
+        'urn:li:organization:123456',
+        0,
+        5
+      );
+      expect(result).toEqual([mockPost]);
+    });
+
+    it('should throw when company account token is expired and refresh fails', async () => {
+      const expiredCompanyAccount: ConnectedAccount = {
+        ...mockCompanyAccount,
+        config: {
+          ...mockCompanyAccount.config,
+          token_expires_at: Date.now() - 1000,
+          refresh_token: undefined,
+        },
+      };
+
+      await expect(
+        adapter.listPosts(expiredCompanyAccount, { limit: 5 }, 'user-123')
+      ).rejects.toThrow('expired');
+    });
   });
 
   describe('getPostMetrics', () => {
@@ -342,10 +386,21 @@ describe('LinkedInAdapter', () => {
       });
     });
 
-    it('should handle company account with expired token and refresh it', async () => {
-      // This test is complex because it requires mocking the internal getValidToken
-      // which handles token refresh. For now, we test that metrics are returned correctly
-      // Token refresh is tested separately in the getValidToken logic
+    it('should refresh expired token for company account before fetching metrics', async () => {
+      const expiredCompanyAccount: ConnectedAccount = {
+        ...mockCompanyAccount,
+        config: {
+          ...mockCompanyAccount.config,
+          token_expires_at: Date.now() - 1000, // Expired
+        },
+      };
+
+      mockLinkedInService.refreshAccessToken.mockResolvedValue({
+        access_token: 'refreshed-org-token',
+        expires_in: 3600,
+        refresh_token: 'new-org-refresh',
+      });
+
       const mockMetrics = {
         followerStatistics: [{ followerCount: 2000 }],
         pageStatistics: [{ pageViews: 10000 }],
@@ -353,8 +408,13 @@ describe('LinkedInAdapter', () => {
       };
       mockLinkedInService.getAggregatedMetrics.mockResolvedValue(mockMetrics);
 
-      const result = await adapter.getAccountMetrics(mockCompanyAccount);
+      const result = await adapter.getAccountMetrics(expiredCompanyAccount, 'user-123');
 
+      expect(mockLinkedInService.refreshAccessToken).toHaveBeenCalled();
+      expect(mockLinkedInService.getAggregatedMetrics).toHaveBeenCalledWith(
+        'refreshed-org-token',
+        'urn:li:organization:123456'
+      );
       expect(result.followers).toEqual(mockMetrics.followerStatistics);
       expect(result.pageViews).toEqual(mockMetrics.pageStatistics);
     });

@@ -28,9 +28,16 @@ function getSocialAdapter(platform: string): LinkedInAdapter | null {
  *     — the reply comes from the same account, not from other accounts
  */
 export class SocialEngagementScanner {
+    private isScanning = false;
+
     constructor(private onActionScheduled?: (delayMs: number) => void) {}
 
     public async runScanner() {
+        if (this.isScanning) {
+            console.log('[SocialEngagementScanner] Already scanning, skipping concurrent run.');
+            return;
+        }
+        this.isScanning = true;
         console.log('[SocialEngagementScanner] Starting discovery scan...');
         try {
             // Only load users that have at least one connected account — skips the
@@ -44,11 +51,19 @@ export class SocialEngagementScanner {
             }
         } catch (error) {
             console.error('[SocialEngagementScanner] Critical error:', error);
+        } finally {
+            this.isScanning = false;
         }
         console.log('[SocialEngagementScanner] Scan complete.');
     }
 
     private async processUser(user: any) {
+        // Global kill switch — skip this user entirely
+        if (user.engagementPaused === true) {
+            console.log(`[SocialEngagementScanner] User ${user.userId}: engagement paused globally, skipping.`);
+            return;
+        }
+
         const accounts = (user.connected_accounts || []).map((a: any) => ({ ...a, userId: user.userId }));
 
         const postOwners = accounts.filter((a: any) => a.engagementSettings?.enablePostDiscovery === true);
@@ -67,8 +82,10 @@ export class SocialEngagementScanner {
         }
 
         // ── COMMENT AUTO-REPLY (self-account) ────────────────────────────
+        // Collect all account URNs for this user — used to filter out self-generated comments
+        const allAccountIds = new Set<string>(accounts.map((a: any) => a.account_id));
         for (const account of commentOwners) {
-            await this.scanAccountPostsForCommentReply(account);
+            await this.scanAccountPostsForCommentReply(account, allAccountIds);
         }
     }
 
@@ -186,12 +203,16 @@ export class SocialEngagementScanner {
         const wantsComment = preferredActions.includes('comment');
         const maxLikes = wantsLike ? (ownerSettings.maxLikesPerPost || 0) : 0;
         const maxComments = wantsComment ? (ownerSettings.maxCommentsPerPost || 0) : 0;
+        const maxEngagers = ownerSettings.maxEngagersPerPost || 2;
         const windowMs = (ownerSettings.engagementWindowMinutes || 60) * 60 * 1000;
+
+        // Limit how many distinct accounts can engage on a single post
+        const cappedEngagers = potentialEngagers.slice(0, maxEngagers);
 
         let likeCount = 0;
         let commentCount = 0;
 
-        for (const engager of potentialEngagers) {
+        for (const engager of cappedEngagers) {
             const needsLike = wantsLike && likeCount < maxLikes;
             const needsComment = wantsComment && commentCount < maxComments;
             if (!needsLike && !needsComment) break;
@@ -244,7 +265,7 @@ export class SocialEngagementScanner {
     // COMMENT AUTO-REPLY (self-account replies/likes its own post's comments)
     // ────────────────────────────────────────────────────────────────────────────
 
-    private async scanAccountPostsForCommentReply(account: any) {
+    private async scanAccountPostsForCommentReply(account: any, ownAccountIds: Set<string>) {
         const settings = account.engagementSettings;
         const platform: string = account.platform;
 
@@ -272,8 +293,11 @@ export class SocialEngagementScanner {
                     continue;
                 }
 
-                const recentComments = comments.filter((c) => c.createdAt >= cutoff);
-                console.log(`[Scanner/CommentReply] Post ${postId}: ${recentComments.length} recent comment(s)`);
+                // Filter out comments from this user's own connected accounts to avoid
+                // replying to auto-generated engagement comments (feedback loop)
+                const externalComments = comments.filter((c) => !ownAccountIds.has(c.actorUrn));
+                const recentComments = externalComments.filter((c) => c.createdAt >= cutoff);
+                console.log(`[Scanner/CommentReply] Post ${postId}: ${recentComments.length} recent external comment(s) (${comments.length - externalComments.length} self-comments filtered)`);
 
                 if (recentComments.length === 0) continue;
                 await this.scheduleCommentReplies(account, settings, postId, platform, recentComments);

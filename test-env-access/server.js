@@ -410,13 +410,23 @@ async function processQueue() {
       }
     } catch (err) {
       console.error(`[relay] Error processing prompt:`, err);
+      const errMsg = err.message || String(err);
       try {
         await postNotionComment(
           notionPageId,
-          `Claude Code error: ${err.message || err}`
+          `Claude Code error: ${errMsg}`
         );
       } catch (commentErr) {
         console.error(`[relay] Failed to post error comment:`, commentErr);
+      }
+
+      // If Claude crashed (exit code 143=SIGTERM, timeout, etc.), re-queue the
+      // prompt so the user's message isn't lost.  Post the error comment above
+      // so the user knows what happened, then retry after a short delay.
+      if (/exited with code (?!0\b)\d+/.test(errMsg)) {
+        console.log(`[relay] Re-queuing prompt after crash for page ${notionPageId}`);
+        await new Promise((r) => setTimeout(r, 5000)); // 5s cooldown
+        promptQueue.push({ prompt, notionPageId });
       }
     }
   }
@@ -678,6 +688,25 @@ if (NOTION_PAGE_ID) {
   }, 5000);
 }
 
+// On startup, ensure all allowlisted IPs have SG rules (handles repo clone / new SG drift)
+async function enforceAllowlist() {
+  const allowlist = readAllowlist();
+  const subnets = new Set();
+  for (const entry of allowlist.ips) {
+    const cidr = entry.subnet || toSubnet24(entry.ip);
+    if (cidr.includes(".")) subnets.add(cidr); // skip non-IPv4 like ::1
+  }
+  if (subnets.size === 0) return;
+  console.log(`[allowlist] Enforcing SG rules for ${subnets.size} subnet(s)...`);
+  for (const cidr of subnets) {
+    await addSecurityGroupRules(cidr);
+  }
+  console.log("[allowlist] SG reconciliation complete.");
+}
+
 app.listen(PORT, () => {
   console.log(`IP allowlist service running on http://localhost:${PORT}`);
+  enforceAllowlist().catch((err) =>
+    console.error("[allowlist] Failed to enforce allowlist on startup:", err)
+  );
 });

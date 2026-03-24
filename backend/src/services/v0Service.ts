@@ -1439,6 +1439,18 @@ async function createVercelProject(
 
   console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl} (requested name: ${projectName})`);
 
+  // Disable Vercel Authentication so preview deployments are publicly accessible
+  try {
+    await axios.patch(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      { vercelAuthentication: { deploymentType: "none" } },
+      { headers }
+    );
+    console.log(`[V0 SERVICE] Disabled Vercel Authentication for ${projectName}`);
+  } catch (authErr: any) {
+    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication: ${authErr.message}`);
+  }
+
   // Manually trigger a deployment — Vercel doesn't always auto-deploy when linking to an existing repo
   const { token: ghToken } = await getGitHubOrgToken();
   const repoInfoRes = await axios.get<any>(`https://api.github.com/repos/${repoFullName}`, {
@@ -1608,6 +1620,110 @@ export async function getDeploymentStatus(
     buildStatus: state === "READY" ? "success" : state.toLowerCase(),
     deployedUrl: record.deployedUrl,
   };
+}
+
+/**
+ * Get the Vercel preview deployment URL for a non-main branch.
+ * Vercel automatically creates preview deployments for branch pushes.
+ * Returns the preview URL and build status.
+ */
+export async function getPreviewDeploymentUrl(
+  vercelProjectId: string,
+  branch: string
+): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string }> {
+  const vercelToken = await getVercelToken();
+  const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
+
+  // Ensure Vercel Authentication is disabled so preview URLs are publicly accessible
+  try {
+    // First, check current project settings
+    const projRes = await axios.get<any>(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      { headers }
+    );
+    console.log(`[V0 SERVICE] Project ${vercelProjectId} protection settings:`, JSON.stringify({
+      ssoProtection: projRes.data?.ssoProtection,
+      vercelAuthentication: projRes.data?.vercelAuthentication,
+      passwordProtection: projRes.data?.passwordProtection,
+      trustedIps: projRes.data?.trustedIps,
+      protectionBypass: projRes.data?.protectionBypass,
+    }));
+
+    // Disable all protection types
+    const patchRes = await axios.patch(
+      `https://api.vercel.com/v9/projects/${vercelProjectId}`,
+      {
+        ssoProtection: null,
+        vercelAuthentication: { deploymentType: "none" },
+        passwordProtection: null,
+      },
+      { headers }
+    );
+    console.log(`[V0 SERVICE] Disabled Vercel Authentication for project ${vercelProjectId}: ${patchRes.status}`);
+  } catch (authErr: any) {
+    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication for ${vercelProjectId}: ${authErr.response?.status} ${authErr.response?.data?.error?.message || authErr.message}`);
+  }
+
+  // List recent deployments filtered by the branch (meta.githubCommitRef)
+  const deploymentsRes = await axios.get<any>(
+    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=5`,
+    { headers }
+  );
+
+  const deployments = deploymentsRes.data?.deployments || [];
+  // Find the most recent deployment for this branch
+  const branchDeployment = deployments.find((d: any) =>
+    d.meta?.githubCommitRef === branch
+  );
+
+  if (!branchDeployment) {
+    return { buildStatus: "pending", previewUrl: undefined };
+  }
+
+  const state = branchDeployment.readyState || branchDeployment.state;
+  const previewUrl = branchDeployment.url ? `https://${branchDeployment.url}` : undefined;
+
+  if (state === "READY") {
+    return { buildStatus: "success", previewUrl };
+  }
+
+  if (state === "ERROR" || state === "CANCELED") {
+    const buildError = await getVercelBuildErrors(branchDeployment.uid, vercelToken);
+    return { buildStatus: "error", buildError, previewUrl };
+  }
+
+  // Still building
+  return { buildStatus: state.toLowerCase(), previewUrl };
+}
+
+/**
+ * Trigger a Vercel deployment for a project on a given branch (defaults to "main").
+ * Used after merging a draft branch to ensure Vercel picks up the changes.
+ */
+export async function triggerVercelDeployment(
+  vercelProjectId: string,
+  repoFullName: string,
+  ref: string = "main"
+): Promise<void> {
+  const vercelToken = await getVercelToken();
+  const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
+
+  const { token: ghToken } = await getGitHubOrgToken();
+  const repoInfoRes = await axios.get<any>(`https://api.github.com/repos/${repoFullName}`, {
+    headers: { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" },
+  });
+  const repoId = repoInfoRes.data.id;
+
+  await axios.post<any>(
+    "https://api.vercel.com/v13/deployments",
+    {
+      name: vercelProjectId,
+      project: vercelProjectId,
+      gitSource: { type: "github", repo: repoFullName, ref, repoId },
+    },
+    { headers }
+  );
+  console.log(`[V0 SERVICE] Triggered deployment for ${repoFullName} on ${ref}`);
 }
 
 /**

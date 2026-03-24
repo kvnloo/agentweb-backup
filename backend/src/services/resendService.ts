@@ -482,6 +482,171 @@ class ResendService {
     return null;
   }
 
+  /**
+   * Create a domain in Resend for email sending
+   */
+  async createDomain(name: string): Promise<{
+    id: string;
+    name: string;
+    status: string;
+    records: Array<{
+      record: string;
+      name: string;
+      value: string;
+      type: string;
+      ttl: string;
+      status: string;
+      priority?: number;
+    }>;
+  } | null> {
+    await this.initializeResend();
+    if (!this.resend) {
+      console.error('Resend service not initialized');
+      return null;
+    }
+
+    const result = await this.retryWithBackoff(
+      async () => {
+        const { data, error } = await this.resend!.domains.create({ name });
+        if (error) {
+          const resendError: any = this.toErrorWithMetadata(error);
+          resendError.message = `Resend domain create error: ${JSON.stringify(error)}`;
+          throw resendError;
+        }
+        return data;
+      },
+      `Create domain ${name}`
+    );
+
+    if (result) {
+      console.log(`Resend domain created: ${result.id} (${result.name})`);
+      return {
+        id: result.id,
+        name: result.name,
+        status: result.status,
+        records: result.records.map(r => ({
+          record: r.record,
+          name: r.name,
+          value: r.value,
+          type: r.type,
+          ttl: r.ttl,
+          status: r.status,
+          priority: r.priority,
+        })),
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Get domain details including DNS records and verification status
+   */
+  async getDomain(domainId: string): Promise<{
+    id: string;
+    name: string;
+    status: string;
+    records: Array<{
+      record: string;
+      name: string;
+      value: string;
+      type: string;
+      ttl: string;
+      status: string;
+      priority?: number;
+    }>;
+  } | null> {
+    await this.initializeResend();
+    if (!this.resend) {
+      console.error('Resend service not initialized');
+      return null;
+    }
+
+    const result = await this.retryWithBackoff(
+      async () => {
+        const { data, error } = await this.resend!.domains.get(domainId);
+        if (error) {
+          const resendError: any = this.toErrorWithMetadata(error);
+          resendError.message = `Resend domain get error: ${JSON.stringify(error)}`;
+          throw resendError;
+        }
+        return data;
+      },
+      `Get domain ${domainId}`
+    );
+
+    if (result) {
+      return {
+        id: result.id,
+        name: result.name,
+        status: result.status,
+        records: result.records.map(r => ({
+          record: r.record,
+          name: r.name,
+          value: r.value,
+          type: r.type,
+          ttl: r.ttl,
+          status: r.status,
+          priority: r.priority,
+        })),
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Trigger domain verification in Resend
+   */
+  async verifyDomain(domainId: string): Promise<boolean> {
+    await this.initializeResend();
+    if (!this.resend) {
+      console.error('Resend service not initialized');
+      return false;
+    }
+
+    const result = await this.retryWithBackoff(
+      async () => {
+        const { data, error } = await this.resend!.domains.verify(domainId);
+        if (error) {
+          const resendError: any = this.toErrorWithMetadata(error);
+          resendError.message = `Resend domain verify error: ${JSON.stringify(error)}`;
+          throw resendError;
+        }
+        return data;
+      },
+      `Verify domain ${domainId}`
+    );
+
+    return result !== null;
+  }
+
+  /**
+   * List all domains in Resend to check for duplicates
+   */
+  async listDomains(): Promise<Array<{ id: string; name: string; status: string }>> {
+    await this.initializeResend();
+    if (!this.resend) {
+      console.error('Resend service not initialized');
+      return [];
+    }
+
+    const result = await this.retryWithBackoff(
+      async () => {
+        const { data, error } = await this.resend!.domains.list();
+        if (error) {
+          const resendError: any = this.toErrorWithMetadata(error);
+          resendError.message = `Resend domain list error: ${JSON.stringify(error)}`;
+          throw resendError;
+        }
+        return data;
+      },
+      'List domains'
+    );
+
+    if (result?.data) {
+      return result.data.map(d => ({ id: d.id, name: d.name, status: d.status }));
+    }
+    return [];
+  }
 }
 
 export const resendService = new ResendService();

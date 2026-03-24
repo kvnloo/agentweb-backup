@@ -1,5 +1,6 @@
 // Define the interface for release notes
 
+
 export interface UserReleaseNote {
   date: string;
   changes: string[];
@@ -7,6 +8,130 @@ export interface UserReleaseNote {
 
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
+  {
+    date: '2026-03-24',
+    changes: [
+      'Feature: Meta Ads Event Match Quality (EMQ)',
+      '- You can now check data match quality scores for your Meta Conversions API (CAPI) datasets directly from the chat',
+      '- Use the Meta Marketing API tool with DATASET → LIST to discover your pixels and linked datasets',
+      '- Use DATASET → GET_MATCH_QUALITY to retrieve EMQ scores per event type (Purchase, Lead, etc.)',
+      '- Helps monitor how well your customer data matches Meta user profiles for better ad targeting',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'Fix: LinkedIn Engagement Being Too Aggressive',
+      '- Fixed race condition where overlapping scanner runs could schedule duplicate comments on the same post',
+      '- Added global "Pause All Engagement" toggle — one switch to stop all automated engagement across all accounts',
+      '- Added "Max accounts per post" setting to limit how many of your accounts engage on a single post (default: 2)',
+      '- Auto-reply now skips comments from your own connected accounts, preventing feedback loops',
+      '- Deduplication check now fails safe — on database errors, engagement is blocked rather than duplicated',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'Improvement: Smarter HTML File Editing with CSS Selectors',
+      '- Emma now uses CSS-selector-based editing when updating HTML reports, replacing the old exact-string-matching approach',
+      '- Supports 9 operations: remove, replace, replaceInner, append, prepend, insertBefore, insertAfter, setAttribute, removeAttribute',
+      '- Much more reliable — no more failures from whitespace mismatches or escaped characters in large HTML files',
+      '- Full file replacement mode still available as a fallback',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'New: Self-Serve Email Domain Setup in CRM',
+      '- You can now set up your email sending domain directly from the Email Sender configuration dialog — no admin involvement needed',
+      '- Enter your domain, add the provided DNS records at your registrar, and verify — all from within the CRM page',
+      '- Suggests using a subdomain (e.g. mail.yourcompany.com) to avoid conflicts with existing email, while still allowing the main domain',
+      '- Shows DNS record status and allows re-verification or switching to a different domain',
+      '- Duplicate domain detection prevents conflicts across accounts',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Feature: GTM Tracker - My Queue View & Dashboard',
+      '- New "My Queue" tab shows all work items across all clients in a single, filterable table',
+      '- Filter by status, assignee (ours / unassigned / specific person), and free-text search',
+      '- Sort by due date, status, or client for urgency-first workflow',
+      '- Dashboard summary bar at the top shows counts: overdue, due soon, pending, assigned to us, agent running, pending review',
+      '- Click any summary chip to instantly filter the queue to matching items',
+      '- Inline editing: click a status chip or PoC to edit directly in the table without opening dialogs',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Fix: LinkedIn Company Pages Missing from Social Posts Page',
+      '- Company pages with expired access tokens were silently dropped from the Social Posts page',
+      '- Now automatically refreshes expired tokens before fetching posts (same as other operations)',
+      '- Accounts remain visible in the Social Posts page even when post loading fails temporarily',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'New: Slack Monitoring for Emma Q&A',
+      '- Mention @Emma in a Slack channel to start a conversation — Emma replies directly in the thread',
+      '- Follow-up messages in the same thread continue the same Agent Mode session',
+      '- Multiple users can participate in the thread, with each message prefixed by the sender\'s name',
+      '- File attachments in Slack threads are forwarded to Emma for context',
+      '- A link to continue the conversation in the AgentWeb portal is included in the first reply',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Feature: Site-Wide LinkedIn Enrichment Accounts',
+      '- Admins can now configure shared Unipile LinkedIn accounts for platform-wide lead enrichment',
+      '- When a user doesn\'t have their own LinkedIn account connected, enrichment automatically falls back to the shared account',
+      '- Multiple accounts can be added for redundancy — if one expires, others are used',
+      '- New CRM tab in the admin dashboard to manage site-wide enrichment accounts',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Fix: LinkedIn Enrichment No Longer Crashes on Invalid URLs',
+      '- Lead enrichment now validates LinkedIn URLs before direct profile lookup',
+      '- Falls back to search-by-name when URLs are invalid or direct lookup fails',
+      '- LinkedIn errors are non-fatal — enrichment continues with other data sources',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Fix: LinkedIn Outreach Account Connection Reliability',
+      '- Fixed an issue where connecting a LinkedIn Outreach (Unipile) account could silently fail to save',
+      '- Added a localStorage fallback for the OAuth popup callback to handle cases where the browser blocks cross-origin postMessage',
+      '- Connected accounts now display their Account ID for easier identification',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'New: Landing Page Staging & Preview Workflow',
+      '- When Emma edits your landing page code, changes now go to a staging branch instead of directly to production',
+      '- Emma provides a Vercel preview URL so you can review changes before they go live',
+      '- Say "publish" to Emma when you\'re happy with the changes, and she\'ll push them live',
+      '- Each chat session gets its own draft branch, so multiple sessions can work independently',
+      '- After publishing, a Vercel deployment is automatically triggered to ensure your live site updates promptly',
+    ],
+  },
+  {
+    date: '2026-03-23',
+    changes: [
+      'Feature: WordPress Blog Publishing Support',
+      '- Emma can now publish blog articles directly to WordPress sites via the REST API',
+      '- Supports image upload to the WordPress media library and automatic featured image assignment',
+      '- Category mapping lets Emma assign the right WordPress categories when publishing',
+      '- Self-service CMS configuration: users can set up their WordPress (or Webflow) credentials directly from the Reports page without admin involvement',
+      '- Admin-configured CMS settings are automatically visible in the self-config UI, so users can see and override what\'s already set up',
+    ],
+  },
   {
     date: '2026-03-22',
     changes: [

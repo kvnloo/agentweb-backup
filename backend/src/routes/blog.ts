@@ -5,7 +5,10 @@ import {
   generateImage,
   publishBlogPost,
   getCmsCategories,
-  publishBlogDirect
+  publishBlogDirect,
+  getCmsConfig,
+  saveCmsConfig,
+  deleteCmsConfig
 } from "../controllers/blog";
 
 const router = Router();
@@ -29,5 +32,10 @@ router.get("/categories", authenticateToken, getCmsCategories);
 
 // Publish a blog article directly from an HTML report URL
 router.post("/publish-direct", authenticateToken, publishBlogDirect);
+
+// CMS configuration self-service endpoints
+router.get("/cms-config", authenticateToken, getCmsConfig);
+router.put("/cms-config", authenticateToken, saveCmsConfig);
+router.delete("/cms-config", authenticateToken, deleteCmsConfig);
 
 export default router;

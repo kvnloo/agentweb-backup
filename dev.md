@@ -1,3 +1,34 @@
+# March 23, 2026: Investigation — Supporting Vendor Role in the System
+
+## Background
+
+Currently the system has two roles: **admin** (`isAdmin: true`) and **user** (default). We want to add a **vendor** role so external partners (e.g., agencies, consultants) can access the platform with appropriate permissions.
+
+## Investigation
+
+### Current Role Model
+
+- Users table (`AW-Users`) has an `isAdmin` boolean field
+- Backend `authenticateToken` middleware sets `req.user.isAdmin` from the JWT
+- Admin checks are scattered across routes using `if (!req.user.isAdmin)` guards
+- Frontend checks `user.isAdmin` from AuthContext to show/hide admin features
+
+### Options Considered
+
+1. **Add a `role` enum field** (`"admin" | "user" | "vendor"`) — cleaner long-term but requires migrating all `isAdmin` checks across backend and frontend
+2. **Add `isVendor` boolean** — minimal change, mirrors `isAdmin` pattern, but doesn't scale if more roles are added
+3. **Grant vendor users admin role temporarily** — zero code changes, quickest path
+
+### Decision
+
+For now, we grant vendor user **Harshit** the admin role for simplicity. This avoids any code changes and unblocks vendor access immediately. A proper role system can be implemented later when requirements are clearer and more vendors need distinct permissions.
+
+### Action Taken
+
+- Harshit's user record updated with `isAdmin: true` in the Users table
+
+---
+
 # March 22, 2026: Investigation — Scheduled Chat "Lead Auto-Enrichment" Not Completing
 
 ## Problem

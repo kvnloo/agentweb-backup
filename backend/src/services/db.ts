@@ -72,6 +72,7 @@ export interface User {
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
+  resendDomainId?: string; // Resend domain ID for domain verification
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
   fromName?: string; // From name for emails
   slackChannel?: string; // Default Slack channel for this user
@@ -92,7 +93,7 @@ export interface User {
     }>;
   }; // User journey funnel configuration for SEO analytics
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folder IDs
-  cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
+  cmsType?: "Basehub" | "Webflow" | "WordPress"; // CMS Type for blog publishing
   companyName?: string;
   memoryEnabled?: boolean; // Whether Emma's long-term memory is enabled (default: true)
   useCaseCategories?: string[];
@@ -1929,13 +1930,12 @@ export const scheduleDb = {
         },
       };
 
-            const result = await dynamodb.query(params).promise();
-            return result.Items || [];
-          } catch (error) {
-            handleDynamoDbError(error, "getSchedulesReadyToRun");
-            return [];
-          }
-        },
+            return await paginatedQuery(dynamodb, params);
+    } catch (error) {
+      handleDynamoDbError(error, "getSchedulesReadyToRun");
+      return [];
+    }
+  },
 
   async getSocialEngagementActionsUpTo(windowEnd: string): Promise<any[]> {
     try {
@@ -5040,8 +5040,9 @@ export const socialEngagementTrackingDb = {
       }
       return false;
     } catch (error) {
+      // Fail safe: assume already engaged on error to prevent duplicate scheduling
       handleDynamoDbError(error, "hasEngaged");
-      return false;
+      return true;
     }
   },
 
@@ -5072,15 +5073,18 @@ export const socialEngagementTrackingDb = {
     }
   },
 
-  // Query all accounts that engaged with a specific post (post-wise view)
-  async getEngagementsByPost(postId: string, options: { from?: string; to?: string } = {}): Promise<any[]> {
+  // Query all accounts that engaged with a specific post (post-wise view).
+  // userId is required to scope results to the requesting user and prevent cross-user data leakage.
+  async getEngagementsByPost(postId: string, options: { from?: string; to?: string; userId: string }): Promise<any[]> {
     try {
       const params: AWS.DynamoDB.DocumentClient.QueryInput = {
         TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
         IndexName: 'PostEngagementIndex',
         KeyConditionExpression: 'postId = :postId' + (options.from ? ' AND executedAt >= :from' : ''),
+        FilterExpression: 'userId = :userId',
         ExpressionAttributeValues: {
           ':postId': postId,
+          ':userId': options.userId,
           ...(options.from && { ':from': options.from }),
         },
       };
