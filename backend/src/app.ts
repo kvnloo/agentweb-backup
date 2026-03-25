@@ -53,6 +53,7 @@ import socialPostsRoutes from "./routes/socialPosts";
 import landingPagesRoutes from "./routes/landingPages";
 import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
+import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
 import { authenticateToken } from "./middleware/auth";
@@ -144,7 +145,8 @@ const corsOptions = {
 app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
-      req.path.startsWith('/api/lead-magnet/')) {
+      req.path.startsWith('/api/lead-magnet/') ||
+      req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -234,6 +236,8 @@ app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
 app.get("/asset/:assetHash", serveAsset);
 app.use("/review", reviewRouter);
+app.use("/api/batch-review", batchReviewRoutes);
+app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/lead-magnet", leadMagnetRoutes);
 
 
