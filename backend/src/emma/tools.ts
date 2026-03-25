@@ -4661,6 +4661,73 @@ emmaToolRegistry.register({
   }
 });
 
+// --- User Skill Creation ---
+emmaToolRegistry.register({
+  name: 'create_skill',
+  definition: {
+    name: 'create_skill',
+    description: 'Create a new agent skill for the user. A skill is a named bundle of tools with an optional system prompt that customizes agent behavior. The skill starts as private and the user can submit it for platform review later via the Settings > Skills page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Name of the skill (e.g., "LinkedIn Post Creator from Latest News")'
+        },
+        description: {
+          type: 'string',
+          description: 'Description of what the skill does'
+        },
+        toolNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tool names this skill can use (e.g., ["bravesearch_brave_news_search", "create_social_media_posts"])'
+        },
+        systemPrompt: {
+          type: 'string',
+          description: 'Optional custom instructions for the agent when this skill is active'
+        }
+      },
+      required: ['name', 'description', 'toolNames']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    // LLMs sometimes send "tools" instead of "toolNames", and may stringify the array
+    let rawTools = args.toolNames ?? args.tools ?? [];
+    if (typeof rawTools === 'string') {
+      try { rawTools = JSON.parse(rawTools); } catch { rawTools = []; }
+    }
+    const toolNames: string[] = Array.isArray(rawTools) ? rawTools : [];
+    const { skillService } = await import('../services/skillService');
+    const skill = await skillService.createSkill(
+      args.name,
+      args.description,
+      toolNames,
+      args.systemPrompt,
+      false
+    );
+    // Set ownership fields and re-save with toolNames explicitly preserved
+    skill.ownerId = userId;
+    skill.visibility = 'private';
+    skill.isBuiltIn = false;
+    skill.toolNames = toolNames;
+    await skillService.updateSkill(skill);
+    return {
+      success: true,
+      skillId: skill.skillId,
+      name: skill.name,
+      description: skill.description,
+      toolNames: skill.toolNames,
+      visibility: skill.visibility,
+      message: `Skill "${skill.name}" created successfully. It is currently private. The user can submit it for platform review from Settings > Skills.`
+    };
+  }
+});
+
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {

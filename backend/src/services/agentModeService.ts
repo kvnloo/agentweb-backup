@@ -1885,6 +1885,12 @@ You can create and manage multi-step work plans using these tools:
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
 
+## Skill Creation
+You can create custom skills for users using:
+- **create_skill**: Create a new skill bundle with a name, description, list of tool names, and optional system prompt. The skill starts as private to the user. They can later submit it for platform review via Settings > Skills.
+
+When a user asks to create a skill, identify the relevant tools from your available tools and create the skill with appropriate toolNames. For example, a "LinkedIn Post Creator from Latest News" skill might use tools like bravesearch_brave_news_search, create_social_media_posts, read_brand_guidelines, etc.
+
 ## GTM Plan Capabilities
 You can read and create Go-To-Market (GTM) plans using these tools:
 - **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.
@@ -2266,6 +2272,9 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+
+    // Skill Creation (users can define custom skill bundles)
+    'create_skill',
 
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
