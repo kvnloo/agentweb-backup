@@ -122,11 +122,6 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     description: 'View and track social media posts and engagement metrics'
   },
   {
-    path: '/my-skills',
-    label: 'My Skills',
-    description: 'Create and manage custom skills for agent sessions'
-  },
-  {
     path: '/my-work-plans',
     label: 'My Work Plans',
     description: 'Create and manage custom work plans for agent sessions'
