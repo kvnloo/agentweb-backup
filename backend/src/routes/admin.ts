@@ -3927,13 +3927,15 @@ router.get("/subscription-types", async (req, res) => {
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+    const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
       subscriptionTypes = [{
         name: "Basic",
         allowedPages: allAvailablePages, // All available pages (expanded)
-        allowedSkills: allAvailableSkills // All available skills (expanded)
+        allowedSkills: allAvailableSkills, // All available skills (expanded)
+        allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
       }];
     }
 
@@ -3960,10 +3962,17 @@ router.get("/subscription-types", async (req, res) => {
         normalizedSkills = allAvailableSkills;
       }
 
+      // Handle allowedConnectedAccounts — default to all if missing or "*"
+      let normalizedConnectedAccounts = type.allowedConnectedAccounts || allAvailableConnectedAccounts;
+      if (normalizedConnectedAccounts.includes('*')) {
+        normalizedConnectedAccounts = allAvailableConnectedAccounts;
+      }
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
         allowedSkills: normalizedSkills,
+        allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
       };
     }));
@@ -3988,6 +3997,7 @@ router.post("/subscription-types", async (req, res) => {
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+    const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4020,6 +4030,14 @@ router.post("/subscription-types", async (req, res) => {
         normalizedSkills = allAvailableSkills;
       }
 
+      // Handle allowedConnectedAccounts — default to all if missing or "*"
+      let normalizedConnectedAccounts = Array.isArray(type.allowedConnectedAccounts)
+        ? type.allowedConnectedAccounts
+        : allAvailableConnectedAccounts;
+      if (normalizedConnectedAccounts.includes('*')) {
+        normalizedConnectedAccounts = allAvailableConnectedAccounts;
+      }
+
       // Parse monthlyTokenAllowance (preserve null for unlimited)
       const parsedAllowance = type.monthlyTokenAllowance != null
         ? Number(type.monthlyTokenAllowance)
@@ -4029,6 +4047,7 @@ router.post("/subscription-types", async (req, res) => {
         name: type.name,
         allowedPages: normalizedPages,
         allowedSkills: normalizedSkills,
+        allowedConnectedAccounts: normalizedConnectedAccounts,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
       };
     }));
