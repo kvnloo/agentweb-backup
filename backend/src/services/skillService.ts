@@ -55,6 +55,7 @@ export interface Skill {
   isBuiltIn?: boolean;
   ownerId?: string;
   visibility?: SkillVisibility;
+  reviewFeedback?: string;
 }
 
 export class SkillService {
@@ -312,6 +313,74 @@ export class SkillService {
       console.error("Error getting sync status:", error);
       throw error;
     }
+  }
+
+  async getSkillsByOwner(ownerId: string): Promise<Skill[]> {
+    const params = {
+      TableName: this.tableName,
+      IndexName: 'OwnerIndex',
+      KeyConditionExpression: 'ownerId = :ownerId',
+      ExpressionAttributeValues: { ':ownerId': ownerId },
+    };
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return (result.Items || []).map(item => this.normalizeSkill(item));
+    } catch (error) {
+      console.error(`Error getting skills for owner ${ownerId}:`, error);
+      throw error;
+    }
+  }
+
+  async getSkillsByVisibility(visibility: SkillVisibility): Promise<Skill[]> {
+    const params = {
+      TableName: this.tableName,
+      IndexName: 'VisibilityIndex',
+      KeyConditionExpression: 'visibility = :visibility',
+      ExpressionAttributeValues: { ':visibility': visibility },
+    };
+
+    try {
+      const result = await dynamodb.query(params).promise();
+      return (result.Items || []).map(item => this.normalizeSkill(item));
+    } catch (error) {
+      console.error(`Error getting skills by visibility ${visibility}:`, error);
+      throw error;
+    }
+  }
+
+  async submitForReview(skillId: string, ownerId: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.ownerId !== ownerId) throw new Error('Not authorized');
+    if (skill.visibility !== 'private') throw new Error('Only private skills can be submitted for review');
+
+    skill.visibility = 'pending_review';
+    skill.reviewFeedback = undefined;
+    await this.updateSkill(skill);
+    return skill;
+  }
+
+  async approveSkill(skillId: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
+
+    skill.visibility = 'public';
+    skill.isPublished = true;
+    await this.updateSkill(skill);
+    return skill;
+  }
+
+  async rejectSkill(skillId: string, feedback: string): Promise<Skill> {
+    const skill = await this.getSkill(skillId);
+    if (!skill) throw new Error('Skill not found');
+    if (skill.visibility !== 'pending_review') throw new Error('Skill is not pending review');
+
+    skill.visibility = 'private';
+    skill.reviewFeedback = feedback;
+    await this.updateSkill(skill);
+    return skill;
   }
 
   async deleteSkill(skillId: string): Promise<void> {
