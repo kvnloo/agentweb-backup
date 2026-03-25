@@ -18084,10 +18084,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           post_url: result.postUrl
         };
       } catch (error: any) {
-        // Handle specific error messages
+        // Handle specific error messages — pass through detailed permission errors as-is
         let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (message.includes('access token expired') && !message.includes('Permission denied')) {
+          message = 'Account token expired. Please reconnect the account in Settings → Connected Accounts.';
         }
 
         return {
@@ -18210,10 +18210,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           post_url: result.postUrl
         };
       } catch (error: any) {
-        // Handle specific error messages
+        // Handle specific error messages — pass through detailed permission errors as-is
         let message = error.message;
-        if (message.includes('access token expired')) {
-          message = 'Account token expired. Please reconnect the account in Settings.';
+        if (message.includes('access token expired') && !message.includes('Permission denied')) {
+          message = 'Account token expired. Please reconnect the account in Settings → Connected Accounts.';
         }
 
         return {
