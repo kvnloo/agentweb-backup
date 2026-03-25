@@ -43,6 +43,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Report Editor Preview Cache',
       '- Fixed an issue where saving HTML changes in the Editor tab did not update the Agentic Revision preview',
       '- The preview now immediately reflects saved edits instead of showing cached content',
+      'Fix: Duplicate Comments in Social Engagements',
+      '- Fixed an issue where automated social engagements could post multiple comments on the same LinkedIn post',
+      '- The system now checks existing comments on a post before commenting, preventing duplicates even if internal tracking is out of sync',
     ],
   },
   {
