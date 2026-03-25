@@ -939,6 +939,82 @@ BACKEND_URL=https://<your-subdomain>.ngrok-free.app
 
 Restart the backend after changing `BACKEND_URL`.
 
+### Google Ads API Configuration
+
+The Google Ads integration allows users to create and manage Google advertising campaigns (Search, Display) and fetch performance metrics via the Google Ads API.
+
+#### 1. Create a Google Ads Manager Account
+
+1. Go to [Google Ads Manager Accounts](https://ads.google.com/home/tools/manager-accounts/)
+2. Sign in with your Google account and create a new **Manager (MCC) account** if you don't have one
+3. Note your **Manager Customer ID** (format: `xxx-xxx-xxxx`, shown in the top-right corner)
+
+#### 2. Get a Developer Token
+
+1. In your Manager account, go to **Tools & Settings > Setup > API Center**
+2. Click **Apply for a Developer Token**
+3. Fill out the application form and submit
+4. Note the **Developer Token** value shown on the API Center page
+5. The token starts at **Test Account** access level (can only manage test ad accounts)
+6. For production use, apply for **Basic** or **Standard** access (see [access levels](https://developers.google.com/google-ads/api/docs/access-levels))
+
+#### 3. Enable the Google Ads API
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Select the **same project** used for Gmail/YouTube OAuth
+3. Go to **APIs & Services > Library**
+4. Search for **Google Ads API** and enable it
+
+#### 4. Add Redirect URIs
+
+In the same OAuth 2.0 Client ID used for Gmail/YouTube (under **APIs & Services > Credentials**), add these redirect URIs:
+- Production: `https://api.agentweb.pro/api/oauth/google-ads/callback`
+- Staging: `https://api-stage.agentweb.pro/api/oauth/google-ads/callback`
+- Local: `http://localhost:3001/api/oauth/google-ads/callback`
+
+Scope (`https://www.googleapis.com/auth/adwords`) is requested at runtime in the authorization URL — no console configuration needed.
+
+#### 5. Store Credentials in AWS Secrets Manager
+
+- Secret Name: `dev/AgentWeb/GoogleAds` (development) or `prod/AgentWeb/GoogleAds` (production)
+- Secret Value (JSON):
+```json
+{
+  "clientId": "your_google_oauth_client_id",
+  "clientSecret": "your_google_oauth_client_secret",
+  "developerToken": "your_google_ads_developer_token",
+  "managerCustomerId": "your_manager_customer_id"
+}
+```
+
+#### 6. Set Up a Test Account (Development Only)
+
+1. In your Manager account, go to **Accounts > Sub-accounts**
+2. Click **+** and select **Create a test account**
+3. Name the test account (e.g., "AgentWeb Dev Test")
+4. Note the test account's **Customer ID**
+5. The test developer token works immediately with test accounts — no approval wait
+6. Test accounts run in a sandbox: no real ad delivery, no charges
+
+#### 7. Verify the Setup
+
+1. Start the backend: `npm run dev`
+2. Navigate to the customer portal Settings page
+3. Click **Connect Google Ads Account**
+4. Complete the Google OAuth flow — you should see your ad accounts listed
+5. Select the test account and confirm the connection
+
+#### Reference: Google Ads vs Meta Hierarchy
+
+Google Ads uses a different entity hierarchy than Meta:
+
+| Google Ads | Meta Equivalent | Purpose |
+|------------|----------------|---------|
+| Campaign | Campaign | Top-level container, budget, bidding strategy |
+| Ad Group | Ad Set | Targeting (keywords for Search, audiences for Display) |
+| Ad | Ad + Creative | The actual ad content shown to users |
+| Keywords | (Audience targeting) | Search terms to bid on (Search campaigns only) |
+
 ### Gmail Connected Account Configuration
 
 Gmail uses Google OAuth 2.0 with offline access to let users connect their Gmail account for reading and sending email.
