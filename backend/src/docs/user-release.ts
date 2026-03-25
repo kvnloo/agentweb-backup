@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-25',
+    changes: [
+      'Feature: Auto-Sync New Users to CRM Lead List',
+      '- New users who sign up (email or Google OAuth) are now automatically added to the configured CRM lead list',
+      '- Enable "Auto-sync new users to this lead list" in the Sync to CRM dialog on the Users tab of the Admin Dashboard',
+      '- Auto-sync is fire-and-forget — registration is never blocked even if the CRM sync fails',
+      '- Manual bulk sync via "Start Syncing" is still available for backfilling',
+    ],
+  },
+  {
     date: '2026-03-24',
     changes: [
       'Feature: Unified Emma Chat Sidebar',
