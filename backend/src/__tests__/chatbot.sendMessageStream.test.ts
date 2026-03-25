@@ -10,6 +10,13 @@ jest.mock('../services/chatbotService', () => ({
   generateChatResponse: jest.fn(),
 }));
 
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn().mockResolvedValue({
+    allowed: true, warning: false, used: 0, allowance: null,
+    bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-03',
+  }),
+}));
+
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockGenerateChatResponse = generateChatResponse as jest.Mock;
 

@@ -45,6 +45,13 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  tokenUsage?: {
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+    resetDate: string;
+  };
+  tokenAllowanceBonus?: number;
   replayUrl?: string; // Microsoft Clarity replay session URL
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }

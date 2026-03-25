@@ -24,6 +24,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improvement: Agent Mode Token Usage Optimization',
       '- Enabled Anthropic prompt caching for Claude models — system prompt and conversation context are cached across iterations, reducing input token costs by up to 50%',
       '- Improved tool result compression — old tool results are now summarized to short previews instead of keeping 8KB each, significantly reducing context size in long conversations',
+      'Feature: Token Usage Allowance per Subscription Type',
+      '- Admins can now set a monthly token allowance per subscription type in the Subscriptions tab',
+      '- Usage column in the Users tab shows each user\'s token usage vs. their allowance (e.g. "6,602 / 500,000")',
+      '- Admins can grant one-time bonus tokens to individual users via the Users tab',
+      '- Users approaching their limit (80%) see a warning; at 100% new messages are blocked with an upgrade prompt',
+      '- Token usage resets automatically each month (bonus tokens also reset)',
     ],
   },
   {

@@ -17,6 +17,7 @@ import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { AgentModeService } from './agentModeService';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3 } from '../utils/s3Utils';
+import { incrementUserTokenUsage } from './tokenUsageService';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -732,6 +733,15 @@ export class ChatbotDB {
     // Incrementally update token usage on the session
     await this.incrementTokenUsage(sessionId, [message]);
 
+    // Increment user-level token usage for allowance tracking
+    if (currentSession.userId && message.usage) {
+      await incrementUserTokenUsage(
+        currentSession.userId,
+        message.usage.total_tokens || 0,
+        message.usage.estimated_cost || 0
+      );
+    }
+
     // Return session with updated messages (no need to update session table)
     return {
       ...currentSession,
@@ -773,6 +783,21 @@ export class ChatbotDB {
 
     // Incrementally update token usage on the session
     await this.incrementTokenUsage(sessionId, messages);
+
+    // Increment user-level token usage for allowance tracking
+    if (currentSession.userId) {
+      let batchTokens = 0;
+      let batchCost = 0;
+      for (const msg of messages) {
+        if (msg.usage) {
+          batchTokens += msg.usage.total_tokens || 0;
+          batchCost += msg.usage.estimated_cost || 0;
+        }
+      }
+      if (batchTokens > 0 || batchCost > 0) {
+        await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
+      }
+    }
 
     // Return session with updated messages (no need to update session table)
     return {

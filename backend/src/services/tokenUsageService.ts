@@ -1,0 +1,177 @@
+import { userDb, User } from "./db";
+import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
+
+export interface TokenUsageStatus {
+  allowed: boolean;
+  warning: boolean;
+  used: number;
+  allowance: number | null; // null = unlimited
+  bonus: number;
+  effectiveAllowance: number | null; // allowance + bonus, null = unlimited
+  percentUsed: number; // 0-100+, 0 if unlimited
+  month: string; // "YYYY-MM"
+}
+
+function getCurrentMonth(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function getNextResetDate(): string {
+  const now = new Date();
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  return nextMonth.toISOString();
+}
+
+/**
+ * Get a user's current month token usage, performing lazy reset if month changed.
+ */
+export async function getUserTokenUsage(
+  userId: string
+): Promise<{ month: string; totalTokens: number; totalCost: number; bonus: number }> {
+  const user = await userDb.getUserById(userId);
+  if (!user) throw new Error(`User not found: ${userId}`);
+
+  const currentMonth = getCurrentMonth();
+  const usage = user.tokenUsage;
+
+  // If no usage yet, or month has changed → treat as zero
+  if (!usage || usage.month !== currentMonth) {
+    return { month: currentMonth, totalTokens: 0, totalCost: 0, bonus: 0 };
+  }
+
+  return {
+    month: currentMonth,
+    totalTokens: usage.totalTokens || 0,
+    totalCost: usage.totalCost || 0,
+    bonus: user.tokenAllowanceBonus || 0,
+  };
+}
+
+/**
+ * Get the token allowance for a user based on their subscription type + bonus.
+ */
+export async function getUserTokenAllowance(
+  userId: string
+): Promise<{ allowance: number | null; bonus: number; effectiveAllowance: number | null }> {
+  const subscriptionTypeName = await getUserSubscriptionType(userId);
+  const config = await getSubscriptionTypeConfig(subscriptionTypeName);
+
+  const baseAllowance = config?.monthlyTokenAllowance ?? null;
+  const user = await userDb.getUserById(userId);
+  const bonus = user?.tokenAllowanceBonus || 0;
+
+  if (baseAllowance === null || baseAllowance === undefined) {
+    return { allowance: null, bonus, effectiveAllowance: null };
+  }
+
+  return {
+    allowance: baseAllowance,
+    bonus,
+    effectiveAllowance: baseAllowance + bonus,
+  };
+}
+
+/**
+ * Check if a user can send messages. Returns usage status with warning/blocked flags.
+ */
+export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus> {
+  const usage = await getUserTokenUsage(userId);
+  const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
+
+  // Unlimited
+  if (effectiveAllowance === null) {
+    return {
+      allowed: true,
+      warning: false,
+      used: usage.totalTokens,
+      allowance,
+      bonus,
+      effectiveAllowance,
+      percentUsed: 0,
+      month: usage.month,
+    };
+  }
+
+  const percentUsed =
+    effectiveAllowance > 0
+      ? Math.round((usage.totalTokens / effectiveAllowance) * 100)
+      : usage.totalTokens > 0
+      ? 100
+      : 0;
+
+  return {
+    allowed: percentUsed < 100,
+    warning: percentUsed >= 80 && percentUsed < 100,
+    used: usage.totalTokens,
+    allowance,
+    bonus,
+    effectiveAllowance,
+    percentUsed,
+    month: usage.month,
+  };
+}
+
+/**
+ * Atomically increment a user's token usage for the current month.
+ * Performs lazy monthly reset if the stored month differs from current.
+ */
+export async function incrementUserTokenUsage(
+  userId: string,
+  tokens: number,
+  cost: number
+): Promise<void> {
+  if (tokens <= 0 && cost <= 0) return;
+
+  const currentMonth = getCurrentMonth();
+
+  try {
+    // Try to read current user to check if we need a month reset
+    const user = await userDb.getUserById(userId);
+    if (!user) return;
+
+    const existingMonth = user.tokenUsage?.month;
+
+    if (existingMonth !== currentMonth) {
+      // New month — reset usage and clear bonus
+      await userDb.updateUser(userId, {
+        tokenUsage: {
+          month: currentMonth,
+          totalTokens: tokens,
+          totalCost: cost,
+          resetDate: getNextResetDate(),
+        },
+        tokenAllowanceBonus: 0,
+      });
+    } else {
+      // Same month — increment atomically
+      await userDb.updateUser(userId, {
+        tokenUsage: {
+          month: currentMonth,
+          totalTokens: (user.tokenUsage?.totalTokens || 0) + tokens,
+          totalCost: (user.tokenUsage?.totalCost || 0) + cost,
+          resetDate: user.tokenUsage?.resetDate || getNextResetDate(),
+        },
+      });
+    }
+  } catch (error) {
+    // Don't block message flow on usage tracking failures
+    console.error(`[tokenUsageService] Failed to increment usage for ${userId}:`, error);
+  }
+}
+
+/**
+ * Grant bonus tokens to a user (additive to any existing bonus).
+ */
+export async function grantTokenBonus(
+  userId: string,
+  bonusTokens: number
+): Promise<void> {
+  const user = await userDb.getUserById(userId);
+  if (!user) throw new Error(`User not found: ${userId}`);
+
+  const currentBonus = user.tokenAllowanceBonus || 0;
+  await userDb.updateUser(userId, {
+    tokenAllowanceBonus: currentBonus + bonusTokens,
+  });
+}
