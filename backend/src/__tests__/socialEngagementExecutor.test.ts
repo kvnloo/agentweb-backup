@@ -20,6 +20,7 @@ jest.mock('../services/db', () => ({
 jest.mock('../services/adapters/linkedInAdapter', () => ({
   LinkedInAdapter: jest.fn().mockImplementation(() => ({
     getPost: jest.fn(),
+    getComments: jest.fn().mockResolvedValue([]),
     createComment: jest.fn(),
     createReaction: jest.fn(),
   })),
@@ -103,6 +104,7 @@ describe('SocialEngagementExecutor', () => {
 
     mockAdapter = {
       getPost: jest.fn().mockResolvedValue('This is a great LinkedIn post about technology.'),
+      getComments: jest.fn().mockResolvedValue([]),
       createComment: jest.fn().mockResolvedValue(undefined),
       createReaction: jest.fn().mockResolvedValue(undefined),
     } as any;
@@ -317,6 +319,146 @@ describe('SocialEngagementExecutor', () => {
         'Great insights! Thanks for sharing.',
         expect.any(String)
       );
+    });
+  });
+
+  // ─── duplicate comment prevention (real-time API check) ────────────────────
+
+  describe('duplicate comment prevention via getComments', () => {
+    it('should skip commenting when the engaging account has already commented on the post', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('New comment') as any
+      );
+      // Simulate that the engaging account already commented on this post
+      mockAdapter.getComments.mockResolvedValue([
+        { commentUrn: 'urn:li:comment:existing', actorUrn: 'acc-engager-1', text: 'Already said this', createdAt: Date.now() },
+      ]);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      // Should NOT call createComment since account already commented
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      // Should still mark as completed (not failed) — the engagement already exists
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' })
+      );
+    });
+
+    it('should allow commenting when a different account has commented but not the engaging one', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('My new comment') as any
+      );
+      // Different account has commented, but NOT the engaging account
+      mockAdapter.getComments.mockResolvedValue([
+        { commentUrn: 'urn:li:comment:other', actorUrn: 'acc-other-account', text: 'Someone else', createdAt: Date.now() },
+      ]);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalled();
+    });
+
+    it('should skip commenting in comment_and_like when already commented, but still like', async () => {
+      const action = makeAction({
+        variableValues: { ...makeAction().variableValues, actionType: 'comment_and_like' },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      const geminiClient = {
+        chat: {
+          completions: {
+            create: jest.fn()
+              .mockResolvedValueOnce({ choices: [{ message: { content: 'Skipped comment' } }] })
+              .mockResolvedValueOnce({ choices: [{ message: { content: 'LIKE' } }] }),
+          },
+        },
+      };
+      mockAgentModeService.getGeminiClient.mockResolvedValue(geminiClient as any);
+      // Engaging account already commented
+      mockAdapter.getComments.mockResolvedValue([
+        { commentUrn: 'urn:li:comment:dup', actorUrn: 'acc-engager-1', text: 'Already here', createdAt: Date.now() },
+      ]);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      // Should NOT comment but SHOULD still like
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockAdapter.createReaction).toHaveBeenCalled();
+    });
+
+    it('should proceed with comment when getComments fails (fail-open for non-dedup errors)', async () => {
+      const action = makeAction({ variableValues: { ...makeAction().variableValues, actionType: 'comment' } });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('Comment despite fetch failure') as any
+      );
+      // getComments fails — should NOT block commenting
+      mockAdapter.getComments.mockRejectedValue(new Error('API error'));
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalled();
+    });
+  });
+
+  // ─── duplicate reply prevention (real-time API check) ─────────────────────
+
+  describe('duplicate reply prevention via getComments', () => {
+    it('should skip replying when the account has already replied to the comment', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: 'Original comment',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('Duplicate reply') as any
+      );
+      // Account already replied to this comment
+      mockAdapter.getComments.mockResolvedValue([
+        { commentUrn: 'urn:li:comment:existing-reply', actorUrn: 'acc-engager-1', text: 'Already replied', createdAt: Date.now() },
+      ]);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).not.toHaveBeenCalled();
+      expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' })
+      );
+    });
+
+    it('should allow replying when no existing replies from this account', async () => {
+      const action = makeAction({
+        variableValues: {
+          postId: 'urn:li:share:123',
+          commentId: 'urn:li:comment:456',
+          commentText: 'Original comment',
+          platform: 'linkedin',
+          ownerAccountId: 'acc-engager-1',
+          engagingAccountId: 'acc-engager-1',
+          actionType: 'reply_comment',
+          targetType: 'comment',
+        },
+      });
+      mockScheduleDb.getSocialEngagementActionsUpTo.mockResolvedValue([action]);
+      mockAgentModeService.getGeminiClient.mockResolvedValue(
+        makeMockGeminiClient('Fresh reply') as any
+      );
+      mockAdapter.getComments.mockResolvedValue([]);
+
+      const p = executor.processQueue(); await jest.runAllTimersAsync(); await p;
+
+      expect(mockAdapter.createComment).toHaveBeenCalled();
     });
   });
 
