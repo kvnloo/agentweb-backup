@@ -217,6 +217,34 @@ export interface User {
   }>;
   allowedPages?: string[];
   allowedSkills?: string[];
+  orgId?: string;
+  orgRole?: "owner" | "member";
+}
+
+export interface Organization {
+  orgId: string;
+  name: string;
+  ownerUserId: string;
+  brandGuidelines?: User["brandGuidelines"];
+  marketStrategy?: User["marketStrategy"];
+  startupProfiles?: User["startupProfiles"];
+  connected_accounts?: User["connected_accounts"];
+  seoDomains?: string[];
+  cmsType?: "Basehub" | "Webflow" | "WordPress";
+  emailDomain?: string;
+  fromName?: string;
+  slackChannel?: string;
+  googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  googleDriveFolders?: Array<{ folderId: string; name: string }>;
+  pendingInvites?: Array<{
+    email: string;
+    inviteToken: string;
+    invitedAt: string;
+    invitedBy: string;
+  }>;
+  maxMembers: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface UserInteraction {
@@ -5165,4 +5193,101 @@ export const socialEngagementTrackingDb = {
       throw error;
     }
   },
+};
+
+// ==================== Organization DB Operations ====================
+
+const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
+const ORG_MAX_MEMBERS = 5;
+
+export const orgDb = {
+  async createOrg(org: Organization): Promise<Organization> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Item: org,
+      ConditionExpression: "attribute_not_exists(orgId)",
+    };
+    await dynamodb.put(params).promise();
+    return org;
+  },
+
+  async getOrgById(orgId: string): Promise<Organization | null> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+    };
+    const result = await dynamodb.get(params).promise();
+    return (result.Item as Organization) || null;
+  },
+
+  async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {
+    const { orgId: _, createdAt: __, ...updatableFields } = updates;
+
+    if (Object.keys(updatableFields).length === 0) {
+      const org = await this.getOrgById(orgId);
+      if (!org) throw new Error(`Organization ${orgId} not found`);
+      return org;
+    }
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: Record<string, string> = {};
+    const expressionAttributeValues: Record<string, any> = {};
+
+    Object.entries(updatableFields).forEach(([key, value]) => {
+      if (value !== undefined) {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      }
+    });
+
+    if (updateExpressions.length === 0) {
+      const org = await this.getOrgById(orgId);
+      if (!org) throw new Error(`Organization ${orgId} not found`);
+      return org;
+    }
+
+    // Always update updatedAt
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW" as const,
+    };
+
+    const result = await dynamodb.update(params).promise();
+    return result.Attributes as Organization;
+  },
+
+  async deleteOrg(orgId: string): Promise<void> {
+    await dynamodb.delete({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+  },
+
+  async getOrgMembers(orgId: string): Promise<User[]> {
+    // Scan users with this orgId - fine for small orgs (max 5 members)
+    const result = await dynamodb.scan({
+      TableName: `${TABLE_PREFIX}AW-Users`,
+      FilterExpression: "orgId = :orgId",
+      ExpressionAttributeValues: { ":orgId": orgId },
+    }).promise();
+    return (result.Items || []) as User[];
+  },
+
+  async getOrgMemberCount(orgId: string): Promise<number> {
+    const result = await dynamodb.scan({
+      TableName: `${TABLE_PREFIX}AW-Users`,
+      FilterExpression: "orgId = :orgId",
+      ExpressionAttributeValues: { ":orgId": orgId },
+      Select: "COUNT",
+    }).promise();
+    return result.Count || 0;
+  },
+
+  ORG_MAX_MEMBERS,
 };
