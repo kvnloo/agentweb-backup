@@ -33,23 +33,18 @@ jest.mock('../services/chatbotService');
 jest.mock('../services/settingsService');
 jest.mock('../utils/secretsManager');
 
-// Mock Bedrock modules
-const mockBedrockInvoke = jest.fn();
-jest.mock('@langchain/aws', () => ({
-  ChatBedrockConverse: jest.fn().mockImplementation(() => ({
-    invoke: mockBedrockInvoke,
-  })),
-}));
+// Mock Bedrock modules — uses ConverseCommand directly (no LangChain)
+const mockBedrockSend = jest.fn();
+let lastConverseInput: any = null;
 
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
-  BedrockRuntimeClient: jest.fn().mockImplementation(() => ({})),
-}));
-
-jest.mock('@langchain/core/messages', () => ({
-  HumanMessage: jest.fn().mockImplementation((content: string) => ({ role: 'user', content })),
-  AIMessage: jest.fn().mockImplementation((content: string | object) => ({ role: 'assistant', ...(typeof content === 'string' ? { content } : content) })),
-  SystemMessage: jest.fn().mockImplementation((content: string) => ({ role: 'system', content })),
-  ToolMessage: jest.fn().mockImplementation((content: string) => ({ role: 'tool', content })),
+  BedrockRuntimeClient: jest.fn().mockImplementation(() => ({
+    send: mockBedrockSend,
+  })),
+  ConverseCommand: jest.fn().mockImplementation((input: any) => {
+    lastConverseInput = input;
+    return { input };
+  }),
 }));
 
 describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
@@ -200,15 +195,16 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   });
 
   describe('Bedrock client lazy-loading', () => {
-    it('should lazy-load Bedrock client for Sonnet 4.5 on first callLLM', async () => {
-      // Mock the Bedrock invoke to return a valid response
-      mockBedrockInvoke.mockResolvedValue({
-        content: 'test response',
-        response_metadata: {
-          usage: { input_tokens: 10, output_tokens: 5 },
-        },
+    beforeEach(() => {
+      // Mock ConverseCommand response format (Bedrock native, not LangChain)
+      mockBedrockSend.mockResolvedValue({
+        output: { message: { role: 'assistant', content: [{ text: 'test response' }] } },
+        usage: { inputTokens: 10, outputTokens: 5 },
+        stopReason: 'end_turn',
       });
+    });
 
+    it('should lazy-load Bedrock client for Sonnet 4.5 on first callLLM', async () => {
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
         { role: 'user', content: 'Hello' },
@@ -219,19 +215,11 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         messages
       );
 
-      // After calling, the client should be cached (no longer null)
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].client).not.toBeNull();
     });
 
     it('should lazy-load Bedrock client for Sonnet 4.6 on first callLLM', async () => {
-      mockBedrockInvoke.mockResolvedValue({
-        content: 'test response',
-        response_metadata: {
-          usage: { input_tokens: 10, output_tokens: 5 },
-        },
-      });
-
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
         { role: 'user', content: 'Hello' },
@@ -247,13 +235,6 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
     });
 
     it('should lazy-load Bedrock client for Opus 4.6 on first callLLM', async () => {
-      mockBedrockInvoke.mockResolvedValue({
-        content: 'test response',
-        response_metadata: {
-          usage: { input_tokens: 10, output_tokens: 5 },
-        },
-      });
-
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
         { role: 'user', content: 'Hello' },
@@ -319,84 +300,55 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   });
 
   describe('Inference profile ARN mapping', () => {
-    it('should map Sonnet 4.5 to its inference profile ARN', async () => {
-      const { ChatBedrockConverse } = require('@langchain/aws');
-
-      mockBedrockInvoke.mockResolvedValue({
-        content: 'test response',
-        response_metadata: {
-          usage: { input_tokens: 10, output_tokens: 5 },
-        },
+    beforeEach(() => {
+      mockBedrockSend.mockResolvedValue({
+        output: { message: { role: 'assistant', content: [{ text: 'test response' }] } },
+        usage: { inputTokens: 10, outputTokens: 5 },
+        stopReason: 'end_turn',
       });
+    });
 
-      const messages = [
-        { role: 'system', content: 'Test' },
-        { role: 'user', content: 'Hello' },
-      ];
+    it('should map Sonnet 4.5 to its inference profile ARN', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
       await (agentModeService as any).callLLM(
         'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        messages
+        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
       );
 
-      // The ChatBedrockConverse constructor should have been called with the inference profile ARN
-      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+      expect(ConverseCommand).toHaveBeenCalledWith(
         expect.objectContaining({
-          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
+          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
         })
       );
     });
 
     it('should map Sonnet 4.6 to its inference profile ARN', async () => {
-      const { ChatBedrockConverse } = require('@langchain/aws');
-
-      mockBedrockInvoke.mockResolvedValue({
-        content: 'test response',
-        response_metadata: {
-          usage: { input_tokens: 10, output_tokens: 5 },
-        },
-      });
-
-      const messages = [
-        { role: 'system', content: 'Test' },
-        { role: 'user', content: 'Hello' },
-      ];
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
       await (agentModeService as any).callLLM(
         'anthropic.claude-sonnet-4-6',
-        messages
+        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
       );
 
-      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+      expect(ConverseCommand).toHaveBeenCalledWith(
         expect.objectContaining({
-          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
+          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
         })
       );
     });
 
     it('should map Opus 4.6 to its inference profile ARN', async () => {
-      const { ChatBedrockConverse } = require('@langchain/aws');
-
-      mockBedrockInvoke.mockResolvedValue({
-        content: 'test response',
-        response_metadata: {
-          usage: { input_tokens: 10, output_tokens: 5 },
-        },
-      });
-
-      const messages = [
-        { role: 'system', content: 'Test' },
-        { role: 'user', content: 'Hello' },
-      ];
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
       await (agentModeService as any).callLLM(
         'anthropic.claude-opus-4-6-v1',
-        messages
+        [{ role: 'system', content: 'Test' }, { role: 'user', content: 'Hello' }]
       );
 
-      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+      expect(ConverseCommand).toHaveBeenCalledWith(
         expect.objectContaining({
-          model: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
+          modelId: 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
         })
       );
     });
