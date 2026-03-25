@@ -121,6 +121,94 @@ export class SocialEngagementScanner {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────────────
+    // SHARED SCHEDULING HELPER
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Records the tracking entry FIRST (dedup guard), then creates the schedule.
+     * If createSchedule fails, the tracking record is deleted so the scanner can
+     * retry on the next run — preventing a permanently blocked post+account+actionType.
+     */
+    private async scheduleOneAction(params: {
+        userId: string;
+        postId: string;
+        commentId?: string;
+        commentText?: string;
+        platform: string;
+        ownerAccountId: string;
+        engagingAccountId: string;
+        engagingAccountName: string;
+        actionType: string;
+        targetType: 'post' | 'comment';
+        windowMs: number;
+        description: string;
+    }) {
+        const delayMs = Math.floor(Math.random() * params.windowMs);
+        const executionTime = new Date(Date.now() + delayMs).toISOString();
+        const scheduleId = uuidv4();
+
+        // Record first — dedup guard is in place before the schedule is created
+        await socialEngagementTrackingDb.recordEngagement({
+            userId: params.userId,
+            postId: params.postId,
+            commentId: params.commentId,
+            platform: params.platform,
+            ownerAccountId: params.ownerAccountId,
+            engagingAccountId: params.engagingAccountId,
+            actionType: params.actionType,
+            scheduleId,
+            status: 'queued',
+        });
+
+        try {
+            await scheduleDb.createSchedule({
+                scheduleId,
+                taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
+                userId: params.userId,
+                frequency: 'once',
+                runCount: 1,
+                nextRunTime: executionTime,
+                status: 'active',
+                createdAt: new Date().toISOString(),
+                type: 'social_engagement_action',
+                description: params.description,
+                variableValues: {
+                    postId: params.postId,
+                    ...(params.commentId !== undefined && { commentId: params.commentId }),
+                    ...(params.commentText !== undefined && { commentText: params.commentText }),
+                    platform: params.platform,
+                    ownerAccountId: params.ownerAccountId,
+                    engagingAccountId: params.engagingAccountId,
+                    actionType: params.actionType,
+                    targetType: params.targetType,
+                },
+            });
+        } catch (scheduleErr) {
+            // Schedule creation failed — remove the tracking record so the scanner
+            // can retry on the next run instead of permanently blocking this action.
+            console.error(`[Scanner] createSchedule failed for "${params.actionType}" on ${params.postId}, rolling back tracking record:`, scheduleErr);
+            try {
+                await socialEngagementTrackingDb.deleteEngagement({
+                    userId: params.userId,
+                    postId: params.postId,
+                    commentId: params.commentId,
+                    engagingAccountId: params.engagingAccountId,
+                    actionType: params.actionType,
+                });
+            } catch (deleteErr) {
+                console.error(`[Scanner] Failed to roll back tracking record for "${params.actionType}" on ${params.postId}:`, deleteErr);
+            }
+            throw scheduleErr;
+        }
+
+        console.log(`[Scanner] Scheduled "${params.actionType}" at ${executionTime} — ${params.description}`);
+
+        if (delayMs <= SCANNER_DIRECT_SCHEDULE_MS) {
+            this.onActionScheduled?.(delayMs);
+        }
+    }
+
     private async schedulePostEngagers(
         ownerAccount: any,
         ownerSettings: any,
@@ -136,77 +224,57 @@ export class SocialEngagementScanner {
         const maxEngagers = ownerSettings.maxEngagersPerPost || 2;
         const windowMs = (ownerSettings.engagementWindowMinutes || 60) * 60 * 1000;
 
-        const availableEngagers: any[] = [];
-        for (const engager of potentialEngagers) {
-            const alreadyQueued = await socialEngagementTrackingDb.hasEngaged(
-                ownerAccount.userId, postId, engager.account_id
-            );
-            if (!alreadyQueued) availableEngagers.push(engager);
-        }
-
-        if (availableEngagers.length === 0) return;
-
         // Limit how many distinct accounts can engage on a single post
-        const cappedEngagers = availableEngagers.slice(0, maxEngagers);
+        const cappedEngagers = potentialEngagers.slice(0, maxEngagers);
 
         let likeCount = 0;
         let commentCount = 0;
 
         for (const engager of cappedEngagers) {
-            const canLike = wantsLike && likeCount < maxLikes;
-            const canComment = wantsComment && commentCount < maxComments;
-            if (!canLike && !canComment) break;
+            const needsLike = wantsLike && likeCount < maxLikes;
+            const needsComment = wantsComment && commentCount < maxComments;
+            if (!needsLike && !needsComment) break;
 
-            const actionType: 'like' | 'comment' | 'comment_and_like' =
-                canLike && canComment ? 'comment_and_like'
-                    : canComment ? 'comment'
-                        : 'like';
+            // Check per action type so an engager who already liked can still comment (and vice versa)
+            const [alreadyLiked, alreadyCommented] = await Promise.all([
+                needsLike
+                    ? socialEngagementTrackingDb.hasEngaged(ownerAccount.userId, postId, engager.account_id, 'like')
+                    : Promise.resolve(true),
+                needsComment
+                    ? socialEngagementTrackingDb.hasEngaged(ownerAccount.userId, postId, engager.account_id, 'comment')
+                    : Promise.resolve(true),
+            ]);
 
-            if (canLike) likeCount++;
-            if (canComment) commentCount++;
-
-            const delayMs = Math.floor(Math.random() * windowMs);
-            const executionTime = new Date(Date.now() + delayMs).toISOString();
-
-            const scheduleId = uuidv4();
-            await scheduleDb.createSchedule({
-                scheduleId,
-                taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
-                userId: ownerAccount.userId,
-                frequency: 'once',
-                runCount: 1,
-                nextRunTime: executionTime,
-                status: 'active',
-                createdAt: new Date().toISOString(),
-                type: 'social_engagement_action',
-                description: `Engage post ${postId} as ${engager.account_name} on ${platform}`,
-                variableValues: {
+            if (needsLike && !alreadyLiked) {
+                await this.scheduleOneAction({
+                    userId: ownerAccount.userId,
                     postId,
                     platform,
                     ownerAccountId: ownerAccount.account_id,
                     engagingAccountId: engager.account_id,
-                    actionType,
+                    engagingAccountName: engager.account_name,
+                    actionType: 'like',
                     targetType: 'post',
-                },
-            });
+                    windowMs,
+                    description: `Like post ${postId} as ${engager.account_name}`,
+                });
+                likeCount++;
+            }
 
-            // Mark as queued immediately so subsequent scanner runs don't schedule it again
-            await socialEngagementTrackingDb.recordEngagement({
-                userId: ownerAccount.userId,
-                postId,
-                platform,
-                ownerAccountId: ownerAccount.account_id,
-                engagingAccountId: engager.account_id,
-                actionType,
-                scheduleId,
-                status: 'queued',
-            });
-
-            console.log(`[Scanner/Posts] Scheduled "${actionType}" on post ${postId} by ${engager.account_name} at ${executionTime}`);
-
-            // If within direct schedule window, fire executor via setTimeout instead of waiting for TimerScheduler
-            if (delayMs <= SCANNER_DIRECT_SCHEDULE_MS) {
-                this.onActionScheduled?.(delayMs);
+            if (needsComment && !alreadyCommented) {
+                await this.scheduleOneAction({
+                    userId: ownerAccount.userId,
+                    postId,
+                    platform,
+                    ownerAccountId: ownerAccount.account_id,
+                    engagingAccountId: engager.account_id,
+                    engagingAccountName: engager.account_name,
+                    actionType: 'comment',
+                    targetType: 'post',
+                    windowMs,
+                    description: `Comment on post ${postId} as ${engager.account_name}`,
+                });
+                commentCount++;
             }
         }
     }
@@ -273,95 +341,76 @@ export class SocialEngagementScanner {
 
         if (maxLikes === 0 && maxReplies === 0) return;
 
-        // Filter out comments already acted on by this account
-        const unhandled: typeof comments = [];
-        for (const comment of comments) {
-            const already = await socialEngagementTrackingDb.hasEngaged(
-                account.userId, comment.commentUrn, account.account_id
-            );
-            if (!already) unhandled.push(comment);
-        }
-
-        if (unhandled.length === 0) return;
-
-        // Enforce per-post lifetime cap — subtract already queued/completed counts
+        // Enforce per-post lifetime cap — counts both queued AND completed items
+        // (queued items now have executedAt set so they appear in the GSI)
         const { likedCount, repliedCount } = await socialEngagementTrackingDb
             .getCommentEngagementCountsForPost(postId, account.account_id);
 
-        const remainingLikes = Math.max(0, maxLikes - likedCount);
         const remainingReplies = Math.max(0, maxReplies - repliedCount);
+        const remainingLikes = Math.max(0, maxLikes - likedCount);
 
-        if (remainingLikes === 0 && remainingReplies === 0) {
+        if (remainingReplies === 0 && remainingLikes === 0) {
             console.log(`[Scanner/CommentReply] Post ${postId}: lifetime cap reached (likes: ${likedCount}/${maxLikes}, replies: ${repliedCount}/${maxReplies}), skipping.`);
             return;
         }
 
-        // Shuffle for random selection
-        const shuffled = [...unhandled].sort(() => Math.random() - 0.5);
+        // Collect candidates per action type independently, checking per-action dedup
+        const replyEligible: typeof comments = [];
+        const likeEligible: typeof comments = [];
 
-        // Select up to remaining capacity for each action independently
-        const replyTargets = new Set(shuffled.slice(0, remainingReplies).map((c) => c.commentUrn));
-        const likeTargets = new Set(shuffled.slice(0, remainingLikes).map((c) => c.commentUrn));
+        for (const comment of comments) {
+            if (wantsReply && replyEligible.length < remainingReplies) {
+                const alreadyReplied = await socialEngagementTrackingDb.hasEngaged(
+                    account.userId, comment.commentUrn, account.account_id, 'reply_comment'
+                );
+                if (!alreadyReplied) replyEligible.push(comment);
+            }
+            if (wantsLike && likeEligible.length < remainingLikes) {
+                const alreadyLiked = await socialEngagementTrackingDb.hasEngaged(
+                    account.userId, comment.commentUrn, account.account_id, 'like_comment'
+                );
+                if (!alreadyLiked) likeEligible.push(comment);
+            }
+        }
 
-        // Union of all comments needing any action
-        const allTargetUrns = new Set([...replyTargets, ...likeTargets]);
+        console.log(`[Scanner/CommentReply] Post ${postId}: ${replyEligible.length} reply candidate(s), ${likeEligible.length} like candidate(s)`);
 
-        for (const commentUrn of allTargetUrns) {
-            const comment = unhandled.find((c) => c.commentUrn === commentUrn)!;
-            const doReply = replyTargets.has(commentUrn);
-            const doLike = likeTargets.has(commentUrn);
+        // Shuffle and cap each list independently
+        const replyTargets = [...replyEligible].sort(() => Math.random() - 0.5).slice(0, remainingReplies);
+        const likeTargets = [...likeEligible].sort(() => Math.random() - 0.5).slice(0, remainingLikes);
 
-            const actionType: 'like_comment' | 'reply_comment' | 'like_and_reply_comment' =
-                doLike && doReply ? 'like_and_reply_comment'
-                    : doReply ? 'reply_comment'
-                        : 'like_comment';
-
-            const delayMs = Math.floor(Math.random() * windowMs);
-            const executionTime = new Date(Date.now() + delayMs).toISOString();
-
-            const scheduleId = uuidv4();
-            await scheduleDb.createSchedule({
-                scheduleId,
-                taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
-                userId: account.userId,
-                frequency: 'once',
-                runCount: 1,
-                nextRunTime: executionTime,
-                status: 'active',
-                createdAt: new Date().toISOString(),
-                type: 'social_engagement_action',
-                description: `Auto-reply to comment on post ${postId} as ${account.account_name}`,
-                variableValues: {
-                    postId,
-                    commentId: commentUrn,
-                    commentText: comment.text,
-                    platform,
-                    ownerAccountId: account.account_id,
-                    engagingAccountId: account.account_id, // self-reply: same account
-                    actionType,
-                    targetType: 'comment',
-                },
-            });
-
-            // Mark as queued immediately so subsequent scanner runs don't schedule it again
-            await socialEngagementTrackingDb.recordEngagement({
+        for (const comment of replyTargets) {
+            await this.scheduleOneAction({
                 userId: account.userId,
                 postId,
-                commentId: commentUrn,
+                commentId: comment.commentUrn,
+                commentText: comment.text,
                 platform,
                 ownerAccountId: account.account_id,
                 engagingAccountId: account.account_id,
-                actionType,
-                scheduleId,
-                status: 'queued',
+                engagingAccountName: account.account_name,
+                actionType: 'reply_comment',
+                targetType: 'comment',
+                windowMs,
+                description: `Reply to comment on post ${postId} as ${account.account_name}`,
             });
+        }
 
-            console.log(`[Scanner/CommentReply] Scheduled "${actionType}" on comment ${commentUrn} as ${account.account_name} at ${executionTime}`);
-
-            // If within direct schedule window, fire executor via setTimeout instead of waiting for TimerScheduler
-            if (delayMs <= SCANNER_DIRECT_SCHEDULE_MS) {
-                this.onActionScheduled?.(delayMs);
-            }
+        for (const comment of likeTargets) {
+            await this.scheduleOneAction({
+                userId: account.userId,
+                postId,
+                commentId: comment.commentUrn,
+                commentText: comment.text,
+                platform,
+                ownerAccountId: account.account_id,
+                engagingAccountId: account.account_id,
+                engagingAccountName: account.account_name,
+                actionType: 'like_comment',
+                targetType: 'comment',
+                windowMs,
+                description: `Like comment on post ${postId} as ${account.account_name}`,
+            });
         }
     }
 }
