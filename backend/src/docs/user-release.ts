@@ -16,6 +16,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Enable "Auto-sync new users to this lead list" in the Sync to CRM dialog on the Users tab of the Admin Dashboard',
       '- Auto-sync is fire-and-forget — registration is never blocked even if the CRM sync fails',
       '- Manual bulk sync via "Start Syncing" is still available for backfilling',
+      'Feature: Batch Review Page',
+      '- When sending multiple assets for review, a single Slack message is sent with a link to a dedicated review page instead of individual messages per asset',
+      '- Reviewers can approve, request changes, or reject each asset from the web page',
+      '- Review progress is updated back to Slack in real-time with a link to the review page',
+      '- When changes are requested, auto-revision generates a new version directly in the review page',
     ],
   },
   {

@@ -63,6 +63,7 @@ export interface AssetApproval {
   reviewedBy?: string;
   feedback?: string;
   note?: string; // User-provided note for context
+  batchId?: string; // Optional reference to a batch review
   createdAt: string;
   updatedAt: string;
 }
@@ -77,6 +78,7 @@ export interface CreateApprovalRequest {
   slackChannelName: string; // Channel name
   slackMessageTs: string | null;
   note?: string; // User-provided note for context
+  batchId?: string; // Optional reference to a batch review
 }
 
 export class ApprovalDB {
@@ -97,6 +99,7 @@ export class ApprovalDB {
       slackChannelName: request.slackChannelName,
       slackMessageTs: request.slackMessageTs,
       note: request.note,
+      ...(request.batchId && { batchId: request.batchId }),
       createdAt: now,
       updatedAt: now,
     };
