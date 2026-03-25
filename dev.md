@@ -1,3 +1,43 @@
+# March 25, 2026: Investigation — LiteLLM Vulnerability Impact on AgentWeb
+
+## Background
+
+Multiple CVEs have been disclosed against **LiteLLM** (BerriAI's LLM proxy/gateway library):
+
+| CVE | Score | Severity | Description |
+|-----|-------|----------|-------------|
+| CVE-2024-4888 | 8.1 | High | Arbitrary file deletion via `/audio/transcriptions` endpoint |
+| CVE-2024-10188 | 7.5 | High | DoS via `ast.literal_eval` on user input |
+| CVE-2025-45809 | 5.4 | Medium | SQL injection via `/key/block` and `/key/unblock` API endpoints |
+| CVE-2025-11203 | 3.5 | Low | API key information disclosure via health endpoint |
+
+## Investigation Findings
+
+**AgentWeb is NOT impacted.** LiteLLM is neither a direct nor transitive dependency.
+
+### What we checked
+
+- `agent-engine/requirements.txt` — no litellm
+- `agent-engine/environment.yml` — no litellm
+- `backend/package.json` — no litellm
+- Full codebase grep for "litellm" — zero code references
+- Transitive dependency check: browser-use, ag2 (AutoGen), and langchain packages do not pull in litellm
+
+### How AgentWeb integrates with LLMs instead
+
+AgentWeb uses direct SDK integrations, not a proxy layer:
+- **AWS Bedrock SDK** — for Claude models (via `@aws-sdk/client-bedrock-runtime`)
+- **Azure OpenAI SDK** — for GPT-4o/GPT-4.1
+- **Google GenAI SDK** — for Gemini models
+- **OpenAI SDK** — direct API access
+- **LangChain** — abstraction layer in agent-engine (does not depend on litellm)
+
+### Conclusion
+
+No remediation action required. AgentWeb's direct-SDK approach avoids the proxy-layer attack surface that LiteLLM exposes.
+
+---
+
 # March 24, 2026: Investigation — Meta Pixel / CAPI Detection on Landing Pages
 
 ## Problem
