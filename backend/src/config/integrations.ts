@@ -1,4 +1,4 @@
-import { getLinkedInCredentials, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials } from '../utils/secretsManager';
+import { getLinkedInCredentials, getLinkedInAdsSecrets, getMetaCredentials, getGmailCredentials, getYouTubeCredentials, getFathomCredentials } from '../utils/secretsManager';
 import { MetaConfig } from '../types/meta';
 
 // Graph API version for Auth/Token exchange - decoupled from SDK version
@@ -99,6 +99,22 @@ export const INTEGRATION_CONFIG = {
     authorizationUrl: 'https://fathom.video/external/v1/oauth2/authorize',
     tokenUrl: 'https://api.fathom.ai/external/v1/oauth2/token',
     scopes: ['public_api'],
+  },
+
+  linkedinAds: {
+    // Separate MDP (Marketing Developer Platform) app — distinct from the posting app
+    redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/linkedin-ads/callback`,
+    scopes: [
+      'r_basicprofile',
+      'r_ads',
+      'rw_ads',
+      'r_ads_reporting',
+    ],
+    authorizationUrl: 'https://www.linkedin.com/oauth/v2/authorization',
+    tokenUrl: 'https://www.linkedin.com/oauth/v2/accessToken',
+    profileUrl: 'https://api.linkedin.com/v2/userinfo',
+    apiBaseUrl: 'https://api.linkedin.com',
+    apiVersion: '202603',
   }
 };
 
@@ -137,6 +153,39 @@ export async function getLinkedInConfig(): Promise<LinkedInConfig> {
     authorizationUrl: INTEGRATION_CONFIG.linkedin.authorizationUrl,
     tokenUrl: INTEGRATION_CONFIG.linkedin.tokenUrl,
     profileUrl: INTEGRATION_CONFIG.linkedin.profileUrl
+  };
+}
+
+// LinkedIn Ads configuration interface
+export interface LinkedInAdsConfig {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  scopes: string[];
+  authorizationUrl: string;
+  tokenUrl: string;
+  profileUrl: string;
+  apiBaseUrl: string;
+  apiVersion: string;
+}
+
+/**
+ * Fetches LinkedIn Ads OAuth configuration from AWS Secrets Manager.
+ * Uses the separate MDP (Marketing Developer Platform) app credentials,
+ * stored at dev/AgentWeb/LinkedIn/Ads (or prod/... for production).
+ */
+export async function getLinkedInAdsConfig(): Promise<LinkedInAdsConfig> {
+  const credentials = await getLinkedInAdsSecrets();
+  return {
+    clientId: credentials.clientId,
+    clientSecret: credentials.clientSecret,
+    redirectUri: INTEGRATION_CONFIG.linkedinAds.redirectUri,
+    scopes: INTEGRATION_CONFIG.linkedinAds.scopes,
+    authorizationUrl: INTEGRATION_CONFIG.linkedinAds.authorizationUrl,
+    tokenUrl: INTEGRATION_CONFIG.linkedinAds.tokenUrl,
+    profileUrl: INTEGRATION_CONFIG.linkedinAds.profileUrl,
+    apiBaseUrl: INTEGRATION_CONFIG.linkedinAds.apiBaseUrl,
+    apiVersion: INTEGRATION_CONFIG.linkedinAds.apiVersion,
   };
 }
 

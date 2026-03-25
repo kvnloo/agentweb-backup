@@ -26,6 +26,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
+import * as linkedInAdsService from './linkedInAdsService';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 
@@ -18482,6 +18483,227 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         error: errorMessage
       };
     }
+  }
+
+  // --- LinkedIn Ads ---
+
+  /**
+   * Retrieve a valid LinkedIn Ads access token for the given user + ad account.
+   * Refreshes via refresh_token if the token is within 5 minutes of expiry and updates the DB.
+   */
+  private async getLinkedInAdsCredentials(userId: string, accountId?: string): Promise<{ accountId: string; accessToken: string }> {
+    const { userDb } = await import('./db');
+    const user = await userDb.getUserById(userId);
+    if (!user) throw new Error('User not found');
+
+    const connectedAccounts = user.connected_accounts || [];
+    const adsAccounts = (connectedAccounts as any[]).filter(
+      (acc: any) =>
+        acc.platform === 'linkedin_ads' &&
+        acc.config?.account_type === 'ad_account' &&
+        acc.config?.access_token
+    );
+
+    if (adsAccounts.length === 0) {
+      throw new Error('LinkedIn Ads account not connected. Please connect your LinkedIn Ads account in settings.');
+    }
+
+    let selected: any;
+    if (accountId) {
+      selected = adsAccounts.find((acc: any) => acc.account_id === accountId);
+      if (!selected) {
+        throw new Error(`LinkedIn Ads account "${accountId}" not found. Check your connected accounts.`);
+      }
+    } else if (adsAccounts.length > 1) {
+      const list = adsAccounts.map((a: any) => `${a.account_name} (ID: ${a.account_id})`).join(', ');
+      throw new Error(`Multiple LinkedIn Ads accounts found: [${list}]. Specify account_id.`);
+    } else {
+      selected = adsAccounts[0];
+    }
+
+    const cfg = selected.config;
+    const now = Date.now();
+    const bufferMs = 5 * 60 * 1000;
+
+    if (cfg.token_expires_at && cfg.token_expires_at > now + bufferMs) {
+      return { accountId: selected.account_id, accessToken: cfg.access_token };
+    }
+
+    // Token expired or expiring soon — refresh it
+    if (!cfg.refresh_token) {
+      throw new Error('LinkedIn Ads access token expired and no refresh token available. Please reconnect your account.');
+    }
+
+    const { getLinkedInAdsConfig } = await import('../config/integrations');
+    const oauthConfig = await getLinkedInAdsConfig();
+
+    const newTokens = await linkedInAdsService.refreshAccessToken(
+      cfg.refresh_token,
+      oauthConfig.clientId,
+      oauthConfig.clientSecret
+    );
+
+    const { updateAccountTokens } = await import('./connectedAccountsDb');
+    await updateAccountTokens(userId, 'linkedin_ads' as any, {
+      access_token: newTokens.access_token,
+      refresh_token: newTokens.refresh_token,
+      token_expires_at: Date.now() + newTokens.expires_in * 1000,
+    });
+
+    return { accountId: selected.account_id, accessToken: newTokens.access_token };
+  }
+
+  /**
+   * Master method for LinkedIn Ads entity management (campaigns, creatives, targeting, etc.)
+   */
+  public async callLinkedInMarketingApi(
+    userId: string,
+    entity_type: 'AD_ACCOUNT' | 'CAMPAIGN_GROUP' | 'CAMPAIGN' | 'CREATIVE' | 'POST' | 'TARGETING' | 'MEDIA',
+    action: string,
+    account_id: string,
+    params: any = {}
+  ): Promise<any> {
+    console.log(`AgentMode: callLinkedInMarketingApi -> ${entity_type} / ${action}`);
+
+    const { accountId, accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+
+    switch (entity_type) {
+      case 'AD_ACCOUNT': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listAdAccounts(accessToken);
+          return { success: true, adAccounts: result.data?.elements || [] };
+        }
+        throw new Error(`Unknown action "${action}" for AD_ACCOUNT`);
+      }
+
+      case 'CAMPAIGN_GROUP': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listCampaignGroups(accessToken, accountId);
+          return { success: true, campaignGroups: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          const result = await linkedInAdsService.createCampaignGroup(accessToken, accountId, params);
+          return { success: true, message: 'Campaign group created', campaignGroup: result.data };
+        }
+        if (action === 'UPDATE') {
+          if (!params.campaign_group_id) throw new Error('UPDATE requires campaign_group_id');
+          const result = await linkedInAdsService.updateCampaignGroup(accessToken, accountId, params.campaign_group_id, params);
+          return { success: true, message: 'Campaign group updated', result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CAMPAIGN_GROUP`);
+      }
+
+      case 'CAMPAIGN': {
+        if (action === 'LIST') {
+          const result = await linkedInAdsService.listCampaigns(accessToken, accountId, params);
+          return { success: true, campaigns: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          const result = await linkedInAdsService.createCampaign(accessToken, accountId, params);
+          return { success: true, message: 'Campaign created', campaign: result.data };
+        }
+        if (action === 'UPDATE') {
+          if (!params.campaign_id) throw new Error('UPDATE requires campaign_id');
+          const result = await linkedInAdsService.updateCampaign(accessToken, accountId, params.campaign_id, params);
+          return { success: true, message: 'Campaign updated', result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CAMPAIGN`);
+      }
+
+      case 'CREATIVE': {
+        if (action === 'LIST') {
+          if (!params.campaign_id) throw new Error('LIST creatives requires campaign_id');
+          const result = await linkedInAdsService.listCreatives(accessToken, params.campaign_id);
+          return { success: true, creatives: result.data?.elements || [] };
+        }
+        if (action === 'CREATE') {
+          if (!params.campaign_id) throw new Error('CREATE creative requires campaign_id');
+          const result = await linkedInAdsService.createCreative(accessToken, params);
+          return { success: true, message: 'Creative created', creative: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for CREATIVE`);
+      }
+
+      case 'POST': {
+        if (action === 'CREATE') {
+          if (!params.author_urn) throw new Error('CREATE post requires author_urn (person or organization URN)');
+          const result = await linkedInAdsService.createPost(accessToken, params);
+          return { success: true, message: 'Dark post created', post: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for POST`);
+      }
+
+      case 'TARGETING': {
+        if (action === 'LIST_FACETS') {
+          const result = await linkedInAdsService.listTargetingFacets(accessToken);
+          return { success: true, facets: result.data?.elements || [] };
+        }
+        if (action === 'SEARCH') {
+          if (!params.facet || !params.query) throw new Error('SEARCH requires facet and query');
+          const result = await linkedInAdsService.searchTargetingEntities(accessToken, { facet_urn: params.facet, query: params.query });
+          return { success: true, entities: result.data?.elements || [] };
+        }
+        if (action === 'ESTIMATE_REACH') {
+          if (!params.targeting_criteria) throw new Error('ESTIMATE_REACH requires targeting_criteria');
+          const result = await linkedInAdsService.getAudienceCount(accessToken, params.targeting_criteria);
+          return { success: true, audienceCount: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for TARGETING`);
+      }
+
+      case 'MEDIA': {
+        if (action === 'INIT_IMAGE_UPLOAD') {
+          if (!params.author_urn) throw new Error('INIT_IMAGE_UPLOAD requires author_urn');
+          const result = await linkedInAdsService.initializeImageUpload(accessToken, params.author_urn);
+          return { success: true, uploadInstructions: result.data };
+        }
+        if (action === 'INIT_VIDEO_UPLOAD') {
+          if (!params.author_urn || !params.file_size) throw new Error('INIT_VIDEO_UPLOAD requires author_urn and file_size');
+          const result = await linkedInAdsService.initializeVideoUpload(accessToken, params.author_urn, params.file_size);
+          return { success: true, uploadInstructions: result.data };
+        }
+        if (action === 'FINALIZE_VIDEO') {
+          if (!params.video_urn) throw new Error('FINALIZE_VIDEO requires video_urn');
+          const result = await linkedInAdsService.finalizeVideoUpload(accessToken, params.video_urn);
+          return { success: true, result: result.data };
+        }
+        throw new Error(`Unknown action "${action}" for MEDIA`);
+      }
+
+      default:
+        throw new Error(`Invalid entity_type: ${entity_type}`);
+    }
+  }
+
+  /**
+   * LinkedIn Ads analytics — synchronous (no polling needed unlike Meta).
+   */
+  public async callLinkedInAdsInsightsApi(
+    userId: string,
+    account_id: string,
+    params: {
+      pivot: string;
+      dateRange: { start: { year: number; month: number; day: number }; end: { year: number; month: number; day: number } };
+      timeGranularity?: string;
+      fields?: string[];
+      campaigns?: string[];
+      adGroups?: string[];
+      creatives?: string[];
+    }
+  ): Promise<any> {
+    console.log(`AgentMode: callLinkedInAdsInsightsApi -> pivot=${params.pivot}`);
+
+    const { accessToken } = await this.getLinkedInAdsCredentials(userId, account_id);
+
+    const result = await linkedInAdsService.getAdAnalytics(
+      accessToken,
+      params.pivot,
+      params.timeGranularity || 'ALL',
+      params.dateRange,
+      params.fields || ['impressions', 'clicks', 'costInLocalCurrency'],
+      { campaign_ids: params.campaigns, creative_ids: params.creatives }
+    );
+    return { success: true, analytics: result.data?.elements || result.data };
   }
 
   // --- Client Health Assessment (admin-only) ---

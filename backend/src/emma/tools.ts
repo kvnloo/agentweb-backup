@@ -610,6 +610,178 @@ emmaToolRegistry.register({
   }
 });
 
+// --- LinkedIn Ads Tools ---
+emmaToolRegistry.register({
+  name: 'call_linkedin_marketing_api',
+  definition: {
+    name: 'call_linkedin_marketing_api',
+    description: `Manage LinkedIn Ads entities via the Marketing Developer Platform API. Requires account_id from list_connected_accounts(platform='linkedin_ads').
+
+ACTION MATRIX (entity_type → supported actions):
+  AD_ACCOUNT     → LIST
+  CAMPAIGN_GROUP → LIST, CREATE, UPDATE
+  CAMPAIGN       → LIST, CREATE, UPDATE
+  CREATIVE       → LIST, CREATE
+  POST           → CREATE  (dark posts: feedDistribution=NONE, lifecycleState=PUBLISHED)
+  TARGETING      → LIST_FACETS, SEARCH, ESTIMATE_REACH
+  MEDIA          → INIT_IMAGE_UPLOAD, INIT_VIDEO_UPLOAD, FINALIZE_VIDEO
+
+ENTITY HIERARCHY: Ad Account → Campaign Group → Campaign → Creative
+
+REQUIRED PARAMS PER ENTITY + ACTION:
+  CAMPAIGN_GROUP CREATE: name, status (ACTIVE|PAUSED|ARCHIVED), runSchedule.start (epoch ms), totalBudget.amount + totalBudget.currencyCode
+  CAMPAIGN CREATE: name, status, campaignGroup (URN), objectiveType (WEBSITE_VISITS|BRAND_AWARENESS|ENGAGEMENT|VIDEO_VIEWS|LEAD_GENERATION|WEBSITE_CONVERSIONS), costType (CPM|CPC|CPV), unitCost.amount + unitCost.currencyCode, targetingCriteria
+  CAMPAIGN UPDATE: campaign_id + fields to update
+  CREATIVE CREATE: campaign_id, type (TEXT_AD|SPONSORED_UPDATES|SPONSORED_INMAILS), plus type-specific fields
+  POST CREATE: author_urn (person or org URN), commentary (text), visibility (PUBLIC|CONNECTIONS), optional media array
+  TARGETING SEARCH: facet (URN like urn:li:adTargetingFacet:locations), query (search string)
+  TARGETING ESTIMATE_REACH: targeting_criteria (object)
+  MEDIA INIT_IMAGE_UPLOAD: author_urn
+  MEDIA INIT_VIDEO_UPLOAD: author_urn, file_size (bytes)
+  MEDIA FINALIZE_VIDEO: video_urn
+
+BUDGET FORMAT: decimal string e.g. "10.00" = $10.00 (NOT micro-currency)
+SCOPES REQUIRED: r_ads, rw_ads (r_ads_reporting for analytics)`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_type: {
+          type: 'string',
+          enum: ['AD_ACCOUNT', 'CAMPAIGN_GROUP', 'CAMPAIGN', 'CREATIVE', 'POST', 'TARGETING', 'MEDIA'],
+          description: 'The LinkedIn Ads entity to operate on.'
+        },
+        action: {
+          type: 'string',
+          enum: ['LIST', 'CREATE', 'UPDATE', 'LIST_FACETS', 'SEARCH', 'ESTIMATE_REACH', 'INIT_IMAGE_UPLOAD', 'INIT_VIDEO_UPLOAD', 'FINALIZE_VIDEO'],
+          description: 'The operation to perform. Must be valid for the chosen entity_type.'
+        },
+        account_id: {
+          type: 'string',
+          description: "LinkedIn Ads account ID. Obtain from list_connected_accounts(platform='linkedin_ads')."
+        },
+        params: {
+          type: 'object',
+          description: 'Action-specific parameters. See tool description for required fields per entity + action.',
+          properties: {
+            // Campaign Group / Campaign common
+            name:        { type: 'string', description: 'Entity name.' },
+            status:      { type: 'string', enum: ['ACTIVE', 'PAUSED', 'ARCHIVED', 'DRAFT', 'CANCELED', 'COMPLETED'], description: 'Entity status.' },
+            campaign_group_id: { type: 'string', description: 'Campaign Group ID. Required for CAMPAIGN LIST/CREATE.' },
+            campaign_id:       { type: 'string', description: 'Campaign ID. Required for CREATIVE LIST/CREATE and CAMPAIGN UPDATE.' },
+            // Campaign
+            objectiveType:     { type: 'string', description: 'Campaign objective (WEBSITE_VISITS, BRAND_AWARENESS, ENGAGEMENT, VIDEO_VIEWS, LEAD_GENERATION, WEBSITE_CONVERSIONS).' },
+            costType:          { type: 'string', enum: ['CPM', 'CPC', 'CPV'], description: 'Bidding type.' },
+            unitCost:          { type: 'object', description: '{ amount: "10.00", currencyCode: "USD" }' },
+            totalBudget:       { type: 'object', description: '{ amount: "1000.00", currencyCode: "USD" }' },
+            dailyBudget:       { type: 'object', description: '{ amount: "50.00", currencyCode: "USD" }' },
+            runSchedule:       { type: 'object', description: '{ start: <epoch_ms>, end?: <epoch_ms> }' },
+            targetingCriteria: { type: 'object', description: 'LinkedIn targeting criteria object.' },
+            // Creative
+            type:              { type: 'string', enum: ['TEXT_AD', 'SPONSORED_UPDATES', 'SPONSORED_INMAILS'], description: 'Creative type.' },
+            reference:         { type: 'string', description: 'Post URN for SPONSORED_UPDATES creatives.' },
+            // Post (dark post)
+            author_urn:        { type: 'string', description: 'Author URN (urn:li:person:ID or urn:li:organization:ID).' },
+            commentary:        { type: 'string', description: 'Post text content.' },
+            visibility:        { type: 'string', enum: ['PUBLIC', 'CONNECTIONS', 'LOGGED_IN'], description: 'Post visibility.' },
+            // Targeting search
+            facet:             { type: 'string', description: 'Targeting facet URN (e.g. urn:li:adTargetingFacet:locations).' },
+            query:             { type: 'string', description: 'Search query for TARGETING SEARCH.' },
+            // Media
+            file_size:         { type: 'number', description: 'Video file size in bytes. Required for INIT_VIDEO_UPLOAD.' },
+            video_urn:         { type: 'string', description: 'Video URN. Required for FINALIZE_VIDEO.' },
+          }
+        }
+      },
+      required: ['entity_type', 'action', 'account_id']
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.callLinkedInMarketingApi(
+      context?.userId,
+      args.entity_type,
+      args.action,
+      args.account_id,
+      args.params,
+    );
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'call_linkedin_ads_insights_api',
+  definition: {
+    name: 'call_linkedin_ads_insights_api',
+    description: `Fetch LinkedIn Ads performance analytics (impressions, clicks, spend, conversions, etc.).
+Analytics are synchronous — results return immediately, no polling needed.
+
+PIVOT OPTIONS (what dimension to group by):
+  CAMPAIGN, CAMPAIGN_GROUP, CREATIVE, COMPANY, ACCOUNT, MEMBER_COMPANY_SIZE,
+  MEMBER_INDUSTRY, MEMBER_SENIORITY, MEMBER_JOB_FUNCTION, MEMBER_COUNTRY_V2,
+  MEMBER_REGION_V2, PLACEMENT_NAME, IMPRESSION_DEVICE_TYPE
+
+TIME_GRANULARITY: ALL (totals only), DAILY, MONTHLY, YEARLY
+
+COMMON FIELDS: impressions, clicks, costInLocalCurrency, totalEngagements, videoViews,
+  videoCompletions, leadGenerationMailContactInfoShares, oneClickLeads`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        account_id: {
+          type: 'string',
+          description: "LinkedIn Ads account ID from list_connected_accounts(platform='linkedin_ads')."
+        },
+        pivot: {
+          type: 'string',
+          description: 'Dimension to group results by (e.g. CAMPAIGN, CREATIVE, MEMBER_COUNTRY_V2).'
+        },
+        dateRange: {
+          type: 'object',
+          description: 'Date range. { start: { year, month, day }, end: { year, month, day } }',
+          properties: {
+            start: { type: 'object', properties: { year: { type: 'number' }, month: { type: 'number' }, day: { type: 'number' } }, required: ['year', 'month', 'day'] },
+            end:   { type: 'object', properties: { year: { type: 'number' }, month: { type: 'number' }, day: { type: 'number' } }, required: ['year', 'month', 'day'] }
+          },
+          required: ['start', 'end']
+        },
+        timeGranularity: {
+          type: 'string',
+          enum: ['ALL', 'DAILY', 'MONTHLY', 'YEARLY'],
+          description: 'Time aggregation. Default: ALL (totals only).'
+        },
+        fields: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Metrics to return. Common: impressions, clicks, costInLocalCurrency, totalEngagements.'
+        },
+        campaigns: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of campaign URNs to filter by.'
+        },
+        creatives: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional list of creative URNs to filter by.'
+        }
+      },
+      required: ['account_id', 'pivot', 'dateRange']
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.callLinkedInAdsInsightsApi(
+      context?.userId,
+      args.account_id,
+      {
+        pivot: args.pivot,
+        dateRange: args.dateRange,
+        timeGranularity: args.timeGranularity,
+        fields: args.fields,
+        campaigns: args.campaigns,
+        creatives: args.creatives,
+      }
+    );
+  }
+});
+
 emmaToolRegistry.register({
   name: 'get_post_analytics',
   definition: {
