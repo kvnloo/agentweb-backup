@@ -595,7 +595,7 @@ export class AgentModeService {
               tools: params.tools.map((tool: any) => ({
                 toolSpec: {
                   name: tool.function.name,
-                  description: tool.function.description || '',
+                  description: tool.function.description || tool.function.name,
                   inputSchema: { json: tool.function.parameters },
                 }
               }))
@@ -2316,7 +2316,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
       .filter(tool => !associatedToolNames.has(tool.name) && !excludedTools.has(tool.name))
       .map(tool => ({
         name: tool.name,
-        description: tool.definition?.function?.description || ''
+        description: tool.definition?.function?.description || tool.name
       }));
   }
 

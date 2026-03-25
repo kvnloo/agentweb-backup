@@ -30,6 +30,12 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Admins can grant one-time bonus tokens to individual users via the Users tab',
       '- Users approaching their limit (80%) see a warning; at 100% new messages are blocked with an upgrade prompt',
       '- Token usage resets automatically each month (bonus tokens also reset)',
+      'Fix: Landing Page Preview URLs Not Publicly Accessible',
+      '- Fixed an issue where Vercel preview deployments for landing page drafts required SSO login to view',
+      '- Preview URLs are now publicly accessible by default so anyone with the link can view draft changes',
+      'Fix: Agent Mode Error When Tools Have Empty Descriptions',
+      '- Fixed a crash where the AI model rejected requests because a tool had an empty description field',
+      '- Tools without descriptions now gracefully fall back to using their tool name',
     ],
   },
   {
