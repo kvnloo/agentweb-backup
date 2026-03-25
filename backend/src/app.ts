@@ -56,6 +56,7 @@ import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
 import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
+import orgRoutes from "./routes/org";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -239,6 +240,7 @@ app.use("/review", reviewRouter);
 app.use("/api/batch-review", batchReviewRoutes);
 app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/lead-magnet", leadMagnetRoutes);
+app.use("/api/org", orgRoutes);
 
 
 // Agent API documentation (public, no auth)
