@@ -36,6 +36,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Agent Mode Error When Tools Have Empty Descriptions',
       '- Fixed a crash where the AI model rejected requests because a tool had an empty description field',
       '- Tools without descriptions now gracefully fall back to using their tool name',
+      'Fix: Report Editor Preview Cache',
+      '- Fixed an issue where saving HTML changes in the Editor tab did not update the Agentic Revision preview',
+      '- The preview now immediately reflects saved edits instead of showing cached content',
     ],
   },
   {
