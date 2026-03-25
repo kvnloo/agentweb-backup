@@ -1,0 +1,391 @@
+import request from 'supertest';
+import express from 'express';
+import orgRoutes from '../routes/org';
+
+// Mock user state
+let mockUser: any = {
+  userId: 'user-1',
+  email: 'owner@example.com',
+  displayName: 'Test Owner',
+  orgId: undefined,
+  orgRole: undefined,
+};
+
+let mockUsers: Record<string, any> = {};
+let mockOrgs: Record<string, any> = {};
+
+// Mock auth middleware
+jest.mock('../middleware/auth', () => ({
+  authenticateToken: (req: any, _res: any, next: any) => {
+    req.user = { userId: mockUser.userId, email: mockUser.email, isAdmin: false };
+    next();
+  },
+  AuthenticatedRequest: {},
+}));
+
+// Mock db
+jest.mock('../services/db', () => ({
+  userDb: {
+    getUserById: jest.fn((userId: string) => {
+      return Promise.resolve(mockUsers[userId] || null);
+    }),
+    getUserByEmail: jest.fn((email: string) => {
+      return Promise.resolve(Object.values(mockUsers).find((u: any) => u.email === email) || null);
+    }),
+    updateUser: jest.fn((userId: string, updates: any) => {
+      if (mockUsers[userId]) {
+        Object.assign(mockUsers[userId], updates);
+      }
+      return Promise.resolve(mockUsers[userId]);
+    }),
+  },
+  orgDb: {
+    createOrg: jest.fn((org: any) => {
+      mockOrgs[org.orgId] = org;
+      return Promise.resolve(org);
+    }),
+    getOrgById: jest.fn((orgId: string) => {
+      return Promise.resolve(mockOrgs[orgId] || null);
+    }),
+    updateOrg: jest.fn((orgId: string, updates: any) => {
+      if (mockOrgs[orgId]) {
+        Object.assign(mockOrgs[orgId], updates);
+      }
+      return Promise.resolve(mockOrgs[orgId]);
+    }),
+    deleteOrg: jest.fn((orgId: string) => {
+      delete mockOrgs[orgId];
+      return Promise.resolve();
+    }),
+    getOrgMembers: jest.fn((orgId: string) => {
+      return Promise.resolve(Object.values(mockUsers).filter((u: any) => u.orgId === orgId));
+    }),
+    getOrgMemberCount: jest.fn((orgId: string) => {
+      return Promise.resolve(Object.values(mockUsers).filter((u: any) => u.orgId === orgId).length);
+    }),
+    ORG_MAX_MEMBERS: 5,
+  },
+}));
+
+// Mock email service
+jest.mock('../services/emailService', () => ({
+  emailService: {
+    sendEmail: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
+let app: express.Application;
+
+describe('Organization routes', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockOrgs = {};
+    mockUsers = {
+      'user-1': {
+        userId: 'user-1',
+        email: 'owner@example.com',
+        displayName: 'Test Owner',
+        orgId: undefined,
+        orgRole: undefined,
+      },
+      'user-2': {
+        userId: 'user-2',
+        email: 'member@example.com',
+        displayName: 'Test Member',
+        orgId: undefined,
+        orgRole: undefined,
+      },
+    };
+    mockUser = mockUsers['user-1'];
+
+    app = express();
+    app.use(express.json());
+    app.use('/api/org', orgRoutes);
+  });
+
+  // === FAIL cases ===
+
+  describe('POST /api/org - create org', () => {
+    it('should fail without a name', async () => {
+      const res = await request(app).post('/api/org').send({});
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/name.*required/i);
+    });
+
+    it('should fail if user is already in an org', async () => {
+      mockUsers['user-1'].orgId = 'existing-org';
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/already in an organization/i);
+    });
+
+    it('should fail with empty name', async () => {
+      const res = await request(app).post('/api/org').send({ name: '  ' });
+      expect(res.status).toBe(400);
+    });
+
+    // === SUCCESS case ===
+    it('should create an org and set user as owner', async () => {
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+      expect(res.status).toBe(201);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.name).toBe('My Org');
+      expect(res.body.data.ownerUserId).toBe('user-1');
+      expect(res.body.data.maxMembers).toBe(5);
+
+      // User should be updated with orgId and owner role
+      expect(mockUsers['user-1'].orgId).toBe(res.body.data.orgId);
+      expect(mockUsers['user-1'].orgRole).toBe('owner');
+    });
+  });
+
+  describe('GET /api/org/me - get current org', () => {
+    it('should return null if user has no org', async () => {
+      const res = await request(app).get('/api/org/me');
+      expect(res.status).toBe(200);
+      expect(res.body.data).toBeNull();
+    });
+
+    it('should return org with members if user is in an org', async () => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+      mockUsers['user-2'].orgId = 'org-1';
+      mockUsers['user-2'].orgRole = 'member';
+
+      const res = await request(app).get('/api/org/me');
+      expect(res.status).toBe(200);
+      expect(res.body.data.name).toBe('Test Org');
+      expect(res.body.data.members).toHaveLength(2);
+      // Members should not include sensitive data
+      expect(res.body.data.members[0]).not.toHaveProperty('password');
+    });
+  });
+
+  describe('PUT /api/org/:orgId - update org', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+    });
+
+    it('should fail if not the owner', async () => {
+      mockUser = mockUsers['user-2'];
+      mockUsers['user-2'].orgId = 'org-1';
+      mockUsers['user-2'].orgRole = 'member';
+      const res = await request(app).put('/api/org/org-1').send({ name: 'New Name' });
+      expect(res.status).toBe(403);
+    });
+
+    it('should fail for non-existent org', async () => {
+      const res = await request(app).put('/api/org/fake-org').send({ name: 'New Name' });
+      expect(res.status).toBe(404);
+    });
+
+    it('should update org name', async () => {
+      const res = await request(app).put('/api/org/org-1').send({ name: 'Updated Org' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+  });
+
+  describe('POST /api/org/:orgId/invite - invite member', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+        pendingInvites: [],
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+    });
+
+    it('should fail without email', async () => {
+      const res = await request(app).post('/api/org/org-1/invite').send({});
+      expect(res.status).toBe(400);
+    });
+
+    it('should fail if not the owner', async () => {
+      mockUser = mockUsers['user-2'];
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'new@example.com' });
+      expect(res.status).toBe(403);
+    });
+
+    it('should fail if target user is already in this org', async () => {
+      mockUsers['user-2'].orgId = 'org-1';
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/already in your organization/i);
+    });
+
+    it('should fail if target user is in another org', async () => {
+      mockUsers['user-2'].orgId = 'other-org';
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/already in another organization/i);
+    });
+
+    it('should succeed and send an invite', async () => {
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'member@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.message).toMatch(/invitation sent/i);
+    });
+  });
+
+  describe('POST /api/org/accept-invite - accept invite', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+        pendingInvites: [{
+          email: 'member@example.com',
+          inviteToken: 'valid-token',
+          invitedAt: '2026-01-01T00:00:00Z',
+          invitedBy: 'user-1',
+        }],
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+      // Switch to member user for accept
+      mockUser = mockUsers['user-2'];
+    });
+
+    it('should fail with missing params', async () => {
+      const res = await request(app).post('/api/org/accept-invite').send({});
+      expect(res.status).toBe(400);
+    });
+
+    it('should fail with wrong token', async () => {
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'wrong-token',
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/invalid or expired/i);
+    });
+
+    it('should fail if user is already in an org', async () => {
+      mockUsers['user-2'].orgId = 'other-org';
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'valid-token',
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/already in an organization/i);
+    });
+
+    it('should succeed and join the org', async () => {
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'valid-token',
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(mockUsers['user-2'].orgId).toBe('org-1');
+      expect(mockUsers['user-2'].orgRole).toBe('member');
+    });
+  });
+
+  describe('DELETE /api/org/:orgId/members/:memberId - remove member', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+      mockUsers['user-2'].orgId = 'org-1';
+      mockUsers['user-2'].orgRole = 'member';
+    });
+
+    it('should fail if not the owner', async () => {
+      mockUser = mockUsers['user-2'];
+      const res = await request(app).delete('/api/org/org-1/members/user-2');
+      expect(res.status).toBe(403);
+    });
+
+    it('should fail if trying to remove self', async () => {
+      const res = await request(app).delete('/api/org/org-1/members/user-1');
+      expect(res.status).toBe(400);
+    });
+
+    it('should succeed and remove member', async () => {
+      const res = await request(app).delete('/api/org/org-1/members/user-2');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+  });
+
+  describe('POST /api/org/:orgId/leave - leave org', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+      mockUsers['user-2'].orgId = 'org-1';
+      mockUsers['user-2'].orgRole = 'member';
+    });
+
+    it('should fail if owner tries to leave', async () => {
+      const res = await request(app).post('/api/org/org-1/leave');
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/owner cannot leave/i);
+    });
+
+    it('should succeed for a member', async () => {
+      mockUser = mockUsers['user-2'];
+      const res = await request(app).post('/api/org/org-1/leave');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+  });
+
+  describe('DELETE /api/org/:orgId - delete org', () => {
+    beforeEach(() => {
+      mockOrgs['org-1'] = {
+        orgId: 'org-1',
+        name: 'Test Org',
+        ownerUserId: 'user-1',
+        maxMembers: 5,
+      };
+      mockUsers['user-1'].orgId = 'org-1';
+      mockUsers['user-1'].orgRole = 'owner';
+      mockUsers['user-2'].orgId = 'org-1';
+      mockUsers['user-2'].orgRole = 'member';
+    });
+
+    it('should fail if not the owner', async () => {
+      mockUser = mockUsers['user-2'];
+      const res = await request(app).delete('/api/org/org-1');
+      expect(res.status).toBe(403);
+    });
+
+    it('should succeed and remove all members', async () => {
+      const res = await request(app).delete('/api/org/org-1');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(mockOrgs['org-1']).toBeUndefined();
+    });
+  });
+});
