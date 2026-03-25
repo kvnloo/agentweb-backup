@@ -225,9 +225,9 @@ describe('trimToolMessagesForContext', () => {
 
     const trimmed = service.trimToolMessagesForContext(messages);
 
-    // Old large tool result (tc1 at index 3) should be truncated
+    // Old large tool result (tc1 at index 3) should be summarized
     expect(trimmed[3].content.length).toBeLessThan(10000);
-    expect(trimmed[3].content).toContain('[truncated]');
+    expect(trimmed[3].content).toMatch(/^\[Tool: search_web/);
 
     // Recent tool results should be preserved
     expect(trimmed[6].content).toBe('file content');
@@ -253,9 +253,11 @@ describe('trimToolMessagesForContext', () => {
 
     const trimmed = service.trimToolMessagesForContext(messages);
 
-    // First 2 tool results should be truncated (old)
+    // First 2 tool results should be summarized (old)
     expect(trimmed[2].content.length).toBeLessThan(10000); // tc0
+    expect(trimmed[2].content).toMatch(/^\[Tool: tool0/);
     expect(trimmed[4].content.length).toBeLessThan(10000); // tc1
+    expect(trimmed[4].content).toMatch(/^\[Tool: tool1/);
 
     // Last 3 tool results should be preserved
     expect(trimmed[6].content).toBe(largeContent); // tc2
