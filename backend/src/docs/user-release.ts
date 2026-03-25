@@ -21,6 +21,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Reviewers can approve, request changes, or reject each asset from the web page',
       '- Review progress is updated back to Slack in real-time with a link to the review page',
       '- When changes are requested, auto-revision generates a new version directly in the review page',
+      'Improvement: Agent Mode Token Usage Optimization',
+      '- Enabled Anthropic prompt caching for Claude models — system prompt and conversation context are cached across iterations, reducing input token costs by up to 50%',
+      '- Improved tool result compression — old tool results are now summarized to short previews instead of keeping 8KB each, significantly reducing context size in long conversations',
     ],
   },
   {
