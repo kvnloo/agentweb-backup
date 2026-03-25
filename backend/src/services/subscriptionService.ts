@@ -8,6 +8,7 @@ export interface SubscriptionType {
   allowedPages: string[]; // Array of page paths (e.g., ["/marketing/research", "/marketing/blog"]) or ["*"] for all
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
+  monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
 }
 
 // Default pages that are always available regardless of subscription type

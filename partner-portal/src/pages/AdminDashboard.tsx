@@ -219,6 +219,13 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  tokenUsage?: {
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+    resetDate: string;
+  };
+  tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }
 
@@ -750,6 +757,12 @@ export default function AdminDashboard() {
   const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
+  const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
+  const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
+  const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
+  const [grantBonusEmail, setGrantBonusEmail] = useState("");
+  const [grantBonusAmount, setGrantBonusAmount] = useState("");
+  const [grantBonusLoading, setGrantBonusLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -854,10 +867,13 @@ export default function AdminDashboard() {
       });
       const types = response.data;
       // Extract type names, including "Basic" as default
-      const typeNames = types.length > 0 
+      const typeNames = types.length > 0
         ? types.map((t: any) => t.name)
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
+      const allowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => { allowanceMap[t.name] = t.monthlyTokenAllowance ?? null; });
+      setSubscriptionTypeAllowanceMap(allowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
       // Default to Basic if loading fails
@@ -2410,6 +2426,38 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleGrantTokenBonus = async () => {
+    if (!grantBonusUserId || !grantBonusAmount) return;
+    const amount = parseInt(grantBonusAmount.replace(/,/g, ''), 10);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Bonus amount must be a positive number");
+      return;
+    }
+    try {
+      setGrantBonusLoading(true);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${grantBonusUserId}/token-bonus`),
+        { bonusTokens: amount },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === grantBonusUserId
+              ? { ...user, tokenAllowanceBonus: response.data.tokenAllowanceBonus }
+              : user
+          )
+        );
+        setSuccess(`Granted ${amount.toLocaleString()} bonus tokens to ${grantBonusEmail}`);
+        setGrantBonusDialogOpen(false);
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to grant token bonus");
+    } finally {
+      setGrantBonusLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -3383,6 +3431,7 @@ export default function AdminDashboard() {
                       label="Subscription Type"
                     />
                   </TableCell>
+                  <TableCell>Usage</TableCell>
                   <TableCell>Replays</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -3390,7 +3439,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={21} align="center">
+                    <TableCell colSpan={22} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -3987,6 +4036,52 @@ export default function AdminDashboard() {
                             <Typography variant="body2" color="text.secondary">
                               -
                             </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {user.roles && user.roles.includes("customer") ? (
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                              {(() => {
+                                const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+                                  ? (user.tokenUsage?.totalTokens || 0) : 0;
+                                const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                const bonus = user.tokenAllowanceBonus || 0;
+                                const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
+                                const pct = effectiveAllowance != null ? (used / effectiveAllowance) * 100 : 0;
+                                const color = effectiveAllowance == null ? "text.primary"
+                                  : pct >= 100 ? "error.main"
+                                  : pct >= 80 ? "warning.main"
+                                  : "success.main";
+                                return (
+                                  <Typography variant="body2" sx={{ color }}>
+                                    {used.toLocaleString()}
+                                    {" / "}
+                                    {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
+                                    {bonus > 0 && (
+                                      <Typography component="span" variant="caption" color="text.secondary">
+                                        {" "}(+{bonus.toLocaleString()} bonus)
+                                      </Typography>
+                                    )}
+                                  </Typography>
+                                );
+                              })()}
+                              <Tooltip title="Grant Bonus Tokens">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setGrantBonusUserId(user.userId);
+                                    setGrantBonusEmail(user.email);
+                                    setGrantBonusAmount("");
+                                    setGrantBonusDialogOpen(true);
+                                  }}
+                                  color="primary"
+                                >
+                                  <AddIcon fontSize="small" />
+                                </IconButton>
+                              </Tooltip>
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">-</Typography>
                           )}
                         </TableCell>
                         <TableCell>
@@ -5577,6 +5672,38 @@ export default function AdminDashboard() {
             disabled={loading}
           >
             {loading ? <CircularProgress size={24} /> : "Deactivate"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Grant Token Bonus Dialog */}
+      <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
+        <DialogTitle>Grant Bonus Tokens</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Grant additional tokens to <strong>{grantBonusEmail}</strong> for the current month.
+          </DialogContentText>
+          <TextField
+            autoFocus
+            fullWidth
+            label="Bonus Tokens"
+            value={grantBonusAmount}
+            onChange={(e) => setGrantBonusAmount(e.target.value)}
+            placeholder="e.g. 50000"
+            type="text"
+            inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setGrantBonusDialogOpen(false)} disabled={grantBonusLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleGrantTokenBonus}
+            variant="contained"
+            disabled={grantBonusLoading || !grantBonusAmount}
+          >
+            {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
           </Button>
         </DialogActions>
       </Dialog>

@@ -41,6 +41,7 @@ interface SubscriptionType {
   name: string;
   allowedPages: string[];
   allowedSkills: string[];
+  monthlyTokenAllowance?: number | null;
 }
 
 interface AvailableSkill {
@@ -70,7 +71,9 @@ const SubscriptionTypesTab: React.FC = () => {
     name: '',
     allowedPages: [],
     allowedSkills: [],
+    monthlyTokenAllowance: null,
   });
+  const [tokenAllowanceInput, setTokenAllowanceInput] = useState('');
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -181,8 +184,10 @@ const SubscriptionTypesTab: React.FC = () => {
         allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
+        monthlyTokenAllowance: type.monthlyTokenAllowance ?? null,
       };
       setFormData(expandedData);
+      setTokenAllowanceInput(type.monthlyTokenAllowance != null ? String(type.monthlyTokenAllowance) : '');
     } else {
       setEditingType(null);
       // When creating new, start with all pages and skills selected
@@ -190,7 +195,9 @@ const SubscriptionTypesTab: React.FC = () => {
         name: '',
         allowedPages: availablePages.map((p) => p.path),
         allowedSkills: availableSkills.map((s) => s.skillId),
+        monthlyTokenAllowance: null,
       });
+      setTokenAllowanceInput('');
     }
     setExpandedSkills(new Set());
     setEditDialogOpen(true);
@@ -203,7 +210,9 @@ const SubscriptionTypesTab: React.FC = () => {
       name: '',
       allowedPages: [],
       allowedSkills: [],
+      monthlyTokenAllowance: null,
     });
+    setTokenAllowanceInput('');
     setExpandedSkills(new Set());
   };
 
@@ -217,6 +226,15 @@ const SubscriptionTypesTab: React.FC = () => {
       setLoading(true);
       setError('');
 
+      // Parse token allowance from input
+      const parsedAllowance = tokenAllowanceInput.trim() === ''
+        ? null
+        : parseInt(tokenAllowanceInput.replace(/,/g, ''), 10);
+      if (parsedAllowance !== null && (isNaN(parsedAllowance) || parsedAllowance < 0)) {
+        setError('Monthly token allowance must be a positive number or empty for unlimited');
+        return;
+      }
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
@@ -228,6 +246,7 @@ const SubscriptionTypesTab: React.FC = () => {
           formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
             ? ['*']
             : formData.allowedSkills,
+        monthlyTokenAllowance: parsedAllowance,
       };
 
       let updatedTypes = [...subscriptionTypes];
@@ -387,6 +406,7 @@ const SubscriptionTypesTab: React.FC = () => {
             <TableHead>
               <TableRow>
                 <TableCell>Name</TableCell>
+                <TableCell>Monthly Token Allowance</TableCell>
                 <TableCell>Allowed Pages</TableCell>
                 <TableCell>Allowed Skills</TableCell>
                 <TableCell>Actions</TableCell>
@@ -395,7 +415,7 @@ const SubscriptionTypesTab: React.FC = () => {
             <TableBody>
               {subscriptionTypes.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={4} align="center">
+                  <TableCell colSpan={5} align="center">
                     <Typography variant="body2" color="text.secondary">
                       No subscription types defined. Using default "Basic" type.
                     </Typography>
@@ -407,6 +427,13 @@ const SubscriptionTypesTab: React.FC = () => {
                     <TableCell>
                       <Typography variant="body1" fontWeight="medium">
                         {type.name}
+                      </Typography>
+                    </TableCell>
+                    <TableCell>
+                      <Typography variant="body2">
+                        {type.monthlyTokenAllowance != null
+                          ? type.monthlyTokenAllowance.toLocaleString()
+                          : 'Unlimited'}
                       </Typography>
                     </TableCell>
                     <TableCell>
@@ -489,6 +516,18 @@ const SubscriptionTypesTab: React.FC = () => {
               sx={{ mb: 3 }}
               disabled={!!editingType}
               helperText={editingType ? 'Name cannot be changed after creation' : ''}
+            />
+
+            <TextField
+              label="Monthly Token Allowance"
+              fullWidth
+              value={tokenAllowanceInput}
+              onChange={(e) => setTokenAllowanceInput(e.target.value)}
+              sx={{ mb: 3 }}
+              placeholder="Leave empty for unlimited"
+              helperText="Maximum tokens per month for this subscription type. Leave empty for unlimited usage."
+              type="text"
+              inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
             />
 
             <Typography variant="h6" gutterBottom>
