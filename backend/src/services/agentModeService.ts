@@ -2202,7 +2202,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      const publishedSkills = await skillService.getPublishedSkills();
+      const publishedSkills = await skillService.getSkillsAvailableToUser(userId);
 
       if (!publishedSkills.length)
         return { message: "No skills available in the library." };
@@ -2434,7 +2434,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
    */
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getPublishedSkills(),
+      userId ? skillService.getSkillsAvailableToUser(userId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
@@ -2442,7 +2442,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId))
+      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
@@ -2490,7 +2490,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getPublishedSkills(),
+        skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
@@ -2509,12 +2509,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         }
       }
 
-      // Filter valid IDs: exists in published skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill)
-      const validSkillIds = skillIds.filter(id =>
-        (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || publishedSkills.some(s => s.skillId === id)) &&
-        (id === ADMIN_SKILL_VIRTUAL_ID || isWildcard || allowedSkillSet.has(id))
-      );
+      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
+      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill)
+      const validSkillIds = skillIds.filter(id => {
+        const skill = publishedSkills.find(s => s.skillId === id);
+        const isOwnSkill = skill && skill.ownerId === userId;
+        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || skill) &&
+          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
+      });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
 

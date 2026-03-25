@@ -40,17 +40,19 @@ emmaToolRegistry.register({
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getPublishedSkills(),
+        skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
-      const validSkillIds = args.skillIds.filter((id: string) =>
-        (id === '__other_skills__' || publishedSkills.some(s => s.skillId === id)) &&
-        (isWildcard || allowedSkillSet.has(id))
-      );
+      const validSkillIds = args.skillIds.filter((id: string) => {
+        const skill = publishedSkills.find(s => s.skillId === id);
+        const isOwnSkill = skill && (skill as any).ownerId === userId;
+        return (id === '__other_skills__' || skill) &&
+          (isOwnSkill || isWildcard || allowedSkillSet.has(id));
+      });
 
       if (validSkillIds.length === 0) {
         return {
@@ -104,16 +106,16 @@ emmaToolRegistry.register({
     const { getAllowedSkills } = await import('../services/subscriptionService');
 
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getPublishedSkills(),
+      skillService.getSkillsAvailableToUser(userId),
       getAllowedSkills(userId)
     ]);
 
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
 
-    // Filter skills by user's subscription
+    // Filter skills by user's subscription (user's own private skills always pass)
     const availableSkills = publishedSkills
-      .filter(skill => isWildcard || allowedSkillSet.has(skill.skillId))
+      .filter(skill => isWildcard || allowedSkillSet.has(skill.skillId) || (skill as any).ownerId === userId)
       .map(skill => ({
         skillId: skill.skillId,
         name: skill.name,

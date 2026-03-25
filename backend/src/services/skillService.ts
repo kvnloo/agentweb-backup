@@ -182,6 +182,22 @@ export class SkillService {
     }
   }
 
+  /**
+   * Get all skills available to a specific user: published skills + their own private skills.
+   * User-created private skills are immediately usable by their owner without admin approval.
+   */
+  async getSkillsAvailableToUser(userId: string): Promise<Skill[]> {
+    const [publishedSkills, userSkills] = await Promise.all([
+      this.getPublishedSkills(),
+      this.getSkillsByOwner(userId),
+    ]);
+
+    // Merge: start with published, add user's private skills that aren't already published
+    const publishedIds = new Set(publishedSkills.map(s => s.skillId));
+    const privateUserSkills = userSkills.filter(s => !publishedIds.has(s.skillId));
+    return [...publishedSkills, ...privateUserSkills];
+  }
+
 
   async getSkillsByIds(skillIds: string[]): Promise<Skill[]> {
     if (!skillIds || skillIds.length === 0) return [];
