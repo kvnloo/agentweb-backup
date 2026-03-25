@@ -136,7 +136,7 @@ describe("AdminDashboard CRM sync", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
     expect(axios.put).toHaveBeenCalledWith(
       "https://api.test/api/admin/crm-sync/users",
-      { listId: "new-users-list" },
+      { listId: "new-users-list", autoSync: false },
       { headers: { Authorization: "Bearer test-token" } }
     );
 
