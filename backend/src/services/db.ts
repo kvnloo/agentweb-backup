@@ -5046,6 +5046,30 @@ export const socialEngagementTrackingDb = {
     }
   },
 
+  async deleteEngagement(params: {
+    userId: string;
+    postId: string;
+    commentId?: string;
+    engagingAccountId: string;
+    actionType: string;
+  }) {
+    try {
+      const dedupId = params.commentId || params.postId;
+      const isLegacyCompound = params.actionType === 'like_and_reply_comment' || params.actionType === 'comment_and_like';
+      const key = isLegacyCompound
+        ? `${dedupId}#${params.engagingAccountId}`
+        : `${dedupId}#${params.engagingAccountId}#${params.actionType}`;
+
+      await dynamodb.delete({
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        Key: { userId: params.userId, postId_engagingAccountId: key },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, "deleteEngagement");
+      throw error;
+    }
+  },
+
   // Query all engagement activity for a specific account (account-wise view)
   async getEngagementsByAccount(engagingAccountId: string, options: { from?: string; to?: string } = {}): Promise<any[]> {
     try {

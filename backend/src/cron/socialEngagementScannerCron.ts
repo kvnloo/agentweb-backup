@@ -127,8 +127,8 @@ export class SocialEngagementScanner {
 
     /**
      * Records the tracking entry FIRST (dedup guard), then creates the schedule.
-     * This order ensures that if createSchedule fails the dedup record still exists,
-     * preventing the scanner from creating an orphaned schedule on the next run.
+     * If createSchedule fails, the tracking record is deleted so the scanner can
+     * retry on the next run — preventing a permanently blocked post+account+actionType.
      */
     private async scheduleOneAction(params: {
         userId: string;
@@ -148,7 +148,7 @@ export class SocialEngagementScanner {
         const executionTime = new Date(Date.now() + delayMs).toISOString();
         const scheduleId = uuidv4();
 
-        // Record first — if createSchedule throws the dedup guard is already in place
+        // Record first — dedup guard is in place before the schedule is created
         await socialEngagementTrackingDb.recordEngagement({
             userId: params.userId,
             postId: params.postId,
@@ -161,28 +161,46 @@ export class SocialEngagementScanner {
             status: 'queued',
         });
 
-        await scheduleDb.createSchedule({
-            scheduleId,
-            taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
-            userId: params.userId,
-            frequency: 'once',
-            runCount: 1,
-            nextRunTime: executionTime,
-            status: 'active',
-            createdAt: new Date().toISOString(),
-            type: 'social_engagement_action',
-            description: params.description,
-            variableValues: {
-                postId: params.postId,
-                ...(params.commentId !== undefined && { commentId: params.commentId }),
-                ...(params.commentText !== undefined && { commentText: params.commentText }),
-                platform: params.platform,
-                ownerAccountId: params.ownerAccountId,
-                engagingAccountId: params.engagingAccountId,
-                actionType: params.actionType,
-                targetType: params.targetType,
-            },
-        });
+        try {
+            await scheduleDb.createSchedule({
+                scheduleId,
+                taskId: 'SYSTEM_SOCIAL_ENGAGEMENT',
+                userId: params.userId,
+                frequency: 'once',
+                runCount: 1,
+                nextRunTime: executionTime,
+                status: 'active',
+                createdAt: new Date().toISOString(),
+                type: 'social_engagement_action',
+                description: params.description,
+                variableValues: {
+                    postId: params.postId,
+                    ...(params.commentId !== undefined && { commentId: params.commentId }),
+                    ...(params.commentText !== undefined && { commentText: params.commentText }),
+                    platform: params.platform,
+                    ownerAccountId: params.ownerAccountId,
+                    engagingAccountId: params.engagingAccountId,
+                    actionType: params.actionType,
+                    targetType: params.targetType,
+                },
+            });
+        } catch (scheduleErr) {
+            // Schedule creation failed — remove the tracking record so the scanner
+            // can retry on the next run instead of permanently blocking this action.
+            console.error(`[Scanner] createSchedule failed for "${params.actionType}" on ${params.postId}, rolling back tracking record:`, scheduleErr);
+            try {
+                await socialEngagementTrackingDb.deleteEngagement({
+                    userId: params.userId,
+                    postId: params.postId,
+                    commentId: params.commentId,
+                    engagingAccountId: params.engagingAccountId,
+                    actionType: params.actionType,
+                });
+            } catch (deleteErr) {
+                console.error(`[Scanner] Failed to roll back tracking record for "${params.actionType}" on ${params.postId}:`, deleteErr);
+            }
+            throw scheduleErr;
+        }
 
         console.log(`[Scanner] Scheduled "${params.actionType}" at ${executionTime} — ${params.description}`);
 
