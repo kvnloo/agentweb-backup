@@ -1455,7 +1455,7 @@ export async function generateSessionResponse(
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
   // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = [];
   try {
     skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
   } catch (error) {
@@ -1655,7 +1655,7 @@ export const agentModeController = {
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = [];
       try {
         skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {

@@ -2432,7 +2432,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
@@ -2441,14 +2441,15 @@ When a user requests client onboarding or says "onboard new client" or similar:
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
-    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = publishedSkills
+    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
       .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
         description: s.description,
         installed: installedIds.has(s.skillId),
-        toolNames: s.toolNames || []
+        toolNames: s.toolNames || [],
+        visibility: s.visibility || 'public',
       }));
 
     // Add virtual other_skills entry if allowed and there are unassociated tools
