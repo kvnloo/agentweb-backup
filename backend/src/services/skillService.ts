@@ -326,7 +326,17 @@ export class SkillService {
     try {
       const result = await dynamodb.query(params).promise();
       return (result.Items || []).map(item => this.normalizeSkill(item));
-    } catch (error) {
+    } catch (error: any) {
+      // Fallback to scan if GSI doesn't exist yet
+      if (error.code === 'ValidationException' && error.message?.includes('specified index')) {
+        console.warn(`OwnerIndex not found on ${this.tableName}, falling back to scan`);
+        const scanResult = await dynamodb.scan({
+          TableName: this.tableName,
+          FilterExpression: 'ownerId = :ownerId',
+          ExpressionAttributeValues: { ':ownerId': ownerId },
+        }).promise();
+        return (scanResult.Items || []).map(item => this.normalizeSkill(item));
+      }
       console.error(`Error getting skills for owner ${ownerId}:`, error);
       throw error;
     }
@@ -343,7 +353,17 @@ export class SkillService {
     try {
       const result = await dynamodb.query(params).promise();
       return (result.Items || []).map(item => this.normalizeSkill(item));
-    } catch (error) {
+    } catch (error: any) {
+      // Fallback to scan if GSI doesn't exist yet
+      if (error.code === 'ValidationException' && error.message?.includes('specified index')) {
+        console.warn(`VisibilityIndex not found on ${this.tableName}, falling back to scan`);
+        const scanResult = await dynamodb.scan({
+          TableName: this.tableName,
+          FilterExpression: 'visibility = :visibility',
+          ExpressionAttributeValues: { ':visibility': visibility },
+        }).promise();
+        return (scanResult.Items || []).map(item => this.normalizeSkill(item));
+      }
       console.error(`Error getting skills by visibility ${visibility}:`, error);
       throw error;
     }
