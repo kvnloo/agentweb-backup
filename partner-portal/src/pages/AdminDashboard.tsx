@@ -836,6 +836,7 @@ export default function AdminDashboard() {
   const [crmSyncSaving, setCrmSyncSaving] = useState(false);
   const [crmSyncRunning, setCrmSyncRunning] = useState(false);
   const [crmSyncForceFull, setCrmSyncForceFull] = useState(false);
+  const [crmSyncAutoSync, setCrmSyncAutoSync] = useState(false);
 
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
@@ -1195,6 +1196,7 @@ export default function AdminDashboard() {
       });
       setCrmSyncListId(response.data?.listId || "");
       setCrmSyncLastSyncAt(response.data?.lastSyncAt || null);
+      setCrmSyncAutoSync(response.data?.autoSync || false);
     } catch (err: any) {
       console.error("Error loading CRM sync config:", err);
       setError(err.response?.data?.message || "Failed to load CRM sync configuration");
@@ -1215,7 +1217,7 @@ export default function AdminDashboard() {
       setCrmSyncSaving(true);
       await axios.put(
         buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}`),
-        { listId: crmSyncListId.trim() },
+        { listId: crmSyncListId.trim(), autoSync: crmSyncAutoSync },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSuccess(`CRM sync configuration saved for ${crmSyncSource}.`);
@@ -6921,6 +6923,18 @@ export default function AdminDashboard() {
                 }
                 label="Force full sync"
               />
+              {crmSyncSource === "users" && (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={crmSyncAutoSync}
+                      onChange={(e) => setCrmSyncAutoSync(e.target.checked)}
+                      disabled={crmSyncSaving || crmSyncRunning}
+                    />
+                  }
+                  label="Auto-sync new users to this lead list"
+                />
+              )}
             </Box>
           )}
         </DialogContent>

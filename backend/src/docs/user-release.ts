@@ -9,6 +9,48 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-25',
+    changes: [
+      'Feature: Auto-Sync New Users to CRM Lead List',
+      '- New users who sign up (email or Google OAuth) are now automatically added to the configured CRM lead list',
+      '- Enable "Auto-sync new users to this lead list" in the Sync to CRM dialog on the Users tab of the Admin Dashboard',
+      '- Auto-sync is fire-and-forget — registration is never blocked even if the CRM sync fails',
+      '- Manual bulk sync via "Start Syncing" is still available for backfilling',
+      'Feature: Batch Review Page',
+      '- When sending multiple assets for review, a single Slack message is sent with a link to a dedicated review page instead of individual messages per asset',
+      '- Reviewers can approve, request changes, or reject each asset from the web page',
+      '- Review progress is updated back to Slack in real-time with a link to the review page',
+      '- When changes are requested, auto-revision generates a new version directly in the review page',
+      'Improvement: Agent Mode Token Usage Optimization',
+      '- Enabled Anthropic prompt caching for Claude models — system prompt and conversation context are cached across iterations, reducing input token costs by up to 50%',
+      '- Improved tool result compression — old tool results are now summarized to short previews instead of keeping 8KB each, significantly reducing context size in long conversations',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'Feature: Unified Emma Chat Sidebar',
+      '- Emma sidebar now uses the same Agent Mode engine as the main chat, providing consistent behavior across the platform',
+      '- All tools are available regardless of which page you are on — Emma decides what is relevant based on context',
+      '- Page updates now refresh automatically after Emma makes changes (e.g. updating brand guidelines)',
+      '- Emma sidebar is hidden on Agent Mode and Guide pages to avoid conflicts',
+    ],
+  },
+  {
+    date: '2026-03-24',
+    changes: [
+      'New: Engagement Memory for Personalized Social Interactions',
+      '- Each connected LinkedIn account now has an "Engagement Memory" — a persona profile that personalizes automated comments and replies',
+      '- Click "Generate" to create the memory from your LinkedIn profile and recent posts using AI',
+      '- Edit the memory directly to fine-tune your engagement voice, key topics, and style preferences',
+      '- Click "Sync" to merge the latest LinkedIn data while preserving your customizations',
+      '- Automated engagement comments and replies now use the memory for more authentic, personalized interactions',
+      'Fix: Slack Chat Links Not Clickable',
+      '- Fixed an issue where links in Emma\'s Slack chat responses appeared as a doc icon but were not clickable',
+      '- Links are now properly rendered as clickable Slack links',
+    ],
+  },
+  {
     date: '2026-03-24',
     changes: [
       'Feature: Meta Ads Event Match Quality (EMQ)',
@@ -37,6 +79,8 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Supports 9 operations: remove, replace, replaceInner, append, prepend, insertBefore, insertAfter, setAttribute, removeAttribute',
       '- Much more reliable — no more failures from whitespace mismatches or escaped characters in large HTML files',
       '- Full file replacement mode still available as a fallback',
+      '- Partial success: if some CSS operations fail to match, the successful ones still apply instead of aborting the entire edit',
+      '- Better selector guidance: Emma now uses :eq(n) positional selectors instead of :nth-of-type, fixing mismatches on mixed-sibling structures',
     ],
   },
   {

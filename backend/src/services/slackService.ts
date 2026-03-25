@@ -687,6 +687,147 @@ export async function sendApprovalRequestWithTracking(
 }
 
 /**
+ * Send a single Slack message for a batch of assets with a link to the review page
+ */
+export async function sendBatchApprovalRequest(params: {
+  channel: string;
+  batchId: string;
+  assets: Array<{ filename: string; assetType: string }>;
+  note?: string;
+  reviewPageUrl: string;
+}): Promise<{ messageTs: string | null }> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const assetCount = params.assets.length;
+  const typeCounts: Record<string, number> = {};
+  for (const a of params.assets) {
+    typeCounts[a.assetType] = (typeCounts[a.assetType] || 0) + 1;
+  }
+  const typeSummary = Object.entries(typeCounts)
+    .map(([type, count]) => `${count} ${type}${count !== 1 ? 's' : ''}`)
+    .join(', ');
+
+  const blocks: any[] = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*Batch Review Request (${assetCount} asset${assetCount !== 1 ? 's' : ''})*\n\n*Assets:* ${typeSummary}${params.note ? `\n*Note:* ${params.note}` : ''}`,
+      },
+    },
+    { type: "divider" },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: {
+            type: "plain_text",
+            text: `Review ${assetCount} Asset${assetCount !== 1 ? 's' : ''}`,
+            emoji: true,
+          },
+          style: "primary",
+          url: params.reviewPageUrl,
+          action_id: "open_batch_review",
+        },
+      ],
+    },
+  ];
+
+  const result = await slackClient.chat.postMessage({
+    channel: params.channel,
+    text: `Batch Review Request: ${assetCount} asset${assetCount !== 1 ? 's' : ''} ready for review`,
+    blocks,
+  });
+
+  if (!result.ok) {
+    throw new Error(`Failed to send batch review message to Slack: ${result.error}`);
+  }
+
+  return { messageTs: result.ts || null };
+}
+
+/**
+ * Update the batch review Slack message with review progress
+ */
+export async function updateBatchReviewMessage(params: {
+  channel: string;
+  messageTs: string;
+  totalAssets: number;
+  reviewed: number;
+  approved: number;
+  needsChanges: number;
+  rejected: number;
+  reviewPageUrl: string;
+  isComplete: boolean;
+}): Promise<void> {
+  if (!slackClient) {
+    throw new Error("Slack client not initialized. Check SLACK_BOT_TOKEN environment variable.");
+  }
+
+  const { totalAssets, reviewed, approved, needsChanges, rejected, reviewPageUrl, isComplete } = params;
+  const pending = totalAssets - reviewed;
+
+  let statusText = `*Progress:* ${reviewed}/${totalAssets} reviewed`;
+  const details: string[] = [];
+  if (approved > 0) details.push(`${approved} approved`);
+  if (needsChanges > 0) details.push(`${needsChanges} needs changes`);
+  if (rejected > 0) details.push(`${rejected} rejected`);
+  if (pending > 0) details.push(`${pending} pending`);
+  if (details.length > 0) statusText += ` (${details.join(', ')})`;
+
+  const headerText = isComplete
+    ? `*Batch Review Complete (${totalAssets} asset${totalAssets !== 1 ? 's' : ''})*`
+    : `*Batch Review Request (${totalAssets} asset${totalAssets !== 1 ? 's' : ''})*`;
+
+  const blocks: any[] = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: headerText,
+      },
+    },
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: statusText,
+      },
+    },
+  ];
+
+  blocks.push(
+    { type: "divider" },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: {
+            type: "plain_text",
+            text: isComplete ? `View Results` : `Review Remaining (${pending})`,
+            emoji: true,
+          },
+          style: isComplete ? undefined : "primary",
+          url: reviewPageUrl,
+          action_id: "open_batch_review",
+        },
+      ],
+    }
+  );
+
+  await slackClient.chat.update({
+    channel: params.channel,
+    ts: params.messageTs,
+    text: `Batch Review: ${reviewed}/${totalAssets} reviewed`,
+    blocks,
+  });
+}
+
+/**
  * Lead notification payload for Slack bot messages
  */
 export interface LeadNotificationPayload {
@@ -824,7 +965,7 @@ function markdownToMrkdwn(markdown: string): string {
   text = text.replace(/<\/(em|i)>/gi, '_');
   text = text.replace(/<code(\s[^>]*)?>/gi, '`');
   text = text.replace(/<\/code>/gi, '`');
-  text = text.replace(/<[^>]+>/g, '');
+  text = text.replace(/<(?!https?:\/\/)[^>]+>/g, '');
   // Decode HTML entities
   text = text.replace(/&amp;/g, '&');
   text = text.replace(/&lt;/g, '<');

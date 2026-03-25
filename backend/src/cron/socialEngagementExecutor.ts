@@ -118,6 +118,9 @@ export class SocialEngagementExecutor {
 
         console.log(`[Executor] Engaging as: "${engagingConnection.account_name}" (${engagingAccountId})`);
 
+        // Load engagement memory for personalized comments
+        const engagerMemory = engagingConnection.engagementMemory?.content || '';
+
         const adapter = getLinkedInAdapter();
         let success = false;
         let errorMsg: string | undefined;
@@ -127,12 +130,12 @@ export class SocialEngagementExecutor {
         try {
             if (targetType === 'comment') {
                 generated = await this.executeCommentAction(
-                    adapter, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType
+                    adapter, engagingConnection, engagingOwnerId, postId, commentId, commentText, actionType, engagerMemory
                 );
             } else {
                 // Default: post engagement
                 generated = await this.executePostAction(
-                    adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType
+                    adapter, engagingConnection, engagingOwnerId, ownerAccountId, userId, postId, actionType, engagerMemory
                 );
             }
             success = true;
@@ -188,7 +191,8 @@ export class SocialEngagementExecutor {
         ownerAccountId: string | undefined,
         ownerUserId: string,
         postId: string,
-        actionType: string
+        actionType: string,
+        engagerMemory?: string
     ): Promise<{ generatedText?: string; reactionType?: string }> {
         const doLike = actionType === 'like' || actionType === 'comment_and_like';
         const doComment = actionType === 'comment' || actionType === 'comment_and_like';
@@ -200,7 +204,7 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doComment) {
-            generatedText = await this.generatePostComment(postContent);
+            generatedText = await this.generatePostComment(postContent, engagerMemory);
             console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
             await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
             console.log(`[Executor] Comment posted on post ${postId}`);
@@ -258,13 +262,17 @@ export class SocialEngagementExecutor {
         return '[Post content unavailable]';
     }
 
-    private async generatePostComment(postContent: string): Promise<string> {
+    private async generatePostComment(postContent: string, engagerMemory?: string): Promise<string> {
         try {
+            let systemPrompt = POST_COMMENT_SYSTEM_PROMPT;
+            if (engagerMemory) {
+                systemPrompt += `\n\nIMPORTANT: Write the comment from the perspective described in this engagement persona profile. Match the voice, tone, and expertise areas described below:\n\n${engagerMemory}`;
+            }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
                 model: COMMENT_MODEL,
                 messages: [
-                    { role: 'system', content: POST_COMMENT_SYSTEM_PROMPT },
+                    { role: 'system', content: systemPrompt },
                     { role: 'user', content: `Post content: ${postContent}` },
                 ],
                 temperature: 0.8,
@@ -308,7 +316,8 @@ export class SocialEngagementExecutor {
         postId: string,
         commentId: string | undefined,
         commentText: string | undefined,
-        actionType: string
+        actionType: string,
+        engagerMemory?: string
     ): Promise<{ generatedText?: string; reactionType?: string }> {
         if (!commentId) {
             throw new Error('commentId is required for comment engagement actions');
@@ -321,7 +330,7 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doReply) {
-            generatedText = await this.generateCommentReply(commentText || '');
+            generatedText = await this.generateCommentReply(commentText || '', engagerMemory);
             console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
             await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
             console.log(`[Executor] Reply posted on comment ${commentId}`);
@@ -348,13 +357,17 @@ export class SocialEngagementExecutor {
         return { generatedText, reactionType };
     }
 
-    private async generateCommentReply(commentText: string): Promise<string> {
+    private async generateCommentReply(commentText: string, engagerMemory?: string): Promise<string> {
         try {
+            let systemPrompt = COMMENT_REPLY_SYSTEM_PROMPT;
+            if (engagerMemory) {
+                systemPrompt += `\n\nIMPORTANT: Write the reply from the perspective described in this engagement persona profile. Match the voice, tone, and expertise areas described below:\n\n${engagerMemory}`;
+            }
             const geminiClient = await agentModeService.getGeminiClient();
             const completion = await geminiClient.chat.completions.create({
                 model: COMMENT_MODEL,
                 messages: [
-                    { role: 'system', content: COMMENT_REPLY_SYSTEM_PROMPT },
+                    { role: 'system', content: systemPrompt },
                     { role: 'user', content: `Comment: ${commentText}` },
                 ],
                 temperature: 0.8,

@@ -73,6 +73,7 @@ describe("Admin CRM sync routes", () => {
       source: "users",
       listId: "",
       lastSyncAt: null,
+      autoSync: false,
     });
   });
 
@@ -108,6 +109,88 @@ describe("Admin CRM sync routes", () => {
     );
     expect(res.body.listId).toBe("new-list");
     expect(res.body.lastSyncAt).toBe("2026-02-10T10:00:00.000Z");
+  });
+
+  it("GET /api/admin/crm-sync/:source returns autoSync field", async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: "admin_crm_sync_users",
+      settingValue: JSON.stringify({
+        listId: "list-1",
+        autoSync: true,
+        lastSyncAt: "2026-03-25T00:00:00.000Z",
+      }),
+    } as any);
+
+    const res = await request(app)
+      .get("/api/admin/crm-sync/users")
+      .set("Authorization", "Bearer test-token")
+      .expect(200);
+
+    expect(res.body.autoSync).toBe(true);
+    expect(res.body.listId).toBe("list-1");
+  });
+
+  it("GET /api/admin/crm-sync/:source defaults autoSync to false when not set", async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: "admin_crm_sync_users",
+      settingValue: JSON.stringify({ listId: "list-1" }),
+    } as any);
+
+    const res = await request(app)
+      .get("/api/admin/crm-sync/users")
+      .set("Authorization", "Bearer test-token")
+      .expect(200);
+
+    expect(res.body.autoSync).toBe(false);
+  });
+
+  it("PUT /api/admin/crm-sync/:source saves autoSync flag", async () => {
+    mockSettingsService.getSetting.mockResolvedValue(null as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: "list-1",
+      publicAccessEnabled: true,
+    } as any);
+    mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+    const res = await request(app)
+      .put("/api/admin/crm-sync/users")
+      .set("Authorization", "Bearer test-token")
+      .send({ listId: "list-1", autoSync: true })
+      .expect(200);
+
+    expect(res.body.autoSync).toBe(true);
+    expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+      "admin_crm_sync_users",
+      expect.stringContaining('"autoSync":true'),
+      expect.any(String),
+      expect.any(String)
+    );
+  });
+
+  it("PUT /api/admin/crm-sync/:source preserves existing autoSync when not provided", async () => {
+    mockSettingsService.getSetting.mockResolvedValue({
+      settingName: "admin_crm_sync_users",
+      settingValue: JSON.stringify({ listId: "old-list", autoSync: true }),
+    } as any);
+    mockCrmDb.getLeadListById.mockResolvedValue({
+      listId: "new-list",
+      publicAccessEnabled: true,
+    } as any);
+    mockSettingsService.setSetting.mockResolvedValue(undefined as any);
+
+    const res = await request(app)
+      .put("/api/admin/crm-sync/users")
+      .set("Authorization", "Bearer test-token")
+      .send({ listId: "new-list" })
+      .expect(200);
+
+    expect(res.body.autoSync).toBe(true);
+    expect(mockSettingsService.setSetting).toHaveBeenCalledWith(
+      "admin_crm_sync_users",
+      expect.stringContaining('"autoSync":true'),
+      expect.any(String),
+      expect.any(String)
+    );
   });
 
   it("POST /api/admin/crm-sync/:source/start performs incremental users sync and updates lastSyncAt on success", async () => {

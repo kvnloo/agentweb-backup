@@ -125,6 +125,9 @@ cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
       "Bash(kill *)",
       "Bash(chmod *)",
       "Bash(~/agentweb/test-env/*)",
+      "Bash(/home/ec2-user/agentweb/test-env/*)",
+      "Bash(npm run *)",
+      "Bash(touch *)",
       "mcp__playwright__browser_navigate",
       "mcp__playwright__browser_snapshot",
       "mcp__playwright__browser_click",
@@ -154,7 +157,8 @@ cat > "$CLAUDE_PROJECT_DIR/settings.local.json" <<'CLSEOF'
       "mcp__notion__API-patch-page",
       "mcp__notion__API-get-block-children",
       "mcp__notion__API-retrieve-a-database",
-      "mcp__notion__API-query-data-source"
+      "mcp__notion__API-query-data-source",
+      "WebFetch"
     ],
     "deny": []
   }

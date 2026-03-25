@@ -541,10 +541,10 @@ export class AgentModeService {
   }
 
   public async getBedrockClient(modelId: string): Promise<any> {
-    // Create a wrapper that implements OpenAI-compatible interface for Bedrock
-    const { ChatBedrockConverse } = await import('@langchain/aws');
-    const { BedrockRuntimeClient } = await import('@aws-sdk/client-bedrock-runtime');
-    const { HumanMessage, AIMessage, SystemMessage, ToolMessage } = await import('@langchain/core/messages');
+    // Use the Bedrock Converse API directly (instead of LangChain) to support
+    // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
+    // input token costs by caching the system prompt and conversation prefix.
+    const { BedrockRuntimeClient, ConverseCommand } = await import('@aws-sdk/client-bedrock-runtime');
 
     const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
     const BEDROCK_REQUEST_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per request
@@ -569,103 +569,96 @@ export class AgentModeService {
     };
     const actualModelId = inferenceProfileMap[modelId] || modelId;
 
-    // Create OpenAI-compatible wrapper
+    // Create OpenAI-compatible wrapper using direct Converse API
     return {
       chat: {
         completions: {
           create: async (params: any) => {
-            // Create chat instance with current parameters
-            const chatBedrock = new ChatBedrockConverse({
-              model: actualModelId,
-              region,
-              client: bedrockClient,
-              temperature: params.temperature !== undefined ? params.temperature : 0.1,
-              maxTokens: params.max_completion_tokens || undefined,
+            // Convert OpenAI messages to Bedrock Converse format
+            const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
+
+            // --- Prompt caching ---
+            // Add cache point after system prompt (~3.5K tokens cached on every call)
+            if (system.length > 0) {
+              system.push({ cachePoint: { type: 'default' } });
+            }
+            // Add cache point before the last message to cache the conversation prefix.
+            // Within the tool-call iteration loop, each subsequent call only pays full
+            // price for the newest exchange; all prior turns hit the cache.
+            if (messages.length > 2) {
+              const pivotMsg = messages[messages.length - 2];
+              pivotMsg.content = [...pivotMsg.content, { cachePoint: { type: 'default' } }];
+            }
+
+            // Convert tools to Bedrock toolConfig format
+            const toolConfig = params.tools && params.tools.length > 0 ? {
+              tools: params.tools.map((tool: any) => ({
+                toolSpec: {
+                  name: tool.function.name,
+                  description: tool.function.description || '',
+                  inputSchema: { json: tool.function.parameters },
+                }
+              }))
+            } : undefined;
+
+            // Send the Converse request
+            const command = new ConverseCommand({
+              modelId: actualModelId,
+              system,
+              messages,
+              ...(toolConfig && { toolConfig }),
+              inferenceConfig: {
+                maxTokens: params.max_completion_tokens || 12384,
+                ...(params.temperature !== undefined && { temperature: params.temperature }),
+              },
             });
 
-            // Convert OpenAI format to LangChain Message objects
-            const messages = params.messages.map((msg: any) => {
-              if (msg.role === 'system') {
-                return new SystemMessage(msg.content);
-              } else if (msg.role === 'user') {
-                return new HumanMessage(msg.content);
-              } else if (msg.role === 'assistant') {
-                if (msg.tool_calls && msg.tool_calls.length > 0) {
-                  // Handle assistant message with tool calls
-                  return new AIMessage({
-                    content: msg.content || '',
-                    tool_calls: msg.tool_calls.map((tc: any) => ({
-                      id: tc.id,
-                      name: tc.function.name,
-                      args: JSON.parse(tc.function.arguments),
-                    })),
+            const response = await bedrockClient.send(command, {
+              abortSignal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
+            });
+
+            // Extract response content
+            const outputMessage = response.output?.message;
+            let messageContent = '';
+            let toolCalls: any[] | null = null;
+
+            if (outputMessage?.content) {
+              const textParts: string[] = [];
+              const toolUseParts: any[] = [];
+
+              for (const block of outputMessage.content) {
+                if ('text' in block && block.text) {
+                  textParts.push(block.text);
+                } else if ('toolUse' in block && block.toolUse) {
+                  toolUseParts.push({
+                    id: block.toolUse.toolUseId || `call_${Date.now()}_${toolUseParts.length}`,
+                    type: 'function',
+                    function: {
+                      name: block.toolUse.name,
+                      arguments: JSON.stringify(block.toolUse.input),
+                    },
                   });
                 }
-                return new AIMessage(msg.content || '');
-              } else if (msg.role === 'tool') {
-                // Handle tool response messages
-                return new ToolMessage({
-                  content: msg.content,
-                  tool_call_id: msg.tool_call_id,
-                });
               }
-              return new HumanMessage(String(msg.content || ''));
-            });
 
-            // Bind tools if provided
-            let modelToInvoke: any = chatBedrock;
-            if (params.tools && params.tools.length > 0) {
-              // Tools are in OpenAI format: { type: 'function', function: { name, description, parameters } }
-              // LangChain's bindTools accepts this format
-              try {
-                modelToInvoke = chatBedrock.bindTools(params.tools);
-              } catch (error: any) {
-                console.error('AgentMode: Error binding tools to Bedrock:', error.message);
-                // If bindTools fails, try to invoke without tools
-                console.warn('AgentMode: Falling back to invocation without tools');
-                modelToInvoke = chatBedrock;
+              messageContent = textParts.join('\n');
+              if (toolUseParts.length > 0) {
+                toolCalls = toolUseParts;
               }
             }
 
-            // Invoke the model with a timeout to prevent indefinite hangs
-            // (Bedrock can stall on throttling or infra issues with no socket-level timeout)
-            const response: any = await modelToInvoke.invoke(messages, {
-              signal: AbortSignal.timeout(BEDROCK_REQUEST_TIMEOUT_MS),
-            });
+            // Extract usage — includes cache metrics when prompt caching is active
+            const usage = response.usage || {} as any;
+            const inputTokens = usage.inputTokens || 0;
+            const outputTokens = usage.outputTokens || 0;
+            const cacheReadTokens = usage.cacheReadInputTokens || 0;
+            const cacheWriteTokens = usage.cacheWriteInputTokens || 0;
 
-            // Extract tool calls if present
-            let toolCalls = null;
-            if (response.tool_calls && response.tool_calls.length > 0) {
-              toolCalls = response.tool_calls.map((tc: any, index: number) => ({
-                id: tc.id || `call_${Date.now()}_${index}`,
-                type: 'function',
-                function: {
-                  name: tc.name,
-                  arguments: JSON.stringify(tc.args),
-                },
-              }));
+            if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
+              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}, uncached input: ${inputTokens}, output: ${outputTokens}`);
             }
 
-            // Extract native stop reason from Bedrock response metadata
-            const nativeStopReason: string = response.response_metadata?.stopReason || '';
-
-            // Extract usage information
-            // response_metadata.usage uses camelCase (inputTokens), usage_metadata uses snake_case (input_tokens)
-            const usage = response.response_metadata?.usage || response.usage_metadata || {};
-            const inputTokens = usage.inputTokens || usage.input_tokens || usage.prompt_tokens || 0;
-            const outputTokens = usage.outputTokens || usage.output_tokens || usage.completion_tokens || 0;
-
-            // Extract text content - handle both string and array formats (Anthropic returns array)
-            let messageContent: string = '';
-            if (typeof response.content === 'string') {
-              messageContent = response.content;
-            } else if (Array.isArray(response.content)) {
-              // Anthropic/Bedrock format: [{type: "text", text: "..."}, ...]
-              messageContent = response.content
-                .map((item: any) => item?.text || '')
-                .filter(Boolean)
-                .join('\n');
-            }
+            const stopReason: string = response.stopReason || '';
 
             // Convert response to OpenAI format
             return {
@@ -680,19 +673,146 @@ export class AgentModeService {
                   content: messageContent,
                   tool_calls: toolCalls,
                 },
-                finish_reason: toolCalls ? 'tool_calls' : (nativeStopReason === 'max_tokens' ? 'length' : 'stop'),
-                stop_reason: nativeStopReason || (toolCalls ? 'tool_use' : 'end_turn'),
+                finish_reason: toolCalls ? 'tool_calls' : (stopReason === 'max_tokens' ? 'length' : 'stop'),
+                stop_reason: stopReason || (toolCalls ? 'tool_use' : 'end_turn'),
               }],
               usage: {
                 prompt_tokens: inputTokens,
                 completion_tokens: outputTokens,
                 total_tokens: inputTokens + outputTokens,
+                cache_read_input_tokens: cacheReadTokens,
+                cache_creation_input_tokens: cacheWriteTokens,
               },
             };
           },
         },
       },
     };
+  }
+
+  /**
+   * Convert OpenAI-format messages to Bedrock Converse API format.
+   * Handles system extraction, role alternation, and tool call/result grouping.
+   */
+  static convertToBedrockConverse(openaiMessages: any[]): { system: any[], messages: any[] } {
+    const system: any[] = [];
+    const messages: any[] = [];
+
+    for (const msg of openaiMessages) {
+      if (msg.role === 'system') {
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? msg.content.map((c: any) => typeof c === 'string' ? c : c.text || '').filter(Boolean).join('\n')
+            : String(msg.content || '');
+        if (text) system.push({ text });
+        continue;
+      }
+
+      let role: string;
+      let contentBlocks: any[] = [];
+
+      if (msg.role === 'user') {
+        role = 'user';
+        contentBlocks = AgentModeService.convertContentToBedrockBlocks(msg.content);
+      } else if (msg.role === 'assistant') {
+        role = 'assistant';
+        // Text content
+        if (msg.content) {
+          const textContent = typeof msg.content === 'string'
+            ? msg.content
+            : Array.isArray(msg.content)
+              ? msg.content.map((c: any) => typeof c === 'string' ? c : c.text || '').filter(Boolean).join('\n')
+              : String(msg.content);
+          if (textContent) contentBlocks.push({ text: textContent });
+        }
+        // Tool use blocks
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          for (const tc of msg.tool_calls) {
+            let input: any;
+            try {
+              input = typeof tc.function.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : tc.function.arguments;
+            } catch {
+              input = { raw: tc.function.arguments };
+            }
+            contentBlocks.push({
+              toolUse: {
+                toolUseId: tc.id,
+                name: tc.function.name,
+                input,
+              }
+            });
+          }
+        }
+        if (contentBlocks.length === 0) contentBlocks.push({ text: '' });
+      } else if (msg.role === 'tool') {
+        // Tool results become user messages with toolResult blocks
+        role = 'user';
+        contentBlocks.push({
+          toolResult: {
+            toolUseId: msg.tool_call_id,
+            content: [{ text: String(msg.content || '') }],
+          }
+        });
+      } else {
+        role = 'user';
+        contentBlocks = [{ text: String(msg.content || '') }];
+      }
+
+      // Merge consecutive same-role messages (required by Bedrock Converse API)
+      if (messages.length > 0 && messages[messages.length - 1].role === role) {
+        messages[messages.length - 1].content.push(...contentBlocks);
+      } else {
+        messages.push({ role, content: contentBlocks });
+      }
+    }
+
+    // Bedrock requires first message to be user role
+    if (messages.length > 0 && messages[0].role !== 'user') {
+      messages.unshift({ role: 'user', content: [{ text: '.' }] });
+    }
+
+    return { system, messages };
+  }
+
+  /**
+   * Convert OpenAI content (string, array, or object) to Bedrock content blocks.
+   */
+  private static convertContentToBedrockBlocks(content: any): any[] {
+    if (!content) return [{ text: '' }];
+    if (typeof content === 'string') return [{ text: content }];
+    if (Array.isArray(content)) {
+      const blocks: any[] = [];
+      for (const item of content) {
+        if (typeof item === 'string') {
+          blocks.push({ text: item });
+        } else if (item.type === 'text') {
+          blocks.push({ text: item.text });
+        } else if (item.type === 'image_url') {
+          const url = item.image_url?.url || '';
+          if (url.startsWith('data:')) {
+            const match = url.match(/^data:image\/([\w+]+);base64,(.+)$/);
+            if (match) {
+              const format = match[1] === 'jpg' ? 'jpeg' : match[1];
+              blocks.push({
+                image: {
+                  format,
+                  source: { bytes: Buffer.from(match[2], 'base64') },
+                }
+              });
+            }
+          } else if (url) {
+            blocks.push({ text: `[Image: ${url}]` });
+          }
+        } else {
+          blocks.push({ text: JSON.stringify(item) });
+        }
+      }
+      return blocks.length > 0 ? blocks : [{ text: '' }];
+    }
+    return [{ text: String(content) }];
   }
 
   private llmModels: Record<string, LLMModelConfig> = {
@@ -849,7 +969,7 @@ export class AgentModeService {
    * Estimate cost in USD for an LLM call based on model pricing.
    * Prices are per 1M tokens (input/output).
    */
-  private estimateCost(model: string, inputTokens: number, outputTokens: number): number {
+  private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
     // Pricing per 1M tokens: [input, output]
     const pricing: Record<string, [number, number]> = {
       'anthropic.claude-sonnet-4-5-20250929-v1:0': [3, 15],
@@ -863,7 +983,11 @@ export class AgentModeService {
       'gemini-3.1-flash-lite-preview': [0.075, 0.3],
     };
     const [inputPrice, outputPrice] = pricing[model] || [3, 15]; // Default to Sonnet pricing
-    return (inputTokens * inputPrice + outputTokens * outputPrice) / 1_000_000;
+    // Cache reads are 10% of input price; cache writes are 125% of input price
+    const cacheReadPrice = inputPrice * 0.1;
+    const cacheWritePrice = inputPrice * 1.25;
+    return (inputTokens * inputPrice + outputTokens * outputPrice
+      + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
   }
 
   // Generate AI response for marketing conversation
@@ -1168,7 +1292,15 @@ export class AgentModeService {
             prompt_tokens: responseUsage.prompt_tokens || 0,
             completion_tokens: responseUsage.completion_tokens || 0,
             total_tokens: responseUsage.total_tokens || 0,
-            estimated_cost: this.estimateCost(llmModel, responseUsage.prompt_tokens || 0, responseUsage.completion_tokens || 0),
+            cache_read_input_tokens: responseUsage.cache_read_input_tokens || 0,
+            cache_creation_input_tokens: responseUsage.cache_creation_input_tokens || 0,
+            estimated_cost: this.estimateCost(
+              llmModel,
+              responseUsage.prompt_tokens || 0,
+              responseUsage.completion_tokens || 0,
+              responseUsage.cache_read_input_tokens || 0,
+              responseUsage.cache_creation_input_tokens || 0,
+            ),
           };
         }
 
@@ -12539,8 +12671,10 @@ Format the response as JSON with this structure:
   }
 
   /**
-   * Truncate large tool-result messages in a copy of the messages array to stay within
-   * LLM context limits. Preserves the most recent tool results at full size.
+   * Compress old tool-result messages to reduce context window usage.
+   * Strategy: keep the most recent tool results at full size, summarize older ones
+   * to a short preview. The LLM has already processed and responded to old results,
+   * so it only needs a reminder of what was returned, not the full content.
    */
   // Tools whose results are allowed a higher truncation limit (e.g. market strategy data)
   private static readonly LARGE_TOOL_RESULT_LIMIT: Record<string, number> = {
@@ -12556,10 +12690,12 @@ Format the response as JSON with this structure:
       }
     }
 
-    // Indices of tool messages that should be preserved at full size (most recent N)
+    if (toolIndices.length <= recentToPreserve) return messages;
+
+    // Most recent N tool results: keep at full size
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
 
-    // Shallow-copy the array; only deep-copy messages that need truncation
+    // Shallow-copy the array; only deep-copy messages that need modification
     const result = messages.map((msg, idx) => {
       if (
         msg.role === 'tool' &&
@@ -12568,7 +12704,9 @@ Format the response as JSON with this structure:
       ) {
         const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
         if (msg.content.length > limit) {
-          return { ...msg, content: msg.content.slice(0, limit) + '\n[truncated]' };
+          // Summarize to a short preview instead of keeping 8KB
+          const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
+          return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
         }
       }
       return msg;
@@ -15871,18 +16009,17 @@ Format the response as JSON with this structure:
       const cheerio = await import('cheerio');
       const $ = cheerio.load(currentContent, { xml: false } as any);
 
-      // Apply operations sequentially
+      // Apply operations sequentially, collecting results for each
       let operationsApplied = 0;
+      const operationResults: { index: number; action: string; selector: string; success: boolean; error?: string }[] = [];
       for (let i = 0; i < operations.length; i++) {
         const op = operations[i];
         const matched = $(op.selector);
 
         if (matched.length === 0) {
-          return {
-            success: false,
-            message: `Operation ${i + 1} (${op.action}): No elements matched selector "${op.selector}"`,
-            suggestion: 'Use read_file_content to inspect the current HTML structure and verify your CSS selector'
-          };
+          console.warn(`AgentMode: CSS edit op ${i + 1}: no match for "${op.selector}"`);
+          operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: false, error: `No elements matched selector "${op.selector}"` });
+          continue;
         }
 
         console.log(`AgentMode: CSS edit op ${i + 1}: ${op.action} on "${op.selector}" (${matched.length} matches)`);
@@ -15917,11 +16054,23 @@ Format the response as JSON with this structure:
             break;
         }
         operationsApplied++;
+        operationResults.push({ index: i + 1, action: op.action, selector: op.selector, success: true });
+      }
+
+      // If nothing was applied, return failure
+      if (operationsApplied === 0) {
+        return {
+          success: false,
+          message: `All ${operations.length} operations failed: no selectors matched`,
+          operations: operationResults,
+          suggestion: 'Use read_file_content to inspect the current HTML structure. Use :eq(n) (0-indexed) to select by position within matched set, e.g. ".step-block:eq(1)" for the 2nd .step-block.'
+        };
       }
 
       // Serialize back to HTML
       const updatedContent = $.html();
-      console.log(`AgentMode: CSS edit complete, ${operationsApplied} operations applied, new length: ${updatedContent.length}`);
+      const failedOps = operationResults.filter(r => !r.success);
+      console.log(`AgentMode: CSS edit complete, ${operationsApplied}/${operations.length} operations applied, new length: ${updatedContent.length}`);
 
       // Upload
       const versionedFilename = this.createVersionedFilename(fileUrl);
@@ -15931,10 +16080,13 @@ Format the response as JSON with this structure:
       return {
         success: true,
         s3_url: uploadResult.url,
-        message: `File updated successfully with ${operationsApplied} CSS-selector operations`,
+        message: failedOps.length > 0
+          ? `File updated with ${operationsApplied}/${operations.length} operations (${failedOps.length} failed: ${failedOps.map(f => `op ${f.index} selector "${f.selector}"`).join(', ')})`
+          : `File updated successfully with ${operationsApplied} CSS-selector operations`,
         method: 'css_selector',
         operations_applied: operationsApplied,
-        updatedContent, // included for verification
+        operations: operationResults,
+        updatedContent,
         versioned_filename: versionedFilename
       };
     } catch (error) {

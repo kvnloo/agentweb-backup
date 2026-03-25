@@ -1,5 +1,8 @@
-import { getAccountsByUserId } from './connectedAccountsDb';
+import { getAccountsByUserId, ConnectedAccount, EngagementMemory, saveEngagementMemory } from './connectedAccountsDb';
 import { socialPlatformService } from './socialPlatformService';
+import { linkedInService } from './linkedInService';
+import { LinkedInConfig } from './connectedAccountsDb';
+import { getPostsByAccount } from './linkedInPostsDb';
 
 const SOCIAL_PLATFORMS = ['linkedin', 'instagram'];
 
@@ -156,5 +159,159 @@ export async function getPostsForUser(
     posts: allPosts,
     accounts: accountSummaries,
   };
+}
+
+// ─── Engagement Memory Generation ─────────────────────────────────────────────
+
+const MEMORY_MODEL = 'gemini-3.1-flash-lite-preview';
+
+const GENERATE_MEMORY_PROMPT = `You are an expert profile analyst. Based on the LinkedIn profile and recent posts provided, create a concise engagement persona profile in markdown format.
+
+The profile should help an AI write personalized comments and replies that sound natural and relevant to this person's interests and communication style.
+
+Include these sections:
+## Bio
+A 2-3 sentence summary of who this person is professionally.
+
+## Voice & Tone
+Describe their communication style based on their posts (e.g., professional, casual, technical, inspirational).
+
+## Key Topics
+Bullet list of 3-7 topics they frequently post about.
+
+## Recent Themes
+Bullet list of 2-5 themes from their most recent posts.
+
+## Engagement Style
+Brief guidance on how to engage authentically with this person (what resonates, what to avoid).
+
+Keep the entire profile under 500 words. Be specific and actionable, not generic.
+IMPORTANT: Always generate the profile with whatever data is available. Never ask for more information. If only a name is provided, create a general professional profile based on the name and account type.`;
+
+const MERGE_MEMORY_PROMPT = `You are an expert profile analyst. You have an existing engagement persona profile and new LinkedIn data (profile info and recent posts).
+
+Your task is to UPDATE the existing profile by:
+1. Preserving any user-added customizations or edits (sections, notes, preferences)
+2. Updating factual information that has changed (new topics, recent themes)
+3. Adding new insights from recent posts
+4. Removing outdated information
+
+Return the complete updated profile in the same markdown format (Bio, Voice & Tone, Key Topics, Recent Themes, Engagement Style). Keep it under 500 words.
+IMPORTANT: Always output a complete profile. Never ask for more information. If the existing profile seems invalid or empty, generate a fresh one from the available data.`;
+
+/**
+ * Generate or sync an engagement memory profile for a connected LinkedIn account.
+ * - If no existing memory: generates from scratch using profile + recent posts.
+ * - If existing memory: merges new data while preserving user edits.
+ */
+export async function generateEngagementMemory(
+  userId: string,
+  account: ConnectedAccount,
+  existingMemory?: EngagementMemory | null
+): Promise<EngagementMemory> {
+  const config = account.config as LinkedInConfig;
+  const accessToken = config.access_token;
+
+  // Fetch profile data
+  let profileSummary = '';
+  try {
+    if (config.account_type === 'personal') {
+      const profile = await linkedInService.getProfile(accessToken);
+      profileSummary = `Name: ${profile.name}\nType: Personal Profile`;
+    } else if (config.account_type === 'company_page' && config.organization_id) {
+      const orgUrn = `urn:li:organization:${config.organization_id}`;
+      profileSummary = `Name: ${account.account_name}\nType: Company Page\nOrg URN: ${orgUrn}`;
+    } else {
+      profileSummary = `Name: ${account.account_name}\nType: ${config.account_type}`;
+    }
+  } catch (err) {
+    console.warn(`[EngagementMemory] Failed to fetch profile for ${account.account_id}:`, err);
+    profileSummary = `Name: ${account.account_name}`;
+  }
+
+  // Fetch recent posts — prefer DB cache (always works), fall back to LinkedIn API
+  let recentPostsSummary = '';
+  try {
+    // Try DB cache first (populated by post sync cron)
+    console.log(`[EngagementMemory] Fetching cached posts for accountId: ${account.account_id}`);
+    const cachedPosts = await getPostsByAccount(account.account_id, 15);
+    console.log(`[EngagementMemory] Found ${cachedPosts.length} cached posts`);
+    if (cachedPosts.length > 0) {
+      recentPostsSummary = cachedPosts
+        .map((p, i) => {
+          const text = p.content || '';
+          const truncated = text.length > 300 ? text.slice(0, 300) + '...' : text;
+          return `Post ${i + 1}: ${truncated}`;
+        })
+        .join('\n\n');
+    } else {
+      // Fallback: try LinkedIn API directly (may fail for personal profiles)
+      const authorUrn = config.account_type === 'company_page' && config.organization_id
+        ? `urn:li:organization:${config.organization_id}`
+        : `urn:li:person:${config.profile_id || account.account_id}`;
+      const postsResponse = await linkedInService.listPosts(accessToken, authorUrn, 0, 15);
+      const posts = postsResponse.elements || [];
+      if (posts.length > 0) {
+        recentPostsSummary = posts
+          .slice(0, 15)
+          .map((p, i) => {
+            const text = p.commentary || '';
+            const truncated = text.length > 300 ? text.slice(0, 300) + '...' : text;
+            return `Post ${i + 1}: ${truncated}`;
+          })
+          .join('\n\n');
+      }
+    }
+  } catch (err) {
+    console.warn(`[EngagementMemory] Failed to fetch posts for ${account.account_id}:`, err);
+  }
+
+  // Build LLM prompt
+  // Detect invalid existing memory (e.g., LLM asked for input instead of generating)
+  const existingContent = existingMemory?.content || '';
+  const isValidMemory = existingContent.length > 0
+    && !existingContent.toLowerCase().includes('please provide')
+    && !existingContent.toLowerCase().includes('standing by')
+    && !existingContent.toLowerCase().includes('once you provide');
+  const isSync = isValidMemory;
+  const systemPrompt = isSync ? MERGE_MEMORY_PROMPT : GENERATE_MEMORY_PROMPT;
+
+  let userContent = `## LinkedIn Profile\n${profileSummary}`;
+  if (recentPostsSummary) {
+    userContent += `\n\n## Recent Posts\n${recentPostsSummary}`;
+  }
+  if (isSync && existingMemory?.content) {
+    userContent += `\n\n## Existing Memory Profile\n${existingMemory.content}`;
+  }
+
+  console.log(`[EngagementMemory] LLM input (${isSync ? 'sync' : 'generate'}): ${userContent.slice(0, 200)}...`);
+
+  // Call Gemini flash-lite
+  const { agentModeService } = await import('./agentModeService');
+  const response = await agentModeService.callLLM(MEMORY_MODEL, [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userContent },
+  ], {
+    temperature: 0.7,
+    max_completion_tokens: 1500,
+  });
+
+  const generatedContent = response.choices[0]?.message?.content?.trim() || '';
+  if (!generatedContent) {
+    throw new Error('LLM returned empty response for memory generation');
+  }
+
+  const now = new Date().toISOString();
+  const memory: EngagementMemory = {
+    content: generatedContent,
+    lastSyncedAt: now,
+    createdAt: existingMemory?.createdAt || now,
+    updatedAt: now,
+  };
+
+  // Save to connected account
+  await saveEngagementMemory(userId, account.account_id, memory);
+
+  return memory;
 }
 

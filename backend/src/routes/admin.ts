@@ -31,6 +31,7 @@ const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
 interface CrmSyncSetting {
   listId: string;
   lastSyncAt?: string;
+  autoSync?: boolean;
 }
 
 const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null => {
@@ -47,6 +48,9 @@ const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null =>
     };
     if (parsed.lastSyncAt && typeof parsed.lastSyncAt === "string") {
       setting.lastSyncAt = parsed.lastSyncAt;
+    }
+    if (typeof parsed.autoSync === "boolean") {
+      setting.autoSync = parsed.autoSync;
     }
     return setting.listId ? setting : null;
   } catch (error) {
@@ -137,6 +141,7 @@ router.get("/crm-sync/:source", async (req, res) => {
         source,
         listId: "",
         lastSyncAt: null,
+        autoSync: false,
       });
     }
 
@@ -144,6 +149,7 @@ router.get("/crm-sync/:source", async (req, res) => {
       source,
       listId: parsed.listId,
       lastSyncAt: parsed.lastSyncAt || null,
+      autoSync: parsed.autoSync || false,
     });
   } catch (error) {
     console.error("Error getting CRM sync setting:", error);
@@ -155,7 +161,7 @@ router.get("/crm-sync/:source", async (req, res) => {
 router.put("/crm-sync/:source", async (req, res) => {
   try {
     const { source } = req.params;
-    const { listId } = req.body;
+    const { listId, autoSync } = req.body;
 
     if (!CRM_SYNC_SOURCES.has(source)) {
       return res.status(400).json({ message: "source must be users or waitlist" });
@@ -177,6 +183,11 @@ router.put("/crm-sync/:source", async (req, res) => {
       listId: normalizedListId,
       lastSyncAt: parsedExisting?.lastSyncAt,
     };
+    if (typeof autoSync === "boolean") {
+      nextSetting.autoSync = autoSync;
+    } else if (parsedExisting?.autoSync !== undefined) {
+      nextSetting.autoSync = parsedExisting.autoSync;
+    }
 
     await settingsService.setSetting(
       settingName,
@@ -190,6 +201,7 @@ router.put("/crm-sync/:source", async (req, res) => {
       source,
       listId: nextSetting.listId,
       lastSyncAt: nextSetting.lastSyncAt || null,
+      autoSync: nextSetting.autoSync || false,
     });
   } catch (error) {
     console.error("Error saving CRM sync setting:", error);
@@ -2452,14 +2464,45 @@ router.get("/chat-sessions", async (req, res) => {
       })
     );
 
-    // Sync mode: batch-score sessions that need it
+    // Sync mode: batch-score sessions that need it (default + all judges)
     if (syncMode) {
-      const { scoreSessionIfNeeded } = await import("../services/sessionScoringService");
+      // Load all configured judges
+      let judges: ScoringJudge[] = [];
+      try {
+        const setting = await settingsService.getSetting("scoring-judges");
+        if (setting?.settingValue) {
+          judges = JSON.parse(setting.settingValue);
+        }
+      } catch (error) {
+        console.error("Error loading scoring judges for sync mode:", error);
+      }
+
       for (const session of sessionsWithMessages) {
+        const s = session as any;
         try {
-          await scoreSessionIfNeeded(session as any);
+          await scoreSessionIfNeeded(s);
         } catch (error) {
-          console.error(`Error scoring session ${(session as any).sessionId}:`, error);
+          console.error(`Error scoring session ${s.sessionId}:`, error);
+        }
+
+        for (const judge of judges) {
+          try {
+            await scoreSessionWithJudgeIfNeeded(s, judge);
+          } catch (error) {
+            console.error(`Error scoring session ${s.sessionId} with judge ${judge.id}:`, error);
+          }
+        }
+      }
+
+      // Re-fetch sessions so response includes newly generated scores
+      if (judges.length > 0) {
+        for (let i = 0; i < sessionsWithMessages.length; i++) {
+          try {
+            const refreshed = await chatbotDb.getChatSession((sessionsWithMessages[i] as any).sessionId);
+            if (refreshed) sessionsWithMessages[i] = refreshed;
+          } catch (error) {
+            // Keep original session data on refresh failure
+          }
         }
       }
     }

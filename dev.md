@@ -1,3 +1,28 @@
+# March 24, 2026: Investigation — Meta Pixel / CAPI Detection on Landing Pages
+
+## Problem
+
+Agent mode session `6219e856-e54a-45cb-b82f-2d14598957bc` (Your360.ai) generated a Meta Ads optimization report that flagged "No conversion tracking" as a critical blocker — the "Results" columns in Meta Ads Manager were empty, suggesting the Meta Pixel or Conversions API was not firing on lead form submissions.
+
+## Investigation Findings
+
+Double-checked Facebook Ads Manager directly. The **Event Match Quality score is 8.3** — pixel tracking is actually working correctly. The pixel is implemented through **PixelFlow** (a third-party pixel management tool), which is why it was not detected by our agent during the page inspection. PixelFlow loads the pixel asynchronously/indirectly, making it invisible to standard DOM-based pixel detection methods.
+
+### Root Cause
+
+Our agent's analysis relied on inspecting the landing page source for Meta Pixel base code (`fbq('init', ...)` or `connect.facebook.net/en_US/fbevents.js`). Since PixelFlow injects the pixel through its own loader, the standard detection approach missed it entirely, leading to a false-positive "no pixel installed" finding in the report.
+
+### Next Steps
+
+Enhance the Meta Ads API integration to support loading **Event Match Quality** scores directly from the Facebook Marketing API. This will allow future analyses to verify pixel health programmatically rather than relying solely on page source inspection. Key endpoints to integrate:
+
+- `GET /{pixel-id}?fields=data_use_setting,event_match_quality` — pixel-level match quality
+- `GET /{ad-account-id}/customconversions` — custom conversion event health
+
+This will make the agent's pixel/CAPI assessments more accurate and avoid false positives when third-party pixel managers (PixelFlow, Google Tag Manager, Segment, etc.) are used.
+
+---
+
 # March 23, 2026: Investigation — Supporting Vendor Role in the System
 
 ## Background
@@ -2319,3 +2344,53 @@ When LLM needs detail -> calls query_message_details("what was the blog URL?")
 - `backend/src/services/agentModeService.ts` — remove window, add summarization, add tool handler, add to foundation tools
 - `backend/src/services/chatbotService.ts` — add `summaries` to ChatSession, add `updateSessionSummaries()`
 - `backend/src/emma/tools.ts` — register `query_message_details` tool
+
+---
+
+## Token Usage Optimization (2026-03-25)
+
+### Investigation Findings (231 tracked prod sessions, March 2026)
+
+| Metric | Value |
+|--------|-------|
+| Total tokens consumed | 171M |
+| Total cost | $1,315 |
+| Avg tokens/session | 741K |
+| Median cost/session | $0.59 |
+| P95 cost/session | $34.96 |
+| Prompt:completion ratio | 94:1 (98.5% prompt tokens) |
+
+**Key insight:** prompt tokens dominate because each LLM call in the iteration loop (up to 20 per turn) resends the full conversation context. A 5-iteration turn with growing context pays prompt tokens on every iteration (e.g. 10K+20K+30K+40K+50K = 150K total).
+
+Token growth by session length:
+- Short (16 msgs): 1.8x growth per call
+- Medium (71 msgs): 7.7x growth
+- Long (142 msgs): 7.9x growth
+- Heaviest (293 msgs, $51): 2.7x growth (started large from prior scheduled runs)
+
+### Changes Implemented
+
+**1. Anthropic Prompt Caching via Bedrock Converse API**
+- Replaced LangChain `ChatBedrockConverse` with direct `ConverseCommand` from `@aws-sdk/client-bedrock-runtime`
+- Added `cachePoint` markers: one after system prompt, one before the last message
+- Within the tool-call iteration loop, each subsequent call only pays full price for the newest exchange; all prior turns hit the cache (90% discount on cached input tokens)
+- Cache metrics logged: `AgentMode: Bedrock cache — read: X, write: Y, uncached input: Z, output: W`
+- Cost estimation updated to account for cache read (10% of input price) and write (125% of input price) tokens
+- Files: `agentModeService.ts` (getBedrockClient, convertToBedrockConverse, estimateCost)
+
+**2. Aggressive Tool Result Summarization**
+- Old tool results (beyond most recent 3) now compressed to ~200-char previews: `[Tool: tool_name — preview...]`
+- Previously these were truncated to 8KB each — with 50+ tool results that's still 400KB of context
+- New approach reduces old tool context by ~97% while preserving tool name and a content hint
+- Files: `agentModeService.ts` (trimToolMessagesForContext)
+
+### Estimated Savings
+- Prompt caching: 30-50% on Claude model sessions (system prompt + conversation prefix cached)
+- Tool summarization: 20-40% additional reduction on long sessions with many tool calls
+- Combined: 50-70% cost reduction expected on typical sessions
+
+### Future Optimization Opportunities
+- Context window summarization (compress old turns into a recap instead of dropping them)
+- Dynamic tool filtering (only send relevant tools based on conversation context)
+- Scheduled session reset (start each run with summary of prior run instead of full history)
+- See "Conversation Summarization Design" section above for the summarization design

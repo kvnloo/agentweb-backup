@@ -97,7 +97,7 @@ export interface ChatMessage {
       sources: string[];
     };
     timestamp: string;
-    portalType?: "customer" | "partner" | "genius" | "agent";
+    portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar";
     pageIdentifier?: string;
     isContextMessage?: boolean;
     toolCalls?: Array<{
@@ -131,7 +131,7 @@ export interface ChatSession {
   updatedAt: string;
   pageContent?: string; // Full page content for storage
   contextChunks?: ContextChunk[]; // Chunked context for RAG
-  portalType?: "customer" | "partner" | "genius" | "agent"; // Added portalType to session
+  portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"; // Added portalType to session
   pageIdentifier?: string; // Added pageIdentifier for page-specific sessions
   archived?: boolean; // Archive status for soft deletion
   selectedStartupId?: string; // Selected startup profile for context
@@ -465,7 +465,7 @@ export class ChatbotDB {
   async createChatSession(
     userId: string,
     pageContent?: string,
-    portalType?: "customer" | "partner" | "genius" | "agent",
+    portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar",
     pageIdentifier?: string,
     selectedStartupId?: string,
     workflowId?: string,
@@ -1458,7 +1458,7 @@ export class ChatbotDB {
 
   async getUserSessions(
     userId: string,
-    portalType?: "customer" | "partner" | "genius" | "agent",
+    portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar",
     limit?: number,
     sortDescending: boolean = true,
     lastEvaluatedKey?: string
@@ -1646,7 +1646,7 @@ export class ChatbotDB {
    */
   async getSessionsWithoutMessages(
     userId: string,
-    portalType?: "customer" | "partner" | "genius" | "agent"
+    portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"
   ): Promise<ChatSession[]> {
     const params: any = {
       TableName: this.tableName,
@@ -1758,7 +1758,7 @@ export class ChatbotDB {
     }
   }
 
-  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius" | "agent"): Promise<number> {
+  async getUserSessionCount(userId: string, portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"): Promise<number> {
     console.log(
       `Getting session count for user: ${userId} from table: ${this.tableName}, portalType: ${portalType || 'all'}`
     );
@@ -1798,7 +1798,7 @@ export class ChatbotDB {
   }
 
   // Get archived sessions for admin management
-  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius" | "agent"): Promise<ChatSession[]> {
+  async getArchivedSessions(userId?: string, portalType?: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"): Promise<ChatSession[]> {
     console.log(
       `Getting archived sessions from table: ${this.tableName}, userId: ${userId || 'all'}, portalType: ${portalType || 'all'}`
     );
@@ -2047,7 +2047,7 @@ export class ChatbotDB {
 
   async updateSessionPortalType(
     sessionId: string,
-    portalType: "customer" | "partner" | "genius" | "agent"
+    portalType: "customer" | "partner" | "genius" | "agent" | "emma-sidebar"
   ): Promise<ChatSession> {
     const timestamp = new Date().toISOString();
 
