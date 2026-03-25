@@ -105,10 +105,9 @@ export default function Skills() {
 
   // Review queue state
   const [pendingSkills, setPendingSkills] = useState<Skill[]>([]);
-  const [pendingWorkPlans, setPendingWorkPlans] = useState<any[]>([]);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
-  const [rejectTarget, setRejectTarget] = useState<{ type: 'skill' | 'plan'; id: string; name: string } | null>(null);
+  const [rejectTarget, setRejectTarget] = useState<{ type: 'skill'; id: string; name: string } | null>(null);
   const [rejectFeedback, setRejectFeedback] = useState("");
 
   const { token } = useAuth();
@@ -186,12 +185,8 @@ export default function Skills() {
   const fetchReviewQueue = useCallback(async () => {
     setReviewLoading(true);
     try {
-      const [skillsRes, plansRes] = await Promise.all([
-        axios.get(buildApiUrl("/api/skills/pending-review"), { headers: { Authorization: `Bearer ${token}` } }),
-        axios.get(buildApiUrl("/api/admin/work-plans/pending-review"), { headers: { Authorization: `Bearer ${token}` } }),
-      ]);
+      const skillsRes = await axios.get(buildApiUrl("/api/skills/pending-review"), { headers: { Authorization: `Bearer ${token}` } });
       setPendingSkills(skillsRes.data || []);
-      setPendingWorkPlans(plansRes.data || []);
     } catch (err) {
       console.error("Failed to fetch review queue", err);
     } finally {
@@ -208,22 +203,11 @@ export default function Skills() {
     } catch (err) { setError("Failed to approve skill"); }
   };
 
-  const handleApprovePlan = async (planId: string) => {
-    try {
-      await axios.post(buildApiUrl(`/api/admin/work-plans/${planId}/approve`), {}, { headers: { Authorization: `Bearer ${token}` } });
-      setSuccessMessage("Work plan approved!");
-      fetchReviewQueue();
-    } catch (err) { setError("Failed to approve work plan"); }
-  };
-
   const handleReject = async () => {
     if (!rejectTarget || !rejectFeedback.trim()) return;
     try {
-      const url = rejectTarget.type === 'skill'
-        ? buildApiUrl(`/api/skills/${rejectTarget.id}/reject`)
-        : buildApiUrl(`/api/admin/work-plans/${rejectTarget.id}/reject`);
-      await axios.post(url, { feedback: rejectFeedback }, { headers: { Authorization: `Bearer ${token}` } });
-      setSuccessMessage(`${rejectTarget.type === 'skill' ? 'Skill' : 'Work plan'} rejected!`);
+      await axios.post(buildApiUrl(`/api/skills/${rejectTarget.id}/reject`), { feedback: rejectFeedback }, { headers: { Authorization: `Bearer ${token}` } });
+      setSuccessMessage("Skill rejected!");
       setRejectDialogOpen(false);
       setRejectTarget(null);
       setRejectFeedback("");
@@ -498,10 +482,10 @@ export default function Skills() {
         {successMessage && <Alert severity="success" sx={{ mb: 3 }} onClose={() => setSuccessMessage("")}>{successMessage}</Alert>}
 
         {/* Review Queue Section */}
-        {(pendingSkills.length > 0 || pendingWorkPlans.length > 0) && (
+        {pendingSkills.length > 0 && (
           <Paper variant="outlined" sx={{ p: 2, mb: 3, borderColor: 'warning.main', bgcolor: 'warning.light', opacity: 0.9 }}>
             <Typography variant="h6" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
-              Pending Review ({pendingSkills.length + pendingWorkPlans.length})
+              Pending Review ({pendingSkills.length})
             </Typography>
             <Stack spacing={1}>
               {pendingSkills.map((skill: Skill) => (
@@ -517,22 +501,6 @@ export default function Skills() {
                   <Stack direction="row" spacing={1}>
                     <Button variant="contained" color="success" size="small" onClick={() => handleApproveSkill(skill.skillId)}>Approve</Button>
                     <Button variant="outlined" color="error" size="small" onClick={() => { setRejectTarget({ type: 'skill', id: skill.skillId, name: skill.name }); setRejectDialogOpen(true); }}>Reject</Button>
-                  </Stack>
-                </Box>
-              ))}
-              {pendingWorkPlans.map((plan: any) => (
-                <Box key={plan.planId} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', p: 1, bgcolor: 'background.paper', borderRadius: 1 }}>
-                  <Box>
-                    <Chip label="Work Plan" size="small" color="secondary" sx={{ mr: 1 }} />
-                    <strong>{plan.title}</strong>
-                    <Typography variant="body2" color="text.secondary" component="span" sx={{ ml: 1 }}>
-                      — {plan.steps?.length || 0} steps
-                    </Typography>
-                    {plan.ownerId && <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>(by {plan.ownerId})</Typography>}
-                  </Box>
-                  <Stack direction="row" spacing={1}>
-                    <Button variant="contained" color="success" size="small" onClick={() => handleApprovePlan(plan.planId)}>Approve</Button>
-                    <Button variant="outlined" color="error" size="small" onClick={() => { setRejectTarget({ type: 'plan', id: plan.planId, name: plan.title }); setRejectDialogOpen(true); }}>Reject</Button>
                   </Stack>
                 </Box>
               ))}
@@ -1230,7 +1198,7 @@ export default function Skills() {
 
       {/* Reject Dialog */}
       <Dialog open={rejectDialogOpen} onClose={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }} maxWidth="sm" fullWidth>
-        <DialogTitle>Reject {rejectTarget?.type === 'skill' ? 'Skill' : 'Work Plan'}: {rejectTarget?.name}</DialogTitle>
+        <DialogTitle>Reject Skill: {rejectTarget?.name}</DialogTitle>
         <DialogContent>
           <TextField
             fullWidth
