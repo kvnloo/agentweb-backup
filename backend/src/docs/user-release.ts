@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-25',
     changes: [
+      'Feature: Connected Accounts Configurable per Subscription Type',
+      '- Admins can now choose which connected account platforms (LinkedIn, Gmail, Meta, YouTube, etc.) are available for each subscription type',
+      '- Configure platform access in the Subscriptions tab of the Admin Dashboard',
+      '- Users only see platforms allowed by their subscription type in Settings → Connected Accounts',
       'Feature: Auto-Sync New Users to CRM Lead List',
       '- New users who sign up (email or Google OAuth) are now automatically added to the configured CRM lead list',
       '- Enable "Auto-sync new users to this lead list" in the Sync to CRM dialog on the Users tab of the Admin Dashboard',
