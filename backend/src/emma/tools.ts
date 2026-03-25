@@ -4730,6 +4730,81 @@ emmaToolRegistry.register({
   }
 });
 
+emmaToolRegistry.register({
+  name: 'save_work_plan',
+  definition: {
+    name: 'save_work_plan',
+    description: 'Save a work plan to the user\'s library for future reuse. The plan starts as private and the user can submit it for platform review later via Settings > Work Plans. Use this after creating a work plan with create_work_plan when the user wants to keep it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the work plan'
+        },
+        description: {
+          type: 'string',
+          description: 'Description of what the work plan accomplishes'
+        },
+        welcomeMessage: {
+          type: 'string',
+          description: 'Optional greeting shown when the plan starts'
+        },
+        steps: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              stepCount: { type: 'number', description: 'Step number (1-based)' },
+              title: { type: 'string', description: 'Step title' },
+              description: { type: 'string', description: 'Step description' },
+            },
+            required: ['stepCount', 'title']
+          },
+          description: 'Array of steps in the work plan'
+        }
+      },
+      required: ['title', 'steps']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    const { workPlanService } = await import('../services/workPlanService');
+    // Normalize steps
+    let steps = args.steps || [];
+    if (typeof steps === 'string') {
+      try { steps = JSON.parse(steps); } catch { steps = []; }
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new Error('At least one step is required');
+    }
+    const plan = await workPlanService.createWorkPlan({
+      title: args.title,
+      description: args.description || '',
+      welcomeMessage: args.welcomeMessage || '',
+      steps: steps.map((s: any, i: number) => ({
+        stepCount: s.stepCount || i + 1,
+        title: s.title,
+        description: s.description || '',
+      })),
+      ownerId: userId,
+      visibility: 'private',
+      isBuiltIn: false,
+    });
+    return {
+      success: true,
+      planId: plan.planId,
+      title: plan.title,
+      steps: plan.steps.length,
+      visibility: plan.visibility,
+      message: `Work plan "${plan.title}" saved successfully. It is currently private. The user can submit it for platform review from Settings > Work Plans.`
+    };
+  }
+});
+
 for (const toolName of adminToolNames) {
   const handler = mcpToolRegistry.getTool(toolName);
   if (handler) {

@@ -2272,6 +2272,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+    'save_work_plan',
 
     // Skill Creation (users can define custom skill bundles)
     'create_skill',

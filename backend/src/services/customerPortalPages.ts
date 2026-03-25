@@ -121,11 +121,6 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     label: 'Social Posts',
     description: 'View and track social media posts and engagement metrics'
   },
-  {
-    path: '/my-work-plans',
-    label: 'My Work Plans',
-    description: 'Create and manage custom work plans for agent sessions'
-  }
 ];
 
 /**
