@@ -1,0 +1,142 @@
+import { Router, Response } from "express";
+import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
+import {
+  addSubdomain,
+  addCustomDomain,
+  removeDomain,
+  listDomains,
+  getDomain,
+  verifyDomain,
+} from "../services/customDomainService";
+
+const router = Router();
+
+router.use(authenticateToken);
+
+/**
+ * GET /api/domains
+ * List all custom domains for the current user.
+ * Optional query param: ?projectId=xxx to filter by Vercel project.
+ */
+router.get("/", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const projectId = req.query.projectId as string | undefined;
+    const domains = await listDomains(userId, projectId);
+    res.json({ domains });
+  } catch (error: any) {
+    console.error("[DOMAINS] Error listing domains:", error);
+    res.status(500).json({ error: "Failed to list domains" });
+  }
+});
+
+/**
+ * GET /api/domains/:id
+ * Get a specific domain record.
+ */
+router.get("/:id", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const domain = await getDomain(req.params.id, userId);
+    if (!domain) return res.status(404).json({ error: "Domain not found" });
+
+    res.json(domain);
+  } catch (error: any) {
+    console.error("[DOMAINS] Error getting domain:", error);
+    res.status(500).json({ error: "Failed to get domain" });
+  }
+});
+
+/**
+ * POST /api/domains/subdomain
+ * Add a subdomain (e.g., mysite.agentwebforms.com) to a landing page project.
+ */
+router.post("/subdomain", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { vercelProjectId, subdomain } = req.body;
+    if (!vercelProjectId || typeof vercelProjectId !== "string") {
+      return res.status(400).json({ error: "vercelProjectId is required" });
+    }
+    if (!subdomain || typeof subdomain !== "string") {
+      return res.status(400).json({ error: "subdomain is required" });
+    }
+
+    const result = await addSubdomain(userId, vercelProjectId, subdomain);
+    res.status(201).json(result);
+  } catch (error: any) {
+    console.error("[DOMAINS] Error adding subdomain:", error);
+    const status = error.message?.includes("Invalid") ? 400 : 500;
+    res.status(status).json({ error: error.message || "Failed to add subdomain" });
+  }
+});
+
+/**
+ * POST /api/domains/custom
+ * Add a custom domain to a landing page project.
+ */
+router.post("/custom", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { vercelProjectId, domain } = req.body;
+    if (!vercelProjectId || typeof vercelProjectId !== "string") {
+      return res.status(400).json({ error: "vercelProjectId is required" });
+    }
+    if (!domain || typeof domain !== "string") {
+      return res.status(400).json({ error: "domain is required" });
+    }
+
+    const result = await addCustomDomain(userId, vercelProjectId, domain);
+    res.status(201).json(result);
+  } catch (error: any) {
+    console.error("[DOMAINS] Error adding custom domain:", error);
+    const status = error.message?.includes("Invalid") ? 400 : 500;
+    res.status(status).json({ error: error.message || "Failed to add custom domain" });
+  }
+});
+
+/**
+ * DELETE /api/domains/:id
+ * Remove a domain from the project and DNS.
+ */
+router.delete("/:id", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    await removeDomain(req.params.id, userId);
+    res.json({ message: "Domain removed successfully" });
+  } catch (error: any) {
+    console.error("[DOMAINS] Error removing domain:", error);
+    const status = error.message?.includes("not found") ? 404 : 500;
+    res.status(status).json({ error: error.message || "Failed to remove domain" });
+  }
+});
+
+/**
+ * POST /api/domains/:id/verify
+ * Check DNS verification status for a custom domain.
+ */
+router.post("/:id/verify", async (req, res: Response) => {
+  try {
+    const userId = (req as unknown as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const result = await verifyDomain(req.params.id, userId);
+    res.json(result);
+  } catch (error: any) {
+    console.error("[DOMAINS] Error verifying domain:", error);
+    const status = error.message?.includes("not found") ? 404 : 500;
+    res.status(status).json({ error: error.message || "Failed to verify domain" });
+  }
+});
+
+export default router;
