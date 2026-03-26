@@ -204,10 +204,16 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doComment) {
-            generatedText = await this.generatePostComment(postContent, engagerMemory);
-            console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
-            await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
-            console.log(`[Executor] Comment posted on post ${postId}`);
+            // Real-time dedup: check if this account already commented on the post
+            const alreadyCommented = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, postId);
+            if (alreadyCommented) {
+                console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
+            } else {
+                generatedText = await this.generatePostComment(postContent, engagerMemory);
+                console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
+                await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
+                console.log(`[Executor] Comment posted on post ${postId}`);
+            }
         }
 
         if (doLike) {
@@ -260,6 +266,26 @@ export class SocialEngagementExecutor {
             console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
         }
         return '[Post content unavailable]';
+    }
+
+    /**
+     * Check if an account has already commented/replied on a post or comment.
+     * Fetches real comments from the LinkedIn API as a runtime dedup safety net.
+     * Fails open (returns false) if the API call fails, so we don't block legitimate comments.
+     */
+    private async hasAccountCommented(
+        adapter: LinkedInAdapter,
+        engagingConnection: ConnectedAccount,
+        engagingUserId: string,
+        targetUrn: string
+    ): Promise<boolean> {
+        try {
+            const comments = await adapter.getComments(engagingConnection, targetUrn, engagingUserId);
+            return comments.some((c) => c.actorUrn === engagingConnection.account_id);
+        } catch (err) {
+            console.warn(`[Executor] Could not fetch comments for dedup check on ${targetUrn}:`, err);
+            return false; // Fail open — don't block commenting if the check fails
+        }
     }
 
     private async generatePostComment(postContent: string, engagerMemory?: string): Promise<string> {
@@ -330,10 +356,16 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doReply) {
-            generatedText = await this.generateCommentReply(commentText || '', engagerMemory);
-            console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
-            await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
-            console.log(`[Executor] Reply posted on comment ${commentId}`);
+            // Real-time dedup: check if this account already replied to the comment
+            const alreadyReplied = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, commentId);
+            if (alreadyReplied) {
+                console.log(`[Executor] Account ${engagingConnection.account_id} already replied to ${commentId}, skipping reply.`);
+            } else {
+                generatedText = await this.generateCommentReply(commentText || '', engagerMemory);
+                console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
+                await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
+                console.log(`[Executor] Reply posted on comment ${commentId}`);
+            }
         }
 
         if (doLike) {
