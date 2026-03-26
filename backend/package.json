@@ -81,6 +81,7 @@
     "mime": "^4.0.4",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^6.10.0",
+    "okareo-ts-sdk": "^0.0.58",
     "openai": "^4.83.0",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",

@@ -182,6 +182,14 @@ export default function Layout() {
                       >
                         Client Health
                       </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
+                        to="/okareo"
+                        variant={isActivePath('/okareo') ? 'contained' : 'text'}
+                      >
+                        Okareo
+                      </Button>
                     </>
                   )}
                   <Button 
