@@ -1385,6 +1385,21 @@ export async function generateSessionResponse(
     }
   }
 
+  // Compute tools to exclude based on page context (e.g. get_visual_context only on visual pages)
+  let excludeTools: string[] | undefined;
+  if (session.portalType === 'emma-sidebar') {
+    // Only include get_visual_context on pages where seeing the rendered UI is useful
+    const visualPages = new Set(['brand-guidelines', 'social-posts', 'images', 'videos', 'email-templates', 'newsletter', 'blog']);
+    const urlPath = (pageContext?.currentUrl || '').replace(/^\//, '');
+    const page = urlPath.split('/')[0].split('?')[0];
+    if (!visualPages.has(page)) {
+      excludeTools = ['get_visual_context'];
+    }
+  } else {
+    // Non-sidebar sessions (agent mode, scheduled chats) never need visual context
+    excludeTools = ['get_visual_context'];
+  }
+
   // Generate AI response using worker process to prevent blocking the main event loop
   // This allows health checks to continue working during long-running operations
   const response = await generateMarketingResponseWorkerService.runInWorker(
@@ -1395,7 +1410,8 @@ export async function generateSessionResponse(
       llmModel,
       sessionId,
       mockMode: false,
-      isInteractiveShare: isInteractiveShare || false
+      isInteractiveShare: isInteractiveShare || false,
+      excludeTools
     },
     (progress) => {
       // Emit progress updates via SSE

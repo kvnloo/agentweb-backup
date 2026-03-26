@@ -3646,7 +3646,6 @@ export async function generateChatResponse(
         // Base tools always available to Emma
         const toolsToInclude = [
           'read_page_source',
-          'get_visual_context',
           'enrich_leads_preview', 'enrich_leads_execute',
           'save_browser_cookies', 'load_browser_cookies', 'clear_browser_cookies',
           'search_user_guide',
@@ -3659,22 +3658,22 @@ export async function generateChatResponse(
         const tab = urlParams.get('tab') || '';
         const pageKey = tab ? `${page}?tab=${tab}` : page;
         const pageToolMap: Record<string, string[]> = {
-          'brand-guidelines': ['read_brand_guidelines', 'update_brand_guidelines'],
+          'brand-guidelines': ['read_brand_guidelines', 'update_brand_guidelines', 'get_visual_context'],
           'market-strategy':  ['read_market_strategy', 'update_market_strategy'],
           'gtm-plan':         ['list_gtm_plans', 'read_gtm_plan', 'create_gtm_plan', 'update_gtm_plan', 'add_gtm_phase', 'add_gtm_work_items', 'update_gtm_work_item', 'update_gtm_phase', 'delete_gtm_items', 'get_gtm_common_items', 'add_gtm_common_items', 'send_gtm_status_report'],
           'crm':              ['get_lead_lists', 'create_lead_list', 'add_leads_to_list', 'get_leads', 'search_leads', 'get_lead_details', 'update_lead', 'delete_leads', 'update_lead_list', 'delete_lead_list', 'update_lead_status', 'get_lead_list_statuses', 'configure_lead_statuses', 'get_lead_engagements', 'add_lead_engagement', 'send_email_to_lead', 'update_email_draft_for_lead'],
-          'social-posts':     ['list_connected_accounts', 'list_connected_account_posts', 'load_connected_account_metrics', 'post_on_connected_account', 'comment_on_linkedin_post', 'react_to_linkedin_post', 'create_social_media_posts'],
+          'social-posts':     ['list_connected_accounts', 'list_connected_account_posts', 'load_connected_account_metrics', 'post_on_connected_account', 'comment_on_linkedin_post', 'react_to_linkedin_post', 'create_social_media_posts', 'get_visual_context'],
           'paid-social':      ['list_connected_accounts', 'list_meta_ads_campaigns', 'get_meta_ads_metrics'],
-          'images':           ['generate_image', 'describe_image'],
-          'videos':           ['generate_video', 'describe_video'],
+          'images':           ['generate_image', 'describe_image', 'get_visual_context'],
+          'videos':           ['generate_video', 'describe_video', 'get_visual_context'],
           'knowledge-base':   ['search_knowledge_base', 'list_knowledge_base_files', 'read_knowledge_base_files', 'read_file_content', 'create_knowledge_base', 'update_knowledge_base_file', 'attach_knowledge_base_files'],
-          'email-templates':  ['list_html_templates', 'create_html_from_template', 'update_html_file'],
+          'email-templates':  ['list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
           'books':            ['list_books', 'get_book_details', 'get_book_content', 'update_book_content', 'generate_book_content', 'create_book', 'create_book_outline', 'add_characters'],
           'research-reports': ['perform_deep_research', 'search_web'],
           'tasks':            ['list_task_templates', 'create_task_from_template', 'create_task_from_prompt'],
-          'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file'],
+          'newsletter':       ['create_social_media_posts', 'list_html_templates', 'create_html_from_template', 'update_html_file', 'get_visual_context'],
           'seo':              ['get_seo_metrics', 'get_website_analytics', 'get_clarity_metrics'],
-          'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article'],
+          'blog':             ['create_blog_article', 'publish_blog_article', 'list_cms_categories', 'repair_blog_article', 'get_visual_context'],
           'agent-mode?tab=scheduled': ['list_scheduled_chats', 'manage_scheduled_chat', 'test_scheduled_chat', 'get_scheduled_chat_test_history', 'submit_scheduled_chat_variables'],
         };
         if (pageToolMap[pageKey]) {

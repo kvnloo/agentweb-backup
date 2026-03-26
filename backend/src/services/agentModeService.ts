@@ -1001,7 +1001,8 @@ export class AgentModeService {
     onProgress?: (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[] }) => void,
     socketEmit?: (room: string, event: string, payload: any) => void,
     isInteractiveShare: boolean = false,
-    isCancelled?: () => boolean
+    isCancelled?: () => boolean,
+    excludeTools?: string[]
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
     try {
       // Track backup model usage
@@ -1199,6 +1200,12 @@ export class AgentModeService {
 
           const skillFilter = isLegacySession ? undefined : allowedToolNames;
           filteredToolsCache = await this.getFilteredTools(userId, skillFilter, userAllowedSkillIds);
+
+          // Exclude tools that are not applicable to the current context (e.g. get_visual_context on non-visual pages)
+          if (excludeTools?.length && filteredToolsCache) {
+            const excludeSet = new Set(excludeTools);
+            filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
+          }
         }
 
         // Trim large old tool results to prevent context window overflow
