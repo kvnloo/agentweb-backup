@@ -99,6 +99,7 @@ export interface GeneratedLandingPage {
   v0ChatId?: string;
   vercelProjectId?: string;
   deployedUrl?: string;
+  customDomainUrl?: string;
   githubRepoUrl?: string;
   previewImageUrl?: string;
   iterations: number;
@@ -1074,7 +1075,8 @@ export async function deployLandingPage(
     return {
       ...record,
       status: "deployed",
-      deployedUrl: customDomain ? `https://${customDomain}` : deployedUrl,
+      deployedUrl,
+      customDomainUrl: customDomain ? `https://${customDomain}` : undefined,
       vercelProjectId,
       githubRepoUrl,
       updatedAt: now,

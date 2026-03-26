@@ -117,15 +117,33 @@ export async function addSubdomain(
   const cleanSubdomain = subdomain.toLowerCase().trim();
   validateSubdomain(cleanSubdomain);
 
-  const fullDomain = `${cleanSubdomain}.${SUBDOMAIN_BASE}`;
   const headers = await getVercelHeaders();
 
-  // Add domain to Vercel project
-  await axios.post(
-    `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
-    { name: fullDomain },
-    { headers }
-  );
+  // Try to add domain to Vercel project, retrying with a random suffix on conflict (409)
+  let finalSubdomain = cleanSubdomain;
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const fullDomain = `${finalSubdomain}.${SUBDOMAIN_BASE}`;
+    try {
+      await axios.post(
+        `${VERCEL_API_BASE}/v10/projects/${vercelProjectId}/domains`,
+        { name: fullDomain },
+        { headers }
+      );
+      break; // Success — exit loop
+    } catch (err: any) {
+      const isConflict = err.response?.status === 409;
+      if (isConflict && attempt < MAX_RETRIES) {
+        // Append a random 4-char hex suffix and retry
+        const suffix = Math.random().toString(16).slice(2, 6);
+        finalSubdomain = `${cleanSubdomain}-${suffix}`.slice(0, 63);
+        continue;
+      }
+      throw err; // Not a conflict or out of retries — propagate
+    }
+  }
+
+  const fullDomain = `${finalSubdomain}.${SUBDOMAIN_BASE}`;
 
   const now = new Date().toISOString();
   const record: CustomDomainRecord = {
