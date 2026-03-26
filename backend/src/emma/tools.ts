@@ -4564,7 +4564,7 @@ const bridgedToolNames = [
   'enable_lead_list_public_access',
   'duplicate_landing_page',
   'get_deployment_status',
-  'list_landing_page_files',
+  // 'list_landing_page_files' — removed: coding_agent handles file listing internally
   'get_landing_page_preview_url',
   'publish_landing_page_changes',
 ];
@@ -4599,7 +4599,7 @@ emmaToolRegistry.register({
   name: 'coding_agent',
   definition: {
     name: 'coding_agent',
-    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code.',
+    description: 'Delegate a code editing task to a specialized coding agent. The coding agent pushes changes to a STAGING draft branch (not directly to production). This creates a Vercel preview deployment URL for the user to review. After calling this tool, ALWAYS tell the user: (1) changes are on a staging branch and NOT live yet, (2) provide the preview URL so they can review, (3) they can ask you to "publish" to push changes live. Use this for ANY task that involves modifying landing page code. IMPORTANT: After coding_agent returns, trust its result — do NOT attempt to verify by reading or listing landing page files yourself (e.g. list_landing_page_files, get_file_contents, read_landing_page_file). The coding agent already verified the changes. If it failed, call coding_agent again with a clearer task_description. Only call coding_agent ONCE per user request unless it explicitly fails.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4616,6 +4616,14 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
+    // Auto-map common param name mistakes (Emma sometimes uses "instructions" instead of "task_description")
+    if (!args.task_description && args.instructions) {
+      args.task_description = args.instructions;
+    }
+    if (!args.task_description) {
+      return { success: false, error: 'task_description is required. Provide a detailed description of the code changes to make.' };
+    }
+
     const { runCodingAgent } = await import('../services/codingAgentService');
     const executeMcpTool = context?.service
       ? async (toolName: string, toolArgs: any) => {
