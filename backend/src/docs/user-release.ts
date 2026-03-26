@@ -20,6 +20,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-25',
     changes: [
+      'Feature: Connected Accounts Configurable per Subscription Type',
+      '- Admins can now choose which connected account platforms (LinkedIn, Gmail, Meta, YouTube, etc.) are available for each subscription type',
+      '- Configure platform access in the Subscriptions tab of the Admin Dashboard',
+      '- Users only see platforms allowed by their subscription type in Settings → Connected Accounts',
       'Feature: Auto-Sync New Users to CRM Lead List',
       '- New users who sign up (email or Google OAuth) are now automatically added to the configured CRM lead list',
       '- Enable "Auto-sync new users to this lead list" in the Sync to CRM dialog on the Users tab of the Admin Dashboard',
@@ -48,6 +52,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: Report Editor Preview Cache',
       '- Fixed an issue where saving HTML changes in the Editor tab did not update the Agentic Revision preview',
       '- The preview now immediately reflects saved edits instead of showing cached content',
+      'Fix: Duplicate Comments in Social Engagements',
+      '- Fixed an issue where automated social engagements could post multiple comments on the same LinkedIn post',
+      '- The system now checks existing comments on a post before commenting, preventing duplicates even if internal tracking is out of sync',
     ],
   },
   {

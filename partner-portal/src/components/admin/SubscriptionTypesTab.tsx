@@ -41,8 +41,19 @@ interface SubscriptionType {
   name: string;
   allowedPages: string[];
   allowedSkills: string[];
+  allowedConnectedAccounts?: string[];
   monthlyTokenAllowance?: number | null;
 }
+
+const AVAILABLE_CONNECTED_ACCOUNTS = [
+  { id: 'linkedin', label: 'LinkedIn' },
+  { id: 'unipile', label: 'LinkedIn Outreach' },
+  { id: 'meta', label: 'Meta Marketing' },
+  { id: 'instagram', label: 'Instagram Business' },
+  { id: 'gmail', label: 'Gmail' },
+  { id: 'youtube', label: 'YouTube' },
+  { id: 'fathom', label: 'Fathom' },
+];
 
 interface AvailableSkill {
   skillId: string;
@@ -71,6 +82,7 @@ const SubscriptionTypesTab: React.FC = () => {
     name: '',
     allowedPages: [],
     allowedSkills: [],
+    allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
     monthlyTokenAllowance: null,
   });
   const [tokenAllowanceInput, setTokenAllowanceInput] = useState('');
@@ -178,23 +190,33 @@ const SubscriptionTypesTab: React.FC = () => {
             return page;
           });
 
+      const allAccountIds = AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id);
+      const expandedConnectedAccounts =
+        !type.allowedConnectedAccounts ||
+        type.allowedConnectedAccounts.includes('*') ||
+        type.allowedConnectedAccounts.length === 0
+          ? allAccountIds
+          : type.allowedConnectedAccounts;
+
       const expandedData: SubscriptionType = {
         name: type.name,
         allowedPages: normalizedPages,
         allowedSkills: type.allowedSkills.includes('*') || type.allowedSkills.length === 0
           ? availableSkills.map((s) => s.skillId)
           : type.allowedSkills,
+        allowedConnectedAccounts: expandedConnectedAccounts,
         monthlyTokenAllowance: type.monthlyTokenAllowance ?? null,
       };
       setFormData(expandedData);
       setTokenAllowanceInput(type.monthlyTokenAllowance != null ? String(type.monthlyTokenAllowance) : '');
     } else {
       setEditingType(null);
-      // When creating new, start with all pages and skills selected
+      // When creating new, start with all pages, skills, and platforms selected
       setFormData({
         name: '',
         allowedPages: availablePages.map((p) => p.path),
         allowedSkills: availableSkills.map((s) => s.skillId),
+        allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
         monthlyTokenAllowance: null,
       });
       setTokenAllowanceInput('');
@@ -210,6 +232,7 @@ const SubscriptionTypesTab: React.FC = () => {
       name: '',
       allowedPages: [],
       allowedSkills: [],
+      allowedConnectedAccounts: AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id),
       monthlyTokenAllowance: null,
     });
     setTokenAllowanceInput('');
@@ -246,6 +269,10 @@ const SubscriptionTypesTab: React.FC = () => {
           formData.allowedSkills.length === availableSkills.length && availableSkills.length > 0
             ? ['*']
             : formData.allowedSkills,
+        allowedConnectedAccounts:
+          (formData.allowedConnectedAccounts?.length ?? 0) === AVAILABLE_CONNECTED_ACCOUNTS.length
+            ? ['*']
+            : formData.allowedConnectedAccounts || [],
         monthlyTokenAllowance: parsedAllowance,
       };
 
@@ -355,6 +382,26 @@ const SubscriptionTypesTab: React.FC = () => {
     }
   };
 
+  const handleToggleConnectedAccount = (accountId: string) => {
+    const current = formData.allowedConnectedAccounts || [];
+    const isSelected = current.includes(accountId);
+    setFormData({
+      ...formData,
+      allowedConnectedAccounts: isSelected
+        ? current.filter((a) => a !== accountId)
+        : [...current, accountId],
+    });
+  };
+
+  const handleToggleAllConnectedAccounts = () => {
+    const allIds = AVAILABLE_CONNECTED_ACCOUNTS.map((a) => a.id);
+    if ((formData.allowedConnectedAccounts?.length ?? 0) === allIds.length) {
+      setFormData({ ...formData, allowedConnectedAccounts: [] });
+    } else {
+      setFormData({ ...formData, allowedConnectedAccounts: allIds });
+    }
+  };
+
   const toggleSkillExpanded = (skillId: string) => {
     setExpandedSkills((prev) => {
       const next = new Set(prev);
@@ -409,13 +456,14 @@ const SubscriptionTypesTab: React.FC = () => {
                 <TableCell>Monthly Token Allowance</TableCell>
                 <TableCell>Allowed Pages</TableCell>
                 <TableCell>Allowed Skills</TableCell>
+                <TableCell>Connected Accounts</TableCell>
                 <TableCell>Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
               {subscriptionTypes.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={5} align="center">
+                  <TableCell colSpan={6} align="center">
                     <Typography variant="body2" color="text.secondary">
                       No subscription types defined. Using default "Basic" type.
                     </Typography>
@@ -474,6 +522,22 @@ const SubscriptionTypesTab: React.FC = () => {
                         <Typography variant="body2" color="text.secondary">
                           {type.allowedSkills.length} skill
                           {type.allowedSkills.length !== 1 ? 's' : ''}
+                        </Typography>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {!type.allowedConnectedAccounts ||
+                      type.allowedConnectedAccounts.includes('*') ||
+                      type.allowedConnectedAccounts.length === AVAILABLE_CONNECTED_ACCOUNTS.length ? (
+                        <Chip label="All Platforms" color="primary" size="small" />
+                      ) : type.allowedConnectedAccounts.length === 0 ? (
+                        <Typography variant="body2" color="text.secondary">
+                          None
+                        </Typography>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          {type.allowedConnectedAccounts.length} platform
+                          {type.allowedConnectedAccounts.length !== 1 ? 's' : ''}
                         </Typography>
                       )}
                     </TableCell>
@@ -673,6 +737,42 @@ const SubscriptionTypesTab: React.FC = () => {
                 )}
               </FormGroup>
             </Box>
+
+            <Typography variant="h6" gutterBottom sx={{ mt: 4 }}>
+              Allowed Connected Accounts
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+              Select which social media platforms users with this subscription type can connect.
+            </Typography>
+            <FormGroup>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={
+                      (formData.allowedConnectedAccounts?.length ?? 0) === AVAILABLE_CONNECTED_ACCOUNTS.length
+                    }
+                    indeterminate={
+                      (formData.allowedConnectedAccounts?.length ?? 0) > 0 &&
+                      (formData.allowedConnectedAccounts?.length ?? 0) < AVAILABLE_CONNECTED_ACCOUNTS.length
+                    }
+                    onChange={handleToggleAllConnectedAccounts}
+                  />
+                }
+                label="Select All Platforms"
+              />
+              {AVAILABLE_CONNECTED_ACCOUNTS.map((account) => (
+                <FormControlLabel
+                  key={account.id}
+                  control={
+                    <Checkbox
+                      checked={formData.allowedConnectedAccounts?.includes(account.id) ?? false}
+                      onChange={() => handleToggleConnectedAccount(account.id)}
+                    />
+                  }
+                  label={account.label}
+                />
+              ))}
+            </FormGroup>
           </Box>
         </DialogContent>
         <DialogActions>
