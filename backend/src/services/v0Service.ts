@@ -5,6 +5,7 @@ import fs from "fs";
 import path from "path";
 import { Agent, setGlobalDispatcher } from "undici";
 import { getV0ApiKey, getGitHubOrgToken, getVercelToken } from "../utils/secretsManager";
+import { addSubdomain, generateSubdomain } from "./customDomainService";
 import { settingsService } from "./settingsService";
 import { paginatedQuery } from "../utils/dynamoPagination";
 
@@ -98,6 +99,7 @@ export interface GeneratedLandingPage {
   v0ChatId?: string;
   vercelProjectId?: string;
   deployedUrl?: string;
+  customDomainUrl?: string;
   githubRepoUrl?: string;
   previewImageUrl?: string;
   iterations: number;
@@ -1058,10 +1060,23 @@ export async function deployLandingPage(
 
     console.log(`[V0 SERVICE] Deployment complete: ${deployedUrl} | GitHub: ${githubRepoUrl}`);
 
+    // Auto-assign an agentwebforms.com subdomain after successful deploy
+    let customDomain: string | undefined;
+    try {
+      const subdomain = generateSubdomain(record.name || "page");
+      const domainRecord = await addSubdomain(userId, vercelProjectId, subdomain);
+      customDomain = domainRecord.domain;
+      console.log(`[V0 SERVICE] Auto-assigned subdomain: ${customDomain}`);
+    } catch (subdomainErr: any) {
+      // Non-fatal — the Vercel URL still works
+      console.warn(`[V0 SERVICE] Could not auto-assign subdomain: ${subdomainErr.message}`);
+    }
+
     return {
       ...record,
       status: "deployed",
       deployedUrl,
+      customDomainUrl: customDomain ? `https://${customDomain}` : undefined,
       vercelProjectId,
       githubRepoUrl,
       updatedAt: now,
