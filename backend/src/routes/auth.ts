@@ -65,6 +65,19 @@ router.get('/me', authenticateToken, async (req, res) => {
       };
     }
 
+    // Lazy-sync subscription status from Stripe if missing
+    if (user.stripe_customer_id && !user.subscription_status) {
+      try {
+        const { syncSubscriptionFromStripe } = await import('../services/stripeService');
+        const synced = await syncSubscriptionFromStripe(user.userId, user.stripe_customer_id);
+        if (synced) {
+          Object.assign(response, synced);
+        }
+      } catch (err: any) {
+        console.error('Error syncing subscription from Stripe:', err.message);
+      }
+    }
+
     // Add subscription type, allowed pages, and allowed skills for customer portal users
     if (user.roles && user.roles.includes('customer')) {
       try {
