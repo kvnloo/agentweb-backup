@@ -50,35 +50,19 @@ const MAX_RETRIES = 2;
 
 // ─── System Prompt ──────────────────────────────────────────────────────────
 
-const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editing landing page code. You have direct access to files in a GitHub repository connected to Vercel. You also have browser tools to verify your changes visually.
+const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing page code in a GitHub repository connected to Vercel. Your edits go to a draft branch, creating a Vercel preview deployment for user review.
 
-## Staging Workflow
-Your edits go to a draft branch (not main). This creates a Vercel preview deployment so the user can review before going live. The user will publish to production separately when satisfied.
+## Principles
+- Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
+- For files over 5KB, use search_in_file to locate code before reading. Use read_file with line ranges, not whole files.
+- Prefer line_edits (from line numbers in search/read output) over search/replace.
+- After editing, check_deployment. If the build fails, fix it. If still failing after 2 attempts, revert_file.
+- Only browse_page to verify when visual correctness matters for the task.
+- Do not make changes the user did not ask for.
+- Before your first edit, note the current commit SHA (via list_commits) so you can revert if needed.
+- When done, call report_to_user with a summary and the preview URL.
 
-## Rules
-1. SEARCH before you READ. For files over 5KB, use search_in_file first to locate the target code, then read_file with a line range. NEVER read an entire large file.
-2. Make small, incremental edits. Each edit_file call should have 1-5 edit blocks.
-3. Use line-number edits (line_edits) whenever you have line numbers from read_file or search_in_file. Fall back to search/replace (edits) only for tiny, unambiguous changes.
-4. After making edits, use check_deployment to verify the preview build succeeds.
-5. If the build fails, read the error, fix it, and check again.
-6. After deployment succeeds, use browse_page to verify the changes look correct on the preview site.
-7. When finished, call report_to_user with a summary of all changes made. Include the preview URL so the user can review.
-8. Do NOT make changes the user did not ask for. Stay focused on the task.
-9. NEVER attempt to rewrite an entire file. Only make targeted edits to specific sections.
-10. BEFORE making any edits, use list_commits to record the current commit SHA. This is your safety bookmark.
-11. If your edits break the build and you cannot fix them within 2 attempts, use revert_file to restore the file to the pre-edit commit SHA.
-
-## Workflow
-1. list_files to see the project structure and file sizes
-2. list_commits (optionally filtered by the file you plan to edit) to record the current commit SHA as a rollback point
-3. search_in_file to find the target code (for files > 5KB)
-4. read_file with start_line/end_line to read only the relevant section
-5. edit_file with line_edits (line numbers from step 3-4) for precise edits
-6. check_deployment to verify the preview build
-7. If build fails: read error → fix → check again. If still failing after 2 fix attempts, revert_file.
-8. browse_page to verify changes visually on the preview deployment
-9. If something looks wrong: fix → redeploy → verify again. If unable to fix, revert_file.
-10. report_to_user when done (include the preview URL and verification results)`;
+Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -800,6 +784,89 @@ async function callWithRetry(
   throw lastError!;
 }
 
+// ─── Failure Summary ─────────────────────────────────────────────────────────
+
+/**
+ * Extract a structured summary from the agent's message history
+ * so the parent agent knows what happened when max iterations is hit.
+ */
+function extractFailureSummary(
+  messages: Anthropic.MessageParam[],
+  maxIterations: number
+): { message: string; previewUrl?: string } {
+  const toolsCalled: string[] = [];
+  const filesEdited: string[] = [];
+  let previewUrl: string | undefined;
+  let lastAgentText = '';
+
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block.type === 'tool_use') {
+          toolsCalled.push(block.name);
+          const input = block.input as any;
+          if (block.name === 'edit_file' && input?.file_path) {
+            if (!filesEdited.includes(input.file_path)) {
+              filesEdited.push(input.file_path);
+            }
+          }
+          if (block.name === 'browse_page' && input?.url) {
+            previewUrl = input.url;
+          }
+        }
+        if (block.type === 'text' && 'text' in block) {
+          lastAgentText = block.text;
+        }
+      }
+    }
+    // Check tool results for preview URLs
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (typeof block === 'object' && 'type' in block && block.type === 'tool_result') {
+          const content = (block as any).content;
+          if (typeof content === 'string') {
+            const urlMatch = content.match(/https:\/\/[^\s"]+\.vercel\.app[^\s"]*/);
+            if (urlMatch) previewUrl = urlMatch[0];
+          }
+        }
+      }
+    }
+  }
+
+  const parts: string[] = [
+    `Coding agent hit the iteration limit (${maxIterations}).`,
+  ];
+
+  if (filesEdited.length > 0) {
+    parts.push(`Files edited: ${filesEdited.join(', ')}.`);
+  } else {
+    parts.push('No files were edited.');
+  }
+
+  if (previewUrl) {
+    parts.push(`Preview: ${previewUrl}`);
+  }
+
+  // Summarize tool call pattern
+  if (toolsCalled.length > 0) {
+    const counts: Record<string, number> = {};
+    for (const t of toolsCalled) counts[t] = (counts[t] || 0) + 1;
+    const summary = Object.entries(counts)
+      .map(([name, count]) => count > 1 ? `${name} x${count}` : name)
+      .join(', ');
+    parts.push(`Activity: ${summary}.`);
+  }
+
+  if (lastAgentText) {
+    const truncated = lastAgentText.length > 200
+      ? lastAgentText.substring(0, 200) + '...'
+      : lastAgentText;
+    parts.push(`Last agent note: "${truncated}"`);
+  }
+
+  return { message: parts.join(' '), previewUrl };
+}
+
 // ─── Main Agent Loop ────────────────────────────────────────────────────────
 
 async function runCodingAgentInternal(
@@ -908,11 +975,14 @@ async function runCodingAgentInternal(
       messages.push({ role: 'user', content: toolResults });
     }
 
-    // Max iterations reached
+    // Max iterations reached — extract useful context for the parent agent
+    const summary = extractFailureSummary(messages, maxIterations);
     return {
       success: false,
-      message: `Coding agent reached maximum iterations (${maxIterations}). The task may be partially complete. Check the deployment for any changes that were made.`,
-      iterations: iteration
+      message: summary.message,
+      iterations: iteration,
+      previewUrl: summary.previewUrl,
+      branch: context.draftBranch,
     };
 
   } catch (error) {
