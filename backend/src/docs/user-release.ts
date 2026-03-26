@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-26',
     changes: [
+      'Improvement: Emma Chat visual context is now page-aware',
+      '- The get_visual_context screenshot tool is now only available on visually-oriented pages (brand guidelines, social posts, images, videos, email templates, newsletter, blog)',
+      '- Reduces unnecessary screenshot prompts on non-visual pages like CRM, knowledge base, and tasks',
+      '- Non-sidebar sessions (agent mode, scheduled chats) no longer include the visual context tool',
       'Internal: Deprecate Legacy Task Scheduling in Agent Engine',
       '- Removed the legacy recurring task schedule execution path from the agent engine',
       '- Scheduled chats (managed by the backend) now fully replace the old scheduling feature',
