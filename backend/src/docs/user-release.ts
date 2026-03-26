@@ -27,6 +27,9 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- Removed the legacy recurring task schedule execution path from the agent engine',
       '- Scheduled chats (managed by the backend) now fully replace the old scheduling feature',
       '- No user-facing behavior changes — scheduled chats continue to run as before',
+      'Improvement: Message Timestamps in Agent Mode',
+      '- Hover over any chat message to see when it was sent',
+      '- Shows relative time: just the time for today, "Yesterday" prefix for yesterday, and date for older messages',
     ],
   },
   {
