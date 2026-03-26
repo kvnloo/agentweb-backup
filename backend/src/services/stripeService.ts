@@ -121,8 +121,25 @@ export async function syncSubscriptionFromStripe(
     const sub = subscriptions.data[0];
     const status = sub.status; // active, trialing, past_due, canceled, etc.
 
-    // Check if customer has a payment method on file (paid vs free trial without card)
-    const hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+    // Check if customer has a payment method on file
+    // Payment method can be on the subscription OR the customer level
+    let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+    if (!hasPaymentMethod) {
+      try {
+        const customer = await stripe.customers.retrieve(stripeCustomerId);
+        if (customer && !customer.deleted) {
+          const cust = customer as any;
+          hasPaymentMethod = !!(cust.default_source || cust.invoice_settings?.default_payment_method);
+          // Also check if any payment methods exist
+          if (!hasPaymentMethod) {
+            const methods = await stripe.paymentMethods.list({ customer: stripeCustomerId, limit: 1 });
+            hasPaymentMethod = methods.data.length > 0;
+          }
+        }
+      } catch {
+        // Non-fatal — default to subscription-level check
+      }
+    }
 
     const updates: any = {
       subscription_status: status,
