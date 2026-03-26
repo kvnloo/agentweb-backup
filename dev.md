@@ -2,40 +2,44 @@
 
 ## Problem
 
-EB event notifications for the production environment (`Agentweb-backend-env-prod-3`, `e-ag9bmkfczz`) were reporting S3 permission errors every 15 minutes:
+EB event notifications for the production environment (`Agentweb-backend-env-prod-3`, `e-ag9bmkfczz`) were reporting S3 permission errors. The `agentweb-test-env-ec2-role` lacked `s3:DeleteObject` on the EB bucket, causing cleanup failures for both tail logs and bundle logs:
 
+**Tail logs** (from cron-based log monitoring):
 ```
 Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-07d440d734bbbcf55
 is not authorized to perform: s3:DeleteObject on resource:
 "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/tail/..."
 ```
 
+**Bundle logs** (from manual `request-environment-info --info-type bundle`):
+```
+Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-03e403b3c8620a994
+is not authorized to perform: s3:DeleteObject on resource:
+"arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/bundle/..."
+```
+
 ## Root Cause
 
-1. Cloud dev instance `i-07d440d734bbbcf55` (`agentweb-test-env-ruiwang-facetoon_image_user-agentweb6`, launched 2026-02-25) had `prod-log-monitor.sh` installed as a cron job running every 15 minutes.
-2. The cron calls `aws elasticbeanstalk request-environment-info` to fetch tail logs from the prod environment.
-3. EB internally uploads tail logs to S3, then tries to clean up (delete) old tail log files **using the caller's IAM role** — in this case `agentweb-test-env-ec2-role`.
-4. That role had permissions for `elasticbeanstalk:RequestEnvironmentInfo` and `elasticbeanstalk:RetrieveEnvironmentInfo`, but **not** `s3:DeleteObject` on the EB bucket.
-5. Result: EB successfully collected and returned logs, but the cleanup step failed every time, generating an ERROR event.
+When any IAM role calls `aws elasticbeanstalk request-environment-info`, EB uploads logs to S3 and later tries to clean up (delete) old log files **using the caller's IAM role**. The `agentweb-test-env-ec2-role` had `elasticbeanstalk:RequestEnvironmentInfo` and `elasticbeanstalk:RetrieveEnvironmentInfo` but **not** `s3:DeleteObject` on the EB bucket. EB successfully collected and returned logs, but cleanup failed every time, generating ERROR events.
 
 ## Fix
 
-Added `s3:DeleteObject` permission to `agentweb-test-env-ec2-role`, scoped to the temporary log prefix:
+Added `s3:DeleteObject` permission to `agentweb-test-env-ec2-role`, scoped to the entire EB bucket:
 
 ```json
 {
-  "Sid": "AllowDeleteEBTailLogs",
+  "Sid": "AllowEBLogCleanup",
   "Effect": "Allow",
   "Action": "s3:DeleteObject",
-  "Resource": "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/*"
+  "Resource": "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/*"
 }
 ```
 
-After applying, the next 15-minute cycle at 18:30 UTC completed cleanly — `Deleted log fragments for this environment.` appeared as INFO instead of ERROR.
+Verified the fix by successfully deleting a bundle log object that previously failed.
 
 ## Lesson
 
-When granting EB log retrieval permissions to an IAM role, also grant `s3:DeleteObject` on `elasticbeanstalk-<region>-<account>/resources/environments/logs/*` so EB can clean up temporary log fragments.
+When granting EB log retrieval permissions to an IAM role, also grant `s3:DeleteObject` on `elasticbeanstalk-<region>-<account>/*` so EB can clean up temporary log fragments (both tail and bundle types).
 
 ---
 
