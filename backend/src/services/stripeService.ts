@@ -105,7 +105,7 @@ export const stripeService = {
 export async function syncSubscriptionFromStripe(
   userId: string,
   stripeCustomerId: string
-): Promise<{ subscription_status: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string } | null> {
+): Promise<{ subscription_status: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean } | null> {
   try {
     const stripe = getStripeOrThrow();
     const subscriptions = await stripe.subscriptions.list({
@@ -121,10 +121,14 @@ export async function syncSubscriptionFromStripe(
     const sub = subscriptions.data[0];
     const status = sub.status; // active, trialing, past_due, canceled, etc.
 
+    // Check if customer has a payment method on file (paid vs free trial without card)
+    const hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+
     const updates: any = {
       subscription_status: status,
       stripe_subscription_id: sub.id,
       current_period_end: new Date((sub as any).current_period_end * 1000).toISOString(),
+      has_payment_method: hasPaymentMethod,
     };
 
     // Derive tier from price if available
@@ -189,6 +193,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     stripe_subscription_id: stripeSubscriptionId,
     subscriptionType,
     subscription_status: 'active',
+    has_payment_method: true, // completed checkout = has payment method
     allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
     allowedSkills: tierConfig?.allowedSkills ?? ['*'],
   });
