@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-26',
     changes: [
+      'Fix: Landing Page Preview URL No Longer Gets Stuck at "Pending"',
+      '- Fixed a bug where the preview URL check returned "pending" for non-existent draft branches, causing the agent to poll indefinitely',
+      '- Non-existent branches now correctly return "not_found", allowing the agent to stop retrying immediately',
+      '- Improved the preview URL tool description so the agent uses the correct branch name from the coding agent result instead of guessing',
       'Improvement: Emma Chat visual context is now page-aware',
       '- The get_visual_context screenshot tool is now only available on visually-oriented pages (brand guidelines, social posts, images, videos, email templates, newsletter, blog)',
       '- Reduces unnecessary screenshot prompts on non-visual pages like CRM, knowledge base, and tasks',
