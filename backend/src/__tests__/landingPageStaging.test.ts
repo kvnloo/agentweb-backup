@@ -472,9 +472,9 @@ describe("GET /preview-url", () => {
     expect(mockGetPreviewDeploymentUrl).toHaveBeenCalledWith("prj_test123", "draft/session-12345678");
   });
 
-  it("SUCCESS: returns pending when no deployment yet", async () => {
+  it("SUCCESS: returns not_found when no deployment exists for the branch", async () => {
     mockGetPreviewDeploymentUrl.mockResolvedValueOnce({
-      buildStatus: "pending",
+      buildStatus: "not_found",
       previewUrl: undefined,
     });
 
@@ -482,6 +482,6 @@ describe("GET /preview-url", () => {
       .get("/api/landing-pages/v0/generated/page-123/preview-url?branch=draft/session-12345678");
 
     expect(res.status).toBe(200);
-    expect(res.body.buildStatus).toBe("pending");
+    expect(res.body.buildStatus).toBe("not_found");
   });
 });
