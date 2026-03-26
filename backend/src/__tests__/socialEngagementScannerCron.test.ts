@@ -267,7 +267,7 @@ describe('SocialEngagementScanner', () => {
       expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
     });
 
-    it('should assign comment_and_like when both are within limits', async () => {
+    it('should schedule separate like and comment actions (not compound comment_and_like) when both are within limits', async () => {
       const ownerAccount = makeAccount({
         account_id: 'acc-owner',
         engagementSettings: {
@@ -289,10 +289,13 @@ describe('SocialEngagementScanner', () => {
 
       await scanner.runScanner();
 
+      // Two separate atomic actions — no compound comment_and_like
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledTimes(2);
       expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
-        expect.objectContaining({
-          variableValues: expect.objectContaining({ actionType: 'comment_and_like' }),
-        })
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'like', targetType: 'post' }) })
+      );
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'comment', targetType: 'post' }) })
       );
     });
 
@@ -347,12 +350,18 @@ describe('SocialEngagementScanner', () => {
 
       await scanner.runScanner();
 
+      // Should never emit legacy compound type
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'like_and_reply_comment' }) })
+      );
+
       expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
         expect.objectContaining({
           variableValues: expect.objectContaining({
             commentId: 'urn:li:comment:200',
             targetType: 'comment',
-            actionType: expect.stringMatching(/^(reply_comment|like_comment|like_and_reply_comment)$/),
+            // Only atomic types — like_and_reply_comment is never emitted by the new scanner
+            actionType: expect.stringMatching(/^(reply_comment|like_comment)$/),
           }),
         })
       );
@@ -715,14 +724,91 @@ describe('SocialEngagementScanner', () => {
         { userId: 'user-1', connected_accounts: [ownerAccount, engagerAccount] },
       ]);
 
+      // Track call order between recordEngagement and createSchedule
+      const callOrder: string[] = [];
+      mockTrackingDb.recordEngagement.mockImplementation(async () => { callOrder.push('record'); return undefined as any; });
+      mockScheduleDb.createSchedule.mockImplementation(async () => { callOrder.push('schedule'); return undefined as any; });
+
       await scanner.runScanner();
 
       expect(mockTrackingDb.recordEngagement).toHaveBeenCalledWith(
-        expect.objectContaining({
-          status: 'queued',
-          userId: 'user-1',
-          postId: 'urn:li:share:100',
-        })
+        expect.objectContaining({ status: 'queued', userId: 'user-1', postId: 'urn:li:share:100' })
+      );
+      // recordEngagement must be called BEFORE createSchedule (Bug 3 fix)
+      expect(callOrder[0]).toBe('record');
+      expect(callOrder[1]).toBe('schedule');
+    });
+  });
+
+  describe('split atomic comment actions', () => {
+    function makeCommentOwnerBoth() {
+      return makeAccount({
+        account_id: 'acc-owner',
+        engagementSettings: {
+          ...makeAccount().engagementSettings,
+          enableCommentDiscovery: true,
+          commentPreferredActions: ['reply', 'like'],
+          maxCommentRepliesPerPost: 1,
+          maxCommentLikesPerPost: 1,
+          commentEngagementWindowMinutes: 1,
+        },
+      });
+    }
+
+    it('should schedule separate reply_comment and like_comment actions (not like_and_reply_comment)', async () => {
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [makeCommentOwnerBoth()] },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'like_and_reply_comment' }) })
+      );
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'reply_comment' }) })
+      );
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'like_comment' }) })
+      );
+    });
+
+    it('should still schedule like_comment when reply_comment is already queued for the same comment', async () => {
+      // reply_comment already handled → hasEngaged returns true only for reply action type
+      mockTrackingDb.hasEngaged.mockImplementation(async (_u, _p, _a, actionType) => {
+        return actionType === 'reply_comment'; // only reply is already done
+      });
+
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [makeCommentOwnerBoth()] },
+      ]);
+
+      await scanner.runScanner();
+
+      // Like should still be scheduled even though reply was already done
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'like_comment' }) })
+      );
+      // Reply should NOT be scheduled again
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'reply_comment' }) })
+      );
+    });
+
+    it('should not schedule reply_comment when per-post reply cap is reached by queued items', async () => {
+      // Simulate cap already hit by queued actions (the GSI fix means these are now counted)
+      mockTrackingDb.getCommentEngagementCountsForPost.mockResolvedValue({
+        likedCount: 0,
+        repliedCount: 1, // at cap (maxCommentRepliesPerPost = 1)
+      });
+      mockUserDb.scanWithFilter.mockResolvedValue([
+        { userId: 'user-1', connected_accounts: [makeCommentOwnerBoth()] },
+      ]);
+
+      await scanner.runScanner();
+
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalledWith(
+        expect.objectContaining({ variableValues: expect.objectContaining({ actionType: 'reply_comment' }) })
       );
     });
   });

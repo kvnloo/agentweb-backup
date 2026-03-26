@@ -82,11 +82,6 @@ import {
   ThumbDown as ThumbDownIcon,
   Sync as SyncIcon,
   Replay as ReplayIcon,
-  ExpandMore as ExpandMoreIcon,
-  ExpandLess as ExpandLessIcon,
-  ContentCopy as ContentCopyIcon,
-  ArrowUpward as ArrowUpwardIcon,
-  ArrowDownward as ArrowDownwardIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -219,6 +214,13 @@ interface User {
   productDomain?: string; // Product site domain for feature usage tracking
   cmsType?: "Basehub" | "Webflow"; // CMS Type for blog publishing
   subscriptionType?: string; // Subscription type for customer portal users
+  tokenUsage?: {
+    month: string;
+    totalTokens: number;
+    totalCost: number;
+    resetDate: string;
+  };
+  tokenAllowanceBonus?: number;
   googleDriveFolders?: Array<{ folderId: string; name: string }>; // Google Drive shared folders
 }
 
@@ -750,6 +752,12 @@ export default function AdminDashboard() {
   const [currentSubscriptionType, setCurrentSubscriptionType] = useState<string>("");
   const [subscriptionTypeEditLoading, setSubscriptionTypeEditLoading] = useState(false);
   const [availableSubscriptionTypes, setAvailableSubscriptionTypes] = useState<string[]>([]);
+  const [subscriptionTypeAllowanceMap, setSubscriptionTypeAllowanceMap] = useState<Record<string, number | null>>({});
+  const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
+  const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
+  const [grantBonusEmail, setGrantBonusEmail] = useState("");
+  const [grantBonusAmount, setGrantBonusAmount] = useState("");
+  const [grantBonusLoading, setGrantBonusLoading] = useState(false);
   const [delegateAccessLoading, setDelegateAccessLoading] = useState<string | null>(null);
   const [emailToDelete, setEmailToDelete] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -836,6 +844,7 @@ export default function AdminDashboard() {
   const [crmSyncSaving, setCrmSyncSaving] = useState(false);
   const [crmSyncRunning, setCrmSyncRunning] = useState(false);
   const [crmSyncForceFull, setCrmSyncForceFull] = useState(false);
+  const [crmSyncAutoSync, setCrmSyncAutoSync] = useState(false);
 
   // Load users data only when Users tab (2) is selected
   useEffect(() => {
@@ -853,10 +862,13 @@ export default function AdminDashboard() {
       });
       const types = response.data;
       // Extract type names, including "Basic" as default
-      const typeNames = types.length > 0 
+      const typeNames = types.length > 0
         ? types.map((t: any) => t.name)
         : ['Basic'];
       setAvailableSubscriptionTypes(typeNames);
+      const allowanceMap: Record<string, number | null> = {};
+      types.forEach((t: any) => { allowanceMap[t.name] = t.monthlyTokenAllowance ?? null; });
+      setSubscriptionTypeAllowanceMap(allowanceMap);
     } catch (error) {
       console.error('Error loading subscription types:', error);
       // Default to Basic if loading fails
@@ -1195,6 +1207,7 @@ export default function AdminDashboard() {
       });
       setCrmSyncListId(response.data?.listId || "");
       setCrmSyncLastSyncAt(response.data?.lastSyncAt || null);
+      setCrmSyncAutoSync(response.data?.autoSync || false);
     } catch (err: any) {
       console.error("Error loading CRM sync config:", err);
       setError(err.response?.data?.message || "Failed to load CRM sync configuration");
@@ -1215,7 +1228,7 @@ export default function AdminDashboard() {
       setCrmSyncSaving(true);
       await axios.put(
         buildApiUrl(`/api/admin/crm-sync/${crmSyncSource}`),
-        { listId: crmSyncListId.trim() },
+        { listId: crmSyncListId.trim(), autoSync: crmSyncAutoSync },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       setSuccess(`CRM sync configuration saved for ${crmSyncSource}.`);
@@ -2408,6 +2421,38 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleGrantTokenBonus = async () => {
+    if (!grantBonusUserId || !grantBonusAmount) return;
+    const amount = parseInt(grantBonusAmount.replace(/,/g, ''), 10);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Bonus amount must be a positive number");
+      return;
+    }
+    try {
+      setGrantBonusLoading(true);
+      const response = await axios.post(
+        buildApiUrl(`/api/admin/users/${grantBonusUserId}/token-bonus`),
+        { bonusTokens: amount },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (response.status === 200) {
+        setUsers((prevUsers: User[]) =>
+          prevUsers.map((user: User) =>
+            user.userId === grantBonusUserId
+              ? { ...user, tokenAllowanceBonus: response.data.tokenAllowanceBonus }
+              : user
+          )
+        );
+        setSuccess(`Granted ${amount.toLocaleString()} bonus tokens to ${grantBonusEmail}`);
+        setGrantBonusDialogOpen(false);
+      }
+    } catch (error: any) {
+      setError(error.response?.data?.message || "Failed to grant token bonus");
+    } finally {
+      setGrantBonusLoading(false);
+    }
+  };
+
   const handleAccessCustomerPortal = async (userId: string) => {
     try {
       setDelegateAccessLoading(userId);
@@ -3381,6 +3426,7 @@ export default function AdminDashboard() {
                       label="Subscription Type"
                     />
                   </TableCell>
+                  <TableCell>Usage</TableCell>
                   <TableCell>Replays</TableCell>
                   <TableCell>Actions</TableCell>
                 </TableRow>
@@ -3388,7 +3434,7 @@ export default function AdminDashboard() {
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={21} align="center">
+                    <TableCell colSpan={22} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
@@ -3985,6 +4031,52 @@ export default function AdminDashboard() {
                             <Typography variant="body2" color="text.secondary">
                               -
                             </Typography>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {user.roles && user.roles.includes("customer") ? (
+                            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                              {(() => {
+                                const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+                                  ? (user.tokenUsage?.totalTokens || 0) : 0;
+                                const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                const bonus = user.tokenAllowanceBonus || 0;
+                                const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
+                                const pct = effectiveAllowance != null ? (used / effectiveAllowance) * 100 : 0;
+                                const color = effectiveAllowance == null ? "text.primary"
+                                  : pct >= 100 ? "error.main"
+                                  : pct >= 80 ? "warning.main"
+                                  : "success.main";
+                                return (
+                                  <Typography variant="body2" sx={{ color }}>
+                                    {used.toLocaleString()}
+                                    {" / "}
+                                    {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
+                                    {bonus > 0 && (
+                                      <Typography component="span" variant="caption" color="text.secondary">
+                                        {" "}(+{bonus.toLocaleString()} bonus)
+                                      </Typography>
+                                    )}
+                                  </Typography>
+                                );
+                              })()}
+                              <Tooltip title="Grant Bonus Tokens">
+                                <IconButton
+                                  size="small"
+                                  onClick={() => {
+                                    setGrantBonusUserId(user.userId);
+                                    setGrantBonusEmail(user.email);
+                                    setGrantBonusAmount("");
+                                    setGrantBonusDialogOpen(true);
+                                  }}
+                                  color="primary"
+                                >
+                                  <AddIcon fontSize="small" />
+                                </IconButton>
+                              </Tooltip>
+                            </Box>
+                          ) : (
+                            <Typography variant="body2" color="text.secondary">-</Typography>
                           )}
                         </TableCell>
                         <TableCell>
@@ -5579,6 +5671,38 @@ export default function AdminDashboard() {
         </DialogActions>
       </Dialog>
 
+      {/* Grant Token Bonus Dialog */}
+      <Dialog open={grantBonusDialogOpen} onClose={() => setGrantBonusDialogOpen(false)}>
+        <DialogTitle>Grant Bonus Tokens</DialogTitle>
+        <DialogContent>
+          <DialogContentText sx={{ mb: 2 }}>
+            Grant additional tokens to <strong>{grantBonusEmail}</strong> for the current month.
+          </DialogContentText>
+          <TextField
+            autoFocus
+            fullWidth
+            label="Bonus Tokens"
+            value={grantBonusAmount}
+            onChange={(e) => setGrantBonusAmount(e.target.value)}
+            placeholder="e.g. 50000"
+            type="text"
+            inputProps={{ inputMode: 'numeric', pattern: '[0-9,]*' }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setGrantBonusDialogOpen(false)} disabled={grantBonusLoading}>
+            Cancel
+          </Button>
+          <Button
+            onClick={handleGrantTokenBonus}
+            variant="contained"
+            disabled={grantBonusLoading || !grantBonusAmount}
+          >
+            {grantBonusLoading ? <CircularProgress size={24} /> : "Grant"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       {/* Chat Dialog */}
       <ChatDialog
         session={selectedSession}
@@ -6921,6 +7045,18 @@ export default function AdminDashboard() {
                 }
                 label="Force full sync"
               />
+              {crmSyncSource === "users" && (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={crmSyncAutoSync}
+                      onChange={(e) => setCrmSyncAutoSync(e.target.checked)}
+                      disabled={crmSyncSaving || crmSyncRunning}
+                    />
+                  }
+                  label="Auto-sync new users to this lead list"
+                />
+              )}
             </Box>
           )}
         </DialogContent>
@@ -6949,39 +7085,11 @@ export default function AdminDashboard() {
 }
 
 // Agent Mode Settings Component
-interface WorkPlanStep {
-  stepCount: number;
-  title: string;
-  description?: string;
-  requiredFunctionCalls?: string[];
-}
-
-interface PredefinedWorkPlan {
-  id?: string;
-  title: string;
-  description?: string;
-  steps: WorkPlanStep[];
-  welcomeMessage?: string;
-  autocomplete?: boolean;
-  requireLogin?: boolean;
-  showLoginSignup?: 'after_plan_completed' | 'always';
-  showInAgentMode?: boolean;
-  defaultModel?: string;
-}
-
-interface AvailableFunctionCall {
-  name: string;
-  description: string;
-}
-
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
-  const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
-  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
-  const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [contentModel, setContentModel] = useState('');
@@ -6990,8 +7098,6 @@ const AgentModeSettings = () => {
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
-  const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
-  const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
   const [savingScheduledChatsDefaultModel, setSavingScheduledChatsDefaultModel] = useState(false);
@@ -7007,14 +7113,6 @@ const AgentModeSettings = () => {
   const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
-  const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
-  const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
-  const [planSyncStatus, setPlanSyncStatus] = useState<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>>({});
-  const [syncEnvironment, setSyncEnvironment] = useState<'development' | 'production'>('production');
-  const [syncingPlanId, setSyncingPlanId] = useState<string | null>(null);
-  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
-  const [planToSync, setPlanToSync] = useState<PredefinedWorkPlan | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
@@ -7022,25 +7120,6 @@ const AgentModeSettings = () => {
     loadAllSettings();
   }, []);
 
-  // Scroll to newly added work plan
-  useEffect(() => {
-    if (newlyAddedPlanId) {
-      // Use setTimeout to ensure DOM is updated
-      setTimeout(() => {
-        const element = document.getElementById(`work-plan-${newlyAddedPlanId}`);
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          // Focus on the title field for better UX
-          const titleInput = element.querySelector('input[type="text"]') as HTMLInputElement;
-          if (titleInput) {
-            titleInput.focus();
-          }
-        }
-        // Clear the newly added plan ID after scrolling
-        setNewlyAddedPlanId(null);
-      }, 100);
-    }
-  }, [newlyAddedPlanId, predefinedWorkPlans]);
 
   const loadAllSettings = async () => {
     try {
@@ -7058,15 +7137,6 @@ const AgentModeSettings = () => {
 
       // Load conversation starters
       await loadConversationStarters();
-
-      // Load available function calls
-      await loadAvailableFunctionCalls();
-
-      // Load predefined work plans
-      await loadPredefinedWorkPlans();
-
-      // Load plan sync status
-      await loadPlanSyncStatus();
 
       // Load content model
       await loadContentModel();
@@ -7143,26 +7213,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const loadAvailableFunctionCalls = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/agent-mode/function-calls'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      if (response.data && response.data.functionCalls) {
-        // Filter out work plan management functions
-        const workPlanFunctions = ['create_work_plan', 'modify_work_plan', 'set_work_plan_status'];
-        const filtered = response.data.functionCalls.filter(
-          (func: AvailableFunctionCall) => !workPlanFunctions.includes(func.name)
-        );
-        setAvailableFunctionCalls(filtered);
-      }
-    } catch (error) {
-      console.error('Error loading available function calls:', error);
-      // Don't fail the entire load if this fails
-      setAvailableFunctionCalls([]);
-    }
-  };
 
   const loadSystemPrompt = async () => {
     try {
@@ -7257,167 +7307,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
-    id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-    autocomplete: false,
-    requireLogin: false,
-    showLoginSignup: 'after_plan_completed',
-    showInAgentMode: false,
-    title: 'Onboarding',
-    welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
-    steps: [
-      {
-        stepCount: 1,
-        title: 'Analyze website and business',
-        description: 'Research and analyze the client\'s website and business to understand their industry, target audience, and current marketing presence',
-        requiredFunctionCalls: ['search_web']
-      },
-      {
-        stepCount: 2,
-        title: 'Create/update brand guidelines',
-        description: 'Establish or update brand guidelines including colors, fonts, tone of voice, and visual identity',
-        requiredFunctionCalls: ['update_brand_guidelines']
-      },
-      {
-        stepCount: 3,
-        title: 'Create/update marketing strategy',
-        description: 'Develop a comprehensive marketing strategy based on business analysis and brand guidelines',
-        requiredFunctionCalls: ['update_marketing_strategy']
-      },
-      {
-        stepCount: 4,
-        title: 'Generate 3 blog articles',
-        description: 'Create three high-quality blog articles aligned with the marketing strategy and brand voice',
-        requiredFunctionCalls: ['create_blog_article']
-      },
-      {
-        stepCount: 5,
-        title: 'Generate social media posts',
-        description: 'Create engaging social media content and visuals to support the marketing strategy',
-        requiredFunctionCalls: ['generate_image']
-      }
-    ]
-  });
-
-  const loadPredefinedWorkPlans = async () => {
-    try {
-      try {
-        const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
-        if (response.data && response.data.settingValue) {
-          const workPlans = JSON.parse(response.data.settingValue);
-          
-          // Ensure all work plans have IDs (for backward compatibility)
-          const workPlansWithIds = workPlans.map((wp: PredefinedWorkPlan) => {
-            if (!wp.id) {
-              // Generate ID from title or create a new one
-              wp.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            }
-            return wp;
-          });
-          
-          // Check if "Onboarding" work plan already exists
-          const hasOnboarding = workPlansWithIds.some((wp: PredefinedWorkPlan) => 
-            wp.title.toLowerCase() === 'onboarding'
-          );
-          
-          // If no Onboarding plan exists, add the default one
-          if (!hasOnboarding) {
-            const defaultOnboardingPlan = getDefaultOnboardingPlan();
-            defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            workPlansWithIds.push(defaultOnboardingPlan);
-            
-            // Save the updated work plans with the default Onboarding plan
-            try {
-              await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-                settingValue: JSON.stringify(workPlansWithIds),
-                description: 'Agent Mode predefined work plans for Emma AI assistant'
-              }, {
-                headers: { Authorization: `Bearer ${token}` }
-              });
-            } catch (saveError) {
-              console.error('Error saving default Onboarding work plan:', saveError);
-              // Continue anyway - we'll still show it in the UI
-            }
-          }
-          
-          setPredefinedWorkPlans(workPlansWithIds);
-          return;
-        }
-      } catch (settingsError: any) {
-        // If setting doesn't exist (404), create default Onboarding plan
-        if (settingsError.response?.status === 404) {
-          const defaultOnboardingPlan = getDefaultOnboardingPlan();
-          defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-          
-          // Try to save the default Onboarding plan
-          try {
-            await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-              settingValue: JSON.stringify([defaultOnboardingPlan]),
-              description: 'Agent Mode predefined work plans for Emma AI assistant'
-            }, {
-              headers: { Authorization: `Bearer ${token}` }
-            });
-          } catch (saveError) {
-            console.error('Error saving default Onboarding work plan:', saveError);
-            // Continue anyway - we'll still show it in the UI
-          }
-          
-          setPredefinedWorkPlans([defaultOnboardingPlan]);
-          return;
-        } else {
-          console.error('Error loading predefined work plans:', settingsError);
-          setPredefinedWorkPlans([]);
-        }
-      }
-    } catch (error) {
-      console.error('Error loading predefined work plans:', error);
-      setPredefinedWorkPlans([]);
-    }
-  };
-
-  const loadPlanSyncStatus = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync-status'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setPlanSyncStatus(response.data.plans || {});
-      setSyncEnvironment(response.data.environment || 'production');
-    } catch (err) {
-      console.error('Error loading plan sync status:', err);
-    }
-  };
-
-  const syncDirection = syncEnvironment === 'development' ? 'dev-to-prod' : 'prod-to-dev';
-  const syncLabel = syncEnvironment === 'development' ? 'Dev → Prod' : 'Prod → Dev';
-
-  const handleOpenSyncDialog = (workPlan: PredefinedWorkPlan) => {
-    setPlanToSync(workPlan);
-    setSyncDialogOpen(true);
-  };
-
-  const handleSyncPlan = async () => {
-    if (!planToSync?.id) return;
-    try {
-      setSyncingPlanId(planToSync.id);
-      await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync'), {
-        planId: planToSync.id,
-        direction: syncDirection
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSuccess(`Plan "${planToSync.title}" synced ${syncLabel}`);
-      setSyncDialogOpen(false);
-      setPlanToSync(null);
-      await loadPlanSyncStatus();
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Failed to sync plan');
-    } finally {
-      setSyncingPlanId(null);
-    }
-  };
 
   const loadContentModel = async () => {
     try {
@@ -7863,276 +7752,6 @@ const AgentModeSettings = () => {
     } finally {
       setSavingConversationStarters(false);
     }
-  };
-
-  const saveIndividualWorkPlan = async (workPlanIndex: number) => {
-    const workPlan = predefinedWorkPlans[workPlanIndex];
-    if (!workPlan) {
-      setError('Work plan not found');
-      return;
-    }
-
-    // Generate ID if it doesn't exist (for new plans)
-    const planId = workPlan.id || `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-    // Clear previous messages
-    setError('');
-    setSuccess('');
-    setWorkPlanErrors(prev => {
-      const updated = { ...prev };
-      delete updated[planId];
-      return updated;
-    });
-    
-    try {
-      setSavingWorkPlanId(planId);
-      setSavingWorkPlanIndex(workPlanIndex);
-      
-      // Validate work plan title
-      if (workPlan.title.trim().length === 0) {
-        const errorMsg = 'Work plan must have a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        // Scroll to the work plan
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate that at least one step exists
-      if (!workPlan.steps || workPlan.steps.length === 0) {
-        const errorMsg = 'Work plan must have at least one step';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate that the first step has a title (first step is required)
-      if (!workPlan.steps[0] || workPlan.steps[0].title.trim().length === 0) {
-        const errorMsg = 'The first step is required and must have a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        // Scroll to the first step input field
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            const firstStepInput = workPlanCard.querySelector('input[placeholder*="Step Title"]') as HTMLInputElement;
-            if (firstStepInput) {
-              firstStepInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              firstStepInput.focus();
-            } else {
-              workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate work plan
-      const validatedWorkPlan = {
-        id: planId,
-        title: workPlan.title.trim(),
-        description: workPlan.description?.trim() || undefined,
-        welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: workPlan.autocomplete || false,
-        requireLogin: workPlan.requireLogin || false,
-        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
-        showInAgentMode: workPlan.showInAgentMode || false,
-        defaultModel: workPlan.defaultModel?.trim() || undefined,
-        steps: workPlan.steps
-          .filter(step => step.title.trim().length > 0)
-          .map((step, index) => ({
-            stepCount: index + 1,
-            title: step.title.trim(),
-            description: step.description?.trim() || undefined,
-            requiredFunctionCalls: step.requiredFunctionCalls?.filter(f => f.trim().length > 0) || undefined
-          }))
-      };
-
-      // Final validation after filtering
-      if (validatedWorkPlan.steps.length === 0) {
-        const errorMsg = 'Work plan must have at least one step with a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Try PUT first (for existing plans), fall back to POST if plan doesn't exist (404)
-      try {
-        // Try to update existing work plan
-        await axios.put(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${planId}`), validatedWorkPlan, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (putError: any) {
-        // If PUT fails with 404, the plan doesn't exist yet, so create it with POST
-        if (putError.response?.status === 404) {
-          await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), validatedWorkPlan, {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-        } else {
-          // Re-throw other errors
-          throw putError;
-        }
-      }
-      
-      // Update local state with the validated plan (including the ID)
-      const updated = [...predefinedWorkPlans];
-      updated[workPlanIndex] = validatedWorkPlan;
-      setPredefinedWorkPlans(updated);
-      setSuccess(`Work plan "${validatedWorkPlan.title}" saved successfully!`);
-      // Clear any work plan specific errors
-      setWorkPlanErrors(prev => {
-        const updated = { ...prev };
-        delete updated[planId];
-        return updated;
-      });
-    } catch (error: any) {
-      console.error('Error saving work plan:', error);
-      const errorMessage = error.response?.data?.error || 'Failed to save work plan';
-      setError(errorMessage);
-      setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMessage }));
-    } finally {
-      setSavingWorkPlanId(null);
-      setSavingWorkPlanIndex(null);
-    }
-  };
-
-  const addWorkPlan = async () => {
-    const newWorkPlan: PredefinedWorkPlan = {
-      id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      title: '',
-      steps: [{ stepCount: 1, title: '' }],
-      autocomplete: false,
-      requireLogin: false,
-      showLoginSignup: 'after_plan_completed',
-      showInAgentMode: false,
-      defaultModel: undefined
-    };
-    
-    setPredefinedWorkPlans([
-      ...predefinedWorkPlans,
-      newWorkPlan
-    ]);
-    
-    // Set the newly added plan ID to trigger scroll and expand
-    setNewlyAddedPlanId(newWorkPlan.id || null);
-    setExpandedPlanId(newWorkPlan.id || null);
-  };
-
-  const removeWorkPlan = async (index: number) => {
-    const workPlan = predefinedWorkPlans[index];
-    if (!workPlan) return;
-
-    // If the work plan has an ID and has been saved, delete it from the backend
-    if (workPlan.id) {
-      try {
-        setSavingWorkPlanId(workPlan.id);
-        setSavingWorkPlanIndex(index);
-        await axios.delete(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${workPlan.id}`), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (error: any) {
-        console.error('Error deleting work plan from backend:', error);
-        const errorMessage = error.response?.data?.error || 'Failed to delete work plan from backend';
-        setError(errorMessage);
-        // Continue with local removal even if backend delete fails
-      } finally {
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-      }
-    }
-
-    // Remove from local state
-    setPredefinedWorkPlans(predefinedWorkPlans.filter((_, i) => i !== index));
-    
-    // Clear any errors for this work plan
-    if (workPlan.id) {
-      setWorkPlanErrors(prev => {
-        const updated = { ...prev };
-        delete updated[workPlan.id!];
-        return updated;
-      });
-    }
-  };
-
-  const updateWorkPlan = (index: number, workPlan: PredefinedWorkPlan) => {
-    const updated = [...predefinedWorkPlans];
-    updated[index] = workPlan;
-    setPredefinedWorkPlans(updated);
-  };
-
-  const addStepToWorkPlan = (workPlanIndex: number) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps.push({
-      stepCount: updated[workPlanIndex].steps.length + 1,
-      title: ''
-    });
-    setPredefinedWorkPlans(updated);
-  };
-
-  const removeStepFromWorkPlan = (workPlanIndex: number, stepIndex: number) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps = updated[workPlanIndex].steps
-      .filter((_, i) => i !== stepIndex)
-      .map((step, i) => ({ ...step, stepCount: i + 1 }));
-    setPredefinedWorkPlans(updated);
-  };
-
-  const moveStepInWorkPlan = (workPlanIndex: number, stepIndex: number, direction: 'up' | 'down') => {
-    const updated = [...predefinedWorkPlans];
-    const steps = [...updated[workPlanIndex].steps];
-    const targetIndex = direction === 'up' ? stepIndex - 1 : stepIndex + 1;
-    if (targetIndex < 0 || targetIndex >= steps.length) return;
-    [steps[stepIndex], steps[targetIndex]] = [steps[targetIndex], steps[stepIndex]];
-    updated[workPlanIndex] = { ...updated[workPlanIndex], steps: steps.map((s, i) => ({ ...s, stepCount: i + 1 })) };
-    setPredefinedWorkPlans(updated);
-  };
-
-  const duplicateWorkPlan = (index: number) => {
-    const original = predefinedWorkPlans[index];
-    const copy: PredefinedWorkPlan = {
-      ...JSON.parse(JSON.stringify(original)),
-      id: undefined,
-      title: `${original.title} (Copy)`,
-    };
-    const tempId = `new-${Date.now()}`;
-    setPredefinedWorkPlans([...predefinedWorkPlans, copy]);
-    setExpandedPlanId(tempId);
-    setNewlyAddedPlanId(tempId);
-  };
-
-  const togglePlanExpanded = (planId: string) => {
-    setExpandedPlanId(prev => prev === planId ? null : planId);
-  };
-
-  const updateStepInWorkPlan = (workPlanIndex: number, stepIndex: number, step: WorkPlanStep) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps[stepIndex] = step;
-    setPredefinedWorkPlans(updated);
   };
 
   const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
@@ -8835,500 +8454,24 @@ const AgentModeSettings = () => {
         </CardContent>
       </Card>
 
-      {/* Predefined Work Plans */}
+      {/* Work Plans - moved to dedicated /work-plans page */}
       <Card>
         <CardContent>
-          <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+          <Box display="flex" justifyContent="space-between" alignItems="center">
             <Typography variant="h6">
-              Predefined Work Plans
+              Work Plans
             </Typography>
-            <Box>
-              <Button
-                variant="outlined"
-                startIcon={<AddIcon />}
-                onClick={addWorkPlan}
-                disabled={false}
-                sx={{ mr: 1 }}
-              >
-                Add Work Plan
-              </Button>
-            </Box>
+            <Button variant="outlined" href="/work-plans">
+              Manage Work Plans
+            </Button>
           </Box>
-          
-          <Typography variant="body2" color="text.secondary" paragraph>
-            Configure predefined work plans that can be used in Agent Mode. Each work plan consists of a title and multiple steps.
-          </Typography>
-
-          {predefinedWorkPlans.length === 0 ? (
-            <Box sx={{ textAlign: 'center', py: 4 }}>
-              <Typography variant="body2" color="text.secondary">
-                No predefined work plans configured. Click "Add Work Plan" to create one.
-              </Typography>
-            </Box>
-          ) : (
-            <Box>
-              {predefinedWorkPlans.map((workPlan, workPlanIndex) => {
-                const planKey = workPlan.id || `index-${workPlanIndex}`;
-                const isExpanded = expandedPlanId === planKey;
-                return (
-                <Card
-                  key={workPlan.id || workPlanIndex}
-                  id={`work-plan-${workPlan.id || workPlanIndex}`}
-                  sx={{ mb: 2, border: '1px solid', borderColor: 'divider' }}
-                >
-                  <CardContent sx={{ pb: isExpanded ? undefined : '16px !important' }}>
-                    {workPlanErrors[workPlan.id || ''] && (
-                      <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
-                        setWorkPlanErrors(prev => {
-                          const updated = { ...prev };
-                          delete updated[workPlan.id || ''];
-                          return updated;
-                        });
-                      }}>
-                        {workPlanErrors[workPlan.id || '']}
-                      </Alert>
-                    )}
-                    {/* Collapsed header row */}
-                    <Box display="flex" justifyContent="space-between" alignItems="center">
-                      <Box
-                        display="flex"
-                        alignItems="center"
-                        sx={{ cursor: 'pointer', flex: 1, mr: 2, minWidth: 0 }}
-                        onClick={() => togglePlanExpanded(planKey)}
-                      >
-                        <IconButton size="small" sx={{ mr: 1 }}>
-                          {isExpanded ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-                        </IconButton>
-                        <Typography variant="subtitle1" fontWeight="medium" noWrap sx={{ mr: 2 }}>
-                          {workPlan.title || 'Untitled Plan'}
-                        </Typography>
-                        <Box display="flex" gap={0.5} flexWrap="wrap">
-                          <Chip label={`${workPlan.steps.length} step${workPlan.steps.length !== 1 ? 's' : ''}`} size="small" variant="outlined" />
-                          {workPlan.showInAgentMode && <Chip label="Visible" size="small" color="success" />}
-                          {workPlan.requireLogin && <Chip label="Login Required" size="small" color="warning" variant="outlined" />}
-                          {workPlan.autocomplete && <Chip label="Autocomplete" size="small" color="info" variant="outlined" />}
-                          {workPlan.defaultModel && <Chip label={workPlan.defaultModel} size="small" variant="outlined" />}
-                          {workPlan.id && planSyncStatus[workPlan.id] && (
-                            planSyncStatus[workPlan.id].inSync
-                              ? <Chip label="In Sync" size="small" color="success" variant="outlined" />
-                              : planSyncStatus[workPlan.id].existsInProd && planSyncStatus[workPlan.id].existsInDev
-                                ? <Chip label={`Out of Sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`} size="small" color="warning" variant="outlined" />
-                                : <Chip label={syncEnvironment === 'development' ? 'Dev Only' : 'Prod Only'} size="small" color="info" variant="outlined" />
-                          )}
-                        </Box>
-                      </Box>
-                      <Box display="flex" gap={0.5} flexShrink={0}>
-                        {workPlan.id && syncEnvironment && (
-                          <Tooltip title={
-                            planSyncStatus[workPlan.id]?.inSync
-                              ? "Prod & Dev in sync"
-                              : planSyncStatus[workPlan.id]?.changedFields?.length
-                                ? `Out of sync: ${planSyncStatus[workPlan.id].changedFields.join(', ')}`
-                                : !planSyncStatus[workPlan.id]?.existsInProd
-                                  ? "Missing in Prod"
-                                  : !planSyncStatus[workPlan.id]?.existsInDev
-                                    ? "Missing in Dev"
-                                    : `Sync Plan (${syncLabel})`
-                          }>
-                            <span>
-                              <IconButton
-                                size="small"
-                                onClick={() => handleOpenSyncDialog(workPlan)}
-                                disabled={planSyncStatus[workPlan.id]?.inSync}
-                              >
-                                {syncingPlanId === workPlan.id ? <CircularProgress size={18} /> : <SyncIcon fontSize="small" />}
-                              </IconButton>
-                            </span>
-                          </Tooltip>
-                        )}
-                        <Tooltip title="Duplicate plan">
-                          <IconButton
-                            size="small"
-                            onClick={() => duplicateWorkPlan(workPlanIndex)}
-                            disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
-                          >
-                            <ContentCopyIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                        <Button
-                          variant="contained"
-                          onClick={() => saveIndividualWorkPlan(workPlanIndex)}
-                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
-                          size="small"
-                        >
-                          {(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex) ? <CircularProgress size={20} /> : 'Save'}
-                        </Button>
-                        <IconButton
-                          color="error"
-                          onClick={() => removeWorkPlan(workPlanIndex)}
-                          disabled={(savingWorkPlanId === workPlan.id || savingWorkPlanIndex === workPlanIndex)}
-                          size="small"
-                        >
-                          <DeleteIcon fontSize="small" />
-                        </IconButton>
-                      </Box>
-                    </Box>
-
-                    <Collapse in={isExpanded}>
-                    <Box sx={{ mt: 2 }}>
-                    <TextField
-                      label="Work Plan Title"
-                      value={workPlan.title}
-                      onChange={(e) => {
-                        updateWorkPlan(workPlanIndex, { ...workPlan, title: e.target.value });
-                        if (workPlanErrors[workPlan.id || '']) {
-                          setWorkPlanErrors(prev => {
-                            const updated = { ...prev };
-                            delete updated[workPlan.id || ''];
-                            return updated;
-                          });
-                        }
-                      }}
-                      placeholder="Enter work plan title..."
-                      variant="outlined"
-                      fullWidth
-                      sx={{ mb: 2 }}
-                      error={!!workPlanErrors[workPlan.id || ''] && workPlanErrors[workPlan.id || ''].includes('title')}
-                    />
-
-                    <TextField
-                      label="Description (Optional)"
-                      value={workPlan.description || ''}
-                      onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, description: e.target.value })}
-                      placeholder="Enter a brief description of this work plan..."
-                      variant="outlined"
-                      fullWidth
-                      multiline
-                      rows={2}
-                      sx={{ mb: 2 }}
-                      helperText="This description will be displayed on the work plan card in Agent Mode."
-                    />
-
-                    <TextField
-                      label="Welcome Message (Optional)"
-                      value={workPlan.welcomeMessage || ''}
-                      onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, welcomeMessage: e.target.value })}
-                      placeholder="Enter the welcome message to display when a session is created with this plan... (supports HTML formatting)"
-                      variant="outlined"
-                      fullWidth
-                      multiline
-                      rows={4}
-                      sx={{ mb: 2 }}
-                      helperText="This message will be displayed as the welcome message when a session is created with this plan. If not provided, the default Agent Mode welcome message will be used."
-                    />
-
-                    <Box sx={{ mb: 2 }}>
-                      <Box display="flex" flexDirection="column" gap={2}>
-                        <Box display="flex" flexWrap="wrap" gap={3}>
-                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  checked={workPlan.autocomplete || false}
-                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, autocomplete: e.target.checked })}
-                                  disabled={false}
-                                />
-                              }
-                              label="Autocomplete Steps"
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
-                              When enabled, Emma MUST complete each step before responding to the user. Steps will be automatically completed when all required function calls are executed.
-                            </Typography>
-                          </Box>
-                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  checked={workPlan.requireLogin || false}
-                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, requireLogin: e.target.checked })}
-                                  disabled={false}
-                                />
-                              }
-                              label="Require Login"
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
-                              Users must log in before starting this plan.
-                            </Typography>
-                          </Box>
-                          <Box display="flex" flexDirection="column" sx={{ minWidth: 200 }}>
-                            <FormControlLabel
-                              control={
-                                <Checkbox
-                                  checked={workPlan.showInAgentMode || false}
-                                  onChange={(e) => updateWorkPlan(workPlanIndex, { ...workPlan, showInAgentMode: e.target.checked })}
-                                  disabled={false}
-                                />
-                              }
-                              label="Show in Agent Mode"
-                            />
-                            <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
-                              When enabled, this plan will be displayed on the agent-mode/new page in the customer portal.
-                            </Typography>
-                          </Box>
-                        </Box>
-                      </Box>
-                    </Box>
-
-                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                      <InputLabel>Show Login/Signup</InputLabel>
-                      <Select
-                        value={workPlan.showLoginSignup || 'after_plan_completed'}
-                        label="Show Login/Signup"
-                        onChange={(e) =>
-                          updateWorkPlan(workPlanIndex, {
-                            ...workPlan,
-                            showLoginSignup: e.target.value as 'after_plan_completed' | 'always'
-                          })
-                        }
-                        disabled={false}
-                      >
-                        <MenuItem value="after_plan_completed">After plan completed</MenuItem>
-                        <MenuItem value="always">Always</MenuItem>
-                      </Select>
-                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                        Controls when the login/signup prompt is displayed during a plan session.
-                      </Typography>
-                    </FormControl>
-
-                    {/* Default Model Selection */}
-                    <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                      <InputLabel>Default Model (Optional)</InputLabel>
-                      <Select
-                        value={workPlan.defaultModel || ''}
-                        onChange={(e) => {
-                          const updated = [...predefinedWorkPlans];
-                          updated[workPlanIndex].defaultModel = e.target.value || undefined;
-                          setPredefinedWorkPlans(updated);
-                        }}
-                        label="Default Model (Optional)"
-                      >
-                        <MenuItem value="">
-                          <em>Use Agent Mode Default</em>
-                        </MenuItem>
-                        {supportedModels.map((modelName) => (
-                          <MenuItem key={modelName} value={modelName}>
-                            {modelName}
-                          </MenuItem>
-                        ))}
-                      </Select>
-                      <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                        Model to use for sessions created with this work plan. Leave empty to use the global Agent Mode default.
-                      </Typography>
-                    </FormControl>
-
-                    <Typography variant="subtitle2" gutterBottom sx={{ mt: 2, mb: 1 }}>
-                      Steps:
-                    </Typography>
-
-                    {workPlan.steps.map((step, stepIndex) => (
-                      <Box key={stepIndex} sx={{ mb: 2, p: 2, bgcolor: 'background.default', borderRadius: 1 }}>
-                        <Box display="flex" justifyContent="space-between" alignItems="flex-start" mb={1}>
-                          <Typography variant="body2" color="text.secondary" sx={{ minWidth: 60 }}>
-                            Step {step.stepCount}:
-                          </Typography>
-                          <Box display="flex" gap={0.25}>
-                            <Tooltip title="Move up">
-                              <span>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => moveStepInWorkPlan(workPlanIndex, stepIndex, 'up')}
-                                  disabled={stepIndex === 0}
-                                >
-                                  <ArrowUpwardIcon fontSize="small" />
-                                </IconButton>
-                              </span>
-                            </Tooltip>
-                            <Tooltip title="Move down">
-                              <span>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => moveStepInWorkPlan(workPlanIndex, stepIndex, 'down')}
-                                  disabled={stepIndex === workPlan.steps.length - 1}
-                                >
-                                  <ArrowDownwardIcon fontSize="small" />
-                                </IconButton>
-                              </span>
-                            </Tooltip>
-                            <IconButton
-                              size="small"
-                              color="error"
-                              onClick={() => removeStepFromWorkPlan(workPlanIndex, stepIndex)}
-                              disabled={false}
-                            >
-                              <DeleteIcon fontSize="small" />
-                            </IconButton>
-                          </Box>
-                        </Box>
-                        <TextField
-                          label="Step Title"
-                          value={step.title}
-                          onChange={(e) => updateStepInWorkPlan(workPlanIndex, stepIndex, { ...step, title: e.target.value })}
-                          placeholder="Enter step title..."
-                          variant="outlined"
-                          fullWidth
-                          size="small"
-                          sx={{ mb: 1 }}
-                        />
-                        <TextField
-                          label="Step Description (Optional)"
-                          value={step.description || ''}
-                          onChange={(e) => updateStepInWorkPlan(workPlanIndex, stepIndex, { ...step, description: e.target.value })}
-                          placeholder="Enter step description..."
-                          variant="outlined"
-                          fullWidth
-                          multiline
-                          rows={2}
-                          size="small"
-                          sx={{ mb: 1 }}
-                        />
-                        <Box>
-                          <Typography variant="body2" fontWeight="medium" gutterBottom>
-                            Required Function Calls (Optional)
-                          </Typography>
-                          
-                          {/* Add Function Call Dropdown */}
-                          <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
-                            <FormControl size="small" sx={{ flexGrow: 1 }}>
-                              <InputLabel>Add Function Call</InputLabel>
-                              <Select
-                                value={selectedFunctionCall[`${workPlanIndex}-${stepIndex}`] || ''}
-                                label="Add Function Call"
-                                onChange={(e) => {
-                                  const selectedFunc = e.target.value as string;
-                                  if (selectedFunc) {
-                                    const currentCalls = step.requiredFunctionCalls || [];
-                                    updateStepInWorkPlan(workPlanIndex, stepIndex, {
-                                      ...step,
-                                      requiredFunctionCalls: [...currentCalls, selectedFunc]
-                                    });
-                                    // Reset the select
-                                    setSelectedFunctionCall(prev => ({
-                                      ...prev,
-                                      [`${workPlanIndex}-${stepIndex}`]: ''
-                                    }));
-                                  }
-                                }}
-                                disabled={savingWorkPlanId !== null || availableFunctionCalls.length === 0}
-                              >
-                                <MenuItem value="">
-                                  <em>Select a function...</em>
-                                </MenuItem>
-                                {availableFunctionCalls.length === 0 ? (
-                                  <MenuItem disabled>Loading function calls...</MenuItem>
-                                ) : (
-                                  availableFunctionCalls.map((func) => (
-                                    <MenuItem key={func.name} value={func.name}>
-                                      <Box>
-                                        <Typography variant="body2" fontWeight="medium">
-                                          {func.name}
-                                        </Typography>
-                                        <Typography variant="caption" color="text.secondary">
-                                          {func.description}
-                                        </Typography>
-                                      </Box>
-                                    </MenuItem>
-                                  ))
-                                )}
-                              </Select>
-                            </FormControl>
-                          </Box>
-
-                          {/* Display Added Function Calls */}
-                          {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
-                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mb: 1 }}>
-                              {step.requiredFunctionCalls.map((funcName, callIndex) => (
-                                <Chip
-                                  key={`${workPlanIndex}-${stepIndex}-${callIndex}`}
-                                  label={funcName}
-                                  onDelete={() => {
-                                    const currentCalls = step.requiredFunctionCalls || [];
-                                    const newCalls = currentCalls.filter((_, idx) => idx !== callIndex);
-                                    updateStepInWorkPlan(workPlanIndex, stepIndex, {
-                                      ...step,
-                                      requiredFunctionCalls: newCalls.length > 0 ? newCalls : undefined
-                                    });
-                                  }}
-                                  deleteIcon={<DeleteIcon />}
-                                  disabled={false}
-                                  color="primary"
-                                  variant="outlined"
-                                />
-                              ))}
-                            </Box>
-                          )}
-
-                          <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                            Add functions that must be called before this step can be marked as completed. The same function can be added multiple times.
-                          </Typography>
-                        </Box>
-                      </Box>
-                    ))}
-
-                    <Button
-                      variant="outlined"
-                      startIcon={<AddIcon />}
-                      onClick={() => addStepToWorkPlan(workPlanIndex)}
-                      disabled={false}
-                      size="small"
-                      sx={{ mt: 1 }}
-                    >
-                      Add Step
-                    </Button>
-                    </Box>
-                    </Collapse>
-                  </CardContent>
-                </Card>
-                );
-              })}
-            </Box>
-          )}
-
-          <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block' }}>
-            Predefined work plans can be used to quickly set up structured workflows in Agent Mode.
-            Each step can have a title, optional description, and optional required function calls.
+          <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+            Work plans have been moved to their own page. Use the button above to manage predefined work plans and review user-submitted plans.
           </Typography>
         </CardContent>
       </Card>
 
-      {/* Sync Plan Dialog */}
-      <Dialog open={syncDialogOpen} onClose={() => { setSyncDialogOpen(false); setPlanToSync(null); }}>
-        <DialogTitle>Sync Plan ({syncLabel})</DialogTitle>
-        <DialogContent>
-          <Typography sx={{ mb: 2 }}>
-            Sync <strong>{planToSync?.title}</strong> {syncLabel}:
-          </Typography>
-          {planToSync?.id && planSyncStatus[planToSync.id] && (() => {
-            const info = planSyncStatus[planToSync.id];
-            if (!info.existsInProd) {
-              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Dev. It will be created in Prod.</Alert>;
-            }
-            if (!info.existsInDev) {
-              return <Alert severity="info" sx={{ mb: 2 }}>This plan only exists in Prod. It will be created in Dev.</Alert>;
-            }
-            if (info.changedFields.length > 0) {
-              return (
-                <Alert severity="info" sx={{ mb: 2 }}>
-                  <strong>Fields that will change:</strong> {info.changedFields.join(', ')}
-                </Alert>
-              );
-            }
-            return null;
-          })()}
-          {syncEnvironment === 'development' && (
-            <Alert severity="warning" sx={{ mt: 1 }}>
-              This will overwrite the production version of this plan.
-            </Alert>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => { setSyncDialogOpen(false); setPlanToSync(null); }} color="inherit">
-            Cancel
-          </Button>
-          <Button onClick={handleSyncPlan} variant="contained" color="primary" disabled={syncingPlanId === planToSync?.id}>
-            {syncingPlanId === planToSync?.id ? <CircularProgress size={20} color="inherit" /> : `Sync ${syncLabel}`}
-          </Button>
-        </DialogActions>
-      </Dialog>
     </Box>
   );
 };
+

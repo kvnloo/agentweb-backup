@@ -32,6 +32,13 @@ jest.mock('../services/agentModeService', () => ({
   }
 }));
 
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn().mockResolvedValue({
+    allowed: true, warning: false, used: 0, allowance: null,
+    bonus: 0, effectiveAllowance: null, percentUsed: 0, month: '2026-03',
+  }),
+}));
+
 jest.mock('../utils/sseProgress', () => ({
   emitProgress: jest.fn(),
   registerProgressCallback: jest.fn(),

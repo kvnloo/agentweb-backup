@@ -46,13 +46,13 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
       );
 
       // Update the account in DB if userId is provided
+      // Pass account_id to ensure we update the correct account (personal vs company page)
       if (userId) {
         await updateAccountTokens(userId, account.platform, {
           access_token: newTokens.access_token,
           refresh_token: newTokens.refresh_token,
           token_expires_at: Date.now() + (newTokens.expires_in * 1000),
-        });
-
+        }, account.account_id);
       }
 
       return { token: newTokens.access_token, wasRefreshed: true };
@@ -167,10 +167,15 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
         throw new Error('LinkedIn rate limit exceeded. Please try again later.');
       }
       if (error.response?.status === 401) {
-        throw new Error('LinkedIn access token expired. Please reconnect your account.');
+        throw new Error('LinkedIn access token expired. Please reconnect your account in Settings → Connected Accounts.');
       }
       if (error.response?.status === 403) {
-        throw new Error('Permission denied. Make sure your account has permission to comment on this post.');
+        const linkedInMsg = error.response?.data?.message || '';
+        const isCompanyPage = config.account_type === 'company_page';
+        if (isCompanyPage) {
+          throw new Error(`Permission denied for company page "${account.account_name}". LinkedIn requires the organization to be enrolled in Community Management to comment as a company page. Please disconnect and reconnect the company page in Settings → Connected Accounts, or try commenting from a personal account instead. LinkedIn error: ${linkedInMsg}`);
+        }
+        throw new Error(`Permission denied. Make sure your account has permission to comment on this post. LinkedIn error: ${linkedInMsg}`);
       }
       throw error;
     }

@@ -7,6 +7,7 @@ import http from 'http';
 import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { generateChatResponse } from './services/chatbotService';
+import { checkTokenUsage } from './services/tokenUsageService';
 
 dotenv.config();
 
@@ -110,6 +111,17 @@ io.on('connection', (socket: Socket) => {
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET || '') as { userId: string };
       const userId = decoded.userId;
+
+      // Check token usage limits
+      const usageStatus = await checkTokenUsage(userId);
+      if (!usageStatus.allowed) {
+        socket.emit('error', {
+          message: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+          code: 'TOKEN_LIMIT_EXCEEDED',
+          tokenUsage: usageStatus,
+        });
+        return;
+      }
 
       const portalType = data.portal || 'partner';
       const response = await generateChatResponse(

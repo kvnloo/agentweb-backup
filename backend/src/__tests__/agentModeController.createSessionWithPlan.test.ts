@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
-import { settingsService } from '../services/settingsService';
+import { workPlanService } from '../services/workPlanService';
 import { agentModeService } from '../services/agentModeService';
 import { getUserFromToken } from '../middleware/auth';
 import { v4 as uuidv4 } from 'uuid';
@@ -21,9 +21,10 @@ jest.mock('../services/chatbotService', () => ({
   }
 }));
 
-jest.mock('../services/settingsService', () => ({
-  settingsService: {
-    getSetting: jest.fn()
+jest.mock('../services/workPlanService', () => ({
+  workPlanService: {
+    getWorkPlansByVisibility: jest.fn(),
+    getWorkPlansByOwner: jest.fn(),
   }
 }));
 
@@ -64,7 +65,7 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
 }));
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
-const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
+const mockWorkPlanService = workPlanService as jest.Mocked<typeof workPlanService>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
 const mockGetUserFromToken = getUserFromToken as jest.MockedFunction<typeof getUserFromToken>;
 
@@ -72,6 +73,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
   const mockPlanTitle = 'Onboarding';
   const mockWorkPlans = [
     {
+      planId: 'plan-123',
       title: 'Onboarding',
       steps: [
         {
@@ -86,7 +88,11 @@ describe('AgentModeController - createSessionWithPlan', () => {
           description: 'Second step'
         }
       ],
-      welcomeMessage: 'Welcome to onboarding!'
+      welcomeMessage: 'Welcome to onboarding!',
+      visibility: 'system' as const,
+      isBuiltIn: true,
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-01T00:00:00Z'
     }
   ];
 
@@ -121,11 +127,16 @@ describe('AgentModeController - createSessionWithPlan', () => {
     jest.clearAllMocks();
     process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
-    // Default mock for settings
-    mockSettingsService.getSetting.mockResolvedValue({
-      settingKey: 'agent-mode-predefined-workplans',
-      settingValue: JSON.stringify(mockWorkPlans)
-    } as any);
+    // Default mock for work plan service - return mockWorkPlans for 'system', empty array for 'public'
+    mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+      if (visibility === 'system') {
+        return Promise.resolve(mockWorkPlans);
+      }
+      return Promise.resolve([]);
+    });
+
+    // Default: no private plans for authenticated users
+    mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([]);
 
     // Mock agent mode service methods
     mockAgentModeService.getSupportedModels.mockResolvedValue(['gpt-5-chat', 'gemini-3-pro-preview', 'claude-opus-4']);
@@ -378,8 +389,8 @@ describe('AgentModeController - createSessionWithPlan', () => {
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
 
-    it('should return 404 when no predefined work plans found', async () => {
-      mockSettingsService.getSetting.mockResolvedValue(null);
+    it('should return 404 when no work plans exist', async () => {
+      mockWorkPlanService.getWorkPlansByVisibility.mockResolvedValue([]);
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -387,7 +398,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       await agentModeController.createSessionWithPlan(req, res);
 
       expect(res.status).toHaveBeenCalledWith(404);
-      expect(res.json).toHaveBeenCalledWith({ error: 'No predefined work plans found' });
+      expect(res.json).toHaveBeenCalledWith({ error: 'Work plan "Onboarding" not found' });
       expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
     });
 
@@ -428,6 +439,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       // Update mock work plans to include autocomplete: true
       const workPlansWithAutocomplete = [
         {
+          planId: 'plan-autocomplete',
           title: 'Onboarding',
           steps: [
             {
@@ -443,13 +455,19 @@ describe('AgentModeController - createSessionWithPlan', () => {
             }
           ],
           welcomeMessage: 'Welcome to onboarding!',
-          autocomplete: true
+          autocomplete: true,
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithAutocomplete)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithAutocomplete);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -469,6 +487,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
       // Work plan without autocomplete field
       const workPlansWithoutAutocomplete = [
         {
+          planId: 'plan-no-autocomplete',
           title: 'Onboarding',
           steps: [
             {
@@ -477,14 +496,20 @@ describe('AgentModeController - createSessionWithPlan', () => {
               description: 'First step'
             }
           ],
-          welcomeMessage: 'Welcome!'
+          welcomeMessage: 'Welcome!',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
           // autocomplete is not specified
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithoutAutocomplete)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithoutAutocomplete);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -503,6 +528,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should store showLoginSignup when predefined plan sets it to always', async () => {
       const workPlansWithLoginSignup = [
         {
+          planId: 'plan-login-signup',
           title: 'Onboarding',
           steps: [
             {
@@ -511,13 +537,19 @@ describe('AgentModeController - createSessionWithPlan', () => {
               description: 'First step'
             }
           ],
-          showLoginSignup: 'always'
+          showLoginSignup: 'always',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithLoginSignup)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithLoginSignup);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -536,6 +568,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should default showLoginSignup to after_plan_completed when not specified', async () => {
       const workPlansWithoutLoginSignup = [
         {
+          planId: 'plan-no-login-signup',
           title: 'Onboarding',
           steps: [
             {
@@ -543,13 +576,19 @@ describe('AgentModeController - createSessionWithPlan', () => {
               title: 'Step 1',
               description: 'First step'
             }
-          ]
+          ],
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithoutLoginSignup)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithoutLoginSignup);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -568,6 +607,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should store requireLogin when predefined plan sets it to true', async () => {
       const workPlansWithRequireLogin = [
         {
+          planId: 'plan-require-login',
           title: 'Onboarding',
           steps: [
             {
@@ -576,13 +616,19 @@ describe('AgentModeController - createSessionWithPlan', () => {
               description: 'First step'
             }
           ],
-          requireLogin: true
+          requireLogin: true,
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithRequireLogin)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithRequireLogin);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -601,6 +647,7 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should default requireLogin to false when not specified', async () => {
       const workPlansWithoutRequireLogin = [
         {
+          planId: 'plan-no-require-login',
           title: 'Onboarding',
           steps: [
             {
@@ -608,13 +655,19 @@ describe('AgentModeController - createSessionWithPlan', () => {
               title: 'Step 1',
               description: 'First step'
             }
-          ]
+          ],
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithoutRequireLogin)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithoutRequireLogin);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -640,15 +693,22 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should use work plan default model when specified and valid', async () => {
       const workPlansWithDefaultModel = [
         {
+          planId: 'plan-default-model',
           title: 'Onboarding',
           steps: [{ stepCount: 1, title: 'Step 1' }],
-          defaultModel: 'gemini-3-pro-preview'
+          defaultModel: 'gemini-3-pro-preview',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithDefaultModel)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithDefaultModel);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -666,15 +726,22 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should fall back to global default when work plan model is invalid', async () => {
       const workPlansWithInvalidModel = [
         {
+          planId: 'plan-invalid-model',
           title: 'Onboarding',
           steps: [{ stepCount: 1, title: 'Step 1' }],
-          defaultModel: 'invalid-model-name'
+          defaultModel: 'invalid-model-name',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithInvalidModel)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithInvalidModel);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -692,14 +759,21 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should use global default when work plan has no default model', async () => {
       const workPlansWithoutDefaultModel = [
         {
+          planId: 'plan-no-default-model',
           title: 'Onboarding',
-          steps: [{ stepCount: 1, title: 'Step 1' }]
+          steps: [{ stepCount: 1, title: 'Step 1' }],
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithoutDefaultModel)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithoutDefaultModel);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -717,15 +791,22 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should use global default when work plan default model is empty string', async () => {
       const workPlansWithEmptyModel = [
         {
+          planId: 'plan-empty-model',
           title: 'Onboarding',
           steps: [{ stepCount: 1, title: 'Step 1' }],
-          defaultModel: ''
+          defaultModel: '',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithEmptyModel)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithEmptyModel);
+        }
+        return Promise.resolve([]);
+      });
 
       const req = mockRequest(mockPlanTitle);
       const res = mockResponse();
@@ -743,15 +824,22 @@ describe('AgentModeController - createSessionWithPlan', () => {
     it('should handle model validation when supported models list is empty', async () => {
       const workPlansWithDefaultModel = [
         {
+          planId: 'plan-empty-supported-models',
           title: 'Onboarding',
           steps: [{ stepCount: 1, title: 'Step 1' }],
-          defaultModel: 'some-model'
+          defaultModel: 'some-model',
+          visibility: 'system' as const,
+          isBuiltIn: true,
+          createdAt: '2024-01-01T00:00:00Z',
+          updatedAt: '2024-01-01T00:00:00Z'
         }
       ];
-      mockSettingsService.getSetting.mockResolvedValue({
-        settingKey: 'agent-mode-predefined-workplans',
-        settingValue: JSON.stringify(workPlansWithDefaultModel)
-      } as any);
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) => {
+        if (visibility === 'system') {
+          return Promise.resolve(workPlansWithDefaultModel);
+        }
+        return Promise.resolve([]);
+      });
       mockAgentModeService.getSupportedModels.mockResolvedValue([]);
 
       const req = mockRequest(mockPlanTitle);

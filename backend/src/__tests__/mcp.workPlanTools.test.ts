@@ -84,14 +84,14 @@ describe('Predefined Work Plan MCP Tools', () => {
   // ─── SUCCESS tests ─────────────────────────────────────────────────────
 
   describe('list_predefined_work_plans', () => {
-    it('should call GET /api/settings/agent-mode-predefined-workplans', async () => {
+    it('should call GET /api/admin/work-plans', async () => {
       mockMcpFetch.mockResolvedValue({ settingValue: '[{"id":"wp-1","title":"Onboarding"}]' });
 
       const result = await mcpToolRegistry.execute('list_predefined_work_plans', {}, context);
 
       expect(mockMcpFetch).toHaveBeenCalledWith({
         method: 'GET',
-        path: '/api/settings/agent-mode-predefined-workplans',
+        path: '/api/admin/work-plans',
         context: { userId: 'user-123', agentUserId: 'user-123' },
       });
       expect(result.content[0].text).toContain('wp-1');
@@ -118,7 +118,7 @@ describe('Predefined Work Plan MCP Tools', () => {
 
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'POST',
-        path: '/api/settings/agent-mode-predefined-workplans',
+        path: '/api/admin/work-plans',
         body: expect.objectContaining({
           title: 'New Plan',
           steps: [{ title: 'Step 1', description: 'Do something' }],
@@ -163,7 +163,7 @@ describe('Predefined Work Plan MCP Tools', () => {
 
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'PUT',
-        path: '/api/settings/agent-mode-predefined-workplans/wp-1',
+        path: '/api/admin/work-plans/wp-1',
         body: expect.objectContaining({
           title: 'Updated Plan',
           steps: [{ title: 'New Step' }],
@@ -183,7 +183,7 @@ describe('Predefined Work Plan MCP Tools', () => {
 
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'DELETE',
-        path: '/api/settings/agent-mode-predefined-workplans/wp-1',
+        path: '/api/admin/work-plans/wp-1',
       }));
     });
   });
@@ -199,7 +199,7 @@ describe('Predefined Work Plan MCP Tools', () => {
 
       expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
         method: 'GET',
-        path: '/api/settings/agent-mode-predefined-workplans/wp-1',
+        path: '/api/admin/work-plans/wp-1',
       }));
       expect(result.content[0].text).toContain('Onboarding');
     });

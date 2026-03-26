@@ -1270,12 +1270,12 @@ mcpToolRegistry.register({
   name: 'get_landing_page_preview_url',
   definition: {
     name: 'get_landing_page_preview_url',
-    description: 'Get the Vercel preview URL for a landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing.',
+    description: 'Get the Vercel preview URL for a landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing. IMPORTANT: The branch name MUST come from the coding_agent tool result (the "branch" field). Do NOT guess or construct branch names yourself. If coding_agent returned is_staging=false or no branch, there is no draft to preview. If buildStatus is "not_found", the branch does not exist on Vercel — do NOT keep polling.',
     inputSchema: {
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        branch: { type: 'string', description: 'The draft branch name (e.g. "draft/abc12345")' }
+        branch: { type: 'string', description: 'The draft branch name from the coding_agent result (e.g. "draft/c8e16e74-0cad-4f"). Do NOT guess this value.' }
       },
       required: ['page_id', 'branch']
     }
@@ -1480,7 +1480,7 @@ mcpToolRegistry.register({
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/settings/agent-mode-predefined-workplans', context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: '/api/admin/work-plans', context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -1532,7 +1532,7 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
-        const data = await mcpFetch({ method: 'POST', path: '/api/settings/agent-mode-predefined-workplans', context: c, body });
+        const data = await mcpFetch({ method: 'POST', path: '/api/admin/work-plans', context: c, body });
         return jsonResult(data);
       }
       case 'update': {
@@ -1544,15 +1544,15 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
         return jsonResult(data);
       }
       default:

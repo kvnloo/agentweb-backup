@@ -120,7 +120,7 @@ export const CUSTOMER_PORTAL_PAGES: CustomerPortalPage[] = [
     path: '/social-posts',
     label: 'Social Posts',
     description: 'View and track social media posts and engagement metrics'
-  }
+  },
 ];
 
 /**

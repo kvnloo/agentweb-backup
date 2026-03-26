@@ -44,6 +44,9 @@ import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
 import mcpServersRoutes from "./routes/mcpServers";
 import skillRoutes from "./routes/skillRoutes";
+import userSkillRoutes from "./routes/userSkillRoutes";
+import userWorkPlanRoutes from "./routes/userWorkPlanRoutes";
+import adminWorkPlanRoutes from "./routes/adminWorkPlanRoutes";
 import supportRoutes from "./routes/support";
 import agentApiRoutes from "./routes/agentApi";
 import emmaApiRoutes from "./routes/emmaApi";
@@ -54,8 +57,10 @@ import landingPagesRoutes from "./routes/landingPages";
 import landingPageGenerationRoutes from "./routes/landingPageGeneration";
 import domainRoutes from "./routes/domains";
 import resultEndpointsRoutes, { reviewRouter } from "./routes/resultEndpoints";
+import batchReviewRoutes, { batchReviewPublicRouter } from "./routes/batchReview";
 import clientHealthRoutes from "./routes/clientHealth";
 import leadMagnetRoutes from "./routes/leadMagnet";
+import orgRoutes from "./routes/org";
 import { authenticateToken } from "./middleware/auth";
 import { isAdmin } from "./middleware/admin";
 
@@ -145,7 +150,8 @@ const corsOptions = {
 app.use((req, res, next) => {
   // Check if this is a public endpoint that needs open CORS
   if (req.path.match(/^\/api\/tasks\/[^\/]+\/subscribers\/join$/) ||
-      req.path.startsWith('/api/lead-magnet/')) {
+      req.path.startsWith('/api/lead-magnet/') ||
+      req.path.startsWith('/batch-review/')) {
     // Allow all origins for public endpoints
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -227,6 +233,9 @@ app.use("/api/admin/mcp-servers", authenticateToken, isAdmin, mcpServersRoutes);
 app.use("/api/admin/lead-magnets", authenticateToken, isAdmin, leadMagnetAdminRoutes);
 app.use("/api/client-health", authenticateToken, isAdmin, clientHealthRoutes);
 app.use("/api/skills", authenticateToken, isAdmin, skillRoutes);
+app.use("/api/user-skills", authenticateToken, userSkillRoutes);
+app.use("/api/user-work-plans", authenticateToken, userWorkPlanRoutes);
+app.use("/api/admin/work-plans", authenticateToken, isAdmin, adminWorkPlanRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/v1/agent", agentApiRoutes);
 app.use("/api/emma", emmaApiRoutes);
@@ -236,7 +245,10 @@ app.use("/r", resultEndpointsRoutes);
 app.get("/asset/:assetHash/stats", getAssetStats);
 app.get("/asset/:assetHash", serveAsset);
 app.use("/review", reviewRouter);
+app.use("/api/batch-review", batchReviewRoutes);
+app.use("/batch-review", batchReviewPublicRouter);
 app.use("/api/lead-magnet", leadMagnetRoutes);
+app.use("/api/org", orgRoutes);
 
 
 // Agent API documentation (public, no auth)

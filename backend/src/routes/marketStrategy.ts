@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
+import { userDb, orgDb } from "../services/db";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -51,8 +52,19 @@ router.get("/", authenticateToken, async (req, res) => {
     const user = users[0];
     console.log(`[MARKET STRATEGY DEBUG] Found user: ${user.email}`);
 
+    // If user is in an org, always read market strategy from the org (not the user)
+    let marketStrategy = user.marketStrategy;
+    let isOrgLevel = false;
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org) {
+        marketStrategy = org.marketStrategy;
+        isOrgLevel = true;
+      }
+    }
+
     // Return market strategy data or default structure
-    const marketStrategy = user.marketStrategy || {
+    const data = marketStrategy || {
       businessOverview: "",
       competitors: [],
       icp: [],
@@ -61,7 +73,8 @@ router.get("/", authenticateToken, async (req, res) => {
     console.log(`[MARKET STRATEGY DEBUG] Returning market strategy data`);
     return res.json({
       success: true,
-      data: marketStrategy,
+      data,
+      isOrgLevel,
     });
   } catch (error) {
     console.error("[MARKET STRATEGY DEBUG] Error in GET /market-strategy:", error);
@@ -123,19 +136,44 @@ router.post("/", authenticateToken, async (req, res) => {
     const user = users[0];
     console.log(`[MARKET STRATEGY DEBUG] Found user: ${user.email}`);
 
-    // Get existing market strategy or default
-    const existingMarketStrategy = user.marketStrategy || {
+    // If user is in an org, read existing from org and save to org
+    let existingSource = user.marketStrategy;
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org) {
+        existingSource = org.marketStrategy || null;
+      }
+    }
+
+    const existingMarketStrategyMerged = existingSource || {
       businessOverview: "",
       competitors: [],
       icp: [],
     };
 
     // Merge: only update fields that are provided
+    const now = new Date().toISOString();
     const marketStrategy = {
-      businessOverview: businessOverview !== undefined ? businessOverview : existingMarketStrategy.businessOverview,
-      competitors: competitors !== undefined ? competitors : existingMarketStrategy.competitors,
-      icp: icp !== undefined ? icp : existingMarketStrategy.icp,
+      businessOverview: businessOverview !== undefined ? businessOverview : existingMarketStrategyMerged.businessOverview,
+      competitors: competitors !== undefined ? competitors : existingMarketStrategyMerged.competitors,
+      icp: icp !== undefined ? icp : existingMarketStrategyMerged.icp,
+      createdAt: (existingMarketStrategyMerged as any).createdAt || now,
+      updatedAt: now,
     };
+
+    // If user is in an org, save to org (owner only)
+    if (user.orgId) {
+      if (user.orgRole !== "owner") {
+        return res.status(403).json({ error: "Only the org owner can update market strategy" });
+      }
+      await orgDb.updateOrg(user.orgId, { marketStrategy });
+      console.log(`[MARKET STRATEGY DEBUG] Updated org ${user.orgId} market strategy`);
+      return res.json({
+        success: true,
+        data: marketStrategy,
+        message: "Market strategy saved successfully (org-level)",
+      });
+    }
 
     // Update user record with market strategy data
     const updateParams = {

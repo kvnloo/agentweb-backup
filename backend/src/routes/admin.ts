@@ -16,6 +16,7 @@ import { workflowDb } from "../services/workflowDb";
 import { paginatedScan } from "../utils/dynamoPagination";
 import { settingsService } from "../services/settingsService";
 import { encryptPassword } from "../utils/crypto";
+import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import multer from "multer";
 import { MAX_FILE_SIZE } from "../config";
 
@@ -31,6 +32,7 @@ const CRM_SYNC_SETTING_PREFIX = "admin_crm_sync_";
 interface CrmSyncSetting {
   listId: string;
   lastSyncAt?: string;
+  autoSync?: boolean;
 }
 
 const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null => {
@@ -47,6 +49,9 @@ const parseCrmSyncSetting = (rawValue?: string | null): CrmSyncSetting | null =>
     };
     if (parsed.lastSyncAt && typeof parsed.lastSyncAt === "string") {
       setting.lastSyncAt = parsed.lastSyncAt;
+    }
+    if (typeof parsed.autoSync === "boolean") {
+      setting.autoSync = parsed.autoSync;
     }
     return setting.listId ? setting : null;
   } catch (error) {
@@ -137,6 +142,7 @@ router.get("/crm-sync/:source", async (req, res) => {
         source,
         listId: "",
         lastSyncAt: null,
+        autoSync: false,
       });
     }
 
@@ -144,6 +150,7 @@ router.get("/crm-sync/:source", async (req, res) => {
       source,
       listId: parsed.listId,
       lastSyncAt: parsed.lastSyncAt || null,
+      autoSync: parsed.autoSync || false,
     });
   } catch (error) {
     console.error("Error getting CRM sync setting:", error);
@@ -155,7 +162,7 @@ router.get("/crm-sync/:source", async (req, res) => {
 router.put("/crm-sync/:source", async (req, res) => {
   try {
     const { source } = req.params;
-    const { listId } = req.body;
+    const { listId, autoSync } = req.body;
 
     if (!CRM_SYNC_SOURCES.has(source)) {
       return res.status(400).json({ message: "source must be users or waitlist" });
@@ -177,6 +184,11 @@ router.put("/crm-sync/:source", async (req, res) => {
       listId: normalizedListId,
       lastSyncAt: parsedExisting?.lastSyncAt,
     };
+    if (typeof autoSync === "boolean") {
+      nextSetting.autoSync = autoSync;
+    } else if (parsedExisting?.autoSync !== undefined) {
+      nextSetting.autoSync = parsedExisting.autoSync;
+    }
 
     await settingsService.setSetting(
       settingName,
@@ -190,6 +202,7 @@ router.put("/crm-sync/:source", async (req, res) => {
       source,
       listId: nextSetting.listId,
       lastSyncAt: nextSetting.lastSyncAt || null,
+      autoSync: nextSetting.autoSync || false,
     });
   } catch (error) {
     console.error("Error saving CRM sync setting:", error);
@@ -3914,13 +3927,15 @@ router.get("/subscription-types", async (req, res) => {
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+    const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
       subscriptionTypes = [{
         name: "Basic",
         allowedPages: allAvailablePages, // All available pages (expanded)
-        allowedSkills: allAvailableSkills // All available skills (expanded)
+        allowedSkills: allAvailableSkills, // All available skills (expanded)
+        allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
       }];
     }
 
@@ -3947,10 +3962,18 @@ router.get("/subscription-types", async (req, res) => {
         normalizedSkills = allAvailableSkills;
       }
 
+      // Handle allowedConnectedAccounts — default to all if missing or "*"
+      let normalizedConnectedAccounts = type.allowedConnectedAccounts || allAvailableConnectedAccounts;
+      if (normalizedConnectedAccounts.includes('*')) {
+        normalizedConnectedAccounts = allAvailableConnectedAccounts;
+      }
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
-        allowedSkills: normalizedSkills
+        allowedSkills: normalizedSkills,
+        allowedConnectedAccounts: normalizedConnectedAccounts,
+        ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
       };
     }));
 
@@ -3974,6 +3997,7 @@ router.post("/subscription-types", async (req, res) => {
     const subscriptionService = await import('../services/subscriptionService');
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
+    const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4006,10 +4030,25 @@ router.post("/subscription-types", async (req, res) => {
         normalizedSkills = allAvailableSkills;
       }
 
+      // Handle allowedConnectedAccounts — default to all if missing or "*"
+      let normalizedConnectedAccounts = Array.isArray(type.allowedConnectedAccounts)
+        ? type.allowedConnectedAccounts
+        : allAvailableConnectedAccounts;
+      if (normalizedConnectedAccounts.includes('*')) {
+        normalizedConnectedAccounts = allAvailableConnectedAccounts;
+      }
+
+      // Parse monthlyTokenAllowance (preserve null for unlimited)
+      const parsedAllowance = type.monthlyTokenAllowance != null
+        ? Number(type.monthlyTokenAllowance)
+        : null;
+
       return {
         name: type.name,
         allowedPages: normalizedPages,
-        allowedSkills: normalizedSkills
+        allowedSkills: normalizedSkills,
+        allowedConnectedAccounts: normalizedConnectedAccounts,
+        ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
       };
     }));
 
@@ -4210,6 +4249,43 @@ router.put("/users/:userId/subscription-type", async (req, res) => {
   } catch (error) {
     console.error("Error updating user subscription type:", error);
     res.status(500).json({ message: "Error updating subscription type" });
+  }
+});
+
+// Grant token bonus to a user
+router.post("/users/:userId/token-bonus", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { bonusTokens } = req.body;
+
+    if (typeof bonusTokens !== "number" || bonusTokens <= 0) {
+      return res.status(400).json({ message: "bonusTokens must be a positive number" });
+    }
+
+    const user = await userDb.getUserById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await grantTokenBonus(userId, bonusTokens);
+    const updatedUser = await userDb.getUserById(userId);
+    res.json(updatedUser);
+  } catch (error) {
+    console.error("Error granting token bonus:", error);
+    res.status(500).json({ message: "Error granting token bonus" });
+  }
+});
+
+// Get token usage for a specific user
+router.get("/users/:userId/token-usage", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const usage = await getUserTokenUsage(userId);
+    const { allowance, bonus, effectiveAllowance } = await getUserTokenAllowance(userId);
+    res.json({ ...usage, allowance, effectiveAllowance });
+  } catch (error) {
+    console.error("Error getting user token usage:", error);
+    res.status(500).json({ message: "Error getting token usage" });
   }
 });
 

@@ -4,6 +4,7 @@ import { getAccountsByUserId, deleteAccount, deleteAccountById, getAccountByPlat
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
+import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 
 const router = express.Router();
 
@@ -48,7 +49,10 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
       };
     });
 
-    res.json({ success: true, accounts: accountsWithStatus });
+    // Include allowed platforms so frontend can show/hide platform cards
+    const allowedConnectedAccounts = await getAllowedConnectedAccounts(userId);
+
+    res.json({ success: true, accounts: accountsWithStatus, allowedConnectedAccounts });
   } catch (error) {
     console.error('List Accounts Error:', error);
     res.status(500).json({ error: 'Failed to list connected accounts' });

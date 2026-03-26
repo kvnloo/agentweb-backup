@@ -103,6 +103,13 @@ export default function Skills() {
   const [foundationSearchText, setFoundationSearchText] = useState("");
   const [savingFoundation, setSavingFoundation] = useState(false);
 
+  // Review queue state
+  const [pendingSkills, setPendingSkills] = useState<Skill[]>([]);
+  const [, setReviewLoading] = useState(false);
+  const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
+  const [rejectTarget, setRejectTarget] = useState<{ type: 'skill'; id: string; name: string } | null>(null);
+  const [rejectFeedback, setRejectFeedback] = useState("");
+
   const { token } = useAuth();
 
   const fetchSkills = useCallback(async () => {
@@ -175,6 +182,39 @@ export default function Skills() {
     }
   }, [token]);
 
+  const fetchReviewQueue = useCallback(async () => {
+    setReviewLoading(true);
+    try {
+      const skillsRes = await axios.get(buildApiUrl("/api/skills/pending-review"), { headers: { Authorization: `Bearer ${token}` } });
+      setPendingSkills(skillsRes.data || []);
+    } catch (err) {
+      console.error("Failed to fetch review queue", err);
+    } finally {
+      setReviewLoading(false);
+    }
+  }, [token]);
+
+  const handleApproveSkill = async (skillId: string) => {
+    try {
+      await axios.post(buildApiUrl(`/api/skills/${skillId}/approve`), {}, { headers: { Authorization: `Bearer ${token}` } });
+      setSuccessMessage("Skill approved!");
+      fetchReviewQueue();
+      fetchSkills();
+    } catch (err) { setError("Failed to approve skill"); }
+  };
+
+  const handleReject = async () => {
+    if (!rejectTarget || !rejectFeedback.trim()) return;
+    try {
+      await axios.post(buildApiUrl(`/api/skills/${rejectTarget.id}/reject`), { feedback: rejectFeedback }, { headers: { Authorization: `Bearer ${token}` } });
+      setSuccessMessage("Skill rejected!");
+      setRejectDialogOpen(false);
+      setRejectTarget(null);
+      setRejectFeedback("");
+      fetchReviewQueue();
+    } catch (err) { setError("Failed to reject"); }
+  };
+
   useEffect(() => {
     if (token) {
       fetchSkills();
@@ -183,8 +223,9 @@ export default function Skills() {
       fetchPublicSkills();
       fetchSyncStatus();
       fetchFoundationTools();
+      fetchReviewQueue();
     }
-  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills, fetchSyncStatus, fetchFoundationTools]);
+  }, [token, fetchSkills, fetchTools, fetchSubscriptionTypes, fetchPublicSkills, fetchSyncStatus, fetchFoundationTools, fetchReviewQueue]);
 
   const handleOpenEditDialog = (skill: Skill | null = null) => {
     if (skill) {
@@ -439,6 +480,33 @@ export default function Skills() {
 
         {error && <Alert severity="error" sx={{ mb: 3 }} onClose={() => setError("")}>{error}</Alert>}
         {successMessage && <Alert severity="success" sx={{ mb: 3 }} onClose={() => setSuccessMessage("")}>{successMessage}</Alert>}
+
+        {/* Review Queue Section */}
+        {pendingSkills.length > 0 && (
+          <Paper variant="outlined" sx={{ p: 2, mb: 3, borderColor: 'warning.main', bgcolor: 'warning.light', opacity: 0.9 }}>
+            <Typography variant="h6" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+              Pending Review ({pendingSkills.length})
+            </Typography>
+            <Stack spacing={1}>
+              {pendingSkills.map((skill: Skill) => (
+                <Box key={skill.skillId} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', p: 1, bgcolor: 'background.paper', borderRadius: 1 }}>
+                  <Box>
+                    <Chip label="Skill" size="small" color="info" sx={{ mr: 1 }} />
+                    <strong>{skill.name}</strong>
+                    <Typography variant="body2" color="text.secondary" component="span" sx={{ ml: 1 }}>
+                      — {skill.description?.substring(0, 100)}{(skill.description?.length || 0) > 100 ? '...' : ''}
+                    </Typography>
+                    {skill.ownerId && <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>(by {skill.ownerId})</Typography>}
+                  </Box>
+                  <Stack direction="row" spacing={1}>
+                    <Button variant="contained" color="success" size="small" onClick={() => handleApproveSkill(skill.skillId)}>Approve</Button>
+                    <Button variant="outlined" color="error" size="small" onClick={() => { setRejectTarget({ type: 'skill', id: skill.skillId, name: skill.name }); setRejectDialogOpen(true); }}>Reject</Button>
+                  </Stack>
+                </Box>
+              ))}
+            </Stack>
+          </Paper>
+        )}
 
         <Box sx={{ mb: 3, display: 'flex', justifyContent: 'flex-start' }}>
           <TextField
@@ -1125,6 +1193,27 @@ export default function Skills() {
           <Button onClick={handleSaveFoundationTools} variant="contained" color="primary" sx={{ minWidth: 120 }} disabled={savingFoundation}>
             {savingFoundation ? <CircularProgress size={20} color="inherit" /> : "Save Changes"}
           </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Reject Dialog */}
+      <Dialog open={rejectDialogOpen} onClose={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }} maxWidth="sm" fullWidth>
+        <DialogTitle>Reject Skill: {rejectTarget?.name}</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth
+            multiline
+            rows={3}
+            label="Feedback (required)"
+            placeholder="Explain why this was rejected..."
+            value={rejectFeedback}
+            onChange={(e) => setRejectFeedback(e.target.value)}
+            sx={{ mt: 1 }}
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => { setRejectDialogOpen(false); setRejectTarget(null); setRejectFeedback(""); }} color="inherit">Cancel</Button>
+          <Button onClick={handleReject} variant="contained" color="error" disabled={!rejectFeedback.trim()}>Reject</Button>
         </DialogActions>
       </Dialog>
     </Container>

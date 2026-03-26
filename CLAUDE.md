@@ -746,6 +746,19 @@ Ephemeral EC2 test environments for manual testing. See `docs/cloud-test-env.md`
 
 **CRITICAL:** When a test environment is active, run `./test-env/test-env.sh sync` after EVERY code change.
 
+### SSH into Cloud Claude Instances
+
+You can SSH into cloud Claude (cloud-dev) EC2 instances using password authentication. The SSH password is stored in AWS Secrets Manager:
+
+```bash
+# Retrieve the SSH password
+aws secretsmanager get-secret-value --secret-id agentweb/cloud-dev/ssh-password --query SecretString --output text
+
+# SSH into the instance (use the Public IP from the Notion task's "Public IP" field)
+ssh ubuntu@<PUBLIC_IP>
+# Enter the password from Secrets Manager when prompted
+```
+
 ## Browser Testing with Playwright MCP
 
 A Playwright MCP server is configured via `.mcp.json` in each repo root. Use the `mcp__playwright__browser_*` tools to drive a real browser against the cloud test environment for manual verification (login, delegation, UI interactions). If the tools are not available, restart the Claude Code session to reload MCP servers.

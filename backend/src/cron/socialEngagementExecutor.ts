@@ -41,10 +41,10 @@ function getLinkedInAdapter(): LinkedInAdapter {
 export class SocialEngagementExecutor {
     private isProcessing = false;
 
-    public async processQueue() {
+    public async processQueue(): Promise<boolean> {
         if (this.isProcessing) {
             console.log('[SocialEngagementExecutor] Already processing, skipping concurrent run.');
-            return;
+            return false;
         }
         this.isProcessing = true;
         console.log('[SocialEngagementExecutor] Checking for due engagements...');
@@ -54,7 +54,7 @@ export class SocialEngagementExecutor {
 
             if (actions.length === 0) {
                 console.log('[SocialEngagementExecutor] No engagements due.');
-                return;
+                return true;
             }
 
             console.log(`[SocialEngagementExecutor] ${actions.length} engagement(s) to process.`);
@@ -70,9 +70,11 @@ export class SocialEngagementExecutor {
             }
         } catch (error) {
             console.error('[SocialEngagementExecutor] Critical error:', error);
+            return false;
         } finally {
             this.isProcessing = false;
         }
+        return true;
     }
 
     private async processAction(action: any) {
@@ -202,16 +204,34 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doComment) {
-            generatedText = await this.generatePostComment(postContent, engagerMemory);
-            console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
-            await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
-            console.log(`[Executor] Comment posted on post ${postId}`);
+            // Real-time dedup: check if this account already commented on the post
+            const alreadyCommented = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, postId);
+            if (alreadyCommented) {
+                console.log(`[Executor] Account ${engagingConnection.account_id} already commented on ${postId}, skipping comment.`);
+            } else {
+                generatedText = await this.generatePostComment(postContent, engagerMemory);
+                console.log(`[Executor] Generated comment: "${generatedText.slice(0, 100)}..."`);
+                await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId);
+                console.log(`[Executor] Comment posted on post ${postId}`);
+            }
         }
 
         if (doLike) {
-            reactionType = await this.generateReactionType(postContent);
-            await adapter.createReaction(engagingConnection, postId, reactionType, engagingUserId);
-            console.log(`[Executor] Reacted "${reactionType}" on post ${postId}`);
+            try {
+                reactionType = await this.generateReactionType(postContent);
+                await adapter.createReaction(engagingConnection, postId, reactionType, engagingUserId);
+                console.log(`[Executor] Reacted "${reactionType}" on post ${postId}`);
+            } catch (likeErr: any) {
+                if (doComment) {
+                    // Like is secondary in comment_and_like — comment already succeeded.
+                    // Log and continue so the action is marked completed rather than retried,
+                    // which would post a duplicate comment.
+                    console.warn(`[Executor] Like sub-action failed (comment already succeeded), continuing:`, likeErr?.message);
+                    reactionType = undefined;
+                } else {
+                    throw likeErr;
+                }
+            }
         }
 
         return { generatedText, reactionType };
@@ -246,6 +266,26 @@ export class SocialEngagementExecutor {
             console.warn(`[Executor] Could not fetch post content for ${postId}:`, err);
         }
         return '[Post content unavailable]';
+    }
+
+    /**
+     * Check if an account has already commented/replied on a post or comment.
+     * Fetches real comments from the LinkedIn API as a runtime dedup safety net.
+     * Fails open (returns false) if the API call fails, so we don't block legitimate comments.
+     */
+    private async hasAccountCommented(
+        adapter: LinkedInAdapter,
+        engagingConnection: ConnectedAccount,
+        engagingUserId: string,
+        targetUrn: string
+    ): Promise<boolean> {
+        try {
+            const comments = await adapter.getComments(engagingConnection, targetUrn, engagingUserId);
+            return comments.some((c) => c.actorUrn === engagingConnection.account_id);
+        } catch (err) {
+            console.warn(`[Executor] Could not fetch comments for dedup check on ${targetUrn}:`, err);
+            return false; // Fail open — don't block commenting if the check fails
+        }
     }
 
     private async generatePostComment(postContent: string, engagerMemory?: string): Promise<string> {
@@ -316,16 +356,34 @@ export class SocialEngagementExecutor {
         let reactionType: string | undefined;
 
         if (doReply) {
-            generatedText = await this.generateCommentReply(commentText || '', engagerMemory);
-            console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
-            await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
-            console.log(`[Executor] Reply posted on comment ${commentId}`);
+            // Real-time dedup: check if this account already replied to the comment
+            const alreadyReplied = await this.hasAccountCommented(adapter, engagingConnection, engagingUserId, commentId);
+            if (alreadyReplied) {
+                console.log(`[Executor] Account ${engagingConnection.account_id} already replied to ${commentId}, skipping reply.`);
+            } else {
+                generatedText = await this.generateCommentReply(commentText || '', engagerMemory);
+                console.log(`[Executor] Generated reply: "${generatedText.slice(0, 100)}..."`);
+                await adapter.createComment(engagingConnection, postId, generatedText, engagingUserId, commentId);
+                console.log(`[Executor] Reply posted on comment ${commentId}`);
+            }
         }
 
         if (doLike) {
-            reactionType = await this.generateReactionType(commentText || '');
-            await adapter.createReaction(engagingConnection, commentId, reactionType, engagingUserId);
-            console.log(`[Executor] Reacted "${reactionType}" on comment ${commentId}`);
+            try {
+                reactionType = await this.generateReactionType(commentText || '');
+                await adapter.createReaction(engagingConnection, commentId, reactionType, engagingUserId);
+                console.log(`[Executor] Reacted "${reactionType}" on comment ${commentId}`);
+            } catch (likeErr: any) {
+                if (doReply) {
+                    // Like is secondary in like_and_reply_comment — reply already succeeded.
+                    // Log and continue so the action is marked completed rather than retried,
+                    // which would post a duplicate reply.
+                    console.warn(`[Executor] Like sub-action failed (reply already succeeded), continuing:`, likeErr?.message);
+                    reactionType = undefined;
+                } else {
+                    throw likeErr;
+                }
+            }
         }
 
         return { generatedText, reactionType };
@@ -358,10 +416,12 @@ export class SocialEngagementExecutor {
 
     private async markActionDone(scheduleId: string) {
         try {
+            const now = new Date().toISOString();
             await scheduleDb.updateScheduleAfterRun(
                 scheduleId,
-                new Date().toISOString(),
-                new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+                now,  // lastRunTime = actual execution time
+                now,  // nextRunTime = same — status becomes 'paused' which blocks re-pickup,
+                      // so this value is never used; set to execution time for clean history
                 true
             );
         } catch (error) {
@@ -374,8 +434,8 @@ export class SocialEngagementExecutor {
 // TIMER SCHEDULER
 // ────────────────────────────────────────────────────────────────────────────
 
-const TIMER_LOOKAHEAD_MS = 30 * 60 * 1000;  // register timers for actions due within 10 min
-const TIMER_CHECK_INTERVAL_MS = 30 * 60 * 1000;  // check every 5 min
+const TIMER_LOOKAHEAD_MS = 30 * 60 * 1000;  // register timers for actions due within 30 min
+const TIMER_CHECK_INTERVAL_MS = 30 * 60 * 1000;  // check every 30 min
 
 /**
  * Polls DB every 5 minutes for social engagement actions due within the next 10 minutes
@@ -411,9 +471,8 @@ export class SocialEngagementTimerScheduler {
                 const delay = Math.max(0, new Date(nextRunTime).getTime() - Date.now());
                 setTimeout(() => {
                     this.pendingTimers.delete(scheduleId);
-                    this.executor.processQueue().catch(e =>
-                        console.error('[TimerScheduler] processQueue error:', e)
-                    );
+                    this.executor.processQueue()
+                        .catch(e => console.error('[TimerScheduler] processQueue error:', e));
                 }, delay);
                 this.pendingTimers.add(scheduleId);
                 registered++;
