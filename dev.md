@@ -1,3 +1,44 @@
+# March 26, 2026: Investigation — Recurring S3 DeleteObject Errors on Prod EB
+
+## Problem
+
+EB event notifications for the production environment (`Agentweb-backend-env-prod-3`, `e-ag9bmkfczz`) were reporting S3 permission errors every 15 minutes:
+
+```
+Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-07d440d734bbbcf55
+is not authorized to perform: s3:DeleteObject on resource:
+"arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/tail/..."
+```
+
+## Root Cause
+
+1. Cloud dev instance `i-07d440d734bbbcf55` (`agentweb-test-env-ruiwang-facetoon_image_user-agentweb6`, launched 2026-02-25) had `prod-log-monitor.sh` installed as a cron job running every 15 minutes.
+2. The cron calls `aws elasticbeanstalk request-environment-info` to fetch tail logs from the prod environment.
+3. EB internally uploads tail logs to S3, then tries to clean up (delete) old tail log files **using the caller's IAM role** — in this case `agentweb-test-env-ec2-role`.
+4. That role had permissions for `elasticbeanstalk:RequestEnvironmentInfo` and `elasticbeanstalk:RetrieveEnvironmentInfo`, but **not** `s3:DeleteObject` on the EB bucket.
+5. Result: EB successfully collected and returned logs, but the cleanup step failed every time, generating an ERROR event.
+
+## Fix
+
+Added `s3:DeleteObject` permission to `agentweb-test-env-ec2-role`, scoped to the temporary log prefix:
+
+```json
+{
+  "Sid": "AllowDeleteEBTailLogs",
+  "Effect": "Allow",
+  "Action": "s3:DeleteObject",
+  "Resource": "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/*"
+}
+```
+
+After applying, the next 15-minute cycle at 18:30 UTC completed cleanly — `Deleted log fragments for this environment.` appeared as INFO instead of ERROR.
+
+## Lesson
+
+When granting EB log retrieval permissions to an IAM role, also grant `s3:DeleteObject` on `elasticbeanstalk-<region>-<account>/resources/environments/logs/*` so EB can clean up temporary log fragments.
+
+---
+
 # March 25, 2026: Investigation — LiteLLM Vulnerability Impact on AgentWeb
 
 ## Background
