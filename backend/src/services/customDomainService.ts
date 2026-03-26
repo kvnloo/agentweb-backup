@@ -165,7 +165,7 @@ export async function addCustomDomain(
     { headers }
   );
 
-  const vercelData = response.data;
+  const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
 
   const now = new Date().toISOString();
@@ -309,7 +309,7 @@ export async function verifyDomain(
     { headers }
   );
 
-  const vercelData = response.data;
+  const vercelData = response.data as any;
   const isVerified = vercelData.verified === true;
 
   if (isVerified && record.status !== "active") {
