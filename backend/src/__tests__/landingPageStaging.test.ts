@@ -202,6 +202,35 @@ describe("PUT /github-edit with draft branch", () => {
     );
   });
 
+  it("SUCCESS: retries getFileSha when branch was just created (eventual consistency)", async () => {
+    // Branch doesn't exist → create it from main
+    mockedAxios.get.mockRejectedValueOnce({ response: { status: 404 } }); // branch check → 404
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "main-sha-456" } })); // get main HEAD
+    mockedAxios.post.mockResolvedValueOnce(axiosRes({})); // create branch ref
+    // First getFileSha → 404 (eventual consistency delay)
+    mockedAxios.get.mockRejectedValueOnce({ response: { status: 404 } });
+    // Retry getFileSha → success
+    mockedAxios.get.mockResolvedValueOnce(axiosRes({ sha: "file-sha-retry" }));
+    mockedAxios.put.mockResolvedValueOnce(axiosRes({ commit: { html_url: "https://github.com/commit/retry" } }));
+
+    const res = await request(app)
+      .put("/api/landing-pages/v0/generated/page-123/github-edit")
+      .send({
+        file_path: "app/page.tsx",
+        content: "retried content",
+        branch: "draft/session-retry123",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.is_staging).toBe(true);
+    // Verify the PUT included the SHA from the retry
+    expect(mockedAxios.put).toHaveBeenCalledWith(
+      expect.stringContaining("/contents/app/page.tsx"),
+      expect.objectContaining({ sha: "file-sha-retry" }),
+      expect.any(Object)
+    );
+  }, 10000);
+
   it("SUCCESS: reuses existing branch", async () => {
     // Branch already exists
     mockedAxios.get.mockResolvedValueOnce(axiosRes({ object: { sha: "branch-sha" } })); // branch exists
