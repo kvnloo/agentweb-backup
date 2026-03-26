@@ -323,7 +323,7 @@ function ScoreCell({
     minWidth: 120,
   };
 
-  if (sims.length === 0) {
+  if (sims.length === 0 || score === null) {
     return (
       <TableCell sx={cellSx}>
         <Typography variant="caption" color="text.disabled">—</Typography>
@@ -436,49 +436,27 @@ export default function SimulationsTable({
     [scenarios, activeScenarioIds]
   );
 
-  // Group all targets by name, sort each group descending by time_created
-  const targetVersionGroups = useMemo(() => {
-    const groups: Record<string, Target[]> = {};
-    for (const t of targets) {
-      if (!groups[t.name]) groups[t.name] = [];
-      groups[t.name].push(t);
-    }
-    for (const name in groups) {
-      groups[name].sort(
-        (a, b) =>
-          new Date(b.time_created || 0).getTime() -
-          new Date(a.time_created || 0).getTime()
-      );
-    }
-    return groups;
+  const targetIdToNameMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const t of targets) map[t.id] = t.name;
+    return map;
   }, [targets]);
 
-  // For display: all active target names, latest 3 versions each, with version labels
-  const displayVersionGroups = useMemo(() => {
-    const result: Record<string, { target: Target; versionLabel: string }[]> = {};
-    for (const name of targetNameOptions) {
-      const versions = targetVersionGroups[name];
-      if (!versions) continue;
-      const total = versions.length;
-      result[name] = versions.slice(0, 3).map((t, i) => ({
-        target: t,
-        versionLabel: `v${total - i}`,
-      }));
-    }
-    return result;
-  }, [targetNameOptions, targetVersionGroups]);
-
-  // matrix[scenario_id][target_id] = Simulation[] sorted by start_time desc
+  // matrix[scenario_id][target_name] = Simulation[] sorted by start_time desc
   const tableMatrix = useMemo(() => {
     const sims = finishedSims;
     const matrix: Record<string, Record<string, Simulation[]>> = {};
     for (const sim of sims) {
       const scen = sim.scenario_set_id;
-      const targ = sim.mut_id;
-      if (!scen || !targ) continue;
+      const targId = sim.mut_id;
+      if (!scen || !targId) continue;
+      
+      const targName = targetIdToNameMap[targId];
+      if (!targName) continue;
+
       if (!matrix[scen]) matrix[scen] = {};
-      if (!matrix[scen][targ]) matrix[scen][targ] = [];
-      matrix[scen][targ].push(sim);
+      if (!matrix[scen][targName]) matrix[scen][targName] = [];
+      matrix[scen][targName].push(sim);
     }
     for (const scenSims of Object.values(matrix)) {
       for (const arr of Object.values(scenSims)) {
@@ -490,15 +468,12 @@ export default function SimulationsTable({
       }
     }
     return matrix;
-  }, [finishedSims]);
+  }, [finishedSims, targetIdToNameMap]);
 
   // Rows: all active scenarios, already sorted alphabetically
   const activeScenarios = sortedScenarioOptions;
 
-  const totalCols = useMemo(
-    () => 1 + Object.values(displayVersionGroups).reduce((sum, vs) => sum + vs.length, 0),
-    [displayVersionGroups]
-  );
+  const totalCols = 1 + targetNameOptions.length;
 
   const hasTargets = targetNameOptions.length > 0;
   const hasScenarios = sortedScenarioOptions.length > 0;
@@ -546,7 +521,6 @@ export default function SimulationsTable({
               {/* Row 1: Target group names */}
               <TableRow>
                 <TableCell
-                  rowSpan={hasTargets ? 2 : 1}
                   sx={{
                     position: 'sticky', left: 0, zIndex: 3,
                     bgcolor: 'background.paper',
@@ -558,59 +532,22 @@ export default function SimulationsTable({
                 >
                   Scenario
                 </TableCell>
-                {!hasTargets ? (
-                  <TableCell sx={{ color: 'text.disabled', fontStyle: 'italic', fontSize: 13 }}>
-                    Select targets above to populate columns
+                {targetNameOptions.map((name) => (
+                  <TableCell
+                    key={name}
+                    align="center"
+                    sx={{
+                      fontWeight: 700, fontSize: 12,
+                      borderLeft: '2px solid', borderColor: 'divider',
+                      bgcolor: 'grey.50', py: 1,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}
+                    title={name}
+                  >
+                    {name}
                   </TableCell>
-                ) : (
-                  Object.entries(displayVersionGroups).map(([name, versions]) => (
-                    <TableCell
-                      key={name}
-                      colSpan={versions.length}
-                      align="center"
-                      sx={{
-                        fontWeight: 700, fontSize: 12,
-                        borderLeft: '2px solid', borderColor: 'divider',
-                        bgcolor: 'grey.50', py: 1,
-                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                      }}
-                      title={name}
-                    >
-                      {name}
-                    </TableCell>
-                  ))
-                )}
+                ))}
               </TableRow>
-
-              {/* Row 2: Version labels (only when targets selected) */}
-              {hasTargets && (
-                <TableRow>
-                  {Object.entries(displayVersionGroups).flatMap(([, versions]) =>
-                    versions.map((v, vi) => (
-                      <TableCell
-                        key={v.target.id}
-                        align="center"
-                        sx={{
-                          fontWeight: 600, fontSize: 11, py: 0.75,
-                          color: vi === 0 ? 'primary.main' : 'text.secondary',
-                          borderLeft: vi === 0 ? '2px solid' : undefined,
-                          borderColor: 'divider',
-                          minWidth: 120,
-                          bgcolor: vi === 0 ? 'primary.50' : 'grey.50',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        {v.versionLabel}
-                        {vi === 0 && (
-                          <Box component="span" sx={{ ml: 0.5, color: 'primary.light', fontSize: 9 }}>
-                            (latest)
-                          </Box>
-                        )}
-                      </TableCell>
-                    ))
-                  )}
-                </TableRow>
-              )}
             </TableHead>
 
             <TableBody>
@@ -637,29 +574,19 @@ export default function SimulationsTable({
                       {scenario.name || scenario.scenario_id}
                     </TableCell>
 
-                    {!hasTargets ? (
-                      <TableCell />
-                    ) : (
-                      Object.entries(displayVersionGroups).flatMap(([, versions]) =>
-                        versions.map((v, vi) => {
-                          const cellSims = tableMatrix[scenario.scenario_id]?.[v.target.id] ?? [];
-                          const prevVersionSims =
-                            vi < versions.length - 1
-                              ? (tableMatrix[scenario.scenario_id]?.[versions[vi + 1].target.id] ?? [])
-                              : [];
-                          return (
-                            <ScoreCell
-                              key={v.target.id}
-                              sims={cellSims}
-                              prevVersionSims={prevVersionSims}
-                              onSimClick={onSimClick}
-                              isFirstInGroup={vi === 0}
-                              checkMetaMap={checkMetaMap}
-                            />
-                          );
-                        })
-                      )
-                    )}
+                    {targetNameOptions.map((name) => {
+                      const cellSims = tableMatrix[scenario.scenario_id]?.[name] ?? [];
+                      return (
+                        <ScoreCell
+                          key={name}
+                          sims={cellSims}
+                          prevVersionSims={[]}
+                          onSimClick={onSimClick}
+                          isFirstInGroup={true}
+                          checkMetaMap={checkMetaMap}
+                        />
+                      );
+                    })}
                   </TableRow>
                 ))
               )}
