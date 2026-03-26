@@ -11,6 +11,8 @@ jest.mock('../services/skillService', () => ({
   skillService: {
     getPublishedSkills: jest.fn(),
     getSkillsByIds: jest.fn(),
+    getSkillsAvailableToUser: jest.fn(),
+    getSkillsByOwner: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -63,12 +65,17 @@ describe('AgentModeService - Skills', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     agentModeService = new AgentModeService();
-    
+
     // Mock settings service for default behavior
     const mockSettingsService = require('../services/settingsService');
     mockSettingsService.settingsService = {
       getSetting: jest.fn().mockResolvedValue(null),
     };
+
+    // By default, getSkillsAvailableToUser returns same as getPublishedSkills
+    (skillService.getSkillsAvailableToUser as jest.Mock).mockImplementation(async () => {
+      return (skillService.getPublishedSkills as jest.Mock)();
+    });
   });
 
   describe('installSkills', () => {

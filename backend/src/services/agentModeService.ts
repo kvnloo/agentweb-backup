@@ -1885,6 +1885,12 @@ You can create and manage multi-step work plans using these tools:
 
 Work plans help organize complex multi-step projects like client onboarding, campaign planning, or content creation workflows. The current work plan status (if any) is automatically provided in your context. **If you see a work plan in your context, you MUST continue working with that existing plan - never create a duplicate.**
 
+## Skill Creation
+You can create custom skills for users using:
+- **create_skill**: Create a new skill bundle with a name, description, list of tool names, and optional system prompt. The skill starts as private to the user. They can later submit it for platform review via Settings > Skills.
+
+When a user asks to create a skill, identify the relevant tools from your available tools and create the skill with appropriate toolNames. For example, a "LinkedIn Post Creator from Latest News" skill might use tools like bravesearch_brave_news_search, create_social_media_posts, read_brand_guidelines, etc.
+
 ## GTM Plan Capabilities
 You can read and create Go-To-Market (GTM) plans using these tools:
 - **list_gtm_plans**: List all GTM plans for the user. Returns plan IDs, titles, descriptions, phase counts, and creation dates.
@@ -2196,7 +2202,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      const publishedSkills = await skillService.getPublishedSkills();
+      const publishedSkills = await skillService.getSkillsAvailableToUser(userId);
 
       if (!publishedSkills.length)
         return { message: "No skills available in the library." };
@@ -2266,6 +2272,10 @@ When a user requests client onboarding or says "onboard new client" or similar:
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+    'save_work_plan',
+
+    // Skill Creation (users can define custom skill bundles)
+    'create_skill',
 
     // GTM Discovery (teasers - hint at Emma's capabilities)
     'search_leads',           // CRM teaser
@@ -2423,23 +2433,24 @@ When a user requests client onboarding or says "onboard new client" or similar:
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[]> {
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getPublishedSkills(),
+      userId ? skillService.getSkillsAvailableToUser(userId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
-    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId))
+    const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
+      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
         description: s.description,
         installed: installedIds.has(s.skillId),
-        toolNames: s.toolNames || []
+        toolNames: s.toolNames || [],
+        visibility: s.visibility || 'public',
       }));
 
     // Add virtual other_skills entry if allowed and there are unassociated tools
@@ -2481,7 +2492,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   public async installSkills(skillIds: string[], userId: string, sessionId: string): Promise<any> {
     try {
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getPublishedSkills(),
+        skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
@@ -2500,12 +2511,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         }
       }
 
-      // Filter valid IDs: exists in published skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill)
-      const validSkillIds = skillIds.filter(id =>
-        (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || publishedSkills.some(s => s.skillId === id)) &&
-        (id === ADMIN_SKILL_VIRTUAL_ID || isWildcard || allowedSkillSet.has(id))
-      );
+      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
+      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill)
+      const validSkillIds = skillIds.filter(id => {
+        const skill = publishedSkills.find(s => s.skillId === id);
+        const isOwnSkill = skill && skill.ownerId === userId;
+        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && isAdmin) || skill) &&
+          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isWildcard || allowedSkillSet.has(id));
+      });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
 

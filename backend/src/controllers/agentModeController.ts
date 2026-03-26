@@ -9,6 +9,7 @@ import crypto from 'crypto';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { emailService } from '../services/emailService';
 import { settingsService } from '../services/settingsService';
+import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
@@ -1455,7 +1456,7 @@ export async function generateSessionResponse(
   const finalSession = await chatbotDb.getChatSession(sessionId);
 
   // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+  let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = [];
   try {
     skills = await agentModeService.getSkillsForDisplay(finalSession?.associatedSkills || [], userId);
   } catch (error) {
@@ -1655,7 +1656,7 @@ export const agentModeController = {
       await syncEmailCampaignExecution(session.userId, session.sessionId, session.emailCampaignTaskId || '');
 
       // Build skills list with installed status (includes virtual other_skills), filtered by subscription
-      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[] }[] = [];
+      let skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = [];
       try {
         skills = await agentModeService.getSkillsForDisplay(session.associatedSkills || [], session.userId);
       } catch (error) {
@@ -4464,26 +4465,52 @@ export const agentModeController = {
     }
   },
 
-  // Get all predefined work plans (public)
+  // Get all predefined work plans (public + user's own private, deduped by title) — reads from AW-WorkPlans table
   async getAllPredefinedWorkPlans(req: Request, res: Response) {
     try {
-      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
-      
-      if (!setting || !setting.settingValue) {
-        return res.json([]);
+      const publicPlans = await workPlanService.getPublicPlansForAgentMode();
+
+      // If user is authenticated, also include their private plans
+      let userPrivatePlans: any[] = [];
+      const result = await getUserFromToken(req);
+      if (result.user) {
+        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
+        userPrivatePlans = ownPlans.filter(p => p.visibility === 'private');
       }
-      
-      const workPlans = JSON.parse(setting.settingValue);
-      // Filter plans to only include those with showInAgentMode === true
-      const visiblePlans = workPlans.filter((plan: any) => plan.showInAgentMode === true);
-      res.json(visiblePlans);
+
+      // Map to legacy shape expected by customer portal (uses 'id' not 'planId')
+      const mapPlan = (p: any) => ({
+        id: p.planId,
+        title: p.title,
+        description: p.description,
+        welcomeMessage: p.welcomeMessage,
+        autocomplete: p.autocomplete || false,
+        requireLogin: p.requireLogin || false,
+        showLoginSignup: p.showLoginSignup || 'after_plan_completed',
+        showInAgentMode: p.showInAgentMode !== false,
+        defaultModel: p.defaultModel,
+        steps: p.steps,
+        visibility: p.visibility,
+      });
+
+      // Put private plans first, then public — deduplicate by title so user's
+      // private plan takes priority over a system/public plan with the same title
+      const allPlans = [...userPrivatePlans.map(mapPlan), ...publicPlans.map(mapPlan)];
+      const seen = new Set<string>();
+      const deduped = allPlans.filter(p => {
+        const key = p.title.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      res.json(deduped);
     } catch (error) {
       console.error('AgentMode: Get all predefined work plans error:', error);
       res.status(500).json({ error: 'Failed to get all predefined work plans' });
     }
   },
 
-  // Get predefined work plan by title (public)
+  // Get predefined work plan by title (public + user's private) — reads from AW-WorkPlans table
   async getPredefinedWorkPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
@@ -4492,17 +4519,23 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Plan title is required' });
       }
 
-      // Load predefined work plans from settings
-      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
-
-      if (!setting || !setting.settingValue) {
-        return res.status(404).json({ error: 'No predefined work plans found' });
+      // Load system + public plans from AW-WorkPlans table
+      const [systemPlans, publicPlans] = await Promise.all([
+        workPlanService.getWorkPlansByVisibility('system'),
+        workPlanService.getWorkPlansByVisibility('public'),
+      ]);
+      // Put user's private plans FIRST so they take priority over system/public plans with same title
+      const result = await getUserFromToken(req);
+      const allPlans: any[] = [];
+      if (result.user) {
+        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
+        const privatePlans = ownPlans.filter(p => p.visibility === 'private');
+        allPlans.push(...privatePlans);
       }
+      allPlans.push(...systemPlans, ...publicPlans);
 
-      const workPlans = JSON.parse(setting.settingValue);
-
-      // Find work plan with matching title (case-insensitive)
-      const workPlan = workPlans.find((wp: any) =>
+      // Find work plan with matching title (case-insensitive) — private plans checked first
+      const workPlan = allPlans.find((wp) =>
         wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
       );
 
@@ -4510,10 +4543,23 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
+      // Enforce ownership for private plans
+      if (workPlan.visibility === 'private' && (!result.user || workPlan.ownerId !== result.user.userId)) {
+        return res.status(403).json({ error: 'Not authorized to view this private work plan' });
+      }
+
       res.json({
-        ...workPlan,
+        id: workPlan.planId,
+        title: workPlan.title,
+        description: workPlan.description,
+        welcomeMessage: workPlan.welcomeMessage,
+        autocomplete: workPlan.autocomplete || false,
+        requireLogin: workPlan.requireLogin || false,
         showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
-        requireLogin: workPlan.requireLogin || false
+        showInAgentMode: workPlan.showInAgentMode !== false,
+        defaultModel: workPlan.defaultModel,
+        steps: workPlan.steps,
+        visibility: workPlan.visibility,
       });
     } catch (error) {
       console.error('AgentMode: Get predefined work plan error:', error);
@@ -4521,7 +4567,7 @@ export const agentModeController = {
     }
   },
 
-  // Create session with predefined work plan (public)
+  // Create session with predefined work plan (public) — reads from AW-WorkPlans table
   async createSessionWithPlan(req: Request, res: Response) {
     try {
       const { planTitle } = req.params;
@@ -4531,17 +4577,26 @@ export const agentModeController = {
         return res.status(400).json({ error: 'Plan title is required' });
       }
 
-      // Get predefined work plan
-      const setting = await settingsService.getSetting('agent-mode-predefined-workplans');
+      // Check if user is authenticated (optional - route is public)
+      const result = await getUserFromToken(req);
+      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
 
-      if (!setting || !setting.settingValue) {
-        return res.status(404).json({ error: 'No predefined work plans found' });
+      // Load system + public plans from AW-WorkPlans table
+      const [systemPlans, publicPlans] = await Promise.all([
+        workPlanService.getWorkPlansByVisibility('system'),
+        workPlanService.getWorkPlansByVisibility('public'),
+      ]);
+      // Put user's private plans FIRST so they take priority over system/public plans with same title
+      const allPlans: any[] = [];
+      if (result.user) {
+        const ownPlans = await workPlanService.getWorkPlansByOwner(result.user.userId);
+        const privatePlans = ownPlans.filter(p => p.visibility === 'private');
+        allPlans.push(...privatePlans);
       }
+      allPlans.push(...systemPlans, ...publicPlans);
 
-      const workPlans = JSON.parse(setting.settingValue);
-
-      // Find work plan with matching title (case-insensitive)
-      const predefinedPlan = workPlans.find((wp: any) =>
+      // Find work plan with matching title (case-insensitive) — private plans checked first
+      const predefinedPlan = allPlans.find((wp) =>
         wp.title && wp.title.toLowerCase() === planTitle.toLowerCase()
       );
 
@@ -4549,10 +4604,10 @@ export const agentModeController = {
         return res.status(404).json({ error: `Work plan "${planTitle}" not found` });
       }
 
-      // Check if user is authenticated (optional - route is public)
-      // Use the common function to extract user from token
-      const result = await getUserFromToken(req);
-      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
+      // Enforce ownership for private plans
+      if (predefinedPlan.visibility === 'private' && predefinedPlan.ownerId !== userId) {
+        return res.status(403).json({ error: 'Not authorized to use this private work plan' });
+      }
 
       // Create session with userId (authenticated or anonymous)
       const session = await chatbotDb.createChatSession(

@@ -40,17 +40,19 @@ emmaToolRegistry.register({
       const { getAllowedSkills } = await import('../services/subscriptionService');
 
       const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getPublishedSkills(),
+        skillService.getSkillsAvailableToUser(userId),
         getAllowedSkills(userId)
       ]);
 
       const isWildcard = userAllowedSkillIds.includes("*");
       const allowedSkillSet = new Set(userAllowedSkillIds);
 
-      const validSkillIds = args.skillIds.filter((id: string) =>
-        (id === '__other_skills__' || publishedSkills.some(s => s.skillId === id)) &&
-        (isWildcard || allowedSkillSet.has(id))
-      );
+      const validSkillIds = args.skillIds.filter((id: string) => {
+        const skill = publishedSkills.find(s => s.skillId === id);
+        const isOwnSkill = skill && (skill as any).ownerId === userId;
+        return (id === '__other_skills__' || skill) &&
+          (isOwnSkill || isWildcard || allowedSkillSet.has(id));
+      });
 
       if (validSkillIds.length === 0) {
         return {
@@ -104,16 +106,16 @@ emmaToolRegistry.register({
     const { getAllowedSkills } = await import('../services/subscriptionService');
 
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-      skillService.getPublishedSkills(),
+      skillService.getSkillsAvailableToUser(userId),
       getAllowedSkills(userId)
     ]);
 
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSkillSet = new Set(userAllowedSkillIds);
 
-    // Filter skills by user's subscription
+    // Filter skills by user's subscription (user's own private skills always pass)
     const availableSkills = publishedSkills
-      .filter(skill => isWildcard || allowedSkillSet.has(skill.skillId))
+      .filter(skill => isWildcard || allowedSkillSet.has(skill.skillId) || (skill as any).ownerId === userId)
       .map(skill => ({
         skillId: skill.skillId,
         name: skill.name,
@@ -4658,6 +4660,193 @@ emmaToolRegistry.register({
     } else {
       return { success: false, error: result.message, iterations: result.iterations };
     }
+  }
+});
+
+// --- User Skill Creation ---
+emmaToolRegistry.register({
+  name: 'create_skill',
+  definition: {
+    name: 'create_skill',
+    description: 'Create a new agent skill for the user. A skill is a named bundle of tools with an optional system prompt that customizes agent behavior. The skill starts as private and the user can submit it for platform review later via the Settings > Skills page.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Name of the skill (e.g., "LinkedIn Post Creator from Latest News")'
+        },
+        description: {
+          type: 'string',
+          description: 'Description of what the skill does'
+        },
+        toolNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of tool names this skill can use (e.g., ["bravesearch_brave_news_search", "create_social_media_posts"])'
+        },
+        systemPrompt: {
+          type: 'string',
+          description: 'Optional custom instructions for the agent when this skill is active'
+        }
+      },
+      required: ['name', 'description', 'toolNames']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    // LLMs sometimes send "tools" instead of "toolNames", and may stringify the array
+    let rawTools = args.toolNames ?? args.tools ?? [];
+    if (typeof rawTools === 'string') {
+      try { rawTools = JSON.parse(rawTools); } catch { rawTools = []; }
+    }
+    const toolNames: string[] = Array.isArray(rawTools) ? rawTools : [];
+    const { skillService } = await import('../services/skillService');
+    const skill = await skillService.createSkill(
+      args.name,
+      args.description,
+      toolNames,
+      args.systemPrompt,
+      false
+    );
+    // Set ownership fields and re-save with toolNames explicitly preserved
+    skill.ownerId = userId;
+    skill.visibility = 'private';
+    skill.isBuiltIn = false;
+    skill.toolNames = toolNames;
+    await skillService.updateSkill(skill);
+    return {
+      success: true,
+      skillId: skill.skillId,
+      name: skill.name,
+      description: skill.description,
+      toolNames: skill.toolNames,
+      visibility: skill.visibility,
+      message: `Skill "${skill.name}" created successfully. It is currently private. The user can submit it for platform review from Settings > Skills.`
+    };
+  }
+});
+
+emmaToolRegistry.register({
+  name: 'save_work_plan',
+  definition: {
+    name: 'save_work_plan',
+    description: 'Save a work plan to the user\'s library for future reuse. The plan starts as private and the user can submit it for platform review later via Settings > Work Plans. Use this after creating a work plan with create_work_plan when the user wants to keep it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: {
+          type: 'string',
+          description: 'Title of the work plan'
+        },
+        description: {
+          type: 'string',
+          description: 'Description of what the work plan accomplishes'
+        },
+        welcomeMessage: {
+          type: 'string',
+          description: 'Optional greeting shown when the plan starts'
+        },
+        steps: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              stepCount: { type: 'number', description: 'Step number (1-based)' },
+              title: { type: 'string', description: 'Step title' },
+              description: { type: 'string', description: 'Step description' },
+              requiredFunctionCalls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Function names that must be called to complete this step (e.g. search_web, update_brand_guidelines)'
+              },
+              skillIds: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Skill IDs to auto-install when this step becomes active'
+              },
+            },
+            required: ['stepCount', 'title']
+          },
+          description: 'Array of steps in the work plan'
+        }
+      },
+      required: ['title', 'steps']
+    }
+  },
+  execute: async (args: any, context?: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) {
+      throw new Error('Authentication required: no user context');
+    }
+    const { workPlanService } = await import('../services/workPlanService');
+
+    // If there's a session work plan, merge requiredFunctionCalls/skillIds from it
+    // because the LLM often omits these when calling save_work_plan
+    let sessionWorkPlan: any = null;
+    if (context?.sessionId) {
+      try {
+        const { chatbotDb } = await import('../services/chatbotService');
+        const session = await chatbotDb.getChatSession(context.sessionId);
+        if (session?.workPlan) {
+          sessionWorkPlan = session.workPlan;
+        }
+      } catch {
+        // Non-critical — proceed without session data
+      }
+    }
+
+    // Normalize steps
+    let steps = args.steps || [];
+    if (typeof steps === 'string') {
+      try { steps = JSON.parse(steps); } catch { steps = []; }
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new Error('At least one step is required');
+    }
+
+    // Build a lookup of session step data by stepCount for merging
+    const sessionStepMap = new Map<number, any>();
+    if (sessionWorkPlan?.steps) {
+      for (const s of sessionWorkPlan.steps) {
+        sessionStepMap.set(s.stepCount, s);
+      }
+    }
+
+    const plan = await workPlanService.createWorkPlan({
+      title: args.title,
+      description: args.description || '',
+      welcomeMessage: args.welcomeMessage || '',
+      steps: steps.map((s: any, i: number) => {
+        const stepNum = s.stepCount || i + 1;
+        const sessionStep = sessionStepMap.get(stepNum);
+        return {
+          stepCount: stepNum,
+          title: s.title,
+          description: s.description || '',
+          requiredFunctionCalls: Array.isArray(s.requiredFunctionCalls) && s.requiredFunctionCalls.length > 0
+            ? s.requiredFunctionCalls
+            : (sessionStep?.requiredFunctionCalls || []),
+          skillIds: Array.isArray(s.skillIds) && s.skillIds.length > 0
+            ? s.skillIds
+            : (sessionStep?.skillIds || []),
+        };
+      }),
+      ownerId: userId,
+      visibility: 'private',
+      isBuiltIn: false,
+    });
+    return {
+      success: true,
+      planId: plan.planId,
+      title: plan.title,
+      steps: plan.steps.length,
+      visibility: plan.visibility,
+      message: `Work plan "${plan.title}" saved successfully. It is currently private. The user can submit it for platform review from Settings > Work Plans.`
+    };
   }
 });
 
