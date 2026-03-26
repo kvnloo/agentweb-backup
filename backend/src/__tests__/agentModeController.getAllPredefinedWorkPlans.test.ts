@@ -1,15 +1,24 @@
 import { Request, Response } from 'express';
 import { agentModeController } from '../controllers/agentModeController';
-import { settingsService } from '../services/settingsService';
+import { workPlanService } from '../services/workPlanService';
+import { getUserFromToken } from '../middleware/auth';
 
 // Mock dependencies
-jest.mock('../services/settingsService', () => ({
-  settingsService: {
-    getSetting: jest.fn()
+jest.mock('../services/workPlanService', () => ({
+  workPlanService: {
+    getPublicPlansForAgentMode: jest.fn(),
+    getWorkPlansByOwner: jest.fn(),
   }
 }));
 
-const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
+jest.mock('../middleware/auth', () => ({
+  getUserFromToken: jest.fn(),
+  authenticateToken: jest.fn(),
+  isAdmin: jest.fn(),
+}));
+
+const mockWorkPlanService = workPlanService as jest.Mocked<typeof workPlanService>;
+const mockGetUserFromToken = getUserFromToken as jest.MockedFunction<typeof getUserFromToken>;
 
 describe('AgentModeController - getAllPredefinedWorkPlans', () => {
   const mockRequest = () => ({} as Request);
@@ -23,102 +32,124 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default: unauthenticated user
+    mockGetUserFromToken.mockResolvedValue({ user: null });
   });
 
-  it('should return only predefined work plans with showInAgentMode === true', async () => {
-    const mockWorkPlans = [
+  it('should return plans from workPlanService with legacy shape', async () => {
+    const mockPlans = [
       {
-        id: 'plan-1',
+        planId: 'plan-1',
         title: 'Onboarding',
         description: 'Get started with our platform',
-        steps: [
-          {
-            stepCount: 1,
-            title: 'Step 1',
-            description: 'First step',
-            requiredFunctionCalls: ['function1']
-          }
-        ],
+        steps: [{ stepCount: 1, title: 'Step 1', description: 'First step', requiredFunctionCalls: ['function1'] }],
         welcomeMessage: 'Welcome!',
-        showInAgentMode: true
+        showInAgentMode: true,
+        visibility: 'system' as const,
+        isBuiltIn: true,
+        createdAt: '2026-01-01',
+        updatedAt: '2026-01-01',
       },
       {
-        id: 'plan-2',
-        title: 'Marketing Strategy',
-        description: 'Create a marketing strategy',
-        steps: [
-          {
-            stepCount: 1,
-            title: 'Analyze market',
-            requiredFunctionCalls: ['analyze_market']
-          }
-        ],
-        showInAgentMode: false
-      },
-      {
-        id: 'plan-3',
+        planId: 'plan-3',
         title: 'Content Creation',
         description: 'Create content',
-        steps: [
-          {
-            stepCount: 1,
-            title: 'Create content',
-            requiredFunctionCalls: ['create_content']
-          }
-        ],
-        showInAgentMode: true
+        steps: [{ stepCount: 1, title: 'Create content', requiredFunctionCalls: ['create_content'] }],
+        showInAgentMode: true,
+        visibility: 'public' as const,
+        isBuiltIn: false,
+        createdAt: '2026-01-01',
+        updatedAt: '2026-01-01',
       }
     ];
 
-    mockSettingsService.getSetting.mockResolvedValue({
-      settingKey: 'agent-mode-predefined-workplans',
-      settingValue: JSON.stringify(mockWorkPlans)
-    } as any);
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue(mockPlans);
 
     const req = mockRequest();
     const res = mockResponse();
 
     await agentModeController.getAllPredefinedWorkPlans(req, res);
 
-    expect(mockSettingsService.getSetting).toHaveBeenCalledWith('agent-mode-predefined-workplans');
-    // Should only return plans with showInAgentMode === true
-    expect(res.json).toHaveBeenCalledWith([
-      mockWorkPlans[0],
-      mockWorkPlans[2]
-    ]);
+    expect(mockWorkPlanService.getPublicPlansForAgentMode).toHaveBeenCalled();
+    // Should map planId to id for legacy compatibility
+    const result = (res.json as jest.Mock).mock.calls[0][0];
+    expect(result).toHaveLength(2);
+    expect(result[0].id).toBe('plan-1');
+    expect(result[0].title).toBe('Onboarding');
+    expect(result[1].id).toBe('plan-3');
     expect(res.status).not.toHaveBeenCalled();
   });
 
   it('should return empty array when no work plans exist', async () => {
-    mockSettingsService.getSetting.mockResolvedValue(null);
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue([]);
 
     const req = mockRequest();
     const res = mockResponse();
 
     await agentModeController.getAllPredefinedWorkPlans(req, res);
 
-    expect(mockSettingsService.getSetting).toHaveBeenCalledWith('agent-mode-predefined-workplans');
     expect(res.json).toHaveBeenCalledWith([]);
     expect(res.status).not.toHaveBeenCalled();
   });
 
-  it('should return empty array when setting value is empty', async () => {
-    mockSettingsService.getSetting.mockResolvedValue({
-      settingKey: 'agent-mode-predefined-workplans',
-      settingValue: null
-    } as any);
+  it('should include user private plans when authenticated', async () => {
+    const publicPlan = {
+      planId: 'plan-1',
+      title: 'Onboarding',
+      description: 'Public plan',
+      steps: [{ stepCount: 1, title: 'Step 1', requiredFunctionCalls: [] }],
+      showInAgentMode: true,
+      visibility: 'system' as const,
+      isBuiltIn: true,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    };
+    const privatePlan = {
+      planId: 'plan-private',
+      title: 'My Private Plan',
+      description: 'Private plan',
+      steps: [{ stepCount: 1, title: 'Step 1', requiredFunctionCalls: [] }],
+      showInAgentMode: true,
+      visibility: 'private' as const,
+      isBuiltIn: false,
+      ownerId: 'user-123',
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    };
+
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue([publicPlan]);
+    mockGetUserFromToken.mockResolvedValue({ user: { userId: 'user-123', email: 'test@example.com' } } as any);
+    mockWorkPlanService.getWorkPlansByOwner.mockResolvedValue([privatePlan]);
 
     const req = mockRequest();
     const res = mockResponse();
 
     await agentModeController.getAllPredefinedWorkPlans(req, res);
 
+    const result = (res.json as jest.Mock).mock.calls[0][0];
+    expect(result).toHaveLength(2);
+    expect(result[0].id).toBe('plan-1');
+    expect(result[0].visibility).toBe('system');
+    expect(result[1].id).toBe('plan-private');
+    expect(result[1].visibility).toBe('private');
+  });
+
+  it('should not include private plans for unauthenticated users', async () => {
+    mockWorkPlanService.getPublicPlansForAgentMode.mockResolvedValue([]);
+    mockGetUserFromToken.mockResolvedValue({ user: null });
+
+    const req = mockRequest();
+    const res = mockResponse();
+
+    await agentModeController.getAllPredefinedWorkPlans(req, res);
+
+    expect(mockWorkPlanService.getWorkPlansByOwner).not.toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith([]);
   });
 
   it('should handle errors gracefully', async () => {
     const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    mockSettingsService.getSetting.mockRejectedValue(new Error('Database error'));
+    mockWorkPlanService.getPublicPlansForAgentMode.mockRejectedValue(new Error('Database error'));
 
     const req = mockRequest();
     const res = mockResponse();

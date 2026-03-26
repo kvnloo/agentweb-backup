@@ -94,11 +94,18 @@ router.put("/:planId", async (req, res) => {
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, visibility } = req.body;
+    const normalizedSteps = steps !== undefined ? steps.map((s: any, i: number) => ({
+      stepCount: s.stepCount || i + 1,
+      title: s.title || `Step ${i + 1}`,
+      description: s.description,
+      requiredFunctionCalls: s.requiredFunctionCalls || [],
+      skillIds: s.skillIds || [],
+    })) : undefined;
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
       ...(description !== undefined && { description }),
-      ...(steps !== undefined && { steps }),
+      ...(normalizedSteps !== undefined && { steps: normalizedSteps }),
       ...(welcomeMessage !== undefined && { welcomeMessage }),
       ...(autocomplete !== undefined && { autocomplete }),
       ...(requireLogin !== undefined && { requireLogin }),

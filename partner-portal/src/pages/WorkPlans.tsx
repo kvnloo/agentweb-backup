@@ -29,6 +29,7 @@ import {
   MenuItem,
   FormControl,
   InputLabel,
+  Autocomplete,
 } from "@mui/material";
 import {
   Edit as EditIcon,
@@ -115,6 +116,9 @@ export default function WorkPlans() {
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<WorkPlan | null>(null);
 
+  // Available function calls for autocomplete
+  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<string[]>([]);
+
   const fetchPlans = useCallback(async () => {
     try {
       const res = await axios.get(buildApiUrl("/api/admin/work-plans"), {
@@ -131,7 +135,24 @@ export default function WorkPlans() {
     }
   }, [token]);
 
-  useEffect(() => { fetchPlans(); }, [fetchPlans]);
+  const fetchAvailableFunctionCalls = useCallback(async () => {
+    try {
+      const res = await axios.get(buildApiUrl("/api/agent-mode/function-calls"), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.data?.functionCalls) {
+        const workPlanFunctions = ["create_work_plan", "modify_work_plan", "set_work_plan_status"];
+        const names = res.data.functionCalls
+          .filter((fc: { name: string }) => !workPlanFunctions.includes(fc.name))
+          .map((fc: { name: string }) => fc.name);
+        setAvailableFunctionCalls(names);
+      }
+    } catch {
+      // Non-critical — autocomplete just won't have suggestions
+    }
+  }, [token]);
+
+  useEffect(() => { fetchPlans(); fetchAvailableFunctionCalls(); }, [fetchPlans, fetchAvailableFunctionCalls]);
 
   const openCreateDialog = () => {
     setEditingPlan(null);
@@ -248,7 +269,7 @@ export default function WorkPlans() {
     setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
   };
 
-  const updateStep = (index: number, field: string, value: string) => {
+  const updateStep = (index: number, field: string, value: string | string[]) => {
     const updated = [...steps];
     updated[index] = { ...updated[index], [field]: value };
     setSteps(updated);
@@ -485,6 +506,39 @@ export default function WorkPlans() {
                       placeholder="Description (optional)"
                       size="small"
                       fullWidth
+                      sx={{ mb: 0.5 }}
+                    />
+                    <Autocomplete
+                      multiple
+                      freeSolo
+                      size="small"
+                      options={availableFunctionCalls}
+                      value={step.requiredFunctionCalls || []}
+                      onChange={(_e, newValue) => {
+                        updateStep(i, "requiredFunctionCalls", newValue as string[]);
+                      }}
+                      renderTags={(value, getTagProps) =>
+                        value.map((option, index) => {
+                          const { key, ...rest } = getTagProps({ index });
+                          return (
+                            <Chip
+                              key={key}
+                              label={option}
+                              size="small"
+                              variant="outlined"
+                              sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}
+                              {...rest}
+                            />
+                          );
+                        })
+                      }
+                      renderInput={(params) => (
+                        <TextField
+                          {...params}
+                          placeholder={step.requiredFunctionCalls?.length ? "" : "Select required function calls..."}
+                          helperText="Functions that must be called to complete this step"
+                        />
+                      )}
                     />
                   </Box>
                   {steps.length > 1 && (

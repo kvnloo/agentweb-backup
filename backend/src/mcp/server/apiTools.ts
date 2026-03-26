@@ -1480,7 +1480,7 @@ mcpToolRegistry.register({
     inputSchema: { type: 'object', properties: {}, required: [] }
   },
   execute: async (_args: any, context: any) => {
-    const data = await mcpFetch({ method: 'GET', path: '/api/settings/agent-mode-predefined-workplans', context: ctx(context) });
+    const data = await mcpFetch({ method: 'GET', path: '/api/admin/work-plans', context: ctx(context) });
     return jsonResult(data);
   }
 });
@@ -1532,7 +1532,7 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
-        const data = await mcpFetch({ method: 'POST', path: '/api/settings/agent-mode-predefined-workplans', context: c, body });
+        const data = await mcpFetch({ method: 'POST', path: '/api/admin/work-plans', context: c, body });
         return jsonResult(data);
       }
       case 'update': {
@@ -1544,15 +1544,15 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c, body });
+        const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
         return jsonResult(data);
       }
       case 'delete': {
-        const data = await mcpFetch({ method: 'DELETE', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
         return jsonResult(data);
       }
       case 'get': {
-        const data = await mcpFetch({ method: 'GET', path: `/api/settings/agent-mode-predefined-workplans/${args.plan_id}`, context: c });
+        const data = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
         return jsonResult(data);
       }
       default:

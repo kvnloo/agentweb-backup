@@ -4758,6 +4758,16 @@ emmaToolRegistry.register({
               stepCount: { type: 'number', description: 'Step number (1-based)' },
               title: { type: 'string', description: 'Step title' },
               description: { type: 'string', description: 'Step description' },
+              requiredFunctionCalls: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Function names that must be called to complete this step (e.g. search_web, update_brand_guidelines)'
+              },
+              skillIds: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Skill IDs to auto-install when this step becomes active'
+              },
             },
             required: ['stepCount', 'title']
           },
@@ -4773,6 +4783,22 @@ emmaToolRegistry.register({
       throw new Error('Authentication required: no user context');
     }
     const { workPlanService } = await import('../services/workPlanService');
+
+    // If there's a session work plan, merge requiredFunctionCalls/skillIds from it
+    // because the LLM often omits these when calling save_work_plan
+    let sessionWorkPlan: any = null;
+    if (context?.sessionId) {
+      try {
+        const { chatbotDb } = await import('../services/chatbotService');
+        const session = await chatbotDb.getChatSession(context.sessionId);
+        if (session?.workPlan) {
+          sessionWorkPlan = session.workPlan;
+        }
+      } catch {
+        // Non-critical — proceed without session data
+      }
+    }
+
     // Normalize steps
     let steps = args.steps || [];
     if (typeof steps === 'string') {
@@ -4781,15 +4807,34 @@ emmaToolRegistry.register({
     if (!Array.isArray(steps) || steps.length === 0) {
       throw new Error('At least one step is required');
     }
+
+    // Build a lookup of session step data by stepCount for merging
+    const sessionStepMap = new Map<number, any>();
+    if (sessionWorkPlan?.steps) {
+      for (const s of sessionWorkPlan.steps) {
+        sessionStepMap.set(s.stepCount, s);
+      }
+    }
+
     const plan = await workPlanService.createWorkPlan({
       title: args.title,
       description: args.description || '',
       welcomeMessage: args.welcomeMessage || '',
-      steps: steps.map((s: any, i: number) => ({
-        stepCount: s.stepCount || i + 1,
-        title: s.title,
-        description: s.description || '',
-      })),
+      steps: steps.map((s: any, i: number) => {
+        const stepNum = s.stepCount || i + 1;
+        const sessionStep = sessionStepMap.get(stepNum);
+        return {
+          stepCount: stepNum,
+          title: s.title,
+          description: s.description || '',
+          requiredFunctionCalls: Array.isArray(s.requiredFunctionCalls) && s.requiredFunctionCalls.length > 0
+            ? s.requiredFunctionCalls
+            : (sessionStep?.requiredFunctionCalls || []),
+          skillIds: Array.isArray(s.skillIds) && s.skillIds.length > 0
+            ? s.skillIds
+            : (sessionStep?.skillIds || []),
+        };
+      }),
       ownerId: userId,
       visibility: 'private',
       isBuiltIn: false,
