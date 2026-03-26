@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-26',
+    changes: [
+      'Internal: Deprecate Legacy Task Scheduling in Agent Engine',
+      '- Removed the legacy recurring task schedule execution path from the agent engine',
+      '- Scheduled chats (managed by the backend) now fully replace the old scheduling feature',
+      '- No user-facing behavior changes — scheduled chats continue to run as before',
+    ],
+  },
+  {
     date: '2026-03-25',
     changes: [
       'Feature: Connected Accounts Configurable per Subscription Type',
