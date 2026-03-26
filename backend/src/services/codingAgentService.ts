@@ -29,13 +29,20 @@ interface SearchReplaceEdit {
   replace: string;
 }
 
+interface LineNumberEdit {
+  start_line: number;
+  end_line: number;
+  new_content: string;
+  expected_content?: string;
+}
+
 interface ApplyResult {
   result: string;
   appliedCount: number;
   errors: string[];
 }
 
-const DEFAULT_MAX_ITERATIONS = 30;
+const DEFAULT_MAX_ITERATIONS = 15;
 const CODING_AGENT_MODEL = 'us.anthropic.claude-opus-4-6-v1';
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
@@ -49,30 +56,29 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent specialized in editin
 Your edits go to a draft branch (not main). This creates a Vercel preview deployment so the user can review before going live. The user will publish to production separately when satisfied.
 
 ## Rules
-1. ALWAYS read a file before editing it. Understand the code first.
-2. Make small, incremental edits. Each edit_file call should have 1-5 search/replace blocks.
-3. The "search" string must match the existing code EXACTLY (including whitespace and indentation).
+1. SEARCH before you READ. For files over 5KB, use search_in_file first to locate the target code, then read_file with a line range. NEVER read an entire large file.
+2. Make small, incremental edits. Each edit_file call should have 1-5 edit blocks.
+3. Use line-number edits (line_edits) whenever you have line numbers from read_file or search_in_file. Fall back to search/replace (edits) only for tiny, unambiguous changes.
 4. After making edits, use check_deployment to verify the preview build succeeds.
 5. If the build fails, read the error, fix it, and check again.
 6. After deployment succeeds, use browse_page to verify the changes look correct on the preview site.
 7. When finished, call report_to_user with a summary of all changes made. Include the preview URL so the user can review.
 8. Do NOT make changes the user did not ask for. Stay focused on the task.
-9. For large changes, break them into multiple edit_file calls.
-10. NEVER attempt to rewrite an entire file or replace more than a small section at once. Only make targeted edits to specific sections. If a file is too large to edit safely, report the limitation to the user.
-11. For large files (>20KB), read the file to understand structure, then make focused edits to only the specific lines that need changing. Do NOT restructure or reorganize code beyond what was requested.
-12. BEFORE making any edits, use list_commits to record the current commit SHA. This is your safety bookmark.
-13. If your edits break the build and you cannot fix them within 2 attempts, use revert_file to restore the file to the pre-edit commit SHA. Do NOT keep trying broken fixes.
+9. NEVER attempt to rewrite an entire file. Only make targeted edits to specific sections.
+10. BEFORE making any edits, use list_commits to record the current commit SHA. This is your safety bookmark.
+11. If your edits break the build and you cannot fix them within 2 attempts, use revert_file to restore the file to the pre-edit commit SHA.
 
 ## Workflow
-1. list_files to see the project structure
+1. list_files to see the project structure and file sizes
 2. list_commits (optionally filtered by the file you plan to edit) to record the current commit SHA as a rollback point
-3. read_file to understand the current code
-4. edit_file with precise search/replace diffs
-5. check_deployment to verify the preview build
-6. If build fails: read error → fix → check again. If still failing after 2 fix attempts, revert_file to the pre-edit commit SHA.
-7. browse_page to verify changes visually on the preview deployment
-8. If something looks wrong: fix → redeploy → verify again. If unable to fix, revert_file.
-9. report_to_user when done (include the preview URL and verification results)`;
+3. search_in_file to find the target code (for files > 5KB)
+4. read_file with start_line/end_line to read only the relevant section
+5. edit_file with line_edits (line numbers from step 3-4) for precise edits
+6. check_deployment to verify the preview build
+7. If build fails: read error → fix → check again. If still failing after 2 fix attempts, revert_file.
+8. browse_page to verify changes visually on the preview deployment
+9. If something looks wrong: fix → redeploy → verify again. If unable to fix, revert_file.
+10. report_to_user when done (include the preview URL and verification results)`;
 
 // ─── Search/Replace Engine ──────────────────────────────────────────────────
 
@@ -158,6 +164,52 @@ export function applySearchReplace(content: string, edits: SearchReplaceEdit[]):
   return { result, appliedCount, errors };
 }
 
+// ─── Line-Number Edit Engine ─────────────────────────────────────────────────
+
+export function applyLineNumberEdit(content: string, edits: LineNumberEdit[]): ApplyResult {
+  const lines = content.split('\n');
+  let appliedCount = 0;
+  const errors: string[] = [];
+
+  // Sort edits by start_line descending so later edits don't shift earlier line numbers
+  const sortedEdits = [...edits].sort((a, b) => b.start_line - a.start_line);
+
+  for (let i = 0; i < sortedEdits.length; i++) {
+    const edit = sortedEdits[i];
+
+    if (edit.start_line < 1 || edit.end_line > lines.length) {
+      errors.push(`Edit ${i + 1}: line range ${edit.start_line}-${edit.end_line} is out of range (file has ${lines.length} lines).`);
+      continue;
+    }
+
+    if (edit.start_line > edit.end_line) {
+      errors.push(`Edit ${i + 1}: start_line (${edit.start_line}) > end_line (${edit.end_line}).`);
+      continue;
+    }
+
+    // Validate expected_content if provided (rough match — trim + compare)
+    if (edit.expected_content !== undefined) {
+      const actualLines = lines.slice(edit.start_line - 1, edit.end_line);
+      const actual = actualLines.join('\n').trim();
+      const expected = edit.expected_content.trim();
+      if (actual !== expected) {
+        errors.push(
+          `Edit ${i + 1}: expected content at lines ${edit.start_line}-${edit.end_line} does not match. ` +
+          `Expected: "${expected.substring(0, 80)}..." Got: "${actual.substring(0, 80)}..."`
+        );
+        continue;
+      }
+    }
+
+    // Apply the replacement
+    const newLines = edit.new_content === '' ? [] : edit.new_content.split('\n');
+    lines.splice(edit.start_line - 1, edit.end_line - edit.start_line + 1, ...newLines);
+    appliedCount++;
+  }
+
+  return { result: lines.join('\n'), appliedCount, errors };
+}
+
 // ─── Tool Definitions (Anthropic native format) ─────────────────────────────
 
 function getToolDefinitions(): Anthropic.Tool[] {
@@ -172,14 +224,40 @@ function getToolDefinitions(): Anthropic.Tool[] {
       }
     },
     {
+      name: 'search_in_file',
+      description: 'Search for a pattern in a file. Returns matching lines with line numbers and 3 lines of surrounding context. Use this BEFORE read_file on large files to find the exact lines you need to edit.',
+      input_schema: {
+        type: 'object' as const,
+        properties: {
+          file_path: {
+            type: 'string',
+            description: 'Path to the file to search in'
+          },
+          pattern: {
+            type: 'string',
+            description: 'Search pattern (case-insensitive substring match)'
+          }
+        },
+        required: ['file_path', 'pattern']
+      }
+    },
+    {
       name: 'read_file',
-      description: 'Read the contents of a file from the repository.',
+      description: 'Read the contents of a file from the repository. Returns content with line numbers prepended. For large files, use start_line and end_line to read only a specific section.',
       input_schema: {
         type: 'object' as const,
         properties: {
           file_path: {
             type: 'string',
             description: 'Path to the file (e.g., "app/page.tsx", "app/globals.css")'
+          },
+          start_line: {
+            type: 'number',
+            description: 'First line to read (1-indexed). If omitted, reads from the beginning.'
+          },
+          end_line: {
+            type: 'number',
+            description: 'Last line to read (1-indexed, inclusive). If omitted, reads to the end.'
           }
         },
         required: ['file_path']
@@ -187,13 +265,39 @@ function getToolDefinitions(): Anthropic.Tool[] {
     },
     {
       name: 'edit_file',
-      description: 'Edit a file using search-and-replace diffs. Each edit specifies an exact string to find and its replacement. The search string must match the existing code exactly (including whitespace). Use read_file first to see the current content.',
+      description: 'Edit a file. Supports two modes:\n1. Line-number edits (preferred): provide "line_edits" array with {start_line, end_line, new_content}. Line numbers come from read_file or search_in_file.\n2. Search/replace edits (fallback): provide "edits" array with {search, replace}. The search string must match exactly once.\nUse line_edits when you have line numbers. Use edits as a fallback for small, unambiguous changes.',
       input_schema: {
         type: 'object' as const,
         properties: {
           file_path: {
             type: 'string',
             description: 'Path to the file to edit'
+          },
+          line_edits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                start_line: {
+                  type: 'number',
+                  description: 'First line to replace (1-indexed, from read_file or search_in_file output)'
+                },
+                end_line: {
+                  type: 'number',
+                  description: 'Last line to replace (1-indexed, inclusive)'
+                },
+                new_content: {
+                  type: 'string',
+                  description: 'Replacement content (can be empty string to delete lines)'
+                },
+                expected_content: {
+                  type: 'string',
+                  description: 'Optional: expected content at those lines (safety check). Edit is rejected if it does not match.'
+                }
+              },
+              required: ['start_line', 'end_line', 'new_content']
+            },
+            description: 'Array of line-number-based edits. Preferred over search/replace edits.'
           },
           edits: {
             type: 'array',
@@ -211,14 +315,14 @@ function getToolDefinitions(): Anthropic.Tool[] {
               },
               required: ['search', 'replace']
             },
-            description: 'Array of search/replace edits to apply sequentially'
+            description: 'Array of search/replace edits (fallback mode). Use line_edits instead when possible.'
           },
           commit_message: {
             type: 'string',
             description: 'Git commit message describing the changes'
           }
         },
-        required: ['file_path', 'edits']
+        required: ['file_path']
       }
     },
     {
@@ -343,6 +447,58 @@ async function executeTool(
       return files.map((f: any) => `${f.path} (${f.size} bytes)`).join('\n') || 'No files found.';
     }
 
+    case 'search_in_file': {
+      if (!args.file_path || !args.pattern) {
+        return 'Error: file_path and pattern are required.';
+      }
+      const data = await mcpFetch({
+        method: 'GET',
+        path: `${basePath}/file-content`,
+        queryParams: { path: args.file_path, ...branchQuery },
+        context: { userId: context.userId }
+      });
+      const content = data.content || '';
+      const lines = content.split('\n');
+      const pattern = args.pattern.toLowerCase();
+      const contextLines = 3;
+      const maxOutputChars = 5000;
+
+      // Find matching line indices
+      const matchIndices: number[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].toLowerCase().includes(pattern)) {
+          matchIndices.push(i);
+        }
+      }
+
+      if (matchIndices.length === 0) {
+        return `No matches found for "${args.pattern}" in ${args.file_path}.`;
+      }
+
+      // Build output with context, merging overlapping ranges
+      let output = `Found ${matchIndices.length} match(es) for "${args.pattern}" in ${args.file_path} (${lines.length} lines total):\n\n`;
+      const shown = new Set<number>();
+
+      for (const idx of matchIndices) {
+        const start = Math.max(0, idx - contextLines);
+        const end = Math.min(lines.length - 1, idx + contextLines);
+        for (let i = start; i <= end; i++) {
+          if (!shown.has(i)) {
+            const marker = i === idx ? '>>>' : '   ';
+            output += `${marker} ${i + 1}: ${lines[i]}\n`;
+            shown.add(i);
+          }
+        }
+        output += '---\n';
+        if (output.length > maxOutputChars) {
+          output += `\n... [truncated, ${matchIndices.length - matchIndices.indexOf(idx) - 1} more matches]`;
+          break;
+        }
+      }
+
+      return output;
+    }
+
     case 'read_file': {
       const data = await mcpFetch({
         method: 'GET',
@@ -350,12 +506,33 @@ async function executeTool(
         queryParams: { path: args.file_path, ...branchQuery },
         context: { userId: context.userId }
       });
-      return data.content || '';
+      const content = data.content || '';
+      const lines = content.split('\n');
+
+      // Apply line range if specified
+      const startLine = args.start_line ? Math.max(1, args.start_line) : 1;
+      const endLine = args.end_line ? Math.min(lines.length, args.end_line) : lines.length;
+
+      // Prepend line numbers
+      const numberedLines = lines
+        .slice(startLine - 1, endLine)
+        .map((line: string, i: number) => `${startLine + i}: ${line}`);
+
+      let result = numberedLines.join('\n');
+      if (args.start_line || args.end_line) {
+        result = `[Lines ${startLine}-${endLine} of ${lines.length}]\n${result}`;
+      } else {
+        result = `[${lines.length} lines total]\n${result}`;
+      }
+      return result;
     }
 
     case 'edit_file': {
-      if (!args.edits || !Array.isArray(args.edits) || args.edits.length === 0) {
-        return 'Error: edits array is required and must not be empty.';
+      const hasLineEdits = args.line_edits && Array.isArray(args.line_edits) && args.line_edits.length > 0;
+      const hasSearchReplace = args.edits && Array.isArray(args.edits) && args.edits.length > 0;
+
+      if (!hasLineEdits && !hasSearchReplace) {
+        return 'Error: either line_edits or edits array is required and must not be empty.';
       }
 
       // Step 1: Read current file content (from draft branch if applicable)
@@ -367,9 +544,26 @@ async function executeTool(
       });
 
       const currentContent = fileData.content || '';
+      let newContent: string;
+      let appliedCount: number;
+      let errors: string[];
+      let totalEdits: number;
 
-      // Step 2: Apply search/replace diffs
-      const { result: newContent, appliedCount, errors } = applySearchReplace(currentContent, args.edits);
+      if (hasLineEdits) {
+        // Line-number-based editing (preferred)
+        const editResult = applyLineNumberEdit(currentContent, args.line_edits);
+        newContent = editResult.result;
+        appliedCount = editResult.appliedCount;
+        errors = editResult.errors;
+        totalEdits = args.line_edits.length;
+      } else {
+        // Search/replace editing (fallback)
+        const editResult = applySearchReplace(currentContent, args.edits);
+        newContent = editResult.result;
+        appliedCount = editResult.appliedCount;
+        errors = editResult.errors;
+        totalEdits = args.edits.length;
+      }
 
       if (appliedCount === 0) {
         return `Failed to apply edits. Errors:\n${errors.join('\n')}`;
@@ -388,7 +582,7 @@ async function executeTool(
         context: { userId: context.userId }
       });
 
-      let response = `Applied ${appliedCount}/${args.edits.length} edits to ${args.file_path}.`;
+      let response = `Applied ${appliedCount}/${totalEdits} edits to ${args.file_path}.`;
       if (writeResult.is_staging) {
         response += ` Changes pushed to draft branch ${branch}. A preview deployment is being created.`;
       } else if (writeResult.deployed_url) {

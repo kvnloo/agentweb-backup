@@ -41,19 +41,25 @@ function validateBranchName(branch: string): boolean {
  * Ensure a branch exists in the repo. Creates it from main's HEAD if missing.
  * No-op if the branch already exists.
  */
+/**
+ * Ensure a branch exists, creating it from main if needed.
+ * Returns true if the branch was just created (callers may need to
+ * account for GitHub eventual-consistency delays).
+ */
 async function ensureBranchExists(
   repoBase: string,
   branch: string,
   ghHeaders: Record<string, string>,
   timeoutMs: number
-): Promise<void> {
-  if (branch === "main") return;
+): Promise<boolean> {
+  if (branch === "main") return false;
 
   try {
     await axios.get<any>(`${repoBase}/git/ref/heads/${branch}`, {
       headers: ghHeaders, timeout: timeoutMs,
     });
     // Branch exists
+    return false;
   } catch (err: any) {
     if (err.response?.status === 404) {
       // Branch doesn't exist — create from main HEAD
@@ -66,6 +72,7 @@ async function ensureBranchExists(
         sha: mainSha,
       }, { headers: ghHeaders, timeout: timeoutMs });
       console.log(`[LP GENERATION] Created branch ${branch} from main (${mainSha.substring(0, 7)})`);
+      return true;
     } else {
       throw err;
     }
@@ -476,7 +483,7 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
     const repoBase = `https://api.github.com/repos/${owner}/${repoName}`;
 
     // Ensure the target branch exists (creates from main if needed)
-    await ensureBranchExists(repoBase, branch, ghHeaders, GITHUB_TIMEOUT_MS);
+    const branchJustCreated = await ensureBranchExists(repoBase, branch, ghHeaders, GITHUB_TIMEOUT_MS);
 
     const base64Content = Buffer.from(content, "utf-8").toString("base64");
     const contentSizeBytes = Buffer.byteLength(content, "utf-8");
@@ -492,7 +499,25 @@ router.put("/generated/:id/github-edit", editRateLimiter, async (req, res: Respo
         );
         return fileRes.data.sha;
       } catch (err: any) {
-        if (err.response?.status === 404) return undefined; // new file
+        if (err.response?.status === 404) {
+          // If we just created the branch, the file should exist (copied from main)
+          // but GitHub's eventual consistency may cause a brief 404. Retry once.
+          if (branchJustCreated) {
+            console.log(`[LP GENERATION] File ${file_path} not found on new branch ${branch}, retrying after 1s...`);
+            await new Promise(r => setTimeout(r, 1000));
+            try {
+              const retryRes = await axios.get<any>(
+                `${repoBase}/contents/${file_path}?ref=${branch}`,
+                { headers: ghHeaders, timeout: GITHUB_TIMEOUT_MS }
+              );
+              return retryRes.data.sha;
+            } catch (retryErr: any) {
+              if (retryErr.response?.status === 404) return undefined; // truly new file
+              throw retryErr;
+            }
+          }
+          return undefined; // new file
+        }
         throw err;
       }
     };
