@@ -95,6 +95,88 @@ export const stripeService = {
   },
 };
 
+// ─── On-Demand Sync ───────────────────────────────────────────────────
+
+/**
+ * Sync subscription status from Stripe for a user who has stripe_customer_id
+ * but missing subscription_status. Called lazily from /api/auth/me.
+ * Returns the updated fields or null if no active subscription found.
+ */
+export async function syncSubscriptionFromStripe(
+  userId: string,
+  stripeCustomerId: string
+): Promise<{ subscription_status: string; stripe_subscription_id?: string; subscriptionType?: string; current_period_end?: string; has_payment_method?: boolean } | null> {
+  try {
+    const stripe = getStripeOrThrow();
+    const subscriptions = await stripe.subscriptions.list({
+      customer: stripeCustomerId,
+      status: 'all',
+      limit: 1,
+    });
+
+    if (subscriptions.data.length === 0) {
+      return null;
+    }
+
+    const sub = subscriptions.data[0];
+    const status = sub.status; // active, trialing, past_due, canceled, etc.
+
+    // Check if customer has a payment method on file
+    // Payment method can be on the subscription OR the customer level
+    let hasPaymentMethod = !!(sub.default_payment_method || (sub as any).default_source);
+    if (!hasPaymentMethod) {
+      try {
+        const customer = await stripe.customers.retrieve(stripeCustomerId);
+        if (customer && !customer.deleted) {
+          const cust = customer as any;
+          hasPaymentMethod = !!(cust.default_source || cust.invoice_settings?.default_payment_method);
+          // Also check if any payment methods exist
+          if (!hasPaymentMethod) {
+            const methods = await stripe.paymentMethods.list({ customer: stripeCustomerId, limit: 1 });
+            hasPaymentMethod = methods.data.length > 0;
+          }
+        }
+      } catch {
+        // Non-fatal — default to subscription-level check
+      }
+    }
+
+    const updates: any = {
+      subscription_status: status,
+      stripe_subscription_id: sub.id,
+      current_period_end: (sub as any).current_period_end
+        ? new Date(typeof (sub as any).current_period_end === 'number'
+            ? (sub as any).current_period_end * 1000
+            : (sub as any).current_period_end
+          ).toISOString()
+        : undefined,
+      has_payment_method: hasPaymentMethod,
+    };
+
+    // Derive tier from price if available
+    const priceId = sub.items?.data?.[0]?.price?.id;
+    if (priceId) {
+      const derivedType = deriveSubscriptionTypeFromPriceId(priceId);
+      if (derivedType) {
+        updates.subscriptionType = derivedType;
+        const tierConfig = await getTierConfig(derivedType);
+        if (tierConfig) {
+          updates.allowedPages = tierConfig.allowedPages;
+          updates.allowedSkills = tierConfig.allowedSkills;
+        }
+      }
+    }
+
+    await userDb.updateUser(userId, updates);
+    console.log(`[STRIPE SYNC] Synced subscription for user ${userId}: status=${status}, sub=${sub.id}`);
+
+    return updates;
+  } catch (error: any) {
+    console.error(`[STRIPE SYNC] Failed for user ${userId}:`, error.message);
+    return null;
+  }
+}
+
 // ─── Webhook Event Handlers ────────────────────────────────────────────
 
 /**
@@ -133,6 +215,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     stripe_subscription_id: stripeSubscriptionId,
     subscriptionType,
     subscription_status: 'active',
+    has_payment_method: true, // completed checkout = has payment method
     allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
     allowedSkills: tierConfig?.allowedSkills ?? ['*'],
   });
@@ -198,6 +281,12 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
  * Maps: Starter plan → "Basic", Pro/Complete plan → "Super Premium".
  * Falls back to "Super Premium" if the price cannot be determined.
  */
+function deriveSubscriptionTypeFromPriceId(priceId: string): string | null {
+  if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Basic';
+  if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Super Premium';
+  return null;
+}
+
 function deriveSubscriptionType(session: any): string {
   const priceId = session.line_items?.data?.[0]?.price?.id
     || session.display_items?.[0]?.price?.id;

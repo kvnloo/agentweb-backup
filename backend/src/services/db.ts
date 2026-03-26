@@ -166,6 +166,7 @@ export interface User {
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
+  has_payment_method?: boolean; // Whether customer has a payment method on file in Stripe
   connected_accounts?: Array<{
     platform: 'linkedin' | 'facebook'
     | 'meta' | 'twitter' | 'instagram';
