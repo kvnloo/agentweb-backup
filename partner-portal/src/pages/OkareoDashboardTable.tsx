@@ -280,21 +280,38 @@ function ScoreCellTooltip({
 
 // ─── ScoreCell ────────────────────────────────────────────────────────────────
 
+function computeAverageScore(sims: Simulation[], checkMetaMap: Record<string, CheckMeta>): number | null {
+  const scores = sims.map(s => computeAggregateScore(s.model_metrics, checkMetaMap)).filter(s => s !== null) as number[];
+  if (scores.length === 0) return null;
+  return scores.reduce((a, b) => a + b, 0) / scores.length;
+}
+
 function ScoreCell({
   sims,
-  prevVersionSims,
-  onSimClick,
   isFirstInGroup,
   checkMetaMap,
 }: {
   sims: Simulation[];
-  prevVersionSims: Simulation[];
-  onSimClick: (sim: Simulation) => void;
+  prevVersionSims: Simulation[]; // Kept for prop signature compatibility, though unused now
+  onSimClick: (sim: Simulation) => void; // Kept for prop signature compatibility
   isFirstInGroup: boolean;
   checkMetaMap: Record<string, CheckMeta>;
 }) {
-  const score = sims.length > 0 ? computeAggregateScore(sims[0].model_metrics, checkMetaMap) : null;
-  const prevScore = prevVersionSims.length > 0 ? computeAggregateScore(prevVersionSims[0].model_metrics, checkMetaMap) : null;
+  // Group by driver to find latest and previous per driver
+  const driverSims: Record<string, Simulation[]> = {};
+  for (const s of sims) {
+    if (!s.driver_id) continue;
+    if (!driverSims[s.driver_id]) driverSims[s.driver_id] = [];
+    driverSims[s.driver_id].push(s);
+  }
+
+  // Latest sims across all drivers
+  const latestSims = Object.values(driverSims).map(arr => arr[0]).filter((s): s is Simulation => Boolean(s));
+  // Previous sims across all drivers (second to latest)
+  const prevSims = Object.values(driverSims).map(arr => arr.length > 1 ? arr[1] : null).filter((s): s is Simulation => Boolean(s));
+
+  const score = computeAverageScore(latestSims, checkMetaMap);
+  const prevScore = computeAverageScore(prevSims, checkMetaMap);
   const delta = score !== null && prevScore !== null ? score - prevScore : null;
 
   const cellSx = {
@@ -316,46 +333,33 @@ function ScoreCell({
 
   return (
     <TableCell sx={cellSx}>
-      <Tooltip title={<ScoreCellTooltip sims={sims} checkMetaMap={checkMetaMap} />} placement="right" arrow>
-        <Box sx={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 0.5, cursor: 'default' }}>
-          <Chip
-            label={score !== null ? `${(score * 100).toFixed(1)}%` : '—'}
-            size="small"
-            onClick={(e) => { e.stopPropagation(); onSimClick(sims[0]); }}
-            sx={{
-              fontWeight: 700,
-              fontSize: 12,
-              cursor: 'pointer',
-              color: scoreColor(score),
-              bgcolor: score === null ? 'grey.100'
-                : score >= 0.75 ? 'success.50'
-                : score >= 0.5 ? 'warning.50'
-                : 'error.50',
-              border: '1px solid',
-              borderColor: scoreColor(score),
-              '&:hover': { opacity: 0.85 },
-            }}
-          />
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minHeight: 18 }}>
-            {delta !== null && (
-              <Typography
-                variant="caption"
-                sx={{ fontWeight: 700, fontSize: 11, color: delta >= 0 ? 'success.main' : 'error.main', lineHeight: 1 }}
-              >
-                {delta >= 0 ? '↑' : '↓'}{Math.abs(delta * 100).toFixed(1)}%
-              </Typography>
-            )}
-            {sims.length > 1 && (
-              <Chip
-                label={sims.length}
-                size="small"
-                variant="outlined"
-                sx={{ height: 16, fontSize: 10, px: 0, '& .MuiChip-label': { px: 0.75 } }}
-              />
-            )}
-          </Box>
+      <Box sx={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', gap: 0.5, cursor: 'default' }}>
+        <Chip
+          label={score !== null ? `${(score * 100).toFixed(1)}%` : '—'}
+          size="small"
+          sx={{
+            fontWeight: 700,
+            fontSize: 12,
+            color: scoreColor(score),
+            bgcolor: score === null ? 'grey.100'
+              : score >= 0.75 ? 'success.50'
+              : score >= 0.5 ? 'warning.50'
+              : 'error.50',
+            border: '1px solid',
+            borderColor: scoreColor(score),
+          }}
+        />
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, minHeight: 18 }}>
+          {delta !== null && delta !== 0 && (
+            <Typography
+              variant="caption"
+              sx={{ fontWeight: 700, fontSize: 11, color: delta > 0 ? 'success.main' : 'error.main', lineHeight: 1 }}
+            >
+              {delta > 0 ? '↑' : '↓'}{Math.abs(delta * 100).toFixed(1)}%
+            </Typography>
+          )}
         </Box>
-      </Tooltip>
+      </Box>
     </TableCell>
   );
 }
@@ -381,28 +385,18 @@ export default function SimulationsTable({
   checks,
   onSimClick,
 }: SimulationsTableProps) {
-  const [selectedDriver, setSelectedDriver] = useState<Driver | null>(null);
-  const [selectedTargetNames, setSelectedTargetNames] = useState<string[]>([]);
-  const [selectedScenarios, setSelectedScenarios] = useState<Scenario[]>([]);
   const [simulations, setSimulations] = useState<Simulation[]>([]);
   const [simsLoading, setSimsLoading] = useState(false);
   const [simsError, setSimsError] = useState<string | null>(null);
 
-  // Fetch simulations whenever the selected driver changes
   useEffect(() => {
-    if (!selectedDriver) {
-      setSimulations([]);
-      return;
-    }
     setSimsLoading(true);
     setSimsError(null);
-    setSelectedScenarios([]);
-    setSelectedTargetNames([]);
-    listSimulations(token, selectedDriver.id)
+    listSimulations(token)
       .then(setSimulations)
       .catch((err) => setSimsError(err.message || 'Failed to load simulations.'))
       .finally(() => setSimsLoading(false));
-  }, [token, selectedDriver]);
+  }, [token]);
 
   const checkMetaMap = useMemo(() => buildCheckMetaMap(checks), [checks]);
 
@@ -420,7 +414,7 @@ export default function SimulationsTable({
     [finishedSims]
   );
 
-  // Unique target names for the multiselect — only targets that have simulations for this driver
+  // Unique target names for the multiselect
   const targetNameOptions = useMemo(() => {
     const seen = new Set<string>();
     const names: string[] = [];
@@ -433,7 +427,7 @@ export default function SimulationsTable({
     return names.sort();
   }, [targets, activeTargetIds]);
 
-  // Scenarios sorted alphabetically — only ones that have simulations for this driver
+  // Scenarios sorted alphabetically
   const sortedScenarioOptions = useMemo(
     () =>
       scenarios
@@ -459,10 +453,10 @@ export default function SimulationsTable({
     return groups;
   }, [targets]);
 
-  // For display: only selected target names, latest 3 versions each, with version labels
+  // For display: all active target names, latest 3 versions each, with version labels
   const displayVersionGroups = useMemo(() => {
     const result: Record<string, { target: Target; versionLabel: string }[]> = {};
-    for (const name of selectedTargetNames) {
+    for (const name of targetNameOptions) {
       const versions = targetVersionGroups[name];
       if (!versions) continue;
       const total = versions.length;
@@ -472,11 +466,10 @@ export default function SimulationsTable({
       }));
     }
     return result;
-  }, [selectedTargetNames, targetVersionGroups]);
+  }, [targetNameOptions, targetVersionGroups]);
 
   // matrix[scenario_id][target_id] = Simulation[] sorted by start_time desc
   const tableMatrix = useMemo(() => {
-    if (!selectedDriver) return {};
     const sims = finishedSims;
     const matrix: Record<string, Record<string, Simulation[]>> = {};
     for (const sim of sims) {
@@ -497,185 +490,47 @@ export default function SimulationsTable({
       }
     }
     return matrix;
-  }, [finishedSims, selectedDriver]);
+  }, [finishedSims]);
 
-  // Rows: only selected scenarios, sorted alphabetically
-  const activeScenarios = useMemo(
-    () => [...selectedScenarios].sort((a, b) => (a.name || a.scenario_id).localeCompare(b.name || b.scenario_id)),
-    [selectedScenarios]
-  );
+  // Rows: all active scenarios, already sorted alphabetically
+  const activeScenarios = sortedScenarioOptions;
 
   const totalCols = useMemo(
     () => 1 + Object.values(displayVersionGroups).reduce((sum, vs) => sum + vs.length, 0),
     [displayVersionGroups]
   );
 
-  const hasDriver = selectedDriver !== null;
-  const hasTargets = selectedTargetNames.length > 0;
-  const hasScenarios = selectedScenarios.length > 0;
+  const hasTargets = targetNameOptions.length > 0;
+  const hasScenarios = sortedScenarioOptions.length > 0;
 
   return (
     <Box>
-      {/* Filters */}
-      <Paper sx={{ p: 2, mb: 3 }}>
-        <Box sx={{ display: 'flex', gap: 2, alignItems: 'flex-start', flexWrap: 'wrap' }}>
-          {/* Driver — single-select, required */}
-          <Autocomplete
-            size="small"
-            options={drivers}
-            getOptionLabel={(option) => option.name || option.id}
-            value={selectedDriver}
-            onChange={(_, newValue) => setSelectedDriver(newValue)}
-            isOptionEqualToValue={(option, value) => option.id === value.id}
-            renderInput={(params) => (
-              <TextField
-                {...params}
-                label="Driver"
-                placeholder="Select a driver..."
-                required
-              />
-            )}
-            sx={{ minWidth: 280 }}
-          />
-
-          {/* Scenarios — multiselect with checkboxes, enabled after driver selected */}
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, flex: 1, minWidth: 320 }}>
-            <Autocomplete
-            multiple
-            disableCloseOnSelect
-            size="small"
-            options={sortedScenarioOptions}
-            getOptionLabel={(option) => option.name || option.scenario_id}
-            value={selectedScenarios}
-            onChange={(_, newValue) => setSelectedScenarios(newValue)}
-            isOptionEqualToValue={(option, value) => option.scenario_id === value.scenario_id}
-            disabled={!hasDriver}
-            renderOption={(props, option, { selected }) => {
-              const { key, ...liProps } = props as any;
-              return (
-                <li key={key} {...liProps}>
-                  <Checkbox
-                    icon={<CheckBoxOutlineBlankIcon fontSize="small" />}
-                    checkedIcon={<CheckBoxIcon fontSize="small" />}
-                    checked={selected}
-                    size="small"
-                    sx={{ mr: 1, p: 0 }}
-                  />
-                  <ListItemText primary={option.name || option.scenario_id} primaryTypographyProps={{ variant: 'body2' }} />
-                </li>
-              );
-            }}
-            renderInput={(params) => (
-              <TextField
-                {...params}
-                label="Scenarios"
-                placeholder={selectedScenarios.length === 0 ? 'Select scenarios...' : ''}
-              />
-            )}
-            renderTags={(value, getTagProps) =>
-              value.map((s, index) => {
-                const { key, ...tagProps } = getTagProps({ index });
-                return <Chip key={key} label={s.name || s.scenario_id} size="small" {...tagProps} />;
-              })
-            }
-            sx={{ width: '100%' }}
-            />
-            <Button
-              size="small"
-              disabled={!hasDriver || sortedScenarioOptions.length === 0}
-              onClick={() => setSelectedScenarios(sortedScenarioOptions)}
-              sx={{ alignSelf: 'flex-start', fontSize: 11 }}
-            >
-              Select all ({sortedScenarioOptions.length})
-            </Button>
-          </Box>
-
-          {/* Targets — multiselect with checkboxes, enabled after driver selected */}
-          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, flex: 1, minWidth: 320 }}>
-          <Autocomplete
-            multiple
-            disableCloseOnSelect
-            size="small"
-            options={targetNameOptions}
-            value={selectedTargetNames}
-            onChange={(_, newValue) => setSelectedTargetNames(newValue)}
-            disabled={!hasDriver}
-            renderOption={(props, option, { selected }) => {
-              const { key, ...liProps } = props as any;
-              return (
-                <li key={key} {...liProps}>
-                  <Checkbox
-                    icon={<CheckBoxOutlineBlankIcon fontSize="small" />}
-                    checkedIcon={<CheckBoxIcon fontSize="small" />}
-                    checked={selected}
-                    size="small"
-                    sx={{ mr: 1, p: 0 }}
-                  />
-                  <ListItemText primary={option} primaryTypographyProps={{ variant: 'body2' }} />
-                </li>
-              );
-            }}
-            renderInput={(params) => (
-              <TextField
-                {...params}
-                label="Targets"
-                placeholder={selectedTargetNames.length === 0 ? 'Select targets...' : ''}
-              />
-            )}
-            renderTags={(value, getTagProps) =>
-              value.map((name, index) => {
-                const { key, ...tagProps } = getTagProps({ index });
-                return <Chip key={key} label={name} size="small" {...tagProps} />;
-              })
-            }
-            sx={{ width: '100%' }}
-          />
-            <Button
-              size="small"
-              disabled={!hasDriver || targetNameOptions.length === 0}
-              onClick={() => setSelectedTargetNames(targetNameOptions)}
-              sx={{ alignSelf: 'flex-start', fontSize: 11 }}
-            >
-              Select all ({targetNameOptions.length})
-            </Button>
-          </Box>
-        </Box>
-      </Paper>
-
-      {/* Empty state: no driver selected */}
-      {!hasDriver && (
-        <Box sx={{ textAlign: 'center', py: 10 }}>
-          <Typography color="text.secondary">
-            Select a driver to get started.
-          </Typography>
-        </Box>
-      )}
 
       {/* Loading simulations */}
-      {hasDriver && simsLoading && (
+      {simsLoading && (
         <Box sx={{ textAlign: 'center', py: 10 }}>
           <Typography color="text.secondary">Loading simulations...</Typography>
         </Box>
       )}
 
       {/* Error loading simulations */}
-      {hasDriver && !simsLoading && simsError && (
+      {!simsLoading && simsError && (
         <Box sx={{ textAlign: 'center', py: 10 }}>
           <Typography color="error.main">{simsError}</Typography>
         </Box>
       )}
 
-      {/* Empty state: driver selected but nothing else */}
-      {hasDriver && !simsLoading && !simsError && !hasScenarios && !hasTargets && (
+      {/* Empty state: targets/scenarios not selected yet */}
+      {!simsLoading && !simsError && (!hasScenarios || !hasTargets) && (
         <Box sx={{ textAlign: 'center', py: 10 }}>
           <Typography color="text.secondary">
-            Now select scenarios and targets to build the comparison table.
+            No simulations available to build the comparison table.
           </Typography>
         </Box>
       )}
 
-      {/* Matrix table — only render once driver is loaded + at least one of scenarios/targets is set */}
-      {hasDriver && !simsLoading && !simsError && (hasScenarios || hasTargets) && (
+      {/* Matrix table */}
+      {!simsLoading && !simsError && hasScenarios && hasTargets && (
         <TableContainer
           component={Paper}
           sx={{
