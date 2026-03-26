@@ -105,7 +105,7 @@ export default function Skills() {
 
   // Review queue state
   const [pendingSkills, setPendingSkills] = useState<Skill[]>([]);
-  const [reviewLoading, setReviewLoading] = useState(false);
+  const [, setReviewLoading] = useState(false);
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
   const [rejectTarget, setRejectTarget] = useState<{ type: 'skill'; id: string; name: string } | null>(null);
   const [rejectFeedback, setRejectFeedback] = useState("");

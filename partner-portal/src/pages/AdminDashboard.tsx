@@ -82,11 +82,6 @@ import {
   ThumbDown as ThumbDownIcon,
   Sync as SyncIcon,
   Replay as ReplayIcon,
-  ExpandMore as ExpandMoreIcon,
-  ExpandLess as ExpandLessIcon,
-  ContentCopy as ContentCopyIcon,
-  ArrowUpward as ArrowUpwardIcon,
-  ArrowDownward as ArrowDownwardIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -7090,39 +7085,11 @@ export default function AdminDashboard() {
 }
 
 // Agent Mode Settings Component
-interface WorkPlanStep {
-  stepCount: number;
-  title: string;
-  description?: string;
-  requiredFunctionCalls?: string[];
-}
-
-interface PredefinedWorkPlan {
-  id?: string;
-  title: string;
-  description?: string;
-  steps: WorkPlanStep[];
-  welcomeMessage?: string;
-  autocomplete?: boolean;
-  requireLogin?: boolean;
-  showLoginSignup?: 'after_plan_completed' | 'always';
-  showInAgentMode?: boolean;
-  defaultModel?: string;
-}
-
-interface AvailableFunctionCall {
-  name: string;
-  description: string;
-}
-
 const AgentModeSettings = () => {
   const [systemPrompt, setSystemPrompt] = useState('');
   const [welcomeMessage, setWelcomeMessage] = useState('');
   const [, setConversationStarters] = useState<string[]>([]);
   const [conversationStartersText, setConversationStartersText] = useState('');
-  const [predefinedWorkPlans, setPredefinedWorkPlans] = useState<PredefinedWorkPlan[]>([]);
-  const [availableFunctionCalls, setAvailableFunctionCalls] = useState<AvailableFunctionCall[]>([]);
-  const [selectedFunctionCall, setSelectedFunctionCall] = useState<Record<string, string>>({});
   const [defaultModel, setDefaultModel] = useState('gpt-5-chat-2');
   const [supportedModels, setSupportedModels] = useState<string[]>([]);
   const [contentModel, setContentModel] = useState('');
@@ -7131,8 +7098,6 @@ const AgentModeSettings = () => {
   const [savingSystemPrompt, setSavingSystemPrompt] = useState(false);
   const [savingWelcomeMessage, setSavingWelcomeMessage] = useState(false);
   const [savingConversationStarters, setSavingConversationStarters] = useState(false);
-  const [savingWorkPlanId, setSavingWorkPlanId] = useState<string | null>(null);
-  const [savingWorkPlanIndex, setSavingWorkPlanIndex] = useState<number | null>(null);
   const [savingContentModel, setSavingContentModel] = useState(false);
   const [scheduledChatsDefaultModel, setScheduledChatsDefaultModel] = useState('');
   const [savingScheduledChatsDefaultModel, setSavingScheduledChatsDefaultModel] = useState(false);
@@ -7148,14 +7113,6 @@ const AgentModeSettings = () => {
   const [savingBackupModel, setSavingBackupModel] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [workPlanErrors, setWorkPlanErrors] = useState<Record<string, string>>({});
-  const [newlyAddedPlanId, setNewlyAddedPlanId] = useState<string | null>(null);
-  const [expandedPlanId, setExpandedPlanId] = useState<string | null>(null);
-  const [planSyncStatus, setPlanSyncStatus] = useState<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>>({});
-  const [syncEnvironment, setSyncEnvironment] = useState<'development' | 'production'>('production');
-  const [syncingPlanId, setSyncingPlanId] = useState<string | null>(null);
-  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
-  const [planToSync, setPlanToSync] = useState<PredefinedWorkPlan | null>(null);
   const { token } = useAuth();
   const fallbackDefaultModel = 'gpt-5-chat-2';
 
@@ -7163,25 +7120,6 @@ const AgentModeSettings = () => {
     loadAllSettings();
   }, []);
 
-  // Scroll to newly added work plan
-  useEffect(() => {
-    if (newlyAddedPlanId) {
-      // Use setTimeout to ensure DOM is updated
-      setTimeout(() => {
-        const element = document.getElementById(`work-plan-${newlyAddedPlanId}`);
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          // Focus on the title field for better UX
-          const titleInput = element.querySelector('input[type="text"]') as HTMLInputElement;
-          if (titleInput) {
-            titleInput.focus();
-          }
-        }
-        // Clear the newly added plan ID after scrolling
-        setNewlyAddedPlanId(null);
-      }, 100);
-    }
-  }, [newlyAddedPlanId, predefinedWorkPlans]);
 
   const loadAllSettings = async () => {
     try {
@@ -7199,15 +7137,6 @@ const AgentModeSettings = () => {
 
       // Load conversation starters
       await loadConversationStarters();
-
-      // Load available function calls
-      await loadAvailableFunctionCalls();
-
-      // Load predefined work plans
-      await loadPredefinedWorkPlans();
-
-      // Load plan sync status
-      await loadPlanSyncStatus();
 
       // Load content model
       await loadContentModel();
@@ -7284,26 +7213,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const loadAvailableFunctionCalls = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/agent-mode/function-calls'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      
-      if (response.data && response.data.functionCalls) {
-        // Filter out work plan management functions
-        const workPlanFunctions = ['create_work_plan', 'modify_work_plan', 'set_work_plan_status'];
-        const filtered = response.data.functionCalls.filter(
-          (func: AvailableFunctionCall) => !workPlanFunctions.includes(func.name)
-        );
-        setAvailableFunctionCalls(filtered);
-      }
-    } catch (error) {
-      console.error('Error loading available function calls:', error);
-      // Don't fail the entire load if this fails
-      setAvailableFunctionCalls([]);
-    }
-  };
 
   const loadSystemPrompt = async () => {
     try {
@@ -7398,167 +7307,6 @@ const AgentModeSettings = () => {
     }
   };
 
-  const getDefaultOnboardingPlan = (): PredefinedWorkPlan => ({
-    id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-    autocomplete: false,
-    requireLogin: false,
-    showLoginSignup: 'after_plan_completed',
-    showInAgentMode: false,
-    title: 'Onboarding',
-    welcomeMessage: 'Welcome to the onboarding process! I\'m here to help you get set up. Let\'s get started!',
-    steps: [
-      {
-        stepCount: 1,
-        title: 'Analyze website and business',
-        description: 'Research and analyze the client\'s website and business to understand their industry, target audience, and current marketing presence',
-        requiredFunctionCalls: ['search_web']
-      },
-      {
-        stepCount: 2,
-        title: 'Create/update brand guidelines',
-        description: 'Establish or update brand guidelines including colors, fonts, tone of voice, and visual identity',
-        requiredFunctionCalls: ['update_brand_guidelines']
-      },
-      {
-        stepCount: 3,
-        title: 'Create/update marketing strategy',
-        description: 'Develop a comprehensive marketing strategy based on business analysis and brand guidelines',
-        requiredFunctionCalls: ['update_marketing_strategy']
-      },
-      {
-        stepCount: 4,
-        title: 'Generate 3 blog articles',
-        description: 'Create three high-quality blog articles aligned with the marketing strategy and brand voice',
-        requiredFunctionCalls: ['create_blog_article']
-      },
-      {
-        stepCount: 5,
-        title: 'Generate social media posts',
-        description: 'Create engaging social media content and visuals to support the marketing strategy',
-        requiredFunctionCalls: ['generate_image']
-      }
-    ]
-  });
-
-  const loadPredefinedWorkPlans = async () => {
-    try {
-      try {
-        const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
-        if (response.data && response.data.settingValue) {
-          const workPlans = JSON.parse(response.data.settingValue);
-          
-          // Ensure all work plans have IDs (for backward compatibility)
-          const workPlansWithIds = workPlans.map((wp: PredefinedWorkPlan) => {
-            if (!wp.id) {
-              // Generate ID from title or create a new one
-              wp.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            }
-            return wp;
-          });
-          
-          // Check if "Onboarding" work plan already exists
-          const hasOnboarding = workPlansWithIds.some((wp: PredefinedWorkPlan) => 
-            wp.title.toLowerCase() === 'onboarding'
-          );
-          
-          // If no Onboarding plan exists, add the default one
-          if (!hasOnboarding) {
-            const defaultOnboardingPlan = getDefaultOnboardingPlan();
-            defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-            workPlansWithIds.push(defaultOnboardingPlan);
-            
-            // Save the updated work plans with the default Onboarding plan
-            try {
-              await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-                settingValue: JSON.stringify(workPlansWithIds),
-                description: 'Agent Mode predefined work plans for Emma AI assistant'
-              }, {
-                headers: { Authorization: `Bearer ${token}` }
-              });
-            } catch (saveError) {
-              console.error('Error saving default Onboarding work plan:', saveError);
-              // Continue anyway - we'll still show it in the UI
-            }
-          }
-          
-          setPredefinedWorkPlans(workPlansWithIds);
-          return;
-        }
-      } catch (settingsError: any) {
-        // If setting doesn't exist (404), create default Onboarding plan
-        if (settingsError.response?.status === 404) {
-          const defaultOnboardingPlan = getDefaultOnboardingPlan();
-          defaultOnboardingPlan.id = `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-          
-          // Try to save the default Onboarding plan
-          try {
-            await axios.put(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), {
-              settingValue: JSON.stringify([defaultOnboardingPlan]),
-              description: 'Agent Mode predefined work plans for Emma AI assistant'
-            }, {
-              headers: { Authorization: `Bearer ${token}` }
-            });
-          } catch (saveError) {
-            console.error('Error saving default Onboarding work plan:', saveError);
-            // Continue anyway - we'll still show it in the UI
-          }
-          
-          setPredefinedWorkPlans([defaultOnboardingPlan]);
-          return;
-        } else {
-          console.error('Error loading predefined work plans:', settingsError);
-          setPredefinedWorkPlans([]);
-        }
-      }
-    } catch (error) {
-      console.error('Error loading predefined work plans:', error);
-      setPredefinedWorkPlans([]);
-    }
-  };
-
-  const loadPlanSyncStatus = async () => {
-    try {
-      const response = await axios.get(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync-status'), {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setPlanSyncStatus(response.data.plans || {});
-      setSyncEnvironment(response.data.environment || 'production');
-    } catch (err) {
-      console.error('Error loading plan sync status:', err);
-    }
-  };
-
-  const syncDirection = syncEnvironment === 'development' ? 'dev-to-prod' : 'prod-to-dev';
-  const syncLabel = syncEnvironment === 'development' ? 'Dev → Prod' : 'Prod → Dev';
-
-  const handleOpenSyncDialog = (workPlan: PredefinedWorkPlan) => {
-    setPlanToSync(workPlan);
-    setSyncDialogOpen(true);
-  };
-
-  const handleSyncPlan = async () => {
-    if (!planToSync?.id) return;
-    try {
-      setSyncingPlanId(planToSync.id);
-      await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans/sync'), {
-        planId: planToSync.id,
-        direction: syncDirection
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setSuccess(`Plan "${planToSync.title}" synced ${syncLabel}`);
-      setSyncDialogOpen(false);
-      setPlanToSync(null);
-      await loadPlanSyncStatus();
-    } catch (err: any) {
-      setError(err.response?.data?.error || 'Failed to sync plan');
-    } finally {
-      setSyncingPlanId(null);
-    }
-  };
 
   const loadContentModel = async () => {
     try {
@@ -8004,276 +7752,6 @@ const AgentModeSettings = () => {
     } finally {
       setSavingConversationStarters(false);
     }
-  };
-
-  const saveIndividualWorkPlan = async (workPlanIndex: number) => {
-    const workPlan = predefinedWorkPlans[workPlanIndex];
-    if (!workPlan) {
-      setError('Work plan not found');
-      return;
-    }
-
-    // Generate ID if it doesn't exist (for new plans)
-    const planId = workPlan.id || `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-    // Clear previous messages
-    setError('');
-    setSuccess('');
-    setWorkPlanErrors(prev => {
-      const updated = { ...prev };
-      delete updated[planId];
-      return updated;
-    });
-    
-    try {
-      setSavingWorkPlanId(planId);
-      setSavingWorkPlanIndex(workPlanIndex);
-      
-      // Validate work plan title
-      if (workPlan.title.trim().length === 0) {
-        const errorMsg = 'Work plan must have a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        // Scroll to the work plan
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate that at least one step exists
-      if (!workPlan.steps || workPlan.steps.length === 0) {
-        const errorMsg = 'Work plan must have at least one step';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate that the first step has a title (first step is required)
-      if (!workPlan.steps[0] || workPlan.steps[0].title.trim().length === 0) {
-        const errorMsg = 'The first step is required and must have a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        // Scroll to the first step input field
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            const firstStepInput = workPlanCard.querySelector('input[placeholder*="Step Title"]') as HTMLInputElement;
-            if (firstStepInput) {
-              firstStepInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
-              firstStepInput.focus();
-            } else {
-              workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
-          }
-        }, 100);
-        return;
-      }
-      
-      // Validate work plan
-      const validatedWorkPlan = {
-        id: planId,
-        title: workPlan.title.trim(),
-        description: workPlan.description?.trim() || undefined,
-        welcomeMessage: workPlan.welcomeMessage?.trim() || undefined,
-        autocomplete: workPlan.autocomplete || false,
-        requireLogin: workPlan.requireLogin || false,
-        showLoginSignup: workPlan.showLoginSignup || 'after_plan_completed',
-        showInAgentMode: workPlan.showInAgentMode || false,
-        defaultModel: workPlan.defaultModel?.trim() || undefined,
-        steps: workPlan.steps
-          .filter(step => step.title.trim().length > 0)
-          .map((step, index) => ({
-            stepCount: index + 1,
-            title: step.title.trim(),
-            description: step.description?.trim() || undefined,
-            requiredFunctionCalls: step.requiredFunctionCalls?.filter(f => f.trim().length > 0) || undefined
-          }))
-      };
-
-      // Final validation after filtering
-      if (validatedWorkPlan.steps.length === 0) {
-        const errorMsg = 'Work plan must have at least one step with a title';
-        setError(errorMsg);
-        setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMsg }));
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-        setTimeout(() => {
-          const workPlanCard = document.getElementById(`work-plan-${planId}`);
-          if (workPlanCard) {
-            workPlanCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
-        }, 100);
-        return;
-      }
-      
-      // Try PUT first (for existing plans), fall back to POST if plan doesn't exist (404)
-      try {
-        // Try to update existing work plan
-        await axios.put(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${planId}`), validatedWorkPlan, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (putError: any) {
-        // If PUT fails with 404, the plan doesn't exist yet, so create it with POST
-        if (putError.response?.status === 404) {
-          await axios.post(buildApiUrl('/api/settings/agent-mode-predefined-workplans'), validatedWorkPlan, {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-        } else {
-          // Re-throw other errors
-          throw putError;
-        }
-      }
-      
-      // Update local state with the validated plan (including the ID)
-      const updated = [...predefinedWorkPlans];
-      updated[workPlanIndex] = validatedWorkPlan;
-      setPredefinedWorkPlans(updated);
-      setSuccess(`Work plan "${validatedWorkPlan.title}" saved successfully!`);
-      // Clear any work plan specific errors
-      setWorkPlanErrors(prev => {
-        const updated = { ...prev };
-        delete updated[planId];
-        return updated;
-      });
-    } catch (error: any) {
-      console.error('Error saving work plan:', error);
-      const errorMessage = error.response?.data?.error || 'Failed to save work plan';
-      setError(errorMessage);
-      setWorkPlanErrors(prev => ({ ...prev, [planId]: errorMessage }));
-    } finally {
-      setSavingWorkPlanId(null);
-      setSavingWorkPlanIndex(null);
-    }
-  };
-
-  const addWorkPlan = async () => {
-    const newWorkPlan: PredefinedWorkPlan = {
-      id: `plan_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      title: '',
-      steps: [{ stepCount: 1, title: '' }],
-      autocomplete: false,
-      requireLogin: false,
-      showLoginSignup: 'after_plan_completed',
-      showInAgentMode: false,
-      defaultModel: undefined
-    };
-    
-    setPredefinedWorkPlans([
-      ...predefinedWorkPlans,
-      newWorkPlan
-    ]);
-    
-    // Set the newly added plan ID to trigger scroll and expand
-    setNewlyAddedPlanId(newWorkPlan.id || null);
-    setExpandedPlanId(newWorkPlan.id || null);
-  };
-
-  const removeWorkPlan = async (index: number) => {
-    const workPlan = predefinedWorkPlans[index];
-    if (!workPlan) return;
-
-    // If the work plan has an ID and has been saved, delete it from the backend
-    if (workPlan.id) {
-      try {
-        setSavingWorkPlanId(workPlan.id);
-        setSavingWorkPlanIndex(index);
-        await axios.delete(buildApiUrl(`/api/settings/agent-mode-predefined-workplans/${workPlan.id}`), {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-      } catch (error: any) {
-        console.error('Error deleting work plan from backend:', error);
-        const errorMessage = error.response?.data?.error || 'Failed to delete work plan from backend';
-        setError(errorMessage);
-        // Continue with local removal even if backend delete fails
-      } finally {
-        setSavingWorkPlanId(null);
-        setSavingWorkPlanIndex(null);
-      }
-    }
-
-    // Remove from local state
-    setPredefinedWorkPlans(predefinedWorkPlans.filter((_, i) => i !== index));
-    
-    // Clear any errors for this work plan
-    if (workPlan.id) {
-      setWorkPlanErrors(prev => {
-        const updated = { ...prev };
-        delete updated[workPlan.id!];
-        return updated;
-      });
-    }
-  };
-
-  const updateWorkPlan = (index: number, workPlan: PredefinedWorkPlan) => {
-    const updated = [...predefinedWorkPlans];
-    updated[index] = workPlan;
-    setPredefinedWorkPlans(updated);
-  };
-
-  const addStepToWorkPlan = (workPlanIndex: number) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps.push({
-      stepCount: updated[workPlanIndex].steps.length + 1,
-      title: ''
-    });
-    setPredefinedWorkPlans(updated);
-  };
-
-  const removeStepFromWorkPlan = (workPlanIndex: number, stepIndex: number) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps = updated[workPlanIndex].steps
-      .filter((_, i) => i !== stepIndex)
-      .map((step, i) => ({ ...step, stepCount: i + 1 }));
-    setPredefinedWorkPlans(updated);
-  };
-
-  const moveStepInWorkPlan = (workPlanIndex: number, stepIndex: number, direction: 'up' | 'down') => {
-    const updated = [...predefinedWorkPlans];
-    const steps = [...updated[workPlanIndex].steps];
-    const targetIndex = direction === 'up' ? stepIndex - 1 : stepIndex + 1;
-    if (targetIndex < 0 || targetIndex >= steps.length) return;
-    [steps[stepIndex], steps[targetIndex]] = [steps[targetIndex], steps[stepIndex]];
-    updated[workPlanIndex] = { ...updated[workPlanIndex], steps: steps.map((s, i) => ({ ...s, stepCount: i + 1 })) };
-    setPredefinedWorkPlans(updated);
-  };
-
-  const duplicateWorkPlan = (index: number) => {
-    const original = predefinedWorkPlans[index];
-    const copy: PredefinedWorkPlan = {
-      ...JSON.parse(JSON.stringify(original)),
-      id: undefined,
-      title: `${original.title} (Copy)`,
-    };
-    const tempId = `new-${Date.now()}`;
-    setPredefinedWorkPlans([...predefinedWorkPlans, copy]);
-    setExpandedPlanId(tempId);
-    setNewlyAddedPlanId(tempId);
-  };
-
-  const togglePlanExpanded = (planId: string) => {
-    setExpandedPlanId(prev => prev === planId ? null : planId);
-  };
-
-  const updateStepInWorkPlan = (workPlanIndex: number, stepIndex: number, step: WorkPlanStep) => {
-    const updated = [...predefinedWorkPlans];
-    updated[workPlanIndex].steps[stepIndex] = step;
-    setPredefinedWorkPlans(updated);
   };
 
   const resetToDefault = async (type: 'systemPrompt' | 'welcomeMessage' | 'conversationStarters' | 'defaultModel' | 'backupModel' | 'scheduledChatsDefaultModel' | 'reportGenerationDefaultModel' | 'imageGenerationDefaultModel' | 'videoGenerationDefaultModel' | 'customerSupportDefaultModel') => {
