@@ -136,7 +136,7 @@ describe('runCodingAgent', () => {
 
   // --- FAIL CASES ---
 
-  test('returns partial result when max iterations reached', async () => {
+  test('returns structured failure info when max iterations reached', async () => {
     // LLM always returns a tool call, never terminates
     mockCreate.mockResolvedValue({
       content: [
@@ -146,11 +146,77 @@ describe('runCodingAgent', () => {
     });
     mockedMcpFetch.mockResolvedValue({ files: [{ path: 'app/page.tsx', size: 1000 }] });
 
-    const result = await runCodingAgent('edit the page', mockContext, 3); // max 3 iterations
+    const result = await runCodingAgent('edit the page', mockContext, 3);
 
     expect(result.success).toBe(false);
-    expect(result.message).toContain('maximum');
+    expect(result.message).toContain('iteration limit');
+    expect(result.message).toContain('list_files');
+    expect(result.message).toContain('No files were edited');
     expect(result.iterations).toBe(3);
+  });
+
+  test('max iterations failure includes files edited and preview URL', async () => {
+    // Iteration 1: read_file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { file_path: 'app/page.tsx' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch.mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' });
+
+    // Iteration 2: edit_file
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_2', name: 'edit_file', input: {
+          file_path: 'app/page.tsx',
+          edits: [{ search: '<h1>Old</h1>', replace: '<h1>New</h1>' }]
+        }}
+      ],
+      stop_reason: 'tool_use'
+    });
+    // edit_file reads content, then writes
+    mockedMcpFetch
+      .mockResolvedValueOnce({ content: '<h1>Old</h1>\n<p>Text</p>' })
+      .mockResolvedValueOnce({ success: true, commit_url: 'https://github.com/test/commit/abc' });
+
+    // Iteration 3: check_deployment (last iteration)
+    mockCreate.mockResolvedValueOnce({
+      content: [
+        { type: 'tool_use', id: 'tu_3', name: 'check_deployment', input: {} }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch.mockResolvedValueOnce({
+      status: 'READY',
+      url: 'https://test-abc.vercel.app',
+      preview_url: 'https://test-abc.vercel.app'
+    });
+
+    const result = await runCodingAgent('change heading', mockContext, 3);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('app/page.tsx');
+    expect(result.message).toContain('vercel.app');
+    expect(result.message).toContain('edit_file');
+    expect(result.previewUrl).toContain('vercel.app');
+  });
+
+  test('max iterations failure includes last agent reasoning', async () => {
+    mockCreate.mockResolvedValue({
+      content: [
+        { type: 'text', text: 'I am trying to fix the CSS import path that is causing the build error.' },
+        { type: 'tool_use', id: 'tu_1', name: 'read_file', input: { file_path: 'app/globals.css' } }
+      ],
+      stop_reason: 'tool_use'
+    });
+    mockedMcpFetch.mockResolvedValue({ content: 'body { margin: 0; }' });
+
+    const result = await runCodingAgent('fix css', mockContext, 2);
+
+    expect(result.success).toBe(false);
+    expect(result.message).toContain('Last agent note');
+    expect(result.message).toContain('CSS import');
   });
 
   test('handles LLM call errors gracefully', async () => {
