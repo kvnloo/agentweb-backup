@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-26',
     changes: [
+      'Improvement: Smarter Landing Page Code Editing',
+      '- The coding agent now uses targeted file search and line-number edits instead of reading entire files, reducing token usage and improving reliability',
+      '- Fixed a race condition where edits on a new draft branch could fail due to GitHub API eventual consistency',
+      '- Emma no longer attempts to manually verify landing page files after delegating edits, resulting in fewer wasted iterations',
       'Fix: Landing Page Preview URL No Longer Gets Stuck at "Pending"',
       '- Fixed a bug where the preview URL check returned "pending" for non-existent draft branches, causing the agent to poll indefinitely',
       '- Non-existent branches now correctly return "not_found", allowing the agent to stop retrying immediately',
