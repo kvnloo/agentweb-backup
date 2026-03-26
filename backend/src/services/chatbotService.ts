@@ -24,6 +24,10 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+// Max serialized message size for DynamoDB persistence (400KB item limit).
+// Safety net in addMessagesToMessagesTable; primary truncation happens in agentModeService.
+const MAX_MESSAGE_CONTENT_SIZE = 350_000;
+
 // Tool calls that require repair for empty results (MCP PR #433 bug)
 const REPAIRABLE_TOOL_CALLS = [
   'generate_image',
@@ -571,15 +575,28 @@ export class ChatbotDB {
       const batchSize = 25;
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize);
-        const writeRequests = batch.map((message, index) => ({
-          PutRequest: {
-            Item: {
-              sessionId,
-              messageIndex: startIndex + i + index,
-              message,
+        const writeRequests = batch.map((message, index) => {
+          let safeMessage = message;
+          // Fast path: only check serialized size when content is large enough to matter
+          const contentLen = typeof message.content === 'string' ? message.content.length : 0;
+          if (contentLen > MAX_MESSAGE_CONTENT_SIZE) {
+            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized content (${contentLen} chars), truncating`);
+            safeMessage = {
+              ...message,
+              content: message.content.substring(0, MAX_MESSAGE_CONTENT_SIZE)
+                + `\n\n[Truncated — original size: ${contentLen} chars]`,
+            };
+          }
+          return {
+            PutRequest: {
+              Item: {
+                sessionId,
+                messageIndex: startIndex + i + index,
+                message: safeMessage,
+              },
             },
-          },
-        }));
+          };
+        });
 
         let unprocessed: any = writeRequests;
         let retries = 0;

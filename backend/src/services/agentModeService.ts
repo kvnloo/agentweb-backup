@@ -24,6 +24,10 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
 const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 const ADMIN_SKILL_TOOL_NAMES = ['list_predefined_work_plans', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'read_user_guide_structure', 'update_user_guide_block', 'append_to_user_guide', 'delete_user_guide_block', 'get_pr_digest'];
+
+// Max tool result content size for persistence. DynamoDB items are limited to 400KB;
+// MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
+const MAX_TOOL_CONTENT_SIZE = 300_000;
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { uploadFileToS3 } from '../utils/s3Utils';
@@ -1469,11 +1473,14 @@ export class AgentModeService {
               (pendingCounterUpdates[toolCall.function.name] || 0) + 1;
 
             const toolContent = result.formattedContent || (typeof result === 'string' ? result : JSON.stringify(result));
+            const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > MAX_TOOL_CONTENT_SIZE
+              ? toolContent.substring(0, MAX_TOOL_CONTENT_SIZE) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+              : toolContent;
             (messages as any[]).push({
               tool_call_id: toolCall.id,
               role: 'tool',
               name: toolCall.function.name,
-              content: toolContent,
+              content: truncatedToolContent,
               metadata: { timestamp: new Date().toISOString() }
             });
           } else {
