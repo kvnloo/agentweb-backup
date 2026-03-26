@@ -2651,6 +2651,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
 
   // Extract only the necessary data for the frontend to reduce storage size
   private extractMinimalToolResult(result: any, toolName: string): any {
+    console.log('[DEBUG] extractMinimalToolResult called for:', toolName);
     // For task creation tools, only keep the essential fields for TaskExecutionStatus
     if (toolName === 'create_task_from_template' || toolName === 'create_task_from_prompt' || toolName === 'create_image_task_from_prompt' || toolName === 'create_revision') {
       // Handle case where result is wrapped in {content: "JSON string", raw: {...}}
@@ -2796,6 +2797,33 @@ When a user requests client onboarding or says "onboard new client" or similar:
         file_url: actualResult.file_url,
         file_name: actualResult.file_name,
       };
+    }
+
+    // For HTML creation, preserve the S3 URL so frontend can open artifact panel
+    if (toolName === 'create_html_from_template') {
+      console.log('[DEBUG] extractMinimalToolResult hit for create_html_from_template');
+      console.log('[DEBUG] result type:', typeof result, 'keys:', Object.keys(result || {}));
+      console.log('[DEBUG] result.s3_url:', result?.s3_url);
+      console.log('[DEBUG] result.content type:', typeof result?.content);
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+          console.log('[DEBUG] parsed content, actualResult keys:', Object.keys(actualResult));
+          console.log('[DEBUG] actualResult.s3_url:', actualResult.s3_url);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse create_html_from_template result.content as JSON:`, e);
+        }
+      }
+      const extracted = {
+        success: actualResult.success,
+        message: actualResult.message,
+        s3_url: actualResult.s3_url,
+        filename: actualResult.filename,
+        template_name: actualResult.template_name,
+      };
+      console.log('[DEBUG] returning extracted:', JSON.stringify(extracted));
+      return extracted;
     }
 
     // For other tools, return empty object to minimize storage
