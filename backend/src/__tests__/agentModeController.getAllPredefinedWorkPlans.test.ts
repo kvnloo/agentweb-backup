@@ -128,10 +128,11 @@ describe('AgentModeController - getAllPredefinedWorkPlans', () => {
 
     const result = (res.json as jest.Mock).mock.calls[0][0];
     expect(result).toHaveLength(2);
-    expect(result[0].id).toBe('plan-1');
-    expect(result[0].visibility).toBe('system');
-    expect(result[1].id).toBe('plan-private');
-    expect(result[1].visibility).toBe('private');
+    // Private plans come first (user's own plans take priority)
+    expect(result[0].id).toBe('plan-private');
+    expect(result[0].visibility).toBe('private');
+    expect(result[1].id).toBe('plan-1');
+    expect(result[1].visibility).toBe('system');
   });
 
   it('should not include private plans for unauthenticated users', async () => {
