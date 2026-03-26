@@ -66,7 +66,7 @@ process.on('message', async (message: any) => {
       // Ensure initialization completed (should already be done)
       await ensureInitialized();
 
-      const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare } = message.params;
+      const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare, excludeTools } = message.params;
 
       // Progress callback to forward progress updates to parent process
       const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[] }) => {
@@ -95,7 +95,8 @@ process.on('message', async (message: any) => {
         onProgress,
         socketEmit,
         isInteractiveShare,
-        isCancelled
+        isCancelled,
+        excludeTools
       );
 
       // Clean up cancelled flag
