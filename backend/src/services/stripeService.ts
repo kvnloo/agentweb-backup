@@ -127,7 +127,12 @@ export async function syncSubscriptionFromStripe(
     const updates: any = {
       subscription_status: status,
       stripe_subscription_id: sub.id,
-      current_period_end: new Date((sub as any).current_period_end * 1000).toISOString(),
+      current_period_end: (sub as any).current_period_end
+        ? new Date(typeof (sub as any).current_period_end === 'number'
+            ? (sub as any).current_period_end * 1000
+            : (sub as any).current_period_end
+          ).toISOString()
+        : undefined,
       has_payment_method: hasPaymentMethod,
     };
 
