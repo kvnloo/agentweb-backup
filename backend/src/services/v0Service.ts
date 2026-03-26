@@ -1671,7 +1671,7 @@ export async function getPreviewDeploymentUrl(
   );
 
   if (!branchDeployment) {
-    return { buildStatus: "pending", previewUrl: undefined };
+    return { buildStatus: "not_found", previewUrl: undefined };
   }
 
   const state = branchDeployment.readyState || branchDeployment.state;

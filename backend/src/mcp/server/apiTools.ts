@@ -1270,12 +1270,12 @@ mcpToolRegistry.register({
   name: 'get_landing_page_preview_url',
   definition: {
     name: 'get_landing_page_preview_url',
-    description: 'Get the Vercel preview URL for a landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing.',
+    description: 'Get the Vercel preview URL for a landing page draft branch. Use this after the coding_agent edits a landing page to get the preview link for the user to review before publishing. IMPORTANT: The branch name MUST come from the coding_agent tool result (the "branch" field). Do NOT guess or construct branch names yourself. If coding_agent returned is_staging=false or no branch, there is no draft to preview. If buildStatus is "not_found", the branch does not exist on Vercel — do NOT keep polling.',
     inputSchema: {
       type: 'object',
       properties: {
         page_id: { type: 'string', description: 'The landing page ID' },
-        branch: { type: 'string', description: 'The draft branch name (e.g. "draft/abc12345")' }
+        branch: { type: 'string', description: 'The draft branch name from the coding_agent result (e.g. "draft/c8e16e74-0cad-4f"). Do NOT guess this value.' }
       },
       required: ['page_id', 'branch']
     }
