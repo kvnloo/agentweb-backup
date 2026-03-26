@@ -235,7 +235,6 @@ dynamodb = get_dynamodb_resource()
 # Initialize tables with environment-specific prefixes
 executions_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskExecutions')
 tasks_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Tasks')
-schedules_table = dynamodb.Table(f'{TABLE_PREFIX}AW-TaskSchedules')
 users_table = dynamodb.Table(f'{TABLE_PREFIX}AW-Users')
 
 logger.info(f"Initialized with environment: {os.getenv('NODE_ENV', 'production')}")
@@ -274,29 +273,6 @@ def get_pending_executions():
         logger.error(f"Error querying pending executions: {e}")
         return []
 
-def get_due_schedules():
-    try:
-        now = datetime.now(timezone.utc).isoformat()
-        response = schedules_table.query(
-            IndexName='StatusStartTimeIndex',
-            KeyConditionExpression='#status = :status AND #nextRunTime <= :now',
-            ExpressionAttributeNames={
-                '#status': 'status',
-                '#nextRunTime': 'nextRunTime'
-            },
-            ExpressionAttributeValues={
-                ':status': 'active',
-                ':now': now
-            }
-        )
-        items = response.get('Items', [])
-        if len(items) > 0:
-            logger.info(f"Found {len(items)} due schedules")
-        return items
-    except ClientError as e:
-        logger.error(f"Error querying due schedules: {e}")
-        return []
-
 def create_execution(task_id, user_id, prompt=None, workflow_execution_id=None):
     try:
         execution_id = str(int(time.time() * 1000))  # Use timestamp as ID
@@ -316,38 +292,6 @@ def create_execution(task_id, user_id, prompt=None, workflow_execution_id=None):
     except ClientError as e:
         logger.error(f"Error creating execution: {e}")
         return None
-
-def update_schedule_next_run_time(schedule):
-    try:
-        now = datetime.now(timezone.utc)
-        next_run = now
-
-        # Calculate next run time based on frequency
-        if schedule['frequency'] == 'daily':
-            next_run = next_run + timedelta(days=1)
-        elif schedule['frequency'] == 'weekly':
-            next_run = next_run + timedelta(weeks=1)
-        elif schedule['frequency'] == 'monthly':
-            # Add one month (approximately)
-            if next_run.month == 12:
-                next_run = next_run.replace(year=next_run.year + 1, month=1)
-            else:
-                next_run = next_run.replace(month=next_run.month + 1)
-
-        # Set to 9:00 AM
-        next_run = next_run.replace(hour=9, minute=0, second=0, microsecond=0)
-
-        # Update the schedule
-        schedules_table.update_item(
-            Key={'scheduleId': schedule['scheduleId']},
-            UpdateExpression='SET nextRunTime = :nextRunTime',
-            ExpressionAttributeValues={
-                ':nextRunTime': next_run.isoformat()
-            }
-        )
-        logger.info(f"Updated next run time for schedule {schedule['scheduleId']} to {next_run.isoformat()}")
-    except ClientError as e:
-        logger.error(f"Error updating schedule next run time: {e}")
 
 async def trigger_scheduled_chats():
     """Trigger scheduled chats by calling the backend API."""
@@ -389,40 +333,13 @@ async def trigger_scheduled_chats():
         logger.error(f"Unexpected error when triggering scheduled chats: {e}")
 
 async def process_schedules():
+    """Process scheduled chats by triggering the backend API.
+
+    Note: The legacy task scheduling feature (recurring task executions) has been
+    deprecated in favor of scheduled chats, which are fully managed by the backend.
+    """
     try:
-        due_schedules = get_due_schedules()
-        
-        # Separate regular task schedules from scheduled chats
-        task_schedules = []
-        scheduled_chat_schedules = []
-        
-        for schedule in due_schedules:
-            if schedule.get('type') == 'scheduled_chat':
-                scheduled_chat_schedules.append(schedule)
-            else:
-                task_schedules.append(schedule)
-        
-        # Process regular task schedules
-        for schedule in task_schedules:
-            try:
-                # Create execution for the scheduled task
-                execution_id = create_execution(schedule['taskId'], schedule['userId'])
-                if execution_id:
-                    logger.info(f"Created execution {execution_id} for scheduled task {schedule['taskId']}")
-                    
-                    # Update the schedule's next run time
-                    update_schedule_next_run_time(schedule)
-            except Exception as e:
-                logger.error(f"Error processing schedule {schedule['scheduleId']}: {e}")
-        
-        # Process scheduled chat schedules
-        if scheduled_chat_schedules:
-            try:
-                await trigger_scheduled_chats()
-                logger.info(f"Triggered scheduled chats processing for {len(scheduled_chat_schedules)} schedules")
-            except Exception as e:
-                logger.error(f"Error triggering scheduled chats: {e}")
-                
+        await trigger_scheduled_chats()
     except Exception as e:
         logger.error(f"Error in process_schedules: {e}")
 
