@@ -17,6 +17,7 @@ import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErro
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
+import { checkTokenUsage } from '../services/tokenUsageService';
 import { DynamoDB } from 'aws-sdk';
 
 /** Default expiration for legacy interactive shares that don't have an expiresAt field (7 days from sharedAt). */
@@ -1707,6 +1708,15 @@ export const agentModeController = {
 
       if (!sessionId || !userMessage) {
         return res.status(400).json({ error: 'Session ID and user message are required' });
+      }
+
+      // Check token usage limits
+      const usageStatus = await checkTokenUsage(user.userId);
+      if (!usageStatus.allowed) {
+        return res.status(429).json({
+          error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
+          tokenUsage: usageStatus,
+        });
       }
 
       // Get session

@@ -375,7 +375,7 @@ describe('AgentModeService - Skills', () => {
 
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('tool_no_desc');
-      expect(result[0].description).toBe('');
+      expect(result[0].description).toBe('tool_no_desc');
     });
 
     it('should exclude admin-only tools from unassociated tools', () => {

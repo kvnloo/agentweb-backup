@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
+import { userDb, orgDb } from "../services/db";
 import multer from "multer";
 import { S3 } from "aws-sdk";
 import crypto from "crypto";
@@ -84,7 +85,17 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
     }
 
     const user = users[0];
-    const brandGuidelines = user.brandGuidelines;
+
+    // If user is in an org, always read brand guidelines from the org (not the user)
+    let brandGuidelines = user.brandGuidelines;
+    let isOrgLevel = false;
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org) {
+        brandGuidelines = org.brandGuidelines;
+        isOrgLevel = true;
+      }
+    }
 
     if (!brandGuidelines) {
       return res.json({
@@ -99,6 +110,7 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       attachments: brandGuidelines.attachments || [],
       createdAt: brandGuidelines.createdAt,
       updatedAt: brandGuidelines.updatedAt,
+      isOrgLevel,
     });
   } catch (error) {
     console.error("[BRAND DEBUG] Error fetching brand guidelines:", error);
@@ -318,6 +330,19 @@ router.post(
         `[BRAND DEBUG] About to update user with email: ${user.email}`
       );
 
+      // If user is in an org, save to org (owner only); otherwise save to user
+      if (user.orgId) {
+        if (user.orgRole !== "owner") {
+          return res.status(403).json({ error: "Only the org owner can update brand guidelines" });
+        }
+        await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData });
+        console.log(`[BRAND DEBUG] Updated org ${user.orgId} brand guidelines`);
+        return res.status(201).json({
+          message: "Brand guidelines saved successfully (org-level)",
+          attachments: attachments.length,
+        });
+      }
+
       // Update user record with brand guidelines
       const updateParams = {
         TableName: `${TABLE_PREFIX}AW-Users`,
@@ -378,24 +403,27 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "User ID not provided" });
     }
 
-    // Get current user and brand guidelines
-    const result = await dynamodb
-      .query({
-        TableName: `${TABLE_PREFIX}AW-Users`,
-        IndexName: "UserIdIndex",
-        KeyConditionExpression: "userId = :userId",
-        ExpressionAttributeValues: {
-          ":userId": userId,
-        },
-      })
-      .promise();
-
-    if (!result.Items || result.Items.length === 0) {
+    // Get current user
+    const user = await userDb.getUserById(userId);
+    if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const user = result.Items[0];
-    const brandGuidelines = user.brandGuidelines;
+    // Determine source: org-level or user-level
+    let brandGuidelines: any;
+    let isOrgLevel = false;
+    if (user.orgId) {
+      if (user.orgRole !== "owner") {
+        return res.status(403).json({ error: "Only the org owner can delete brand assets" });
+      }
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org?.brandGuidelines) {
+        brandGuidelines = org.brandGuidelines;
+        isOrgLevel = true;
+      }
+    } else {
+      brandGuidelines = user.brandGuidelines;
+    }
 
     if (!brandGuidelines) {
       return res.status(404).json({ error: "Brand guidelines not found" });
@@ -425,29 +453,31 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       // Continue with database update even if S3 deletion fails
     }
 
-    // Update the user's brand guidelines
+    // Update brand guidelines
     const updatedBrandGuidelines = {
       ...brandGuidelines,
       attachments: updatedAttachments,
       updatedAt: new Date().toISOString(),
     };
 
-    await dynamodb
-      .update({
-        TableName: `${TABLE_PREFIX}AW-Users`,
-        Key: { email: user.email },
-        UpdateExpression:
-          "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
-        ExpressionAttributeValues: {
-          ":brandGuidelines": updatedBrandGuidelines,
-          ":updatedAt": new Date().toISOString(),
-        },
-      })
-      .promise();
-
-    console.log(
-      `[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`
-    );
+    if (isOrgLevel) {
+      await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
+      console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
+    } else {
+      await dynamodb
+        .update({
+          TableName: `${TABLE_PREFIX}AW-Users`,
+          Key: { email: user.email },
+          UpdateExpression:
+            "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+          ExpressionAttributeValues: {
+            ":brandGuidelines": updatedBrandGuidelines,
+            ":updatedAt": new Date().toISOString(),
+          },
+        })
+        .promise();
+      console.log(`[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`);
+    }
 
     res.json({ message: "Asset deleted successfully" });
   } catch (error) {

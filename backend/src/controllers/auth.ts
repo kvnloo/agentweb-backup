@@ -8,6 +8,7 @@ import { v4 as uuidv4 } from "uuid";
 import { emailService } from "../services/emailService";
 import crypto from "crypto";
 import { getTierConfig, DEFAULT_PAGES } from "../services/subscriptionService";
+import { syncNewUserToLeadList } from "../services/crmAutoSyncService";
 
 export const register = async (req: Request, res: Response) => {
   try {
@@ -85,6 +86,18 @@ export const register = async (req: Request, res: Response) => {
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
     });
+
+    // Auto-sync new user to CRM lead list (fire-and-forget)
+    syncNewUserToLeadList({
+      userId,
+      email,
+      fullName: finalDisplayName,
+      roles: finalRoles,
+      isAdmin: false,
+      createdAt: new Date().toISOString(),
+      stripe_customer_id,
+      subscriptionType: "Free",
+    }).catch(() => {});
 
     // JWT includes roles array
     const token = jwt.sign(
@@ -245,6 +258,16 @@ export const googleCallback = async (
           allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
           allowedSkills: freeTierConfig?.allowedSkills ?? [],
         });
+
+        // Auto-sync new user to CRM lead list (fire-and-forget)
+        syncNewUserToLeadList({
+          userId: user.userId,
+          email,
+          fullName: finalDisplayName,
+          roles,
+          isAdmin: false,
+          subscriptionType: "Free",
+        }).catch(() => {});
       } else {
         // For other portals, look up waitlist for bonus data (no gate)
         const waitlistEntry = await waitlistDb.getByEmail(email);
@@ -294,6 +317,17 @@ export const googleCallback = async (
           allowedPages: freeTierConfigOAuth?.allowedPages ?? [...DEFAULT_PAGES],
           allowedSkills: freeTierConfigOAuth?.allowedSkills ?? [],
         });
+
+        // Auto-sync new user to CRM lead list (fire-and-forget)
+        syncNewUserToLeadList({
+          userId: user.userId,
+          email,
+          fullName: finalDisplayName,
+          roles,
+          isAdmin: false,
+          stripe_customer_id,
+          subscriptionType: "Free",
+        }).catch(() => {});
       }
     }
 

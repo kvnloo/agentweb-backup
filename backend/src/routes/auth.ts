@@ -1,7 +1,7 @@
 import express from 'express';
 import { register, login, googleCallback } from '../controllers/auth';
 import { authenticateToken } from '../middleware/auth';
-import { userDb, taskDb, subscriberDb } from '../services/db';
+import { userDb, taskDb, subscriberDb, orgDb } from '../services/db';
 import passport from 'passport';
 import { Strategy as GoogleStrategy, Profile } from 'passport-google-oauth20';
 import { AuthRequest } from '../types/express';
@@ -71,15 +71,19 @@ router.get('/me', authenticateToken, async (req, res) => {
         const { getUserSubscriptionType, getAllowedPages, getAllowedSkills } = await import('../services/subscriptionService');
         const { skillService } = await import('../services/skillService');
 
-        const subscriptionTypeName = await getUserSubscriptionType(userId);
+        // If user is in an org, resolve subscription from the org owner
+        const subscriptionUserId = user.orgId
+          ? (await orgDb.getOrgById(user.orgId))?.ownerUserId || userId
+          : userId;
+        const subscriptionTypeName = await getUserSubscriptionType(subscriptionUserId);
 
         response.subscriptionType = subscriptionTypeName;
 
-        // Get allowed pages (expands "*" to actual list)
-        response.allowedPages = await getAllowedPages(userId);
+        // Get allowed pages (expands "*" to actual list) — use org owner's if in org
+        response.allowedPages = await getAllowedPages(subscriptionUserId);
 
-        // Get allowed skills resolved to { skillId, name } for display
-        const allowedSkillIds = await getAllowedSkills(userId);
+        // Get allowed skills resolved to { skillId, name } for display — use org owner's if in org
+        const allowedSkillIds = await getAllowedSkills(subscriptionUserId);
         const publishedSkills = await skillService.getPublishedSkills();
         const isWildcard = allowedSkillIds.includes("*");
         const allowedSet = new Set(allowedSkillIds);
@@ -105,6 +109,17 @@ router.get('/me', authenticateToken, async (req, res) => {
     }
 
     response.hasBrandGuidelines = !!(user.brandGuidelines?.brandData?.brandName);
+
+    // Include org info if user is in an org
+    if (user.orgId) {
+      const org = await orgDb.getOrgById(user.orgId);
+      if (org) {
+        response.orgId = org.orgId;
+        response.orgName = org.name;
+        response.orgRole = user.orgRole;
+        response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      }
+    }
 
     res.json(response);
   } catch (error) {

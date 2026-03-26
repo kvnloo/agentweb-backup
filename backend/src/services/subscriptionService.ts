@@ -7,7 +7,9 @@ export interface SubscriptionType {
   name: string;
   allowedPages: string[]; // Array of page paths (e.g., ["/marketing/research", "/marketing/blog"]) or ["*"] for all
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
+  allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
+  monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
 }
 
 // Default pages that are always available regardless of subscription type
@@ -242,6 +244,39 @@ export async function getPublicAllowedSkills(): Promise<string[]> {
   } catch (error) {
     console.error("Error getting public allowed skills:", error);
     return [];
+  }
+}
+
+/**
+ * All connected account platform types that can be gated per subscription.
+ * "instagram" is a separate UI entry even though it uses the "meta" OAuth flow.
+ */
+export function getAllAvailableConnectedAccounts(): string[] {
+  return ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram'];
+}
+
+/**
+ * Get allowed connected account platforms for a user based on their subscription type.
+ * Returns the actual list of platform strings.
+ */
+export async function getAllowedConnectedAccounts(userId: string): Promise<string[]> {
+  try {
+    const subscriptionTypeName = await getUserSubscriptionType(userId);
+    const subscriptionType = await getSubscriptionTypeConfig(subscriptionTypeName);
+
+    if (!subscriptionType) {
+      return getAllAvailableConnectedAccounts();
+    }
+
+    const allowed = subscriptionType.allowedConnectedAccounts;
+    if (!allowed || allowed.includes('*') || allowed.length === 0) {
+      return getAllAvailableConnectedAccounts();
+    }
+
+    return allowed;
+  } catch (error) {
+    console.error('Error getting allowed connected accounts:', error);
+    return getAllAvailableConnectedAccounts();
   }
 }
 

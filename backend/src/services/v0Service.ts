@@ -1439,16 +1439,16 @@ async function createVercelProject(
 
   console.log(`[V0 SERVICE] Created Vercel project: ${vercelProjectId}, URL: ${deployedUrl} (requested name: ${projectName})`);
 
-  // Disable Vercel Authentication so preview deployments are publicly accessible
+  // Disable deployment protection so preview deployments are publicly accessible
   try {
     await axios.patch(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
-      { vercelAuthentication: { deploymentType: "none" } },
+      { ssoProtection: null, passwordProtection: null, trustedIps: null },
       { headers }
     );
-    console.log(`[V0 SERVICE] Disabled Vercel Authentication for ${projectName}`);
+    console.log(`[V0 SERVICE] Disabled deployment protection for ${projectName}`);
   } catch (authErr: any) {
-    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication: ${authErr.message}`);
+    console.warn(`[V0 SERVICE] Could not disable deployment protection: ${authErr.message}`);
   }
 
   // Manually trigger a deployment — Vercel doesn't always auto-deploy when linking to an existing repo
@@ -1643,25 +1643,19 @@ export async function getPreviewDeploymentUrl(
     );
     console.log(`[V0 SERVICE] Project ${vercelProjectId} protection settings:`, JSON.stringify({
       ssoProtection: projRes.data?.ssoProtection,
-      vercelAuthentication: projRes.data?.vercelAuthentication,
       passwordProtection: projRes.data?.passwordProtection,
       trustedIps: projRes.data?.trustedIps,
-      protectionBypass: projRes.data?.protectionBypass,
     }));
 
     // Disable all protection types
     const patchRes = await axios.patch(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
-      {
-        ssoProtection: null,
-        vercelAuthentication: { deploymentType: "none" },
-        passwordProtection: null,
-      },
+      { ssoProtection: null, passwordProtection: null, trustedIps: null },
       { headers }
     );
-    console.log(`[V0 SERVICE] Disabled Vercel Authentication for project ${vercelProjectId}: ${patchRes.status}`);
+    console.log(`[V0 SERVICE] Disabled deployment protection for project ${vercelProjectId}: ${patchRes.status}`);
   } catch (authErr: any) {
-    console.warn(`[V0 SERVICE] Could not disable Vercel Authentication for ${vercelProjectId}: ${authErr.response?.status} ${authErr.response?.data?.error?.message || authErr.message}`);
+    console.warn(`[V0 SERVICE] Could not disable deployment protection for ${vercelProjectId}: ${authErr.response?.status} ${authErr.response?.data?.error?.message || authErr.message}`);
   }
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)

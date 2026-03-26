@@ -156,6 +156,13 @@ export interface User {
   resetPasswordToken?: string;
   resetPasswordExpires?: string;
   subscriptionType?: string | null; // Subscription type for customer-portal users (defaults to "Basic")
+  tokenUsage?: {
+    month: string;        // "YYYY-MM" format for current tracking month
+    totalTokens: number;  // cumulative tokens used this month
+    totalCost: number;    // cumulative cost in USD this month
+    resetDate: string;    // ISO date of next monthly reset
+  };
+  tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
   stripe_subscription_id?: string; // Stripe subscription ID
   subscription_status?: string; // Stripe subscription status: active, trialing, past_due, canceled, canceling
   current_period_end?: string; // ISO date of current billing period end
@@ -210,6 +217,34 @@ export interface User {
   }>;
   allowedPages?: string[];
   allowedSkills?: string[];
+  orgId?: string;
+  orgRole?: "owner" | "member";
+}
+
+export interface Organization {
+  orgId: string;
+  name: string;
+  ownerUserId: string;
+  brandGuidelines?: User["brandGuidelines"];
+  marketStrategy?: User["marketStrategy"];
+  startupProfiles?: User["startupProfiles"];
+  connected_accounts?: User["connected_accounts"];
+  seoDomains?: string[];
+  cmsType?: "Basehub" | "Webflow" | "WordPress";
+  emailDomain?: string;
+  fromName?: string;
+  slackChannel?: string;
+  googleAnalyticsProperties?: Array<{ propertyId: string; label: string }>;
+  googleDriveFolders?: Array<{ folderId: string; name: string }>;
+  pendingInvites?: Array<{
+    email: string;
+    inviteToken: string;
+    invitedAt: string;
+    invitedBy: string;
+  }>;
+  maxMembers: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface UserInteraction {
@@ -4935,7 +4970,12 @@ export const socialEngagementTrackingDb = {
   }) {
     try {
       const dedupId = tracker.commentId || tracker.postId;
-      const key = `${dedupId}#${tracker.engagingAccountId}`;
+      // Legacy compound types keep the old key format (no action suffix) for backward compat.
+      // New atomic types include the action type so like and reply can coexist on the same comment.
+      const isLegacyCompound = tracker.actionType === 'like_and_reply_comment' || tracker.actionType === 'comment_and_like';
+      const key = isLegacyCompound
+        ? `${dedupId}#${tracker.engagingAccountId}`
+        : `${dedupId}#${tracker.engagingAccountId}#${tracker.actionType}`;
 
       if (tracker.status === 'failed') {
         // Use UPDATE + ADD to atomically increment failCount instead of overwriting it
@@ -4962,8 +5002,38 @@ export const socialEngagementTrackingDb = {
           ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
           ExpressionAttributeValues: exprValues,
         }).promise();
+      } else if (tracker.status === 'queued') {
+        // Use UPDATE (not PUT) so failCount is preserved across retries.
+        // A PUT would wipe failCount, resetting it to 0 on every scanner re-queue
+        // and making the 3-retry cap impossible to reach.
+        // executedAt is set now so the item appears in GSIs (DynamoDB excludes items
+        // with missing GSI sort keys, which would break the per-post cap count).
+        const executedAt = tracker.executedAt ?? new Date().toISOString();
+        const setFields = [
+          '#status = :status', '#platform = :platform',
+          'ownerAccountId = :ownerAccountId', 'actionType = :actionType',
+          'scheduleId = :scheduleId', 'createdAt = :createdAt', 'executedAt = :executedAt',
+        ];
+        const exprValues: Record<string, any> = {
+          ':status': 'queued',
+          ':platform': tracker.platform,
+          ':ownerAccountId': tracker.ownerAccountId,
+          ':actionType': tracker.actionType,
+          ':scheduleId': tracker.scheduleId,
+          ':createdAt': new Date().toISOString(),
+          ':executedAt': executedAt,
+        };
+        if (tracker.commentId)    { setFields.push('commentId = :commentId');       exprValues[':commentId']    = tracker.commentId; }
+        if (tracker.postId)       { setFields.push('postId = :postId');             exprValues[':postId']       = tracker.postId; }
+        await dynamodb.update({
+          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+          Key: { userId: tracker.userId, postId_engagingAccountId: key },
+          UpdateExpression: `SET ${setFields.join(', ')}`,
+          ExpressionAttributeNames: { '#status': 'status', '#platform': 'platform' },
+          ExpressionAttributeValues: exprValues,
+        }).promise();
       } else {
-        // queued / completed — plain put (resets failCount is intentional on success)
+        // completed — plain PUT resets failCount intentionally on success
         await dynamodb.put({
           TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
           Item: { ...tracker, postId_engagingAccountId: key, createdAt: new Date().toISOString() },
@@ -4977,29 +5047,61 @@ export const socialEngagementTrackingDb = {
     }
   },
 
-  async hasEngaged(userId: string, postId: string, engagingAccountId: string): Promise<boolean> {
+  async hasEngaged(userId: string, postId: string, engagingAccountId: string, actionType?: string): Promise<boolean> {
     try {
-      const params = {
-        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
-        KeyConditionExpression: "userId = :userId AND postId_engagingAccountId = :postId_engagingAccountId",
-        // Block if already queued/completed, or if max retries reached
-        FilterExpression: "#status IN (:queued, :completed) OR failCount >= :maxRetries",
-        ExpressionAttributeNames: { "#status": "status" },
-        ExpressionAttributeValues: {
-          ":userId": userId,
-          ":postId_engagingAccountId": `${postId}#${engagingAccountId}`,
-          ":queued": "queued",
-          ":completed": "completed",
-          ":maxRetries": SOCIAL_ENGAGEMENT_MAX_RETRIES,
-        }
-      };
+      // For new atomic action types, check both the action-specific key (new format) and
+      // the legacy compound key (old format) so existing records still block reschedules.
+      const isLegacyCompound = !actionType || actionType === 'like_and_reply_comment' || actionType === 'comment_and_like';
+      const keysToCheck = isLegacyCompound
+        ? [`${postId}#${engagingAccountId}`]
+        : [`${postId}#${engagingAccountId}#${actionType}`, `${postId}#${engagingAccountId}`];
 
-      const result = await dynamodb.query(params).promise();
-      return (result.Items && result.Items.length > 0) ? true : false;
+      for (const key of keysToCheck) {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+          KeyConditionExpression: "userId = :userId AND postId_engagingAccountId = :postId_engagingAccountId",
+          // Block if already queued/completed, or if max retries reached
+          FilterExpression: "#status IN (:queued, :completed) OR failCount >= :maxRetries",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":userId": userId,
+            ":postId_engagingAccountId": key,
+            ":queued": "queued",
+            ":completed": "completed",
+            ":maxRetries": SOCIAL_ENGAGEMENT_MAX_RETRIES,
+          }
+        }).promise();
+        if (result.Items && result.Items.length > 0) return true;
+      }
+      return false;
     } catch (error) {
       // Fail safe: assume already engaged on error to prevent duplicate scheduling
       handleDynamoDbError(error, "hasEngaged");
       return true;
+    }
+  },
+
+  async deleteEngagement(params: {
+    userId: string;
+    postId: string;
+    commentId?: string;
+    engagingAccountId: string;
+    actionType: string;
+  }) {
+    try {
+      const dedupId = params.commentId || params.postId;
+      const isLegacyCompound = params.actionType === 'like_and_reply_comment' || params.actionType === 'comment_and_like';
+      const key = isLegacyCompound
+        ? `${dedupId}#${params.engagingAccountId}`
+        : `${dedupId}#${params.engagingAccountId}#${params.actionType}`;
+
+      await dynamodb.delete({
+        TableName: `${TABLE_PREFIX}AW-SocialEngagementTracking`,
+        Key: { userId: params.userId, postId_engagingAccountId: key },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, "deleteEngagement");
+      throw error;
     }
   },
 
@@ -5091,4 +5193,101 @@ export const socialEngagementTrackingDb = {
       throw error;
     }
   },
+};
+
+// ==================== Organization DB Operations ====================
+
+const ORGS_TABLE = `${TABLE_PREFIX}AW-Organizations`;
+const ORG_MAX_MEMBERS = 5;
+
+export const orgDb = {
+  async createOrg(org: Organization): Promise<Organization> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Item: org,
+      ConditionExpression: "attribute_not_exists(orgId)",
+    };
+    await dynamodb.put(params).promise();
+    return org;
+  },
+
+  async getOrgById(orgId: string): Promise<Organization | null> {
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+    };
+    const result = await dynamodb.get(params).promise();
+    return (result.Item as Organization) || null;
+  },
+
+  async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {
+    const { orgId: _, createdAt: __, ...updatableFields } = updates;
+
+    if (Object.keys(updatableFields).length === 0) {
+      const org = await this.getOrgById(orgId);
+      if (!org) throw new Error(`Organization ${orgId} not found`);
+      return org;
+    }
+
+    const updateExpressions: string[] = [];
+    const expressionAttributeNames: Record<string, string> = {};
+    const expressionAttributeValues: Record<string, any> = {};
+
+    Object.entries(updatableFields).forEach(([key, value]) => {
+      if (value !== undefined) {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      }
+    });
+
+    if (updateExpressions.length === 0) {
+      const org = await this.getOrgById(orgId);
+      if (!org) throw new Error(`Organization ${orgId} not found`);
+      return org;
+    }
+
+    // Always update updatedAt
+    updateExpressions.push("#updatedAt = :updatedAt");
+    expressionAttributeNames["#updatedAt"] = "updatedAt";
+    expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const params = {
+      TableName: ORGS_TABLE,
+      Key: { orgId },
+      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      ExpressionAttributeNames: expressionAttributeNames,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: "ALL_NEW" as const,
+    };
+
+    const result = await dynamodb.update(params).promise();
+    return result.Attributes as Organization;
+  },
+
+  async deleteOrg(orgId: string): Promise<void> {
+    await dynamodb.delete({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+  },
+
+  async getOrgMembers(orgId: string): Promise<User[]> {
+    // Scan users with this orgId - fine for small orgs (max 5 members)
+    const result = await dynamodb.scan({
+      TableName: `${TABLE_PREFIX}AW-Users`,
+      FilterExpression: "orgId = :orgId",
+      ExpressionAttributeValues: { ":orgId": orgId },
+    }).promise();
+    return (result.Items || []) as User[];
+  },
+
+  async getOrgMemberCount(orgId: string): Promise<number> {
+    const result = await dynamodb.scan({
+      TableName: `${TABLE_PREFIX}AW-Users`,
+      FilterExpression: "orgId = :orgId",
+      ExpressionAttributeValues: { ":orgId": orgId },
+      Select: "COUNT",
+    }).promise();
+    return result.Count || 0;
+  },
+
+  ORG_MAX_MEMBERS,
 };

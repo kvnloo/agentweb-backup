@@ -26,6 +26,7 @@ jest.mock('../services/settingsService', () => ({
 jest.mock('../services/subscriptionService', () => ({
   getAllAvailablePages: jest.fn(() => ['/', '/agent-mode', '/settings', '/guide', '/tasks']),
   getAllAvailableSkills: jest.fn(async () => ['skill-1', 'skill-2', '__other_skills__']),
+  getAllAvailableConnectedAccounts: jest.fn(() => ['linkedin', 'unipile', 'meta', 'gmail', 'youtube', 'fathom', 'instagram']),
   getPublicAllowedSkills: jest.fn(async () => []),
   // Keep getAllAvailableFunctionCalls for backward compat if referenced elsewhere
   getAllAvailableFunctionCalls: jest.fn(async () => ['generate_image', 'generate_video', 'search_web']),
