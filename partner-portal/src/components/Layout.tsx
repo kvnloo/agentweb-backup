@@ -177,6 +177,14 @@ export default function Layout() {
                       <Button
                         color="primary"
                         component={RouterLink}
+                        to="/schedule-templates"
+                        variant={isActivePath('/schedule-templates') ? 'contained' : 'text'}
+                      >
+                        Schedule Templates
+                      </Button>
+                      <Button
+                        color="primary"
+                        component={RouterLink}
                         to="/gtm-ops"
                         variant={isActivePath('/gtm-ops') ? 'contained' : 'text'}
                       >

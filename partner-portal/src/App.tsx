@@ -32,6 +32,7 @@ import Guide from './pages/Guide';
 import Templates from './pages/Templates';
 import Skills from './pages/Skills';
 import WorkPlans from './pages/WorkPlans';
+import ScheduleTemplates from './pages/ScheduleTemplates';
 import ClientHealth from './pages/ClientHealth';
 import Api from './pages/Api';
 import Marketing from './pages/marketing';
@@ -93,6 +94,14 @@ export default function App() {
                       element={
                         <PartnerRoute>
                           <WorkPlans />
+                        </PartnerRoute>
+                      }
+                    />
+                    <Route
+                      path="schedule-templates"
+                      element={
+                        <PartnerRoute>
+                          <ScheduleTemplates />
                         </PartnerRoute>
                       }
                     />
