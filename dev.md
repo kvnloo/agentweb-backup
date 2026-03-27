@@ -2527,3 +2527,170 @@ Token growth by session length:
 - Dynamic tool filtering (only send relevant tools based on conversation context)
 - Scheduled session reset (start each run with summary of prior run instead of full history)
 - See "Conversation Summarization Design" section above for the summarization design
+
+## Known Limitation: `get_chat_history` Tool Crashes on Large Time Ranges (2026-03-27)
+
+The `get_chat_history` admin tool (used by Emma to analyze usage) crashes when querying large time ranges (e.g. 7 days). Root cause:
+
+1. `chatbotService.getRecentSessionsPage()` with a time range does an **unbounded fetch-all-then-slice** — a `do...while` loop paginates through ALL DynamoDB pages before applying `limit` as a post-fetch `Array.slice()`. For 7 days, this fetches ~1,100+ session records into memory.
+2. The admin route (`GET /api/admin/chat-sessions`) then calls `getChatSession()` for each returned session (up to 100) via `Promise.all`, loading full message content — 100 parallel DynamoDB queries.
+3. The full response (100 sessions with all messages) is returned as a tool result to the LLM, which can exceed context/memory limits and crash the agent mid-stream.
+
+**Impact:** Session `1e5af232-1164-46cb-bce5-83d76edd6734` crashed when the user asked Emma to "fetch the chat history of last 7 days, then count the total usage and cost per accounts."
+
+**Potential fixes (not yet implemented):**
+- Push `Limit` into the DynamoDB query (early termination) instead of fetch-all-then-slice
+- Add a `metadata_only` mode to skip loading full messages when only counts/costs are needed
+- The tool's `limit` param defaults to 100, but the DynamoDB fetch still retrieves all 1,100+ sessions before slicing
+
+## Usage & Cost Analysis — Week of March 21–27, 2026
+
+### Summary
+
+| Metric | Value |
+|--------|-------|
+| Total sessions | 987 |
+| Sessions with cost tracking | 305 (31%) |
+| Sessions without cost tracking | 682 (69%) |
+| Total tracked cost | $1,414.14 |
+| Projected monthly cost (×4.3) | ~$6,081 |
+| Avg cost/session (tracked) | $4.64 |
+| Median cost/session | $0.57 |
+| Unique users | 62 |
+
+**Note:** 69% of sessions have no cost data. These are likely sessions that either (a) errored out before any LLM call, (b) used models where cost tracking wasn't implemented, or (c) are predefined-work-plan previews from anonymous users that didn't complete.
+
+### By Subscription Tier
+
+| Tier | Users | Sessions | Cost | Avg/User (7d) | Avg/Session |
+|------|------:|---------:|-----:|---------------:|------------:|
+| Super Premium | 17 | 693 | $1,138.78 | $66.99 | $1.64 |
+| Advanced | 4 | 47 | $131.21 | $32.80 | $2.79 |
+| Free / Anonymous | 40 | 210 | $138.34 | $3.46 | $0.66 |
+| Basic | 1 | 37 | $5.80 | $5.80 | $0.16 |
+
+Super Premium users drive **80.5%** of total cost ($1,139 of $1,414). Advanced users are the most expensive per-session ($2.79 avg) — they tend toward complex research workflows. Free/anonymous users are mostly work-plan previews (single-session anonymous users) plus a few registered Free accounts.
+
+### Cost Distribution (305 tracked sessions)
+
+| Percentile | Cost |
+|-----------|-----:|
+| Min | $0.01 |
+| P25 | $0.17 |
+| Median | $0.57 |
+| P75 | $3.32 |
+| P90 | $11.05 |
+| P95 | $23.25 |
+| P99 | $56.25 |
+| Max | $106.76 |
+
+The distribution is heavily right-skewed: 75% of sessions cost under $3.32, but the top 5% cost $23+ each and drive a disproportionate share of total spend.
+
+### Top Accounts by Cost (7 days)
+
+| Account | Tier | Sessions | Cost | Avg/Sess | Primary Activity |
+|---------|------|----------|------|----------|-----------------|
+| renata@your360.ai | Super Premium | 112 | $324.64 | $2.90 | Regular chats, some scheduled |
+| founders@agentweb.pro (internal) | Super Premium | 199 | $215.30 | $1.08 | Regular + 50 scheduled + testing |
+| amrutha@structuredlabs.com | Super Premium | 36 | $204.38 | $5.68 | Regular chats (high complexity) |
+| agentwebintegration@xcures.com | Super Premium | 70 | $156.07 | $2.23 | Scheduled + regular |
+| juan@usehaven.ai | Advanced | 8 | $92.72 | $11.59 | Complex regular sessions |
+| dyllan@rankai.ai | Super Premium | 54 | $57.15 | $1.06 | Regular chats |
+| harsha@agentweb.pro (internal) | Super Premium | 71 | $49.35 | $0.70 | Regular + scheduled + work plans |
+
+**Key observation:** The top 5 external users (all Super Premium / Advanced) account for $834.96 (59% of total cost). Since these tiers are not yet billed, this is pure cost with no revenue offset.
+
+### By Session Type
+
+| Type | Sessions | Cost | Avg/Session |
+|------|----------|------|------------|
+| Regular (live chat) | 752 | $948.06 | $1.26 |
+| Scheduled | 180 | $265.27 | $1.47 |
+| Predefined work plan | 49 | $188.31 | $3.84 |
+| Result endpoint | 1 | $11.95 | $11.95 |
+| Video/image gen | 5 | $0.56 | $0.11 |
+
+Predefined work plans cost ~3× more per session than regular chats — they involve multi-step workflows with many tool calls.
+
+### Daily Trend
+
+| Date | Sessions | Cost |
+|------|----------|------|
+| Mar 21 | 60 | $132.04 |
+| Mar 22 | 67 | $102.67 |
+| Mar 23 | 82 | $208.82 |
+| Mar 24 | 85 | $427.74 |
+| Mar 25 | 213 | $92.86 |
+| Mar 26 | 317 | $322.91 |
+| Mar 27 | 163 | $127.09 |
+
+Session volume is growing (~3× from Mar 21 to Mar 26). Mar 24 was the most expensive day ($427.74) despite having fewer sessions — likely driven by a few high-cost complex sessions. Mar 25 had the most sessions (213) but lowest cost ($92.86), likely due to prompt caching optimizations deployed that day.
+
+### Top 10 Most Expensive Individual Sessions
+
+| Cost | User | Type | Title |
+|------|------|------|-------|
+| $106.76 | renata@your360.ai | regular | Agent Mode Session |
+| $78.05 | xcures.com | scheduled | Weekly Competitor News Researcher |
+| $65.14 | renata@your360.ai | regular | Adding Videos to Landing Pages |
+| $56.25 | dyllan@rankai.ai | regular | SEO/GEO/AEO Competitor Ad Scraping |
+| $51.90 | amrutha@structuredlabs.com | regular | Waldium Hero Banner CSS Analysis |
+| $51.35 | juan@usehaven.ai | regular | Competitor Meta Ads Analysis |
+| $46.76 | renata@your360.ai | regular | Meta Campaign Overview |
+| $43.45 | amrutha@structuredlabs.com | regular | Landing Page Hero Banner Redesign |
+| $42.59 | amrutha@structuredlabs.com | regular | Waldium Hero Banner CSS Analysis |
+| $37.36 | ruiwangwarm@gmail.com | regular | Ella's Book Sale Poster |
+
+### Revised Token Limits (March 27, 2026)
+
+Based on the usage data above and discussion, the revised token limits are:
+
+| Tier | Current DB Value | Monthly Token Limit | Rationale |
+|------|-----------------|--------------------:|-----------|
+| **Free** | Free | **1M** | ~10–15 sessions. Enough to see value, caps within first week of active use |
+| **Basic** | Basic | **20M** | ~130–200 sessions. Basic users are not yet active so current data is limited; 20M provides comfortable headroom for light-to-moderate daily use |
+| **Pro** | Super Premium / Advanced | **100M** | ~650–1000 sessions. Covers most Pro users comfortably (avg Super Premium user projects to ~40-50M/month). Heavy users will approach the limit |
+| **Enterprise** | Enterprise (new) | **500M** | Soft cap to prevent abuse. Effectively unlimited for any realistic usage pattern |
+
+**Tier mapping (current DB `subscriptionType` → new tier names):**
+- `Free` → Free
+- `Basic` → Basic
+- `Super Premium` / `Advanced` → Pro
+- New: `Enterprise` (not yet in DB)
+
+**How the top users fit under these limits:**
+
+| Account | Current Tier | Monthly Cost (proj.) | Est. Monthly Tokens | Fits in? |
+|---------|-------------|---------------------:|--------------------:|----------|
+| renata@your360.ai | Super Premium → **Enterprise** | ~$1,396 | ~150–200M | Yes (Enterprise 500M) |
+| founders@agentweb.pro (internal) | Super Premium → **Enterprise** | ~$926 | ~100–130M | Yes (Enterprise 500M) |
+| amrutha@structuredlabs.com | Super Premium → Pro | ~$879 | ~100–120M | Tight — may hit 100M limit |
+| agentwebintegration@xcures.com | Super Premium → Pro | ~$671 | ~80–90M | Yes, with room |
+| juan@usehaven.ai | Advanced → Pro | ~$399 | ~50–60M | Yes |
+| dyllan@rankai.ai | Super Premium → Pro | ~$246 | ~30–40M | Yes, comfortable |
+| harsha@agentweb.pro (internal) | Super Premium → **Enterprise** | ~$49 | ~7M | Yes |
+
+**Key decisions:**
+- **renata@your360.ai** should be upgraded to Enterprise tier — her projected ~150–200M tokens/month exceeds the Pro 100M cap.
+- **Internal accounts** (founders@, harsha@, ruiw@) should be Enterprise tier to avoid hitting limits during testing/development.
+- **Basic users** are not currently active, so their usage data doesn't reflect real-world patterns. The 20M limit is set generously and can be adjusted once Basic users are onboarded and billing is active.
+- **Model cost multipliers** (Opus = 7x, see March 20 proposal) are still recommended to protect margins on the Pro tier. Without multipliers, a Pro user running all-Opus sessions could consume $700+ in cost against a ~$499 price point.
+
+**Margin analysis (post-caching, GPT-5 blended ~$2/1M effective):**
+
+| Tier | Price | Limit | Max Cost to Us | Min Gross Margin |
+|------|------:|------:|---------------:|-----------------:|
+| Free | $0 | 1M | ~$2 | -$2 (acquisition) |
+| Basic | $199 | 20M | ~$40 | ~$159 (80%) |
+| Pro | $499 | 100M | ~$200 | ~$299 (60%) |
+| Enterprise | Custom ($1K+) | 500M | ~$1,000 | Negotiated |
+
+Post-caching margins are healthy across all paid tiers. The risk is Opus-heavy Pro users (effective cost ~$14/1M with caching) — at 100M tokens that's $1,400, well above the $499 price. Model multipliers or tier-restricted model access would mitigate this.
+
+### Prompt Caching Impact (Mar 25 deployment)
+
+The prompt caching optimization was deployed on Mar 25. Comparing per-session costs:
+- Pre-caching (Mar 21–24, 294 sessions): $870.27 → $2.96/session avg
+- Post-caching (Mar 25–27, 693 sessions): $542.86 → $0.78/session avg
+
+**~74% reduction in avg cost per session.** Even accounting for session mix variation, caching is clearly delivering significant savings. The projected monthly cost of $6,081 already reflects the post-caching rates; without caching it would have been ~$16K+/month
