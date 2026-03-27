@@ -690,7 +690,7 @@ export default function AdminDashboard() {
   const [userSearchQuery, setUserSearchQuery] = useState("");
   const [userFilterStatus, setUserFilterStatus] = useState<"active" | "inactive" | "all">("active");
   const [userFilterTier, setUserFilterTier] = useState<string>("all");
-  const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid">("all");
+  const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
@@ -1432,8 +1432,9 @@ export default function AdminDashboard() {
         if (userFilterTier !== "none" && tier !== userFilterTier) return false;
       }
       // Paid filter
-      if (userFilterPaid === "paid" && !user.stripe_customer_id) return false;
-      if (userFilterPaid === "unpaid" && user.stripe_customer_id) return false;
+      if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
+      if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
+      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status)) return false;
       return true;
     });
     return filtered.sort((a, b) => {
@@ -3370,9 +3371,10 @@ export default function AdminDashboard() {
           <Box sx={{ display: "flex", gap: 2, mb: 3 }}>
             {[
               { label: "Total Users", value: contextUsers.length },
-              { label: "Paying", value: contextUsers.filter(u => u.subscription_status === "active" || u.stripe_customer_id).length },
+              { label: "Paying", value: contextUsers.filter(u => u.subscription_status === "active").length },
+              { label: "Trial", value: contextUsers.filter(u => u.subscription_status === "trialing").length },
+              { label: "Bounced", value: contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status).length },
               { label: "Past Due", value: contextUsers.filter(u => u.subscription_status === "past_due").length },
-              { label: "Canceled", value: contextUsers.filter(u => u.subscription_status === "canceled" || u.subscription_status === "canceling").length },
               { label: "Showing", value: sortedUsers.length },
             ].map((stat) => (
               <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100 }}>
@@ -3426,6 +3428,7 @@ export default function AdminDashboard() {
               <Select value={userFilterPaid} label="Payment" onChange={(e) => setUserFilterPaid(e.target.value as any)}>
                 <MenuItem value="all">All</MenuItem>
                 <MenuItem value="paid">Paying</MenuItem>
+                <MenuItem value="bounced">Bounced</MenuItem>
                 <MenuItem value="unpaid">Not Paying</MenuItem>
               </Select>
             </FormControl>
@@ -3480,7 +3483,8 @@ export default function AdminDashboard() {
                     const paymentStatus = user.subscription_status === "past_due" ? "past_due"
                       : user.subscription_status === "canceled" || user.subscription_status === "canceling" ? "canceled"
                       : user.subscription_status === "trialing" ? "trialing"
-                      : user.subscription_status === "active" || user.stripe_customer_id ? "paying"
+                      : user.subscription_status === "active" ? "paying"
+                      : user.stripe_customer_id && !user.subscription_status ? "bounced"
                       : "free";
                     const lastSeen = user.lastLoginTime ? (() => {
                       const d = new Date(user.lastLoginTime!);
@@ -3532,6 +3536,9 @@ export default function AdminDashboard() {
                           )}
                           {paymentStatus === "canceled" && (
                             <Chip icon={<CancelIcon />} label="Canceled" size="small" color="error" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "bounced" && (
+                            <Chip label="Bounced" size="small" color="warning" variant="outlined" sx={{ fontWeight: 500 }} />
                           )}
                           {paymentStatus === "free" && (
                             <Typography variant="caption" color="text.disabled">—</Typography>
