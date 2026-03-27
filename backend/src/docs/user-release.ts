@@ -14,6 +14,7 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Improvement: Coding Agent Reliability',
       '- Increased the coding agent iteration limit from 15 to 50, allowing it to complete larger editing tasks without running out of steps',
       '- Optimized the agent workflow to batch all code edits before checking deployment status, reducing wasted iterations',
+      '- Fixed preview URL generation: the system now auto-triggers a Vercel deployment when no preview build is found for a draft branch',
     ],
   },
   {
