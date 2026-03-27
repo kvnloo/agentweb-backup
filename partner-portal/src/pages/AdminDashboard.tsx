@@ -3367,6 +3367,65 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
+          {/* Attention needed — urgent users at the top */}
+          {(() => {
+            const now = new Date();
+            const pastDue = contextUsers.filter(u => u.subscription_status === "past_due" && u.isActive !== false);
+            const trialEnding = contextUsers.filter(u => {
+              if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
+              const daysLeft = Math.ceil((new Date(u.current_period_end).getTime() - now.getTime()) / 86400000);
+              return daysLeft <= 7 && daysLeft >= 0;
+            }).map(u => ({ ...u, _daysLeft: Math.ceil((new Date(u.current_period_end!).getTime() - now.getTime()) / 86400000) }));
+            const trialExpired = contextUsers.filter(u => {
+              if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
+              return new Date(u.current_period_end).getTime() < now.getTime();
+            });
+            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0;
+            if (!hasAttention) return null;
+            return (
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
+                <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
+                  ⚠️ Attention Needed
+                </Typography>
+                {pastDue.length > 0 && (
+                  <Box sx={{ mb: 1.5 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main" }}>PAYMENT FAILED</Typography>
+                    {pastDue.map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Past Due" size="small" color="error" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {trialExpired.length > 0 && (
+                  <Box sx={{ mb: 1.5 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main" }}>TRIAL EXPIRED — AWAITING PAYMENT</Typography>
+                    {trialExpired.map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Expired" size="small" color="error" variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">expired {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {trialEnding.length > 0 && (
+                  <Box>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "warning.main" }}>TRIAL ENDING SOON</Typography>
+                    {trialEnding.sort((a, b) => a._daysLeft - b._daysLeft).map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label={u._daysLeft === 0 ? "Today!" : `${u._daysLeft}d left`} size="small" color={u._daysLeft <= 2 ? "error" : "warning"} variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""} · ends {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+              </Paper>
+            );
+          })()}
           {/* Summary cards - Stripe-style muted design */}
           <Box sx={{ display: "flex", gap: 2, mb: 3 }}>
             {[
