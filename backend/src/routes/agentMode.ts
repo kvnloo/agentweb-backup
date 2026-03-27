@@ -120,6 +120,10 @@ router.post('/public/scheduled-chat-variables/:accessToken/upload', upload.singl
 
 // Conversable routes (protected by conversable token, not authentication)
 
+// POST /api/agent-mode/ishare/:shareId/email-report
+// Send report email to lead (public, validated by conversable token)
+router.post('/ishare/:shareId/email-report', asyncHandler(agentModeController.emailReportToLead));
+
 // All other routes require authentication
 router.use(authenticateToken);
 

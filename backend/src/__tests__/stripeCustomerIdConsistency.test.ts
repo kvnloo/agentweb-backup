@@ -49,49 +49,41 @@ describe('Stripe Customer ID Consistency - API Key Validation', () => {
     jest.clearAllMocks();
   });
 
-  // ─── FAIL cases ───────────────────────────────────────────────
-  describe('FAIL cases - should reject users without valid paid status', () => {
-    it('should return 403 when user has no stripe_customer_id and no customer role', async () => {
-      mockGetUserById.mockResolvedValue({
-        userId: 'test-user-id',
-        email: 'test@example.com',
-        roles: ['free'],
-        // no stripe_customer_id
-      });
+  // ─── All authenticated users can generate keys (subscription gate removed) ──
+  describe('should allow all authenticated users to generate API keys', () => {
+    const mockKeyResult = {
+      rawKey: 'aw_testapikey_free',
+      keyRecord: {
+        keyId: 'key-uuid-free',
+        maskedKey: 'aw_...free',
+        keyName: 'My Key',
+        scopes: ['tools:read', 'tools:execute'],
+        rateLimitPerMin: 60,
+        createdAt: '2025-01-01T00:00:00.000Z',
+        status: 'active',
+      },
+    };
+
+    it('should return 201 for user with no stripe_customer_id and no customer role', async () => {
+      mockGenerateKey.mockResolvedValue(mockKeyResult);
 
       const res = await request(app)
         .post('/api/v1/agent/api-keys')
         .send({ keyName: 'My Key' });
 
-      expect(res.status).toBe(403);
-      expect(res.body.error).toContain('subscription');
+      expect(res.status).toBe(201);
+      expect(res.body.rawKey).toBe('aw_testapikey_free');
     });
 
-    it('should return 403 when user is not found', async () => {
-      mockGetUserById.mockResolvedValue(undefined);
+    it('should return 201 for user with empty stripe_customer_id', async () => {
+      mockGenerateKey.mockResolvedValue(mockKeyResult);
 
       const res = await request(app)
         .post('/api/v1/agent/api-keys')
         .send({ keyName: 'My Key' });
 
-      expect(res.status).toBe(403);
-      expect(res.body.error).toContain('subscription');
-    });
-
-    it('should return 403 when stripe_customer_id is empty string and no customer role', async () => {
-      mockGetUserById.mockResolvedValue({
-        userId: 'test-user-id',
-        email: 'test@example.com',
-        stripe_customer_id: '',
-        roles: ['free'],
-      });
-
-      const res = await request(app)
-        .post('/api/v1/agent/api-keys')
-        .send({ keyName: 'My Key' });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error).toContain('subscription');
+      expect(res.status).toBe(201);
+      expect(res.body.rawKey).toBe('aw_testapikey_free');
     });
   });
 

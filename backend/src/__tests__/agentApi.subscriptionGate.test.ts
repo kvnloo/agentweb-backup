@@ -9,14 +9,6 @@ jest.mock('../middleware/auth', () => ({
   },
 }));
 
-// Mock userDb
-const mockGetUserById = jest.fn();
-jest.mock('../services/db', () => ({
-  userDb: {
-    getUserById: (...args: any[]) => mockGetUserById(...args),
-  },
-}));
-
 // Mock agentApiKeyService
 const mockGenerateKey = jest.fn();
 const mockGetKeysByUserId = jest.fn();
@@ -36,60 +28,13 @@ const app = express();
 app.use(express.json());
 app.use('/api/v1/agent', agentApiRoutes);
 
-describe('Agent API - Subscription Gate', () => {
+describe('Agent API - API Key Access (all authenticated users)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  describe('POST /api/v1/agent/api-keys - subscription check', () => {
-    it('should return 403 when user has no stripe_customer_id', async () => {
-      mockGetUserById.mockResolvedValue({
-        userId: 'test-user-id',
-        email: 'test@example.com',
-        // no stripe_customer_id
-      });
-
-      const res = await request(app)
-        .post('/api/v1/agent/api-keys')
-        .send({ keyName: 'My Key' });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error).toContain('subscription');
-    });
-
-    it('should return 403 when user is not found', async () => {
-      mockGetUserById.mockResolvedValue(undefined);
-
-      const res = await request(app)
-        .post('/api/v1/agent/api-keys')
-        .send({ keyName: 'My Key' });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error).toContain('subscription');
-    });
-
-    it('should return 403 when stripe_customer_id is empty string', async () => {
-      mockGetUserById.mockResolvedValue({
-        userId: 'test-user-id',
-        email: 'test@example.com',
-        stripe_customer_id: '',
-      });
-
-      const res = await request(app)
-        .post('/api/v1/agent/api-keys')
-        .send({ keyName: 'My Key' });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error).toContain('subscription');
-    });
-
-    it('should return 201 when user has valid stripe_customer_id', async () => {
-      mockGetUserById.mockResolvedValue({
-        userId: 'test-user-id',
-        email: 'test@example.com',
-        stripe_customer_id: 'cus_abc123',
-      });
-
+  describe('POST /api/v1/agent/api-keys', () => {
+    it('should return 201 for any authenticated user', async () => {
       mockGenerateKey.mockResolvedValue({
         rawKey: 'aw_testapikey123',
         keyRecord: {
@@ -118,31 +63,36 @@ describe('Agent API - Subscription Gate', () => {
         undefined
       );
     });
+
+    it('should return 400 when keyName is missing', async () => {
+      const res = await request(app)
+        .post('/api/v1/agent/api-keys')
+        .send({});
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('keyName');
+    });
   });
 
-  describe('GET /api/v1/agent/api-keys - no subscription check', () => {
-    it('should return 200 without subscription check', async () => {
+  describe('GET /api/v1/agent/api-keys', () => {
+    it('should return 200 for any authenticated user', async () => {
       mockGetKeysByUserId.mockResolvedValue([]);
 
       const res = await request(app).get('/api/v1/agent/api-keys');
 
       expect(res.status).toBe(200);
       expect(res.body.keys).toEqual([]);
-      // userDb.getUserById should NOT be called for GET
-      expect(mockGetUserById).not.toHaveBeenCalled();
     });
   });
 
-  describe('DELETE /api/v1/agent/api-keys/:keyId - no subscription check', () => {
-    it('should return 200 without subscription check', async () => {
+  describe('DELETE /api/v1/agent/api-keys/:keyId', () => {
+    it('should return 200 for any authenticated user', async () => {
       mockRevokeKey.mockResolvedValue(undefined);
 
       const res = await request(app).delete('/api/v1/agent/api-keys/key-123');
 
       expect(res.status).toBe(200);
       expect(res.body.message).toContain('revoked');
-      // userDb.getUserById should NOT be called for DELETE
-      expect(mockGetUserById).not.toHaveBeenCalled();
     });
   });
 });

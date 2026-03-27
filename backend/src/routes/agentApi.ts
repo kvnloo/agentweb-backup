@@ -1,7 +1,6 @@
 import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { agentApiKeyService } from "../services/agentApiKeyService";
-import { userDb } from "../services/db";
 
 const router = Router();
 
@@ -19,21 +18,9 @@ router.post(
         return res.status(400).json({ error: "keyName is required" });
       }
 
-      // Gate key creation behind active subscription
-      // A paid user is identified by having a stripe_customer_id OR a "customer" role.
-      // Both paths are valid because some users were upgraded from free→customer
-      // without their stripe_customer_id being copied from the waitlist.
-      const user = await userDb.getUserById(authReq.user.userId);
-      const hasStripeId = user?.stripe_customer_id;
-      const hasCustomerRole = user?.roles?.includes("customer");
-      if (!user || (!hasStripeId && !hasCustomerRole)) {
-        return res.status(403).json({
-          error: "Active subscription required to generate API keys",
-        });
-      }
-      if (hasCustomerRole && !hasStripeId) {
-        console.warn(`API key generation: user ${user.userId} has customer role but no stripe_customer_id — using role-based fallback`);
-      }
+      // API key access is available to all authenticated users.
+      // Usage is controlled via per-key rate limiting (rateLimitPerMin)
+      // and token usage tracking at the session level.
 
       const { rawKey, keyRecord } = await agentApiKeyService.generateKey(
         authReq.user.userId,

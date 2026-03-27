@@ -2960,6 +2960,83 @@ export const agentModeController = {
     }
   },
 
+  // Email report to lead (public with conversable token)
+  async emailReportToLead(req: Request, res: Response) {
+    try {
+      const { shareId } = req.params;
+      const { email, reportUrl, conversableToken } = req.body;
+
+      if (!email || typeof email !== 'string' || !email.trim()) {
+        return res.status(400).json({ error: 'email is required' });
+      }
+      if (!reportUrl || typeof reportUrl !== 'string') {
+        return res.status(400).json({ error: 'reportUrl is required' });
+      }
+      if (!conversableToken) {
+        return res.status(401).json({ error: 'conversableToken is required' });
+      }
+
+      const session = await chatbotDb.getChatSession(shareId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const interactiveShare = session.interactiveShareMetadata;
+      if (!interactiveShare?.isActive || interactiveShare.token !== conversableToken) {
+        return res.status(401).json({ error: 'Invalid or expired conversable token' });
+      }
+
+      if (interactiveShare?.isActive && new Date() > getInteractiveShareExpiresAt(interactiveShare)) {
+        return res.status(410).json({ error: 'Interactive share link has expired' });
+      }
+
+      // Build email HTML
+      const emailHtml = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #1B2549; margin: 0;">AgentWeb</h1>
+            <p style="color: #666; margin: 5px 0;">Your AI-Powered Report</p>
+          </div>
+
+          <div style="background: #f8f9fa; padding: 30px; border-radius: 8px; margin-bottom: 20px;">
+            <h2 style="color: #1B2549; margin-top: 0;">Your Report is Ready!</h2>
+            <p style="color: #333; line-height: 1.6;">
+              Your personalized AI analysis has been completed. Click below to view your full report.
+            </p>
+
+            <div style="text-align: center; margin: 20px 0;">
+              <a href="${reportUrl}"
+                 style="background: linear-gradient(90deg, #643B7E 0%, #6F3DFD 100%); color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: bold;">
+                View Your Report
+              </a>
+            </div>
+
+            <p style="color: #333; line-height: 1.6; margin-top: 20px;">
+              Want Emma to help you act on these insights?
+              <a href="https://app.agentweb.pro/register" style="color: #643B7E; text-decoration: none;">Create your free account</a>
+              and she'll walk you through fixing each issue step by step.
+            </p>
+          </div>
+
+          <div style="text-align: center; color: #666; font-size: 12px;">
+            <p>Powered by <a href="https://agentweb.pro" style="color: #643B7E; text-decoration: none;">AgentWeb</a></p>
+          </div>
+        </div>`;
+
+      await emailService.sendEmail(
+        email.trim(),
+        'Your AI Report is Ready — AgentWeb',
+        `Your report is ready! View it here: ${reportUrl}`,
+        emailHtml
+      );
+
+      res.json({ success: true, message: `Report sent to ${email.trim()}` });
+    } catch (error) {
+      console.error('AgentMode: Email report to lead error:', error);
+      res.status(500).json({ error: 'Failed to send report email' });
+    }
+  },
+
   // Upload file attachment for Agent Mode
   async uploadAttachment(req: Request, res: Response) {
     try {

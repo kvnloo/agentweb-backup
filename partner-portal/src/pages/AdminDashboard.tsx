@@ -40,6 +40,7 @@ import {
   Collapse,
   Popover,
   ButtonGroup,
+  InputAdornment,
 } from "@mui/material";
 import { format } from "date-fns";
 import axios from "axios";
@@ -82,6 +83,12 @@ import {
   ThumbDown as ThumbDownIcon,
   Sync as SyncIcon,
   Replay as ReplayIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
+  CreditCard as CreditCardIcon,
+  Warning as WarningIcon,
+  Cancel as CancelIcon,
+  Search as SearchIcon,
 } from "@mui/icons-material";
 
 interface TabPanelProps {
@@ -200,7 +207,11 @@ interface User {
   workflowCount?: number;
   chatSessionCount?: number;
   isOAuthUser?: boolean; // Ensured from API structure
-  stripe_customer_id?: string; // Added stripe_customer_id
+  stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  subscription_status?: string; // active, trialing, past_due, canceled, canceling
+  has_payment_method?: boolean;
+  current_period_end?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
@@ -675,6 +686,12 @@ export default function AdminDashboard() {
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [usersOrderBy, setUsersOrderBy] = useState<keyof User>("createdAt");
   const [usersOrder, setUsersOrder] = useState<"asc" | "desc">("desc");
+  // User filters
+  const [userSearchQuery, setUserSearchQuery] = useState("");
+  const [userFilterStatus, setUserFilterStatus] = useState<"active" | "inactive" | "all">("active");
+  const [userFilterTier, setUserFilterTier] = useState<string>("all");
+  const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid" | "bounced">("all");
+  const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
@@ -1404,13 +1421,40 @@ export default function AdminDashboard() {
         return user.isAdmin ? 1 : 0;
       case "isActive":
         return user.isActive === false ? 0 : 1;
+      case "tokenUsage":
+        return user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+          ? (user.tokenUsage?.totalTokens || 0) : 0;
       default:
         return (user as unknown as Record<string, unknown>)[property] ?? "";
     }
   };
 
   const sortedUsers = React.useMemo(() => {
-    return [...contextUsers].sort((a, b) => {
+    const filtered = contextUsers.filter((user) => {
+      // Search filter
+      if (userSearchQuery) {
+        const q = userSearchQuery.toLowerCase();
+        const matchEmail = user.email?.toLowerCase().includes(q);
+        const matchNote = user.supportNote?.toLowerCase().includes(q);
+        const matchId = user.userId?.toLowerCase().includes(q);
+        if (!matchEmail && !matchNote && !matchId) return false;
+      }
+      // Status filter
+      if (userFilterStatus === "active" && user.isActive === false) return false;
+      if (userFilterStatus === "inactive" && user.isActive !== false) return false;
+      // Tier filter
+      if (userFilterTier !== "all") {
+        const tier = user.subscriptionType || (user.roles?.includes("customer") ? "Basic" : "");
+        if (userFilterTier === "none" && tier) return false;
+        if (userFilterTier !== "none" && tier !== userFilterTier) return false;
+      }
+      // Paid filter
+      if (userFilterPaid === "paid" && user.subscription_status !== "active") return false;
+      if (userFilterPaid === "unpaid" && user.subscription_status === "active") return false;
+      if (userFilterPaid === "bounced" && !(user.stripe_customer_id && !user.subscription_status)) return false;
+      return true;
+    });
+    return filtered.sort((a, b) => {
       const aVal = getUserSortValue(a, usersOrderBy);
       const bVal = getUserSortValue(b, usersOrderBy);
 
@@ -1424,7 +1468,7 @@ export default function AdminDashboard() {
         ? aStr.localeCompare(bStr)
         : bStr.localeCompare(aStr);
     });
-  }, [contextUsers, usersOrder, usersOrderBy]);
+  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid]);
 
   const handleUserSort = (property: keyof User) => {
     const isAsc = usersOrderBy === property && usersOrder === "asc";
@@ -3363,12 +3407,159 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
-          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
-            <Button
-              variant="contained"
-              startIcon={<SyncIcon />}
-              onClick={() => handleOpenCrmSyncDialog("users")}
-            >
+          {/* Attention needed — urgent users at the top */}
+          {(() => {
+            const now = new Date();
+            const pastDue = contextUsers.filter(u => u.subscription_status === "past_due" && u.isActive !== false);
+            const trialEnding = contextUsers.filter(u => {
+              if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
+              const daysLeft = Math.ceil((new Date(u.current_period_end).getTime() - now.getTime()) / 86400000);
+              return daysLeft <= 7 && daysLeft >= 0;
+            }).map(u => ({ ...u, _daysLeft: Math.ceil((new Date(u.current_period_end!).getTime() - now.getTime()) / 86400000) }));
+            const trialExpired = contextUsers.filter(u => {
+              if (u.subscription_status !== "trialing" || !u.current_period_end) return false;
+              return new Date(u.current_period_end).getTime() < now.getTime();
+            });
+            const hasAttention = pastDue.length > 0 || trialEnding.length > 0 || trialExpired.length > 0;
+            if (!hasAttention) return null;
+            return (
+              <Paper variant="outlined" sx={{ mb: 3, p: 2, borderColor: "error.light", bgcolor: "error.50" }}>
+                <Typography variant="subtitle2" sx={{ fontWeight: 700, mb: 1.5, color: "error.main" }}>
+                  ⚠️ Attention Needed
+                </Typography>
+                {pastDue.length > 0 && (
+                  <Box sx={{ mb: 1.5 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main" }}>PAYMENT FAILED</Typography>
+                    {pastDue.map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Past Due" size="small" color="error" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {trialExpired.length > 0 && (
+                  <Box sx={{ mb: 1.5 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "error.main" }}>TRIAL EXPIRED — AWAITING PAYMENT</Typography>
+                    {trialExpired.map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label="Expired" size="small" color="error" variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">expired {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+                {trialEnding.length > 0 && (
+                  <Box>
+                    <Typography variant="caption" sx={{ fontWeight: 600, color: "warning.main" }}>TRIAL ENDING SOON</Typography>
+                    {trialEnding.sort((a, b) => a._daysLeft - b._daysLeft).map(u => (
+                      <Box key={u.userId} sx={{ display: "flex", alignItems: "center", gap: 1, py: 0.5 }}>
+                        <Chip label={u._daysLeft === 0 ? "Today!" : `${u._daysLeft}d left`} size="small" color={u._daysLeft <= 2 ? "error" : "warning"} variant="outlined" />
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>{u.email}</Typography>
+                        <Typography variant="caption" color="text.secondary">{u.supportNote || u.subscriptionType || ""} · ends {format(new Date(u.current_period_end!), "MMM d")}</Typography>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+              </Paper>
+            );
+          })()}
+          {/* Summary cards - Stripe-style muted design */}
+          <Box sx={{ display: "flex", gap: 2, mb: 3, flexWrap: "wrap" }}>
+            {(() => {
+              const active = contextUsers.filter(u => u.isActive !== false);
+              const paying = contextUsers.filter(u => u.subscription_status === "active");
+              const trialing = contextUsers.filter(u => u.subscription_status === "trialing");
+              const pastDue = contextUsers.filter(u => u.subscription_status === "past_due");
+              const canceled = contextUsers.filter(u => u.subscription_status === "canceled" || u.subscription_status === "canceling");
+              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status);
+              // Churn rate: canceled / (paying + canceled) — lifetime simple churn
+              const churnBase = paying.length + canceled.length;
+              const churnRate = churnBase > 0 ? ((canceled.length / churnBase) * 100).toFixed(0) : "0";
+              // Monthly churn: canceled in last 30 days
+              const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000);
+              const recentChurned = canceled.filter(u => u.current_period_end && new Date(u.current_period_end) > thirtyDaysAgo);
+              const monthlyChurnBase = paying.length + recentChurned.length;
+              const monthlyChurn = monthlyChurnBase > 0 ? ((recentChurned.length / monthlyChurnBase) * 100).toFixed(0) : "0";
+              return [
+                { label: "Active Users", value: active.length, sub: `${contextUsers.length} total` },
+                { label: "Paying", value: paying.length, sub: trialing.length > 0 ? `+${trialing.length} trial` : undefined },
+                { label: "Past Due", value: pastDue.length, sub: pastDue.length > 0 ? "⚠️ needs follow-up" : undefined, warn: pastDue.length > 0 },
+                { label: "Churned", value: canceled.length, sub: `${recentChurned.length} last 30d` },
+                { label: "Churn Rate", value: `${monthlyChurn}%`, sub: `${churnRate}% lifetime` },
+                { label: "Bounced", value: bounced.length, sub: "checkout abandoned" },
+                { label: "Showing", value: sortedUsers.length, sub: undefined },
+              ];
+            })().map((stat) => (
+              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100, borderColor: stat.warn ? "error.main" : undefined }}>
+                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2, color: stat.warn ? "error.main" : undefined }}>
+                  {stat.value}
+                </Typography>
+                <Typography variant="caption" color="text.secondary">
+                  {stat.label}
+                </Typography>
+                {stat.sub && (
+                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.65rem", mt: 0.25 }}>
+                    {stat.sub}
+                  </Typography>
+                )}
+              </Paper>
+            ))}
+          </Box>
+          {/* Filter bar */}
+          <Box sx={{ display: "flex", gap: 1.5, mb: 2, alignItems: "center" }}>
+            <TextField
+              size="small"
+              placeholder="Search users..."
+              value={userSearchQuery}
+              onChange={(e) => setUserSearchQuery(e.target.value)}
+              sx={{ minWidth: 240 }}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon fontSize="small" sx={{ color: "text.disabled" }} />
+                  </InputAdornment>
+                ),
+              }}
+            />
+            <FormControl size="small" sx={{ minWidth: 110 }}>
+              <InputLabel>Status</InputLabel>
+              <Select value={userFilterStatus} label="Status" onChange={(e) => setUserFilterStatus(e.target.value as any)}>
+                <MenuItem value="active">Active</MenuItem>
+                <MenuItem value="inactive">Inactive</MenuItem>
+                <MenuItem value="all">All</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 130 }}>
+              <InputLabel>Tier</InputLabel>
+              <Select value={userFilterTier} label="Tier" onChange={(e) => setUserFilterTier(e.target.value)}>
+                <MenuItem value="all">All Tiers</MenuItem>
+                <MenuItem value="Managed">Managed</MenuItem>
+                <MenuItem value="Super Premium">Super Premium</MenuItem>
+                <MenuItem value="Advanced">Advanced</MenuItem>
+                <MenuItem value="Basic">Basic</MenuItem>
+                <MenuItem value="Free">Free</MenuItem>
+                <MenuItem value="none">No Tier</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 120 }}>
+              <InputLabel>Payment</InputLabel>
+              <Select value={userFilterPaid} label="Payment" onChange={(e) => setUserFilterPaid(e.target.value as any)}>
+                <MenuItem value="all">All</MenuItem>
+                <MenuItem value="paid">Paying</MenuItem>
+                <MenuItem value="bounced">Bounced</MenuItem>
+                <MenuItem value="unpaid">Not Paying</MenuItem>
+              </Select>
+            </FormControl>
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all") && (
+              <Button size="small" onClick={() => { setUserSearchQuery(""); setUserFilterStatus("active"); setUserFilterTier("all"); setUserFilterPaid("all"); }}>
+                Clear
+              </Button>
+            )}
+            <Box sx={{ flexGrow: 1 }} />
+            <Button variant="contained" size="small" startIcon={<SyncIcon />} onClick={() => handleOpenCrmSyncDialog("users")}>
               Sync to CRM
             </Button>
           </Box>
@@ -3403,863 +3594,372 @@ export default function AdminDashboard() {
               <Typography variant="caption" color="success.main">Saved!</Typography>
             )}
           </Box>
-          <TableContainer component={Paper}>
-            <Table>
+          <TableContainer component={Paper} variant="outlined">
+            <Table size="small">
               <TableHead>
-                <TableRow>
+                <TableRow sx={{ "& th": { fontWeight: 600, fontSize: "0.75rem", color: "text.secondary", textTransform: "uppercase", letterSpacing: "0.05em", py: 1.5 } }}>
+                  <TableCell sx={{ width: 32, p: 0.5 }} />
                   <TableCell>
-                    <UserSortLabel property="email" label="Email" />
+                    <UserSortLabel property="email" label="User" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property="userId" label="User ID" />
+                    <UserSortLabel property="subscriptionType" label="Tier" />
+                  </TableCell>
+                  <TableCell>Payment</TableCell>
+                  <TableCell>
+                    <UserSortLabel property="chatSessionCount" label="Sessions" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel
-                      property="stripe_customer_id"
-                      label="Stripe Customer ID"
-                    />
+                    <UserSortLabel property="lastLoginTime" label="Last Active" />
                   </TableCell>
                   <TableCell>
-                    <UserSortLabel property="adAccount" label="Ad Account" />
+                    <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
                   </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="emailDomain"
-                      label="Email Sender"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="slackChannel"
-                      label="Slack Channel"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="secretNames" label="Secrets" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="seoDomains" label="SEO/AEO" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="googleDriveFolders" label="Shared Folders" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="cmsType" label="CMS Type" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="createdAt" label="Created" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="lastLoginTime"
-                      label="Last Login"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="supportNote"
-                      label="Support Note"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="roles" label="Roles" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="chatSessionCount"
-                      label="Chat Sessions"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="taskCount" label="Tasks" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="workflowCount" label="Workflows" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="isOAuthUser"
-                      label="OAuth User"
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="isAdmin" label="Admin" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel property="isActive" label="Status" />
-                  </TableCell>
-                  <TableCell>
-                    <UserSortLabel
-                      property="subscriptionType"
-                      label="Subscription Type"
-                    />
-                  </TableCell>
-                  <TableCell>Usage</TableCell>
-                  <TableCell>Replays</TableCell>
-                  <TableCell>Actions</TableCell>
+                  <TableCell sx={{ width: 100 }}>Actions</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
                 {adminLoading ? (
                   <TableRow>
-                    <TableCell colSpan={22} align="center">
+                    <TableCell colSpan={8} align="center">
                       <CircularProgress />
                     </TableCell>
                   </TableRow>
                 ) : (
                   sortedUsers.map((user) => {
-                    // Determine roles to display, SOLELY from roles array.
-                    let displayRoles: ("partner" | "customer" | "free")[] = [];
-                    if (user.roles && user.roles.length > 0) {
-                      displayRoles = user.roles; // Use the array if present and not empty
-                    }
-                    // If user.roles is empty or undefined, displayRoles remains [], meaning no roles will be shown.
+                    const isExpanded = expandedUserId === user.userId;
+                    const tier = user.subscriptionType || (user.roles?.includes("customer") ? "Basic" : "Free");
+                    const tierColor = tier === "Managed" ? "info" as const
+                      : tier === "Super Premium" ? "success" as const
+                      : tier === "Advanced" ? "warning" as const
+                      : "default" as const;
+                    const tierVariant = (tier === "Free" || tier === "Basic") ? "outlined" as const : "filled" as const;
+                    const paymentStatus = user.subscription_status === "past_due" ? "past_due"
+                      : user.subscription_status === "canceled" || user.subscription_status === "canceling" ? "canceled"
+                      : user.subscription_status === "trialing" ? "trialing"
+                      : user.subscription_status === "active" ? "paying"
+                      : user.stripe_customer_id && !user.subscription_status ? "bounced"
+                      : "free";
+                    const lastSeen = user.lastLoginTime ? (() => {
+                      const d = new Date(user.lastLoginTime!);
+                      const now = new Date();
+                      const diffH = Math.floor((now.getTime() - d.getTime()) / 3600000);
+                      if (diffH < 1) return "Just now";
+                      if (diffH < 24) return `${diffH}h ago`;
+                      const diffD = Math.floor(diffH / 24);
+                      if (diffD < 7) return `${diffD}d ago`;
+                      return format(d, "MMM d");
+                    })() : "Never";
+                    const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+                      ? (user.tokenUsage?.totalTokens || 0) : 0;
 
                     return (
-                      <TableRow key={user.userId}>
-                        <TableCell>{user.email}</TableCell>
-                        <TableCell>{user.userId}</TableCell>
-                        <TableCell>
-                          {editingStripeCustomerIdUserId === user.userId ? (
-                            <>
-                              <TextField
-                                size="small"
-                                value={currentStripeCustomerIdText}
-                                onChange={(e) => setCurrentStripeCustomerIdText(e.target.value)}
-                                placeholder="cus_..."
-                                sx={{ minWidth: 200 }}
-                                disabled={stripeCustomerIdEditLoading}
-                                helperText="Stripe Customer ID (starts with cus_)"
-                              />
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSaveStripeCustomerId(user.userId)}
-                                disabled={stripeCustomerIdEditLoading}
-                                color="primary"
-                              >
-                                <CheckIcon />
-                              </IconButton>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingStripeCustomerIdUserId(null);
-                                  setCurrentStripeCustomerIdText("");
-                                }}
-                                disabled={stripeCustomerIdEditLoading}
-                              >
-                                <CloseIcon />
-                              </IconButton>
-                            </>
-                          ) : (
-                            <>
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                {user.stripe_customer_id || "-"}
-                              </Typography>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingStripeCustomerIdUserId(user.userId);
-                                  setCurrentStripeCustomerIdText(user.stripe_customer_id || "");
-                                }}
-                                disabled={stripeCustomerIdEditLoading}
-                              >
-                                <EditIcon />
-                              </IconButton>
-                            </>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {editingAdAccountUserId === user.userId ? (
-                            <>
-                                                              <TextField
-                                  size="small"
-                                  value={currentAdAccountText}
-                                  onChange={(e) => setCurrentAdAccountText(e.target.value)}
-                                  placeholder="Enter Meta Ad Account ID (e.g., 123456789012345)..."
-                                  sx={{ minWidth: 250 }}
-                                  disabled={adAccountEditLoading}
-                                  helperText="Meta Ad Account ID from business.facebook.com"
-                                />
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSaveAdAccount(user.userId)}
-                                disabled={adAccountEditLoading}
-                                color="primary"
-                              >
-                                <CheckIcon />
-                              </IconButton>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingAdAccountUserId(null);
-                                  setCurrentAdAccountText("");
-                                }}
-                                disabled={adAccountEditLoading}
-                              >
-                                <CloseIcon />
-                              </IconButton>
-                            </>
-                          ) : (
-                            <>
-                              <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                {user.adAccount || "-"}
-                              </Typography>
-                              <IconButton
-                                size="small"
-                                onClick={() => {
-                                  setEditingAdAccountUserId(user.userId);
-                                  setCurrentAdAccountText(user.adAccount || "");
-                                }}
-                                disabled={adAccountEditLoading}
-                              >
-                                <EditIcon />
-                              </IconButton>
-                            </>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ flex: 1, minWidth: 100 }}>
-                            {user.emailDomain ? (
-                              <div>
-                                <div><strong>Domain:</strong> {user.emailDomain}</div>
-                                {user.defaultSenderUsername && (
-                                  <div><strong>Username:</strong> {user.defaultSenderUsername}</div>
-                                )}
-                                {user.fromName && (
-                                  <div><strong>From:</strong> {user.fromName}</div>
-                                )}
-                              </div>
-                            ) : "-"}
-                          </Box>
-                          <IconButton
-                            type="button"
-                            size="small"
-                            onClick={() => {
-                              setEditingEmailSenderUserId(user.userId);
-                              setEmailDomain(user.emailDomain || "");
-                              setDefaultSenderUsername(user.defaultSenderUsername || "");
-                              setFromName(user.fromName || "");
-                              setEmailSenderDialogOpen(true);
-                            }}
-                            disabled={emailSenderEditLoading}
-                          >
-                            <EditIcon />
+                      <React.Fragment key={user.userId}>
+                      <TableRow
+                        hover
+                        sx={{ cursor: "pointer", "& td": { py: 1.5, borderBottom: isExpanded ? "none" : undefined } }}
+                        onClick={() => setExpandedUserId(isExpanded ? null : user.userId)}
+                      >
+                        <TableCell sx={{ p: 0.5, width: 32 }}>
+                          <IconButton size="small" sx={{ p: 0.25 }}>
+                            {isExpanded ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
                           </IconButton>
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                              {user.slackChannel || "-"}
+                          <Box>
+                            <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                              {user.email}
                             </Typography>
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                setEditingSlackChannelUserId(user.userId);
-                                setCurrentSlackChannelText(user.slackChannel || "");
-                                setSlackChannelDialogOpen(true);
-                              }}
-                              disabled={slackChannelEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
+                            <Typography variant="caption" color="text.secondary">
+                              {user.supportNote || (user.roles?.includes("partner") ? "Partner" : "")}
+                            </Typography>
                           </Box>
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Box sx={{ flex: 1, minWidth: 120 }}>
-                              {user.secretNames && user.secretNames.length > 0 ? (
-                                <Box>
-                                  {user.secretNames.map((name: string, idx: number) => (
-                                    <Chip
-                                      key={idx}
-                                      label={name}
-                                      size="small"
-                                      sx={{ mr: 0.5, mb: 0.5 }}
-                                    />
-                                  ))}
-                                </Box>
-                              ) : (
-                                <Typography variant="body2">No secrets</Typography>
-                              )}
-                            </Box>
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                setEditingSecretsUserId(user.userId);
-                                // Pre-populate with existing secret names (values left empty = unchanged)
-                                const existing = user.secretNames || [];
-                                setSecretEntries(
-                                  existing.length > 0
-                                    ? existing.map((n: string) => ({ name: n, value: "" }))
-                                    : [{ name: "", value: "" }]
-                                );
-                                setSecretsDialogOpen(true);
-                              }}
-                              disabled={secretsEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Box>
+                          <Chip label={tier} size="small" color={tierColor} variant={tierVariant} sx={{ fontWeight: 500, minWidth: 60 }} />
                         </TableCell>
                         <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Box sx={{ flex: 1, minWidth: 200 }}>
-                              {user.seoDomains && user.seoDomains.length > 0 ? (
-                                <Box sx={{ mb: 1 }}>
-                                  {user.seoDomains.map((domain: string, idx: number) => (
-                                    <Chip
-                                      key={idx}
-                                      label={domain}
-                                      size="small"
-                                      sx={{ mr: 0.5, mb: 0.5 }}
-                                    />
-                                  ))}
-                                </Box>
-                              ) : (
-                                <Typography variant="body2" sx={{ mb: 1 }}>
-                                  No domains
-                                </Typography>
-                              )}
-                              {((user as any).googleAnalyticsProperties && (user as any).googleAnalyticsProperties.length > 0) ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  GA: {(user as any).googleAnalyticsProperties.map((p: any) => `${p.label} (${p.propertyId})`).join(', ')}
-                                </Typography>
-                              ) : user.googleAnalyticsPropertyId ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  GA: {user.googleAnalyticsPropertyId}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  No GA ID
-                                </Typography>
-                              )}
-                              {((user as any).clarityProjects && (user as any).clarityProjects.length > 0) ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  Clarity: {(user as any).clarityProjects.map((p: any) => `${p.label} (${p.projectId})`).join(', ')}
-                                </Typography>
-                              ) : user.clarityProjectId ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  Clarity: {user.clarityProjectId}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  No Clarity ID
-                                </Typography>
-                              )}
-                              {user.productDomain ? (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  Product: {user.productDomain}
-                                </Typography>
-                              ) : (
-                                <Typography variant="body2" sx={{ color: '#1e293b !important' }}>
-                                  No Product Domain
-                                </Typography>
-                              )}
-                            </Box>
-                            <IconButton
-                              size="small"
-                              onClick={() => {
-                                setEditingSeoDomainsUserId(user.userId);
-                                setSeoDomainsText(user.seoDomains?.join("\n") || "");
-                                setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || "");
-
-                                // Migrate from old single value to new array format if needed
-                                const gaProps = (user as any).googleAnalyticsProperties;
-                                if (gaProps && Array.isArray(gaProps) && gaProps.length > 0) {
-                                  setGoogleAnalyticsProperties(gaProps);
-                                } else if (user.googleAnalyticsPropertyId) {
-                                  setGoogleAnalyticsProperties([{ propertyId: user.googleAnalyticsPropertyId, label: "Main Property" }]);
-                                } else {
-                                  setGoogleAnalyticsProperties([]);
-                                }
-
-                                setGaFilteredDomainsText(user.gaFilteredDomains?.join("\n") || "");
-                                setClarityProjectId(user.clarityProjectId || "");
-
-                                // Migrate from old single value to new array format if needed
-                                const clarityProjs = (user as any).clarityProjects;
-                                if (clarityProjs && Array.isArray(clarityProjs) && clarityProjs.length > 0) {
-                                  setClarityProjects(clarityProjs);
-                                } else if (user.clarityProjectId) {
-                                  setClarityProjects([{ projectId: user.clarityProjectId, label: "Main Project" }]);
-                                } else {
-                                  setClarityProjects([]);
-                                }
-
-                                setProductDomain(user.productDomain || "");
-                                setSeoDomainsDialogOpen(true);
-                              }}
-                              disabled={seoDomainsEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Box>
+                          {paymentStatus === "paying" && (
+                            <Chip icon={<CreditCardIcon />} label="Paid" size="small" color="success" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "trialing" && (
+                            <Chip label="Trial" size="small" color="info" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "past_due" && (
+                            <Chip icon={<WarningIcon />} label="Past Due" size="small" color="error" sx={{ fontWeight: 600 }} />
+                          )}
+                          {paymentStatus === "canceled" && (
+                            <Chip icon={<CancelIcon />} label="Canceled" size="small" color="error" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "bounced" && (
+                            <Chip label="Bounced" size="small" color="warning" variant="outlined" sx={{ fontWeight: 500 }} />
+                          )}
+                          {paymentStatus === "free" && (
+                            <Typography variant="caption" color="text.disabled">—</Typography>
+                          )}
                         </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            <Box sx={{ flex: 1, minWidth: 150 }}>
-                              {user.googleDriveFolders && user.googleDriveFolders.length > 0 ? (
-                                <Box>
-                                  {user.googleDriveFolders.map((folder: { folderId: string; name: string }, idx: number) => (
-                                    <Chip
-                                      key={idx}
-                                      label={folder.name}
-                                      size="small"
-                                      sx={{ mr: 0.5, mb: 0.5 }}
-                                    />
-                                  ))}
-                                </Box>
-                              ) : (
-                                <Typography variant="body2">
-                                  No folders
-                                </Typography>
-                              )}
-                            </Box>
-                            <IconButton
-                              size="small"
-                              onClick={async () => {
-                                setEditingGoogleDriveFoldersUserId(user.userId);
-                                setGoogleDriveFolderEntries(
-                                  user.googleDriveFolders && user.googleDriveFolders.length > 0
-                                    ? user.googleDriveFolders.map((f: { folderId: string; name: string }) => ({ folderId: f.folderId, name: f.name }))
-                                    : []
-                                );
-                                setGoogleDriveFoldersDialogOpen(true);
-                                // Fetch available folders from Google Drive
-                                setGoogleDriveFoldersListLoading(true);
-                                try {
-                                  const response = await axios.get(
-                                    buildApiUrl("/api/admin/google-drive-folders"),
-                                    { headers: { Authorization: `Bearer ${token}` } }
-                                  );
-                                  setAvailableGoogleDriveFolders(response.data.folders || []);
-                                } catch (err) {
-                                  console.error("Error fetching Google Drive folders:", err);
-                                  setAvailableGoogleDriveFolders([]);
-                                } finally {
-                                  setGoogleDriveFoldersListLoading(false);
-                                }
-                              }}
-                              disabled={googleDriveFoldersEditLoading}
-                            >
-                              <EditIcon />
-                            </IconButton>
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            {editingCmsTypeUserId === user.userId ? (
-                              <>
-                                <FormControl size="small" sx={{ minWidth: 120 }}>
-                                  <Select
-                                    value={currentCmsType}
-                                    onChange={(e) => setCurrentCmsType(e.target.value as "Basehub" | "Webflow" | "")}
-                                    disabled={cmsTypeEditLoading}
-                                  >
-                                    <MenuItem value="">None</MenuItem>
-                                    <MenuItem value="Basehub">Basehub</MenuItem>
-                                    <MenuItem value="Webflow">Webflow</MenuItem>
-                                  </Select>
-                                </FormControl>
-                                <IconButton
-                                  size="small"
-                                  onClick={handleSaveCmsType}
-                                  disabled={cmsTypeEditLoading}
-                                  color="primary"
-                                >
-                                  <CheckIcon />
-                                </IconButton>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingCmsTypeUserId(null);
-                                    setCurrentCmsType("");
-                                  }}
-                                  disabled={cmsTypeEditLoading}
-                                >
-                                  <CloseIcon />
-                                </IconButton>
-                              </>
-                            ) : (
-                              <>
-                                <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                  {user.cmsType || "-"}
-                                </Typography>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingCmsTypeUserId(user.userId);
-                                    setCurrentCmsType(user.cmsType || "");
-                                  }}
-                                  disabled={cmsTypeEditLoading}
-                                >
-                                  <EditIcon />
-                                </IconButton>
-                              </>
-                            )}
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          {new Date(user.createdAt).toLocaleDateString()}
-                        </TableCell>
-                        <TableCell>
-                          {user.lastLoginTime 
-                            ? new Date(user.lastLoginTime).toLocaleDateString() + ' ' + 
-                              new Date(user.lastLoginTime).toLocaleTimeString()
-                            : "Never"
-                          }
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                            {editingSupportNoteUserId === user.userId ? (
-                              <>
-                                <TextField
-                                  size="small"
-                                  value={currentSupportNoteText}
-                                  onChange={(e) => setCurrentSupportNoteText(e.target.value)}
-                                  placeholder="Add support note..."
-                                  sx={{ minWidth: 200 }}
-                                  disabled={supportNoteEditLoading}
-                                />
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleSaveSupportNote(user.userId)}
-                                  disabled={supportNoteEditLoading}
-                                  color="primary"
-                                >
-                                  <CheckIcon />
-                                </IconButton>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingSupportNoteUserId(null);
-                                    setCurrentSupportNoteText("");
-                                  }}
-                                  disabled={supportNoteEditLoading}
-                                >
-                                  <CloseIcon />
-                                </IconButton>
-                              </>
-                            ) : (
-                              <>
-                                <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                  {user.supportNote || "-"}
-                                </Typography>
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setEditingSupportNoteUserId(user.userId);
-                                    setCurrentSupportNoteText(user.supportNote || "");
-                                  }}
-                                  disabled={supportNoteEditLoading}
-                                >
-                                  <EditIcon />
-                                </IconButton>
-                              </>
-                            )}
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <Box
-                            sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}
-                          >
-                            {displayRoles.map(
-                              (role) => (
-                                <Chip
-                                  key={role}
-                                  label={
-                                    role.charAt(0).toUpperCase() + role.slice(1)
-                                  }
-                                  size="small"
-                                  color={
-                                    role === "partner" ? "primary" : "secondary"
-                                  }
-                                  icon={
-                                    role === "partner" ? (
-                                      <HandshakeIcon fontSize="small" />
-                                    ) : (
-                                      <PersonIcon fontSize="small" />
-                                    )
-                                  }
-                                  sx={{
-                                    height: "auto", // Ensure icon doesn't overly stretch chip
-                                    "& .MuiChip-label": { py: "1px" }, // Adjust padding if needed
-                                  }}
-                                />
-                              )
-                            )}
-                          </Box>
-                        </TableCell>
-                        <TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
                           <Chip
                             label={user.chatSessionCount || 0}
                             size="small"
-                            color={
-                              (user.chatSessionCount ?? 0) > 0
-                                ? "primary"
-                                : "default"
-                            }
+                            color={(user.chatSessionCount ?? 0) > 0 ? "primary" : "default"}
+                            variant="outlined"
+                            sx={{ cursor: (user.chatSessionCount ?? 0) > 0 ? "pointer" : undefined }}
+                            onClick={() => {}}
                           />
                         </TableCell>
                         <TableCell>
-                          <Chip
-                            label={user.taskCount || 0}
-                            size="small"
-                            color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
-                            style={{ cursor: (user.taskCount ?? 0) > 0 ? "pointer" : undefined }}
-                            onClick={() => {
-                              if ((user.taskCount ?? 0) > 0) {
-                                setUserTasksDialogUserId(user.userId);
-                                setUserTasksDialogUserEmail(user.email);
-                                setUserTasksDialogOpen(true);
-                              }
-                            }}
-                          />
+                          <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
                         </TableCell>
                         <TableCell>
-                          <Chip
-                            label={user.workflowCount || 0}
-                            size="small"
-                            color={
-                              (user.workflowCount ?? 0) > 0
-                                ? "primary"
-                                : "default"
-                            }
-                          />
+                          <Typography variant="body2" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                            {used > 0 ? used.toLocaleString() : "—"}
+                          </Typography>
                         </TableCell>
-                        <TableCell>{user.isOAuthUser ? "Yes" : "No"}</TableCell>
-                        <TableCell>{user.isAdmin ? "Yes" : "No"}</TableCell>
-                        <TableCell>
-                          <Chip
-                            label={
-                              user.isActive === false ? "Inactive" : "Active"
-                            }
-                            color={
-                              user.isActive === false ? "error" : "success"
-                            }
-                            size="small"
-                          />
-                        </TableCell>
-                        <TableCell>
-                          {user.roles && user.roles.includes("customer") ? (
-                            <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                              {editingSubscriptionTypeUserId === user.userId ? (
-                                <>
-                                  <FormControl size="small" sx={{ minWidth: 120 }}>
-                                    <Select
-                                      value={currentSubscriptionType}
-                                      onChange={(e) => setCurrentSubscriptionType(e.target.value)}
-                                      disabled={subscriptionTypeEditLoading}
-                                    >
-                                      {availableSubscriptionTypes.map((type) => (
-                                        <MenuItem key={type} value={type}>
-                                          {type}
-                                        </MenuItem>
-                                      ))}
-                                    </Select>
-                                  </FormControl>
-                                  <IconButton
-                                    size="small"
-                                    onClick={handleSaveSubscriptionType}
-                                    disabled={subscriptionTypeEditLoading}
-                                    color="primary"
-                                  >
-                                    <CheckIcon />
-                                  </IconButton>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => {
-                                      setEditingSubscriptionTypeUserId(null);
-                                      setCurrentSubscriptionType("");
-                                    }}
-                                    disabled={subscriptionTypeEditLoading}
-                                  >
-                                    <CloseIcon />
-                                  </IconButton>
-                                </>
-                              ) : (
-                                <>
-                                  <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                    {user.subscriptionType || "Basic"}
-                                  </Typography>
-                                  <IconButton
-                                    size="small"
-                                    onClick={() => {
-                                      setEditingSubscriptionTypeUserId(user.userId);
-                                      setCurrentSubscriptionType(user.subscriptionType || "Basic");
-                                    }}
-                                    disabled={subscriptionTypeEditLoading}
-                                  >
-                                    <EditIcon />
-                                  </IconButton>
-                                </>
-                              )}
-                            </Box>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              -
-                            </Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {user.roles && user.roles.includes("customer") ? (
-                            <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
-                              {(() => {
-                                const used = user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
-                                  ? (user.tokenUsage?.totalTokens || 0) : 0;
-                                const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
-                                const bonus = user.tokenAllowanceBonus || 0;
-                                const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
-                                const pct = effectiveAllowance != null ? (used / effectiveAllowance) * 100 : 0;
-                                const color = effectiveAllowance == null ? "text.primary"
-                                  : pct >= 100 ? "error.main"
-                                  : pct >= 80 ? "warning.main"
-                                  : "success.main";
-                                return (
-                                  <Typography variant="body2" sx={{ color }}>
-                                    {used.toLocaleString()}
-                                    {" / "}
-                                    {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
-                                    {bonus > 0 && (
-                                      <Typography component="span" variant="caption" color="text.secondary">
-                                        {" "}(+{bonus.toLocaleString()} bonus)
-                                      </Typography>
-                                    )}
-                                  </Typography>
-                                );
-                              })()}
-                              <Tooltip title="Grant Bonus Tokens">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setGrantBonusUserId(user.userId);
-                                    setGrantBonusEmail(user.email);
-                                    setGrantBonusAmount("");
-                                    setGrantBonusDialogOpen(true);
-                                  }}
-                                  color="primary"
-                                >
-                                  <AddIcon fontSize="small" />
-                                </IconButton>
-                              </Tooltip>
-                            </Box>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">-</Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {user.replayUrl ? (
-                            <Tooltip title="View Clarity Replays">
-                              <IconButton
-                                size="small"
-                                component="a"
-                                href={user.replayUrl}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                color="primary"
-                              >
-                                <PlayCircleOutlineIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                          ) : (
-                            <Typography variant="body2" color="text.secondary">
-                              -
-                            </Typography>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display: "flex", gap: 0.5, alignItems: "center", flexWrap: "nowrap" }}>
-                            {user.roles && user.roles.includes("customer") && (
-                              <Tooltip title="Access Customer Portal">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleAccessCustomerPortal(user.userId)}
-                                  disabled={delegateAccessLoading === user.userId}
-                                  color="primary"
-                                  sx={{
-                                    border: '1px solid',
-                                    borderColor: 'primary.main',
-                                    '&:hover': { bgcolor: 'primary.50' }
-                                  }}
-                                >
-                                  {delegateAccessLoading === user.userId ? (
-                                    <CircularProgress size={16} />
-                                  ) : (
-                                    <OpenInNewIcon fontSize="small" />
-                                  )}
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <Box sx={{ display: "flex", gap: 0.5 }}>
+                            {user.roles?.includes("customer") && (
+                              <Tooltip title="Access Portal">
+                                <IconButton size="small" onClick={() => handleAccessCustomerPortal(user.userId)} disabled={delegateAccessLoading === user.userId} color="primary">
+                                  {delegateAccessLoading === user.userId ? <CircularProgress size={14} /> : <OpenInNewIcon fontSize="small" />}
                                 </IconButton>
                               </Tooltip>
                             )}
-
                             <Tooltip title="Manage Roles">
-                              <IconButton
-                                size="small"
-                                onClick={() => handleRoleDialogOpen(user)}
-                                color="primary"
-                                sx={{ 
-                                  border: '1px solid',
-                                  borderColor: 'primary.main',
-                                  '&:hover': { bgcolor: 'primary.50' }
-                                }}
-                              >
-                                <EditIcon fontSize="small" />
-                              </IconButton>
+                              <IconButton size="small" onClick={() => handleRoleDialogOpen(user)}><EditIcon fontSize="small" /></IconButton>
                             </Tooltip>
-                            
-                            {!user.isAdmin && user.isActive !== false && (
-                              <Tooltip title="Deactivate User">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => {
-                                    setSelectedUser(user);
-                                    setDeactivateDialogOpen(true);
-                                  }}
-                                  color="warning"
-                                  sx={{ 
-                                    border: '1px solid',
-                                    borderColor: 'warning.main',
-                                    '&:hover': { bgcolor: 'warning.50' }
-                                  }}
-                                >
-                                  <PersonOffIcon fontSize="small" />
-                                </IconButton>
-                              </Tooltip>
-                            )}
-                            
-                            <Tooltip title="Set Password">
-                              <IconButton
-                                size="small"
-                                onClick={() => handleSetPassword(user.userId, user.email)}
-                                color="secondary"
-                                sx={{ 
-                                  border: '1px solid',
-                                  borderColor: 'secondary.main',
-                                  '&:hover': { bgcolor: 'secondary.50' }
-                                }}
-                              >
-                                <LockIcon fontSize="small" />
-                              </IconButton>
-                            </Tooltip>
-                            
-                            {!user.isAdmin && (
-                              <Tooltip title="Delete User">
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleOpenUserDeleteConfirm(user.userId)}
-                                  color="error"
-                                  sx={{ 
-                                    border: '1px solid',
-                                    borderColor: 'error.main',
-                                    '&:hover': { bgcolor: 'error.50' }
-                                  }}
-                                >
-                                  <DeleteIcon fontSize="small" />
-                                </IconButton>
-                              </Tooltip>
-                            )}
                           </Box>
                         </TableCell>
                       </TableRow>
+                      {/* Expandable detail row */}
+                      <TableRow>
+                        <TableCell colSpan={8} sx={{ py: 0, borderBottom: isExpanded ? undefined : "none" }}>
+                          <Collapse in={isExpanded} timeout="auto" unmountOnExit>
+                            <Box sx={{ py: 2, px: 1 }}>
+                              <Grid container spacing={2}>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">User ID</Typography>
+                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem", wordBreak: "break-all" }}>{user.userId}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Stripe ID</Typography>
+                                  <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Created</Typography>
+                                  <Typography variant="body2">{user.createdAt ? format(new Date(user.createdAt), "MMM d, yyyy") : "—"}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Status</Typography>
+                                  <Box><Chip label={user.isActive === false ? "Inactive" : "Active"} color={user.isActive === false ? "error" : "success"} size="small" /></Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Roles</Typography>
+                                  <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mt: 0.5 }}>
+                                    {(user.roles || []).map(r => <Chip key={r} label={r} size="small" variant="outlined" />)}
+                                    {(!user.roles || user.roles.length === 0) && <Typography variant="body2" color="text.disabled">—</Typography>}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Tasks / Workflows</Typography>
+                                  <Box sx={{ display: "flex", gap: 1, mt: 0.5 }}>
+                                    <Chip
+                                      label={`${user.taskCount || 0} tasks`}
+                                      size="small"
+                                      color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
+                                      variant="outlined"
+                                      sx={{ cursor: (user.taskCount ?? 0) > 0 ? "pointer" : undefined }}
+                                      onClick={() => { if ((user.taskCount ?? 0) > 0) { setUserTasksDialogUserId(user.userId); setUserTasksDialogUserEmail(user.email); setUserTasksDialogOpen(true); } }}
+                                    />
+                                    <Chip label={`${user.workflowCount || 0} workflows`} size="small" color={(user.workflowCount ?? 0) > 0 ? "primary" : "default"} variant="outlined" />
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">OAuth / Admin</Typography>
+                                  <Typography variant="body2">{user.isOAuthUser ? "OAuth" : "Email"} / {user.isAdmin ? "Admin" : "No"}</Typography>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Subscription</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (
+                                      editingSubscriptionTypeUserId === user.userId ? (
+                                        <Box sx={{ display: "flex", gap: 0.5 }}>
+                                          <FormControl size="small" sx={{ minWidth: 100 }}>
+                                            <Select value={currentSubscriptionType} onChange={(e) => setCurrentSubscriptionType(e.target.value)} disabled={subscriptionTypeEditLoading}>
+                                              {availableSubscriptionTypes.map(t => <MenuItem key={t} value={t}>{t}</MenuItem>)}
+                                            </Select>
+                                          </FormControl>
+                                          <IconButton size="small" onClick={handleSaveSubscriptionType} disabled={subscriptionTypeEditLoading} color="primary"><CheckIcon /></IconButton>
+                                          <IconButton size="small" onClick={() => { setEditingSubscriptionTypeUserId(null); setCurrentSubscriptionType(""); }}><CloseIcon /></IconButton>
+                                        </Box>
+                                      ) : (
+                                        <>
+                                          <Chip label={tier} size="small" color={tierColor} variant={tierVariant} />
+                                          <IconButton size="small" onClick={() => { setEditingSubscriptionTypeUserId(user.userId); setCurrentSubscriptionType(user.subscriptionType || "Basic"); }}><EditIcon fontSize="small" /></IconButton>
+                                        </>
+                                      )
+                                    ) : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                  </Box>
+                                </Grid>
+                                {/* Config details — all with inline edit */}
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Stripe Customer ID</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingStripeCustomerIdUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentStripeCustomerIdText} onChange={(e) => setCurrentStripeCustomerIdText(e.target.value)} placeholder="cus_..." sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveStripeCustomerId(user.userId)} disabled={stripeCustomerIdEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingStripeCustomerIdUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingStripeCustomerIdUserId(user.userId); setCurrentStripeCustomerIdText(user.stripe_customer_id || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Ad Account</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingAdAccountUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentAdAccountText} onChange={(e) => setCurrentAdAccountText(e.target.value)} sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveAdAccount(user.userId)} disabled={adAccountEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingAdAccountUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.adAccount || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingAdAccountUserId(user.userId); setCurrentAdAccountText(user.adAccount || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Email Sender</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.emailDomain ? `${user.defaultSenderUsername || "noreply"}@${user.emailDomain}` : "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingEmailSenderUserId(user.userId); setEmailDomain(user.emailDomain || ""); setDefaultSenderUsername(user.defaultSenderUsername || ""); setFromName(user.fromName || ""); setEmailSenderDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Slack Channel</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.slackChannel || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSlackChannelUserId(user.userId); setCurrentSlackChannelText(user.slackChannel || ""); setSlackChannelDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Secrets</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.secretNames?.join(", ") || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSecretsUserId(user.userId); setSecretEntries((user.secretNames || []).map(n => ({ name: n, value: "" }))); setSecretsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">CMS Type</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingCmsTypeUserId === user.userId ? (
+                                      <>
+                                        <FormControl size="small" sx={{ minWidth: 100 }}>
+                                          <Select value={currentCmsType} onChange={(e) => setCurrentCmsType(e.target.value as any)}>
+                                            <MenuItem value="">None</MenuItem>
+                                            <MenuItem value="Basehub">Basehub</MenuItem>
+                                            <MenuItem value="Webflow">Webflow</MenuItem>
+                                          </Select>
+                                        </FormControl>
+                                        <IconButton size="small" onClick={() => handleSaveCmsType()} disabled={cmsTypeEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingCmsTypeUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.cmsType || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingCmsTypeUserId(user.userId); setCurrentCmsType(user.cmsType || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Shared Folders</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.googleDriveFolders?.map(f => f.name).join(", ") || "—"}</Typography>
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">Support Note</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingSupportNoteUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentSupportNoteText} onChange={(e) => setCurrentSupportNoteText(e.target.value)} sx={{ flex: 1 }} multiline maxRows={3} />
+                                        <IconButton size="small" onClick={() => handleSaveSupportNote(user.userId)} disabled={supportNoteEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingSupportNoteUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.supportNote || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingSupportNoteUserId(user.userId); setCurrentSupportNoteText(user.supportNote || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                {/* Usage + actions row */}
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">Token Usage</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") ? (() => {
+                                      const baseAllowance = subscriptionTypeAllowanceMap[user.subscriptionType || "Basic"] ?? null;
+                                      const bonus = user.tokenAllowanceBonus || 0;
+                                      const effectiveAllowance = baseAllowance != null ? baseAllowance + bonus : null;
+                                      return (
+                                        <Typography variant="body2">
+                                          {used.toLocaleString()} / {effectiveAllowance != null ? effectiveAllowance.toLocaleString() : "∞"}
+                                          {bonus > 0 && <Typography component="span" variant="caption" color="text.secondary"> (+{bonus.toLocaleString()} bonus)</Typography>}
+                                        </Typography>
+                                      );
+                                    })() : <Typography variant="body2" color="text.disabled">—</Typography>}
+                                    {user.roles?.includes("customer") && (
+                                      <Tooltip title="Grant Bonus Tokens">
+                                        <IconButton size="small" onClick={() => { setGrantBonusUserId(user.userId); setGrantBonusEmail(user.email); setGrantBonusAmount(""); setGrantBonusDialogOpen(true); }} color="primary"><AddIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    )}
+                                  </Box>
+                                </Grid>
+                                <Grid item xs={6}>
+                                  <Typography variant="caption" color="text.secondary">Actions</Typography>
+                                  <Box sx={{ display: "flex", gap: 0.5, mt: 0.5 }}>
+                                    {user.roles?.includes("customer") && (
+                                      <Button size="small" variant="outlined" startIcon={<OpenInNewIcon />} onClick={() => handleAccessCustomerPortal(user.userId)} disabled={delegateAccessLoading === user.userId}>
+                                        Portal
+                                      </Button>
+                                    )}
+                                    {user.replayUrl && (
+                                      <Button size="small" variant="outlined" startIcon={<PlayCircleOutlineIcon />} component="a" href={user.replayUrl} target="_blank" rel="noopener noreferrer">
+                                        Replays
+                                      </Button>
+                                    )}
+                                    <Button size="small" variant="outlined" startIcon={<LockIcon />} onClick={() => handleSetPassword(user.userId, user.email)}>Password</Button>
+                                    {!user.isAdmin && user.isActive !== false && (
+                                      <Button size="small" variant="outlined" color="warning" startIcon={<PersonOffIcon />} onClick={() => { setSelectedUser(user); setDeactivateDialogOpen(true); }}>Deactivate</Button>
+                                    )}
+                                    {!user.isAdmin && (
+                                      <Button size="small" variant="outlined" color="error" startIcon={<DeleteIcon />} onClick={() => handleOpenUserDeleteConfirm(user.userId)}>Delete</Button>
+                                    )}
+                                  </Box>
+                                </Grid>
+                              </Grid>
+                            </Box>
+                          </Collapse>
+                        </TableCell>
+                      </TableRow>
+                      </React.Fragment>
                     );
                   })
                 )}
@@ -4267,7 +3967,6 @@ export default function AdminDashboard() {
             </Table>
           </TableContainer>
         </TabPanel>
-
         <TabPanel value={tabValue} index={3}>
           {error && (
             <Alert severity="error" sx={{ mb: 2 }}>
