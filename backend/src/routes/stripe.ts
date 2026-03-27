@@ -399,16 +399,25 @@ router.post(
         await userDb.updateUser(userId, { stripe_customer_id: customerId });
       }
 
-      const session = await stripe.checkout.sessions.create({
+      // Check if user has already used a trial — don't offer trial again
+      const hasUsedTrial = !!(user as any)?.has_used_trial;
+
+      const sessionParams: any = {
         ui_mode: "embedded",
         customer: customerId,
         line_items: [{ price: priceId, quantity: 1 }],
         mode: "subscription",
-        subscription_data: {
-          trial_period_days: 14,
-        },
         return_url: `${CUSTOMER_FRONTEND_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-      });
+      };
+
+      // Only offer trial if user hasn't used one before
+      if (!hasUsedTrial) {
+        sessionParams.subscription_data = {
+          trial_period_days: 14,
+        };
+      }
+
+      const session = await stripe.checkout.sessions.create(sessionParams);
 
       res.json({ clientSecret: session.client_secret });
     } catch (error: any) {
@@ -430,6 +439,120 @@ router.get("/config", (_req: Request, res: Response) => {
   }
   res.json({ publishableKey });
 });
+
+/**
+ * @route POST /api/stripe/upgrade
+ * @desc Upgrade an existing subscription to a different plan (proration handled by Stripe)
+ * @access Private (requires authentication)
+ */
+router.post(
+  "/upgrade",
+  authenticateToken,
+  async (req: Request, res: Response) => {
+    if (!stripe) {
+      return res
+        .status(500)
+        .json({ error: "Stripe integration is not configured correctly." });
+    }
+
+    const authenticatedReq = req as AuthenticatedRequest;
+    const userId = authenticatedReq.user?.userId;
+    const userEmail = authenticatedReq.user?.email;
+
+    if (!userId || !userEmail) {
+      return res.status(401).json({ error: "User not authenticated." });
+    }
+
+    const { plan, newPriceId } = req.body;
+
+    // Resolve price ID from plan name or use direct newPriceId
+    const planPriceMap: Record<string, string> = {
+      starter: process.env.STRIPE_STARTER_PRICE_ID || "",
+      complete: process.env.STRIPE_COMPLETE_PRICE_ID || "",
+      pro: process.env.STRIPE_COMPLETE_PRICE_ID || "",
+    };
+
+    const resolvedPriceId = newPriceId || (plan ? planPriceMap[plan.toLowerCase()] : null);
+    if (!resolvedPriceId) {
+      return res.status(400).json({ error: "A valid plan or newPriceId is required." });
+    }
+
+    try {
+      const user = await userDb.getUserById(userId);
+      if (!user || !user.stripe_customer_id) {
+        return res.status(400).json({
+          error: "No Stripe customer found. Please subscribe first.",
+        });
+      }
+
+      // Import stripeService to use the new methods
+      const { stripeService } = await import("../services/stripeService");
+
+      // Find the active subscription
+      const currentSub = await stripeService.findActiveSubscription(user.stripe_customer_id);
+      if (!currentSub) {
+        return res.status(404).json({
+          error: "No active subscription found. Please subscribe first.",
+        });
+      }
+
+      // Check if user is already on this price
+      const currentPriceId = currentSub.items.data[0]?.price?.id;
+      if (currentPriceId === resolvedPriceId) {
+        return res.status(400).json({
+          error: "You are already on this plan.",
+        });
+      }
+
+      // Perform the upgrade via Stripe's subscription update API
+      const updated = await stripeService.upgradeSubscription(currentSub.id, resolvedPriceId);
+
+      // Derive the new subscription type from the price
+      const { deriveSubscriptionTypeFromPriceId } = await import("../services/stripeService");
+      const newTierName = deriveSubscriptionTypeFromPriceId(resolvedPriceId);
+
+      // Update user record with new subscription details
+      const { getTierConfig } = await import("../services/subscriptionService");
+      const tierConfig = newTierName ? await getTierConfig(newTierName) : null;
+
+      const updateData: Record<string, any> = {
+        stripe_subscription_id: updated.id,
+        subscription_status: updated.status,
+      };
+
+      if (newTierName) {
+        updateData.subscriptionType = newTierName;
+      }
+      if (tierConfig) {
+        updateData.allowedPages = tierConfig.allowedPages;
+        updateData.allowedSkills = tierConfig.allowedSkills;
+      }
+
+      const periodEnd = (updated as any).current_period_end;
+      if (periodEnd) {
+        updateData.current_period_end = new Date(
+          typeof periodEnd === 'number' ? periodEnd * 1000 : periodEnd
+        ).toISOString();
+      }
+
+      await userDb.updateUser(userId, updateData);
+
+      console.log(
+        `[STRIPE UPGRADE] User ${userId} upgraded to ${newTierName || 'unknown tier'} (price=${resolvedPriceId})`
+      );
+
+      res.json({
+        message: "Subscription upgraded successfully.",
+        subscriptionType: newTierName,
+        subscription_status: updated.status,
+        current_period_end: updateData.current_period_end,
+      });
+    } catch (error: any) {
+      console.error("Error upgrading subscription:", error.message);
+      res.status(500).json({ error: "Failed to upgrade subscription." });
+    }
+  }
+);
 
 /**
  * @route POST /api/stripe/create-customer-portal-session
