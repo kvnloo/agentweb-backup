@@ -65,6 +65,7 @@ jest.mock("../services/v0Service", () => ({
   buildBrandEnrichedPrompt: jest.fn(),
   getDeploymentStatus: jest.fn(),
   getPreviewDeploymentUrl: (...args: any[]) => mockGetPreviewDeploymentUrl(...args),
+  resolveVercelProjectId: jest.fn().mockImplementation((page: any) => Promise.resolve(page.vercelProjectId || null)),
   BrandContext: {},
 }));
 

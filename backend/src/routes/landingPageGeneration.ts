@@ -13,6 +13,7 @@ import {
   getDeploymentStatus,
   getPreviewDeploymentUrl,
   triggerVercelDeployment,
+  resolveVercelProjectId,
 } from "../services/v0Service";
 
 const router = Router();
@@ -1008,7 +1009,9 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
 
     const page = await getLandingPage(req.params.id, userId);
     if (!page) return res.status(404).json({ error: "Landing page not found" });
-    if (!page.vercelProjectId) return res.status(400).json({ error: "No Vercel project" });
+
+    const vercelProjectId = await resolveVercelProjectId(page);
+    if (!vercelProjectId) return res.status(400).json({ error: "No Vercel project" });
 
     const branch = req.query.branch as string;
     if (!branch || branch === "main") {
@@ -1018,7 +1021,7 @@ router.get("/generated/:id/preview-url", async (req, res: Response) => {
       return res.status(400).json({ error: "Invalid branch name" });
     }
 
-    const result = await getPreviewDeploymentUrl(page.vercelProjectId, branch);
+    const result = await getPreviewDeploymentUrl(vercelProjectId, branch);
     res.json(result);
   } catch (error: any) {
     console.error("[LP GENERATION] Error getting preview URL:", error);
