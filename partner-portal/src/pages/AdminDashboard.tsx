@@ -1407,6 +1407,9 @@ export default function AdminDashboard() {
         return user.isAdmin ? 1 : 0;
       case "isActive":
         return user.isActive === false ? 0 : 1;
+      case "tokenUsage":
+        return user.tokenUsage?.month === new Date().toISOString().slice(0, 7)
+          ? (user.tokenUsage?.totalTokens || 0) : 0;
       default:
         return (user as unknown as Record<string, unknown>)[property] ?? "";
     }
@@ -3519,7 +3522,9 @@ export default function AdminDashboard() {
                   <TableCell>
                     <UserSortLabel property="lastLoginTime" label="Last Active" />
                   </TableCell>
-                  <TableCell>Usage</TableCell>
+                  <TableCell>
+                    <UserSortLabel property={"tokenUsage" as keyof User} label="Usage" />
+                  </TableCell>
                   <TableCell sx={{ width: 100 }}>Actions</TableCell>
                 </TableRow>
               </TableHead>
