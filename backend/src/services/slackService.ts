@@ -1056,6 +1056,22 @@ export async function getSlackUserDisplayName(slackUserId: string): Promise<stri
   return slackUserId;
 }
 
+export async function getSlackUserEmail(slackUserId: string): Promise<string | null> {
+  if (!slackClient) {
+    return null;
+  }
+
+  try {
+    const result = await slackClient.users.info({ user: slackUserId });
+    if (result.ok && result.user) {
+      return (result.user as any).profile?.email || null;
+    }
+  } catch (error) {
+    console.error(`Failed to get Slack user email for ${slackUserId}:`, error);
+  }
+  return null;
+}
+
 /**
  * Post a temporary "thinking" message to a Slack thread
  * Returns the message timestamp so it can be updated/deleted later

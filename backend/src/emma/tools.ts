@@ -4616,9 +4616,15 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    // Auto-map common param name mistakes (Emma sometimes uses "instructions" instead of "task_description")
+    // Auto-map common param name mistakes
+    if (!args.page_id && args.landing_page_id) {
+      args.page_id = args.landing_page_id;
+    }
     if (!args.task_description && args.instructions) {
       args.task_description = args.instructions;
+    }
+    if (!args.page_id) {
+      return { success: false, error: 'page_id is required. Provide the landing page ID to edit.' };
     }
     if (!args.task_description) {
       return { success: false, error: 'task_description is required. Provide a detailed description of the code changes to make.' };

@@ -1645,14 +1645,14 @@ export async function getDeploymentStatus(
 export async function getPreviewDeploymentUrl(
   vercelProjectId: string,
   branch: string
-): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string }> {
+): Promise<{ previewUrl?: string; buildStatus: string; buildError?: string; prUrl?: string }> {
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
 
-  // Ensure Vercel Authentication is disabled so preview URLs are publicly accessible
+  // Fetch project info and ensure Vercel Authentication is disabled
+  let projRes: any = null;
   try {
-    // First, check current project settings
-    const projRes = await axios.get<any>(
+    projRes = await axios.get<any>(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
       { headers }
     );
@@ -1675,17 +1675,32 @@ export async function getPreviewDeploymentUrl(
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)
   const deploymentsRes = await axios.get<any>(
-    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=5`,
+    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=20`,
     { headers }
   );
 
   const deployments = deploymentsRes.data?.deployments || [];
+  console.log(`[V0 SERVICE] Found ${deployments.length} deployments for project ${vercelProjectId}, looking for branch "${branch}". Branches in deployments: [${deployments.map((d: any) => d.meta?.githubCommitRef || 'none').join(', ')}]`);
+
   // Find the most recent deployment for this branch
   const branchDeployment = deployments.find((d: any) =>
     d.meta?.githubCommitRef === branch
   );
 
   if (!branchDeployment) {
+    // No deployment found — Vercel deploys on PRs, not branch pushes.
+    // Create a draft PR to trigger the Vercel preview deployment.
+    const repoLink = projRes?.data?.link;
+    if (repoLink?.type === "github" && repoLink.repo) {
+      try {
+        const repoFullName = `${repoLink.org}/${repoLink.repo}`;
+        console.log(`[V0 SERVICE] No deployment found for branch "${branch}", creating draft PR to trigger Vercel preview`);
+        const prUrl = await createDraftPrForBranch(repoFullName, branch);
+        return { buildStatus: "building", previewUrl: undefined, prUrl };
+      } catch (prErr: any) {
+        console.warn(`[V0 SERVICE] Failed to create draft PR for branch "${branch}": ${prErr.response?.data?.message || prErr.message}`);
+      }
+    }
     return { buildStatus: "not_found", previewUrl: undefined };
   }
 
@@ -1703,6 +1718,40 @@ export async function getPreviewDeploymentUrl(
 
   // Still building
   return { buildStatus: state.toLowerCase(), previewUrl };
+}
+
+/**
+ * Create a draft PR for a branch if one doesn't already exist.
+ * Vercel's GitHub integration deploys on PRs, so this triggers the preview deployment.
+ */
+async function createDraftPrForBranch(repoFullName: string, branch: string): Promise<string | undefined> {
+  const { token: ghToken } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" };
+
+  // Check if a PR already exists for this branch
+  const existingPrs = await axios.get<any>(
+    `https://api.github.com/repos/${repoFullName}/pulls?head=${repoFullName.split('/')[0]}:${branch}&state=open`,
+    { headers: ghHeaders }
+  );
+  if (existingPrs.data?.length > 0) {
+    console.log(`[V0 SERVICE] Draft PR already exists for branch "${branch}": #${existingPrs.data[0].number}`);
+    return existingPrs.data[0].html_url;
+  }
+
+  // Create a draft PR
+  const prRes = await axios.post<any>(
+    `https://api.github.com/repos/${repoFullName}/pulls`,
+    {
+      title: `Preview: ${branch}`,
+      head: branch,
+      base: "main",
+      draft: true,
+      body: "Auto-created draft PR to trigger Vercel preview deployment.",
+    },
+    { headers: ghHeaders }
+  );
+  console.log(`[V0 SERVICE] Created draft PR #${prRes.data.number} for branch "${branch}" to trigger Vercel preview`);
+  return prRes.data.html_url;
 }
 
 /**

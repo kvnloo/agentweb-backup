@@ -11,6 +11,17 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-27',
     changes: [
+      'Feature: Admin Slack Channel for Starting Sessions on Behalf of Any User',
+      '- Admins can now configure a shared Slack channel from the Users tab in the admin dashboard',
+      '- In the admin channel, use the syntax: @Emma for user@email.com <message> to start a session as any user',
+      '- Thread replies automatically continue the same user\'s session without repeating the email',
+      '- Sessions include delegation info for audit trail, and a direct "Open in Slack" link is shown after configuration',
+      'Improvement: Coding Agent Reliability',
+      '- Increased the coding agent iteration limit from 15 to 50, allowing it to complete larger editing tasks without running out of steps',
+      '- Optimized the agent workflow to batch all code edits before checking deployment status, reducing wasted iterations',
+      '- Fixed preview URL generation: the system now auto-creates a draft PR to trigger Vercel preview deployments when no build is found for a draft branch',
+      '- Fixed a parameter mismatch where Emma could pass the wrong field name to the coding agent, causing "Landing page not found" errors',
+      '- Coding agent results (success/failure, branch, preview URL) are now logged for easier debugging',
       'Fix: Landing Page Preview URL Auto-Recovery',
       '- Fixed a bug where the coding agent could not generate preview URLs for landing pages missing their Vercel project configuration',
       '- The system now automatically resolves the Vercel project from sibling pages sharing the same repository and backfills the missing data',
