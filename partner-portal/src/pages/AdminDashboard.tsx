@@ -3430,22 +3430,44 @@ export default function AdminDashboard() {
             );
           })()}
           {/* Summary cards - Stripe-style muted design */}
-          <Box sx={{ display: "flex", gap: 2, mb: 3 }}>
-            {[
-              { label: "Total Users", value: contextUsers.length },
-              { label: "Paying", value: contextUsers.filter(u => u.subscription_status === "active").length },
-              { label: "Trial", value: contextUsers.filter(u => u.subscription_status === "trialing").length },
-              { label: "Bounced", value: contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status).length },
-              { label: "Past Due", value: contextUsers.filter(u => u.subscription_status === "past_due").length },
-              { label: "Showing", value: sortedUsers.length },
-            ].map((stat) => (
-              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100 }}>
-                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2 }}>
+          <Box sx={{ display: "flex", gap: 2, mb: 3, flexWrap: "wrap" }}>
+            {(() => {
+              const active = contextUsers.filter(u => u.isActive !== false);
+              const paying = contextUsers.filter(u => u.subscription_status === "active");
+              const trialing = contextUsers.filter(u => u.subscription_status === "trialing");
+              const pastDue = contextUsers.filter(u => u.subscription_status === "past_due");
+              const canceled = contextUsers.filter(u => u.subscription_status === "canceled" || u.subscription_status === "canceling");
+              const bounced = contextUsers.filter(u => u.stripe_customer_id && !u.subscription_status);
+              // Churn rate: canceled / (paying + canceled) — lifetime simple churn
+              const churnBase = paying.length + canceled.length;
+              const churnRate = churnBase > 0 ? ((canceled.length / churnBase) * 100).toFixed(0) : "0";
+              // Monthly churn: canceled in last 30 days
+              const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000);
+              const recentChurned = canceled.filter(u => u.current_period_end && new Date(u.current_period_end) > thirtyDaysAgo);
+              const monthlyChurnBase = paying.length + recentChurned.length;
+              const monthlyChurn = monthlyChurnBase > 0 ? ((recentChurned.length / monthlyChurnBase) * 100).toFixed(0) : "0";
+              return [
+                { label: "Active Users", value: active.length, sub: `${contextUsers.length} total` },
+                { label: "Paying", value: paying.length, sub: trialing.length > 0 ? `+${trialing.length} trial` : undefined },
+                { label: "Past Due", value: pastDue.length, sub: pastDue.length > 0 ? "⚠️ needs follow-up" : undefined, warn: pastDue.length > 0 },
+                { label: "Churned", value: canceled.length, sub: `${recentChurned.length} last 30d` },
+                { label: "Churn Rate", value: `${monthlyChurn}%`, sub: `${churnRate}% lifetime` },
+                { label: "Bounced", value: bounced.length, sub: "checkout abandoned" },
+                { label: "Showing", value: sortedUsers.length, sub: undefined },
+              ];
+            })().map((stat) => (
+              <Paper key={stat.label} variant="outlined" sx={{ px: 2.5, py: 1.5, minWidth: 100, borderColor: stat.warn ? "error.main" : undefined }}>
+                <Typography variant="h5" sx={{ fontWeight: 600, lineHeight: 1.2, color: stat.warn ? "error.main" : undefined }}>
                   {stat.value}
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
                   {stat.label}
                 </Typography>
+                {stat.sub && (
+                  <Typography variant="caption" display="block" color="text.disabled" sx={{ fontSize: "0.65rem", mt: 0.25 }}>
+                    {stat.sub}
+                  </Typography>
+                )}
               </Paper>
             ))}
           </Box>
