@@ -449,6 +449,137 @@ mcpToolRegistry.register({
   }
 });
 
+// ─── Schedule Templates ─────────────────────────────────────────────────────
+
+mcpToolRegistry.register({
+  name: 'list_schedule_templates',
+  definition: {
+    name: 'list_schedule_templates',
+    description: 'List all schedule templates available to the user (their own private templates + all platform-wide templates). Schedule templates are reusable blueprints for creating scheduled chats.',
+    inputSchema: { type: 'object', properties: {}, required: [] }
+  },
+  execute: async (_args: any, context: any) => {
+    const data = await mcpFetch({ method: 'GET', path: '/api/agent-mode/schedule-templates', context: ctx(context) });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'manage_schedule_template',
+  definition: {
+    name: 'manage_schedule_template',
+    description: 'Create, update, or delete a schedule template. Templates are reusable blueprints for scheduled chats that can be shared across the platform.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['create', 'update', 'delete'], description: 'CRUD action' },
+        template_id: { type: 'string', description: 'Template ID (required for update/delete)' },
+        name: { type: 'string', description: 'Template name (create/update)' },
+        description: { type: 'string', description: 'Template description (create/update)' },
+        category: { type: 'string', description: 'Template category e.g. SEO, Social, Email, Content, Analytics, General (create/update)' },
+        visibility: { type: 'string', enum: ['system', 'private', 'public', 'pending_review'], description: 'Visibility: system (admin-created, always visible), private (only visible to creator), public (approved, visible to all), pending_review (submitted for admin review). Default: private. (create/update)' },
+        starting_message: { type: 'string', description: 'The prompt/message template. Use {{variable_name}} for variables. (create/update)' },
+        variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' }, type: { type: 'string', enum: ['text', 'long_text', 'file'] } }, required: ['name'] }, description: 'Variable definitions (auto-extracted from message if not provided)' },
+        keywords: { type: 'array', items: { type: 'string' }, description: 'Keywords to verify in scheduled chat output (create/update)' },
+        required_function_calls: { type: 'array', items: { type: 'string' }, description: 'Function calls required in each run (create/update)' },
+        function_call_min_calls: { type: 'object', description: 'Minimum call counts per function (create/update)' },
+        suggested_frequency: { type: 'string', description: 'Suggested frequency: hourly, daily, weekly, monthly, every_n_days (create/update)' },
+        frequency_interval_days: { type: 'number', description: 'Days between runs when suggested_frequency is every_n_days (create/update)' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Default email addresses for notifications (create/update)' },
+        daily_digest: { type: 'boolean', description: 'Default daily digest setting (create/update)' },
+        llm_model: { type: 'string', description: 'Default LLM model (create/update)' },
+      },
+      required: ['action']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const c = ctx(context);
+    switch (args.action) {
+      case 'create': {
+        const body: any = {
+          name: args.name,
+          startingMessage: args.starting_message,
+        };
+        if (args.description !== undefined) body.description = args.description;
+        if (args.category !== undefined) body.category = args.category;
+        if (args.visibility !== undefined) body.visibility = args.visibility;
+        if (args.variables !== undefined) body.variables = args.variables;
+        if (args.keywords !== undefined) body.keywords = args.keywords;
+        if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
+        if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
+        if (args.suggested_frequency !== undefined) body.suggestedFrequency = args.suggested_frequency;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
+        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
+        if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        const data = await mcpFetch({ method: 'POST', path: '/api/agent-mode/schedule-templates', context: c, body });
+        return jsonResult(data);
+      }
+      case 'update': {
+        const body: any = {};
+        if (args.name !== undefined) body.name = args.name;
+        if (args.description !== undefined) body.description = args.description;
+        if (args.category !== undefined) body.category = args.category;
+        if (args.visibility !== undefined) body.visibility = args.visibility;
+        if (args.starting_message !== undefined) body.startingMessage = args.starting_message;
+        if (args.variables !== undefined) body.variables = args.variables;
+        if (args.keywords !== undefined) body.keywords = args.keywords;
+        if (args.required_function_calls !== undefined) body.requiredFunctionCalls = args.required_function_calls;
+        if (args.function_call_min_calls !== undefined) body.functionCallMinCalls = args.function_call_min_calls;
+        if (args.suggested_frequency !== undefined) body.suggestedFrequency = args.suggested_frequency;
+        if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
+        if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+        if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
+        if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/schedule-templates/${args.template_id}`, context: c, body });
+        return jsonResult(data);
+      }
+      case 'delete': {
+        const data = await mcpFetch({ method: 'DELETE', path: `/api/agent-mode/schedule-templates/${args.template_id}`, context: c });
+        return jsonResult(data);
+      }
+      default:
+        return jsonResult({ error: `Unknown action: ${args.action}` });
+    }
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'create_schedule_from_template',
+  definition: {
+    name: 'create_schedule_from_template',
+    description: 'Create a new scheduled chat from a schedule template. The template provides the prompt, variables, keywords, and other defaults. You can override frequency, notifications, and provide variable values.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        template_id: { type: 'string', description: 'The template ID to create from' },
+        schedule_name: { type: 'string', description: 'Name for the new scheduled chat (defaults to template name)' },
+        schedule_frequency: { type: 'string', description: 'Override frequency: hourly, daily, weekly, monthly, every_n_days' },
+        frequency_interval_days: { type: 'number', description: 'Override days between runs for every_n_days' },
+        next_run_time: { type: 'string', description: 'ISO 8601 datetime for the first run' },
+        email_notifications: { type: 'array', items: { type: 'string' }, description: 'Override notification emails' },
+        variable_values: { type: 'object', description: 'Variable values for the template placeholders' },
+        run_count: { type: 'number', description: 'Number of runs (-1 for unlimited)' },
+        llm_model: { type: 'string', description: 'Override LLM model' },
+      },
+      required: ['template_id']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const body: any = {};
+    if (args.schedule_name !== undefined) body.scheduleName = args.schedule_name;
+    if (args.schedule_frequency !== undefined) body.scheduleFrequency = args.schedule_frequency;
+    if (args.frequency_interval_days !== undefined) body.frequencyIntervalDays = args.frequency_interval_days;
+    if (args.next_run_time !== undefined) body.nextRunTime = args.next_run_time;
+    if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
+    if (args.variable_values !== undefined) body.variableValues = args.variable_values;
+    if (args.run_count !== undefined) body.runCount = args.run_count;
+    if (args.llm_model !== undefined) body.llmModel = args.llm_model;
+    const data = await mcpFetch({ method: 'POST', path: `/api/agent-mode/schedule-templates/${args.template_id}/use`, context: ctx(context), body });
+    return jsonResult(data);
+  }
+});
+
 // ─── CRM / Leads ────────────────────────────────────────────────────────────
 
 mcpToolRegistry.register({

@@ -267,6 +267,29 @@ router.get('/scheduled-chats/:scheduleId/test-history', asyncHandler(agentModeCo
 // Send test notification email for a specific test history record
 router.post('/scheduled-chats/:scheduleId/test-history/:runId/send-email', asyncHandler(agentModeController.sendScheduledChatTestEmail));
 
+// ─── Schedule Templates ──────────────────────────────────────────────────
+
+// POST /api/agent-mode/schedule-templates
+router.post('/schedule-templates', asyncHandlerAuth(agentModeController.createScheduleTemplate));
+
+// GET /api/agent-mode/schedule-templates
+router.get('/schedule-templates', asyncHandlerAuth(agentModeController.getScheduleTemplates));
+
+// GET /api/agent-mode/schedule-templates/:templateId
+router.get('/schedule-templates/:templateId', asyncHandlerAuth(agentModeController.getScheduleTemplate));
+
+// PUT /api/agent-mode/schedule-templates/:templateId
+router.put('/schedule-templates/:templateId', asyncHandlerAuth(agentModeController.updateScheduleTemplate));
+
+// DELETE /api/agent-mode/schedule-templates/:templateId
+router.delete('/schedule-templates/:templateId', asyncHandlerAuth(agentModeController.deleteScheduleTemplate));
+
+// POST /api/agent-mode/schedule-templates/:templateId/use
+router.post('/schedule-templates/:templateId/use', asyncHandlerAuth(agentModeController.createScheduleFromTemplate));
+
+// POST /api/agent-mode/schedule-templates/:templateId/submit-for-review
+router.post('/schedule-templates/:templateId/submit-for-review', asyncHandlerAuth(agentModeController.submitTemplateForReview));
+
 // GET /api/agent-mode/foundation-tools
 // Get foundation tools list (admin only)
 router.get('/foundation-tools', requireAdmin, asyncHandler(agentModeController.getFoundationTools));

@@ -5292,3 +5292,186 @@ export const orgDb = {
 
   ORG_MAX_MEMBERS,
 };
+
+// ─── Schedule Templates ──────────────────────────────────────────────────────
+
+export const scheduleTemplateDb = {
+  async createTemplate(template: {
+    templateId: string;
+    createdBy: string;
+    name: string;
+    description?: string;
+    category: string;
+    visibility: 'system' | 'private' | 'public' | 'pending_review';
+    startingMessage: string;
+    variables?: Array<{ name: string; description?: string; type?: 'text' | 'long_text' | 'file' }>;
+    keywords?: string[];
+    requiredFunctionCalls?: string[];
+    functionCallMinCalls?: { [functionName: string]: number };
+    suggestedFrequency?: string;
+    frequencyIntervalDays?: number;
+    emailNotifications?: string[];
+    dailyDigest?: boolean;
+    llmModel?: string;
+    usageCount?: number;
+    reviewFeedback?: string;
+    createdAt: string;
+    updatedAt: string;
+  }) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        Item: template,
+      };
+      await dynamodb.put(params).promise();
+      return template;
+    } catch (error) {
+      handleDynamoDbError(error, "createTemplate");
+    }
+  },
+
+  async getTemplateById(templateId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        Key: { templateId },
+      };
+      const result = await dynamodb.get(params).promise();
+      return result.Item;
+    } catch (error) {
+      handleDynamoDbError(error, "getTemplateById");
+    }
+  },
+
+  async getTemplatesByCreator(createdBy: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        IndexName: 'CreatedByIndex',
+        KeyConditionExpression: 'createdBy = :createdBy',
+        ExpressionAttributeValues: { ':createdBy': createdBy },
+      };
+      return await paginatedQuery(dynamodb, params);
+    } catch (error) {
+      handleDynamoDbError(error, "getTemplatesByCreator");
+      return [];
+    }
+  },
+
+  async getTemplatesByVisibility(visibility: string, category?: string) {
+    try {
+      let keyCondition = 'visibility = :visibility';
+      const expressionValues: any = { ':visibility': visibility };
+
+      if (category) {
+        keyCondition += ' AND category = :category';
+        expressionValues[':category'] = category;
+      }
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        IndexName: 'VisibilityCategoryIndex',
+        KeyConditionExpression: keyCondition,
+        ExpressionAttributeValues: expressionValues,
+      };
+      return await paginatedQuery(dynamodb, params);
+    } catch (error) {
+      handleDynamoDbError(error, "getTemplatesByVisibility");
+      return [];
+    }
+  },
+
+  async updateTemplate(
+    templateId: string,
+    updates: Partial<{
+      name: string;
+      description: string;
+      category: string;
+      visibility: 'system' | 'private' | 'public' | 'pending_review';
+      startingMessage: string;
+      variables: Array<{ name: string; description?: string; type?: 'text' | 'long_text' | 'file' }>;
+      keywords: string[];
+      requiredFunctionCalls: string[];
+      functionCallMinCalls: { [functionName: string]: number };
+      suggestedFrequency: string;
+      frequencyIntervalDays: number;
+      emailNotifications: string[];
+      dailyDigest: boolean;
+      llmModel: string;
+      usageCount: number;
+      reviewFeedback: string;
+      updatedAt: string;
+    }>
+  ) {
+    try {
+      const updateExpressions: string[] = [];
+      const expressionAttributeNames: { [key: string]: string } = {};
+      const expressionAttributeValues: { [key: string]: any } = {};
+
+      Object.entries(updates).forEach(([key, value]) => {
+        updateExpressions.push(`#${key} = :${key}`);
+        expressionAttributeNames[`#${key}`] = key;
+        expressionAttributeValues[`:${key}`] = value;
+      });
+
+      if (updateExpressions.length === 0) return;
+
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        Key: { templateId },
+        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
+        ExpressionAttributeNames: expressionAttributeNames,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW' as const,
+      };
+
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "updateTemplate");
+    }
+  },
+
+  async deleteTemplate(templateId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        Key: { templateId },
+      };
+      await dynamodb.delete(params).promise();
+    } catch (error) {
+      handleDynamoDbError(error, "deleteTemplate");
+    }
+  },
+
+  async incrementUsageCount(templateId: string) {
+    try {
+      const params = {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+        Key: { templateId },
+        UpdateExpression: 'SET usageCount = if_not_exists(usageCount, :zero) + :one, updatedAt = :now',
+        ExpressionAttributeValues: {
+          ':zero': 0,
+          ':one': 1,
+          ':now': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW' as const,
+      };
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes;
+    } catch (error) {
+      handleDynamoDbError(error, "incrementUsageCount");
+    }
+  },
+
+  async getAllTemplates() {
+    try {
+      return await paginatedScan(dynamodb, {
+        TableName: `${TABLE_PREFIX}AW-ScheduleTemplates`,
+      });
+    } catch (error) {
+      handleDynamoDbError(error, "getAllTemplates");
+      return [];
+    }
+  },
+};
