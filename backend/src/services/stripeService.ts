@@ -50,6 +50,85 @@ export const stripeService = {
   },
 
   /**
+   * Upgrade an existing subscription to a new price (plan).
+   * Uses Stripe's subscription update API with proration.
+   * Returns the updated Stripe subscription object.
+   */
+  async upgradeSubscription(
+    stripeSubscriptionId: string,
+    newPriceId: string
+  ): Promise<Stripe.Subscription> {
+    if (!stripeSubscriptionId) throw new Error('stripeSubscriptionId is required');
+    if (!newPriceId) throw new Error('newPriceId is required');
+
+    const s = getStripeOrThrow();
+    const subscription = await s.subscriptions.retrieve(stripeSubscriptionId);
+    const existingItemId = subscription.items.data[0]?.id;
+
+    if (!existingItemId) {
+      throw new Error('No subscription item found on the existing subscription.');
+    }
+
+    return s.subscriptions.update(stripeSubscriptionId, {
+      items: [{ id: existingItemId, price: newPriceId }],
+      proration_behavior: 'create_prorations',
+    });
+  },
+
+  /**
+   * Cancel duplicate subscriptions for a customer, keeping only the specified one.
+   */
+  async cancelDuplicateSubscriptions(
+    stripeCustomerId: string,
+    keepSubscriptionId: string
+  ): Promise<number> {
+    const s = getStripeOrThrow();
+    let canceledCount = 0;
+
+    for (const status of ['active', 'trialing'] as const) {
+      const subs = await s.subscriptions.list({
+        customer: stripeCustomerId,
+        status,
+        limit: 100,
+      });
+
+      for (const sub of subs.data) {
+        if (sub.id !== keepSubscriptionId) {
+          await s.subscriptions.cancel(sub.id);
+          canceledCount++;
+          console.log(`[STRIPE] Canceled duplicate subscription ${sub.id} for customer ${stripeCustomerId}`);
+        }
+      }
+    }
+
+    return canceledCount;
+  },
+
+  /**
+   * Find the active/trialing subscription for a customer.
+   * Returns the most recent one if multiple exist.
+   */
+  async findActiveSubscription(
+    stripeCustomerId: string
+  ): Promise<Stripe.Subscription | null> {
+    const s = getStripeOrThrow();
+
+    // Check active first, then trialing
+    for (const status of ['active', 'trialing'] as const) {
+      const subs = await s.subscriptions.list({
+        customer: stripeCustomerId,
+        status,
+        limit: 1,
+      });
+      if (subs.data.length > 0) {
+        return subs.data[0];
+      }
+    }
+
+    return null;
+  },
+
+  /**
    * Create a Stripe Customer Portal session so the user can manage billing.
    */
   async createCustomerPortalSession(stripeCustomerId: string, returnUrl: string) {
@@ -232,6 +311,7 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
     subscriptionType,
     subscription_status: actualStatus,
     has_payment_method: true, // completed checkout = has payment method
+    has_used_trial: true, // Mark trial as used so future upgrades don't offer trial
     allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
     allowedSkills: tierConfig?.allowedSkills ?? ['*'],
   };
@@ -240,6 +320,23 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   }
 
   await userDb.updateUser(user.userId, updateData);
+
+  // Cancel any duplicate subscriptions for this customer (keep only the latest)
+  if (stripeCustomerId && stripeSubscriptionId) {
+    try {
+      const canceledCount = await stripeService.cancelDuplicateSubscriptions(
+        stripeCustomerId,
+        stripeSubscriptionId
+      );
+      if (canceledCount > 0) {
+        console.log(
+          `[STRIPE] Canceled ${canceledCount} duplicate subscription(s) for customer ${stripeCustomerId}`
+        );
+      }
+    } catch (dupError: any) {
+      console.error(`[STRIPE] Failed to cancel duplicates for ${stripeCustomerId}:`, dupError.message);
+    }
+  }
 
   console.log(
     `Checkout completed: user ${user.userId} → stripe_customer_id=${stripeCustomerId}, subscription=${stripeSubscriptionId}, status=${actualStatus}, periodEnd=${currentPeriodEnd || 'unknown'}`
@@ -257,6 +354,15 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
   const user = await findUserByStripeCustomerId(customerId);
   if (!user) {
     console.warn(`No user found for subscription update. customer=${customerId}`);
+    return;
+  }
+
+  // Only process this webhook if it's for the user's current subscription
+  // (prevents stale/duplicate subscription webhooks from overwriting the latest state)
+  if (user.stripe_subscription_id && user.stripe_subscription_id !== subscription.id) {
+    console.log(
+      `[STRIPE] Ignoring subscription update for ${subscription.id} — user ${user.userId} has current subscription ${user.stripe_subscription_id}`
+    );
     return;
   }
 
@@ -326,7 +432,7 @@ export async function handleSubscriptionDeleted(subscription: any): Promise<void
  * Maps: Starter plan → "Basic", Pro/Complete plan → "Super Premium".
  * Falls back to "Super Premium" if the price cannot be determined.
  */
-function deriveSubscriptionTypeFromPriceId(priceId: string): string | null {
+export function deriveSubscriptionTypeFromPriceId(priceId: string): string | null {
   if (priceId === process.env.STRIPE_STARTER_PRICE_ID) return 'Basic';
   if (priceId === process.env.STRIPE_COMPLETE_PRICE_ID) return 'Super Premium';
   return null;
