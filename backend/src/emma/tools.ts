@@ -4666,7 +4666,14 @@ emmaToolRegistry.register({
           : undefined,
       };
     } else {
-      return { success: false, error: result.message, iterations: result.iterations };
+      return {
+        success: false,
+        error: result.message,
+        iterations: result.iterations,
+        previewUrl: result.previewUrl,
+        branch: result.branch,
+        is_staging: !!result.branch && result.branch !== 'main',
+      };
     }
   }
 });

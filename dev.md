@@ -1,3 +1,48 @@
+# March 26, 2026: Investigation — Recurring S3 DeleteObject Errors on Prod EB
+
+## Problem
+
+EB event notifications for the production environment (`Agentweb-backend-env-prod-3`, `e-ag9bmkfczz`) were reporting S3 permission errors. The `agentweb-test-env-ec2-role` lacked `s3:DeleteObject` on the EB bucket, causing cleanup failures for both tail logs and bundle logs:
+
+**Tail logs** (from cron-based log monitoring):
+```
+Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-07d440d734bbbcf55
+is not authorized to perform: s3:DeleteObject on resource:
+"arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/tail/..."
+```
+
+**Bundle logs** (from manual `request-environment-info --info-type bundle`):
+```
+Service:Amazon S3, Message:User: arn:aws:sts::992382574572:assumed-role/agentweb-test-env-ec2-role/i-03e403b3c8620a994
+is not authorized to perform: s3:DeleteObject on resource:
+"arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/resources/environments/logs/bundle/..."
+```
+
+## Root Cause
+
+When any IAM role calls `aws elasticbeanstalk request-environment-info`, EB uploads logs to S3 and later tries to clean up (delete) old log files **using the caller's IAM role**. The `agentweb-test-env-ec2-role` had `elasticbeanstalk:RequestEnvironmentInfo` and `elasticbeanstalk:RetrieveEnvironmentInfo` but **not** `s3:DeleteObject` on the EB bucket. EB successfully collected and returned logs, but cleanup failed every time, generating ERROR events.
+
+## Fix
+
+Added `s3:DeleteObject` permission to `agentweb-test-env-ec2-role`, scoped to the entire EB bucket:
+
+```json
+{
+  "Sid": "AllowEBLogCleanup",
+  "Effect": "Allow",
+  "Action": "s3:DeleteObject",
+  "Resource": "arn:aws:s3:::elasticbeanstalk-us-west-2-992382574572/*"
+}
+```
+
+Verified the fix by successfully deleting a bundle log object that previously failed.
+
+## Lesson
+
+When granting EB log retrieval permissions to an IAM role, also grant `s3:DeleteObject` on `elasticbeanstalk-<region>-<account>/*` so EB can clean up temporary log fragments (both tail and bundle types).
+
+---
+
 # March 25, 2026: Investigation — LiteLLM Vulnerability Impact on AgentWeb
 
 ## Background
