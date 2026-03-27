@@ -2136,7 +2136,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         expect(mockRes.status).toHaveBeenCalledWith(400);
         expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'Email Notifications are required when using variables in startingMessage'
+          error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)'
         });
       });
     });
@@ -2260,7 +2260,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         expect(mockRes.status).toHaveBeenCalledWith(400);
         expect(mockRes.json).toHaveBeenCalledWith({
-          error: 'Email Notifications are required when using variables in startingMessage'
+          error: 'Email Notifications are required when using variables in startingMessage (unless all variable values are pre-filled)'
         });
       });
     });

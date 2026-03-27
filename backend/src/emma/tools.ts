@@ -4555,6 +4555,10 @@ const bridgedToolNames = [
   'test_scheduled_chat',
   'get_scheduled_chat_test_history',
   'submit_scheduled_chat_variables',
+  // Schedule Template tools
+  'list_schedule_templates',
+  'manage_schedule_template',
+  'create_schedule_from_template',
   // Landing Page tools (v0 generation + management — file editing delegated to coding_agent)
   'generate_landing_page',
   'deploy_landing_page',
