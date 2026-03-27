@@ -1,3 +1,51 @@
+# March 27, 2026: Investigation — Sessions Not Showing Up in Customer Portal
+
+## Problem
+
+Admin page (Users tab) shows 15+ sessions for a customer (`harshitshah1989@gmail.com`), but the customer portal only shows 1 session. The session counts between admin and customer views are inconsistent.
+
+## Root Cause
+
+**Portal type filtering mismatch between admin count and customer portal query.**
+
+### Production data for the affected user (userId: `100c8fa5-8444-4dfb-81b3-805f29d8e39e`)
+
+- **16 total sessions** in `AW-ChatSessions`
+  - 1 session with `portalType = 'agent'` (main agent chat)
+  - 15 sessions with `portalType = 'emma-sidebar'` (Emma assistant sidebar)
+  - None archived
+
+### Admin page count (`db.ts` → `getChatSessionCount`)
+
+Queries `AW-ChatSessions` `UserIdIndex` with only an archived filter — counts ALL session types:
+```
+COUNT(sessions WHERE userId = :userId AND (archived not set OR archived = false))
+```
+Result: **16 sessions**
+
+### Customer portal list (`agentModeController.ts:1570`)
+
+Defaults `portalType` to `'agent'` when not passed by the frontend:
+```typescript
+const portalType = (req.query.portalType as string) === 'emma-sidebar'
+  ? 'emma-sidebar' as const : 'agent' as const;
+```
+The frontend hook (`useAgentModeSessions.ts` → `loadSessions`) calls `GET /api/agent-mode/sessions?limit=50` without a `portalType` parameter, so it defaults to `'agent'` and only returns agent sessions.
+
+Result: **1 session**
+
+### Additional note on emma-sidebar session creation
+
+The 15 emma-sidebar sessions were created in rapid bursts (many within seconds of each other around 09:13 and 09:59 UTC on March 26), suggesting repeated page loads or sidebar reconnections are creating new sessions each time.
+
+## Fix Options
+
+1. **Fix admin count** — filter `getChatSessionCount` by portalType so it matches what the customer sees (or show a breakdown)
+2. **Show emma-sidebar sessions in customer portal** — include them in the session list
+3. **Both** — accurate admin counts AND full session visibility in customer portal
+
+---
+
 # March 26, 2026: Investigation — Recurring S3 DeleteObject Errors on Prod EB
 
 ## Problem
