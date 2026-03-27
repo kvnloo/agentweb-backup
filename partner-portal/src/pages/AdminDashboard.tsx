@@ -3537,8 +3537,15 @@ export default function AdminDashboard() {
                             <Typography variant="caption" color="text.disabled">—</Typography>
                           )}
                         </TableCell>
-                        <TableCell>
-                          <Typography variant="body2">{user.chatSessionCount || 0}</Typography>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
+                          <Chip
+                            label={user.chatSessionCount || 0}
+                            size="small"
+                            color={(user.chatSessionCount ?? 0) > 0 ? "primary" : "default"}
+                            variant="outlined"
+                            sx={{ cursor: (user.chatSessionCount ?? 0) > 0 ? "pointer" : undefined }}
+                            onClick={() => {}}
+                          />
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" color="text.secondary">{lastSeen}</Typography>
@@ -3594,7 +3601,17 @@ export default function AdminDashboard() {
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Tasks / Workflows</Typography>
-                                  <Typography variant="body2">{user.taskCount || 0} / {user.workflowCount || 0}</Typography>
+                                  <Box sx={{ display: "flex", gap: 1, mt: 0.5 }}>
+                                    <Chip
+                                      label={`${user.taskCount || 0} tasks`}
+                                      size="small"
+                                      color={(user.taskCount ?? 0) > 0 ? "primary" : "default"}
+                                      variant="outlined"
+                                      sx={{ cursor: (user.taskCount ?? 0) > 0 ? "pointer" : undefined }}
+                                      onClick={() => { if ((user.taskCount ?? 0) > 0) { setUserTasksDialogUserId(user.userId); setUserTasksDialogUserEmail(user.email); setUserTasksDialogOpen(true); } }}
+                                    />
+                                    <Chip label={`${user.workflowCount || 0} workflows`} size="small" color={(user.workflowCount ?? 0) > 0 ? "primary" : "default"} variant="outlined" />
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">OAuth / Admin</Typography>
@@ -3623,38 +3640,114 @@ export default function AdminDashboard() {
                                     ) : <Typography variant="body2" color="text.disabled">—</Typography>}
                                   </Box>
                                 </Grid>
-                                {/* Config details */}
+                                {/* Config details — all with inline edit */}
+                                <Grid item xs={3}>
+                                  <Typography variant="caption" color="text.secondary">Stripe Customer ID</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingStripeCustomerIdUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentStripeCustomerIdText} onChange={(e) => setCurrentStripeCustomerIdText(e.target.value)} placeholder="cus_..." sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveStripeCustomerId(user.userId)} disabled={stripeCustomerIdEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingStripeCustomerIdUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2" sx={{ fontFamily: "monospace", fontSize: "0.75rem" }}>{user.stripe_customer_id || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingStripeCustomerIdUserId(user.userId); setCurrentStripeCustomerIdText(user.stripe_customer_id || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
+                                </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Ad Account</Typography>
-                                  <Typography variant="body2">{user.adAccount || "—"}</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingAdAccountUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentAdAccountText} onChange={(e) => setCurrentAdAccountText(e.target.value)} sx={{ flex: 1 }} />
+                                        <IconButton size="small" onClick={() => handleSaveAdAccount(user.userId)} disabled={adAccountEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingAdAccountUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.adAccount || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingAdAccountUserId(user.userId); setCurrentAdAccountText(user.adAccount || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Email Sender</Typography>
-                                  <Typography variant="body2">{user.emailDomain ? `${user.defaultSenderUsername || "noreply"}@${user.emailDomain}` : "—"}</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.emailDomain ? `${user.defaultSenderUsername || "noreply"}@${user.emailDomain}` : "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingEmailSenderUserId(user.userId); setEmailDomain(user.emailDomain || ""); setDefaultSenderUsername(user.defaultSenderUsername || ""); setFromName(user.fromName || ""); setEmailSenderDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">Slack</Typography>
-                                  <Typography variant="body2">{user.slackChannel || "—"}</Typography>
+                                  <Typography variant="caption" color="text.secondary">Slack Channel</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.slackChannel || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSlackChannelUserId(user.userId); setCurrentSlackChannelText(user.slackChannel || ""); setSlackChannelDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">SEO Domains</Typography>
-                                  <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
+                                  <Typography variant="caption" color="text.secondary">SEO / GA / Clarity</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.seoDomains?.join(", ") || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSeoDomainsUserId(user.userId); setSeoDomainsText((user.seoDomains || []).join("\n")); setGoogleAnalyticsPropertyId(user.googleAnalyticsPropertyId || ""); setGaFilteredDomainsText((user.gaFilteredDomains || []).join("\n")); setClarityProjectId(user.clarityProjectId || ""); setProductDomain(user.productDomain || ""); setSeoDomainsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
                                   <Typography variant="caption" color="text.secondary">Secrets</Typography>
-                                  <Typography variant="body2">{user.secretNames?.join(", ") || "—"}</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.secretNames?.join(", ") || "—"}</Typography>
+                                    <IconButton size="small" onClick={() => { setEditingSecretsUserId(user.userId); setSecretEntries((user.secretNames || []).map(n => ({ name: n, value: "" }))); setSecretsDialogOpen(true); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">GA / Clarity</Typography>
-                                  <Typography variant="body2">{user.googleAnalyticsPropertyId || "—"} / {user.clarityProjectId || "—"}</Typography>
+                                  <Typography variant="caption" color="text.secondary">CMS Type</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingCmsTypeUserId === user.userId ? (
+                                      <>
+                                        <FormControl size="small" sx={{ minWidth: 100 }}>
+                                          <Select value={currentCmsType} onChange={(e) => setCurrentCmsType(e.target.value as any)}>
+                                            <MenuItem value="">None</MenuItem>
+                                            <MenuItem value="Basehub">Basehub</MenuItem>
+                                            <MenuItem value="Webflow">Webflow</MenuItem>
+                                          </Select>
+                                        </FormControl>
+                                        <IconButton size="small" onClick={() => handleSaveCmsType()} disabled={cmsTypeEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingCmsTypeUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.cmsType || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingCmsTypeUserId(user.userId); setCurrentCmsType(user.cmsType || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
                                 </Grid>
                                 <Grid item xs={3}>
-                                  <Typography variant="caption" color="text.secondary">CMS</Typography>
-                                  <Typography variant="body2">{user.cmsType || "—"}</Typography>
+                                  <Typography variant="caption" color="text.secondary">Shared Folders</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="body2">{user.googleDriveFolders?.map(f => f.name).join(", ") || "—"}</Typography>
+                                  </Box>
                                 </Grid>
-                                <Grid item xs={3}>
+                                <Grid item xs={6}>
                                   <Typography variant="caption" color="text.secondary">Support Note</Typography>
-                                  <Typography variant="body2">{user.supportNote || "—"}</Typography>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    {editingSupportNoteUserId === user.userId ? (
+                                      <>
+                                        <TextField size="small" value={currentSupportNoteText} onChange={(e) => setCurrentSupportNoteText(e.target.value)} sx={{ flex: 1 }} multiline maxRows={3} />
+                                        <IconButton size="small" onClick={() => handleSaveSupportNote(user.userId)} disabled={supportNoteEditLoading} color="primary"><CheckIcon fontSize="small" /></IconButton>
+                                        <IconButton size="small" onClick={() => setEditingSupportNoteUserId(null)}><CloseIcon fontSize="small" /></IconButton>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Typography variant="body2">{user.supportNote || "—"}</Typography>
+                                        <IconButton size="small" onClick={() => { setEditingSupportNoteUserId(user.userId); setCurrentSupportNoteText(user.supportNote || ""); }}><EditIcon sx={{ fontSize: 14 }} /></IconButton>
+                                      </>
+                                    )}
+                                  </Box>
                                 </Grid>
                                 {/* Usage + actions row */}
                                 <Grid item xs={6}>
