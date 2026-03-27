@@ -1649,10 +1649,10 @@ export async function getPreviewDeploymentUrl(
   const vercelToken = await getVercelToken();
   const headers = { Authorization: `Bearer ${vercelToken}`, "Content-Type": "application/json" };
 
-  // Ensure Vercel Authentication is disabled so preview URLs are publicly accessible
+  // Fetch project info and ensure Vercel Authentication is disabled
+  let projRes: any = null;
   try {
-    // First, check current project settings
-    const projRes = await axios.get<any>(
+    projRes = await axios.get<any>(
       `https://api.vercel.com/v9/projects/${vercelProjectId}`,
       { headers }
     );
@@ -1675,17 +1675,32 @@ export async function getPreviewDeploymentUrl(
 
   // List recent deployments filtered by the branch (meta.githubCommitRef)
   const deploymentsRes = await axios.get<any>(
-    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=5`,
+    `https://api.vercel.com/v6/deployments?projectId=${vercelProjectId}&limit=20`,
     { headers }
   );
 
   const deployments = deploymentsRes.data?.deployments || [];
+  console.log(`[V0 SERVICE] Found ${deployments.length} deployments for project ${vercelProjectId}, looking for branch "${branch}". Branches in deployments: [${deployments.map((d: any) => d.meta?.githubCommitRef || 'none').join(', ')}]`);
+
   // Find the most recent deployment for this branch
   const branchDeployment = deployments.find((d: any) =>
     d.meta?.githubCommitRef === branch
   );
 
   if (!branchDeployment) {
+    // No deployment found — Vercel webhook may not have fired for GitHub API commits.
+    // Try to trigger a deployment manually.
+    const repoLink = projRes?.data?.link;
+    if (repoLink?.type === "github" && repoLink.repo) {
+      try {
+        const repoFullName = `${repoLink.org}/${repoLink.repo}`;
+        console.log(`[V0 SERVICE] No deployment found for branch "${branch}", triggering manual deployment for ${repoFullName}`);
+        await triggerVercelDeployment(vercelProjectId, repoFullName, branch);
+        return { buildStatus: "building", previewUrl: undefined };
+      } catch (triggerErr: any) {
+        console.warn(`[V0 SERVICE] Failed to trigger deployment for branch "${branch}": ${triggerErr.response?.data?.error?.message || triggerErr.message}`);
+      }
+    }
     return { buildStatus: "not_found", previewUrl: undefined };
   }
 
