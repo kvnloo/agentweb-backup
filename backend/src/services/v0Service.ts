@@ -1688,17 +1688,17 @@ export async function getPreviewDeploymentUrl(
   );
 
   if (!branchDeployment) {
-    // No deployment found — Vercel webhook may not have fired for GitHub API commits.
-    // Try to trigger a deployment manually.
+    // No deployment found — Vercel deploys on PRs, not branch pushes.
+    // Create a draft PR to trigger the Vercel preview deployment.
     const repoLink = projRes?.data?.link;
     if (repoLink?.type === "github" && repoLink.repo) {
       try {
         const repoFullName = `${repoLink.org}/${repoLink.repo}`;
-        console.log(`[V0 SERVICE] No deployment found for branch "${branch}", triggering manual deployment for ${repoFullName}`);
-        await triggerVercelDeployment(vercelProjectId, repoFullName, branch);
+        console.log(`[V0 SERVICE] No deployment found for branch "${branch}", creating draft PR to trigger Vercel preview`);
+        await createDraftPrForBranch(repoFullName, branch);
         return { buildStatus: "building", previewUrl: undefined };
-      } catch (triggerErr: any) {
-        console.warn(`[V0 SERVICE] Failed to trigger deployment for branch "${branch}": ${triggerErr.response?.data?.error?.message || triggerErr.message}`);
+      } catch (prErr: any) {
+        console.warn(`[V0 SERVICE] Failed to create draft PR for branch "${branch}": ${prErr.response?.data?.message || prErr.message}`);
       }
     }
     return { buildStatus: "not_found", previewUrl: undefined };
@@ -1718,6 +1718,39 @@ export async function getPreviewDeploymentUrl(
 
   // Still building
   return { buildStatus: state.toLowerCase(), previewUrl };
+}
+
+/**
+ * Create a draft PR for a branch if one doesn't already exist.
+ * Vercel's GitHub integration deploys on PRs, so this triggers the preview deployment.
+ */
+async function createDraftPrForBranch(repoFullName: string, branch: string): Promise<void> {
+  const { token: ghToken } = await getGitHubOrgToken();
+  const ghHeaders = { Authorization: `Bearer ${ghToken}`, Accept: "application/vnd.github.v3+json" };
+
+  // Check if a PR already exists for this branch
+  const existingPrs = await axios.get<any>(
+    `https://api.github.com/repos/${repoFullName}/pulls?head=${repoFullName.split('/')[0]}:${branch}&state=open`,
+    { headers: ghHeaders }
+  );
+  if (existingPrs.data?.length > 0) {
+    console.log(`[V0 SERVICE] Draft PR already exists for branch "${branch}": #${existingPrs.data[0].number}`);
+    return;
+  }
+
+  // Create a draft PR
+  const prRes = await axios.post<any>(
+    `https://api.github.com/repos/${repoFullName}/pulls`,
+    {
+      title: `Preview: ${branch}`,
+      head: branch,
+      base: "main",
+      draft: true,
+      body: "Auto-created draft PR to trigger Vercel preview deployment.",
+    },
+    { headers: ghHeaders }
+  );
+  console.log(`[V0 SERVICE] Created draft PR #${prRes.data.number} for branch "${branch}" to trigger Vercel preview`);
 }
 
 /**
