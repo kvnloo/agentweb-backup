@@ -327,7 +327,7 @@ class UserDB {
     }
   }
 
-  private async getChatSessionCount(userId: string): Promise<number> {
+  async getChatSessionCount(userId: string): Promise<number> {
     let totalCount = 0;
     let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined =
       undefined;
@@ -341,9 +341,10 @@ class UserDB {
         ExpressionAttributeValues: {
           ":userId": userId,
           ":archivedFalse": false,
+          ":agentType": "agent",
         },
         FilterExpression:
-          "(attribute_not_exists(archived) OR archived = :archivedFalse)",
+          "(attribute_not_exists(archived) OR archived = :archivedFalse) AND portalType = :agentType",
       };
 
       if (lastEvaluatedKey) {
