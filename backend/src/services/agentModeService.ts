@@ -2853,6 +2853,34 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return extracted;
     }
 
+    // For coding_agent, preserve the full response so Emma can relay PR/preview info
+    if (toolName === 'coding_agent') {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse coding_agent result.content as JSON:`, e);
+        }
+      }
+      console.log(`[CODING_AGENT] Result:`, JSON.stringify({
+        success: actualResult.success,
+        message: actualResult.message,
+        iterations: actualResult.iterations,
+        branch: actualResult.branch,
+        previewUrl: actualResult.previewUrl,
+        error: actualResult.error,
+      }));
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        iterations: actualResult.iterations,
+        branch: actualResult.branch,
+        previewUrl: actualResult.previewUrl,
+        error: actualResult.error,
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
