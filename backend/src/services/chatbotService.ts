@@ -2774,6 +2774,43 @@ export class ChatbotDB {
       expressionValues[":end"] = timeRange.endTime;
     }
 
+    // When a time range is specified, fetch ALL sessions in the range by paginating
+    // through DynamoDB pages. The BETWEEN condition already bounds the result set,
+    // and downstream filtering (e.g. removing empty sessions) can significantly
+    // reduce the count — so a single page with Limit may miss older sessions.
+    if (timeRange) {
+      const accumulated: ChatSession[] = [];
+      let currentKey = lastEvaluatedKey;
+
+      try {
+        do {
+          const params: AWS.DynamoDB.DocumentClient.QueryInput = {
+            TableName: this.tableName,
+            IndexName: "AdminUpdatedAtIndex",
+            KeyConditionExpression: keyCondition,
+            ExpressionAttributeValues: expressionValues,
+            ScanIndexForward: false,
+          };
+          if (currentKey) {
+            params.ExclusiveStartKey = currentKey;
+          }
+
+          const result = await dynamodb.query(params).promise();
+          accumulated.push(...((result.Items as ChatSession[]) || []));
+          currentKey = result.LastEvaluatedKey;
+        } while (currentKey);
+
+        return {
+          sessions: accumulated.slice(0, limit),
+          lastEvaluatedKey: accumulated.length > limit ? undefined : undefined,
+        };
+      } catch (error) {
+        console.error("Error getting chat sessions by time range:", error);
+        throw error;
+      }
+    }
+
+    // No time range: single-page query for admin chat list pagination
     const params: AWS.DynamoDB.DocumentClient.QueryInput = {
       TableName: this.tableName,
       IndexName: "AdminUpdatedAtIndex",
