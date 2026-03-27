@@ -731,6 +731,10 @@ export default function AdminDashboard() {
   const [editingSlackChannelUserId, setEditingSlackChannelUserId] = useState<string | null>(null);
   const [currentSlackChannelText, setCurrentSlackChannelText] = useState("");
   const [slackChannelEditLoading, setSlackChannelEditLoading] = useState(false);
+  const [adminSlackChannel, setAdminSlackChannel] = useState("");
+  const [adminSlackChannelInput, setAdminSlackChannelInput] = useState("");
+  const [adminSlackChannelLoading, setAdminSlackChannelLoading] = useState(false);
+  const [adminSlackChannelSaved, setAdminSlackChannelSaved] = useState(false);
   const [secretsDialogOpen, setSecretsDialogOpen] = useState(false);
   const [editingSecretsUserId, setEditingSecretsUserId] = useState<string | null>(null);
   const [secretEntries, setSecretEntries] = useState<Array<{ name: string; value: string }>>([]);
@@ -851,6 +855,16 @@ export default function AdminDashboard() {
     if (tabValue === 2) {
       loadUsers();
       loadSubscriptionTypes();
+      // Load admin Slack channel setting
+      axios.get(buildApiUrl('/api/settings/slack_admin_channel'), {
+        headers: { Authorization: `Bearer ${token}` },
+      }).then((res) => {
+        const val = res.data?.settingValue || '';
+        setAdminSlackChannel(val);
+        setAdminSlackChannelInput(val);
+      }).catch(() => {
+        // Setting not found — leave empty
+      });
     }
   }, [tabValue]);
 
@@ -2063,6 +2077,29 @@ export default function AdminDashboard() {
       setError(error.response?.data?.message || "Failed to update slack channel");
     } finally {
       setSlackChannelEditLoading(false);
+    }
+  };
+
+  const handleSaveAdminSlackChannel = async () => {
+    try {
+      setAdminSlackChannelLoading(true);
+      await axios.post(
+        buildApiUrl('/api/settings'),
+        {
+          settingName: 'slack_admin_channel',
+          settingValue: adminSlackChannelInput.trim(),
+          description: 'Admin Slack channel ID for delegated Emma access'
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      setAdminSlackChannel(adminSlackChannelInput.trim());
+      setAdminSlackChannelSaved(true);
+      setTimeout(() => setAdminSlackChannelSaved(false), 3000);
+    } catch (error: any) {
+      console.error("Error saving admin Slack channel:", error);
+      setError(error.response?.data?.message || "Failed to save admin Slack channel");
+    } finally {
+      setAdminSlackChannelLoading(false);
     }
   };
 
@@ -3334,6 +3371,37 @@ export default function AdminDashboard() {
             >
               Sync to CRM
             </Button>
+          </Box>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1, border: '1px solid', borderColor: 'divider' }}>
+            <Typography variant="subtitle2" sx={{ minWidth: 160, whiteSpace: 'nowrap' }}>Admin Slack Channel:</Typography>
+            <TextField
+              size="small"
+              placeholder="Channel ID (e.g., C07XXXXXXXX)"
+              value={adminSlackChannelInput}
+              onChange={(e) => { setAdminSlackChannelInput(e.target.value); setAdminSlackChannelSaved(false); }}
+              sx={{ width: 280 }}
+            />
+            <Button
+              variant="contained"
+              size="small"
+              onClick={handleSaveAdminSlackChannel}
+              disabled={adminSlackChannelLoading || !adminSlackChannelInput.trim()}
+            >
+              {adminSlackChannelLoading ? <CircularProgress size={20} /> : 'Save'}
+            </Button>
+            {adminSlackChannel && (
+              <Link
+                href={`https://slack.com/app_redirect?channel=${adminSlackChannel}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                sx={{ display: 'flex', alignItems: 'center', gap: 0.5, whiteSpace: 'nowrap' }}
+              >
+                Open in Slack <OpenInNewIcon fontSize="small" />
+              </Link>
+            )}
+            {adminSlackChannelSaved && (
+              <Typography variant="caption" color="success.main">Saved!</Typography>
+            )}
           </Box>
           <TableContainer component={Paper}>
             <Table>
