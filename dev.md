@@ -46,6 +46,47 @@ The 15 emma-sidebar sessions were created in rapid bursts (many within seconds o
 
 ---
 
+# March 27, 2026: Investigation — Landing Page Preview URLs Returning `not_found`
+
+## Problem
+
+The coding agent's `get_landing_page_preview_url` tool was consistently returning `buildStatus: "not_found"` for draft branch preview deployments. Observed in session `2db6affe-75f1-4502-8cbc-5e2c476dab6b` (Waldium hero banner redesign) — the tool was called 3 times, all returning not_found despite the draft branch having valid commits pushed via the GitHub API.
+
+## Root Cause
+
+**Two Vercel projects existed for the same customer**, created at different times:
+
+1. **Original project** (`waldium-lander`, `prj_P6X3YHKGydAVFN3xtml1dxl1Haqo`) — linked to the consolidated repo `AgentWebPro/v0-waldium-lander`, serving production at `start.waldium.com`, receiving all branch push webhooks and creating preview deployments correctly.
+2. **Auto-generated project** (`lp-waldium-value-first-landing-pa-0ae94752`, `prj_ZlAxFRUuxfowuTCAsjyiDngVBj0p`) — created by the `createVercelProject()` flow in `v0Service.ts` when a new landing page was generated. Linked to a stale auto-generated repo `AgentWebPro/lp-waldium-value-first-landing-pa-0ae94752`, which had no draft branches and no recent deployments since March 18.
+
+All 5 Waldium landing page records in `AW-LandingPages` had `vercelProjectId` pointing to the **wrong** (auto-generated) project. When `getPreviewDeploymentUrl()` queried Vercel's deployments API for `prj_ZlAxFRUuxfowuTCAsjyiDngVBj0p`, it found no deployments matching the draft branch — because the coding agent pushed code to `v0-waldium-lander`, which only the original project was watching.
+
+## Investigation Steps
+
+1. Retrieved session data from `AW-ChatSessions` — `calledFunctions` showed `get_landing_page_preview_url` called 3x, `coding_agent` called 2x (retried after preview failure).
+2. Confirmed draft branch `draft/2db6affe-75f1-45` existed in `AgentWebPro/v0-waldium-lander` with 4 commits.
+3. Used Vercel API (token from `dev/AgentWeb/Vercel` in Secrets Manager) to list deployments on the DB-referenced project — found only `main` branch deployments from March 18, zero draft branch deployments.
+4. Discovered a second Vercel project (`waldium-lander`) linked to the correct repo, which had READY deployments for all draft branches including `draft/2db6affe-75f1-45`.
+
+## Fix
+
+Updated `vercelProjectId` in `AW-LandingPages` DynamoDB table for all affected records:
+
+**Waldium** (5 pages): `prj_ZlAxFRUuxfowuTCAsjyiDngVBj0p` → `prj_P6X3YHKGydAVFN3xtml1dxl1Haqo`
+**Haven** (2 pages): `prj_CRoy9Bt1h23v4az2NrRvRpq5DsRz` → `prj_U38WBYiLKZdjh1IUcfyIBhQTtzaE`
+
+Full prod scan of all 32 landing pages across 6 Vercel projects confirmed only Waldium and Haven were affected. Other customers (xCures, AgentWeb SEO, Your360, AgentWeb Main) had matching repo/project configurations.
+
+## Lesson
+
+When a customer's landing pages are consolidated into a single `v0-*` GitHub repo, the `vercelProjectId` in DynamoDB must be updated to match the Vercel project that is actually linked to that repo. The auto-generated `lp-*` Vercel project (created by `createVercelProject()` during initial page generation) becomes stale after consolidation.
+
+To diagnose similar issues in the future:
+- Compare `githubRepoUrl` in `AW-LandingPages` against the Vercel project's `link.repo` via `GET /v9/projects/{id}`
+- If they point to different GitHub repos, the preview URL flow is broken
+
+---
+
 # March 26, 2026: Investigation — Recurring S3 DeleteObject Errors on Prod EB
 
 ## Problem
