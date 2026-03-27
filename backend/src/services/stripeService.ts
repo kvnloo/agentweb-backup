@@ -210,18 +210,39 @@ export async function handleCheckoutSessionCompleted(session: any): Promise<void
   const subscriptionType = deriveSubscriptionType(session);
   const tierConfig = await getTierConfig(subscriptionType);
 
-  await userDb.updateUser(user.userId, {
+  // Fetch the actual subscription to get accurate status and period end
+  let actualStatus = 'active';
+  let currentPeriodEnd: string | undefined;
+  if (stripeSubscriptionId) {
+    try {
+      const s = getStripeOrThrow();
+      const sub = await s.subscriptions.retrieve(stripeSubscriptionId) as any;
+      actualStatus = sub.status; // Could be 'trialing', 'active', etc.
+      if (sub.current_period_end) {
+        currentPeriodEnd = new Date(sub.current_period_end * 1000).toISOString();
+      }
+    } catch (err) {
+      console.warn(`Could not fetch subscription ${stripeSubscriptionId} for status:`, err);
+    }
+  }
+
+  const updateData: Record<string, any> = {
     stripe_customer_id: stripeCustomerId,
     stripe_subscription_id: stripeSubscriptionId,
     subscriptionType,
-    subscription_status: 'active',
+    subscription_status: actualStatus,
     has_payment_method: true, // completed checkout = has payment method
     allowedPages: tierConfig?.allowedPages ?? [...DEFAULT_PAGES],
     allowedSkills: tierConfig?.allowedSkills ?? ['*'],
-  });
+  };
+  if (currentPeriodEnd) {
+    updateData.current_period_end = currentPeriodEnd;
+  }
+
+  await userDb.updateUser(user.userId, updateData);
 
   console.log(
-    `Checkout completed: user ${user.userId} → stripe_customer_id=${stripeCustomerId}, subscription=${stripeSubscriptionId}`
+    `Checkout completed: user ${user.userId} → stripe_customer_id=${stripeCustomerId}, subscription=${stripeSubscriptionId}, status=${actualStatus}, periodEnd=${currentPeriodEnd || 'unknown'}`
   );
 }
 
@@ -239,12 +260,36 @@ export async function handleSubscriptionUpdated(subscription: any): Promise<void
     return;
   }
 
-  await userDb.updateUser(user.userId, {
+  const updateData: Record<string, any> = {
     subscription_status: subscription.status,
-  });
+  };
+
+  // Sync current_period_end so trial end dates are tracked
+  if (subscription.current_period_end) {
+    updateData.current_period_end = new Date(
+      typeof subscription.current_period_end === 'number'
+        ? subscription.current_period_end * 1000
+        : subscription.current_period_end
+    ).toISOString();
+  }
+
+  // Sync plan tier on upgrades/downgrades
+  if (subscription.items?.data?.[0]?.price?.id) {
+    const newType = deriveSubscriptionTypeFromPriceId(subscription.items.data[0].price.id);
+    if (newType) {
+      updateData.subscriptionType = newType;
+      const tierConfig = await getTierConfig(newType);
+      if (tierConfig) {
+        updateData.allowedPages = tierConfig.allowedPages;
+        updateData.allowedSkills = tierConfig.allowedSkills;
+      }
+    }
+  }
+
+  await userDb.updateUser(user.userId, updateData);
 
   console.log(
-    `Subscription updated: user ${user.userId} → status=${subscription.status}`
+    `Subscription updated: user ${user.userId} → status=${subscription.status}, periodEnd=${updateData.current_period_end || 'unchanged'}`
   );
 }
 
