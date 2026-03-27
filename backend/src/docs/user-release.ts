@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-27',
+    changes: [
+      'Fix: Landing Page Preview URL Auto-Recovery',
+      '- Fixed a bug where the coding agent could not generate preview URLs for landing pages missing their Vercel project configuration',
+      '- The system now automatically resolves the Vercel project from sibling pages sharing the same repository and backfills the missing data',
+      '- This is a one-time self-heal — once resolved, future requests are instant',
+    ],
+  },
+  {
     date: '2026-03-26',
     changes: [
       'Improvement: Smarter Landing Page Code Editing',
