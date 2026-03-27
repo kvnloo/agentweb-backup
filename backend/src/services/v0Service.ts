@@ -1820,6 +1820,48 @@ export async function getLandingPage(
 }
 
 /**
+ * Resolve the vercelProjectId for a page that is missing it by looking up
+ * sibling pages (same user, same githubRepoUrl) that have the field set.
+ * If found, backfills the value on the page record so future lookups are fast.
+ */
+export async function resolveVercelProjectId(
+  page: GeneratedLandingPage
+): Promise<string | null> {
+  if (page.vercelProjectId) return page.vercelProjectId;
+  if (!page.githubRepoUrl) return null;
+
+  const siblings = await paginatedQuery<GeneratedLandingPage>(dynamodb, {
+    TableName: TABLE_NAME,
+    IndexName: "UserIdIndex",
+    KeyConditionExpression: "userId = :userId",
+    ExpressionAttributeValues: { ":userId": page.userId },
+  });
+
+  const donor = siblings.find(
+    (s) => s.githubRepoUrl === page.githubRepoUrl && !!s.vercelProjectId
+  );
+  if (!donor?.vercelProjectId) return null;
+
+  // Backfill so this page won't need resolution again
+  await dynamodb
+    .update({
+      TableName: TABLE_NAME,
+      Key: { id: page.id },
+      UpdateExpression: "SET vercelProjectId = :vpid, updatedAt = :now",
+      ExpressionAttributeValues: {
+        ":vpid": donor.vercelProjectId,
+        ":now": new Date().toISOString(),
+      },
+    })
+    .promise();
+  console.log(
+    `[V0 SERVICE] Backfilled vercelProjectId ${donor.vercelProjectId} on page ${page.id} from sibling ${donor.id}`
+  );
+
+  return donor.vercelProjectId;
+}
+
+/**
  * List all generated landing pages for a user (excludes archived).
  */
 export async function listLandingPages(
