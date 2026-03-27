@@ -79,7 +79,20 @@ const baseAdminContext = {
 
 const getTableEmails = (table: HTMLElement) => {
   const rows = within(table).getAllByRole("row").slice(1);
-  return rows.map((row) => within(row).getAllByRole("cell")[0]?.textContent);
+  return rows
+    .map((row) => {
+      const cells = within(row).getAllByRole("cell");
+      if (!cells.length) return null;
+      // Users table has an expand icon button in cell[0], email in cell[1].
+      // Waitlist table has email directly in cell[0].
+      // Check cell[0] first; if it doesn't contain an email, try cell[1].
+      const cell0Text = cells[0]?.textContent?.trim() || "";
+      if (cell0Text.includes("@")) return cell0Text;
+      const cell1Text = cells[1]?.textContent?.trim() || "";
+      if (cell1Text.includes("@")) return cell1Text;
+      return null;
+    })
+    .filter((email): email is string => email !== null);
 };
 
 describe("AdminDashboard sorting", () => {
@@ -88,21 +101,21 @@ describe("AdminDashboard sorting", () => {
     (axios.get as jest.Mock).mockResolvedValue({ data: [] });
   });
 
-  it("defaults Users table to Created desc and toggles on click", async () => {
+  it("defaults Users table to createdAt desc and re-sorts on User header click", async () => {
     searchParams = new URLSearchParams("tab=users");
     mockAdminContext = {
       ...baseAdminContext,
       users: [
         {
           userId: "old",
-          email: "old@example.com",
+          email: "alpha@example.com",
           isAdmin: false,
           isActive: true,
           createdAt: "2026-01-01T10:00:00.000Z",
         },
         {
           userId: "new",
-          email: "new@example.com",
+          email: "zebra@example.com",
           isAdmin: false,
           isActive: true,
           createdAt: "2026-01-03T10:00:00.000Z",
@@ -117,11 +130,13 @@ describe("AdminDashboard sorting", () => {
     );
 
     const table = await screen.findByRole("table");
-    expect(getTableEmails(table)).toEqual(["new@example.com", "old@example.com"]);
+    // Default sort is createdAt desc — newer user (zebra) first
+    expect(getTableEmails(table)).toEqual(["zebra@example.com", "alpha@example.com"]);
 
+    // Click "User" header to sort by email ascending — alpha before zebra
     const user = userEvent.setup();
-    await user.click(screen.getByText("Created"));
-    expect(getTableEmails(table)).toEqual(["old@example.com", "new@example.com"]);
+    await user.click(screen.getByText("User"));
+    expect(getTableEmails(table)).toEqual(["alpha@example.com", "zebra@example.com"]);
   });
 
   it("defaults Waitlist table to Joined desc", async () => {
