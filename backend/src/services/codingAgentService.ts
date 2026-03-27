@@ -42,7 +42,7 @@ interface ApplyResult {
   errors: string[];
 }
 
-const DEFAULT_MAX_ITERATIONS = 15;
+const DEFAULT_MAX_ITERATIONS = 50;
 const CODING_AGENT_MODEL = 'us.anthropic.claude-opus-4-6-v1';
 const AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes max for the entire agent run
 const MAX_TOOL_RESULT_CHARS = 30000; // Truncate tool results to prevent context bloat
@@ -56,11 +56,11 @@ const CODING_AGENT_SYSTEM_PROMPT = `You are a coding agent that edits landing pa
 - Make targeted, small edits (1-5 edit blocks per call). Never rewrite entire files.
 - For files over 5KB, use search_in_file to locate code before reading. Use read_file with line ranges, not whole files.
 - Prefer line_edits (from line numbers in search/read output) over search/replace.
-- After editing, check_deployment. If the build fails, fix it. If still failing after 2 attempts, revert_file.
+- Do NOT check_deployment after every edit. Make ALL your edits first, then check_deployment ONCE at the end. If the build fails, fix it. If still failing after 2 attempts, revert_file.
 - Only browse_page to verify when visual correctness matters for the task.
 - Do not make changes the user did not ask for.
 - Before your first edit, note the current commit SHA (via list_commits) so you can revert if needed.
-- When done, call report_to_user with a summary and the preview URL.
+- When done, check_deployment once, then call report_to_user with a summary and the preview URL.
 
 Skip steps that aren't needed. For a simple text change, you might just: read the file, edit it, check deployment, and report. Use your judgment.`;
 
