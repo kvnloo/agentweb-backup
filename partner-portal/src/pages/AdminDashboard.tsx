@@ -675,6 +675,11 @@ export default function AdminDashboard() {
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const [usersOrderBy, setUsersOrderBy] = useState<keyof User>("createdAt");
   const [usersOrder, setUsersOrder] = useState<"asc" | "desc">("desc");
+  // User filters
+  const [userSearchQuery, setUserSearchQuery] = useState("");
+  const [userFilterStatus, setUserFilterStatus] = useState<"active" | "inactive" | "all">("active");
+  const [userFilterTier, setUserFilterTier] = useState<string>("all");
+  const [userFilterPaid, setUserFilterPaid] = useState<"all" | "paid" | "unpaid">("all");
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
@@ -1396,7 +1401,30 @@ export default function AdminDashboard() {
   };
 
   const sortedUsers = React.useMemo(() => {
-    return [...contextUsers].sort((a, b) => {
+    const filtered = contextUsers.filter((user) => {
+      // Search filter
+      if (userSearchQuery) {
+        const q = userSearchQuery.toLowerCase();
+        const matchEmail = user.email?.toLowerCase().includes(q);
+        const matchNote = user.supportNote?.toLowerCase().includes(q);
+        const matchId = user.userId?.toLowerCase().includes(q);
+        if (!matchEmail && !matchNote && !matchId) return false;
+      }
+      // Status filter
+      if (userFilterStatus === "active" && user.isActive === false) return false;
+      if (userFilterStatus === "inactive" && user.isActive !== false) return false;
+      // Tier filter
+      if (userFilterTier !== "all") {
+        const tier = user.subscriptionType || (user.roles?.includes("customer") ? "Basic" : "");
+        if (userFilterTier === "none" && tier) return false;
+        if (userFilterTier !== "none" && tier !== userFilterTier) return false;
+      }
+      // Paid filter
+      if (userFilterPaid === "paid" && !user.stripe_customer_id) return false;
+      if (userFilterPaid === "unpaid" && user.stripe_customer_id) return false;
+      return true;
+    });
+    return filtered.sort((a, b) => {
       const aVal = getUserSortValue(a, usersOrderBy);
       const bVal = getUserSortValue(b, usersOrderBy);
 
@@ -1410,7 +1438,7 @@ export default function AdminDashboard() {
         ? aStr.localeCompare(bStr)
         : bStr.localeCompare(aStr);
     });
-  }, [contextUsers, usersOrder, usersOrderBy]);
+  }, [contextUsers, usersOrder, usersOrderBy, userSearchQuery, userFilterStatus, userFilterTier, userFilterPaid]);
 
   const handleUserSort = (property: keyof User) => {
     const isAsc = usersOrderBy === property && usersOrder === "asc";
@@ -3326,7 +3354,88 @@ export default function AdminDashboard() {
               {success}
             </Alert>
           )}
-          <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 2 }}>
+          {/* Summary stats */}
+          <Box sx={{ display: "flex", gap: 2, mb: 2, flexWrap: "wrap" }}>
+            {[
+              { label: "Total", value: contextUsers.length, color: "default" as const },
+              { label: "Active", value: contextUsers.filter(u => u.isActive !== false).length, color: "success" as const },
+              { label: "Paid (Stripe)", value: contextUsers.filter(u => u.stripe_customer_id).length, color: "primary" as const },
+              { label: "Super Premium", value: contextUsers.filter(u => u.subscriptionType === "Super Premium").length, color: "secondary" as const },
+              { label: "Advanced", value: contextUsers.filter(u => u.subscriptionType === "Advanced").length, color: "warning" as const },
+              { label: "Free / Basic", value: contextUsers.filter(u => !u.subscriptionType || u.subscriptionType === "Free" || u.subscriptionType === "Basic").length, color: "default" as const },
+              { label: "Showing", value: sortedUsers.length, color: "info" as const },
+            ].map((stat) => (
+              <Chip
+                key={stat.label}
+                label={`${stat.label}: ${stat.value}`}
+                color={stat.color}
+                variant={stat.label === "Showing" ? "outlined" : "filled"}
+                size="small"
+              />
+            ))}
+          </Box>
+          {/* Filter bar */}
+          <Box sx={{ display: "flex", gap: 2, mb: 2, alignItems: "center", flexWrap: "wrap" }}>
+            <TextField
+              size="small"
+              placeholder="Search email, name, or ID..."
+              value={userSearchQuery}
+              onChange={(e) => setUserSearchQuery(e.target.value)}
+              sx={{ minWidth: 250 }}
+            />
+            <FormControl size="small" sx={{ minWidth: 120 }}>
+              <InputLabel>Status</InputLabel>
+              <Select
+                value={userFilterStatus}
+                label="Status"
+                onChange={(e) => setUserFilterStatus(e.target.value as "active" | "inactive" | "all")}
+              >
+                <MenuItem value="active">Active</MenuItem>
+                <MenuItem value="inactive">Inactive</MenuItem>
+                <MenuItem value="all">All</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 140 }}>
+              <InputLabel>Tier</InputLabel>
+              <Select
+                value={userFilterTier}
+                label="Tier"
+                onChange={(e) => setUserFilterTier(e.target.value)}
+              >
+                <MenuItem value="all">All Tiers</MenuItem>
+                <MenuItem value="Super Premium">Super Premium</MenuItem>
+                <MenuItem value="Advanced">Advanced</MenuItem>
+                <MenuItem value="Basic">Basic</MenuItem>
+                <MenuItem value="Free">Free</MenuItem>
+                <MenuItem value="none">No Tier Set</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 130 }}>
+              <InputLabel>Payment</InputLabel>
+              <Select
+                value={userFilterPaid}
+                label="Payment"
+                onChange={(e) => setUserFilterPaid(e.target.value as "all" | "paid" | "unpaid")}
+              >
+                <MenuItem value="all">All</MenuItem>
+                <MenuItem value="paid">Paid (Stripe)</MenuItem>
+                <MenuItem value="unpaid">No Stripe ID</MenuItem>
+              </Select>
+            </FormControl>
+            {(userSearchQuery || userFilterStatus !== "active" || userFilterTier !== "all" || userFilterPaid !== "all") && (
+              <Button
+                size="small"
+                onClick={() => {
+                  setUserSearchQuery("");
+                  setUserFilterStatus("active");
+                  setUserFilterTier("all");
+                  setUserFilterPaid("all");
+                }}
+              >
+                Clear Filters
+              </Button>
+            )}
+            <Box sx={{ flexGrow: 1 }} />
             <Button
               variant="contained"
               startIcon={<SyncIcon />}
@@ -4011,9 +4120,18 @@ export default function AdminDashboard() {
                                 </>
                               ) : (
                                 <>
-                                  <Typography variant="body2" sx={{ flex: 1, minWidth: 100 }}>
-                                    {user.subscriptionType || "Basic"}
-                                  </Typography>
+                                  <Chip
+                                    label={user.subscriptionType || "Basic"}
+                                    size="small"
+                                    color={
+                                      (user.subscriptionType === "Super Premium") ? "success" :
+                                      (user.subscriptionType === "Advanced") ? "warning" :
+                                      (user.subscriptionType === "Basic" || !user.subscriptionType) ? "default" :
+                                      (user.subscriptionType === "Free") ? "default" : "default"
+                                    }
+                                    variant={(user.subscriptionType === "Free" || !user.subscriptionType) ? "outlined" : "filled"}
+                                    sx={{ flex: 0, minWidth: 80 }}
+                                  />
                                   <IconButton
                                     size="small"
                                     onClick={() => {
