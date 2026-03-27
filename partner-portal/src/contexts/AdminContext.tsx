@@ -32,6 +32,10 @@ interface User {
   chatSessionCount?: number;
   isOAuthUser?: boolean;
   stripe_customer_id?: string;
+  stripe_subscription_id?: string;
+  subscription_status?: string; // active, trialing, past_due, canceled, canceling
+  has_payment_method?: boolean;
+  current_period_end?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
   defaultSenderUsername?: string; // Default sender username (e.g., noreply)
