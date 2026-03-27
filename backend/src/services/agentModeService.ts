@@ -2853,6 +2853,26 @@ When a user requests client onboarding or says "onboard new client" or similar:
       return extracted;
     }
 
+    // For HTML file creation, preserve the S3 URL so frontend can open artifact panel
+    if (toolName === 'create_html_file') {
+      console.log('[DEBUG] extractMinimalToolResult hit for create_html_file');
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse create_html_file result.content as JSON:`, e);
+        }
+      }
+      return {
+        success: actualResult.success,
+        message: actualResult.message,
+        s3_url: actualResult.s3_url,
+        filename: actualResult.filename,
+        title: actualResult.title,
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
