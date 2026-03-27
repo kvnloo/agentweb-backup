@@ -13,6 +13,7 @@ import {
   postThinkingMessage,
   deleteSlackMessage,
   getSlackUserDisplayName,
+  getSlackUserEmail,
   downloadSlackFile
 } from "../services/slackService";
 import { approvalDb, getAssetTypeFromFilename } from "../services/approvalDb";
@@ -23,6 +24,103 @@ import { isSessionLimitError } from "../utils/agentModeErrors";
 import { sendAgentModeOncallAlert } from "../utils/agentModeAlerts";
 
 const router = express.Router();
+
+/**
+ * Helper: handles the shared post-session-creation flow for Slack sessions.
+ * Sets title, associates thread, saves mapping, generates response, posts to Slack.
+ */
+async function handleSlackSessionResponse(params: {
+  session: any;
+  user: any;
+  channel: string;
+  ts: string;
+  rawMessage: string;
+  userMessage: string;
+}) {
+  const { session, user, channel, ts, rawMessage, userMessage } = params;
+  const { chatbotDb } = await import('../services/chatbotService');
+  const { settingsService } = await import('../services/settingsService');
+
+  // Set session title based on raw message (without username prefix)
+  const sessionTitle = rawMessage.length > 50
+    ? rawMessage.substring(0, 47) + '...'
+    : rawMessage;
+  await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
+
+  // Associate the session with this Slack thread
+  const slackThread = { channel, threadTs: ts };
+  await chatbotDb.updateSessionSlackThread(session.sessionId, slackThread);
+
+  // Save thread-to-session mapping for future thread replies
+  const threadMappingKey = `slack_thread_${channel}_${ts}`;
+  await settingsService.setSetting(
+    threadMappingKey,
+    JSON.stringify({ sessionId: session.sessionId, userId: user.userId }),
+    `Slack thread to session mapping`,
+    'system'
+  );
+
+  // Create interactive share link so user can optionally continue in the portal
+  const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
+  console.log('🔗 iShare link created for Slack session:', ishareLink);
+
+  // Post a "thinking" message while we generate the response
+  const thinkingTs = await postThinkingMessage(channel, ts);
+
+  // Generate the response
+  const { generateSessionResponse } = await import('../controllers/agentModeController');
+  const { agentModeService } = await import('../services/agentModeService');
+
+  const llmModel = session.llmModel || await agentModeService.getDefaultModel();
+
+  try {
+    const response = await generateSessionResponse(
+      session.sessionId,
+      userMessage,
+      user.userId,
+      llmModel,
+      [] // attachments
+    );
+
+    // Remove the thinking message
+    if (thinkingTs) {
+      await deleteSlackMessage(channel, thinkingTs);
+    }
+
+    // Post Emma's response to the Slack thread
+    if (response.content) {
+      await postThreadResponse(channel, ts, response.content);
+    }
+
+    // Post iShare link as a separate follow-up message
+    if (ishareLink) {
+      const { WebClient } = await import('@slack/web-api');
+      const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+      await slackClient.chat.postMessage({
+        channel,
+        thread_ts: ts,
+        text: `Continue chat by simply reply or click to chat in AgentWeb portal: ${ishareLink}`,
+        blocks: [
+          {
+            type: 'context',
+            elements: [
+              {
+                type: 'mrkdwn',
+                text: `:speech_balloon: Continue chat by simply reply or <${ishareLink}|click to chat in AgentWeb portal>`
+              }
+            ]
+          }
+        ]
+      });
+    }
+  } catch (genError) {
+    console.error('❌ Error generating agent response for Slack session:', genError);
+    if (thinkingTs) {
+      await deleteSlackMessage(channel, thinkingTs);
+    }
+    await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
+  }
+}
 
 /**
  * @route GET /api/slack/channels
@@ -170,58 +268,20 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
         });
 
         try {
-          // Find user by slack channel using AW-Settings cache
           const { userDb } = await import('../services/db');
+          const { chatbotDb } = await import('../services/chatbotService');
+          const { WebClient } = await import('@slack/web-api');
+          const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
 
-          const mappingKey = `slack_channel_mapping_${channel}`;
-          let user = null;
-
-          // Try to get userId from AW-Settings cache
-          const cachedMapping = await settingsService.getSetting(mappingKey);
-          if (cachedMapping?.settingValue) {
-            console.log(`✅ Found cached userId for Slack channel ${channel}: ${cachedMapping.settingValue}`);
-            user = await userDb.getUserById(cachedMapping.settingValue);
-          }
-
-          // If not found in cache, scan all users and save mapping
-          if (!user) {
-            console.log(`🔍 No cached mapping found for channel ${channel}, scanning all users...`);
-            const allUsers = await userDb.getAllUsers();
-            user = allUsers.find(u => u.slackChannel === channel);
-
-            // Save mapping to cache if user found
-            if (user) {
-              console.log(`💾 Saving Slack channel mapping: ${channel} -> ${user.userId}`);
-              await settingsService.setSetting(
-                mappingKey,
-                user.userId,
-                `Slack channel to userId mapping for channel ${channel}`,
-                'system'
-              );
-            }
-          }
-
-          if (!user) {
-            console.log(`❌ No user found with slackChannel: ${channel}`);
-            // Send error message to Slack
-            const { WebClient } = await import('@slack/web-api');
-            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-            await slackClient.chat.postMessage({
-              channel,
-              text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
-              thread_ts: ts
-            });
-            return;
-          }
-
-          // Extract the user's message (remove the bot mention)
+          // Extract the message (remove bot mention and normalize Slack formatting)
           const botMentionPattern = /<@[A-Z0-9]+>/g;
-          const rawMessage = text.replace(botMentionPattern, '').trim();
+          const rawMessage = text
+            .replace(botMentionPattern, '')
+            .replace(/<mailto:([^|>]+)\|[^>]+>/g, '$1') // <mailto:email|email> → email
+            .replace(/<mailto:([^|>]+)>/g, '$1')         // <mailto:email> → email
+            .trim();
 
           if (!rawMessage) {
-            console.log('❌ No message content after removing bot mention');
-            const { WebClient } = await import('@slack/web-api');
-            const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
             await slackClient.chat.postMessage({
               channel,
               text: '👋 Hi! Please include a message after mentioning me. For example: @Emma help me create a social media post',
@@ -230,117 +290,131 @@ router.post("/events", express.json(), async (req: Request, res: Response) => {
             return;
           }
 
+          // Check if this is the admin Slack channel
+          const adminChannelSetting = await settingsService.getSetting('slack_admin_channel');
+          const isAdminChannel = adminChannelSetting?.settingValue && adminChannelSetting.settingValue === channel;
+
+          let user = null;
+          let delegateInfo: { adminUserId: string; adminEmail: string; isDelegated: boolean } | undefined;
+          let actualMessage = rawMessage;
+          let pageIdentifier = 'slack-bot';
+
+          if (isAdminChannel) {
+            // Admin channel: parse "for user@email.com <message>" syntax
+            // Allow optional comma/colon after email: "for user@email.com, say hello"
+            const forMatch = rawMessage.match(/^for\s+(\S+@\S+?)[,:\s]\s*([\s\S]+)$/i);
+
+            if (!forMatch) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: 'This is the admin support channel. Please use the syntax:\n`@Emma for user@email.com <your message>`',
+                thread_ts: ts
+              });
+              return;
+            }
+
+            const targetEmail = forMatch[1].toLowerCase();
+            actualMessage = forMatch[2].trim();
+
+            // Look up the target user
+            user = await userDb.getUserByEmail(targetEmail);
+            if (!user) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: `User not found: ${targetEmail}`,
+                thread_ts: ts
+              });
+              return;
+            }
+
+            // Resolve admin identity from Slack
+            const adminEmail = await getSlackUserEmail(slackUserId);
+            let adminUserId = slackUserId;
+            if (adminEmail) {
+              const adminUser = await userDb.getUserByEmail(adminEmail);
+              if (adminUser) {
+                adminUserId = adminUser.userId;
+              }
+            }
+
+            delegateInfo = {
+              adminUserId,
+              adminEmail: adminEmail || `slack:${slackUserId}`,
+              isDelegated: true
+            };
+            pageIdentifier = 'slack-bot-admin';
+
+            // Post confirmation
+            await postThreadResponse(channel, ts, `Starting session for ${targetEmail}`);
+            console.log(`📝 Admin channel: creating session for ${targetEmail} (admin: ${delegateInfo.adminEmail})`);
+          } else {
+            // Regular per-user channel: existing lookup logic
+            const mappingKey = `slack_channel_mapping_${channel}`;
+
+            const cachedMapping = await settingsService.getSetting(mappingKey);
+            if (cachedMapping?.settingValue) {
+              user = await userDb.getUserById(cachedMapping.settingValue);
+            }
+
+            if (!user) {
+              const allUsers = await userDb.getAllUsers();
+              user = allUsers.find((u: any) => u.slackChannel === channel);
+
+              if (user) {
+                await settingsService.setSetting(
+                  mappingKey,
+                  user.userId,
+                  `Slack channel to userId mapping for channel ${channel}`,
+                  'system'
+                );
+              }
+            }
+
+            if (!user) {
+              await slackClient.chat.postMessage({
+                channel,
+                text: '❌ Sorry, I couldn\'t find a user account linked to this Slack channel. Please contact support.',
+                thread_ts: ts
+              });
+              return;
+            }
+          }
+
           // Prefix message with sender's display name
           const displayName = await getSlackUserDisplayName(slackUserId);
-          const userMessage = `${displayName}: ${rawMessage}`;
+          const userMessage = `${displayName}: ${actualMessage}`;
 
           console.log('📝 Creating Agent Mode session for user:', user.userId);
 
           // Create Agent Mode session
-          const { chatbotDb } = await import('../services/chatbotService');
           const session = await chatbotDb.createChatSession(
             user.userId,
             undefined, // pageContent
             'agent', // portalType
-            'slack-bot', // pageIdentifier
+            pageIdentifier,
             undefined, // selectedStartupId
             undefined, // workflowId
             undefined, // executionId
             undefined, // emailCampaignTaskId
             'regular', // sessionType
-            undefined // delegateInfo
+            delegateInfo
           );
 
           console.log('✅ Agent Mode session created:', session.sessionId);
 
-          // Set session title based on raw message (without username prefix)
-          const sessionTitle = rawMessage.length > 50
-            ? rawMessage.substring(0, 47) + '...'
-            : rawMessage;
-          await chatbotDb.updateSessionTitle(session.sessionId, sessionTitle);
-
-          // Associate the session with this Slack thread
-          const slackThread = { channel, threadTs: ts };
-          await chatbotDb.updateSessionSlackThread(session.sessionId, slackThread);
-
-          // Save thread-to-session mapping for future thread replies
-          const threadMappingKey = `slack_thread_${channel}_${ts}`;
-          await settingsService.setSetting(
-            threadMappingKey,
-            JSON.stringify({ sessionId: session.sessionId, userId: user.userId }),
-            `Slack thread to session mapping`,
-            'system'
-          );
-
-          // Create interactive share link so user can optionally continue in the portal
-          const ishareLink = await chatbotDb.createOrReuseInteractiveShare(session.sessionId);
-          console.log('🔗 iShare link created for Slack session:', ishareLink);
-
-          console.log('🔗 Slack thread associated with session:', session.sessionId);
-
-          // Post a "thinking" message while we generate the response
-          const thinkingTs = await postThinkingMessage(channel, ts);
-
-          // Generate the response (await it so we can post back to Slack)
-          const { generateSessionResponse } = await import('../controllers/agentModeController');
-          const { agentModeService } = await import('../services/agentModeService');
-
-          const llmModel = session.llmModel || await agentModeService.getDefaultModel();
-
-          try {
-            const response = await generateSessionResponse(
-              session.sessionId,
-              userMessage,
-              user.userId,
-              llmModel,
-              [] // attachments
-            );
-
-            // Remove the thinking message
-            if (thinkingTs) {
-              await deleteSlackMessage(channel, thinkingTs);
-            }
-
-            // Post Emma's response to the Slack thread
-            if (response.content) {
-              await postThreadResponse(channel, ts, response.content);
-            }
-
-            // Post iShare link as a separate follow-up message
-            console.log('🔗 About to post iShare link:', ishareLink);
-            if (ishareLink) {
-              const { WebClient } = await import('@slack/web-api');
-              const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-              await slackClient.chat.postMessage({
-                channel,
-                thread_ts: ts,
-                text: `Continue chat by simply reply or click to chat in AgentWeb portal: ${ishareLink}`,
-                blocks: [
-                  {
-                    type: 'context',
-                    elements: [
-                      {
-                        type: 'mrkdwn',
-                        text: `:speech_balloon: Continue chat by simply reply or <${ishareLink}|click to chat in AgentWeb portal>`
-                      }
-                    ]
-                  }
-                ]
-              });
-            }
-          } catch (genError) {
-            console.error('❌ Error generating agent response for Slack session:', genError);
-            // Remove thinking message and post error
-            if (thinkingTs) {
-              await deleteSlackMessage(channel, thinkingTs);
-            }
-            await postThreadResponse(channel, ts, 'Sorry, I encountered an error while processing your request. Please try again.');
-          }
+          // Handle the rest: title, thread mapping, response generation, posting
+          await handleSlackSessionResponse({
+            session,
+            user,
+            channel,
+            ts,
+            rawMessage: actualMessage,
+            userMessage
+          });
 
           console.log('✅ Emma bot mention handled successfully');
         } catch (error) {
           console.error('❌ Error handling Emma bot mention:', error);
-          // Send error message to Slack
           try {
             const { WebClient } = await import('@slack/web-api');
             const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
