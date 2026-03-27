@@ -12,6 +12,10 @@ import {
   IconButton,
   LinearProgress,
   Skeleton,
+  Table,
+  TableBody,
+  TableCell,
+  TableRow,
   TextField,
   Tooltip,
   Typography,
@@ -29,6 +33,7 @@ import PaletteIcon from '@mui/icons-material/Palette';
 import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import ShieldIcon from '@mui/icons-material/Shield';
+import BarChartIcon from '@mui/icons-material/BarChart';
 
 // ------------------------------------------------------------------
 // Types
@@ -71,12 +76,19 @@ interface CreativeVariety {
   top_creatives?: Array<{ id: string; name: string; spend_pct: number }>;
 }
 
+interface UsageSummary {
+  chatSessionCount: number;
+  taskCount: number;
+  workflowCount: number;
+}
+
 interface ClientHealthDetail {
   client: { userId: string; email: string; displayName: string };
   ads_layer: AdsLayerHealth;
   lander_layer: LanderLayerHealth;
   lead_quality_layer: LeadQualityLayerHealth;
   creative_variety: CreativeVariety;
+  usage_summary?: UsageSummary;
   status: HealthStatus;
   status_reasons: string[];
 }
@@ -549,6 +561,59 @@ export default function ClientHealth() {
                       ))}
                     </Box>
                   )}
+              </CardContent>
+            </Card>
+
+            {/* Usage Summary */}
+            <Card>
+              <CardContent>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                  <BarChartIcon fontSize="small" />
+                  <Typography variant="h6">User Engagement</Typography>
+                </Box>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                  New user usage from chat sessions and platform activity
+                </Typography>
+                {detail.usage_summary ? (
+                  <Table size="small">
+                    <TableBody>
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 600, border: 0, pl: 0 }}>Chat Sessions</TableCell>
+                        <TableCell sx={{ border: 0 }}>
+                          <Chip
+                            label={detail.usage_summary.chatSessionCount}
+                            size="small"
+                            color={detail.usage_summary.chatSessionCount > 0 ? 'primary' : 'default'}
+                          />
+                        </TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 600, border: 0, pl: 0 }}>Tasks Created</TableCell>
+                        <TableCell sx={{ border: 0 }}>
+                          <Chip
+                            label={detail.usage_summary.taskCount}
+                            size="small"
+                            color={detail.usage_summary.taskCount > 0 ? 'success' : 'default'}
+                          />
+                        </TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 600, border: 0, pl: 0 }}>Workflows</TableCell>
+                        <TableCell sx={{ border: 0 }}>
+                          <Chip
+                            label={detail.usage_summary.workflowCount}
+                            size="small"
+                            color={detail.usage_summary.workflowCount > 0 ? 'success' : 'default'}
+                          />
+                        </TableCell>
+                      </TableRow>
+                    </TableBody>
+                  </Table>
+                ) : (
+                  <Typography variant="body2" color="text.secondary" fontStyle="italic">
+                    Usage data not available
+                  </Typography>
+                )}
               </CardContent>
             </Card>
 

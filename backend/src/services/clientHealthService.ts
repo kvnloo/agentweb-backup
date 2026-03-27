@@ -9,7 +9,7 @@
  * Also provides creative variety heuristics from ad-level data.
  */
 
-import { userDb } from './db';
+import { userDb, taskDb, workflowDb } from './db';
 import { getAccountsByUserId } from './connectedAccountsDb';
 
 type HealthStatus = 'healthy' | 'mediocre' | 'at-risk' | 'blocked';
@@ -38,12 +38,19 @@ interface CreativeVariety {
   top_creatives?: Array<{ id: string; name: string; spend_pct: number }>;
 }
 
+interface UsageSummary {
+  chatSessionCount: number;
+  taskCount: number;
+  workflowCount: number;
+}
+
 interface ClientHealthAssessment {
   client: { userId: string; email: string; displayName: string };
   ads_layer: AdsLayerHealth;
   lander_layer: LanderLayerHealth;
   lead_quality_layer: LeadQualityLayerHealth;
   creative_variety: CreativeVariety;
+  usage_summary: UsageSummary;
   status: HealthStatus;
   status_reasons: string[];
 }
@@ -286,6 +293,19 @@ export async function assessClientHealth(
       top_creatives: topCreatives,
     };
 
+    // --- Usage Summary ---
+    const [chatSessionCount, taskCount, workflowCount] = await Promise.all([
+      userDb.getChatSessionCount(client.userId),
+      taskDb.getUserTaskCount(client.userId),
+      workflowDb.getUserWorkflowCount(client.userId),
+    ]);
+
+    const usageSummary: UsageSummary = {
+      chatSessionCount,
+      taskCount,
+      workflowCount,
+    };
+
     // --- Overall Status ---
     const { status, reasons } = determineStatus(adsLayer, landerLayer, leadQualityLayer, creativeVariety);
 
@@ -299,6 +319,7 @@ export async function assessClientHealth(
       lander_layer: landerLayer,
       lead_quality_layer: leadQualityLayer,
       creative_variety: creativeVariety,
+      usage_summary: usageSummary,
       status,
       status_reasons: reasons,
     };
