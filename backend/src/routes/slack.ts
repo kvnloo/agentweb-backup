@@ -115,6 +115,18 @@ async function handleSlackSessionResponse(params: {
     }
   } catch (genError) {
     console.error('❌ Error generating agent response for Slack session:', genError);
+
+    // Persist partial token usage from messages accumulated before the error
+    if ((genError as any)?.partialUsageMessages?.length) {
+      try {
+        const { chatbotDb } = await import('../services/chatbotService');
+        await chatbotDb.addMessagesToSession(session.sessionId, (genError as any).partialUsageMessages);
+        console.log(`Slack session: Persisted partial usage from ${(genError as any).partialUsageMessages.length} messages for failed session ${session.sessionId}`);
+      } catch (usageErr) {
+        console.error('Failed to persist partial usage for Slack session:', usageErr);
+      }
+    }
+
     if (thinkingTs) {
       await deleteSlackMessage(channel, thinkingTs);
     }
