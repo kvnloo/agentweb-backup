@@ -3,8 +3,8 @@ import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
 import path from "path";
-import { getGuide } from "../controllers/guide";
 import { getReleases } from "../controllers/release";
+import { getUserGuideContent } from "../services/notionService";
 import { getApiDocs } from "../controllers/api";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
@@ -2924,7 +2924,6 @@ function printKnowledgeBase(): void {
 // Load and cache content from backend API controllers directly
 async function loadKnowledgeBase(): Promise<void> {
   const endpoints = [
-    { controller: getGuide, source: "guide" },
     { controller: getReleases, source: "release" },
     { controller: getApiDocs, source: "api" },
     { controller: getUserReleaseNotes, source: "user-release" },
@@ -2932,6 +2931,38 @@ async function loadKnowledgeBase(): Promise<void> {
 
   const chunks: ContextChunk[] = [];
   let chunkId = 0;
+
+  // Load Notion-based user guide content
+  try {
+    const guideContent = await getUserGuideContent();
+    if (guideContent) {
+      const guideChunks = guideContent.match(/[^\.!\?]+[\.!\?]+/g) || [guideContent];
+      let currentChunk = "";
+      for (const sentence of guideChunks) {
+        if ((currentChunk + sentence).length > 2000) {
+          if (currentChunk) {
+            chunks.push({
+              id: `chunk-guide-${chunkId++}`,
+              content: currentChunk.trim(),
+              metadata: { source: "guide" },
+            });
+          }
+          currentChunk = sentence;
+        } else {
+          currentChunk += " " + sentence;
+        }
+      }
+      if (currentChunk.trim()) {
+        chunks.push({
+          id: `chunk-guide-${chunkId++}`,
+          content: currentChunk.trim(),
+          metadata: { source: "guide" },
+        });
+      }
+    }
+  } catch (error) {
+    console.error("Error loading Notion user guide for knowledge base:", error);
+  }
 
   for (const endpoint of endpoints) {
     try {
@@ -2969,7 +3000,7 @@ async function loadKnowledgeBase(): Promise<void> {
       ) {
         let content = "";
 
-        if (endpoint.source === "guide" || endpoint.source === "api") {
+        if (endpoint.source === "api") {
           for (const section of mockResponse.data.data) {
             content += `${section.title}\n`;
             for (const paragraph of section.content) {
