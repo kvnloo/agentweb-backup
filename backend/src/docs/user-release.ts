@@ -9,6 +9,15 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-28',
+    changes: [
+      'Improvement: Context-Aware Error Messages',
+      '- When Emma encounters an error mid-task, she now provides a specific, helpful message instead of a generic "I encountered an error" response',
+      '- A lightweight diagnosis agent analyzes the error context, work plan progress, and failed operations to explain what happened and what to do next',
+      '- For example, if 5 of 6 landing pages were generated before an error, the message now tells you exactly which step failed and that the others succeeded',
+    ],
+  },
+  {
     date: '2026-03-27',
     changes: [
       'Feature: Shared Schedule Templates',

@@ -14,7 +14,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
-import { isContextLimitError, isSessionLimitError } from '../utils/agentModeErrors';
+import { isContextLimitError, isSessionLimitError, isTransientLLMError } from '../utils/agentModeErrors';
+import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { skillService } from '../services/skillService';
 import { getAllowedSkills } from '../services/subscriptionService';
@@ -33,6 +34,49 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
   if (share.expiresAt) return new Date(share.expiresAt);
   if (share.sharedAt) return new Date(new Date(share.sharedAt).getTime() + LEGACY_SHARE_DEFAULT_EXPIRATION_DAYS * 86400000);
   return new Date(0); // No dates at all — treat as expired
+}
+
+/** Classify an error for the diagnosis agent. */
+function classifyErrorType(error: unknown): DiagnosisContext['errorType'] {
+  if (isContextLimitError(error)) return 'context_limit';
+  if (error instanceof Error) {
+    if (error.message.includes('content policies') || error.message.includes('content_filter')) return 'content_filter';
+    if (error.message.includes('high demand') || (error as any)?.status === 429) return 'rate_limit';
+    if (isTransientLLMError(error)) return 'transient';
+  }
+  return 'unknown';
+}
+
+/** Build a compact work plan summary string for the diagnosis agent. */
+function buildWorkPlanSummary(session: any): string | null {
+  if (!session?.workPlan?.steps?.length) return null;
+  return session.workPlan.steps
+    .map((s: any) => `Step ${s.stepCount}: ${s.title} [${s.status}]`)
+    .join('\n');
+}
+
+/**
+ * Invoke the diagnosis agent to produce a context-aware error message.
+ * Returns null if diagnosis fails — caller should fall back to the generic message.
+ */
+async function getDiagnosticErrorMessage(
+  error: unknown,
+  sessionId: string,
+  userMessage: string
+): Promise<string | null> {
+  try {
+    const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    const context: DiagnosisContext = {
+      errorType: classifyErrorType(error),
+      errorMessage: error instanceof Error ? error.message : String(error),
+      userMessage: userMessage || '',
+      workPlanSummary: buildWorkPlanSummary(session),
+      failedFunctions: session?.failedFunctions || null,
+    };
+    return await agentModeService.generateDiagnosticMessage(context);
+  } catch {
+    return null;
+  }
 }
 
 // Common function: ensure a campaign execution exists and contains all HTML report URLs
@@ -1827,14 +1871,23 @@ export const agentModeController = {
 
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
+      // Use the diagnosis agent for a context-aware message when possible.
+      let diagnosticContent: string | null = null;
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
+        // Skip diagnosis for errors that already have specific handling below (context limit, etc.)
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          const userMessage = req.body?.userMessage || '';
+          diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+        }
+
         const errorAssistantMessage: ChatMessage = {
           role: 'assistant',
-          content: 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
             isErrorMessage: true,
+            ...(diagnosticContent ? { isDiagnosticMessage: true } : {}),
           },
         };
         await chatbotDb.addMessageToSession(sessionId, errorAssistantMessage).catch(err => {
@@ -1973,7 +2026,10 @@ export const agentModeController = {
         }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
-      res.status(500).json({ error: 'Failed to generate response' });
+      res.status(500).json({
+        error: 'Failed to generate response',
+        ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
+      });
     }
   },
 
@@ -2384,14 +2440,22 @@ export const agentModeController = {
 
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
+      // Use the diagnosis agent for a context-aware message when possible.
+      let diagnosticContent: string | null = null;
       if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+        if (!(error instanceof Error && isContextLimitError(error))) {
+          const userMessage = req.body?.userMessage || '';
+          diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+        }
+
         const errorAssistantMessage: ChatMessage = {
           role: 'assistant',
-          content: 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
             isErrorMessage: true,
+            ...(diagnosticContent ? { isDiagnosticMessage: true } : {}),
           },
         };
         await chatbotDb.addMessageToSession(shareId, errorAssistantMessage).catch(err => {
@@ -2532,7 +2596,10 @@ export const agentModeController = {
         }).catch(err => console.error('Failed to send oncall alert:', err));
       }
 
-      res.status(500).json({ error: 'Failed to generate response' });
+      res.status(500).json({
+        error: 'Failed to generate response',
+        ...(diagnosticContent ? { diagnosticMessage: diagnosticContent } : {}),
+      });
     }
   },
 
