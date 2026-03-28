@@ -32,6 +32,73 @@ A secondary issue: `runVerifiedChat` had **no pre-flight check** on the session 
 
 ---
 
+# March 28, 2026: Investigation — Why Some Sessions Do Not Have Usage Data
+
+## Problem
+
+Some chat sessions in `AW-ChatSessions` have no `totalTokens` or `totalCost`, even though they contain messages and had LLM calls. Need to determine scope and root cause.
+
+## Investigation
+
+Analyzed last 500 sessions in production (queried `AdminUpdatedAtIndex`).
+
+### Data Breakdown
+
+| Portal Type | Total | With Usage | Without Usage | Multi-Msg Without Usage |
+|-------------|-------|------------|---------------|------------------------|
+| agent       | 118   | 96         | 22            | 4                      |
+| emma-sidebar| 202   | 1          | 201           | 0                      |
+
+### Emma-sidebar sessions (201 without usage) — NOT A BUG
+
+These are auto-created sessions when a user navigates to a page. 196 of 200 `messageCount=1` sessions have `updatedAt ≈ createdAt` (within 1 second) — the session was created with a system message in AW-ChatMessages, but the user never actually chatted. No LLM calls were made.
+
+The 1 Emma session that had a real conversation (7 messages) correctly has usage data.
+
+### Agent sessions with messageCount=0 (18 without usage) — NOT A BUG
+
+Sessions created but never started (e.g., predefined work plans set up but user hasn't interacted).
+
+### Agent sessions with messages but no usage — 4 sessions
+
+| Session | Type | Msgs | Model | Root Cause |
+|---------|------|------|-------|------------|
+| `f8cf70d9` | predefined-work-plan | 30 | gemini-3-pro | **Pre-dates usage tracking** (created 2026-03-16, earliest session with usage is 2026-03-26) |
+| `c3615c1c` | predefined-work-plan | 25 | claude-opus-4-6 | **Same** — created 2026-03-16 |
+| `a19cc80d` | scheduled | 2 | gemini-3.1-pro | Only system+user msgs, **AI response never persisted** (worker timeout/crash) |
+| `1e5af232` | regular (slack-bot) | 2 | undefined | Only system+user msgs, **AI response never persisted**, model undefined |
+
+### Root Causes
+
+1. **Historical sessions**: Sessions created before usage tracking was deployed (pre March 26). All messages have `hasUsage=false`. No fix needed.
+
+2. **Failed/incomplete sessions**: Worker crashed or timed out during `generateMarketingResponse`. Usage is completely lost because:
+   - Usage extraction only happens when `response.responseMessages` are persisted via `addMessagesToSession`
+   - If worker throws/times out, `responseMessages` is never populated
+   - `incrementTokenUsage()` at chatbotService.ts:803 is never reached
+   - No fallback to capture partial usage from the worker process
+
+### Gap: Usage Lost on Worker Failure
+
+When `generateMarketingResponseWorkerService.runInWorker()` fails:
+- User message: saved (before worker call)
+- AI response messages: NOT saved
+- Token usage on session: NOT tracked
+- User token allowance: NOT decremented (even though LLM was called)
+- Error message: saved for scheduled sessions only
+
+The worker (generateMarketingResponseWorker.ts) catches errors and sends them back to the parent process, but the error message contains no usage data. The LLM may have been called (and tokens consumed) before the error occurred.
+
+## Architecture Note
+
+**`chatbotService.ts` is legacy infrastructure** — it powers the partner portal chatbot and provides shared DB operations (session CRUD, message persistence, token tracking). The primary intelligence service is **`agentModeService.ts`** (Agent Mode), which handles all agent, emma-sidebar, scheduled, and Slack bot sessions. The `generateChatResponse()` function in chatbotService is only used by the partner portal's `/api/chatbot` endpoint and is not actively maintained. Future work should consolidate onto the Agent Mode path and deprecate the chatbot-specific response generation.
+
+## Recommendations
+
+1. **Capture partial usage on worker failure**: When the worker throws, include accumulated usage data in the error payload so the parent can still call `incrementTokenUsage()`.
+2. **Backfill historical sessions**: For sessions created before usage tracking (pre March 26), usage data is unrecoverable since individual message usage was never recorded.
+3. **Monitor for incomplete sessions**: Add alerting for sessions where `calledFunctions` is populated but `totalTokens` is missing — indicates a worker failure with lost usage.
+
 # March 27, 2026: Investigation — Sessions Not Showing Up in Customer Portal
 
 ## Problem
