@@ -5,28 +5,32 @@ export interface NotionCredentials {
   userGuidePageId: string;
 }
 
-let cachedCredentials: NotionCredentials | null = null;
+const credentialsCache: Record<string, NotionCredentials> = {};
 
 export async function getNotionCredentials(): Promise<NotionCredentials> {
-  if (cachedCredentials) return cachedCredentials;
-
   const environment = process.env.NODE_ENV || 'development';
-  const secretName = environment === 'production'
+  return getNotionCredentialsForEnv(environment === 'production' ? 'production' : 'development');
+}
+
+export async function getNotionCredentialsForEnv(env: 'development' | 'production'): Promise<NotionCredentials> {
+  if (credentialsCache[env]) return credentialsCache[env];
+
+  const secretName = env === 'production'
     ? 'prod/AgentWeb/Notion'
     : 'dev/AgentWeb/Notion';
 
   const secretString = await getSecret(secretName);
   if (!secretString || secretString.trim() === '') {
-    throw new Error('Notion credentials secret is empty');
+    throw new Error(`Notion credentials secret is empty for ${env}`);
   }
 
   const credentials = JSON.parse(secretString) as NotionCredentials;
   if (!credentials.apiToken || !credentials.userGuidePageId) {
-    throw new Error('Notion credentials missing apiToken or userGuidePageId');
+    throw new Error(`Notion credentials missing apiToken or userGuidePageId for ${env}`);
   }
 
-  cachedCredentials = credentials;
-  return cachedCredentials;
+  credentialsCache[env] = credentials;
+  return credentials;
 }
 
 const NOTION_API_BASE = 'https://api.notion.com/v1';
@@ -196,4 +200,255 @@ export async function deleteBlock(blockId: string): Promise<any> {
   return notionFetch(`/blocks/${blockId}`, {
     method: 'DELETE',
   });
+}
+
+// --- Sync infrastructure ---
+
+async function notionFetchWithCreds(creds: NotionCredentials, path: string, options: RequestInit = {}): Promise<any> {
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(`${NOTION_API_BASE}${path}`, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${creds.apiToken}`,
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
+
+    if (res.status === 429) {
+      const retryAfter = parseInt(res.headers.get('retry-after') || '1', 10);
+      console.log(`[Notion] Rate limited, retrying after ${retryAfter}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+      continue;
+    }
+
+    const data = await res.json();
+    if (data.object === 'error') {
+      throw new Error(`Notion API error: ${data.message}`);
+    }
+    return data;
+  }
+  throw new Error('Notion API: max retries exceeded due to rate limiting');
+}
+
+/** Fetch raw Notion block objects recursively */
+async function getRawBlocks(creds: NotionCredentials, parentId: string): Promise<any[]> {
+  const blocks: any[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const params = cursor ? `?start_cursor=${cursor}&page_size=100` : '?page_size=100';
+    const data = await notionFetchWithCreds(creds, `/blocks/${parentId}/children${params}`);
+
+    for (const block of data.results) {
+      if (block.has_children) {
+        block._children = await getRawBlocks(creds, block.id);
+      }
+      blocks.push(block);
+    }
+
+    cursor = data.has_more ? data.next_cursor : undefined;
+  } while (cursor);
+
+  return blocks;
+}
+
+/** Strip read-only fields from a raw Notion block and prepare it for creation */
+function transformBlockForCreation(block: any): any {
+  const type = block.type;
+  const typeData = block[type];
+
+  if (!typeData) return null;
+
+  // Unsupported block types for the API append endpoint
+  const unsupportedTypes = ['child_page', 'child_database', 'link_to_page', 'unsupported'];
+  if (unsupportedTypes.includes(type)) return null;
+
+  const cleanedTypeData = { ...typeData };
+
+  // Remove read-only fields
+  delete cleanedTypeData.id;
+
+  // Remove null values (Notion API rejects null for optional object fields like icon)
+  for (const key of Object.keys(cleanedTypeData)) {
+    if (cleanedTypeData[key] === null) {
+      delete cleanedTypeData[key];
+    }
+  }
+
+  const created: any = {
+    object: 'block',
+    type,
+    [type]: cleanedTypeData,
+  };
+
+  // Add children if present (recursively transformed)
+  if (block._children && block._children.length > 0) {
+    created[type].children = block._children
+      .map(transformBlockForCreation)
+      .filter(Boolean);
+  }
+
+  return created;
+}
+
+/** Delete all top-level blocks from a Notion page */
+async function deleteAllPageBlocks(creds: NotionCredentials, pageId: string): Promise<void> {
+  // Collect only top-level block IDs (children deleted automatically with parent)
+  const blockIds: string[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const params = cursor ? `?start_cursor=${cursor}&page_size=100` : '?page_size=100';
+    const data = await notionFetchWithCreds(creds, `/blocks/${pageId}/children${params}`);
+    for (const block of data.results) {
+      blockIds.push(block.id);
+    }
+    cursor = data.has_more ? data.next_cursor : undefined;
+  } while (cursor);
+
+  console.log(`[UserGuideSync] Deleting ${blockIds.length} top-level blocks...`);
+
+  // Delete in parallel batches of 3 (Notion rate limit is ~3 req/s)
+  const BATCH = 3;
+  for (let i = 0; i < blockIds.length; i += BATCH) {
+    const batch = blockIds.slice(i, i + BATCH);
+    await Promise.all(
+      batch.map(id => notionFetchWithCreds(creds, `/blocks/${id}`, { method: 'DELETE' }))
+    );
+    // Small delay between batches to stay under rate limit
+    if (i + BATCH < blockIds.length) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+    }
+  }
+}
+
+/** Append blocks to a page in batches (Notion API limit: 100 blocks per request) */
+async function appendBlocksToPage(creds: NotionCredentials, pageId: string, blocks: any[]): Promise<void> {
+  const BATCH_SIZE = 100;
+  for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
+    const batch = blocks.slice(i, i + BATCH_SIZE);
+    await notionFetchWithCreds(creds, `/blocks/${pageId}/children`, {
+      method: 'PATCH',
+      body: JSON.stringify({ children: batch }),
+    });
+  }
+}
+
+/** Get plain text content of a Notion page using specific credentials */
+async function getPagePlainText(creds: NotionCredentials, pageId: string): Promise<string> {
+  const rawBlocks = await getRawBlocks(creds, pageId);
+
+  function rawBlocksToText(blocks: any[], indent: number = 0): string {
+    const lines: string[] = [];
+    const prefix = '  '.repeat(indent);
+    for (const block of blocks) {
+      const text = blockToText(block);
+      if (text) {
+        lines.push(`${prefix}${text}`);
+      }
+      if (block._children && block._children.length > 0) {
+        lines.push(rawBlocksToText(block._children, indent + 1));
+      }
+    }
+    return lines.join('\n');
+  }
+
+  return rawBlocksToText(rawBlocks);
+}
+
+export interface ContentDiff {
+  type: 'added' | 'removed' | 'unchanged';
+  text: string;
+}
+
+/** Compute a simple line-level diff between two texts */
+function computeLineDiff(source: string, target: string): ContentDiff[] {
+  const sourceLines = source.trim().split('\n');
+  const targetLines = target.trim().split('\n');
+  const sourceSet = new Set(sourceLines);
+  const targetSet = new Set(targetLines);
+
+  const diffs: ContentDiff[] = [];
+
+  // Lines in target but not in source (will be removed by sync)
+  for (const line of targetLines) {
+    if (!sourceSet.has(line) && line.trim()) {
+      diffs.push({ type: 'removed', text: line });
+    }
+  }
+
+  // Lines in source but not in target (will be added by sync)
+  for (const line of sourceLines) {
+    if (!targetSet.has(line) && line.trim()) {
+      diffs.push({ type: 'added', text: line });
+    }
+  }
+
+  return diffs;
+}
+
+export interface UserGuideSyncStatus {
+  inSync: boolean;
+  devContentLength: number;
+  prodContentLength: number;
+  environment: string;
+  diff: ContentDiff[];
+}
+
+/** Compare user guide content between dev and prod Notion pages */
+export async function getUserGuideSyncStatus(): Promise<UserGuideSyncStatus> {
+  const environment = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+  const [devCreds, prodCreds] = await Promise.all([
+    getNotionCredentialsForEnv('development'),
+    getNotionCredentialsForEnv('production'),
+  ]);
+
+  const [devContent, prodContent] = await Promise.all([
+    getPagePlainText(devCreds, devCreds.userGuidePageId),
+    getPagePlainText(prodCreds, prodCreds.userGuidePageId),
+  ]);
+
+  const inSync = devContent.trim() === prodContent.trim();
+
+  // Compute diff: what would change in target if we sync from source
+  // In dev env, source=dev target=prod; in prod env, source=prod target=dev
+  const sourceContent = environment === 'development' ? devContent : prodContent;
+  const targetContent = environment === 'development' ? prodContent : devContent;
+  const diff = inSync ? [] : computeLineDiff(sourceContent, targetContent);
+
+  return {
+    inSync,
+    devContentLength: devContent.length,
+    prodContentLength: prodContent.length,
+    environment,
+    diff,
+  };
+}
+
+/** Sync the entire user guide between dev and prod Notion pages */
+export async function syncUserGuide(direction: 'dev-to-prod' | 'prod-to-dev'): Promise<{ success: boolean; blocksTransferred: number }> {
+  console.log(`[UserGuideSync] Starting sync: ${direction}`);
+  const sourceCreds = await getNotionCredentialsForEnv(direction === 'dev-to-prod' ? 'development' : 'production');
+  const targetCreds = await getNotionCredentialsForEnv(direction === 'dev-to-prod' ? 'production' : 'development');
+
+  // Read all blocks from source
+  console.log('[UserGuideSync] Reading source blocks...');
+  const rawBlocks = await getRawBlocks(sourceCreds, sourceCreds.userGuidePageId);
+  const transformedBlocks = rawBlocks.map(transformBlockForCreation).filter(Boolean);
+  console.log(`[UserGuideSync] Read ${transformedBlocks.length} blocks from source`);
+
+  // Clear target page
+  console.log('[UserGuideSync] Clearing target page...');
+  await deleteAllPageBlocks(targetCreds, targetCreds.userGuidePageId);
+  console.log('[UserGuideSync] Target page cleared');
+
+  // Write transformed blocks to target
+  console.log('[UserGuideSync] Writing blocks to target...');
+  await appendBlocksToPage(targetCreds, targetCreds.userGuidePageId, transformedBlocks);
+  console.log(`[UserGuideSync] Sync complete: ${transformedBlocks.length} blocks transferred`);
+
+  return { success: true, blocksTransferred: transformedBlocks.length };
 }

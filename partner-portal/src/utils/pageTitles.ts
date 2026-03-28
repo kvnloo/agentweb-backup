@@ -11,7 +11,6 @@ const routeTitles: Record<string, string> = {
   '/tasks': 'Tasks Dashboard',
   '/tasks/create': 'Create New Task',
   '/templates': 'Templates Library',
-  '/guide': 'User Guide',
   '/admin': 'Admin Dashboard',
   '/profile': 'User Profile',
   '/config': 'Configuration Page',
