@@ -87,6 +87,19 @@ interface LLMCallOptions {
   response_format?: { type: 'text' | 'json_object' } | null;
 }
 
+// Diagnosis agent configuration
+const DIAGNOSIS_MODEL = 'gemini-3.1-flash-lite-preview';
+const DIAGNOSIS_TIMEOUT_MS = 10_000;
+
+// Context passed to the diagnosis agent when the main agent fails
+export interface DiagnosisContext {
+  errorType: 'transient' | 'context_limit' | 'content_filter' | 'rate_limit' | 'unknown';
+  errorMessage: string;
+  userMessage: string;
+  workPlanSummary: string | null;
+  failedFunctions: Record<string, number> | null;
+}
+
 
 export class AgentModeService {
   private fileContentCache: Map<string, { file_url: string; file_name: string; file_size: number; timestamp: number }> = new Map();
@@ -8987,6 +9000,55 @@ Format the response as JSON with this structure:
     } catch (error) {
       console.error('AgentMode: Failed to generate session title:', error);
       return 'Marketing Task';
+    }
+  }
+
+  /**
+   * Diagnosis agent: when the main agent fails, this makes a lightweight LLM call
+   * to produce a context-aware error message instead of the generic fallback.
+   * Returns null if diagnosis fails (caller should use the generic message).
+   */
+  async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
+    try {
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+
+      const parts: string[] = [
+        `Error type: ${context.errorType}`,
+        `Error: ${context.errorMessage.slice(0, 200)}`,
+        `User's request: ${context.userMessage.slice(0, 300)}`,
+      ];
+      if (context.workPlanSummary) {
+        parts.push(`Work plan status:\n${context.workPlanSummary}`);
+      } else {
+        parts.push('No work plan.');
+      }
+      if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
+        parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
+      }
+
+      const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: parts.join('\n\n') },
+      ], {
+        max_completion_tokens: 200,
+        temperature: 0.3,
+      });
+
+      const timeoutPromise = new Promise<null>((resolve) =>
+        setTimeout(() => resolve(null), DIAGNOSIS_TIMEOUT_MS)
+      );
+
+      const response = await Promise.race([llmPromise, timeoutPromise]);
+      if (!response) {
+        console.warn('AgentMode: Diagnosis agent timed out');
+        return null;
+      }
+
+      const message = (response as any).choices?.[0]?.message?.content?.trim();
+      return message || null;
+    } catch (error) {
+      console.error('AgentMode: Diagnostic message generation failed:', error);
+      return null;
     }
   }
 
