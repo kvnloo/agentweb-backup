@@ -1021,6 +1021,9 @@ export class AgentModeService {
     isCancelled?: () => boolean,
     excludeTools?: string[]
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string }> {
+    // Hoisted so the catch block can extract partial usage from messages accumulated before an error
+    let _messages: any[] | null = null;
+    let _initialMessageCount = 0;
     try {
       // Track backup model usage
       const originalLlmModel = llmModel;
@@ -1116,6 +1119,8 @@ export class AgentModeService {
 
       // Remember initial message count to slice response messages later
       let initialMessageCount = messages.length;
+      _messages = messages;
+      _initialMessageCount = initialMessageCount;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 20; // Prevent infinite loops
@@ -1637,6 +1642,12 @@ export class AgentModeService {
         userMessage = 'I apologize, but I encountered an error processing your request. Please try again.';
       }
 
+      // Extract partial usage from any response messages accumulated before the error.
+      // This ensures token costs are tracked even when generation fails mid-stream.
+      const partialResponseMessages = _messages
+        ? _messages.slice(_initialMessageCount).filter((msg: any) => msg.role !== 'user' && msg.usage)
+        : [];
+
       // Preserve original error details for upstream error classification (e.g. isContextLimitError)
       // while still providing a user-friendly message
       const wrappedError: any = new Error(userMessage);
@@ -1644,6 +1655,9 @@ export class AgentModeService {
       wrappedError.originalMessage = error?.message || String(error);
       if (error?.status) wrappedError.status = error.status;
       if (error?.code) wrappedError.code = error.code;
+      if (partialResponseMessages.length > 0) {
+        wrappedError.partialUsageMessages = partialResponseMessages;
+      }
       throw wrappedError;
     }
   }

@@ -1098,6 +1098,16 @@ export async function runScheduledChat(
 
     // Save error to session record if session was created
     if (sessionId) {
+      // Persist partial token usage from messages accumulated before the error
+      if ((error as any)?.partialUsageMessages?.length) {
+        try {
+          await chatbotDb.addMessagesToSession(sessionId, (error as any).partialUsageMessages);
+          console.log(`Scheduled chat: Persisted partial usage from ${(error as any).partialUsageMessages.length} messages for failed session ${sessionId}`);
+        } catch (usageErr) {
+          console.error('Failed to persist partial usage for scheduled chat:', usageErr);
+        }
+      }
+
       try {
         await chatbotDb.updateSessionError(
           sessionId,
@@ -1867,6 +1877,17 @@ export const agentModeController = {
       if (sessionId) {
         emitProgress(sessionId, { iteration: 0, status: 'complete' });
         progressStore.delete(sessionId);
+      }
+
+      // Persist partial token usage from messages accumulated before the error.
+      // This ensures we track costs even when generation fails mid-stream.
+      if (sessionId && (error as any)?.partialUsageMessages?.length) {
+        try {
+          await chatbotDb.addMessagesToSession(sessionId, (error as any).partialUsageMessages);
+          console.log(`AgentMode: Persisted partial usage from ${(error as any).partialUsageMessages.length} messages for failed session ${sessionId}`);
+        } catch (usageErr) {
+          console.error('AgentMode: Failed to persist partial usage on error:', usageErr);
+        }
       }
 
       // Persist an error message to the session so the user sees feedback on reload.

@@ -126,6 +126,8 @@ process.on('message', async (message: any) => {
     });
 
     // Send error back to parent process with context
+    // Include partial usage messages if available (accumulated before the error)
+    const partialUsageMessages = (error as any)?.partialUsageMessages;
     process.send!({
       type: 'error',
       requestId,
@@ -134,7 +136,8 @@ process.on('message', async (message: any) => {
       context: {
         sessionId: message.params?.sessionId,
         llmModel: message.params?.llmModel,
-      }
+      },
+      ...(partialUsageMessages?.length ? { partialUsageMessages } : {})
     });
   }
 });
