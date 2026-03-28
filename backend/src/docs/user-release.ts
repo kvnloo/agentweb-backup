@@ -11,6 +11,15 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-28',
     changes: [
+      'Fix: Emma Now Updates Org-Level Brand Guidelines and Market Strategy',
+      '- Fixed a bug where updating brand guidelines or market strategy via Emma would save to the user\'s personal data instead of the organization record',
+      '- Org owners\' updates via Emma now correctly write to the shared org data, consistent with the Settings page behavior',
+      '- Org members are now properly prevented from making these updates via Emma',
+    ],
+  },
+  {
+    date: '2026-03-28',
+    changes: [
       'Improvement: Context-Aware Error Messages',
       '- When Emma encounters an error mid-task, she now provides a specific, helpful message instead of a generic "I encountered an error" response',
       '- A lightweight diagnosis agent analyzes the error context, work plan progress, and failed operations to explain what happened and what to do next',
