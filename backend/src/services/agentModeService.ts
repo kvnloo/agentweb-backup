@@ -4558,7 +4558,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Read current user's brand guidelines
   public async readBrandGuidelines(userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -4569,7 +4569,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      const brand = user.brandGuidelines;
+      // If user belongs to an org, read from org data instead
+      let brand = user.brandGuidelines;
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org && org.brandGuidelines) {
+          brand = org.brandGuidelines;
+        }
+      }
       if (!brand) {
         return {
           success: true,
@@ -4692,7 +4699,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Read current user's market strategy
   public async readMarketStrategy(userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -4703,7 +4710,14 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      const marketStrategy = user.marketStrategy;
+      // If user belongs to an org, read from org data instead
+      let marketStrategy = user.marketStrategy;
+      if (user.orgId) {
+        const org = await orgDb.getOrgById(user.orgId);
+        if (org && org.marketStrategy) {
+          marketStrategy = org.marketStrategy;
+        }
+      }
       if (!marketStrategy) {
         return {
           success: true,
@@ -4748,7 +4762,7 @@ When a user requests client onboarding or says "onboard new client" or similar:
   // Update user's market strategy
   public async updateMarketStrategy(updateData: any, userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -4758,8 +4772,26 @@ When a user requests client onboarding or says "onboard new client" or similar:
         };
       }
 
-      // Get existing market strategy
-      const existingMarketStrategy = user.marketStrategy;
+      // Check org membership - only owners can update, members are rejected
+      const isOrgOwner = user.orgId && user.orgRole === 'owner';
+      const isOrgMember = user.orgId && user.orgRole !== 'owner';
+
+      if (isOrgMember) {
+        return {
+          success: false,
+          message: 'Only the org owner can update market strategy',
+          error: 'Permission denied'
+        };
+      }
+
+      // Get existing market strategy from org (if owner) or personal
+      let existingMarketStrategy: any;
+      if (isOrgOwner) {
+        const org = await orgDb.getOrgById(user.orgId!);
+        existingMarketStrategy = org?.marketStrategy;
+      } else {
+        existingMarketStrategy = user.marketStrategy;
+      }
 
       // Extract market strategy fields from updateData
       const { businessOverview, competitors, icp, ...otherFields } = updateData;
@@ -4813,10 +4845,12 @@ When a user requests client onboarding or says "onboard new client" or similar:
         updatedAt: new Date().toISOString()
       };
 
-      // Update user record with market strategy data
-      await userDb.updateUser(userId, {
-        marketStrategy: marketStrategyData
-      });
+      // Update org-level or personal market strategy
+      if (isOrgOwner) {
+        await orgDb.updateOrg(user.orgId!, { marketStrategy: marketStrategyData });
+      } else {
+        await userDb.updateUser(userId, { marketStrategy: marketStrategyData });
+      }
 
       // Track what was updated vs added
       const updatedEntries: string[] = [];
@@ -7642,7 +7676,7 @@ Format the response as JSON with this structure:
   // Update user's brand guidelines (supports both brandData and attachments)
   public async updateBrandGuidelines(updateData: any, userId: string): Promise<any> {
     try {
-      const { userDb } = await import('./db');
+      const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
       if (!user) {
         return {
@@ -7652,8 +7686,26 @@ Format the response as JSON with this structure:
         };
       }
 
-      // Get existing brand guidelines
-      let existingBrand = user.brandGuidelines;
+      // Check org membership - only owners can update, members are rejected
+      const isOrgOwner = user.orgId && user.orgRole === 'owner';
+      const isOrgMember = user.orgId && user.orgRole !== 'owner';
+
+      if (isOrgMember) {
+        return {
+          success: false,
+          message: 'Only the org owner can update brand guidelines',
+          error: 'Permission denied'
+        };
+      }
+
+      // Get existing brand guidelines from org (if owner) or personal
+      let existingBrand: any;
+      if (isOrgOwner) {
+        const org = await orgDb.getOrgById(user.orgId!);
+        existingBrand = org?.brandGuidelines;
+      } else {
+        existingBrand = user.brandGuidelines;
+      }
 
       // If no existing brand guidelines, create a new structure
       if (!existingBrand) {
@@ -7679,10 +7731,12 @@ Format the response as JSON with this structure:
           updatedAt: new Date().toISOString(),
         };
 
-        // Update the user with initial brand guidelines
-        await userDb.updateUser(userId, {
-          brandGuidelines: initialBrandGuidelines
-        });
+        // Update org or user with initial brand guidelines
+        if (isOrgOwner) {
+          await orgDb.updateOrg(user.orgId!, { brandGuidelines: initialBrandGuidelines });
+        } else {
+          await userDb.updateUser(userId, { brandGuidelines: initialBrandGuidelines });
+        }
 
         // Use the initial structure as the base for updates
         existingBrand = initialBrandGuidelines;
@@ -7781,15 +7835,19 @@ Format the response as JSON with this structure:
         }
       }
 
-      // Update the user's brand guidelines
-      await userDb.updateUser(userId, {
-        brandGuidelines: {
-          ...existingBrand,
-          brandData: updatedBrandData,
-          attachments: updatedAttachments,
-          updatedAt: new Date().toISOString()
-        }
-      });
+      // Update org-level or personal brand guidelines
+      const updatedGuidelines = {
+        ...existingBrand,
+        brandData: updatedBrandData,
+        attachments: updatedAttachments,
+        updatedAt: new Date().toISOString()
+      };
+
+      if (isOrgOwner) {
+        await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedGuidelines });
+      } else {
+        await userDb.updateUser(userId, { brandGuidelines: updatedGuidelines });
+      }
 
       const updatedFields = [];
       if (brandData) updatedFields.push(...Object.keys(brandData));
