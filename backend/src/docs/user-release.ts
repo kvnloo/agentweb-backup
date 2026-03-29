@@ -9,6 +9,14 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-03-29',
+    changes: [
+      'Fix: User Guide Updates Now Handle Long Content',
+      '- Fixed an issue where updating the user guide with long text (over 2,000 characters) would fail due to Notion API limits',
+      '- Long content is now automatically split into smaller chunks, allowing seamless guide updates',
+    ],
+  },
+  {
     date: '2026-03-28',
     changes: [
       'Improvement: Work Plan Review Details (Partner Portal)',
