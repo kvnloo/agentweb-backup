@@ -18,6 +18,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
       'Fix: User Guide Updates Now Handle Long Content',
       '- Fixed an issue where updating the user guide with long text (over 2,000 characters) would fail due to Notion API limits',
       '- Long content is now automatically split into smaller chunks, allowing seamless guide updates',
+      'Fix: Slack Table Formatting in Agent Mode Responses',
+      '- Fixed messy table formatting in Slack when agent mode responses contain markdown tables',
+      '- Tables are now properly formatted with aligned columns and wrapped in code blocks for monospaced display',
+      '- Previously, table columns were smashed together without spacing or structure',
     ],
   },
   {
