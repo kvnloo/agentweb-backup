@@ -11,6 +11,10 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-03-29',
     changes: [
+      'Improvement: Richer Chat History Data for Emma',
+      '- Emma\'s get_chat_history tool now returns all session metadata shown in the admin Chat History tab',
+      '- Added: LLM model, portal type, work plan summary, feedback counts (likes/dislikes), longest wait time, and max heap usage',
+      '- Raw messages are still excluded to keep responses lightweight',
       'Fix: User Guide Updates Now Handle Long Content',
       '- Fixed an issue where updating the user guide with long text (over 2,000 characters) would fail due to Notion API limits',
       '- Long content is now automatically split into smaller chunks, allowing seamless guide updates',

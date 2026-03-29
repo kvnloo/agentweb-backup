@@ -1808,21 +1808,65 @@ mcpToolRegistry.register({
       context: ctx(context)
     });
 
-    // Format response for backward compatibility with Emma's expected shape
+    // Format response — return all metadata shown in the admin Chat History tab, but exclude raw messages
     const sessions = (data as any)?.sessions || [];
-    const formattedSessions = sessions.map((session: any) => ({
-      sessionId: session.sessionId,
-      userId: session.userId,
-      title: session.title,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      sessionType: session.sessionType,
-      messageCount: session.messages?.length || 0,
-      satisfactionScore: session.satisfactionScore,
-      judgeScores: session.judgeScores || null,
-      totalTokens: session.totalTokens || null,
-      totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
-    }));
+    const formattedSessions = sessions.map((session: any) => {
+      const messages: any[] = session.messages || [];
+
+      // Compute feedback summary from messages
+      let likes = 0;
+      let dislikes = 0;
+      let longestWaitMs = 0;
+      let maxHeapMB = 0;
+      for (const msg of messages) {
+        if (msg?.role !== 'assistant') continue;
+        if (msg?.metadata?.feedback?.type === 'like') likes++;
+        if (msg?.metadata?.feedback?.type === 'dislike') dislikes++;
+        if (Array.isArray(msg?.metadata?.iterationTimings)) {
+          const waitMs = msg.metadata.iterationTimings.reduce(
+            (sum: number, t: any) => sum + (t.llmDurationMs || 0), 0
+          );
+          if (waitMs > longestWaitMs) longestWaitMs = waitMs;
+        }
+        if (msg?.metadata?.memoryUsage?.currentHeapUsedMB != null) {
+          const heap = msg.metadata.memoryUsage.currentHeapUsedMB;
+          if (heap > maxHeapMB) maxHeapMB = heap;
+        }
+      }
+
+      // Work plan summary (title + step statuses, no full descriptions)
+      let workPlanSummary = null;
+      if (session.workPlan) {
+        workPlanSummary = {
+          title: session.workPlan.title,
+          steps: (session.workPlan.steps || []).map((s: any) => ({
+            stepCount: s.stepCount,
+            title: s.title,
+            status: s.status,
+          })),
+        };
+      }
+
+      return {
+        sessionId: session.sessionId,
+        userId: session.userId,
+        title: session.title,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        portalType: session.portalType || null,
+        sessionType: session.sessionType || null,
+        llmModel: session.llmModel || null,
+        messageCount: messages.length,
+        totalTokens: session.totalTokens || null,
+        totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
+        satisfactionScore: session.satisfactionScore || null,
+        judgeScores: session.judgeScores || null,
+        feedback: (likes > 0 || dislikes > 0) ? { likes, dislikes } : null,
+        longestWaitMs: longestWaitMs > 0 ? longestWaitMs : null,
+        maxHeapMB: maxHeapMB > 0 ? Math.round(maxHeapMB) : null,
+        workPlan: workPlanSummary,
+      };
+    });
 
     return jsonResult({
       sessions: formattedSessions,
