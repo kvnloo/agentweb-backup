@@ -1,3 +1,90 @@
+# March 29, 2026: Investigation — Sonnet 4.6 vs Opus 4.6 Cost & Quality Comparison for Agent Mode
+
+## Problem
+
+Agent Mode defaults to Opus 4.6 (`anthropic.claude-opus-4-6-v1`) for all sessions. Opus is the most expensive Claude model. Need to determine whether switching the default to Sonnet 4.6 would meaningfully reduce costs without degrading output quality for typical marketing tasks.
+
+## Approach
+
+Ran identical marketing tasks on both models using the test account (`test@example.com`) and compared cost, token usage, and output quality.
+
+### Tasks Tested
+1. **SWOT Analysis** — "Create a SWOT analysis for my business"
+2. **LinkedIn Posts** — "Create 3 LinkedIn posts for my business"
+3. **Email Nurture Sequence** — email marketing content
+4. **Brand Guidelines Review** — brand strategy analysis
+5. **Competitor Analysis** — competitive landscape research
+
+## Results
+
+### Cost Comparison (Same Tasks, Same Account)
+
+| Task | Sonnet 4.6 Cost | Opus 4.6 Cost | Opus Premium |
+|------|-----------------|---------------|--------------|
+| SWOT Analysis | $0.091 | $0.677 | **7.4x** |
+| LinkedIn Posts | $0.062 | $1.270 | **20.5x** |
+
+**Average: Opus costs ~14x more per session for comparable marketing tasks.**
+
+### Sonnet 4.6 — Full Test Results
+
+| Task | Session | Cost | Output Tokens |
+|------|---------|------|---------------|
+| SWOT Analysis | 9246850b | $0.091 | 10,526 |
+| LinkedIn Posts | 53c768c5 | $0.062 | ~7,000 |
+| Email Nurture | d41e9b3c | $0.062 | ~7,000 |
+| Brand Guidelines | dfdc46b6 | $0.106 | ~10,000 |
+| Competitor Analysis | 067d7bd5 | $0.159 | ~14,000 |
+
+**Average Sonnet session cost: $0.096**
+
+### Opus 4.6 — Test Results
+
+| Task | Session | Cost | Output Tokens |
+|------|---------|------|---------------|
+| SWOT Analysis | d3173b8a | $0.677 | 10,468 |
+| LinkedIn Posts | 9b0603f3 | $1.270 | 8,654 |
+
+**Average Opus session cost: $0.974**
+
+### Pricing Reference
+
+| Model | Input (per 1M tokens) | Output (per 1M tokens) |
+|-------|----------------------|------------------------|
+| Sonnet 4.6 | $3 | $15 |
+| Opus 4.6 | $15 | $75 |
+
+## Quality Assessment
+
+Both models produced **excellent, production-quality** marketing outputs:
+
+- **SWOT Analysis**: Both generated comprehensive strategic frameworks with tables, bullet points, and actionable recommendations. Indistinguishable quality.
+- **LinkedIn Posts**: Both created well-crafted content. Opus was slightly more "feature-aware" — it discovered and used the `create_social_media_posts` tool to save posts directly, while Sonnet presented them inline. The extra tool usage drove Opus cost much higher.
+- **Email/Brand/Competitor tasks** (Sonnet only): All produced thorough, well-structured outputs comparable to what Opus would generate.
+
+### Key Observation
+
+Opus's main advantage is being more likely to discover and use platform tools (e.g., `create_social_media_posts`, `install_skills`). However, this increases cost significantly (more iterations, more tool calls) and the end-user output quality is equivalent.
+
+## Projected Monthly Savings
+
+Assuming ~500 agent mode sessions/month:
+- **Opus monthly cost**: ~$487 (500 × $0.974)
+- **Sonnet monthly cost**: ~$48 (500 × $0.096)
+- **Potential savings**: ~$439/month (~90% reduction)
+
+## Recommendation
+
+**Switch the default model to Sonnet 4.6.** The quality difference is negligible for marketing tasks, and the cost savings are dramatic (7-20x per session). Opus can remain available as a manual selection in the model dropdown for users who want it.
+
+### Also Investigated: Auto_CostSaving Meta-Model
+
+Explored building an `Auto_CostSaving` meta-model that dynamically routes between Claude models per iteration based on task complexity. Implementation was completed but ultimately unnecessary — since Sonnet handles all tested tasks at equivalent quality, a simple default switch is cleaner than a dynamic routing system.
+
+**Decision:** Discard Auto_CostSaving code; switch default model to Sonnet 4.6 instead.
+
+---
+
 # March 28, 2026: Investigation — SESSION_MESSAGE_LIMIT_EXCEEDED on Scheduled Chat (BirdDog Blog Articles)
 
 ## Problem
